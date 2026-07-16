@@ -24,8 +24,11 @@ fn project_name(p: &str) -> String {
 }
 
 // Working animation: an equalizer-style bar rising and falling.
-const WORKING_FRAMES: [&str; 12] =
-    ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "▆", "▅", "▄", "▃", "▂"];
+// Working animation: a braille "snake" that wanders the cell, its body
+// breathing between 2 and 3 dots. Deterministic (indexed by tick).
+const WORKING_FRAMES: [&str; 16] = [
+    "⠑", "⠔", "⣄", "⣠", "⡠", "⠢", "⠚", "⠜", "⠔", "⠤", "⣠", "⣄", "⢄", "⠆", "⠃", "⠑",
+];
 
 fn glyph_for(status: Status, tick: u32) -> String {
     match status {
