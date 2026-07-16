@@ -49,6 +49,16 @@ impl AppState {
     pub fn move_bottom(&mut self) {
         self.cursor = self.agents.len().saturating_sub(1);
     }
+
+    // Edge queries for vim-tmux-navigator handoff: at an edge (or with no list),
+    // a Ctrl-nav in that direction should fall through to the neighboring pane.
+    pub fn at_top(&self) -> bool {
+        self.cursor == 0
+    }
+
+    pub fn at_bottom(&self) -> bool {
+        self.cursor + 1 >= self.agents.len()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +69,10 @@ pub enum Msg {
     Top,
     Bottom,
     Jump,
-    PaneLeft,
-    PaneRight,
+    // Ctrl-h/j/k/l: vim-tmux-navigator style. Move within the list when the
+    // direction has somewhere to go; otherwise hand off to the neighboring
+    // tmux pane. Left/right always hand off (the list is one-dimensional).
+    CtrlNav(types::Dir),
     Refresh,
     Quit,
     // Ok carries observations plus any per-surface partial-failure warnings.
@@ -103,8 +115,17 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
             Some(o) => vec![Cmd::Jump(Box::new(o.clone()))],
             None => vec![],
         },
-        Msg::PaneLeft => vec![Cmd::SelectPane(types::Dir::Left)],
-        Msg::PaneRight => vec![Cmd::SelectPane(types::Dir::Right)],
+        Msg::CtrlNav(dir) => match dir {
+            // Vertical: move within the list; only hand off to the neighboring
+            // pane when already at that edge (so a mid-list Ctrl-j/k scrolls
+            // the list, and at the edge it crosses into the next pane).
+            types::Dir::Down if !state.at_bottom() => { state.move_down(); vec![] }
+            types::Dir::Up if !state.at_top() => { state.move_up(); vec![] }
+            // At a vertical edge, or any horizontal move: the list has no such
+            // neighbor, so delegate to tmux, which resolves the actual pane in
+            // that direction regardless of how the app's pane is laid out.
+            _ => vec![Cmd::SelectPane(dir)],
+        },
         Msg::Quit => { state.should_quit = true; vec![Cmd::Quit] }
         Msg::Scanned(Ok((next, warnings))) => {
             let ping = state.ping_on_blocked && newly_blocked(&state.agents, &next);
@@ -145,10 +166,10 @@ pub fn decode_key(
     if ctrl {
         *pending = None;
         return match code {
-            KeyCode::Char('j') => Msg::Down,
-            KeyCode::Char('k') => Msg::Up,
-            KeyCode::Char('h') => Msg::PaneLeft,
-            KeyCode::Char('l') => Msg::PaneRight,
+            KeyCode::Char('j') => Msg::CtrlNav(types::Dir::Down),
+            KeyCode::Char('k') => Msg::CtrlNav(types::Dir::Up),
+            KeyCode::Char('h') => Msg::CtrlNav(types::Dir::Left),
+            KeyCode::Char('l') => Msg::CtrlNav(types::Dir::Right),
             _ => Msg::Ignored,
         };
     }
@@ -298,10 +319,43 @@ mod tests {
     }
 
     #[test]
-    fn pane_left_right_emit_select_pane() {
+    fn ctrl_left_right_always_select_neighbor_pane() {
         let mut s = AppState::new(true, true);
-        assert_eq!(update(&mut s, Msg::PaneLeft), vec![Cmd::SelectPane(types::Dir::Left)]);
-        assert_eq!(update(&mut s, Msg::PaneRight), vec![Cmd::SelectPane(types::Dir::Right)]);
+        update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
+        // Horizontal moves have no in-list meaning: always delegate to tmux.
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Left)), vec![Cmd::SelectPane(types::Dir::Left)]);
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Right)), vec![Cmd::SelectPane(types::Dir::Right)]);
+    }
+
+    #[test]
+    fn ctrl_down_moves_within_list_then_crosses_pane_at_bottom() {
+        let mut s = AppState::new(true, true);
+        update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
+        // Mid-list: Ctrl-j scrolls the list, no pane switch.
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Down)), vec![]);
+        assert_eq!(s.cursor, 1);
+        // At the bottom edge: Ctrl-j hands off to the pane below.
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Down)), vec![Cmd::SelectPane(types::Dir::Down)]);
+        assert_eq!(s.cursor, 1, "cursor stays put when crossing panes");
+    }
+
+    #[test]
+    fn ctrl_up_moves_within_list_then_crosses_pane_at_top() {
+        let mut s = AppState::new(true, true);
+        update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
+        s.move_bottom(); // cursor = 1
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Up)), vec![]);
+        assert_eq!(s.cursor, 0);
+        // At the top edge: Ctrl-k hands off to the pane above.
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Up)), vec![Cmd::SelectPane(types::Dir::Up)]);
+    }
+
+    #[test]
+    fn ctrl_nav_with_empty_list_always_crosses_pane() {
+        let mut s = AppState::new(true, true);
+        // No agents: every direction is an edge, so all delegate to tmux.
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Down)), vec![Cmd::SelectPane(types::Dir::Down)]);
+        assert_eq!(update(&mut s, Msg::CtrlNav(types::Dir::Up)), vec![Cmd::SelectPane(types::Dir::Up)]);
     }
 
     fn dk(code: KeyCode, mods: KeyModifiers, vim: bool, pending: &mut Option<char>) -> Msg {
@@ -319,13 +373,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_chords_always_work_regardless_of_vim_mode() {
+    fn ctrl_chords_decode_to_directional_nav_regardless_of_vim_mode() {
         let mut p = None;
         let c = KeyModifiers::CONTROL;
-        assert_eq!(dk(KeyCode::Char('j'), c, false, &mut p), Msg::Down);
-        assert_eq!(dk(KeyCode::Char('k'), c, false, &mut p), Msg::Up);
-        assert_eq!(dk(KeyCode::Char('h'), c, false, &mut p), Msg::PaneLeft);
-        assert_eq!(dk(KeyCode::Char('l'), c, false, &mut p), Msg::PaneRight);
+        assert_eq!(dk(KeyCode::Char('j'), c, false, &mut p), Msg::CtrlNav(types::Dir::Down));
+        assert_eq!(dk(KeyCode::Char('k'), c, false, &mut p), Msg::CtrlNav(types::Dir::Up));
+        assert_eq!(dk(KeyCode::Char('h'), c, false, &mut p), Msg::CtrlNav(types::Dir::Left));
+        assert_eq!(dk(KeyCode::Char('l'), c, false, &mut p), Msg::CtrlNav(types::Dir::Right));
     }
 
     #[test]
