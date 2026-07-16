@@ -1,6 +1,6 @@
 [package]
 name = "hotl"
-description = "A terminal dashboard that discovers AI-agent processes in tmux, shows their live status, and jumps focus to them."
+description = "A human-on-the-loop tui with byo-keybindings - discovers AI-agent processes, shows their live status, gives an (optional) audible ping when an agent is waiting on your input, jump to pane."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
