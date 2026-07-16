@@ -1,0 +1,75 @@
+name: Publish to crates.io
+
+# Semver release flow: publishing is driven by an annotated version tag, never
+# by ordinary commits (crates.io rejects re-publishing an existing version, so
+# "publish on every commit" would just fail once the version stops changing).
+#
+# To cut a release:
+#   1. Bump `version` in the root Cargo.toml ([workspace.package]).
+#   2. Commit, then tag that commit `vX.Y.Z` (must match the manifest version).
+#   3. `git push --follow-tags` — this workflow verifies the tag, builds, tests,
+#      then publishes every workspace crate in dependency order.
+on:
+  push:
+    tags:
+      # Strict semver, optionally with a pre-release/build suffix
+      # (v1.2.3, v1.2.3-rc.1, v1.2.3+meta). Non-semver tags are ignored.
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# Never run two publishes concurrently — crates.io publishes are irreversible.
+concurrency:
+  group: publish-crates-io
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: crates-io # gate on a protected environment for manual approval
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag is semver and matches the manifest version
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+
+          # Strict semver (major.minor.patch[-prerelease][+build]).
+          semver_re='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'
+          if ! [[ "$version" =~ $semver_re ]]; then
+            echo "::error::Tag '$tag' is not valid semver (expected vMAJOR.MINOR.PATCH)."
+            exit 1
+          fi
+
+          # The tag must match the version the crates will actually publish as.
+          # jq is preinstalled on GitHub-hosted runners.
+          manifest_version="$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "hotl") | .version')"
+          echo "tag version:      $version"
+          echo "manifest version: $manifest_version"
+          if [ "$manifest_version" != "$version" ]; then
+            echo "::error::Tag ($version) != Cargo.toml version ($manifest_version). Bump the manifest and re-tag."
+            exit 1
+          fi
+
+      - name: Build and test
+        run: cargo test --workspace --locked
+
+      # Handles workspace dependency ordering, version-skip, and waiting for
+      # each crate to land on the index before publishing its dependents.
+      - name: Publish workspace to crates.io
+        uses: katyo/publish-crates@v2
+        with:
+          registry-token: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          # Re-running the release after a partial/duplicate publish exits
+          # cleanly instead of erroring on already-published versions.
+          ignore-unpublished-changes: true
+          args: --locked
