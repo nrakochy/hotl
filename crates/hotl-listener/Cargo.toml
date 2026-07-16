@@ -1,0 +1,11 @@
+[package]
+name = "listener"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "listener"
+path = "src/lib.rs"
+
+[dependencies]
+types = { path = "../hotl-types" }

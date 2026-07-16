@@ -1,0 +1,11 @@
+[package]
+name = "tmux"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+name = "tmux"
+path = "src/lib.rs"
+
+[dependencies]
+types = { path = "../hotl-types" }

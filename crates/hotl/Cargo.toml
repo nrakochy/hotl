@@ -1,0 +1,16 @@
+[package]
+name = "hotl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "hotl"
+path = "src/main.rs"
+
+[dependencies]
+types = { path = "../hotl-types" }
+tmux = { path = "../hotl-tmux" }
+listener = { path = "../hotl-listener" }
+tui = { path = "../hotl-tui" }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
