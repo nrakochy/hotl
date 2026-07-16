@@ -4,6 +4,8 @@ use types::Dir;
 
 pub fn select_pane_argv(dir: Dir) -> Vec<String> {
     let flag = match dir {
+        Dir::Up => "-U",
+        Dir::Down => "-D",
         Dir::Left => "-L",
         Dir::Right => "-R",
     };
@@ -36,5 +38,11 @@ mod tests {
     #[test]
     fn right_argv() {
         assert_eq!(select_pane_argv(Dir::Right), vec!["select-pane", "-R"]);
+    }
+
+    #[test]
+    fn up_down_argv() {
+        assert_eq!(select_pane_argv(Dir::Up), vec!["select-pane", "-U"]);
+        assert_eq!(select_pane_argv(Dir::Down), vec!["select-pane", "-D"]);
     }
 }
