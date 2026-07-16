@@ -15,6 +15,13 @@ pub trait StatusDetector {
         let _ = tail;
         None
     }
+
+    /// Extract the model name from the pane tail.
+    /// Returns `None` if the model cannot be determined.
+    fn model(&self, tail: &str) -> Option<String> {
+        let _ = tail;
+        None
+    }
 }
 
 // ─── Shared helpers ────────────────────────────────────────────────────────────
@@ -56,10 +63,28 @@ impl StatusDetector for ClaudeDetector {
         }
     }
 
+    /// Claude's status bar: `[I] .../path [branch] ModelName ctx:N%` or just
+    /// `[I] .../path [branch] ModelName`. Match lines starting with `[I]` or
+    /// `[A]` (insert/agent mode indicators).
     fn status_line(&self, tail: &str) -> Option<String> {
         tail.lines()
-            .find(|l| l.contains("ctx:"))
-            .map(|l| l.trim().to_string())
+            .map(|l| l.trim())
+            .find(|l| l.starts_with("[I]") || l.starts_with("[A]"))
+            .map(|l| l.to_string())
+    }
+
+    /// Model name appears after the last `]` bracket on the status line:
+    /// `[I] .../path [branch] Sonnet 5` → `Sonnet 5`
+    fn model(&self, tail: &str) -> Option<String> {
+        let line = self.status_line(tail)?;
+        // Find the last `] ` and take everything after it, trimming ctx info.
+        let after_bracket = line.rsplit("] ").next()?;
+        let model = after_bracket
+            .split(" ctx:")
+            .next()
+            .unwrap_or(after_bracket)
+            .trim();
+        if model.is_empty() { None } else { Some(model.to_string()) }
     }
 }
 
@@ -90,10 +115,34 @@ impl StatusDetector for PiDetector {
         }
     }
 
+    /// Pi's footer: `↑9.5k ↓1.9k ... 3.2%/1.0M (auto)  model • level`
     fn status_line(&self, tail: &str) -> Option<String> {
         tail.lines()
             .find(|l| l.contains('↑') && l.contains('↓') && l.contains("/1"))
             .map(|l| l.trim().to_string())
+    }
+
+    /// Model is at the end of the footer, after the `(auto)` or percentage:
+    /// `↑9.5k ↓1.9k ... 6.4%/1.0M (auto)  us.anthropic.claude-opus-4-6-v1 • medium`
+    fn model(&self, tail: &str) -> Option<String> {
+        let line = self.status_line(tail)?;
+        // Model appears after the last run of whitespace following the stats.
+        // Split on `•` to separate model from thinking level if present.
+        // The model identifier comes after `(auto)` or the percentage block.
+        let model_part = if let Some(after) = line.split("(auto)").nth(1) {
+            after.trim().to_string()
+        } else {
+            // fallback: take from after the percentage pattern `/1.0M`
+            line.split("/1").nth(1)
+                .and_then(|s| s.split_whitespace().nth(1))
+                .map(|rest| {
+                    // rejoin remaining words
+                    let idx = line.find(rest)?;
+                    Some(line[idx..].to_string())
+                })
+                .flatten()?
+        };
+        if model_part.is_empty() { None } else { Some(model_part) }
     }
 }
 
@@ -133,25 +182,30 @@ impl StatusDetector for OpenCodeDetector {
         }
     }
 
+    /// OpenCode shows the model in the `Build · ModelName Provider` line.
     fn status_line(&self, tail: &str) -> Option<String> {
-        // Extract the line with token context info from the sidebar
-        tail.lines()
-            .find(|l| l.contains("tokens") || l.contains("Context"))
-            .map(|l| l.trim().to_string())
+        Self::build_line(tail).map(|l| l.to_string())
+    }
+
+    fn model(&self, tail: &str) -> Option<String> {
+        let line = Self::build_line(tail)?;
+        // Format: "Build · US Anthropic Claude Opus 4.6 Amazon Bedrock"
+        let after = line.split("Build · ").nth(1)?.trim();
+        if after.is_empty() { None } else { Some(after.to_string()) }
     }
 }
 
 impl OpenCodeDetector {
-    /// OpenCode shows a progress bar (⬝ chars) and "esc interrupt" when working.
+    /// OpenCode shows `⬝` progress dots and `esc interrupt` when working.
     fn tail_is_working(tail: &str) -> bool {
-        tail.contains("esc interrupt") || tail.contains('⬝')
+        tail.contains("esc interrupt")
     }
 
-    /// OpenCode is idle when it shows the editor prompt or "Ask anything".
+    /// OpenCode is idle when the editor/footer is visible without a working
+    /// indicator. Detected by `Build ·` model line or `tab agents` footer.
     fn tail_is_idle(tail: &str) -> bool {
-        tail.contains("Ask anything") || (
-            tail.contains("tab agents") && !Self::tail_is_working(tail)
-        )
+        !Self::tail_is_working(tail)
+            && (Self::build_line(tail).is_some() || tail.contains("Ask anything"))
     }
 
     /// OpenCode may prompt for tool approval.
@@ -159,6 +213,16 @@ impl OpenCodeDetector {
         let t = tail.to_lowercase();
         (t.contains("approve") || t.contains("allow") || t.contains("confirm"))
             && (t.contains("y/n") || t.contains("enter") || t.contains("deny"))
+    }
+
+    /// Find the `Build · ...` line showing the active model/agent.
+    fn build_line(tail: &str) -> Option<&str> {
+        tail.lines()
+            .filter_map(|l| {
+                let t = l.trim().trim_start_matches('┃').trim_start_matches('▣').trim();
+                if t.starts_with("Build") && t.contains('·') { Some(t) } else { None }
+            })
+            .last()
     }
 }
 
@@ -197,6 +261,10 @@ pub fn extract_status_line(agent_name: &str, tail: &str) -> Option<String> {
     detector_for(agent_name).status_line(tail)
 }
 
+pub fn extract_model(agent_name: &str, tail: &str) -> Option<String> {
+    detector_for(agent_name).model(tail)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +281,8 @@ Do you want to proceed?
 ❯ 1. Yes
   2. No
 enter to select · esc to cancel · ↑↓ to navigate";
+
+    // --- Claude tests ---
 
     #[test]
     fn working_when_title_has_braille_spinner() {
@@ -246,6 +316,58 @@ enter to select · esc to cancel · ↑↓ to navigate";
     }
 
     #[test]
+    fn idle_when_prompt_has_drafted_input() {
+        assert_eq!(classify("claude", "✳", "❯ some draft text"), Status::Idle);
+    }
+
+    #[test]
+    fn menu_option_prompt_is_not_idle() {
+        assert_eq!(classify("codex", "plain", "❯ 1. Yes"), Status::Unknown);
+    }
+
+    #[test]
+    fn claude_status_line_matches_mode_indicator() {
+        let tail = "some output\n  [I] .../sources/hotl [master*] Sonnet 5\n  -- INSERT --";
+        assert_eq!(
+            extract_status_line("claude", tail).as_deref(),
+            Some("[I] .../sources/hotl [master*] Sonnet 5"),
+        );
+    }
+
+    #[test]
+    fn claude_status_line_with_ctx() {
+        let tail = "❯\n  [I] .../proj [main] Opus 4.8 ctx:15%";
+        assert_eq!(
+            extract_status_line("claude", tail).as_deref(),
+            Some("[I] .../proj [main] Opus 4.8 ctx:15%"),
+        );
+    }
+
+    #[test]
+    fn claude_status_line_none_when_missing() {
+        assert_eq!(extract_status_line("claude", "just log output\n❯ "), None);
+    }
+
+    #[test]
+    fn claude_model_from_status_line() {
+        let tail = "❯\n  [I] .../sources/hotl [master*] Sonnet 5\n  -- INSERT --";
+        assert_eq!(extract_model("claude", tail).as_deref(), Some("Sonnet 5"));
+    }
+
+    #[test]
+    fn claude_model_with_ctx_suffix() {
+        let tail = "❯\n  [I] .../proj [main] Opus 4.8 ctx:15%";
+        assert_eq!(extract_model("claude", tail).as_deref(), Some("Opus 4.8"));
+    }
+
+    #[test]
+    fn claude_model_none_when_no_status_line() {
+        assert_eq!(extract_model("claude", "plain output"), None);
+    }
+
+    // --- Generic tests ---
+
+    #[test]
     fn generic_detector_ignores_blocked_form() {
         assert_eq!(classify("codex", "plain", BLOCKED_TAIL), Status::Unknown);
     }
@@ -256,52 +378,7 @@ enter to select · esc to cancel · ↑↓ to navigate";
         assert_eq!(classify("codex", "plain", IDLE_TAIL), Status::Idle);
     }
 
-    #[test]
-    fn idle_when_prompt_has_drafted_input() {
-        assert_eq!(classify("claude", "✳", "❯ some draft text"), Status::Idle);
-    }
-
-    #[test]
-    fn menu_option_prompt_is_not_idle() {
-        assert_eq!(classify("codex", "plain", "❯ 1. Yes"), Status::Unknown);
-    }
-
-    // --- status_line extraction ---
-
-    #[test]
-    fn claude_status_line_extracts_ctx() {
-        let tail = "some output\n  [I] .../proj [main] ctx:9%\nmore";
-        assert_eq!(
-            extract_status_line("claude", tail).as_deref(),
-            Some("[I] .../proj [main] ctx:9%"),
-        );
-    }
-
-    #[test]
-    fn claude_status_line_none_when_no_ctx() {
-        assert_eq!(extract_status_line("claude", "just log output\n❯ "), None);
-    }
-
-    #[test]
-    fn pi_status_line_extracts_footer() {
-        let tail = "───\n~/sources/hotl (master)\n↑9.5k ↓1.9k R174k W32k CH98.8% $0.379 3.2%/1.0M (auto)  model • medium";
-        assert_eq!(
-            extract_status_line("pi", tail).as_deref(),
-            Some("↑9.5k ↓1.9k R174k W32k CH98.8% $0.379 3.2%/1.0M (auto)  model • medium"),
-        );
-    }
-
-    #[test]
-    fn pi_status_line_none_when_no_footer() {
-        assert_eq!(extract_status_line("pi", "just some output"), None);
-    }
-
-    #[test]
-    fn generic_status_line_is_none() {
-        assert_eq!(extract_status_line("codex", "anything"), None);
-    }
-
-    // --- Pi detector tests ---
+    // --- Pi tests ---
 
     const PI_WORKING_TAIL: &str = "\
 $ bash some-command
@@ -313,14 +390,14 @@ Elapsed 0.1s
 
 ───────────────────────────────────
 ~/sources/hotl (master)
-↑9.5k ↓1.9k R174k W32k CH98.8% $0.379 3.2%/1.0M (auto)  model • medium";
+↑9.5k ↓1.9k R174k W32k CH98.8% $0.379 3.2%/1.0M (auto)  us.anthropic.claude-opus-4-6-v1 • medium";
 
     const PI_IDLE_TAIL: &str = "\
 ───────────────────────────────────
 
 ───────────────────────────────────
 ~/sources/hotl (master)
-↑9.5k ↓1.9k R174k W32k CH98.8% $0.379 3.2%/1.0M (auto)  model • medium";
+↑9.5k ↓1.9k R174k W32k CH98.8% $0.379 3.2%/1.0M (auto)  us.anthropic.claude-opus-4-6-v1 • medium";
 
     const PI_BLOCKED_TAIL: &str = "\
 Allow tool execution in /tmp/proj?
@@ -352,40 +429,64 @@ Trust this project? (y/n)
         assert_eq!(classify("pi", "π - hotl", PI_WORKING_TAIL), Status::Working);
     }
 
-    // --- OpenCode detector tests ---
+    #[test]
+    fn pi_status_line_extracts_footer() {
+        assert_eq!(
+            extract_status_line("pi", PI_IDLE_TAIL).as_deref(),
+            Some("↑9.5k ↓1.9k R174k W32k CH98.8% $0.379 3.2%/1.0M (auto)  us.anthropic.claude-opus-4-6-v1 • medium"),
+        );
+    }
+
+    #[test]
+    fn pi_model_extraction() {
+        assert_eq!(
+            extract_model("pi", PI_IDLE_TAIL).as_deref(),
+            Some("us.anthropic.claude-opus-4-6-v1 • medium"),
+        );
+    }
+
+    #[test]
+    fn pi_model_none_when_no_footer() {
+        assert_eq!(extract_model("pi", "just some output"), None);
+    }
+
+    // --- OpenCode tests ---
 
     const OC_WORKING_TAIL: &str = "\
-  ┃\n\
-  ┃  Build · US Anthropic Claude Opus 4.6 Amazon Bedrock\n\
-  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+  ┃  Build · US Anthropic Claude Opus 4.6 Amazon Bedrock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
    ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                tab agents  ctrl+p commands    • OpenCode 1.15.12";
 
     const OC_IDLE_TAIL: &str = "\
-  ┃\n\
-  ┃  Ask anything... \"Fix a TODO in the codebase\"\n\
-  ┃\n\
-  ┃  Build · US Anthropic Claude Opus 4.6 Amazon Bedrock\n\
-  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+  ┃
+  ┃  Build · US Anthropic Claude Opus 4.6 Amazon Bedrock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+                                                         tab agents  ctrl+p commands    • OpenCode 1.15.12";
+
+    const OC_WELCOME_TAIL: &str = "\
+  ┃  Ask anything... \"Fix a TODO in the codebase\"
+  ┃
+  ┃  Build · US Anthropic Claude Opus 4.6 Amazon Bedrock
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
                                                          tab agents  ctrl+p commands    • OpenCode 1.15.12";
 
     const OC_BLOCKED_TAIL: &str = "\
-Approve tool execution? (y/n)\n\
+Approve tool execution? (y/n)
 tab agents  ctrl+p commands    • OpenCode 1.15.12";
 
     #[test]
-    fn opencode_working_when_progress_dots() {
+    fn opencode_working_when_esc_interrupt() {
         assert_eq!(classify("opencode", "OpenCode", OC_WORKING_TAIL), Status::Working);
     }
 
     #[test]
-    fn opencode_idle_when_ask_anything() {
+    fn opencode_idle_with_build_line() {
         assert_eq!(classify("opencode", "OpenCode", OC_IDLE_TAIL), Status::Idle);
     }
 
     #[test]
-    fn opencode_idle_when_tab_agents_no_spinner() {
-        let tail = "  ┃  Build · model\n  ╹▀▀▀\n                    tab agents  ctrl+p commands";
-        assert_eq!(classify("opencode", "OpenCode", tail), Status::Idle);
+    fn opencode_idle_on_welcome_screen() {
+        assert_eq!(classify("opencode", "OpenCode", OC_WELCOME_TAIL), Status::Idle);
     }
 
     #[test]
@@ -400,16 +501,32 @@ tab agents  ctrl+p commands    • OpenCode 1.15.12";
 
     #[test]
     fn opencode_working_takes_precedence_over_idle() {
-        // Has both "tab agents" and "esc interrupt"
         assert_eq!(classify("opencode", "OpenCode", OC_WORKING_TAIL), Status::Working);
     }
 
     #[test]
-    fn opencode_status_line_extracts_tokens() {
-        let tail = "some output\n1.2k tokens\n  Build";
+    fn opencode_model_extraction() {
         assert_eq!(
-            extract_status_line("opencode", tail).as_deref(),
-            Some("1.2k tokens"),
+            extract_model("opencode", OC_IDLE_TAIL).as_deref(),
+            Some("US Anthropic Claude Opus 4.6 Amazon Bedrock"),
         );
+    }
+
+    #[test]
+    fn opencode_model_none_when_no_build_line() {
+        assert_eq!(extract_model("opencode", "random output"), None);
+    }
+
+    #[test]
+    fn opencode_status_line_is_build_line() {
+        assert_eq!(
+            extract_status_line("opencode", OC_IDLE_TAIL).as_deref(),
+            Some("Build · US Anthropic Claude Opus 4.6 Amazon Bedrock"),
+        );
+    }
+
+    #[test]
+    fn generic_model_is_none() {
+        assert_eq!(extract_model("codex", "anything"), None);
     }
 }
