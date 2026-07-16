@@ -166,6 +166,7 @@ pub fn decode_key(
     if ctrl {
         *pending = None;
         return match code {
+            KeyCode::Char('c') => Msg::Quit,
             KeyCode::Char('j') => Msg::CtrlNav(types::Dir::Down),
             KeyCode::Char('k') => Msg::CtrlNav(types::Dir::Up),
             KeyCode::Char('h') => Msg::CtrlNav(types::Dir::Left),
@@ -380,6 +381,13 @@ mod tests {
         assert_eq!(dk(KeyCode::Char('k'), c, false, &mut p), Msg::CtrlNav(types::Dir::Up));
         assert_eq!(dk(KeyCode::Char('h'), c, false, &mut p), Msg::CtrlNav(types::Dir::Left));
         assert_eq!(dk(KeyCode::Char('l'), c, false, &mut p), Msg::CtrlNav(types::Dir::Right));
+    }
+
+    #[test]
+    fn ctrl_c_quits() {
+        let mut p = None;
+        assert_eq!(dk(KeyCode::Char('c'), KeyModifiers::CONTROL, false, &mut p), Msg::Quit);
+        assert_eq!(dk(KeyCode::Char('c'), KeyModifiers::CONTROL, true, &mut p), Msg::Quit);
     }
 
     #[test]
