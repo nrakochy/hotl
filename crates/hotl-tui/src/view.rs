@@ -39,12 +39,22 @@ fn glyph_for(status: Status, tick: u32) -> String {
     }
 }
 
+fn agent_icon(name: &str) -> &'static str {
+    match name {
+        "claude" => "✳",
+        "pi" => "π",
+        "opencode" => "▣",
+        "codex" => "◎",
+        _ => "◆",
+    }
+}
+
 pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
     let mut out = Vec::new();
     for (idx, o) in agents.iter().enumerate() {
         out.push(Row::Agent {
             glyph: glyph_for(o.status, tick),
-            name: project_name(&o.cwd),
+            name: format!("{} {}", agent_icon(&o.agent.name), project_name(&o.cwd)),
             subtitle: o.status_line.clone().unwrap_or_else(|| o.agent.name.clone()),
             status: o.status,
             selected: idx == cursor,
@@ -258,7 +268,7 @@ mod tests {
     #[test]
     fn agent_named_by_project_dir_with_status_glyph() {
         let rs = rows(&[obs("g", "w (0)", "/home/me/lca", Status::Blocked)], 0, 0);
-        let found = rs.iter().any(|r| matches!(r, Row::Agent { name, glyph, status: Status::Blocked, .. } if name == "lca" && glyph == "!"));
+        let found = rs.iter().any(|r| matches!(r, Row::Agent { name, glyph, status: Status::Blocked, .. } if name.contains("lca") && glyph == "!"));
         assert!(found);
     }
 
