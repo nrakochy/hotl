@@ -1,11 +1,19 @@
 [package]
-name = "listener"
+name = "hotl-listener"
+description = "Aggregates agent observations across surfaces for hotl."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tmux", "agent", "dashboard"]
+categories = ["command-line-utilities"]
 
 [lib]
 name = "listener"
 path = "src/lib.rs"
 
 [dependencies]
-types = { path = "../hotl-types" }
+types = { package = "hotl-types", path = "../hotl-types", version = "0.1.0" }

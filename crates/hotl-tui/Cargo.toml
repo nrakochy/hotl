@@ -1,13 +1,21 @@
 [package]
-name = "tui"
+name = "hotl-tui"
+description = "Elm-style ratatui TUI (state, update, view) for hotl."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tui", "ratatui", "agent", "dashboard"]
+categories = ["command-line-utilities"]
 
 [lib]
 name = "tui"
 path = "src/lib.rs"
 
 [dependencies]
-types = { path = "../hotl-types" }
+types = { package = "hotl-types", path = "../hotl-types", version = "0.1.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

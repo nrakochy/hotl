@@ -1,7 +1,15 @@
 [package]
-name = "types"
+name = "hotl-types"
+description = "Core config, observation model, and surface trait for hotl."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tmux", "agent", "dashboard"]
+categories = ["command-line-utilities"]
 
 [lib]
 name = "types"

@@ -1,16 +1,25 @@
 [package]
 name = "hotl"
+description = "A terminal dashboard that discovers AI-agent processes in tmux, shows their live status, and jumps focus to them."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "README.md"
+keywords = ["tmux", "tui", "agent", "dashboard", "cli"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "hotl"
 path = "src/main.rs"
 
 [dependencies]
-types = { path = "../hotl-types" }
-tmux = { path = "../hotl-tmux" }
-listener = { path = "../hotl-listener" }
-tui = { path = "../hotl-tui" }
+types = { package = "hotl-types", path = "../hotl-types", version = "0.1.0" }
+tmux = { package = "hotl-tmux", path = "../hotl-tmux", version = "0.1.0" }
+listener = { package = "hotl-listener", path = "../hotl-listener", version = "0.1.0" }
+tui = { package = "hotl-tui", path = "../hotl-tui", version = "0.1.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

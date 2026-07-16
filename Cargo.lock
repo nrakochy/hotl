@@ -164,11 +164,42 @@ name = "hotl"
 version = "0.1.0"
 dependencies = [
  "crossterm",
- "listener",
+ "hotl-listener",
+ "hotl-tmux",
+ "hotl-tui",
+ "hotl-types",
  "ratatui",
- "tmux",
- "tui",
- "types",
+]
+
+[[package]]
+name = "hotl-listener"
+version = "0.1.0"
+dependencies = [
+ "hotl-types",
+]
+
+[[package]]
+name = "hotl-tmux"
+version = "0.1.0"
+dependencies = [
+ "hotl-types",
+]
+
+[[package]]
+name = "hotl-tui"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "hotl-types",
+ "ratatui",
+]
+
+[[package]]
+name = "hotl-types"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "toml",
 ]
 
 [[package]]
@@ -235,13 +266,6 @@ name = "linux-raw-sys"
 version = "0.4.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
-
-[[package]]
-name = "listener"
-version = "0.1.0"
-dependencies = [
- "types",
-]
 
 [[package]]
 name = "lock_api"
@@ -515,13 +539,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tmux"
-version = "0.1.0"
-dependencies = [
- "types",
-]
-
-[[package]]
 name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -561,23 +578,6 @@ name = "toml_write"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
-
-[[package]]
-name = "tui"
-version = "0.1.0"
-dependencies = [
- "crossterm",
- "ratatui",
- "types",
-]
-
-[[package]]
-name = "types"
-version = "0.1.0"
-dependencies = [
- "serde",
- "toml",
-]
 
 [[package]]
 name = "unicode-ident"
