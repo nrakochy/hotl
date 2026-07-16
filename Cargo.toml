@@ -11,6 +11,11 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.75"
+authors = ["nrakochy"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/nrakochy/hotl"
+homepage = "https://github.com/nrakochy/hotl"
 
 [workspace.dependencies]
 ratatui = "0.29"
