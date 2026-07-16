@@ -6,11 +6,6 @@ Run it in a pane of your own; it discovers AI-agent processes across your
 terminal multiplexer, shows their live status, gives an (optional) audible ping
 when an agent is waiting on your input, and lets you jump focus to an agent.
 
-`hotl` never owns a terminal. The multiplexer owns your agents' panes; `hotl`
-observes them from the outside and can switch your focus to one. Today it
-observes **tmux**; the observation layer is surface-agnostic so other backends
-(e.g. zellij) can be added without changing the rest of the tool.
-
 **Docs — install, usage, config, keys:** see [`crates/hotl/README.md`](crates/hotl/README.md)
 (also rendered on the [crates.io page](https://crates.io/crates/hotl)).
 
