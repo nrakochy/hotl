@@ -1,6 +1,6 @@
 use crate::panes::{list_panes, run_jump, Pane};
 use crate::procs::{agent_for, read_proc_table, ProcTable};
-use crate::status::classify;
+use crate::status::{classify, extract_status_line};
 use types::{AgentObservation, Location, LocationHandle, Source, Surface, SurfaceError};
 
 pub struct TmuxSurface {
@@ -13,13 +13,7 @@ impl TmuxSurface {
     }
 }
 
-/// The agent's own status line: the first captured line containing `ctx:`
-/// (claude's context-usage token), trimmed. `None` if no such line.
-pub fn status_line(tail: &str) -> Option<String> {
-    tail.lines()
-        .find(|l| l.contains("ctx:"))
-        .map(|l| l.trim().to_string())
-}
+
 
 // Pure mapping, kept separate from Surface::observe so it's testable without tmux I/O.
 pub fn observations(
@@ -35,11 +29,12 @@ pub fn observations(
         };
         let tail = tail_for(&pane.pane_id);
         let status = classify(&agent.name, &pane.title, &tail);
+        let sline = extract_status_line(&agent.name, &tail);
         out.push(AgentObservation {
             agent,
             cwd: pane.current_path.clone(),
             status,
-            status_line: status_line(&tail),
+            status_line: sline,
             location: Location {
                 group: pane.session.clone(),
                 sub_group: Some(format!("{} ({})", pane.window_name, pane.window_index)),
@@ -138,15 +133,15 @@ some output
   -- INSERT -- ↑/↓ to select
   ⏺ general-purpose  Review crate    21m · ↓ 56k tokens";
         assert_eq!(
-            status_line(tail).as_deref(),
+            extract_status_line("claude", tail).as_deref(),
             Some("[I] .../sources/hotl [master] Opus 4.8 (1M context) ctx:15%"),
         );
     }
 
     #[test]
     fn status_line_none_when_no_ctx() {
-        assert_eq!(status_line("just some log output\n❯ "), None);
-        assert_eq!(status_line(""), None);
+        assert_eq!(extract_status_line("claude", "just some log output\n❯ "), None);
+        assert_eq!(extract_status_line("claude", ""), None);
     }
 
     #[test]

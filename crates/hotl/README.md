@@ -82,7 +82,7 @@ Keys:
 (`Ctrl`/arrow keys work regardless of `vim_mode`; the `j`/`k`/`gg`/`G`/`gd`
 letter bindings require `vim_mode = true`, the default.)
 
-Detected agents (v1): `claude`, `codex`.
+Detected agents (v1): `claude`, `codex`, `pi`.
 
 Each agent shows a live status glyph: an animated braille snake while working ·
 `!` blocked (needs your input) · `√` idle · `·` unknown. When an agent
@@ -117,7 +117,7 @@ Optional `~/.config/hotl/config.toml` (absent → sensible defaults):
     [settings]
     ping_on_blocked = true         # audible ping when an agent needs input
     poll_interval_ms = 1000        # scan cadence
-    agents = ["claude", "codex"]   # process names counted as agents
+    agents = ["claude", "codex", "pi"]   # process names counted as agents
     vim_mode = true                # vim list keys (j/k/gg/G/gd); false = arrows only
 
     [settings.theme]
