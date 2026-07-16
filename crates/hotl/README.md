@@ -1,8 +1,10 @@
-# hotl
+# hotl — a human-on-the-loop terminal agent dashboard
 
-A terminal agent dashboard. Run it in a pane of your own; it discovers AI-agent
-processes across your terminal multiplexer, shows their live status, and lets you
-jump focus to an agent — grouped by session → window.
+[![crates.io](https://img.shields.io/crates/v/hotl.svg)](https://crates.io/crates/hotl)
+
+Run it in a pane of your own; it discovers AI-agent processes across your
+terminal multiplexer, shows their live status, gives an (optional) audible ping
+when an agent is waiting on your input, and lets you jump focus to an agent.
 
 `hotl` never owns a terminal. The multiplexer owns your agents' panes; `hotl`
 observes them from the outside and can switch your focus to one. Today it
