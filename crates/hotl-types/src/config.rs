@@ -65,7 +65,7 @@ impl Default for Theme {
             muted: "#8a92a6".into(),
             faint: "#596072".into(),
             accent: "#6c8cff".into(),
-            band: "#1b2233".into(),
+            band: "#2a3350".into(),
         }
     }
 }
