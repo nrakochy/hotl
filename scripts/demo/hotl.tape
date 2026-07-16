@@ -3,7 +3,11 @@
 #
 # Setup (session + layout + launching hotl/claude) lives in setup.sh and runs
 # hidden. VHS `Wait`s for claude's UI to appear before recording, so no manual
-# cropping is needed. Teardown kills ONLY the hotl-demo session.
+# cropping is needed.
+#
+# The demo runs on its own tmux server (socket `hotl-demo`), so hotl sees exactly
+# the three agents setup.sh started and nothing else on your machine. Every tmux
+# command here must pass -L hotl-demo. Teardown kills only the hotl-demo session.
 
 Require hotl
 Require tmux
@@ -18,10 +22,12 @@ Set Padding 20
 
 # --- setup (hidden): build the session, launch panes, then wait for claude ---
 Hide
-Type "bash ~/sources/hotl/scripts/demo/setup.sh && tmux attach -t hotl-demo" Enter
-# Wait (up to 30s) for hotl's status bar to report detected agents. Matching
-# claude's `ctx:` is unreliable — it gets truncated in the narrow panes.
-Wait+Screen@30s /[0-9]+ agents/
+Type "bash ~/sources/hotl/scripts/demo/setup.sh && tmux -L hotl-demo attach -t hotl-demo" Enter
+# Wait (up to 30s) for hotl's status bar to report its agents. Matching claude's
+# `ctx:` is unreliable — it gets truncated in the narrow panes. The private
+# socket means the count is exactly 3, so pinning it here doubles as a guard:
+# if a claude failed to start, the tape fails instead of recording wrong rows.
+Wait+Screen@30s /3 agents/
 Sleep 1500ms
 Show
 
@@ -64,13 +70,13 @@ Ctrl+a
 Type "m"
 Sleep 800ms
 
-# Over to the hotl pane, select the middle-claude ("crates") agent, and jump
-# to it with gd. Tune the j count if the selected row isn't the crates pane.
+# Over to the hotl pane, select the middle-claude ("crates") agent, and jump to
+# it with gd. setup.sh starts the agents in pane order and the private socket
+# admits no others, so the rows are always hotl / crates / docs — gg then one j.
 Ctrl+h
 Sleep 600ms
 Type "gg"
 Sleep 400ms
-Type "j" Sleep 300ms
 Type "j" Sleep 300ms
 Type "gd"
 Sleep 2s
@@ -81,10 +87,10 @@ Sleep 600ms
 Enter
 Sleep 2s
 
-# --- teardown (hidden): detach, then kill only the demo session ---
+# --- teardown (hidden): detach, then kill ONLY the demo session ---
 Hide
 Ctrl+a
 Type "d"
 Sleep 500ms
-Type "tmux kill-session -t hotl-demo 2>/dev/null" Enter
+Type "tmux -L hotl-demo kill-session -t hotl-demo 2>/dev/null" Enter
 Show

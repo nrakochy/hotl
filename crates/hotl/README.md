@@ -2,19 +2,16 @@
 
 [![crates.io](https://img.shields.io/crates/v/hotl.svg)](https://crates.io/crates/hotl)
 
-Run it in a pane of your own; it discovers AI-agent processes across your
-terminal multiplexer, shows their live status, gives an (optional) audible ping
-when an agent is waiting on your input, and lets you jump focus to an agent.
+I was inspired by [herdr](https://herdr.dev/), but I wanted to retain those sweet sweet navigation bindings from [neovim-tmux navigation](https://github.com/alexghergh/nvim-tmux-navigation).
 
-`hotl` never owns a terminal. The multiplexer owns your agents' panes; `hotl`
-observes them from the outside and can switch your focus to one. Today it
-observes **tmux**; the observation layer is surface-agnostic so other backends
-(e.g. zellij) can be added without changing the rest of the tool.
+So, byo-keybindings. Run this tui in a pane of your own. It discovers AI-agent processes across your
+ze multiplexer, shows their live status, gives an (optional) audible ping when an agent is waiting on your input.
+
+![hotl demo](https://raw.githubusercontent.com/nrakochy/hotl/master/docs/hotl.gif)
 
 ## Quick start
 
-**Requirements:** [tmux](https://github.com/tmux/tmux) on your `PATH` (run `hotl`
-from inside a tmux session) and `ps` (standard on macOS/Linux).
+**Requirements:** [tmux](https://github.com/tmux/tmux) on your `PATH` (run `hotl` from inside a tmux session) and `ps` (standard on macOS/Linux).
 
 Install a prebuilt binary — no toolchain needed:
 
