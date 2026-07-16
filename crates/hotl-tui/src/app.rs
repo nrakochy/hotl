@@ -74,7 +74,9 @@ pub enum Msg {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
     Scan,
-    Jump(AgentObservation),
+    // Boxed: AgentObservation is large relative to the other variants, so
+    // boxing keeps Cmd small (avoids clippy::large_enum_variant).
+    Jump(Box<AgentObservation>),
     SelectPane(types::Dir),
     Ping,
     Quit,
@@ -98,7 +100,7 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
         Msg::Top => { state.move_top(); vec![] }
         Msg::Bottom => { state.move_bottom(); vec![] }
         Msg::Jump => match state.selected() {
-            Some(o) => vec![Cmd::Jump(o.clone())],
+            Some(o) => vec![Cmd::Jump(Box::new(o.clone()))],
             None => vec![],
         },
         Msg::PaneLeft => vec![Cmd::SelectPane(types::Dir::Left)],

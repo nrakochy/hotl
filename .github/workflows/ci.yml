@@ -1,0 +1,31 @@
+name: CI
+
+# Build, test, and lint on every push and pull request. Publishing is a
+# separate, tag-triggered workflow (see publish.yml) — this one just keeps the
+# default branch green.
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"] # tag pushes are handled by publish.yml
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace --locked
