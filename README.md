@@ -120,3 +120,17 @@ A `[plugins]` section is reserved for future use (parsed but inert).
 
     cargo build --release
     ./target/release/hotl
+
+## Releasing
+
+Cut a release with the helper script — it bumps the workspace version, commits,
+tags `vX.Y.Z`, and pushes. The tag triggers the crates.io publish and the
+prebuilt-binary/installer workflows.
+
+    scripts/release.sh patch    # 0.1.0 -> 0.1.1  (bug fix)
+    scripts/release.sh minor    # 0.1.0 -> 0.2.0  (feature, or breaking pre-1.0)
+    scripts/release.sh major    # 0.1.0 -> 1.0.0
+    scripts/release.sh 0.4.2    # explicit version
+
+Versions are immutable on crates.io — always go up, never reuse one. The tag
+must match the `[workspace.package]` version (the script keeps them in sync).
