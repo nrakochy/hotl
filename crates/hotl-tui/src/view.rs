@@ -5,9 +5,18 @@ use types::{AgentObservation, Status, Theme};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Row {
-    Group(String),
     Agent { glyph: String, name: String, subtitle: String, status: Status, selected: bool },
     Spacer,
+}
+
+// Some(count) only when agents span more than one session; else None.
+fn session_summary(agents: &[AgentObservation]) -> Option<String> {
+    let sessions: std::collections::BTreeSet<&str> =
+        agents.iter().map(|o| o.location.group.as_str()).collect();
+    match sessions.len() {
+        0 | 1 => None,
+        n => Some(format!("{n} sessions")),
+    }
 }
 
 fn project_name(p: &str) -> String {
@@ -29,16 +38,7 @@ fn glyph_for(status: Status, tick: u32) -> String {
 
 pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
     let mut out = Vec::new();
-
-    // Title bar already labels the panel; no in-panel header here.
-    // Grouped by session, not window: many panes share a window and should
-    // each surface individually rather than collapse under one header.
-    let mut last_group: Option<String> = None;
     for (idx, o) in agents.iter().enumerate() {
-        if last_group.as_deref() != Some(o.location.group.as_str()) {
-            out.push(Row::Group(o.location.group.clone()));
-            last_group = Some(o.location.group.clone());
-        }
         out.push(Row::Agent {
             glyph: glyph_for(o.status, tick),
             name: project_name(&o.cwd),
@@ -82,6 +82,19 @@ fn status_color(p: &Palette, s: Status) -> Color {
     }
 }
 
+// Wordmark, plus a session breadcrumb only when spanning >1 session.
+fn title_line(agents: &[AgentObservation], p: &Palette) -> Line<'static> {
+    let mut spans = vec![
+        Span::styled(" ◆ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
+        Span::styled("hotl", Style::default().fg(p.ink).add_modifier(Modifier::BOLD)),
+    ];
+    if let Some(sess) = session_summary(agents) {
+        spans.push(Span::styled("  ·  ", Style::default().fg(p.faint)));
+        spans.push(Span::styled(format!("⧉ {sess}"), Style::default().fg(p.muted)));
+    }
+    Line::from(spans)
+}
+
 pub fn view(state: &AppState, theme: &Theme, frame: &mut Frame) {
     let p = palette(theme);
     let area = frame.area();
@@ -93,10 +106,7 @@ pub fn view(state: &AppState, theme: &Theme, frame: &mut Frame) {
     .split(area);
 
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(" hotl ", Style::default().fg(Color::Black).bg(p.accent).add_modifier(Modifier::BOLD)),
-            Span::styled("  agents", Style::default().fg(p.muted)),
-        ])),
+        Paragraph::new(title_line(&state.agents, &p)),
         chunks[0],
     );
 
@@ -136,10 +146,6 @@ fn truncate(s: &str, max: usize) -> String {
 fn row_line(row: &Row, p: &Palette, width: u16) -> Line<'static> {
     match row {
         Row::Spacer => Line::from(""),
-        Row::Group(g) => Line::from(Span::styled(
-            format!("   {}", truncate(g, (width as usize).saturating_sub(3))),
-            Style::default().fg(p.faint).add_modifier(Modifier::DIM),
-        )),
         Row::Agent { glyph, name, subtitle, status, selected } => {
             let gcolor = status_color(p, *status);
             let base = if *selected { Style::default().bg(p.band) } else { Style::default() };
@@ -185,10 +191,65 @@ mod tests {
     }
 
     #[test]
-    fn groups_by_session_no_section_headers() {
+    fn rows_are_flat_no_group_headers() {
+        // Session context moved to the title bar; the list has only agents/spacers.
         let rs = rows(&[obs("base-0", "w (0)", "/tmp/a", Status::Idle)], 0, 0);
-        assert!(rs.iter().any(|r| matches!(r, Row::Group(g) if g == "base-0")));
         assert!(rs.iter().any(|r| matches!(r, Row::Agent { .. })));
+        assert!(rs.iter().all(|r| matches!(r, Row::Agent { .. } | Row::Spacer)));
+    }
+
+    #[test]
+    fn session_summary_hidden_for_single_session() {
+        let a = vec![
+            obs("base-0", "w", "/tmp/a", Status::Idle),
+            obs("base-0", "w", "/tmp/b", Status::Idle),
+        ];
+        assert_eq!(session_summary(&a), None);
+        assert_eq!(session_summary(&[]), None);
+    }
+
+    #[test]
+    fn session_summary_counts_multiple_sessions() {
+        let a = vec![
+            obs("base-0", "w", "/tmp/a", Status::Idle),
+            obs("work", "w", "/tmp/b", Status::Idle),
+            obs("work", "w", "/tmp/c", Status::Idle),
+        ];
+        assert_eq!(session_summary(&a).as_deref(), Some("2 sessions"));
+    }
+
+    #[test]
+    fn title_is_just_wordmark_for_single_session() {
+        let pal = palette(&Theme::default());
+        let a = vec![
+            obs("base-0", "w", "/tmp/a", Status::Blocked),
+            obs("base-0", "w", "/tmp/b", Status::Idle),
+        ];
+        let text: String = title_line(&a, &pal)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("hotl"), "wordmark present: {text}");
+        // Counts are noise in the title — they belong in the status bar.
+        assert!(!text.contains("agent"), "no agent count in title: {text}");
+        assert!(!text.contains("blocked"), "no blocked count in title: {text}");
+        assert!(!text.contains("session"), "no breadcrumb for one session: {text}");
+    }
+
+    #[test]
+    fn title_breadcrumb_appears_with_multiple_sessions() {
+        let pal = palette(&Theme::default());
+        let a = vec![
+            obs("base-0", "w", "/tmp/a", Status::Idle),
+            obs("work", "w", "/tmp/b", Status::Idle),
+        ];
+        let text: String = title_line(&a, &pal)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("2 sessions"), "breadcrumb present: {text}");
     }
 
     #[test]
