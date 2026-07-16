@@ -92,6 +92,27 @@ Each agent shows a live status glyph: an animated braille snake while working ·
 transitions **into** blocked, `hotl` plays an audible ping so you know it's
 waiting on you.
 
+## tmux + vim-tmux-navigator
+
+`hotl` handles `Ctrl-h/j/k/l` itself by switching tmux panes, so it works out
+of the box. If you also use
+[vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator), add
+`hotl` to its `vim_pattern` so tmux forwards those keys **into** `hotl` (which
+does the pane switch) instead of stepping around it — this keeps movement
+seamless whether the focused pane is Vim, another navigator-aware app, or
+`hotl`. In `~/.config/tmux/tmux.conf`:
+
+    # add `hotl` to the alternation (…|fzf|hotl)
+    vim_pattern='(\S+/)?g?\.?(view|l?n?vim?x?|fzf|hotl)(diff)?(-wrapped)?'
+    is_vim="ps -o state= -o comm= -t '#{pane_tty}' \
+        | grep -iqE '^[^TXZ ]+ +${vim_pattern}$'"
+    bind-key -n 'C-h' if-shell "$is_vim" 'send-keys C-h' 'select-pane -L'
+    bind-key -n 'C-j' if-shell "$is_vim" 'send-keys C-j' 'select-pane -D'
+    bind-key -n 'C-k' if-shell "$is_vim" 'send-keys C-k' 'select-pane -U'
+    bind-key -n 'C-l' if-shell "$is_vim" 'send-keys C-l' 'select-pane -R'
+
+Reload with `tmux source-file ~/.config/tmux/tmux.conf`.
+
 ## Config
 
 Optional `~/.config/hotl/config.toml` (absent → sensible defaults):
