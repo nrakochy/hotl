@@ -1,5 +1,5 @@
 // End-to-end: a raw Ctrl-k / Ctrl-j keystroke flows through decode_key and
-// update to the right Cmd, matching the vim-tmux-navigator handoff contract.
+// update to a pane switch, while plain j/k stay list navigation.
 use crossterm::event::{KeyCode, KeyModifiers};
 use tui::{decode_key, update, AppState, Cmd, Msg};
 use types::{Agent, AgentObservation, Dir, Location, LocationHandle, Source, Status};
@@ -20,25 +20,26 @@ fn obs(pane: &str) -> AgentObservation {
 }
 
 #[test]
-fn ctrl_k_at_top_crosses_to_pane_above() {
+fn ctrl_k_switches_pane_never_moves_list() {
     let mut pending = None;
-    // Raw Ctrl-k as crossterm delivers it in raw mode.
     let msg = decode_key(KeyCode::Char('k'), KeyModifiers::CONTROL, true, &mut pending);
     assert_eq!(msg, Msg::CtrlNav(Dir::Up));
 
     let mut s = AppState::new(true, true);
     update(&mut s, Msg::Scanned(Ok((vec![obs("%1"), obs("%2")], vec![]))));
-    // cursor starts at top (0): Ctrl-k should hand off to the pane above.
+    s.move_bottom(); // cursor = 1, mid/bottom of list
     assert_eq!(update(&mut s, msg), vec![Cmd::SelectPane(Dir::Up)]);
+    assert_eq!(s.cursor, 1, "Ctrl-k does not touch the list cursor");
 }
 
 #[test]
-fn ctrl_j_mid_list_scrolls_not_crosses() {
+fn plain_j_moves_list_not_pane() {
     let mut pending = None;
-    let msg = decode_key(KeyCode::Char('j'), KeyModifiers::CONTROL, true, &mut pending);
+    let msg = decode_key(KeyCode::Char('j'), KeyModifiers::NONE, true, &mut pending);
+    assert_eq!(msg, Msg::Down);
+
     let mut s = AppState::new(true, true);
     update(&mut s, Msg::Scanned(Ok((vec![obs("%1"), obs("%2")], vec![]))));
-    // At top with 2 items, Ctrl-j moves down inside the list (no pane switch).
     assert_eq!(update(&mut s, msg), vec![]);
     assert_eq!(s.cursor, 1);
 }
