@@ -116,6 +116,52 @@ impl PiDetector {
     }
 }
 
+// ─── OpenCode ──────────────────────────────────────────────────────────────────
+
+pub struct OpenCodeDetector;
+
+impl StatusDetector for OpenCodeDetector {
+    fn classify(&self, sig: &Signals) -> Status {
+        if Self::tail_is_working(sig.tail) {
+            Status::Working
+        } else if Self::tail_is_blocked(sig.tail) {
+            Status::Blocked
+        } else if Self::tail_is_idle(sig.tail) {
+            Status::Idle
+        } else {
+            Status::Unknown
+        }
+    }
+
+    fn status_line(&self, tail: &str) -> Option<String> {
+        // Extract the line with token context info from the sidebar
+        tail.lines()
+            .find(|l| l.contains("tokens") || l.contains("Context"))
+            .map(|l| l.trim().to_string())
+    }
+}
+
+impl OpenCodeDetector {
+    /// OpenCode shows a progress bar (⬝ chars) and "esc interrupt" when working.
+    fn tail_is_working(tail: &str) -> bool {
+        tail.contains("esc interrupt") || tail.contains('⬝')
+    }
+
+    /// OpenCode is idle when it shows the editor prompt or "Ask anything".
+    fn tail_is_idle(tail: &str) -> bool {
+        tail.contains("Ask anything") || (
+            tail.contains("tab agents") && !Self::tail_is_working(tail)
+        )
+    }
+
+    /// OpenCode may prompt for tool approval.
+    fn tail_is_blocked(tail: &str) -> bool {
+        let t = tail.to_lowercase();
+        (t.contains("approve") || t.contains("allow") || t.contains("confirm"))
+            && (t.contains("y/n") || t.contains("enter") || t.contains("deny"))
+    }
+}
+
 // ─── Generic (fallback) ────────────────────────────────────────────────────────
 
 pub struct GenericDetector;
@@ -138,6 +184,7 @@ pub fn detector_for(agent_name: &str) -> Box<dyn StatusDetector> {
     match agent_name {
         "claude" => Box::new(ClaudeDetector),
         "pi" => Box::new(PiDetector),
+        "opencode" => Box::new(OpenCodeDetector),
         _ => Box::new(GenericDetector),
     }
 }
@@ -303,5 +350,66 @@ Trust this project? (y/n)
     #[test]
     fn pi_working_takes_precedence_over_idle() {
         assert_eq!(classify("pi", "π - hotl", PI_WORKING_TAIL), Status::Working);
+    }
+
+    // --- OpenCode detector tests ---
+
+    const OC_WORKING_TAIL: &str = "\
+  ┃\n\
+  ┃  Build · US Anthropic Claude Opus 4.6 Amazon Bedrock\n\
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+   ⬝⬝⬝⬝⬝⬝⬝⬝  esc interrupt                                tab agents  ctrl+p commands    • OpenCode 1.15.12";
+
+    const OC_IDLE_TAIL: &str = "\
+  ┃\n\
+  ┃  Ask anything... \"Fix a TODO in the codebase\"\n\
+  ┃\n\
+  ┃  Build · US Anthropic Claude Opus 4.6 Amazon Bedrock\n\
+  ╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀\n\
+                                                         tab agents  ctrl+p commands    • OpenCode 1.15.12";
+
+    const OC_BLOCKED_TAIL: &str = "\
+Approve tool execution? (y/n)\n\
+tab agents  ctrl+p commands    • OpenCode 1.15.12";
+
+    #[test]
+    fn opencode_working_when_progress_dots() {
+        assert_eq!(classify("opencode", "OpenCode", OC_WORKING_TAIL), Status::Working);
+    }
+
+    #[test]
+    fn opencode_idle_when_ask_anything() {
+        assert_eq!(classify("opencode", "OpenCode", OC_IDLE_TAIL), Status::Idle);
+    }
+
+    #[test]
+    fn opencode_idle_when_tab_agents_no_spinner() {
+        let tail = "  ┃  Build · model\n  ╹▀▀▀\n                    tab agents  ctrl+p commands";
+        assert_eq!(classify("opencode", "OpenCode", tail), Status::Idle);
+    }
+
+    #[test]
+    fn opencode_blocked_on_approve_prompt() {
+        assert_eq!(classify("opencode", "OpenCode", OC_BLOCKED_TAIL), Status::Blocked);
+    }
+
+    #[test]
+    fn opencode_unknown_when_no_signals() {
+        assert_eq!(classify("opencode", "OpenCode", "random output"), Status::Unknown);
+    }
+
+    #[test]
+    fn opencode_working_takes_precedence_over_idle() {
+        // Has both "tab agents" and "esc interrupt"
+        assert_eq!(classify("opencode", "OpenCode", OC_WORKING_TAIL), Status::Working);
+    }
+
+    #[test]
+    fn opencode_status_line_extracts_tokens() {
+        let tail = "some output\n1.2k tokens\n  Build";
+        assert_eq!(
+            extract_status_line("opencode", tail).as_deref(),
+            Some("1.2k tokens"),
+        );
     }
 }
