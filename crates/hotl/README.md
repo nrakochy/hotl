@@ -4,7 +4,7 @@
 
 I was inspired by [herdr](https://herdr.dev/), but I wanted to retain those sweet sweet navigation bindings from [neovim-tmux navigation](https://github.com/alexghergh/nvim-tmux-navigation).
 
-So, byo-keybindings. Run this tui in a pane of your own. It discovers AI-agent processes across your
+So, byo-keybindings. Run this tui in a pane of your own. It discovers AI-agent processes across
 ze multiplexer, shows their live status, gives an (optional) audible ping when an agent is waiting on your input.
 
 ![hotl demo](https://raw.githubusercontent.com/nrakochy/hotl/master/docs/hotl.gif)
@@ -84,10 +84,14 @@ letter bindings require `vim_mode = true`, the default.)
 
 Detected agents (v1): `claude`, `codex`, `pi`, `opencode`.
 
-Each agent shows a live status glyph: an animated braille snake while working ·
-`!` blocked (needs your input) · `√` idle · `·` unknown. When an agent
-transitions **into** blocked, `hotl` plays an audible ping so you know it's
-waiting on you.
+Each agent shows an icon identifying it (`✳` claude · `π` pi · `▣` opencode ·
+`◎` codex) alongside a live status glyph: an animated braille snake while
+working · `!` blocked (needs your input) · `√` idle · `·` unknown. When an
+agent transitions **into** blocked, `hotl` plays an audible ping so you know
+it's waiting on you.
+
+Below the project name, each row shows the agent's status line — model name,
+token usage, context percentage, or whatever the agent exposes in its footer.
 
 ## tmux + vim-tmux-navigator
 
