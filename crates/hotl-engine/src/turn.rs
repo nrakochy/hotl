@@ -292,7 +292,11 @@ impl<'d> Turn<'d> {
         if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
             return Err(SampleEnd::ContextFull);
         }
-        let used_pct = (estimate.saturating_mul(100) / window).min(100) as u8;
+        let used_pct = self
+            .shared
+            .config
+            .show_context_pct
+            .then(|| (estimate.saturating_mul(100) / window).min(100) as u8);
         let turn_context = hotl_context::turn_context(
             self.shared.clock.now_ms(),
             &self.shared.cwd,

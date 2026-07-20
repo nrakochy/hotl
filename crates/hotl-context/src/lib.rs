@@ -110,9 +110,16 @@ pub fn nested_instructions(cwd: &Path, touched: &Path) -> Option<(String, Item)>
 /// The MOIM ephemeral turn-context block (M2; corpus 04): attached to the
 /// request only — never persisted, never cached (it rides after the cache
 /// marker by construction).
-pub fn turn_context(now_ms: u64, cwd: &Path, context_used_pct: u8, sample: u32) -> String {
+/// `context_used_pct` is optional (tech-debt #9): broadcasting how full the
+/// window is every sample can induce "context anxiety" (premature wrap-up —
+/// Anthropic long-horizon finding), so a caller may omit it.
+pub fn turn_context(now_ms: u64, cwd: &Path, context_used_pct: Option<u8>, sample: u32) -> String {
+    let used = match context_used_pct {
+        Some(pct) => format!(" context_used=\"{pct}%\""),
+        None => String::new(),
+    };
     format!(
-        "<turn-context now_unix_ms=\"{now_ms}\" cwd=\"{}\" context_used=\"{context_used_pct}%\" sample=\"{sample}\"/>",
+        "<turn-context now_unix_ms=\"{now_ms}\" cwd=\"{}\"{used} sample=\"{sample}\"/>",
         cwd.display()
     )
 }

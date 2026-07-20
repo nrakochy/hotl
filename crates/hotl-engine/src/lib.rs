@@ -36,6 +36,13 @@ pub struct EngineConfig {
     pub context_window: u64,
     /// Housekeeping model (compaction summarize); defaults to `model`.
     pub fast_model: Option<String>,
+    /// Reset-mode compaction (M4/#9): the continuation gets the preserved
+    /// prefix + digest only, no verbatim tail — a fresh slate rather than a
+    /// summarized-then-refilling window. Default false = M2 in-place behavior.
+    pub compaction_reset: bool,
+    /// Include `context_used%` in the MOIM turn-context block (M4/#9).
+    /// Default true = M2 behavior; false to avoid inducing context anxiety.
+    pub show_context_pct: bool,
 }
 
 impl Default for EngineConfig {
@@ -50,6 +57,8 @@ impl Default for EngineConfig {
             tool_failure_budget: 5,
             context_window: 200_000,
             fast_model: None,
+            compaction_reset: false,
+            show_context_pct: true,
         }
     }
 }
@@ -115,6 +124,10 @@ impl std::fmt::Debug for EngineEvent {
 pub enum SessionCmd {
     /// A user prompt. Starts a turn, or queues (one-at-a-time promotion).
     Prompt(String),
+    /// Continue an interrupted turn (M4/#8): sample against the current
+    /// projection with no new user item — used on resume when the last item
+    /// is a user/tool turn the model never answered. No-op if already running.
+    Continue,
     /// Mid-turn guidance: admitted durably now, woven into the next sample.
     Steer(String),
     /// Turn task → actor: sample-boundary snapshot refresh.
@@ -161,10 +174,22 @@ impl SessionHandle {
     pub async fn steer(&self, text: String) {
         let _ = self.cmd.send(SessionCmd::Steer(text)).await;
     }
+    /// Continue an interrupted turn on resume (M4/#8).
+    pub async fn continue_turn(&self) {
+        let _ = self.cmd.send(SessionCmd::Continue).await;
+    }
     /// Out-of-band interrupt of the in-flight turn (never queued behind data).
     pub fn interrupt(&self) {
         self.current_turn.lock().expect("turn token mutex").cancel();
     }
+}
+
+/// Whether a projection ends on the model's turn to speak (M4/#8): the last
+/// item is a user prompt or a batch of tool results the model never answered
+/// — i.e. an interrupted turn worth continuing on resume. A projection ending
+/// in an assistant item (or holding only instructions) is complete.
+pub fn needs_continuation(items: &[Item]) -> bool {
+    matches!(items.last(), Some(Item::User { .. } | Item::ToolResults { .. }))
 }
 
 pub fn spawn_session(deps: SessionDeps) -> SessionHandle {

@@ -89,6 +89,12 @@ pub(crate) async fn run(
                     running = start_turn(&shared, &mut items, text, &cmd_tx, &events, &current_turn).await;
                 }
             }
+            SessionCmd::Continue => {
+                if !running && crate::needs_continuation(&items) {
+                    spawn_turn(&shared, &cmd_tx, &events, &current_turn);
+                    running = true;
+                }
+            }
             SessionCmd::Steer(text) => admit_steer(&shared, &mut items, text),
             SessionCmd::Snapshot { reply } => {
                 let _ = reply.send(Arc::new(items.clone()));
@@ -215,6 +221,14 @@ async fn compact(shared: &SharedDeps, items: &mut Vec<Item>) -> Result<bool, Str
     let tail_budget = (shared.config.context_window as f64 * TAIL_RATIO) as u64;
     let Some(plan) = compaction::plan(items, tail_budget) else {
         return Err("context window exhausted — nothing left to compact".into());
+    };
+    // Reset mode (#9): fold *everything* after the preserved prefix into the
+    // digest and keep no verbatim tail — the continuation is a fresh slate.
+    // In-place mode (default): fold [prefix..kept_from) and keep the tail.
+    let plan = if shared.config.compaction_reset {
+        compaction::Plan { prefix_end: plan.prefix_end, kept_from: items.len() }
+    } else {
+        plan
     };
     let folded = &items[plan.prefix_end..plan.kept_from];
     let (digest, degraded) = match summarize(shared, folded).await {

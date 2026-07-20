@@ -131,6 +131,14 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
 
     if let Some(r) = &resumed {
         println!("resumed from session {} ({} items of context)", r.parent_id, r.items.len());
+        // #8: if the resumed session was cut off mid-turn (last item is a
+        // user prompt or tool results the model never answered), continue it
+        // rather than idling for a fresh prompt.
+        if hotl_engine::needs_continuation(&r.items) {
+            println!("(continuing the interrupted turn…)");
+            surface.handle.continue_turn().await;
+            surface.turn_running = true;
+        }
     }
     print_banner(&model, &session_id, &sandbox_status);
     surface.repl().await
@@ -536,6 +544,9 @@ fn engine_config(model: &str, secrets: &dyn SecretStore) -> EngineConfig {
         config.context_window = window;
     }
     config.fast_model = secrets.get("HOTL_FAST_MODEL");
+    // M4/#9: opt into fresh-slate compaction and hiding the context gauge.
+    config.compaction_reset = secrets.get("HOTL_COMPACTION_RESET").as_deref() == Some("1");
+    config.show_context_pct = secrets.get("HOTL_HIDE_CONTEXT_PCT").as_deref() != Some("1");
     config
 }
 

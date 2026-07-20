@@ -52,6 +52,15 @@ impl Harness {
 
 impl Harness {
     pub fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>, config: EngineConfig) -> Self {
+        Self::with_items(scripts, config, Vec::new())
+    }
+
+    /// Construct a harness with a pre-seeded projection (resume scenarios).
+    pub fn with_items(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
             .expect("session log");
@@ -68,7 +77,7 @@ impl Harness {
             system: "test-system".into(),
             cwd: dir.path().to_path_buf(),
             snapshots: Some(Arc::new(RecordingSnapshotter(snapshots.clone()))),
-            initial_items: Vec::new(),
+            initial_items,
             config,
         };
         let handle = spawn_session(deps);
@@ -534,6 +543,88 @@ mod tests {
         );
         h.prompt_and_wait("read it").await;
         assert!(h.snapshots.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_continues_an_interrupted_turn() {
+        // A projection ending in a user turn the model never answered (the
+        // process died mid-turn). continue_turn re-samples and completes it
+        // without a fresh prompt (#8).
+        let seeded = vec![Item::User { text: "half-finished request".into(), synthetic: None }];
+        let mut h = Harness::with_items(
+            vec![ScriptedProvider::text_reply("finished the interrupted turn")],
+            cfg(),
+            seeded,
+        );
+        assert!(hotl_engine::needs_continuation(&h.items()) || h.items().is_empty());
+        h.handle.continue_turn().await;
+        let outcome = h.wait_for_outcome().await;
+        assert_eq!(outcome, Outcome::Done { text: "finished the interrupted turn".into() });
+        // No new user item was appended — the request the model saw is the
+        // seeded one, not a duplicate.
+        let user_turns = h.provider.requests()[0]
+            .items
+            .iter()
+            .filter(|i| matches!(i, Item::User { synthetic: None, .. }))
+            .count();
+        assert_eq!(user_turns, 1, "continue must not append a second user item");
+    }
+
+    #[tokio::test]
+    async fn continue_is_a_noop_on_a_complete_projection() {
+        // Last item is an assistant reply → nothing to continue.
+        let done = vec![
+            Item::User { text: "q".into(), synthetic: None },
+            Item::Assistant { blocks: vec![json!({"type":"text","text":"a"})] },
+        ];
+        assert!(!hotl_engine::needs_continuation(&done));
+    }
+
+    #[tokio::test]
+    async fn reset_mode_compaction_drops_the_verbatim_tail() {
+        // Same overflow setup as the in-place test, but compaction_reset=true:
+        // the continuation request carries the digest and NO verbatim tail.
+        let cfg = EngineConfig {
+            context_window: 1000,
+            max_turns: 10,
+            compaction_reset: true,
+            ..Default::default()
+        };
+        let scripts = vec![
+            ScriptedProvider::tool_call("t1", "bash", json!({"command": format!("echo {}", "A".repeat(1100))})),
+            tool_call_reporting("t2", "bash", json!({"command": format!("echo {}", "B".repeat(200))}), 750),
+            ScriptedProvider::text_reply("GOAL: digest"),
+            ScriptedProvider::text_reply("done after reset compaction"),
+        ];
+        let mut h = Harness::new(scripts, cfg);
+        let outcome = h.prompt_and_wait("do the thing").await;
+        assert_eq!(outcome, Outcome::Done { text: "done after reset compaction".into() });
+        assert!(h.seen.iter().any(|e| e.starts_with("Compacted")));
+        let continuation = h.provider.requests().last().unwrap().clone();
+        // The digest is present…
+        assert!(continuation.items.iter().any(|i| matches!(
+            i,
+            Item::User { synthetic: Some(SyntheticReason::CompactionSummary), .. }
+        )));
+        // …and no ToolResults / Assistant verbatim tail rode along (fresh slate).
+        assert!(
+            !continuation.items.iter().any(|i| matches!(i, Item::ToolResults { .. } | Item::Assistant { .. })),
+            "reset-mode continuation must not carry the verbatim tail: {:?}",
+            continuation.items
+        );
+    }
+
+    #[tokio::test]
+    async fn moim_context_pct_can_be_hidden() {
+        let mut h = Harness::new(
+            vec![ScriptedProvider::text_reply("hi")],
+            EngineConfig { show_context_pct: false, ..cfg() },
+        );
+        h.prompt_and_wait("hello").await;
+        let reqs = h.provider.requests();
+        let tc = reqs[0].turn_context.as_deref().unwrap();
+        assert!(!tc.contains("context_used"), "pct must be omitted: {tc}");
+        assert!(tc.contains("sample="), "the rest of MOIM still rides");
     }
 
     #[allow(dead_code)]
