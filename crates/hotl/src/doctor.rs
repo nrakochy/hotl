@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use hotl_platform::EnvSecrets;
+use hotl_platform::{EnvSecrets, SecretStore};
 use hotl_store::Masker;
 use hotl_tools::sandbox;
 
@@ -32,6 +32,12 @@ fn fail(line: String) -> Check {
 pub fn doctor_main() -> i32 {
     let config_dir = crate::agent::config_dir();
     let sessions_dir = crate::agent::sessions_dir();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build doctor's single-threaded runtime");
+    let key_helper = key_helper_check(&rt);
+    let gateway = gateway_check(&rt);
     let checks = [
         provider_check(),
         sandbox_check(),
@@ -41,6 +47,8 @@ pub fn doctor_main() -> i32 {
         memory_check(&config_dir),
         audit_check(&sessions_dir),
         undo_check(),
+        key_helper,
+        gateway,
     ];
     println!("hotl {} — doctor", env!("CARGO_PKG_VERSION"));
     let mut failed = false;
@@ -62,12 +70,78 @@ pub fn doctor_main() -> i32 {
     }
 }
 
+fn source_kind(refreshable: bool) -> &'static str {
+    if refreshable { "helper" } else { "static env key" }
+}
+
+fn probe_line(base: &str, result: Result<u16, String>) -> String {
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    match result {
+        Ok(s) if s < 400 => format!("gateway: {url} reachable (HTTP {s}, key accepted)"),
+        Ok(s) if s == 401 || s == 403 => format!(
+            "gateway: {url} reachable but rejected the key (HTTP {s}) — check the key source"
+        ),
+        Ok(s) => format!("gateway: {url} responded HTTP {s}"),
+        Err(e) => format!("gateway: {url} unreachable ({e}) — is the gateway running?"),
+    }
+}
+
 fn provider_check() -> Check {
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
     match crate::agent::select_provider(&cfg, &EnvSecrets) {
-        Ok((_, model, _source)) => ok(format!("provider: {model} selected (keys present)")),
+        Ok((_, model, source)) => {
+            ok(format!("provider: {model} selected (key source: {})", source_kind(source.refreshable())))
+        }
         Err(msg) => fail(format!("provider: {}", msg.lines().next().unwrap_or(&msg))),
     }
+}
+
+fn key_helper_check(rt: &tokio::runtime::Runtime) -> Check {
+    let cfg = crate::config::Config::load(&crate::agent::config_dir());
+    let helper = EnvSecrets.get("HOTL_API_KEY_HELPER").or_else(|| cfg.provider.api_key_helper.clone());
+    let Some(_) = helper else {
+        return ok("key helper: not configured (static env keys)".into());
+    };
+    let (_, _, source) = match crate::agent::select_provider(&cfg, &EnvSecrets) {
+        Ok(t) => t,
+        Err(_) => return warn("key helper: configured, but provider selection failed (see above)".into()),
+    };
+    let start = std::time::Instant::now();
+    match rt.block_on(source.get()) {
+        Ok(Some(_)) => ok(format!("key helper: OK ({:.1}s, key masked)", start.elapsed().as_secs_f32())),
+        Ok(None) => warn("key helper: ran but produced no key".into()),
+        Err(e) => fail(format!("key helper: {e}")),
+    }
+}
+
+fn gateway_check(rt: &tokio::runtime::Runtime) -> Check {
+    let cfg = crate::config::Config::load(&crate::agent::config_dir());
+    let base = match EnvSecrets.get("HOTL_OPENAI_BASE_URL").or_else(|| cfg.provider.base_url.clone()) {
+        Some(b) if b != hotl_provider_openai::DEFAULT_BASE_URL => b,
+        _ => return ok("gateway: no custom base_url (direct provider)".into()),
+    };
+    let key = crate::agent::select_provider(&cfg, &EnvSecrets)
+        .ok()
+        .and_then(|(_, _, s)| rt.block_on(s.get()).ok().flatten());
+    let result = gateway_probe(rt, &base, key.as_deref());
+    match &result {
+        Ok(s) if *s == 401 || *s == 403 => warn(probe_line(&base, result)),
+        Ok(s) if *s < 500 => ok(probe_line(&base, result)),
+        _ => fail(probe_line(&base, result)),
+    }
+}
+
+fn gateway_probe(rt: &tokio::runtime::Runtime, base: &str, key: Option<&str>) -> Result<u16, String> {
+    rt.block_on(async {
+        let client = reqwest::Client::new();
+        let mut req = client
+            .get(format!("{}/models", base.trim_end_matches('/')))
+            .timeout(std::time::Duration::from_secs(5));
+        if let Some(k) = key {
+            req = req.bearer_auth(k);
+        }
+        req.send().await.map(|r| r.status().as_u16()).map_err(|e| e.to_string())
+    })
 }
 
 fn sandbox_check() -> Check {
@@ -143,5 +217,29 @@ fn audit_check(sessions_dir: &Path) -> Check {
             hits.len(),
             hits[0].display()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_source_line_names_active_source() {
+        assert_eq!(source_kind(true), "helper");
+        assert_eq!(source_kind(false), "static env key");
+    }
+
+    #[test]
+    fn gateway_probe_line_formats() {
+        assert_eq!(
+            probe_line("http://localhost:8080/v1", Ok(200)),
+            "gateway: http://localhost:8080/v1/models reachable (HTTP 200, key accepted)"
+        );
+        assert_eq!(
+            probe_line("http://localhost:8080/v1", Ok(401)),
+            "gateway: http://localhost:8080/v1/models reachable but rejected the key (HTTP 401) — check the key source"
+        );
+        assert!(probe_line("http://x/v1", Err("connection refused".into())).contains("connection refused"));
     }
 }
