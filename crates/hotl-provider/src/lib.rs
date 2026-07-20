@@ -94,11 +94,17 @@ pub trait Provider: Send + Sync {
 /// in tests. Each `stream()` call pops the next script.
 pub struct ScriptedProvider {
     scripts: Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>,
+    /// Every request the engine made, for test assertions on what the model saw.
+    requests: Mutex<Vec<SamplingRequest>>,
 }
 
 impl ScriptedProvider {
     pub fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Self {
-        Self { scripts: Mutex::new(scripts.into()) }
+        Self { scripts: Mutex::new(scripts.into()), requests: Mutex::new(Vec::new()) }
+    }
+
+    pub fn requests(&self) -> Vec<SamplingRequest> {
+        self.requests.lock().expect("requests mutex").clone()
     }
 
     /// Convenience: a one-sample script that answers with plain text.
@@ -133,7 +139,8 @@ impl ScriptedProvider {
 }
 
 impl Provider for ScriptedProvider {
-    fn stream(&self, _req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        self.requests.lock().expect("requests mutex").push(req);
         let script = self
             .scripts
             .lock()
@@ -171,5 +178,107 @@ impl SseParser {
             }
         }
         out
+    }
+}
+
+/// Pure-data retry classification (RELIABILITY.md; corpus 06 — never regex
+/// on prose). Both HTTP providers consult this; budgets reset per sample.
+pub mod retry {
+    use super::ProviderError;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Decision {
+        /// Wait this many seconds, then retry the request.
+        Retry { after_secs: u64 },
+        /// Not recoverable by retrying (auth, parse, client errors).
+        Fatal,
+    }
+
+    pub const MAX_ATTEMPTS: u32 = 3;
+
+    /// `attempt` is 1-based (the attempt that just failed).
+    pub fn classify(err: &ProviderError, attempt: u32) -> Decision {
+        if attempt >= MAX_ATTEMPTS {
+            return Decision::Fatal;
+        }
+        match err {
+            ProviderError::Http { status, retry_after, .. } if *status == 429 || *status >= 500 => {
+                Decision::Retry { after_secs: retry_after.unwrap_or(1u64 << (attempt - 1)) }
+            }
+            ProviderError::Transport(_) => Decision::Retry { after_secs: 1u64 << (attempt - 1) },
+            _ => Decision::Fatal,
+        }
+    }
+
+    /// Availability-class errors are the only ones that justify falling back
+    /// to another model (never auth/billing/parse — corpus 12).
+    pub fn is_availability(err: &ProviderError) -> bool {
+        matches!(
+            err,
+            ProviderError::Http { status, .. } if *status == 429 || *status >= 500
+        ) || matches!(err, ProviderError::Transport(_))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn classify_rules() {
+            let overload = ProviderError::Http { status: 529, message: String::new(), retry_after: Some(7) };
+            assert_eq!(classify(&overload, 1), Decision::Retry { after_secs: 7 });
+            assert_eq!(classify(&overload, MAX_ATTEMPTS), Decision::Fatal);
+            let auth = ProviderError::Auth("bad".into());
+            assert_eq!(classify(&auth, 1), Decision::Fatal);
+            assert!(!is_availability(&auth));
+            let transport = ProviderError::Transport("reset".into());
+            assert_eq!(classify(&transport, 2), Decision::Retry { after_secs: 2 });
+            assert!(is_availability(&transport));
+            let bad_req = ProviderError::Http { status: 400, message: String::new(), retry_after: None };
+            assert_eq!(classify(&bad_req, 1), Decision::Fatal);
+        }
+    }
+}
+
+/// The named cross-provider canonicalization stage (system-design §L2
+/// `transform_messages`, Pi corpus 08 Q4). Canonical assistant blocks are
+/// Anthropic-shaped; when a request targets a *different* provider than the
+/// one that produced a block, provider-bound reasoning must not cross.
+pub mod transform {
+    use serde_json::Value;
+
+    /// Drop blocks that are provider-bound (signed/redacted thinking) when
+    /// sending history to a foreign dialect. Text and tool_use always pass.
+    pub fn strip_foreign_reasoning(blocks: &[Value]) -> Vec<Value> {
+        blocks
+            .iter()
+            .filter(|b| {
+                !matches!(
+                    b.get("type").and_then(Value::as_str),
+                    Some("thinking") | Some("redacted_thinking")
+                )
+            })
+            .cloned()
+            .collect()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        #[test]
+        fn strips_thinking_keeps_rest() {
+            let blocks = vec![
+                json!({"type":"thinking","thinking":"x","signature":"s"}),
+                json!({"type":"redacted_thinking","data":"d"}),
+                json!({"type":"text","text":"hi"}),
+                json!({"type":"tool_use","id":"1","name":"read","input":{}}),
+            ];
+            let out = strip_foreign_reasoning(&blocks);
+            assert_eq!(out.len(), 2);
+            assert_eq!(out[0]["type"], "text");
+            assert_eq!(out[1]["type"], "tool_use");
+        }
     }
 }

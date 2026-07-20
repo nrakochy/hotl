@@ -20,7 +20,6 @@ use serde_json::{json, Value};
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
 const API_URL: &str = "https://api.anthropic.com/v1/messages";
 const API_VERSION: &str = "2023-06-01";
-const MAX_ATTEMPTS: u32 = 3;
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -141,23 +140,31 @@ impl Provider for AnthropicProvider {
                             return;
                         }
                         let err = ProviderError::Http { status, message, retry_after };
-                        if err.retryable() && attempt < MAX_ATTEMPTS {
-                            let wait = retry_after.unwrap_or(1u64 << (attempt - 1));
-                            yield Ok(StreamEvent::Retrying { attempt, reason: format!("HTTP {status}") });
-                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                            continue;
+                        match hotl_provider::retry::classify(&err, attempt) {
+                            hotl_provider::retry::Decision::Retry { after_secs } => {
+                                yield Ok(StreamEvent::Retrying { attempt, reason: format!("HTTP {status}") });
+                                tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
+                                continue;
+                            }
+                            hotl_provider::retry::Decision::Fatal => {
+                                yield Err(err);
+                                return;
+                            }
                         }
-                        yield Err(err);
-                        return;
                     }
                     Err(e) => {
-                        if attempt < MAX_ATTEMPTS {
-                            yield Ok(StreamEvent::Retrying { attempt, reason: e.to_string() });
-                            tokio::time::sleep(std::time::Duration::from_secs(1u64 << (attempt - 1))).await;
-                            continue;
+                        let err = ProviderError::Transport(e.to_string());
+                        match hotl_provider::retry::classify(&err, attempt) {
+                            hotl_provider::retry::Decision::Retry { after_secs } => {
+                                yield Ok(StreamEvent::Retrying { attempt, reason: e.to_string() });
+                                tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
+                                continue;
+                            }
+                            hotl_provider::retry::Decision::Fatal => {
+                                yield Err(err);
+                                return;
+                            }
                         }
-                        yield Err(ProviderError::Transport(e.to_string()));
-                        return;
                     }
                 }
             };

@@ -21,7 +21,6 @@ use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-const MAX_ATTEMPTS: u32 = 3;
 
 pub struct OpenAiCompatProvider {
     client: reqwest::Client,
@@ -67,8 +66,11 @@ fn convert_item(item: &Item, out: &mut Vec<Value>) {
         Item::System { .. } | Item::Unknown => {}
         Item::User { text, .. } => out.push(json!({"role": "user", "content": text})),
         Item::Assistant { blocks } => {
-            let text = hotl_types::assistant_text(blocks);
-            let tool_calls: Vec<Value> = hotl_types::assistant_tool_uses(blocks)
+            // Named canonicalization stage: provider-bound reasoning from a
+            // foreign dialect never crosses (hotl_provider::transform).
+            let blocks = hotl_provider::transform::strip_foreign_reasoning(blocks);
+            let text = hotl_types::assistant_text(&blocks);
+            let tool_calls: Vec<Value> = hotl_types::assistant_tool_uses(&blocks)
                 .into_iter()
                 .map(|tu| {
                     json!({
@@ -241,23 +243,31 @@ impl Provider for OpenAiCompatProvider {
                             return;
                         }
                         let err = ProviderError::Http { status, message, retry_after };
-                        if err.retryable() && attempt < MAX_ATTEMPTS {
-                            let wait = retry_after.unwrap_or(1u64 << (attempt - 1));
-                            yield Ok(StreamEvent::Retrying { attempt, reason: format!("HTTP {status}") });
-                            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
-                            continue;
+                        match hotl_provider::retry::classify(&err, attempt) {
+                            hotl_provider::retry::Decision::Retry { after_secs } => {
+                                yield Ok(StreamEvent::Retrying { attempt, reason: format!("HTTP {status}") });
+                                tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
+                                continue;
+                            }
+                            hotl_provider::retry::Decision::Fatal => {
+                                yield Err(err);
+                                return;
+                            }
                         }
-                        yield Err(err);
-                        return;
                     }
                     Err(e) => {
-                        if attempt < MAX_ATTEMPTS {
-                            yield Ok(StreamEvent::Retrying { attempt, reason: e.to_string() });
-                            tokio::time::sleep(std::time::Duration::from_secs(1u64 << (attempt - 1))).await;
-                            continue;
+                        let err = ProviderError::Transport(e.to_string());
+                        match hotl_provider::retry::classify(&err, attempt) {
+                            hotl_provider::retry::Decision::Retry { after_secs } => {
+                                yield Ok(StreamEvent::Retrying { attempt, reason: e.to_string() });
+                                tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
+                                continue;
+                            }
+                            hotl_provider::retry::Decision::Fatal => {
+                                yield Err(err);
+                                return;
+                            }
                         }
-                        yield Err(ProviderError::Transport(e.to_string()));
-                        return;
                     }
                 }
             };
