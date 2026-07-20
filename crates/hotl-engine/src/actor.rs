@@ -24,55 +24,42 @@ const SUMMARIZE_MAX_TOKENS: u32 = 2_000;
 /// prevents a fold-the-digest spiral when the tail alone overflows.
 const MAX_COMPACT_STREAK: u32 = 2;
 
-/// Dependencies shared with turn tasks. The log lives behind a mutex but is
-/// only ever touched from the actor loop — the mutex exists to make the
-/// struct `Sync` for the spawned turns that never use it.
+/// Dependencies shared with turn tasks. The log is *not* here: only the actor
+/// loop writes it, so it lives as a local in [`run`].
 pub(crate) struct SharedDeps {
     pub provider: Arc<dyn Provider>,
     pub registry: Arc<Registry>,
     pub rules: Arc<Rules>,
     pub sandbox_enforced: bool,
     pub clock: Arc<dyn Clock>,
-    pub system: String,
+    pub system: Arc<str>,
     pub cwd: PathBuf,
     pub config: EngineConfig,
     pub snapshots: Option<Arc<dyn crate::Snapshotter>>,
     pub hooks: Option<Arc<dyn crate::hooks::Hooks>>,
-    log: Mutex<SessionLog>,
 }
 
 impl SharedDeps {
-    fn new(deps: SessionDeps) -> Self {
-        Self {
+    fn new(deps: SessionDeps) -> (Self, SessionLog) {
+        let shared = Self {
             provider: deps.provider,
             registry: deps.registry,
             rules: deps.rules,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,
-            system: deps.system,
+            system: deps.system.into(),
             cwd: deps.cwd,
             config: deps.config,
             snapshots: deps.snapshots,
             hooks: deps.hooks,
-            log: Mutex::new(deps.log),
-        }
+        };
+        (shared, deps.log)
     }
 
     /// Durable append (flush inside `SessionLog`); false = log sealed.
     /// The failure surfaces to the user via the turn outcome, not stderr.
-    fn append(&self, payload: EntryPayload) -> bool {
-        let now = self.clock.now_ms();
-        self.log.lock().expect("log mutex").append(payload, now).is_ok()
-    }
-
-    /// Write an oversized tool result to a masked blob (T4); `None` on failure.
-    fn write_blob(&self, tool_use_id: &str, content: &str) -> Option<String> {
-        self.log
-            .lock()
-            .expect("log mutex")
-            .write_blob(tool_use_id, content)
-            .ok()
-            .map(|p| p.display().to_string())
+    fn append(&self, log: &mut SessionLog, payload: &EntryPayload) -> bool {
+        log.append(payload, self.clock.now_ms()).is_ok()
     }
 }
 
@@ -83,10 +70,11 @@ pub(crate) async fn run(
     events: mpsc::Sender<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
 ) {
-    let mut items: Vec<Item> = std::mem::take(&mut deps.initial_items);
+    let mut items: Arc<Vec<Item>> = Arc::new(std::mem::take(&mut deps.initial_items));
     let mut running = false;
     let mut queue: VecDeque<(String, Option<SyntheticReason>)> = VecDeque::new();
-    let shared = Arc::new(SharedDeps::new(deps));
+    let (shared, mut log) = SharedDeps::new(deps);
+    let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
     let mut compact_streak: u32 = 0;
@@ -94,10 +82,10 @@ pub(crate) async fn run(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             SessionCmd::Prompt(text) => {
-                running = admit_prompt(&shared, &mut items, &mut queue, running, text, None, &cmd_tx, &events, &current_turn).await;
+                running = admit_prompt(&shared, &mut log, &mut items, &mut queue, running, text, None, &cmd_tx, &events, &current_turn).await;
             }
             SessionCmd::PromptTagged { text, synthetic } => {
-                running = admit_prompt(&shared, &mut items, &mut queue, running, text, Some(synthetic), &cmd_tx, &events, &current_turn).await;
+                running = admit_prompt(&shared, &mut log, &mut items, &mut queue, running, text, Some(synthetic), &cmd_tx, &events, &current_turn).await;
             }
             SessionCmd::Continue => {
                 if !running && crate::needs_continuation(&items) {
@@ -105,19 +93,23 @@ pub(crate) async fn run(
                     running = true;
                 }
             }
-            SessionCmd::Steer(text) => admit_steer(&shared, &mut items, text),
+            SessionCmd::Steer(text) => admit_steer(&shared, &mut log, &mut items, text),
             SessionCmd::Snapshot { reply } => {
-                let _ = reply.send(Arc::new(items.clone()));
+                let _ = reply.send(Arc::clone(&items));
             }
             SessionCmd::Propose { entries, reply } => {
-                let _ = reply.send(commit(&shared, &mut items, entries));
+                let _ = reply.send(commit(&shared, &mut log, &mut items, entries));
             }
             SessionCmd::WriteBlob { tool_use_id, content, reply } => {
-                let _ = reply.send(shared.write_blob(&tool_use_id, &content));
+                let result = match log.write_blob(&tool_use_id, &content) {
+                    Ok(path) => Ok(path.display().to_string()),
+                    Err(_) => Err(content), // hand the content back — never lose it
+                };
+                let _ = reply.send(result);
             }
             SessionCmd::TurnFinished { end, usage } => {
                 on_turn_finished(TurnFinishedCtx {
-                    shared: &shared, items: &mut items, queue: &mut queue, running: &mut running,
+                    shared: &shared, log: &mut log, items: &mut items, queue: &mut queue, running: &mut running,
                     carry_usage: &mut carry_usage, compact_streak: &mut compact_streak,
                     cmd_tx: &cmd_tx, events: &events, current_turn: &current_turn,
                 }, end, usage)
@@ -130,7 +122,8 @@ pub(crate) async fn run(
 /// The mutable session state `on_turn_finished` threads back into the loop.
 struct TurnFinishedCtx<'a> {
     shared: &'a Arc<SharedDeps>,
-    items: &'a mut Vec<Item>,
+    log: &'a mut SessionLog,
+    items: &'a mut Arc<Vec<Item>>,
     queue: &'a mut VecDeque<(String, Option<SyntheticReason>)>,
     running: &'a mut bool,
     carry_usage: &'a mut TokenUsage,
@@ -148,7 +141,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
         TurnEnd::Compact => {
             *ctx.carry_usage += usage;
             usage = TokenUsage::default();
-            try_compact(ctx.shared, ctx.items, ctx.compact_streak, ctx.cmd_tx, ctx.events, ctx.current_turn).await
+            try_compact(ctx.shared, ctx.log, ctx.items, ctx.compact_streak, ctx.cmd_tx, ctx.events, ctx.current_turn).await
         }
     };
     if let Some(outcome) = outcome {
@@ -156,7 +149,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
         let mut total = usage;
         total += std::mem::take(ctx.carry_usage);
         *ctx.running = end_turn(
-            ctx.shared, ctx.items, ctx.queue, outcome, total, ctx.cmd_tx, ctx.events, ctx.current_turn,
+            ctx.shared, ctx.log, ctx.items, ctx.queue, outcome, total, ctx.cmd_tx, ctx.events, ctx.current_turn,
         )
         .await;
     }
@@ -165,9 +158,11 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
 /// One compaction attempt on behalf of a turn that hit the threshold: fold,
 /// announce, respawn the continuation. `Some(outcome)` means compaction can't
 /// proceed (streak cap, nothing to fold, sealed log) and the turn ends.
+#[allow(clippy::too_many_arguments)]
 async fn try_compact(
     shared: &Arc<SharedDeps>,
-    items: &mut Vec<Item>,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
     compact_streak: &mut u32,
     cmd_tx: &mpsc::Sender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
@@ -177,7 +172,7 @@ async fn try_compact(
     let compacted = if *compact_streak > MAX_COMPACT_STREAK {
         Err("context window exhausted — compaction can no longer make room".into())
     } else {
-        compact(shared, items).await
+        compact(shared, log, items).await
     };
     match compacted {
         Ok(degraded) => {
@@ -194,7 +189,8 @@ async fn try_compact(
 #[allow(clippy::too_many_arguments)]
 async fn end_turn(
     shared: &Arc<SharedDeps>,
-    items: &mut Vec<Item>,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
     queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
     outcome: Outcome,
     usage: TokenUsage,
@@ -202,10 +198,10 @@ async fn end_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
-    annotate(shared, &outcome);
+    annotate(shared, log, &outcome);
     let _ = events.send(EngineEvent::TurnDone { outcome, usage }).await;
     match queue.pop_front() {
-        Some((next, synthetic)) => start_turn(shared, items, next, synthetic, cmd_tx, events, current_turn).await,
+        Some((next, synthetic)) => start_turn(shared, log, items, next, synthetic, cmd_tx, events, current_turn).await,
         None => false,
     }
 }
@@ -213,28 +209,31 @@ async fn end_turn(
 /// Durable admission on arrival; projection advances only after the append
 /// (commit-protocol §durability). Linear-log M1 records the steer as a
 /// tagged user item; the `steer_admission` entry kind arrives with M3b's tree.
-fn admit_steer(shared: &SharedDeps, items: &mut Vec<Item>, text: String) {
-    let item = Item::User { text, synthetic: Some(SyntheticReason::Steer) };
-    if shared.append(EntryPayload::Item { item: item.clone() }) {
-        items.push(item);
+fn admit_steer(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>, text: String) {
+    let payload =
+        EntryPayload::Item { item: Item::User { text, synthetic: Some(SyntheticReason::Steer) } };
+    if shared.append(log, &payload) {
+        if let EntryPayload::Item { item } = payload {
+            Arc::make_mut(items).push(item);
+        }
     }
 }
 
 /// Commit a proposal: append each entry durably, then project it.
-fn commit(shared: &SharedDeps, items: &mut Vec<Item>, entries: Vec<EntryPayload>) -> bool {
+fn commit(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>, entries: Vec<EntryPayload>) -> bool {
     for payload in entries {
-        if !shared.append(payload.clone()) {
+        if !shared.append(log, &payload) {
             return false;
         }
         if let EntryPayload::Item { item } = payload {
-            items.push(item);
+            Arc::make_mut(items).push(item);
         }
     }
     true
 }
 
 /// Non-Done outcomes leave a durable annotation in the log.
-fn annotate(shared: &SharedDeps, outcome: &Outcome) {
+fn annotate(shared: &SharedDeps, log: &mut SessionLog, outcome: &Outcome) {
     let reason = match outcome {
         Outcome::Cancelled => Some("user interrupt".to_string()),
         Outcome::TurnLimit => Some(format!("max_turns ({}) reached", shared.config.max_turns)),
@@ -244,7 +243,7 @@ fn annotate(shared: &SharedDeps, outcome: &Outcome) {
         Outcome::Done { .. } | Outcome::Refused => None,
     };
     if let Some(reason) = reason {
-        shared.append(EntryPayload::Cancelled { reason });
+        shared.append(log, &EntryPayload::Cancelled { reason });
     }
 }
 
@@ -254,7 +253,7 @@ fn annotate(shared: &SharedDeps, outcome: &Outcome) {
 /// keeps everything. Runs inline in the actor: no turn is in flight, and
 /// admission blocking during the summarize call is the serialization working
 /// as designed.
-async fn compact(shared: &SharedDeps, items: &mut Vec<Item>) -> Result<bool, String> {
+async fn compact(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>) -> Result<bool, String> {
     let tail_budget = (shared.config.context_window as f64 * TAIL_RATIO) as u64;
     let Some(plan) = compaction::plan(items, tail_budget) else {
         return Err("context window exhausted — nothing left to compact".into());
@@ -278,10 +277,10 @@ async fn compact(shared: &SharedDeps, items: &mut Vec<Item>) -> Result<bool, Str
         kept_from: plan.kept_from,
         degraded,
     };
-    if !shared.append(payload) {
+    if !shared.append(log, &payload) {
         return Err("session log is sealed".into());
     }
-    *items = compaction::apply(items, &plan, &digest);
+    *items = Arc::new(compaction::apply(items, &plan, &digest));
     Ok(degraded)
 }
 
@@ -292,8 +291,11 @@ async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
         model,
         max_tokens: SUMMARIZE_MAX_TOKENS,
         system: compaction::SUMMARIZE_SYSTEM.into(),
-        items: vec![Item::User { text: compaction::summarize_prompt(folded), synthetic: None }],
-        tools: Vec::new(),
+        items: Arc::new(vec![Item::User {
+            text: compaction::summarize_prompt(folded),
+            synthetic: None,
+        }]),
+        tools: Vec::new().into(),
         thinking: false,
         cache_static: false,
         turn_context: None,
@@ -323,7 +325,8 @@ async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
 #[allow(clippy::too_many_arguments)]
 async fn admit_prompt(
     shared: &Arc<SharedDeps>,
-    items: &mut Vec<Item>,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
     queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
     running: bool,
     text: String,
@@ -337,20 +340,22 @@ async fn admit_prompt(
         let _ = events.send(EngineEvent::PromptQueued).await;
         return true;
     }
-    start_turn(shared, items, text, synthetic, cmd_tx, events, current_turn).await
+    start_turn(shared, log, items, text, synthetic, cmd_tx, events, current_turn).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_turn(
     shared: &Arc<SharedDeps>,
-    items: &mut Vec<Item>,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
     text: String,
     synthetic: Option<SyntheticReason>,
     cmd_tx: &mpsc::Sender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
-    let item = Item::User { text, synthetic };
-    if !shared.append(EntryPayload::Item { item: item.clone() }) {
+    let payload = EntryPayload::Item { item: Item::User { text, synthetic } };
+    if !shared.append(log, &payload) {
         let _ = events
             .send(EngineEvent::TurnDone {
                 outcome: Outcome::Error { message: "session log is sealed".into() },
@@ -359,7 +364,9 @@ async fn start_turn(
             .await;
         return false;
     }
-    items.push(item);
+    if let EntryPayload::Item { item } = payload {
+        Arc::make_mut(items).push(item);
+    }
     spawn_turn(shared, cmd_tx, events, current_turn);
     true
 }
@@ -373,6 +380,6 @@ fn spawn_turn(
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) {
     let token = CancellationToken::new();
-    *current_turn.lock().expect("turn token mutex") = token.clone();
+    *current_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
     tokio::spawn(turn::run(shared.clone(), cmd_tx.clone(), events.clone(), token));
 }

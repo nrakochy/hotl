@@ -9,11 +9,12 @@ pub mod retention;
 pub mod shadow;
 
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use hotl_types::{new_ulid, Entry, EntryPayload, SessionHeader, FORMAT_VERSION};
+use serde::Serialize;
 
 /// Ingestion-time sentinel masking: values of secret-named env vars are
 /// replaced with `«masked:NAME»` in every serialized entry.
@@ -68,6 +69,12 @@ impl Masker {
     pub fn contains_secret(&self, text: &str) -> bool {
         self.pairs.iter().any(|(secret, _)| text.contains(secret.as_str()))
     }
+
+    /// Whether any registered secret spans lines (e.g. a raw PEM key) — the
+    /// only case a line-by-line scan could miss.
+    fn has_multiline_secret(&self) -> bool {
+        self.pairs.iter().any(|(secret, _)| secret.contains('\n'))
+    }
 }
 
 /// The inner text of a value's JSON string encoding (the escaped body without
@@ -96,14 +103,29 @@ pub fn audit_secrets(dir: &Path, masker: &Masker) -> Vec<PathBuf> {
         if path.extension().is_none_or(|e| e != "jsonl") {
             continue;
         }
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            if masker.contains_secret(&content) {
-                hits.push(path);
-            }
+        if log_contains_secret(&path, masker) {
+            hits.push(path);
         }
     }
     hits.sort();
     hits
+}
+
+/// Scan one log line-by-line (never slurping the file); a secret containing
+/// newlines can straddle lines, so that rare case falls back to a full read.
+fn log_contains_secret(path: &Path, masker: &Masker) -> bool {
+    if masker.has_multiline_secret() {
+        return std::fs::read_to_string(path).is_ok_and(|c| masker.contains_secret(&c));
+    }
+    let Ok(file) = File::open(path) else { return false };
+    for line in BufReader::new(file).lines() {
+        match line {
+            Ok(line) if masker.contains_secret(&line) => return true,
+            Ok(_) => {}
+            Err(_) => return false, // unreadable — same as the slurping path
+        }
+    }
+    false
 }
 
 pub struct SessionLog {
@@ -129,7 +151,7 @@ impl SessionLog {
         let file = OpenOptions::new().create_new(true).append(true).open(&path)?;
         let mut log = Self { file, path, masker, last_id: None, session_id: session_id.clone() };
         log.append(
-            EntryPayload::Header {
+            &EntryPayload::Header {
                 header: SessionHeader {
                     format_version: FORMAT_VERSION,
                     session_id,
@@ -170,22 +192,28 @@ impl SessionLog {
         Ok(path)
     }
 
-    /// Append one entry (chained via parent_id), masked, flushed.
-    pub fn append(&mut self, payload: EntryPayload, now_ms: u64) -> std::io::Result<String> {
-        let entry = Entry {
-            id: new_ulid(),
-            parent_id: self.last_id.clone(),
-            ts_ms: now_ms,
-            payload,
-        };
+    /// Append one entry (chained via parent_id), masked, flushed. Takes the
+    /// payload by reference — the entry only ever needs a serialized view.
+    pub fn append(&mut self, payload: &EntryPayload, now_ms: u64) -> std::io::Result<String> {
+        /// Borrowed mirror of [`Entry`]: identical field names and order, so
+        /// the wire format is byte-for-byte what `Entry` would serialize.
+        #[derive(Serialize)]
+        struct EntryRef<'a> {
+            id: &'a str,
+            parent_id: Option<&'a str>,
+            ts_ms: u64,
+            payload: &'a EntryPayload,
+        }
+        let id = new_ulid();
+        let entry = EntryRef { id: &id, parent_id: self.last_id.as_deref(), ts_ms: now_ms, payload };
         let line = serde_json::to_string(&entry)
             .map_err(|e| std::io::Error::other(format!("serialize entry: {e}")))?;
         let masked = self.masker.apply(&line);
         self.file.write_all(masked.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.file.flush()?;
-        self.last_id = Some(entry.id.clone());
-        Ok(entry.id)
+        self.last_id = Some(id.clone());
+        Ok(id)
     }
 }
 
@@ -217,12 +245,17 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut current = session_id.to_string();
     for _ in 0..32 {
         let path = dir.join(format!("{current}.jsonl"));
-        let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let first: Entry = raw
-            .lines()
-            .next()
-            .ok_or_else(|| format!("{}: empty log", path.display()))
-            .and_then(|l| serde_json::from_str(l).map_err(|e| format!("{}: {e}", path.display())))?;
+        // The lineage walk needs only the header — read the first line, not the file.
+        let file = File::open(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let mut first_line = String::new();
+        BufReader::new(file)
+            .read_line(&mut first_line)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        if first_line.is_empty() {
+            return Err(format!("{}: empty log", path.display()));
+        }
+        let first: Entry = serde_json::from_str(first_line.trim_end_matches(['\n', '\r']))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let EntryPayload::Header { header } = first.payload else {
             return Err(format!("{}: first entry is not a header", path.display()));
         };
@@ -252,15 +285,16 @@ fn apply_log(
     items: &mut Vec<hotl_types::Item>,
     warnings: &mut Vec<String>,
 ) -> Result<hotl_types::SessionHeader, String> {
-    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut header = None;
     let mut prev_id: Option<String> = None;
     let mut chain_ok = true;
     // §2b: an unresolved pending_ask at end-of-log means the session stopped
     // mid-ask — surface it on resume (id → summary).
     let mut pending_asks: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-    for (n, line) in raw.lines().enumerate() {
-        let entry: Entry = serde_json::from_str(line)
+    for (n, line) in BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
+        let entry: Entry = serde_json::from_str(&line)
             .map_err(|e| format!("{}:{} unparseable entry: {e}", path.display(), n + 1))?;
         if chain_ok && entry.parent_id != prev_id {
             warnings.push(format!(
@@ -334,7 +368,7 @@ mod tests {
         let mut log = SessionLog::create(dir.path(), "test-model", None, masker, 1000).unwrap();
 
         log.append(
-            EntryPayload::Item {
+            &EntryPayload::Item {
                 item: Item::User {
                     text: "here is the key: sk-super-secret-12345".into(),
                     synthetic: None,
@@ -368,7 +402,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "m", None, masker, 1).unwrap();
         log.append(
-            EntryPayload::Item {
+            &EntryPayload::Item {
                 item: Item::User { text: r#"key is p@ss"w0rd\x"#.into(), synthetic: None },
             },
             2,
@@ -387,11 +421,11 @@ mod tests {
         let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
         let user = |t: &str| Item::User { text: t.into(), synthetic: None };
         for text in ["one", "two", "three", "four"] {
-            log.append(EntryPayload::Item { item: user(text) }, 2).unwrap();
+            log.append(&EntryPayload::Item { item: user(text) }, 2).unwrap();
         }
         // Compaction: fold [0..2) into a digest, keep the tail.
         log.append(
-            EntryPayload::Compaction {
+            &EntryPayload::Compaction {
                 digest: vec![user("digest-of-one-two")],
                 prefix_end: 0,
                 kept_from: 2,
@@ -401,9 +435,9 @@ mod tests {
         )
         .unwrap();
         // Projection now: [digest, three, four]. Roll back to 2 items, record why.
-        log.append(EntryPayload::BranchMove { keep_items: 2 }, 4).unwrap();
+        log.append(&EntryPayload::BranchMove { keep_items: 2 }, 4).unwrap();
         log.append(
-            EntryPayload::Supersede { digest: vec![user("abandoned: four")] },
+            &EntryPayload::Supersede { digest: vec![user("abandoned: four")] },
             5,
         )
         .unwrap();
@@ -430,9 +464,9 @@ mod tests {
     fn replay_surfaces_a_dangling_pending_ask() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
-        log.append(EntryPayload::Item { item: Item::User { text: "go".into(), synthetic: None } }, 2).unwrap();
+        log.append(&EntryPayload::Item { item: Item::User { text: "go".into(), synthetic: None } }, 2).unwrap();
         // A pending_ask with no matching ask_resolved (the session stopped mid-ask).
-        log.append(EntryPayload::PendingAsk { id: "a1".into(), summary: "bash: rm -rf /".into(), protected_why: None }, 3).unwrap();
+        log.append(&EntryPayload::PendingAsk { id: "a1".into(), summary: "bash: rm -rf /".into(), protected_why: None }, 3).unwrap();
 
         let replayed = replay(log.path()).expect("replay");
         assert!(
@@ -442,7 +476,7 @@ mod tests {
         );
 
         // Resolving it clears the warning.
-        log.append(EntryPayload::AskResolved { id: "a1".into(), allowed: false }, 4).unwrap();
+        log.append(&EntryPayload::AskResolved { id: "a1".into(), allowed: false }, 4).unwrap();
         let replayed = replay(log.path()).expect("replay");
         assert!(
             !replayed.warnings.iter().any(|w| w.contains("unanswered permission request")),

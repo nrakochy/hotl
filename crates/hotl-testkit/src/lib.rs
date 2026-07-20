@@ -24,6 +24,9 @@ pub struct Harness {
     pub seen: Vec<String>,
     log_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
+    /// Extra temp dirs whose lifetime must match the harness (scenario
+    /// fixtures the scripted tools read/write) — kept, not leaked.
+    extra_dirs: Vec<tempfile::TempDir>,
     /// Answer for every Ask event (T1: defaults to Allow).
     pub ask_reply: AskReply,
     /// One-shot steer to send when the next ToolStart is observed.
@@ -47,6 +50,12 @@ impl Harness {
     /// also a scratch space for files the scripted tools touch).
     pub fn dir(&self) -> &std::path::Path {
         self._dir.path()
+    }
+
+    /// Tie a fixture temp dir's lifetime to the harness (it is removed when
+    /// the harness drops, instead of being forgotten and leaked on disk).
+    pub fn keep_dir(&mut self, dir: tempfile::TempDir) {
+        self.extra_dirs.push(dir);
     }
 }
 
@@ -106,6 +115,7 @@ impl Harness {
             seen: Vec::new(),
             log_path,
             _dir: dir,
+            extra_dirs: Vec::new(),
             ask_reply: AskReply::Allow,
             steer_on_tool_start: None,
             snapshots,
@@ -668,7 +678,7 @@ mod tests {
         let outcome = h.prompt_and_wait("do the thing").await;
         assert_eq!(outcome, Outcome::Done { text: "done after reset compaction".into() });
         assert!(h.seen.iter().any(|e| e.starts_with("Compacted")));
-        let continuation = h.provider.requests().last().unwrap().clone();
+        let continuation = h.provider.last_request().unwrap();
         // The digest is present…
         assert!(continuation.items.iter().any(|i| matches!(
             i,
@@ -786,7 +796,7 @@ mod tests {
             ],
             EngineConfig { max_turns: 6, ..Default::default() },
         );
-        std::mem::forget(dir);
+        h.keep_dir(dir);
         h.prompt_and_wait("read then write").await;
         h
     }
@@ -822,7 +832,7 @@ mod tests {
             EngineConfig { evict_threshold_tokens: threshold, max_turns: 6, ..Default::default() },
         );
         h.prompt_and_wait("read the big file").await;
-        std::mem::forget(dir);
+        drop(dir);
         let items = h.items();
         let Item::ToolResults { results } = &items[2] else { panic!("expected results") };
         // The blob (when evicted) lives beside the harness log.

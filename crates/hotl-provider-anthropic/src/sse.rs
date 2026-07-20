@@ -181,7 +181,7 @@ mod tests {
         let mut events = Vec::new();
         // Feed in awkward 17-byte chunks to prove reassembly.
         for chunk in bytes.chunks(17) {
-            for data in p.feed(chunk) {
+            for data in p.feed(chunk).unwrap() {
                 events.extend(a.handle(&data).unwrap());
             }
         }

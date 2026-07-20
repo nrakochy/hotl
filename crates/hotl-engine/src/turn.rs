@@ -1,6 +1,7 @@
 //! One turn: sample → tools → sample, until a terminal outcome.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -52,10 +53,12 @@ struct Turn<'d> {
     cmd_tx: mpsc::Sender<SessionCmd>,
     events: mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
-    tool_defs: Vec<ToolDef>,
+    tool_defs: Arc<[ToolDef]>,
     models: Vec<String>,
     model_idx: usize,
-    call_sigs: Vec<String>,
+    /// The trailing tool-call signatures the doom-loop detector reads —
+    /// bounded to [`DOOM_WINDOW`], not the whole turn.
+    call_sigs: VecDeque<CallSig>,
     consecutive_failures: HashMap<String, u32>,
     usage: TokenUsage,
     /// (provider-reported tokens, projection length) at the last completed
@@ -82,10 +85,10 @@ impl<'d> Turn<'d> {
             cmd_tx,
             events,
             cancel,
-            tool_defs: shared.registry.defs(),
+            tool_defs: shared.registry.defs().into(),
             models,
             model_idx: 0,
-            call_sigs: Vec::new(),
+            call_sigs: VecDeque::new(),
             consecutive_failures: HashMap::new(),
             usage: TokenUsage::default(),
             anchor: None,
@@ -163,9 +166,12 @@ impl<'d> Turn<'d> {
     async fn run_tool_phase(&mut self, blocks: &[Value]) -> Option<Outcome> {
         let uses = assistant_tool_uses(blocks);
         for tu in &uses {
-            self.call_sigs.push(format!("{}({})", tu.name, tu.input));
+            self.call_sigs.push_back(CallSig::new(tu));
         }
-        if let Some(pattern) = detect_doom_loop(&self.call_sigs) {
+        while self.call_sigs.len() > DOOM_WINDOW {
+            self.call_sigs.pop_front();
+        }
+        if let Some(pattern) = detect_doom_loop(self.call_sigs.make_contiguous()) {
             let cont = self
                 .ask(format!("the agent keeps repeating: {pattern} — let it continue?"), None)
                 .await;
@@ -234,7 +240,8 @@ impl<'d> Turn<'d> {
                 *budget_blown = Some(tu.name.clone());
             }
         } else {
-            self.consecutive_failures.insert(tu.name.clone(), 0);
+            // Missing key == zero; keeps the map bounded to failing tools.
+            self.consecutive_failures.remove(&tu.name);
         }
         (content, outcome.is_error)
     }
@@ -343,9 +350,9 @@ impl<'d> Turn<'d> {
         Ok(SamplingRequest {
             model: self.models[self.model_idx].clone(),
             max_tokens: self.shared.config.max_tokens,
-            system: self.shared.system.clone(),
-            items: (**snapshot).clone(),
-            tools: self.tool_defs.clone(),
+            system: Arc::clone(&self.shared.system),
+            items: Arc::clone(snapshot),
+            tools: Arc::clone(&self.tool_defs),
             thinking: self.shared.config.thinking,
             cache_static: self.shared.config.cache_static,
             turn_context: Some(turn_context),
@@ -444,22 +451,30 @@ impl<'d> Turn<'d> {
         if hotl_context::tokens::estimate_text(&outcome.content) <= threshold {
             return;
         }
+        // Cut the preview before the content moves; on any failure the
+        // content comes back — eviction is never a data-loss path.
+        let content = std::mem::take(&mut outcome.content);
+        let total = content.len();
+        let head = clip(&content, 2048).to_string();
         let (tx, rx) = oneshot::channel();
-        let cmd = SessionCmd::WriteBlob {
-            tool_use_id: tu.id.clone(),
-            content: outcome.content.clone(),
-            reply: tx,
-        };
-        if self.cmd_tx.send(cmd).await.is_err() {
+        let cmd = SessionCmd::WriteBlob { tool_use_id: tu.id.clone(), content, reply: tx };
+        if let Err(mpsc::error::SendError(cmd)) = self.cmd_tx.send(cmd).await {
+            if let SessionCmd::WriteBlob { content, .. } = cmd {
+                outcome.content = content;
+            }
             return;
         }
-        if let Ok(Some(path)) = rx.await {
-            let total = outcome.content.len();
-            let head = clip(&outcome.content, 2048);
-            outcome.content = format!(
-                "{head}\n<evicted total_bytes={total} file=\"{path}\">Full output saved. \
-                 Read it with the read tool ({path}); use offset to page.</evicted>"
-            );
+        match rx.await {
+            Ok(Ok(path)) => {
+                outcome.content = format!(
+                    "{head}\n<evicted total_bytes={total} file=\"{path}\">Full output saved. \
+                     Read it with the read tool ({path}); use offset to page.</evicted>"
+                );
+            }
+            // Blob write failed: the actor handed the content back.
+            Ok(Err(content)) => outcome.content = content,
+            // Actor gone mid-write (session closing): keep the preview.
+            Err(_) => outcome.content = head,
         }
     }
 
@@ -543,9 +558,31 @@ fn unknown_tool(defs: &[ToolDef], name: &str) -> ToolOutcome {
     ToolOutcome::err(format!("Unknown tool `{name}`. Available tools: {}.", available.join(", ")))
 }
 
+/// Doom-loop lookback: max period (3) × required repeats (3). The detector
+/// only ever reads this many trailing signatures.
+const DOOM_WINDOW: usize = 9;
+
+/// One tool-call signature: a hash for cheap equality plus the display text
+/// the ask embeds. The display rides along (bounded by [`DOOM_WINDOW`])
+/// because the repeating block can span batches — it can't always be
+/// re-derived from the current batch's tool uses.
+struct CallSig {
+    hash: u64,
+    display: String,
+}
+
+impl CallSig {
+    fn new(tu: &ToolUse) -> Self {
+        let display = format!("{}({})", tu.name, tu.input);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        display.hash(&mut hasher);
+        Self { hash: hasher.finish(), display }
+    }
+}
+
 /// Repeating suffix patterns over tool-call signatures: any period p ≤ 3
 /// whose block repeats 3× at the tail (a repetition detector).
-fn detect_doom_loop(sigs: &[String]) -> Option<String> {
+fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
     const REPEATS: usize = 3;
     for period in 1..=3usize {
         let need = period * REPEATS;
@@ -554,8 +591,11 @@ fn detect_doom_loop(sigs: &[String]) -> Option<String> {
         }
         let tail = &sigs[sigs.len() - need..];
         let block = &tail[..period];
-        if tail.chunks(period).all(|c| c == block) {
-            return Some(block.join(" → "));
+        let same = |a: &CallSig, b: &CallSig| a.hash == b.hash;
+        if tail.chunks(period).all(|c| c.iter().zip(block).all(|(a, b)| same(a, b))) {
+            return Some(
+                block.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(" → "),
+            );
         }
     }
     None
@@ -564,15 +604,23 @@ fn detect_doom_loop(sigs: &[String]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn sig(name: &str, input: Value) -> CallSig {
+        CallSig::new(&ToolUse { id: "t".into(), name: name.into(), input })
+    }
 
     #[test]
     fn doom_detector_finds_periods() {
-        let a = "read({\"path\":\"x\"})".to_string();
-        let b = "bash({\"command\":\"ls\"})".to_string();
-        assert!(detect_doom_loop(&[a.clone(), a.clone(), a.clone()]).is_some());
-        let sigs = vec![a.clone(), b.clone(), a.clone(), b.clone(), a.clone(), b.clone()];
+        let a = || sig("read", json!({"path":"x"}));
+        let b = || sig("bash", json!({"command":"ls"}));
+        assert!(detect_doom_loop(&[a(), a(), a()]).is_some());
+        let sigs = vec![a(), b(), a(), b(), a(), b()];
         assert!(detect_doom_loop(&sigs).is_some());
-        assert!(detect_doom_loop(&[a.clone(), a.clone(), b.clone()]).is_none());
-        assert!(detect_doom_loop(&[a.clone(), a.clone()]).is_none());
+        assert!(detect_doom_loop(&[a(), a(), b()]).is_none());
+        assert!(detect_doom_loop(&[a(), a()]).is_none());
+        // The ask still shows the human-readable signatures.
+        let pattern = detect_doom_loop(&[a(), a(), a()]).unwrap();
+        assert_eq!(pattern, "read({\"path\":\"x\"})");
     }
 }

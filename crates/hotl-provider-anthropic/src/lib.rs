@@ -45,7 +45,7 @@ impl AnthropicProvider {
             "messages": messages,
         });
         if !req.system.is_empty() {
-            let mut sys = json!({"type": "text", "text": req.system});
+            let mut sys = json!({"type": "text", "text": req.system.as_ref()});
             if req.cache_static {
                 sys["cache_control"] = json!({"type": "ephemeral"});
             }
@@ -243,16 +243,17 @@ mod tests {
             model: DEFAULT_MODEL.into(),
             max_tokens: 1024,
             system: "sys".into(),
-            items: vec![
+            items: std::sync::Arc::new(vec![
                 Item::User { text: "instructions".into(), synthetic: None },
                 Item::Assistant { blocks: vec![serde_json::json!({"type":"text","text":"ok"})] },
                 Item::ToolResults { results: vec![ToolResultItem { tool_use_id: "t1".into(), content: "out".into(), is_error: false }] },
-            ],
+            ]),
             tools: vec![ToolDef {
                 name: "read".into(),
                 description: "d".into(),
                 input_schema: serde_json::json!({"type":"object"}),
-            }],
+            }]
+            .into(),
             thinking: true,
             cache_static: true,
             turn_context: Some("<turn-context sample=\"1\"/>".into()),

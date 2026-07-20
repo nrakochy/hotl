@@ -38,9 +38,9 @@ impl OpenAiCompatProvider {
     fn build_body(req: &SamplingRequest) -> Value {
         let mut messages = Vec::new();
         if !req.system.is_empty() {
-            messages.push(json!({"role": "system", "content": req.system}));
+            messages.push(json!({"role": "system", "content": req.system.as_ref()}));
         }
-        for item in &req.items {
+        for item in req.items.iter() {
             convert_item(item, &mut messages);
         }
         if let Some(tc) = &req.turn_context {
@@ -317,7 +317,7 @@ mod tests {
             model: "gpt-test".into(),
             max_tokens: 512,
             system: "sys".into(),
-            items: vec![
+            items: std::sync::Arc::new(vec![
                 Item::User { text: "hi".into(), synthetic: None },
                 Item::Assistant {
                     blocks: vec![
@@ -333,8 +333,8 @@ mod tests {
                         ToolResultItem { tool_use_id: "toolu_2".into(), content: "out2".into(), is_error: true },
                     ],
                 },
-            ],
-            tools: vec![ToolDef { name: "read".into(), description: "d".into(), input_schema: json!({"type":"object"}) }],
+            ]),
+            tools: vec![ToolDef { name: "read".into(), description: "d".into(), input_schema: json!({"type":"object"}) }].into(),
             thinking: true,
             cache_static: true,
             turn_context: Some("<turn-context/>".into()),

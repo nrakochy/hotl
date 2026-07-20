@@ -159,8 +159,9 @@ pub enum SessionCmd {
     Propose { entries: Vec<EntryPayload>, reply: oneshot::Sender<bool> },
     /// Turn task → actor: write an oversized tool result to a masked blob
     /// (T4 — the actor owns the log, the turn never touches it directly).
-    /// Replies with the blob path, or None on write failure.
-    WriteBlob { tool_use_id: String, content: String, reply: oneshot::Sender<Option<String>> },
+    /// Replies `Ok(path)` on success; on write failure the content is handed
+    /// back in `Err` so eviction never loses data.
+    WriteBlob { tool_use_id: String, content: String, reply: oneshot::Sender<Result<String, String>> },
     /// Turn task → actor: the turn is over (or needs a compaction respawn).
     TurnFinished { end: TurnEnd, usage: TokenUsage },
 }
@@ -213,7 +214,8 @@ impl SessionHandle {
     }
     /// Out-of-band interrupt of the in-flight turn (never queued behind data).
     pub fn interrupt(&self) {
-        self.current_turn.lock().expect("turn token mutex").cancel();
+        // A poisoned lock is fine: the token has no invariants to protect.
+        self.current_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cancel();
     }
 }
 

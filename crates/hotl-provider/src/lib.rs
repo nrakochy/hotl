@@ -10,7 +10,7 @@
 //! are derived at the gated milestone (rust-implementation §Key trait signatures).
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use futures_util::stream::BoxStream;
 use hotl_types::{Item, StopReason, TokenUsage};
@@ -29,9 +29,9 @@ pub struct SamplingRequest {
     pub model: String,
     pub max_tokens: u32,
     /// Byte-stable owner system prompt (L6 discipline).
-    pub system: String,
-    pub items: Vec<Item>,
-    pub tools: Vec<ToolDef>,
+    pub system: Arc<str>,
+    pub items: Arc<Vec<Item>>,
+    pub tools: Arc<[ToolDef]>,
     /// Adaptive thinking on models that support it.
     pub thinking: bool,
     /// M0 static cache placement: system block + latest user block
@@ -95,8 +95,19 @@ impl ScriptedProvider {
         Self { scripts: Mutex::new(scripts.into()), requests: Mutex::new(Vec::new()) }
     }
 
+    /// Every captured request. Cheap since a request's history/tools are
+    /// shared (`Arc`) — the clone copies pointers, not items.
     pub fn requests(&self) -> Vec<SamplingRequest> {
         self.requests.lock().expect("requests mutex").clone()
+    }
+
+    /// The most recent request, if any.
+    pub fn last_request(&self) -> Option<SamplingRequest> {
+        self.requests.lock().expect("requests mutex").last().cloned()
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.requests.lock().expect("requests mutex").len()
     }
 
     /// Append a script after construction (tests that need the harness's
@@ -159,23 +170,34 @@ pub struct SseParser {
     buf: Vec<u8>,
 }
 
+/// A stream that never sends a newline must not buffer without bound.
+const SSE_MAX_BUFFER: usize = 1024 * 1024;
+
 impl SseParser {
     /// Feed a chunk; returns complete `data:` payloads (`[DONE]` filtered).
-    pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+    /// Errors when a single line exceeds [`SSE_MAX_BUFFER`].
+    pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, ProviderError> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line);
-            let line = line.trim_end_matches(['\n', '\r']);
+        let mut start = 0;
+        while let Some(pos) = self.buf[start..].iter().position(|&b| b == b'\n') {
+            let line = String::from_utf8_lossy(&self.buf[start..start + pos]);
+            let line = line.trim_end_matches('\r');
             if let Some(data) = line.strip_prefix("data:") {
                 let data = data.trim_start();
                 if !data.is_empty() && data != "[DONE]" {
                     out.push(data.to_string());
                 }
             }
+            start += pos + 1;
         }
-        out
+        self.buf.drain(..start);
+        if self.buf.len() > SSE_MAX_BUFFER {
+            return Err(ProviderError::Parse(format!(
+                "SSE line exceeded {SSE_MAX_BUFFER} bytes without a newline"
+            )));
+        }
+        Ok(out)
     }
 }
 
@@ -460,7 +482,11 @@ where
                     return;
                 }
             };
-            for data in parser.feed(&chunk) {
+            let payloads = match parser.feed(&chunk) {
+                Ok(payloads) => payloads,
+                Err(e) => { yield Err(e); return; }
+            };
+            for data in payloads {
                 match assembler.handle(&data) {
                     Ok(events) => for ev in events { yield Ok(ev); },
                     Err(e) => { yield Err(e); return; }
