@@ -51,7 +51,22 @@ Layers (02, 09, 12):
 
 The spawn depth cap is **structural, not a counter**: children are built without a `spawn` tool, so "a sub-agent spawning sub-agents forever" cannot happen — the capability simply isn't in the child's registry. `fork` (seed a child from the parent projection) and `teammate` (hotl as an ACP *client* of another agent) are reserved topologies.
 
-**Not yet specified — each bound to a named milestone gate, not floating debt (r2 R5):** the default policy file contents + the remaining trust-prompt screens (extension install, workspace trust — the MCP first-use screen shipped with M3a) + parameterized capabilities (fs scoped to path globs, http to host allowlists) are an **M5 entry gate**. These prompts and defaults *are* the real boundary — undesigned, they are the Forge failure recursed (Sec #12); gated, they cannot be silently skipped.
+## M5 entry-gate artifacts (extensions)
+
+The **default policy file** is specified in [design-docs/default-policy.md](design-docs/default-policy.md) (a minimal, read-only-by-default `permissions.toml` starter — "defaults are the safety design" made concrete). The two remaining **trust-prompt screens** (the MCP first-use screen shipped with M3a):
+
+- **Extension-install screen** — before a hook (lane 1 registered in owner config, or a lane-2 shell command) first runs, a *protected* ask shows: the hook's trigger event (e.g. `PreToolUse`), what it can do (deny/rewrite a tool call, block a turn), and for a shell hook the command + its binary path. Approving is per-hook; a changed command re-asks. Never auto-allowable.
+- **Workspace-trust screen** — the first time hotl runs in a repo that ships its own `.hotl/` config (hooks, settings), a *protected* ask surfaces what that config would enable before any of it takes effect. Untrusted until approved; the config is metadata-visible / execution-blocked until then (the trust-degradation posture, corpus 03/11).
+
+**Hook routing rows:**
+
+| Untrusted path | Where it flows | Control |
+|---|---|---|
+| repo `.hotl/` hook config → behavior | hook registry | workspace-trust screen; execution-blocked until approved |
+| model tool call → PreToolUse hook | hook sees the call, may deny/rewrite | the hook is owner-authored (trusted logic) but its *trigger* is model-controlled; a rewritten call re-enters the normal permission gate — a hook cannot launder a call past the y/N ask |
+| lane-2 shell hook output → decision | hook stdout → allow/deny/rewrite | runs under the sandbox floor; repeat-offender eviction (3 failures → dropped for the session, RELIABILITY.md); malformed output = no-op (fail-open on *decision*, never on *permission* — a hook that errors cannot grant, only fail to block) |
+
+**Still deferred (not M5-blocking):** parameterized capabilities (fs scoped to path globs, http to host allowlists) attach to the browser/http lanes that need them, not to compiled-in hooks. Recorded, not floating.
 
 Other standing rules:
 - **`hotl watch` is a single-user tool on a single-user assumption.** It runs `ps -axo …` (every user's process command lines) and `tmux capture-pane` (whatever is on screen). On a shared/multi-user host these can surface other users' secrets (`mysql -pPASSWORD`, `--token=…`) and arbitrary scrollback. All `ps`/`tmux` calls use argv arrays (no shell interpolation — no command injection), so this is local information disclosure inherent to a process dashboard, not an execution risk. Don't run `hotl watch` on a host where you shouldn't see other users' process arguments. (security-evaluation H-10.)
