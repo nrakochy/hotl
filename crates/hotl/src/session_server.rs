@@ -19,16 +19,16 @@ use std::sync::{Arc, Mutex};
 
 use hotl_engine::{EngineEvent, SessionHandle};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::acp::{outcome_tag, update_payload, UPDATE_SCHEMA_VERSION};
 
-type ClientWriter = Arc<AsyncMutex<Option<Box<dyn AsyncWrite + Send + Unpin>>>>;
+type ClientWriter = AsyncMutex<Option<tokio::net::unix::OwnedWriteHalf>>;
 
 struct Shared {
-    handle: Arc<SessionHandle>,
+    handle: SessionHandle,
     client: ClientWriter,
     /// Parked permission asks: id → (reply channel, the request frame to re-send).
     pending: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<hotl_engine::AskReply>, Value)>>,
@@ -88,8 +88,8 @@ pub async fn serve_on(
 ) {
     let events = std::mem::replace(&mut handle.events, tokio::sync::mpsc::channel(1).1);
     let shared = Arc::new(Shared {
-        handle: Arc::new(handle),
-        client: Arc::new(AsyncMutex::new(None)),
+        handle,
+        client: AsyncMutex::new(None),
         pending: Mutex::new(HashMap::new()),
         next_ask: AtomicU64::new(1),
         session_id,
@@ -113,7 +113,7 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
     loop {
         let Ok((stream, _)) = listener.accept().await else { continue };
         let (read, write) = stream.into_split();
-        *shared.client.lock().await = Some(Box::new(write));
+        *shared.client.lock().await = Some(write);
         resend_pending(&shared).await;
         // Handle this client until it disconnects; the session lives on.
         let stop = handle_client(read, &shared).await;
@@ -137,7 +137,7 @@ async fn handle_client(read: impl AsyncRead + Unpin, shared: &Arc<Shared>) -> bo
             "cancel" => shared.handle.interrupt(),
             "ask_reply" => {
                 if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                    if let Some((reply, _)) = shared.pending.lock().expect("pending").remove(&id) {
+                    if let Some((reply, _)) = shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id) {
                         let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
                         let deny_msg = msg.get("message").and_then(Value::as_str).map(String::from);
                         let ans = if allow {
@@ -159,8 +159,13 @@ async fn handle_client(read: impl AsyncRead + Unpin, shared: &Arc<Shared>) -> bo
 
 /// Re-issue every parked ask to the newly-attached client (the whole point).
 async fn resend_pending(shared: &Arc<Shared>) {
-    let frames: Vec<Value> =
-        shared.pending.lock().expect("pending").values().map(|(_, f)| f.clone()).collect();
+    let frames: Vec<Value> = {
+        // Prune asks whose reply channel died (turn cancelled/ended) so a
+        // reattach never sees an ask that can no longer be answered.
+        let mut pending = shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        pending.retain(|_, (tx, _)| !tx.is_closed());
+        pending.values().map(|(_, f)| f.clone()).collect()
+    };
     // Tell the client the current session id first (a lightweight hello).
     send(shared, &json!({"t": "hello", "sessionId": shared.session_id})).await;
     for frame in frames {
@@ -176,10 +181,17 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                 let frame = json!({
                     "t": "ask", "id": id, "summary": summary, "protectedWhy": protected_why,
                 });
-                shared.pending.lock().expect("pending").insert(id, (reply, frame.clone()));
+                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, (reply, frame.clone()));
                 send(&shared, &frame).await; // no-op if detached; re-sent on attach
             }
             EngineEvent::TurnDone { outcome, usage } => {
+                // A turn that ended without its asks being answered left dead
+                // reply channels behind — drop them so they never re-issue.
+                shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|_, (tx, _)| !tx.is_closed());
                 send(&shared, &json!({
                     "t": "turn_done",
                     "schemaVersion": UPDATE_SCHEMA_VERSION,

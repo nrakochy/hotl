@@ -4,13 +4,10 @@
 //! and answers parked permission asks. `Ctrl-D` detaches (the session lives on);
 //! `/stop` shuts the session down. Bare `hotl attach` lists live sessions.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
-use tokio::sync::Mutex;
 
 use crate::session_server::{list_live, socket_exists, socket_path};
 
@@ -53,8 +50,7 @@ async fn connect(id: &str) -> i32 {
         }
     };
     println!("attached to {id} — type to prompt · Ctrl-D detaches · /stop ends the session");
-    let (read, write) = stream.into_split();
-    let write = Arc::new(Mutex::new(write));
+    let (read, mut write) = stream.into_split();
 
     // Terminal stdin on a blocking thread → channel (same shape as the REPL).
     let (tx, mut stdin_rx) = mpsc::channel::<String>(8);
@@ -76,7 +72,7 @@ async fn connect(id: &str) -> i32 {
 
     let mut server = BufReader::new(read).lines();
     // The id of an ask currently awaiting a y/N answer, if any.
-    let pending_ask: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+    let mut pending_ask: Option<u64> = None;
     let mut turn_running = false;
 
     loop {
@@ -84,7 +80,7 @@ async fn connect(id: &str) -> i32 {
             frame = server.next_line() => match frame {
                 Ok(Some(line)) => {
                     if let Ok(msg) = serde_json::from_str::<Value>(&line) {
-                        if render(&msg, &pending_ask, &mut turn_running).await {
+                        if render(&msg, &mut pending_ask, &mut turn_running) {
                             turn_running = true;
                         }
                     }
@@ -92,8 +88,8 @@ async fn connect(id: &str) -> i32 {
                 _ => { println!("\n(session closed)"); return 0; }
             },
             line = stdin_rx.recv() => {
-                let Some(line) = line else { return detach(&write).await };
-                match on_input(line.trim(), &write, &pending_ask, turn_running).await {
+                let Some(line) = line else { return detach(&mut write).await };
+                match on_input(line.trim(), &mut write, &mut pending_ask, turn_running).await {
                     Input::Continue => {}
                     Input::StartedTurn => turn_running = true,
                     Input::Stop => return 0,
@@ -113,8 +109,8 @@ enum Input {
 /// new turn, or handle `/stop`.
 async fn on_input(
     text: &str,
-    write: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
-    pending_ask: &Arc<Mutex<Option<u64>>>,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
+    pending_ask: &mut Option<u64>,
     turn_running: bool,
 ) -> Input {
     if text == "/stop" {
@@ -124,7 +120,7 @@ async fn on_input(
     if text.is_empty() {
         return Input::Continue;
     }
-    if let Some(id) = pending_ask.lock().await.take() {
+    if let Some(id) = pending_ask.take() {
         let allow = matches!(text, "y" | "Y" | "yes");
         let _ = send(write, json!({"t": "ask_reply", "id": id, "allow": allow})).await;
         return Input::Continue;
@@ -140,7 +136,7 @@ async fn on_input(
 }
 
 /// Render a server frame; returns true if it implies a turn is now running.
-async fn render(msg: &Value, pending_ask: &Arc<Mutex<Option<u64>>>, turn_running: &mut bool) -> bool {
+fn render(msg: &Value, pending_ask: &mut Option<u64>, turn_running: &mut bool) -> bool {
     match msg.get("t").and_then(Value::as_str).unwrap_or("") {
         "hello" => false,
         "ask" => {
@@ -150,7 +146,7 @@ async fn render(msg: &Value, pending_ask: &Arc<Mutex<Option<u64>>>, turn_running
                 }
                 eprint!("allow {}? [y/N] ", msg.get("summary").and_then(Value::as_str).unwrap_or("?"));
                 let _ = std::io::Write::flush(&mut std::io::stderr());
-                *pending_ask.lock().await = Some(id);
+                *pending_ask = Some(id);
             }
             true
         }
@@ -189,19 +185,18 @@ fn render_update(update: &Value) {
     }
 }
 
-async fn detach(write: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>) -> i32 {
+async fn detach(write: &mut tokio::net::unix::OwnedWriteHalf) -> i32 {
     let _ = send(write, json!({"t": "detach"})).await;
     println!("\n(detached — session still running; `hotl attach` to return)");
     0
 }
 
 async fn send(
-    write: &Arc<Mutex<tokio::net::unix::OwnedWriteHalf>>,
+    write: &mut tokio::net::unix::OwnedWriteHalf,
     frame: Value,
 ) -> std::io::Result<()> {
     let mut line = frame.to_string();
     line.push('\n');
-    let mut w = write.lock().await;
-    w.write_all(line.as_bytes()).await?;
-    w.flush().await
+    write.write_all(line.as_bytes()).await?;
+    write.flush().await
 }

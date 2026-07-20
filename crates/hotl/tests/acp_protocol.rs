@@ -111,6 +111,98 @@ async fn initialize_new_prompt_permission_and_result() {
     assert!(err["error"]["message"].as_str().unwrap().contains("unknown method"));
 }
 
+/// Two prompts in flight: the engine queues the second, and each prompt
+/// request is answered by its own turn's outcome, in order.
+#[tokio::test]
+async fn overlapping_prompts_resolve_in_order() {
+    let factory: acp::SessionFactory = Box::new(|_spec| {
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        std::mem::forget(dir);
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::text_reply("first turn"),
+            ScriptedProvider::text_reply("second turn"),
+        ]));
+        Ok(spawn_session(SessionDeps {
+            provider,
+            registry: Arc::new(Registry::builtin()),
+            rules: Arc::new(Rules::default()),
+            sandbox_enforced: false,
+            clock: Arc::new(SystemClock),
+            log,
+            system: "sys".into(),
+            cwd: std::env::temp_dir(),
+            snapshots: None,
+            hooks: None,
+            initial_items: Vec::new(),
+            config: EngineConfig { max_turns: 6, ..Default::default() },
+        }))
+    });
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":1,"method":"session/new"})).await;
+    read_until_id(&mut lines, 1).await;
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"a"}})).await;
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"b"}})).await;
+
+    let first = read_until_id(&mut lines, 2).await;
+    assert_eq!(first["result"]["outcome"]["text"], "first turn");
+    let second = read_until_id(&mut lines, 3).await;
+    assert_eq!(second["result"]["outcome"]["text"], "second turn");
+}
+
+/// Replacing the session (session/new while one exists) aborts the old drain
+/// and clears its parked state — the new session works end to end, and the
+/// old in-flight prompt is never answered with the new session's outcome.
+#[tokio::test]
+async fn replacing_a_session_clears_parked_state() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":1,"method":"session/new"})).await;
+    let first = read_until_id(&mut lines, 1).await;
+    let first_sid = first["result"]["sessionId"].as_str().expect("session id").to_string();
+
+    // Prompt; wait for the gated bash call's permission request — leave it parked.
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"go"}})).await;
+    loop {
+        let msg = next(&mut lines).await;
+        if msg.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            break;
+        }
+    }
+
+    // Replace the session while the ask is parked.
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":3,"method":"session/new"})).await;
+    let second = read_until_id(&mut lines, 3).await;
+    let second_sid = second["result"]["sessionId"].as_str().expect("session id").to_string();
+    assert_ne!(first_sid, second_sid);
+
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"text":"again"}})).await;
+    let result = loop {
+        let msg = next(&mut lines).await;
+        assert_ne!(msg.get("id"), Some(&json!(2)), "stale prompt answered: {msg}");
+        if msg.get("method").and_then(Value::as_str) == Some("session/request_permission") {
+            assert_eq!(msg["params"]["sessionId"], second_sid);
+            let rid = msg["id"].clone();
+            send(&mut cwrite, json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}})).await;
+        } else if msg.get("id") == Some(&json!(4)) {
+            break msg;
+        }
+    };
+    assert_eq!(result["result"]["outcome"]["kind"], "done");
+    assert_eq!(result["result"]["outcome"]["text"], "all done via acp");
+}
+
 async fn read_until_id(
     lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
     id: u64,

@@ -72,7 +72,9 @@ impl Config {
         let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
         match text.parse::<toml::Value>() {
             Ok(raw) => {
-                let mut cfg: Config = raw.clone().try_into().unwrap_or_default();
+                // Parse the typed settings from the same source string (no
+                // deep clone of the raw document just to deserialize it).
+                let mut cfg: Config = toml::from_str(&text).unwrap_or_default();
                 cfg.raw = Some(raw);
                 cfg
             }

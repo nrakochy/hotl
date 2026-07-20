@@ -35,6 +35,8 @@ use serde_json::{json, Value};
 
 const MAX_STRIKES: u32 = 3;
 const HOOK_TIMEOUT_SECS: u64 = 10;
+/// A decision is tiny JSON; a hook that floods stdout past this is malformed.
+const HOOK_MAX_OUTPUT: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Deserialize)]
 struct HookSpec {
@@ -100,14 +102,25 @@ impl ShellHook {
             let _ = stdin.write_all(payload.to_string().as_bytes()).await;
             let _ = stdin.shutdown().await;
         }
+        // Read stdout capped rather than wait_with_output: past the cap the
+        // pipe closes, an over-chatty hook dies on SIGPIPE, and it strikes.
+        let mut stdout = child.stdout.take();
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(HOOK_TIMEOUT_SECS),
-            child.wait_with_output(),
+            async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(so) = stdout.as_mut() {
+                    let _ = so.take((HOOK_MAX_OUTPUT + 1) as u64).read_to_end(&mut buf).await;
+                }
+                drop(stdout);
+                (child.wait().await, buf)
+            },
         )
         .await;
         match out {
-            Ok(Ok(o)) if o.status.success() => {
-                serde_json::from_slice(&o.stdout).ok().or_else(|| {
+            Ok((Ok(status), buf)) if status.success() && buf.len() <= HOOK_MAX_OUTPUT => {
+                serde_json::from_slice(&buf).ok().or_else(|| {
                     // Exited 0 but no JSON: treat as continue (not a failure).
                     Some(json!({"decision": "continue"}))
                 })

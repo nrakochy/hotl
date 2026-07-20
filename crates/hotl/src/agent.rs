@@ -13,6 +13,7 @@ use hotl_platform::{Clock, EnvSecrets, SecretStore, SystemClock};
 use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, sandbox, Registry};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 
 const ASK_TIMEOUT_SECS: u64 = 300;
@@ -52,14 +53,15 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
         }
     };
     let secrets = EnvSecrets;
-    let (provider, model) = match select_provider(&secrets) {
+    let cfg = crate::config::Config::load(&config_dir());
+    let (provider, model) = match select_provider(&cfg, &secrets) {
         Ok(pair) => pair,
         Err(msg) => {
             eprintln!("hotl: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -125,14 +127,15 @@ pub async fn resume_main(args: Vec<String>) -> i32 {
 /// protocol loop. One connection, one process (process-per-session).
 pub async fn acp_main() -> i32 {
     let secrets = EnvSecrets;
-    let (provider, model) = match select_provider(&secrets) {
+    let cfg = crate::config::Config::load(&config_dir());
+    let (provider, model) = match select_provider(&cfg, &secrets) {
         Ok(pair) => pair,
         Err(msg) => {
             eprintln!("hotl: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -161,14 +164,15 @@ pub async fn acp_main() -> i32 {
 /// unix socket for `hotl attach` (the detached-session server behind `hotl bg`).
 pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
     let secrets = EnvSecrets;
-    let (provider, model) = match select_provider(&secrets) {
+    let cfg = crate::config::Config::load(&config_dir());
+    let (provider, model) = match select_provider(&cfg, &secrets) {
         Ok(pair) => pair,
         Err(msg) => {
             eprintln!("hotl serve: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -201,32 +205,38 @@ struct Scaffold {
     config: EngineConfig,
     registry: Arc<Registry>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    /// The parsed config.toml, loaded once per process and shared with every
+    /// helper that used to re-read the file.
+    cfg: crate::config::Config,
 }
 
-fn scaffold(provider: Arc<dyn hotl_provider::Provider>, model: String, secrets: &dyn SecretStore) -> Result<Scaffold, i32> {
+fn scaffold(
+    provider: Arc<dyn hotl_provider::Provider>,
+    model: String,
+    secrets: &dyn SecretStore,
+    cfg: crate::config::Config,
+) -> Result<Scaffold, i32> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let config_dir = config_dir();
     // config.toml [behavior].sandbox = false disables the floor (env still wins).
-    if crate::config::Config::load(&config_dir).behavior.sandbox == Some(false)
-        && secrets.get("HOTL_SANDBOX").is_none()
-    {
+    if cfg.behavior.sandbox == Some(false) && secrets.get("HOTL_SANDBOX").is_none() {
         std::env::set_var("HOTL_SANDBOX", "off");
     }
     let system = load_system_prompt(&config_dir);
-    let rules = load_rules(&config_dir);
+    let rules = load_rules(&cfg);
     let sandbox_status = sandbox::probe();
     let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = engine_config(&model, secrets);
+    let config = engine_config(&model, secrets, &cfg);
     let spawn_builder = child_builder(
         provider.clone(), rules.clone(), clock.clone(), config.clone(),
-        cwd.clone(), config_dir.clone(), system.clone(), model.clone(), sandbox_enforced,
+        cwd.clone(), cfg.hooks_toml(), system.clone(), model.clone(), sandbox_enforced,
     );
-    let registry = Arc::new(build_registry(&config_dir, Some(spawn_builder)));
-    let hooks = load_hooks(&config_dir);
+    let registry = Arc::new(build_registry(&cfg, &config_dir, Some(spawn_builder)));
+    let hooks = load_hooks(&cfg);
     Ok(Scaffold {
         provider, model, clock, config_dir, system, rules, sandbox_enforced,
-        sandbox_status, cwd, config, registry, hooks,
+        sandbox_status, cwd, config, registry, hooks, cfg,
     })
 }
 
@@ -267,14 +277,15 @@ fn age(t: std::time::SystemTime) -> String {
 async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<Resumed>) -> i32 {
     let headless = prompt.is_some();
     let secrets = EnvSecrets;
-    let (provider, model) = match select_provider(&secrets) {
+    let cfg = crate::config::Config::load(&config_dir());
+    let (provider, model) = match select_provider(&cfg, &secrets) {
         Ok(pair) => pair,
         Err(msg) => {
             eprintln!("hotl: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg) {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -294,7 +305,8 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     let (snapshots, initial_items) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
     let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
 
-    let mut surface = Surface::new(handle, headless, json_events);
+    let mut surface =
+        Surface::new(handle, headless, json_events, ask_timeout_from_env(&secrets, &scaffold.cfg));
     if let Some(p) = prompt {
         surface.handle.prompt(crate::setup::expand_file_refs(&p)).await;
         return surface.run_until_idle().await;
@@ -319,10 +331,10 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
 /// builder is supplied. `spawn` is omitted for child sessions, so sub-agents
 /// cannot recurse (structural depth cap).
 fn build_registry(
+    cfg: &crate::config::Config,
     config_dir: &std::path::Path,
     spawn_builder: Option<Arc<dyn crate::spawn::ChildBuilder>>,
 ) -> Registry {
-    let cfg = crate::config::Config::load(config_dir);
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
     let diagnostics = cfg
         .hooks_toml()
@@ -356,7 +368,9 @@ struct HotlChildBuilder {
     clock: Arc<dyn Clock>,
     config: EngineConfig,
     cwd: PathBuf,
-    config_dir: PathBuf,
+    /// The parent's config.toml `[diagnostics]` (as a hooks.toml-shaped
+    /// string), captured at construction — children don't re-read the file.
+    hooks_toml: Option<String>,
     system: String,
     model: String,
     sandbox_enforced: bool,
@@ -366,9 +380,10 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
     fn build(&self, _brief: &str) -> Result<hotl_engine::SessionHandle, String> {
         let log = SessionLog::create(&sessions_dir(), &self.model, None, Masker::from_env(), self.clock.now_ms())
             .map_err(|e| format!("child session log: {e}"))?;
-        let diagnostics = crate::config::Config::load(&self.config_dir)
-            .hooks_toml()
-            .map(|t| hotl_tools::diagnostics::Diagnostics::from_toml(&t))
+        let diagnostics = self
+            .hooks_toml
+            .as_deref()
+            .map(hotl_tools::diagnostics::Diagnostics::from_toml)
             .unwrap_or_default();
         let registry = Registry::builtin_with(diagnostics);
         Ok(spawn_session(SessionDeps {
@@ -395,7 +410,7 @@ fn child_builder(
     clock: Arc<dyn Clock>,
     config: EngineConfig,
     cwd: PathBuf,
-    config_dir: PathBuf,
+    hooks_toml: Option<String>,
     system: String,
     model: String,
     sandbox_enforced: bool,
@@ -406,7 +421,7 @@ fn child_builder(
         clock,
         config,
         cwd,
-        config_dir,
+        hooks_toml,
         system,
         model,
         sandbox_enforced,
@@ -510,16 +525,14 @@ pub(crate) fn undo_main(args: Vec<String>) -> i32 {
 }
 
 /// Lane-2 shell hooks from config.toml `[[hook]]`, or None (M5).
-fn load_hooks(config_dir: &std::path::Path) -> Option<Arc<dyn hotl_engine::hooks::Hooks>> {
-    let cfg = crate::config::Config::load(config_dir);
+fn load_hooks(cfg: &crate::config::Config) -> Option<Arc<dyn hotl_engine::hooks::Hooks>> {
     cfg.hooks_toml()
         .and_then(|t| crate::shell_hooks::load_str(&t))
         .map(|h| Arc::new(h) as Arc<dyn hotl_engine::hooks::Hooks>)
 }
 
 /// Allow-rules from config.toml `[[allow]]`.
-fn load_rules(config_dir: &std::path::Path) -> Arc<Rules> {
-    let cfg = crate::config::Config::load(config_dir);
+fn load_rules(cfg: &crate::config::Config) -> Arc<Rules> {
     let rules = match cfg.allow_toml() {
         Some(t) => Rules::from_toml(&t).unwrap_or_else(|e| {
             eprintln!("hotl: config.toml [[allow]] ignored: {e}");
@@ -552,10 +565,19 @@ struct Surface {
     /// `None` = wait indefinitely (a backgrounded/detached session holds the
     /// ask until you reattach and answer — `HOTL_ASK_TIMEOUT=0`).
     ask_timeout: Option<std::time::Duration>,
+    /// One SIGINT stream for the surface's lifetime — registered once, not
+    /// per select iteration, and shared with `ask_human` so Ctrl-C during a
+    /// permission ask isn't dropped.
+    sigint: tokio::signal::unix::Signal,
 }
 
 impl Surface {
-    fn new(handle: SessionHandle, headless: bool, json: bool) -> Self {
+    fn new(
+        handle: SessionHandle,
+        headless: bool,
+        json: bool,
+        ask_timeout: Option<std::time::Duration>,
+    ) -> Self {
         let (tx, rx) = mpsc::channel(8);
         if !headless {
             std::thread::spawn(move || {
@@ -581,7 +603,8 @@ impl Surface {
             stdin: rx,
             turn_running: false,
             saw_text: false,
-            ask_timeout: ask_timeout_from_env(&EnvSecrets),
+            ask_timeout,
+            sigint: signal(SignalKind::interrupt()).expect("SIGINT handler"),
         }
     }
 
@@ -607,7 +630,7 @@ impl Surface {
                         self.turn_running = true;
                     }
                 }
-                _ = tokio::signal::ctrl_c() => {
+                _ = self.sigint.recv() => {
                     if self.turn_running {
                         self.handle.interrupt();
                     } else {
@@ -636,7 +659,7 @@ impl Surface {
                         return code;
                     }
                 }
-                _ = tokio::signal::ctrl_c() => self.handle.interrupt(),
+                _ = self.sigint.recv() => self.handle.interrupt(),
             }
         }
     }
@@ -753,13 +776,30 @@ impl Surface {
         }
         // A bare `n` denies; `n <reason>` sends the reason to the model (T1).
         eprint!("allow {summary}? [y/N — add a reason after 'n' to tell the model why] ");
+        // Ctrl-C while the ask is parked = deny + interrupt (the same
+        // semantics as Ctrl-C mid-turn — without this branch the signal
+        // would be dropped while we await stdin).
         let Some(timeout) = self.ask_timeout else {
-            return reply_from_line(self.stdin.recv().await.as_deref());
+            return tokio::select! {
+                line = self.stdin.recv() => reply_from_line(line.as_deref()),
+                _ = self.sigint.recv() => {
+                    eprintln!();
+                    self.handle.interrupt();
+                    AskReply::Deny { message: None }
+                }
+            };
         };
-        match tokio::time::timeout(timeout, self.stdin.recv()).await {
-            Ok(line) => reply_from_line(line.as_deref()),
-            Err(_) => {
-                eprintln!("(no answer in {}s — denied)", timeout.as_secs());
+        tokio::select! {
+            answered = tokio::time::timeout(timeout, self.stdin.recv()) => match answered {
+                Ok(line) => reply_from_line(line.as_deref()),
+                Err(_) => {
+                    eprintln!("(no answer in {}s — denied)", timeout.as_secs());
+                    AskReply::Deny { message: None }
+                }
+            },
+            _ = self.sigint.recv() => {
+                eprintln!();
+                self.handle.interrupt();
                 AskReply::Deny { message: None }
             }
         }
@@ -785,11 +825,11 @@ fn reply_from_line(line: Option<&str>) -> hotl_engine::AskReply {
 
 /// The interactive ask timeout from `HOTL_ASK_TIMEOUT` (seconds): unset →
 /// the 300s default; `0` → wait indefinitely (backgrounded/detached sessions).
-fn ask_timeout_from_env(secrets: &dyn SecretStore) -> Option<std::time::Duration> {
+fn ask_timeout_from_env(secrets: &dyn SecretStore, cfg: &crate::config::Config) -> Option<std::time::Duration> {
     let secs = secrets
         .get("HOTL_ASK_TIMEOUT")
         .and_then(|v| v.parse::<u64>().ok())
-        .or_else(|| crate::config::Config::load(&config_dir()).behavior.ask_timeout_secs);
+        .or(cfg.behavior.ask_timeout_secs);
     match secs {
         Some(0) => None,
         Some(n) => Some(std::time::Duration::from_secs(n)),
@@ -868,8 +908,7 @@ fn initial_items(config_dir: &std::path::Path, cwd: &std::path::Path) -> Vec<hot
 /// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
 /// Build the engine config from `config.toml [context]` with env overrides
 /// (env > config.toml > default).
-fn engine_config(model: &str, secrets: &dyn SecretStore) -> EngineConfig {
-    let cfg = crate::config::Config::load(&config_dir());
+fn engine_config(model: &str, secrets: &dyn SecretStore, cfg: &crate::config::Config) -> EngineConfig {
     let mut config = EngineConfig { model: model.to_string(), ..Default::default() };
     if let Some(window) = secrets.get("HOTL_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).or(cfg.context.window) {
         config.context_window = window;
@@ -903,9 +942,9 @@ fn exit_code(outcome: &Outcome) -> i32 {
 ///                        keyless OpenAI-compatible endpoints (Ollama etc.)
 /// A bare model string means Anthropic; unset means the Anthropic default.
 pub(crate) fn select_provider(
+    cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
 ) -> Result<(Arc<dyn hotl_provider::Provider>, String), String> {
-    let cfg = crate::config::Config::load(&config_dir());
     // Precedence: env HOTL_MODEL > config.toml [provider].model > default.
     let raw = secrets
         .get("HOTL_MODEL")

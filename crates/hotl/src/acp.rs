@@ -8,7 +8,7 @@
 //! (Tier-1 stable, not a side-channel); permission asks are
 //! `session/request_permission` round-trips to the client.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use hotl_engine::{AskReply, EngineEvent, Outcome, SessionHandle};
@@ -40,8 +40,9 @@ fn ask_reply_from_result(result: Option<&Value>) -> AskReply {
     }
     AskReply::Deny { message: r.get("message").and_then(Value::as_str).map(String::from) }
 }
-/// The JSON-RPC id of the in-flight prompt request, answered on TurnDone.
-type PendingPrompt = Arc<std::sync::Mutex<Option<Value>>>;
+/// JSON-RPC ids of in-flight prompt requests, answered in order on TurnDone
+/// (the engine queues overlapping prompts and finishes them FIFO).
+type PendingPrompt = Arc<std::sync::Mutex<VecDeque<Value>>>;
 
 /// What a client asked the factory to produce.
 pub enum SessionSpec {
@@ -61,7 +62,7 @@ pub async fn serve(
 ) {
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
-    let pending_prompt: PendingPrompt = Arc::new(std::sync::Mutex::new(None));
+    let pending_prompt: PendingPrompt = Arc::new(std::sync::Mutex::new(VecDeque::new()));
     let mut next_id: u64 = 1;
     let mut session: Option<SessionState> = None;
 
@@ -73,7 +74,7 @@ pub async fn serve(
         // A client response to one of our permission requests?
         if msg.get("method").is_none() {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some(reply) = pending.lock().expect("pending").remove(&id) {
+                if let Some(reply) = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id) {
                     let _ = reply.send(ask_reply_from_result(msg.get("result")));
                 }
             }
@@ -86,8 +87,8 @@ pub async fn serve(
 
 struct SessionState {
     id: String,
-    handle: Arc<SessionHandle>,
-    _drain: tokio::task::JoinHandle<()>,
+    handle: SessionHandle,
+    drain: tokio::task::JoinHandle<()>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -116,6 +117,15 @@ async fn handle_request(
             };
             match factory(spec) {
                 Ok(handle) => {
+                    // Replacing a session: stop its drain task and drop its
+                    // parked state — a dropped ask sender reads as a deny to
+                    // the old engine, and a stale prompt id must never be
+                    // answered with the new session's first TurnDone.
+                    if let Some(old) = session.take() {
+                        old.drain.abort();
+                        pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+                        pending_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+                    }
                     let state = start_session(handle, writer.clone(), pending.clone(), pending_prompt.clone(), next_id);
                     let sid = state.id.clone();
                     *session = Some(state);
@@ -133,7 +143,7 @@ async fn handle_request(
             };
             // Stash the id; the drain task answers it on TurnDone so the read
             // loop stays free to service permission responses meanwhile.
-            *pending_prompt.lock().expect("prompt") = Some(id);
+            pending_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(id);
             state.handle.prompt(text.to_string()).await;
         }
         "session/cancel" => {
@@ -160,7 +170,7 @@ fn start_session(
     let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
     let sid = id.clone();
     let drain = tokio::spawn(drain_events(events, writer, pending, pending_prompt, sid, req_id_seed));
-    SessionState { id, handle: Arc::new(handle), _drain: drain }
+    SessionState { id, handle, drain }
 }
 
 /// Map engine events to `session/update` notifications, turn permission asks
@@ -178,7 +188,7 @@ async fn drain_events(
         match event {
             EngineEvent::Ask { summary, protected_why, reply } => {
                 req_id += 1;
-                pending.lock().expect("pending").insert(req_id, reply);
+                pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(req_id, reply);
                 send(&writer, &json!({
                     "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
                     "params": {"sessionId": session_id, "summary": summary, "protectedWhy": protected_why},
@@ -186,10 +196,16 @@ async fn drain_events(
                 .await;
             }
             EngineEvent::TurnDone { outcome, usage } => {
+                // A turn that ended without its asks being answered left dead
+                // reply channels behind — drop them so they can't leak.
+                pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|_, tx| !tx.is_closed());
                 notify(&writer, &session_id, json!({"type": "turn_done", "outcome": outcome_tag(&outcome)})).await;
                 // Take the id and drop the guard *before* awaiting (a
                 // std::sync guard held across .await would make this non-Send).
-                let prompt_id = pending_prompt.lock().expect("prompt").take();
+                let prompt_id = pending_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front();
                 if let Some(id) = prompt_id {
                     reply_ok(
                         &writer,
