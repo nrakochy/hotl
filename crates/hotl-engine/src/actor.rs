@@ -75,7 +75,7 @@ pub(crate) async fn run(
 ) {
     let mut items: Vec<Item> = std::mem::take(&mut deps.initial_items);
     let mut running = false;
-    let mut queue: VecDeque<String> = VecDeque::new();
+    let mut queue: VecDeque<(String, Option<SyntheticReason>)> = VecDeque::new();
     let shared = Arc::new(SharedDeps::new(deps));
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
@@ -84,12 +84,10 @@ pub(crate) async fn run(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             SessionCmd::Prompt(text) => {
-                if running {
-                    queue.push_back(text);
-                    let _ = events.send(EngineEvent::PromptQueued).await;
-                } else {
-                    running = start_turn(&shared, &mut items, text, &cmd_tx, &events, &current_turn).await;
-                }
+                running = admit_prompt(&shared, &mut items, &mut queue, running, text, None, &cmd_tx, &events, &current_turn).await;
+            }
+            SessionCmd::PromptTagged { text, synthetic } => {
+                running = admit_prompt(&shared, &mut items, &mut queue, running, text, Some(synthetic), &cmd_tx, &events, &current_turn).await;
             }
             SessionCmd::Continue => {
                 if !running && crate::needs_continuation(&items) {
@@ -160,7 +158,7 @@ async fn try_compact(
 async fn end_turn(
     shared: &Arc<SharedDeps>,
     items: &mut Vec<Item>,
-    queue: &mut VecDeque<String>,
+    queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
     outcome: Outcome,
     usage: TokenUsage,
     cmd_tx: &mpsc::Sender<SessionCmd>,
@@ -170,7 +168,7 @@ async fn end_turn(
     annotate(shared, &outcome);
     let _ = events.send(EngineEvent::TurnDone { outcome, usage }).await;
     match queue.pop_front() {
-        Some(next) => start_turn(shared, items, next, cmd_tx, events, current_turn).await,
+        Some((next, synthetic)) => start_turn(shared, items, next, synthetic, cmd_tx, events, current_turn).await,
         None => false,
     }
 }
@@ -283,15 +281,38 @@ async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
     None
 }
 
-async fn start_turn(
+/// Start a turn now, or queue the prompt if one is running (one-at-a-time
+/// promotion). Carries an optional provenance tag (T2).
+#[allow(clippy::too_many_arguments)]
+async fn admit_prompt(
     shared: &Arc<SharedDeps>,
     items: &mut Vec<Item>,
+    queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
+    running: bool,
     text: String,
+    synthetic: Option<SyntheticReason>,
     cmd_tx: &mpsc::Sender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
-    let item = Item::User { text, synthetic: None };
+    if running {
+        queue.push_back((text, synthetic));
+        let _ = events.send(EngineEvent::PromptQueued).await;
+        return true;
+    }
+    start_turn(shared, items, text, synthetic, cmd_tx, events, current_turn).await
+}
+
+async fn start_turn(
+    shared: &Arc<SharedDeps>,
+    items: &mut Vec<Item>,
+    text: String,
+    synthetic: Option<SyntheticReason>,
+    cmd_tx: &mpsc::Sender<SessionCmd>,
+    events: &mpsc::Sender<EngineEvent>,
+    current_turn: &Arc<Mutex<CancellationToken>>,
+) -> bool {
+    let item = Item::User { text, synthetic };
     if !shared.append(EntryPayload::Item { item: item.clone() }) {
         let _ = events
             .send(EngineEvent::TurnDone {

@@ -28,11 +28,61 @@ pub(crate) struct Resumed {
 }
 
 pub async fn agent_main(args: Vec<String>) -> i32 {
-    let (prompt, json_events) = match parse_args(args) {
+    let parsed = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
-    run_session(prompt, json_events, None).await
+    match (parsed.schema, parsed.prompt) {
+        (Some(schema), Some(prompt)) => structured_main(&prompt, &schema).await,
+        (_, prompt) => run_session(prompt, parsed.json_events, None).await,
+    }
+}
+
+/// `hotl -p "…" --json-schema <file>` (T2): run one headless turn, validate the
+/// answer against the schema (with bounded retry), print the JSON or exit 1.
+async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
+    let schema: serde_json::Value = match std::fs::read_to_string(schema_path)
+        .map_err(|e| e.to_string())
+        .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
+    {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("hotl: could not read --json-schema `{}`: {e}", schema_path.display());
+            return 2;
+        }
+    };
+    let secrets = EnvSecrets;
+    let (provider, model) = match select_provider(&secrets) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            return 1;
+        }
+    };
+    let scaffold = match scaffold(provider, model, &secrets) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, Masker::from_env(), scaffold.clock.now_ms()) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("hotl: could not create session log: {e}");
+            return 1;
+        }
+    };
+    let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
+    items.push(crate::structured::contract_item(&schema));
+    let mut handle = spawn_session(scaffold.deps(log, None, items));
+    match crate::structured::run_structured(&mut handle, &schema, prompt, crate::structured::MAX_RETRIES).await {
+        Ok(value) => {
+            println!("{value}");
+            0
+        }
+        Err(e) => {
+            eprintln!("hotl: {e}");
+            1
+        }
+    }
 }
 
 /// `hotl resume [id-prefix]`: bare lists recent sessions; with a prefix,
@@ -718,14 +768,22 @@ fn ask_timeout_from_env(secrets: &dyn SecretStore) -> Option<std::time::Duration
 }
 
 /// `(-p prompt, --json)`; `Err(exit_code)` on bad usage.
-fn parse_args(args: Vec<String>) -> Result<(Option<String>, bool), i32> {
+struct Args {
+    prompt: Option<String>,
+    json_events: bool,
+    schema: Option<PathBuf>,
+}
+
+fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut prompt: Option<String> = None;
     let mut json_events = false;
+    let mut schema: Option<PathBuf> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-p" | "--print" => prompt = iter.next(),
             "--json" => json_events = true,
+            "--json-schema" => schema = iter.next().map(PathBuf::from),
             other => {
                 eprintln!("hotl: unknown argument `{other}` (try --help)");
                 return Err(2);
@@ -736,7 +794,11 @@ fn parse_args(args: Vec<String>) -> Result<(Option<String>, bool), i32> {
         eprintln!("hotl: -p requires a prompt");
         return Err(2);
     }
-    Ok((prompt, json_events))
+    if schema.is_some() && prompt.is_none() {
+        eprintln!("hotl: --json-schema requires -p \"<prompt>\"");
+        return Err(2);
+    }
+    Ok(Args { prompt, json_events, schema })
 }
 
 /// Secrets-at-rest audit (M2): warn about earlier logs holding values that

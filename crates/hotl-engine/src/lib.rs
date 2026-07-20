@@ -140,6 +140,9 @@ impl std::fmt::Debug for EngineEvent {
 pub enum SessionCmd {
     /// A user prompt. Starts a turn, or queues (one-at-a-time promotion).
     Prompt(String),
+    /// A prompt whose committed item carries a provenance tag (T2: schema
+    /// contract + validation-retry feedback ride in as tagged user items).
+    PromptTagged { text: String, synthetic: hotl_types::SyntheticReason },
     /// Continue an interrupted turn (M4/#8): sample against the current
     /// projection with no new user item — used on resume when the last item
     /// is a user/tool turn the model never answered. No-op if already running.
@@ -188,6 +191,10 @@ pub struct SessionHandle {
 impl SessionHandle {
     pub async fn prompt(&self, text: String) {
         let _ = self.cmd.send(SessionCmd::Prompt(text)).await;
+    }
+    /// A prompt whose committed user item carries a provenance tag (T2).
+    pub async fn prompt_tagged(&self, text: String, synthetic: hotl_types::SyntheticReason) {
+        let _ = self.cmd.send(SessionCmd::PromptTagged { text, synthetic }).await;
     }
     pub async fn steer(&self, text: String) {
         let _ = self.cmd.send(SessionCmd::Steer(text)).await;

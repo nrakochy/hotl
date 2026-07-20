@@ -45,6 +45,7 @@ anyhow = "1"
 ulid = "1"
 tempfile = "3"
 async-stream = "0.3"
+jsonschema = { version = "0.26", default-features = false }
 libc = "0.2"
 sha2 = "0.10"
 

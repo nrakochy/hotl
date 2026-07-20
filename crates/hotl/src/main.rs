@@ -25,6 +25,7 @@ mod session_server;
 mod setup;
 mod shell_hooks;
 mod spawn;
+mod structured;
 mod watch;
 
 /// The zsh `:` prefix (Forge, corpus 11): a line starting with `: ` becomes
@@ -97,7 +98,7 @@ fn print_help() {
     println!(
         "hotl — human on the loop\n\n\
          USAGE:\n  hotl                 agent REPL (execute)\n  \
-         hotl -p \"prompt\"     headless one-shot (add --json for a JSONL event stream)\n  \
+         hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
          hotl watch           tmux agent dashboard (watch)\n  \
