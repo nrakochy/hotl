@@ -65,24 +65,7 @@ fn main() {
             let force = args.iter().any(|a| a == "--force" || a == "-f");
             std::process::exit(setup::setup_main(&agent::config_dir(), force));
         }
-        Some("update") => {
-            let current = env!("CARGO_PKG_VERSION");
-            println!("hotl {current}");
-            // A caller (or a future release-feed fetch) can pass the latest
-            // known version to get a real up-to-date/outdated verdict.
-            if let Some(latest) = args.get(1) {
-                if setup::is_newer(current, latest) {
-                    println!("a newer version is available: {latest}");
-                } else {
-                    println!("up to date (latest: {latest}).");
-                }
-            }
-            println!(
-                "to update: `cargo install --locked hotl`, or re-run the installer script.\n\
-                 (automated self-update is not wired yet — it needs a signed release feed; MD.)"
-            );
-            std::process::exit(0);
-        }
+        Some("update") => std::process::exit(update_main(args.get(1).map(String::as_str))),
         Some("init") => {
             // Binary-generated shell integration (0001 §M1, Forge's `:` prefix).
             match args.get(1).map(String::as_str) {
@@ -116,6 +99,25 @@ fn main() {
         }
         _ => std::process::exit(block_on(agent::agent_main(args))),
     }
+}
+
+/// `hotl update`: report the current version, compare against `latest` if the
+/// caller supplied one, and point at the update path.
+fn update_main(latest: Option<&str>) -> i32 {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("hotl {current}");
+    if let Some(latest) = latest {
+        if setup::is_newer(current, latest) {
+            println!("a newer version is available: {latest}");
+        } else {
+            println!("up to date (latest: {latest}).");
+        }
+    }
+    println!(
+        "to update: `cargo install --locked hotl`, or re-run the installer script.\n\
+         (automated self-update is not wired yet — it needs a signed release feed; MD.)"
+    );
+    0
 }
 
 /// One-shot CLI paths run current_thread per the async policy (no pool

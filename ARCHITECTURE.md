@@ -4,7 +4,7 @@
 
 **Shape: event-log-as-canon, actor-as-serializer, ACP spine.** Session state is a projection of one append-only entry log (a tree via `parent_id`, with a movable leaf); the model transcript and the UI replay are two *projections* of it; compaction is an appended entry that re-points the projection, never a rewrite. One actor per session serializes admission and commits; turn tasks *propose* entries, only the actor commits them.
 
-Status: design settled (see [the blueprint](docs/design-docs/blueprint.md)); **M0–M3 implemented** (see [0001](docs/exec-plans/active/0001-harness-build.md) for what each landed and the named residual gaps). This file is the map; the blueprint and the vendored research corpus ([docs/references/agent-framework/](docs/references/agent-framework/README.md)) are the source of record for design, the exec plan for build state.
+Status: design settled (see [the blueprint](docs/design-docs/blueprint.md)); **M0–M5 implemented, MD partially** (M4 surfaces/orchestration + M5 extension hooks landed 2026-07-20; some M4/M5 items deferred to the owner-driven 0006 plan) (see [0001](docs/exec-plans/active/0001-harness-build.md) for what each landed and the named residual gaps). This file is the map; the blueprint and the vendored research corpus ([docs/references/agent-framework/](docs/references/agent-framework/README.md)) are the source of record for design, the exec plan for build state.
 
 ## The layers (build order)
 
