@@ -14,6 +14,7 @@
 mod acp;
 mod agent;
 mod doctor;
+mod spawn;
 mod watch;
 
 /// The zsh `:` prefix (Forge, corpus 11): a line starting with `: ` becomes

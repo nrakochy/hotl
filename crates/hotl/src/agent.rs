@@ -85,7 +85,18 @@ pub async fn acp_main() -> i32 {
     let sandbox_enforced = matches!(sandbox::probe(), sandbox::SandboxStatus::Enforced(_));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = engine_config(&model, &secrets);
-    let registry = Arc::new(build_registry(&config_dir));
+    let spawn_builder = child_builder(
+        provider.clone(),
+        rules.clone(),
+        clock.clone(),
+        config.clone(),
+        cwd.clone(),
+        config_dir.clone(),
+        system.clone(),
+        model.clone(),
+        sandbox_enforced,
+    );
+    let registry = Arc::new(build_registry(&config_dir, Some(spawn_builder)));
 
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         let resumed = match spec {
@@ -162,9 +173,21 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     spawn_secret_audit(log.path().to_path_buf());
     let (snapshots, initial_items) = session_context(&session_id, &cwd, &config_dir, &resumed);
 
+    let config = engine_config(&model, &secrets);
+    let spawn_builder = child_builder(
+        provider.clone(),
+        rules.clone(),
+        clock.clone(),
+        config.clone(),
+        cwd.clone(),
+        config_dir.clone(),
+        system.clone(),
+        model.clone(),
+        sandbox_enforced,
+    );
     let handle = spawn_session(SessionDeps {
         provider,
-        registry: Arc::new(build_registry(&config_dir)),
+        registry: Arc::new(build_registry(&config_dir, Some(spawn_builder))),
         rules,
         sandbox_enforced,
         clock,
@@ -173,7 +196,7 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
         cwd: cwd.clone(),
         snapshots,
         initial_items,
-        config: engine_config(&model, &secrets),
+        config,
     });
 
     let mut surface = Surface::new(handle, headless, json_events);
@@ -198,8 +221,13 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     surface.repl().await
 }
 
-/// Builtins + the `mcp` meta-tool when servers are configured (M3a).
-fn build_registry(config_dir: &std::path::Path) -> Registry {
+/// Builtins + the `mcp` meta-tool (M3a) + the `spawn` tool (M4) when a child
+/// builder is supplied. `spawn` is omitted for child sessions, so sub-agents
+/// cannot recurse (structural depth cap — 0005 §3).
+fn build_registry(
+    config_dir: &std::path::Path,
+    spawn_builder: Option<Arc<dyn crate::spawn::ChildBuilder>>,
+) -> Registry {
     let mut registry = Registry::builtin_with(hotl_tools::diagnostics::Diagnostics::load(config_dir));
     let (mcp, warning) = hotl_mcp::config::load(config_dir);
     if let Some(warning) = warning {
@@ -212,7 +240,71 @@ fn build_registry(config_dir: &std::path::Path) -> Registry {
     if hotl_tools::skills::SkillTool::has_skills(config_dir) {
         registry.register(Box::new(hotl_tools::skills::SkillTool::new(config_dir)));
     }
+    if let Some(builder) = spawn_builder {
+        registry.register(Box::new(crate::spawn::SpawnTool::new(builder)));
+    }
     registry
+}
+
+/// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
+/// provider/rules/config but with a builtins-only registry (no spawn, no MCP,
+/// no snapshots — a clean, non-recursive child). M4.
+struct HotlChildBuilder {
+    provider: Arc<dyn hotl_provider::Provider>,
+    rules: Arc<Rules>,
+    clock: Arc<dyn Clock>,
+    config: EngineConfig,
+    cwd: PathBuf,
+    config_dir: PathBuf,
+    system: String,
+    model: String,
+    sandbox_enforced: bool,
+}
+
+impl crate::spawn::ChildBuilder for HotlChildBuilder {
+    fn build(&self, _brief: &str) -> Result<hotl_engine::SessionHandle, String> {
+        let log = SessionLog::create(&sessions_dir(), &self.model, None, Masker::from_env(), self.clock.now_ms())
+            .map_err(|e| format!("child session log: {e}"))?;
+        let registry = Registry::builtin_with(hotl_tools::diagnostics::Diagnostics::load(&self.config_dir));
+        Ok(spawn_session(SessionDeps {
+            provider: self.provider.clone(),
+            registry: Arc::new(registry),
+            rules: self.rules.clone(),
+            sandbox_enforced: self.sandbox_enforced,
+            clock: self.clock.clone(),
+            log,
+            system: self.system.clone(),
+            cwd: self.cwd.clone(),
+            snapshots: None,
+            initial_items: Vec::new(),
+            config: self.config.clone(),
+        }))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn child_builder(
+    provider: Arc<dyn hotl_provider::Provider>,
+    rules: Arc<Rules>,
+    clock: Arc<dyn Clock>,
+    config: EngineConfig,
+    cwd: PathBuf,
+    config_dir: PathBuf,
+    system: String,
+    model: String,
+    sandbox_enforced: bool,
+) -> Arc<dyn crate::spawn::ChildBuilder> {
+    Arc::new(HotlChildBuilder {
+        provider,
+        rules,
+        clock,
+        config,
+        cwd,
+        config_dir,
+        system,
+        model,
+        sandbox_enforced,
+    })
 }
 
 /// Snapshotter + starting context for a session. A resumed session inherits

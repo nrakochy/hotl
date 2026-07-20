@@ -40,7 +40,18 @@ Layers (02, 09, 12):
 
 **Trust-store first-use screen (Sec #12):** the first call to a server raises a *protected* ask (never auto-allowable by rules): server name, binary path, SHA-256 of the binary, and what approval means ("this program will run on your machine and its output will enter the model's context"). Approval is recorded in `~/.config/hotl/trust.toml` keyed by server name → binary hash. A changed hash re-raises the screen (content-hash revocation, the standing rule below). Denial simply fails the call back to the model.
 
-**Not yet specified — each bound to a named milestone gate, not floating debt (r2 R5):** cross-agent-message routing rows are an **M4 exit gate**; the default policy file contents + the remaining trust-prompt screens (extension install, workspace trust — the MCP first-use screen shipped with M3a) + parameterized capabilities (fs scoped to path globs, http to host allowlists) are an **M5 entry gate**. These prompts and defaults *are* the real boundary — undesigned, they are the Forge failure recursed (Sec #12); gated, they cannot be silently skipped.
+## M4 cross-agent routing rows (the exit-gate artifact — r2 R12)
+
+| Untrusted path | Where it flows | Control | Notes |
+|---|---|---|---|
+| sub-agent result → parent context | tool result on the parent's `spawn` call | wrapped in the untrusted-content envelope (`<subagent-result trust="untrusted">`) with closing-delimiter defang; the parent treats it as data, not the user's word | `hotl-tools`-style envelope in the `spawn` tool (M4) |
+| sub-agent → tool execution | child engine on the same machine | the child has **no human on the loop**, so its permission asks **default-deny** (headless posture); it runs only auto-allowed/read-only tools. It inherits the parent's sandbox floor and allow-rules but gets a builtins-only registry (no `spawn`, no MCP) — it cannot recurse or reach external servers | structural depth cap = 1 |
+| ACP client → session | the `hotl acp` protocol surface | the client answers `session/request_permission` round-trips — it *is* the human-on-the-loop for that session, exactly like the REPL; a client that never answers is a dropped oneshot = deny | one session per connection |
+| orchestrator mailbox / task-list content → context | *(when `hotl fleet` ships)* | **reserved**: mailbox and task-list text is untrusted-envelope input on arrival, same as a sub-agent result — an orchestrator is not a trusted principal | M4 seam; fleet is future |
+
+The spawn depth cap is **structural, not a counter**: children are built without a `spawn` tool, so "a sub-agent spawning sub-agents forever" cannot happen — the capability simply isn't in the child's registry. `fork` (seed a child from the parent projection) and `teammate` (hotl as an ACP *client* of another agent) are reserved topologies.
+
+**Not yet specified — each bound to a named milestone gate, not floating debt (r2 R5):** the default policy file contents + the remaining trust-prompt screens (extension install, workspace trust — the MCP first-use screen shipped with M3a) + parameterized capabilities (fs scoped to path globs, http to host allowlists) are an **M5 entry gate**. These prompts and defaults *are* the real boundary — undesigned, they are the Forge failure recursed (Sec #12); gated, they cannot be silently skipped.
 
 Other standing rules:
 - **`hotl watch` is a single-user tool on a single-user assumption.** It runs `ps -axo …` (every user's process command lines) and `tmux capture-pane` (whatever is on screen). On a shared/multi-user host these can surface other users' secrets (`mysql -pPASSWORD`, `--token=…`) and arbitrary scrollback. All `ps`/`tmux` calls use argv arrays (no shell interpolation — no command injection), so this is local information disclosure inherent to a process dashboard, not an execution risk. Don't run `hotl watch` on a host where you shouldn't see other users' process arguments. (security-evaluation H-10.)
