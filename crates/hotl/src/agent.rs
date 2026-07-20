@@ -1,16 +1,19 @@
-//! The execute surface: REPL and `-p` headless (0001 §M0).
+//! The execute surface (0001 §M0/M1): a steering REPL and `-p` headless.
+//!
+//! The surface is a client of the session actor: it renders events, answers
+//! asks, and turns typed lines into prompts (idle) or steers (mid-turn).
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use futures_util::future::BoxFuture;
 use hotl_context::{load_system_prompt, project_instructions};
-use hotl_engine::{Engine, EngineConfig, EngineEvent, Outcome};
+use hotl_engine::{spawn_session, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
 use hotl_platform::{Clock, EnvSecrets, SecretStore, SystemClock};
 use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
 use hotl_store::{Masker, SessionLog};
-use hotl_tools::{PermissionGate, Registry};
-use tokio_util::sync::CancellationToken;
+use hotl_tools::{rules::Rules, sandbox, Registry};
+use tokio::sync::mpsc;
 
 const ASK_TIMEOUT_SECS: u64 = 300;
 
@@ -35,164 +38,277 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     }
 
     let secrets = EnvSecrets;
-    let (provider, model): (Box<dyn hotl_provider::Provider>, String) =
-        match select_provider(&secrets) {
-            Ok(pair) => pair,
-            Err(msg) => {
-                eprintln!("hotl: {msg}");
-                return 1;
-            }
-        };
-    let provider = &*provider;
-    let registry = Registry::builtin();
-    let clock = SystemClock;
+    let (provider, model) = match select_provider(&secrets) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            return 1;
+        }
+    };
+
+    let clock = Arc::new(SystemClock);
     let config_dir = config_dir();
     let system = load_system_prompt(&config_dir);
+    let rules = Arc::new(Rules::load(&config_dir));
+    let sandbox_status = sandbox::probe();
+    let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let mut log = match SessionLog::create(&sessions_dir(), &model, None, Masker::from_env(), clock.now_ms()) {
+    let log = match SessionLog::create(&sessions_dir(), &model, None, Masker::from_env(), clock.now_ms()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl: could not create session log: {e}");
             return 1;
         }
     };
+    let session_id = log.session_id.clone();
 
-    let mut items = Vec::new();
+    let mut initial_items = Vec::new();
     if let Some(instructions) = project_instructions(&cwd) {
-        items.push(instructions);
+        initial_items.push(instructions);
     }
 
-    let gate = CliGate { headless };
-    let engine = Engine {
+    let handle = spawn_session(SessionDeps {
         provider,
-        registry: &registry,
-        gate: &gate,
-        clock: &clock,
+        registry: Arc::new(Registry::builtin()),
+        rules,
+        sandbox_enforced,
+        clock,
+        log,
+        system,
+        initial_items,
         config: EngineConfig { model: model.clone(), ..Default::default() },
-    };
-
-    if let Some(p) = prompt {
-        return run_one(&engine, &mut items, &mut log, &system, p, json_events).await;
-    }
-
-    // REPL
-    println!("hotl · {model} · session {} · ctrl-c interrupts a turn, ctrl-d exits", log.session_id);
-    loop {
-        eprint!("\n❯ ");
-        let Some(line) = read_stdin_line().await else {
-            println!();
-            return 0; // EOF
-        };
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            continue;
-        }
-        if matches!(line.as_str(), "exit" | "quit") {
-            return 0;
-        }
-        run_one(&engine, &mut items, &mut log, &system, line, false).await;
-    }
-}
-
-async fn run_one(
-    engine: &Engine<'_>,
-    items: &mut Vec<hotl_types::Item>,
-    log: &mut SessionLog,
-    system: &str,
-    prompt: String,
-    json_events: bool,
-) -> i32 {
-    let cancel = CancellationToken::new();
-    let cancel_on_sigint = cancel.clone();
-    let ctrlc = tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            cancel_on_sigint.cancel();
-        }
     });
 
-    let mut saw_text = false;
-    let mut on_event = |event: EngineEvent| {
-        if json_events {
-            let v = match &event {
-                EngineEvent::TextDelta(t) => serde_json::json!({"type":"text_delta","text":t}),
-                EngineEvent::ThinkingDelta(_) => serde_json::json!({"type":"thinking_delta"}),
-                EngineEvent::ToolStart { name, summary } => serde_json::json!({"type":"tool_start","name":name,"summary":summary}),
-                EngineEvent::ToolDone { name, ok } => serde_json::json!({"type":"tool_done","name":name,"ok":ok}),
-                EngineEvent::ToolDenied { name } => serde_json::json!({"type":"tool_denied","name":name}),
-                EngineEvent::Retrying { attempt, reason } => serde_json::json!({"type":"retrying","attempt":attempt,"reason":reason}),
-                EngineEvent::TurnDone { usage } => serde_json::json!({"type":"turn_done","usage":usage}),
-            };
-            println!("{v}");
+    let mut surface = Surface::new(handle, headless, json_events);
+
+    if let Some(p) = prompt {
+        surface.handle.prompt(p).await;
+        return surface.run_until_idle().await;
+    }
+
+    println!(
+        "hotl · {model} · session {session_id} · {}",
+        match &sandbox_status {
+            sandbox::SandboxStatus::Enforced(m) => format!("sandbox:{m}"),
+            other => other.label(),
+        }
+    );
+    println!("type to prompt · type mid-turn to steer · ctrl-c interrupts · ctrl-d exits");
+    surface.repl().await
+}
+
+struct Surface {
+    handle: SessionHandle,
+    headless: bool,
+    json: bool,
+    stdin: mpsc::Receiver<String>,
+    turn_running: bool,
+    saw_text: bool,
+}
+
+impl Surface {
+    fn new(handle: SessionHandle, headless: bool, json: bool) -> Self {
+        let (tx, rx) = mpsc::channel(8);
+        if !headless {
+            std::thread::spawn(move || {
+                let stdin = std::io::stdin();
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    match stdin.read_line(&mut line) {
+                        Ok(0) | Err(_) => break, // EOF
+                        Ok(_) => {
+                            if tx.blocking_send(line.clone()).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+        Self { handle, headless, json, stdin: rx, turn_running: false, saw_text: false }
+    }
+
+    /// Interactive loop. Lines while idle → prompts; lines mid-turn → steers.
+    async fn repl(&mut self) -> i32 {
+        self.prompt_marker();
+        loop {
+            tokio::select! {
+                maybe_event = self.handle.events.recv() => {
+                    let Some(event) = maybe_event else { return 0 };
+                    self.render(event).await;
+                }
+                maybe_line = self.stdin.recv() => {
+                    let Some(line) = maybe_line else { println!(); return 0 };
+                    let line = line.trim().to_string();
+                    if line.is_empty() { if !self.turn_running { self.prompt_marker(); } continue; }
+                    if !self.turn_running && matches!(line.as_str(), "exit" | "quit") { return 0; }
+                    if self.turn_running {
+                        self.handle.steer(line).await;
+                        eprintln!("(steered — woven into the agent's next step)");
+                    } else {
+                        self.handle.prompt(line).await;
+                        self.turn_running = true;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => {
+                    if self.turn_running {
+                        self.handle.interrupt();
+                    } else {
+                        println!();
+                        return 0;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Headless: drain events until the (single) turn completes.
+    async fn run_until_idle(&mut self) -> i32 {
+        self.turn_running = true;
+        loop {
+            tokio::select! {
+                maybe_event = self.handle.events.recv() => {
+                    let Some(event) = maybe_event else { return 1 };
+                    let done_code = if let EngineEvent::TurnDone { ref outcome, .. } = event {
+                        Some(exit_code(outcome))
+                    } else {
+                        None
+                    };
+                    self.render(event).await;
+                    if let Some(code) = done_code {
+                        return code;
+                    }
+                }
+                _ = tokio::signal::ctrl_c() => self.handle.interrupt(),
+            }
+        }
+    }
+
+    fn prompt_marker(&self) {
+        if !self.headless {
+            eprint!("\n❯ ");
+        }
+    }
+
+    async fn render(&mut self, event: EngineEvent) {
+        if self.json {
+            self.render_json(event);
             return;
         }
         match event {
             EngineEvent::TextDelta(t) => {
-                saw_text = true;
+                self.saw_text = true;
                 print!("{t}");
                 let _ = std::io::stdout().flush();
             }
+            EngineEvent::ThinkingDelta(_) => {}
             EngineEvent::ToolStart { summary, .. } => {
-                if saw_text {
+                if self.saw_text {
                     println!();
-                    saw_text = false;
+                    self.saw_text = false;
                 }
                 eprintln!("· {summary}");
             }
             EngineEvent::ToolDone { ok, .. } => {
                 if !ok {
-                    eprintln!("  (tool reported an error — feeding it back to the model)");
+                    eprintln!("  (tool error — fed back to the model)");
                 }
             }
             EngineEvent::ToolDenied { .. } => eprintln!("  (denied)"),
+            EngineEvent::ToolAutoAllowed { name, rule } => {
+                eprintln!("  (auto-allowed {name} by rule: {rule})");
+            }
             EngineEvent::Retrying { attempt, reason } => eprintln!("· retrying ({attempt}): {reason}"),
-            EngineEvent::ThinkingDelta(_) => {}
-            EngineEvent::TurnDone { usage } => {
+            EngineEvent::FallbackModel { model } => eprintln!("· falling back to {model}"),
+            EngineEvent::PromptQueued => eprintln!("(queued — runs after the current turn)"),
+            EngineEvent::Ask { summary, protected_why, reply } => {
+                let answer = self.ask_human(&summary, protected_why.as_deref()).await;
+                let _ = reply.send(answer);
+            }
+            EngineEvent::TurnDone { outcome, usage } => {
+                self.turn_running = false;
+                match &outcome {
+                    Outcome::Done { .. } => {}
+                    Outcome::Cancelled => eprintln!("\n(interrupted)"),
+                    Outcome::TurnLimit => eprintln!("\nhotl: stopped at max_turns — break the task into smaller prompts."),
+                    Outcome::Refused => eprintln!("\nhotl: the model declined this request."),
+                    Outcome::DoomLoop { pattern } => eprintln!("\nhotl: stopped — the model kept repeating: {pattern}"),
+                    Outcome::ToolFailureBudget { tool } => {
+                        eprintln!("\nhotl: stopped — `{tool}` failed too many times in a row.")
+                    }
+                    Outcome::Error { message } => eprintln!("\nhotl: {message}"),
+                }
                 eprintln!(
-                    "\n[in {} out {} cache-read {}]",
+                    "[in {} out {} cache-read {}]",
                     usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
                 );
+                self.prompt_marker();
             }
         }
-    };
+    }
 
-    let result = engine
-        .run_prompt(items, log, system, prompt, cancel.clone(), &mut on_event)
-        .await;
-    ctrlc.abort();
+    fn render_json(&mut self, event: EngineEvent) {
+        let v = match event {
+            EngineEvent::TextDelta(t) => serde_json::json!({"type":"text_delta","text":t}),
+            EngineEvent::ThinkingDelta(_) => serde_json::json!({"type":"thinking_delta"}),
+            EngineEvent::ToolStart { name, summary } => serde_json::json!({"type":"tool_start","name":name,"summary":summary}),
+            EngineEvent::ToolDone { name, ok } => serde_json::json!({"type":"tool_done","name":name,"ok":ok}),
+            EngineEvent::ToolDenied { name } => serde_json::json!({"type":"tool_denied","name":name}),
+            EngineEvent::ToolAutoAllowed { name, rule } => serde_json::json!({"type":"tool_auto_allowed","name":name,"rule":rule}),
+            EngineEvent::Retrying { attempt, reason } => serde_json::json!({"type":"retrying","attempt":attempt,"reason":reason}),
+            EngineEvent::FallbackModel { model } => serde_json::json!({"type":"fallback_model","model":model}),
+            EngineEvent::PromptQueued => serde_json::json!({"type":"prompt_queued"}),
+            EngineEvent::Ask { summary, reply, .. } => {
+                // JSON mode is headless automation: default-deny, emit the record.
+                let _ = reply.send(false);
+                serde_json::json!({"type":"ask_denied","summary":summary})
+            }
+            EngineEvent::TurnDone { outcome, usage } => {
+                self.turn_running = false;
+                serde_json::json!({"type":"turn_done","outcome":format!("{outcome:?}"),"usage":usage})
+            }
+        };
+        println!("{v}");
+    }
 
-    match result {
-        Ok(Outcome::Done { .. }) => 0,
-        Ok(Outcome::Cancelled) => {
-            eprintln!("\n(interrupted)");
-            130
+    async fn ask_human(&mut self, summary: &str, protected_why: Option<&str>) -> bool {
+        if self.headless || !std::io::stdin().is_terminal() {
+            eprintln!("hotl: denied (headless): {summary}");
+            return false;
         }
-        Ok(Outcome::TurnLimit) => {
-            eprintln!("\nhotl: stopped at max_turns — the task didn't converge; break it into smaller prompts.");
-            1
+        if let Some(why) = protected_why {
+            eprintln!("⚠ PROTECTED PATH — {why}");
         }
-        Ok(Outcome::Refused) => {
-            eprintln!("\nhotl: the model declined this request (safety classifiers).");
-            1
-        }
-        Ok(Outcome::DoomLoop { pattern }) => {
-            eprintln!("\nhotl: stopped — the model kept repeating: {pattern}");
-            1
-        }
-        Err(e) => {
-            eprintln!("\nhotl: {e}");
-            1
+        eprint!("allow {summary}? [y/N] ");
+        match tokio::time::timeout(std::time::Duration::from_secs(ASK_TIMEOUT_SECS), self.stdin.recv()).await {
+            Ok(Some(line)) => matches!(line.trim(), "y" | "Y" | "yes"),
+            Ok(None) => false,
+            Err(_) => {
+                eprintln!("(no answer in {ASK_TIMEOUT_SECS}s — denied)");
+                false
+            }
         }
     }
 }
 
-/// Provider/model selection (distribution.md §D5 resolution order applies to
-/// keys). `HOTL_MODEL` accepts `provider/model`:
+fn exit_code(outcome: &Outcome) -> i32 {
+    match outcome {
+        Outcome::Done { .. } => 0,
+        Outcome::Cancelled => 130,
+        _ => 1,
+    }
+}
+
+/// Provider/model selection. `HOTL_MODEL` accepts `provider/model`:
 ///   anthropic/claude-…   needs ANTHROPIC_API_KEY
 ///   openai/gpt-…         needs OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for
 ///                        keyless OpenAI-compatible endpoints (Ollama etc.)
 /// A bare model string means Anthropic; unset means the Anthropic default.
-fn select_provider(secrets: &dyn SecretStore) -> Result<(Box<dyn hotl_provider::Provider>, String), String> {
+fn select_provider(
+    secrets: &dyn SecretStore,
+) -> Result<(Arc<dyn hotl_provider::Provider>, String), String> {
     let raw = secrets.get("HOTL_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let (provider_name, model) = match raw.split_once('/') {
         Some((p, m)) => (p.to_ascii_lowercase(), m.to_string()),
@@ -207,7 +323,7 @@ fn select_provider(secrets: &dyn SecretStore) -> Result<(Box<dyn hotl_provider::
                  `hotl watch` needs no key."
                     .to_string()
             })?;
-            Ok((Box::new(AnthropicProvider::new(key)), model))
+            Ok((Arc::new(AnthropicProvider::new(key)), model))
         }
         "openai" | "oai" => {
             let base = secrets
@@ -220,58 +336,12 @@ fn select_provider(secrets: &dyn SecretStore) -> Result<(Box<dyn hotl_provider::
                             local/compatible endpoint, e.g. http://localhost:11434/v1 for Ollama)."
                     .to_string());
             }
-            Ok((Box::new(hotl_provider_openai::OpenAiCompatProvider::new(base, key)), model))
+            Ok((Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(base, key)), model))
         }
         other => Err(format!(
             "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, openai/<model> \
              (openai covers any OpenAI-compatible endpoint via HOTL_OPENAI_BASE_URL)."
         )),
-    }
-}
-
-/// The human on the loop, CLI edition. Headless (`-p`) default-denies without
-/// waiting (Sec #11); interactive asks time out to deny after 5 minutes so an
-/// unattended terminal can't hold a turn open forever.
-struct CliGate {
-    headless: bool,
-}
-
-impl PermissionGate for CliGate {
-    fn ask<'a>(&'a self, summary: &'a str, protected_why: Option<&'a str>) -> BoxFuture<'a, bool> {
-        Box::pin(async move {
-            if self.headless || !std::io::stdin().is_terminal() {
-                eprintln!("hotl: denied (headless): {summary}");
-                return false;
-            }
-            if let Some(why) = protected_why {
-                eprintln!("⚠ PROTECTED PATH — {why}");
-            }
-            eprint!("allow {summary}? [y/N] ");
-            let answer = tokio::time::timeout(
-                std::time::Duration::from_secs(ASK_TIMEOUT_SECS),
-                read_stdin_line(),
-            )
-            .await;
-            match answer {
-                Ok(Some(line)) => matches!(line.trim(), "y" | "Y" | "yes"),
-                Ok(None) => false,
-                Err(_) => {
-                    eprintln!("(no answer in {ASK_TIMEOUT_SECS}s — denied)");
-                    false
-                }
-            }
-        })
-    }
-}
-
-async fn read_stdin_line() -> Option<String> {
-    use tokio::io::AsyncBufReadExt;
-    let mut line = String::new();
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-    match reader.read_line(&mut line).await {
-        Ok(0) => None,
-        Ok(_) => Some(line),
-        Err(_) => None,
     }
 }
 

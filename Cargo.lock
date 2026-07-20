@@ -499,6 +499,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotl-testkit"
+version = "0.1.2"
+dependencies = [
+ "hotl-engine",
+ "hotl-platform",
+ "hotl-provider",
+ "hotl-store",
+ "hotl-tools",
+ "hotl-types",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "hotl-tools"
 version = "0.1.2"
 dependencies = [
@@ -506,10 +521,12 @@ dependencies = [
  "hotl-provider",
  "landlock",
  "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]
