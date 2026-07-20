@@ -4,7 +4,7 @@
 
 **Shape: event-log-as-canon, actor-as-serializer, ACP spine.** Session state is a projection of one append-only entry log (a tree via `parent_id`, with a movable leaf); the model transcript and the UI replay are two *projections* of it; compaction is an appended entry that re-points the projection, never a rewrite. One actor per session serializes admission and commits; turn tasks *propose* entries, only the actor commits them.
 
-Status: design settled (see [the blueprint](docs/design-docs/blueprint.md)); implementation not started. This file is the map; the blueprint and the vendored research corpus ([docs/references/agent-framework/](docs/references/agent-framework/README.md)) are the source of record.
+Status: design settled (see [the blueprint](docs/design-docs/blueprint.md)); **M0 and M1 implemented** (see [0001](docs/exec-plans/active/0001-harness-build.md) for what each landed and the named residual gaps). This file is the map; the blueprint and the vendored research corpus ([docs/references/agent-framework/](docs/references/agent-framework/README.md)) are the source of record for design, the exec plan for build state.
 
 ## The layers (build order)
 
@@ -30,14 +30,6 @@ Compilation targets: **native from day one; WASM (browser) is a gated post-M5 mi
 | Agent ↔ frontend | ACP (Zed's) — the embedding contract |
 | Agent ↔ own sub/peer agents | Own spawn interface; agents-as-tools (MCP) / agents-as-providers (ACP) |
 | Agent ↔ un-owned peers | A2A — seam reserved, implementation deferred |
-
-```mermaid
-flowchart LR
-    WATCH["hotl watch (W1–W4)<br/>(observes from outside:<br/>pane titles, process state,<br/>captured output)"] -.observes.-> CORE
-    FLEET["hotl fleet (future)<br/>+ other frontends<br/>(headless, zsh plugin, editor, TUI)"] -- "ACP" --> CORE["hotl execute — harness core<br/>types → providers → turn engine<br/>tools → persistence → context"]
-    CORE -- "MCP" --> TOOLS["MCP servers / tools"]
-    CORE -- "spawn interface<br/>(topology as data)" --> AGENTS["Subagents / forks / teams<br/>other harnesses via ACP or MCP"]
-```
 
 ## How a prompt flows (M1 runtime)
 
