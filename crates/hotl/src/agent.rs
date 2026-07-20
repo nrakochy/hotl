@@ -380,7 +380,7 @@ fn exit_code(outcome: &Outcome) -> i32 {
 ///   openai/gpt-…         needs OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for
 ///                        keyless OpenAI-compatible endpoints (Ollama etc.)
 /// A bare model string means Anthropic; unset means the Anthropic default.
-fn select_provider(
+pub(crate) fn select_provider(
     secrets: &dyn SecretStore,
 ) -> Result<(Arc<dyn hotl_provider::Provider>, String), String> {
     let raw = secrets.get("HOTL_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
@@ -419,7 +419,7 @@ fn select_provider(
     }
 }
 
-fn config_dir() -> PathBuf {
+pub(crate) fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
@@ -427,7 +427,7 @@ fn config_dir() -> PathBuf {
         .join("hotl")
 }
 
-fn sessions_dir() -> PathBuf {
+pub(crate) fn sessions_dir() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))

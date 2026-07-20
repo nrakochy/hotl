@@ -5,10 +5,11 @@
 //!   -p "prompt"   headless one-shot; asks default-deny (Sec #11); --json for events
 //!   watch         the tmux dashboard (the pre-merge `hotl`)
 //!   fleet         reserved (orchestrate, M4+)
-//!   doctor        reserved (MD)
+//!   doctor        environment/setup checks (MD)
 //!   update        reserved (MD)
 
 mod agent;
+mod doctor;
 mod watch;
 
 /// The zsh `:` prefix (Forge, corpus 11): a line starting with `: ` becomes
@@ -38,8 +39,9 @@ fn main() {
             eprintln!("hotl fleet (orchestrate) is reserved and not built yet — it arrives after the harness's M4 seams. See docs/exec-plans/active/0001-harness-build.md.");
             std::process::exit(2);
         }
-        Some("doctor") | Some("update") => {
-            eprintln!("`hotl {}` is reserved for the distribution milestone (MD) and not built yet.", args[0]);
+        Some("doctor") => std::process::exit(doctor::doctor_main()),
+        Some("update") => {
+            eprintln!("`hotl update` is reserved for the distribution milestone (MD) and not built yet.");
             std::process::exit(2);
         }
         Some("init") => {
@@ -59,6 +61,7 @@ fn main() {
                  hotl -p \"prompt\"     headless one-shot (add --json for a JSONL event stream)\n  \
                  hotl watch           tmux agent dashboard (watch)\n  \
                  hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
+                 hotl doctor          check provider keys, sandbox, config, session store\n  \
                  hotl fleet           reserved (orchestrate)\n\n\
                  ENV:\n  HOTL_MODEL             provider/model, e.g. anthropic/{} or openai/gpt-5\n  \
                  ANTHROPIC_API_KEY      for the anthropic provider (the default)\n  \
