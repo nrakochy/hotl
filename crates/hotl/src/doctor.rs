@@ -40,6 +40,7 @@ pub fn doctor_main() -> i32 {
         sessions_check(&sessions_dir),
         memory_check(&config_dir),
         audit_check(&sessions_dir),
+        undo_check(),
     ];
     println!("hotl {} — doctor", env!("CARGO_PKG_VERSION"));
     let mut failed = false;
@@ -121,6 +122,14 @@ fn memory_check(config_dir: &Path) -> Check {
             "memory: none (create {}/memory/MEMORY.md to enable)",
             config_dir.display()
         )),
+    }
+}
+
+fn undo_check() -> Check {
+    if hotl_store::shadow::git_available() {
+        ok("undo: git found — sessions snapshot before/after mutating steps".into())
+    } else {
+        warn("undo: git not found — `hotl undo` snapshots are disabled".into())
     }
 }
 

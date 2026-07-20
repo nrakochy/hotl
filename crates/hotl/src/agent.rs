@@ -104,6 +104,10 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     let session_id = log.session_id.clone();
 
     spawn_secret_audit(log.path().to_path_buf());
+    let snapshots = shadow_snapshotter(&session_id, &cwd);
+    if snapshots.is_none() {
+        eprintln!("hotl: git not found — `hotl undo` snapshots disabled this session");
+    }
     // A resumed session inherits the replayed projection verbatim (it already
     // carries the original memory/instructions); fresh sessions assemble anew.
     let initial_items = match &resumed {
@@ -120,6 +124,7 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
         log,
         system,
         cwd: cwd.clone(),
+        snapshots,
         initial_items,
         config: engine_config(&model, &secrets),
     });
@@ -150,6 +155,82 @@ fn build_registry(config_dir: &std::path::Path) -> Registry {
         registry.register(Box::new(hotl_mcp::McpTool::new(mcp.servers, trust)));
     }
     registry
+}
+
+/// Shadow-git snapshotter (M3b): blocking git work runs on the blocking
+/// pool so a slow snapshot never stalls the turn.
+struct GitSnapshotter(Arc<hotl_store::shadow::Shadow>);
+
+impl hotl_engine::Snapshotter for GitSnapshotter {
+    fn snapshot(&self, label: String) -> futures_util::future::BoxFuture<'static, ()> {
+        let shadow = self.0.clone();
+        Box::pin(async move {
+            let _ = tokio::task::spawn_blocking(move || shadow.snapshot(&label)).await;
+        })
+    }
+}
+
+fn shadow_snapshotter(
+    session_id: &str,
+    cwd: &std::path::Path,
+) -> Option<Arc<dyn hotl_engine::Snapshotter>> {
+    let shadow = hotl_store::shadow::Shadow::create(&shadow_root(), session_id, cwd)?;
+    Some(Arc::new(GitSnapshotter(Arc::new(shadow))))
+}
+
+pub(crate) fn shadow_root() -> PathBuf {
+    sessions_dir().parent().map(|p| p.join("shadow")).unwrap_or_else(|| PathBuf::from("shadow"))
+}
+
+/// `hotl undo [--force]`: restore the workspace to the newest session's
+/// last pre-batch snapshot. Interactive confirm unless --force.
+pub(crate) fn undo_main(args: Vec<String>) -> i32 {
+    let force = args.iter().any(|a| a == "--force" || a == "-f");
+    let root = shadow_root();
+    let Some(session) = hotl_store::shadow::latest_session(&root) else {
+        eprintln!("hotl: no shadow snapshots found (sessions record them automatically when git is available)");
+        return 1;
+    };
+    let Some(shadow) = hotl_store::shadow::Shadow::open(&root, &session) else {
+        eprintln!("hotl: shadow repo for session {session} is unreadable");
+        return 1;
+    };
+    let Some((hash, label)) = shadow.latest_pre() else {
+        eprintln!("hotl: session {session} has no pre-batch snapshot to restore");
+        return 1;
+    };
+    println!(
+        "restore `{}` to snapshot \"{label}\" of session {session}?",
+        shadow.work_tree().display()
+    );
+    if !force {
+        eprint!("this overwrites tracked files changed since then [y/N] ");
+        let mut answer = String::new();
+        if std::io::stdin().read_line(&mut answer).is_err()
+            || !matches!(answer.trim(), "y" | "Y" | "yes")
+        {
+            println!("(cancelled)");
+            return 1;
+        }
+    }
+    match shadow.restore(&hash) {
+        Ok(files) if files.is_empty() => {
+            println!("nothing differed — tree already matches \"{label}\"");
+            0
+        }
+        Ok(files) => {
+            println!("restored {} file(s) to \"{label}\":", files.len());
+            for f in &files {
+                println!("  {f}");
+            }
+            println!("(files created after the snapshot are kept, listed above if changed)");
+            0
+        }
+        Err(e) => {
+            eprintln!("hotl: undo failed: {e}");
+            1
+        }
+    }
 }
 
 fn load_rules(config_dir: &std::path::Path) -> Arc<Rules> {

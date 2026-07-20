@@ -180,7 +180,13 @@ impl<'d> Turn<'d> {
     }
 
     /// Execute the batch in source order; every call gets a paired result.
+    /// Mutating batches (anything beyond `read`) are bracketed by shadow
+    /// snapshots so `hotl undo` can restore the pre-batch tree (M3b).
     async fn run_tool_batch(&mut self, uses: &[ToolUse]) -> Option<Outcome> {
+        let mutating = uses.iter().any(|tu| tu.name != "read");
+        if mutating {
+            self.snap(format!("pre batch {}", self.samples)).await;
+        }
         let mut results = Vec::with_capacity(uses.len());
         let mut budget_blown: Option<String> = None;
         for tu in uses {
@@ -191,6 +197,9 @@ impl<'d> Turn<'d> {
             let outcome = self.execute_gated(tu).await;
             let (content, failed) = self.apply_failure_budget(tu, outcome, &mut budget_blown);
             results.push(ToolResultItem { tool_use_id: tu.id.clone(), content, is_error: failed });
+        }
+        if mutating {
+            self.snap(format!("post batch {}", self.samples)).await;
         }
         let cancelled = self.cancel.is_cancelled();
         let mut entries = vec![EntryPayload::Item { item: Item::ToolResults { results } }];
@@ -373,6 +382,12 @@ impl<'d> Turn<'d> {
                     if text.contains(marker)
             )
         })
+    }
+
+    async fn snap(&self, label: String) {
+        if let Some(snapshots) = &self.shared.snapshots {
+            snapshots.snapshot(label).await;
+        }
     }
 
     async fn snapshot(&self) -> Option<Arc<Vec<Item>>> {

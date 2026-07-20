@@ -36,6 +36,7 @@ pub(crate) struct SharedDeps {
     pub system: String,
     pub cwd: PathBuf,
     pub config: EngineConfig,
+    pub snapshots: Option<Arc<dyn crate::Snapshotter>>,
     log: Mutex<SessionLog>,
 }
 
@@ -50,6 +51,7 @@ impl SharedDeps {
             system: deps.system,
             cwd: deps.cwd,
             config: deps.config,
+            snapshots: deps.snapshots,
             log: Mutex::new(deps.log),
         }
     }

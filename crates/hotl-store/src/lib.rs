@@ -5,6 +5,8 @@
 //! a later cleanup pass can never reach what was already written. Durable-ack
 //! commit semantics arrive with the M1 writer actor; M0 flushes per entry.
 
+pub mod shadow;
+
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};

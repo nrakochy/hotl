@@ -7,6 +7,7 @@
 //!   fleet         reserved (orchestrate, M4+)
 //!   doctor        environment/setup checks (MD)
 //!   resume        continue an earlier session from its log (M3b)
+//!   undo          restore files to the last pre-batch snapshot (M3b)
 //!   update        reserved (MD)
 
 mod agent;
@@ -41,6 +42,7 @@ fn main() {
             std::process::exit(2);
         }
         Some("doctor") => std::process::exit(doctor::doctor_main()),
+        Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
         Some("resume") => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -72,6 +74,7 @@ fn main() {
                  hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
                  hotl doctor          check provider keys, sandbox, config, session store\n  \
                  hotl resume [id]     continue an earlier session (bare: list recent)\n  \
+                 hotl undo            restore files to before the agent's last change\n  \
                  hotl fleet           reserved (orchestrate)\n\n\
                  ENV:\n  HOTL_MODEL             provider/model, e.g. anthropic/{} or openai/gpt-5\n  \
                  ANTHROPIC_API_KEY      for the anthropic provider (the default)\n  \

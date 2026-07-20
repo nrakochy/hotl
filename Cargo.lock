@@ -570,6 +570,7 @@ dependencies = [
 name = "hotl-testkit"
 version = "0.1.2"
 dependencies = [
+ "futures-util",
  "hotl-engine",
  "hotl-platform",
  "hotl-provider",

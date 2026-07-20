@@ -28,6 +28,18 @@ pub struct Harness {
     pub ask_answer: bool,
     /// One-shot steer to send when the next ToolStart is observed.
     pub steer_on_tool_start: Option<String>,
+    /// Labels of every shadow snapshot the engine requested, in order.
+    pub snapshots: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+/// Records snapshot labels instead of running git.
+struct RecordingSnapshotter(Arc<std::sync::Mutex<Vec<String>>>);
+
+impl hotl_engine::Snapshotter for RecordingSnapshotter {
+    fn snapshot(&self, label: String) -> futures_util::future::BoxFuture<'static, ()> {
+        self.0.lock().expect("snapshot log").push(label);
+        Box::pin(async {})
+    }
 }
 
 impl Harness {
@@ -45,6 +57,7 @@ impl Harness {
             .expect("session log");
         let log_path = log.path().to_path_buf();
         let provider = Arc::new(ScriptedProvider::new(scripts));
+        let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deps = SessionDeps {
             provider: provider.clone(),
             registry: Arc::new(Registry::builtin()),
@@ -54,6 +67,7 @@ impl Harness {
             log,
             system: "test-system".into(),
             cwd: dir.path().to_path_buf(),
+            snapshots: Some(Arc::new(RecordingSnapshotter(snapshots.clone()))),
             initial_items: Vec::new(),
             config,
         };
@@ -66,6 +80,7 @@ impl Harness {
             _dir: dir,
             ask_answer: true,
             steer_on_tool_start: None,
+            snapshots,
         }
     }
 
@@ -491,6 +506,34 @@ mod tests {
         let requests = h.provider.requests();
         let flat = format!("{:?}", requests[1].items);
         assert!(flat.contains("web subproject rules"));
+    }
+
+    #[tokio::test]
+    async fn mutating_batches_are_bracketed_by_snapshots() {
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
+                ScriptedProvider::text_reply("done"),
+            ],
+            cfg(),
+        );
+        h.prompt_and_wait("run it").await;
+        let labels = h.snapshots.lock().unwrap().clone();
+        assert_eq!(labels, ["pre batch 1", "post batch 1"]);
+
+        // Read-only batches don't snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "x").unwrap();
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "read", json!({"path": file.to_str().unwrap()})),
+                ScriptedProvider::text_reply("read"),
+            ],
+            cfg(),
+        );
+        h.prompt_and_wait("read it").await;
+        assert!(h.snapshots.lock().unwrap().is_empty());
     }
 
     #[allow(dead_code)]

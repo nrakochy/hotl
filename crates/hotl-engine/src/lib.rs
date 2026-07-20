@@ -125,6 +125,13 @@ pub enum SessionCmd {
     TurnFinished { end: TurnEnd, usage: TokenUsage },
 }
 
+/// Workspace snapshots around mutating tool batches (M3b shadow-git).
+/// Implementations run the actual snapshot off-thread; a slow or absent
+/// snapshotter must never wedge the turn.
+pub trait Snapshotter: Send + Sync {
+    fn snapshot(&self, label: String) -> futures_util::future::BoxFuture<'static, ()>;
+}
+
 pub struct SessionDeps {
     pub provider: Arc<dyn Provider>,
     pub registry: Arc<Registry>,
@@ -135,6 +142,8 @@ pub struct SessionDeps {
     pub system: String,
     /// Working directory for subdir instruction hints (M2).
     pub cwd: PathBuf,
+    /// Shadow snapshots (M3b); None = run without undo support.
+    pub snapshots: Option<Arc<dyn Snapshotter>>,
     pub initial_items: Vec<Item>,
     pub config: EngineConfig,
 }
