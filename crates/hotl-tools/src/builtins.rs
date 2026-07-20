@@ -110,7 +110,10 @@ fn render_lines(lines: &[&str], offset: usize, total: usize) -> String {
     out
 }
 
-pub struct WriteTool;
+#[derive(Default)]
+pub struct WriteTool {
+    pub diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
+}
 
 impl Tool for WriteTool {
     fn name(&self) -> &'static str {
@@ -133,7 +136,7 @@ impl Tool for WriteTool {
         file_permission("write", input)
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(write_impl(&input).await) })
+        Box::pin(async move { with_diagnostics(&self.diag, &input, write_impl(&input).await).await })
     }
 }
 
@@ -153,7 +156,10 @@ async fn write_impl(input: &Value) -> ToolResult {
     Ok(ToolOutcome::ok(format!("Wrote {} bytes to {path}.", content.len())))
 }
 
-pub struct EditTool;
+#[derive(Default)]
+pub struct EditTool {
+    pub diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
+}
 
 impl Tool for EditTool {
     fn name(&self) -> &'static str {
@@ -177,8 +183,25 @@ impl Tool for EditTool {
         file_permission("edit", input)
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(edit_impl(&input).await) })
+        Box::pin(async move { with_diagnostics(&self.diag, &input, edit_impl(&input).await).await })
     }
+}
+
+/// Append the configured post-mutation check (M3a) to a successful result.
+async fn with_diagnostics(
+    diag: &crate::diagnostics::Diagnostics,
+    input: &Value,
+    result: ToolResult,
+) -> ToolOutcome {
+    let mut outcome = done(result);
+    if !outcome.is_error {
+        if let Ok(path) = str_arg(input, "path") {
+            if let Some(report) = diag.check(path).await {
+                outcome.content.push_str(&report);
+            }
+        }
+    }
+    outcome
 }
 
 async fn edit_impl(input: &Value) -> ToolResult {
@@ -343,14 +366,14 @@ mod tests {
         std::fs::write(&path, "aaa\nbbb\naaa\n").unwrap();
         let p = path.to_str().unwrap();
 
-        let dup = run(&EditTool, json!({"path": p, "old_string": "aaa", "new_string": "ccc"}));
+        let dup = run(&EditTool::default(), json!({"path": p, "old_string": "aaa", "new_string": "ccc"}));
         assert!(dup.is_error);
         assert!(dup.content.contains("matches 2 places"));
 
-        let missing = run(&EditTool, json!({"path": p, "old_string": "zzz", "new_string": "ccc"}));
+        let missing = run(&EditTool::default(), json!({"path": p, "old_string": "zzz", "new_string": "ccc"}));
         assert!(missing.is_error && missing.content.contains("not found"));
 
-        let ok = run(&EditTool, json!({"path": p, "old_string": "bbb", "new_string": "BBB"}));
+        let ok = run(&EditTool::default(), json!({"path": p, "old_string": "bbb", "new_string": "BBB"}));
         assert!(!ok.is_error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaa\nBBB\naaa\n");
     }
@@ -360,7 +383,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a/b/c.txt");
         let p = path.to_str().unwrap();
-        let w = run(&WriteTool, json!({"path": p, "content": "one\ntwo\n"}));
+        let w = run(&WriteTool::default(), json!({"path": p, "content": "one\ntwo\n"}));
         assert!(!w.is_error, "{}", w.content);
         let r = run(&ReadTool, json!({"path": p}));
         assert!(!r.is_error);

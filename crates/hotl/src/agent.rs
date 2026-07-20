@@ -79,7 +79,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
 
 /// Builtins + the `mcp` meta-tool when servers are configured (M3a).
 fn build_registry(config_dir: &std::path::Path) -> Registry {
-    let mut registry = Registry::builtin();
+    let mut registry = Registry::builtin_with(hotl_tools::diagnostics::Diagnostics::load(config_dir));
     let (mcp, warning) = hotl_mcp::config::load(config_dir);
     if let Some(warning) = warning {
         eprintln!("hotl: {warning}");

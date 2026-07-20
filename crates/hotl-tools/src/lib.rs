@@ -6,6 +6,7 @@
 //! corpus 14). Erasure happens once: tools are `dyn Tool` in the registry.
 
 mod builtins;
+pub mod diagnostics;
 pub(crate) mod matcher;
 pub mod rules;
 pub mod sandbox;
@@ -73,11 +74,17 @@ pub struct Registry {
 
 impl Registry {
     pub fn builtin() -> Self {
+        Self::builtin_with(diagnostics::Diagnostics::default())
+    }
+
+    /// Builtins with post-mutation diagnostics (M3a) shared by edit/write.
+    pub fn builtin_with(diag: diagnostics::Diagnostics) -> Self {
+        let diag = std::sync::Arc::new(diag);
         Self {
             tools: vec![
                 Box::new(ReadTool),
-                Box::new(EditTool),
-                Box::new(WriteTool),
+                Box::new(EditTool { diag: diag.clone() }),
+                Box::new(WriteTool { diag }),
                 Box::new(BashTool),
             ],
         }
