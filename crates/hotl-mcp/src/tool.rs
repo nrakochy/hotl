@@ -23,6 +23,10 @@ pub struct McpTool {
     servers: Vec<ServerConfig>,
     clients: tokio::sync::Mutex<HashMap<String, Arc<Client>>>,
     trust: Mutex<TrustStore>,
+    /// Binary hash per server, computed once and reused for the trust screen
+    /// and the recorded grant (H-07): the value the user is shown is exactly
+    /// the value persisted, and the file isn't re-read on every call.
+    hashes: Mutex<HashMap<String, String>>,
     connector: Connector,
     /// Leaked once at construction: the Tool trait hands out &'static str.
     description: &'static str,
@@ -62,6 +66,7 @@ impl McpTool {
             servers,
             clients: tokio::sync::Mutex::new(HashMap::new()),
             trust: Mutex::new(trust),
+            hashes: Mutex::new(HashMap::new()),
             connector,
             description,
         }
@@ -71,6 +76,15 @@ impl McpTool {
         self.servers.iter().find(|s| s.name == name)
     }
 
+    /// Cached binary hash for a server (computed once per session).
+    fn hash_of(&self, cfg: &ServerConfig) -> String {
+        let mut cache = self.hashes.lock().expect("hash cache");
+        cache
+            .entry(cfg.name.clone())
+            .or_insert_with(|| binary_hash(&cfg.command))
+            .clone()
+    }
+
     async fn ensure_client(&self, cfg: &ServerConfig) -> Result<Arc<Client>, String> {
         let mut clients = self.clients.lock().await;
         if let Some(client) = clients.get(&cfg.name) {
@@ -78,11 +92,12 @@ impl McpTool {
         }
         let client = (self.connector)(cfg.clone()).await?;
         // Reaching run() means the (protected) ask was approved upstream —
-        // record the grant now, keyed to the binary that was approved.
+        // record the grant now, keyed to the *same* hash the screen showed
+        // (H-07: shown value == recorded value, from one read).
         self.trust
             .lock()
             .expect("trust mutex")
-            .record(&cfg.name, &binary_hash(&cfg.command));
+            .record(&cfg.name, &self.hash_of(cfg));
         clients.insert(cfg.name.clone(), client.clone());
         Ok(client.clone())
     }
@@ -163,7 +178,7 @@ impl Tool for McpTool {
             // Unknown server: run() errors without side effects.
             return Permission::None;
         };
-        let hash = binary_hash(&cfg.command);
+        let hash = self.hash_of(cfg);
         if self.trust.lock().expect("trust mutex").is_trusted(server, &hash) {
             Permission::Ask { summary }
         } else {

@@ -582,6 +582,16 @@ pub(crate) fn select_provider(
                             local/compatible endpoint, e.g. http://localhost:11434/v1 for Ollama)."
                     .to_string());
             }
+            // H-09: a bearer key over cleartext http:// to a non-loopback host
+            // crosses the network unencrypted. Warn loudly (don't silently
+            // send it); loopback http is the normal local-endpoint case.
+            if key.is_some() && cleartext_nonloopback(&base) {
+                eprintln!(
+                    "hotl: WARNING — HOTL_OPENAI_BASE_URL is a non-loopback http:// URL and \
+                     OPENAI_API_KEY is set; the key will cross the network unencrypted. \
+                     Use https:// or an SSH tunnel."
+                );
+            }
             Ok((Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(base, key)), model))
         }
         other => Err(format!(
@@ -589,6 +599,13 @@ pub(crate) fn select_provider(
              (openai covers any OpenAI-compatible endpoint via HOTL_OPENAI_BASE_URL)."
         )),
     }
+}
+
+/// A cleartext base URL pointing somewhere other than the local machine.
+fn cleartext_nonloopback(base: &str) -> bool {
+    let Some(rest) = base.strip_prefix("http://") else { return false };
+    let host = rest.split(['/', ':']).next().unwrap_or("");
+    !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") && !host.is_empty()
 }
 
 pub(crate) fn config_dir() -> PathBuf {
