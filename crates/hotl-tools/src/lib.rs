@@ -83,6 +83,11 @@ impl Registry {
         }
     }
 
+    /// Register an additional tool (MCP meta-tool, skills — M3).
+    pub fn register(&mut self, tool: Box<dyn Tool>) {
+        self.tools.push(tool);
+    }
+
     pub fn defs(&self) -> Vec<ToolDef> {
         self.tools
             .iter()

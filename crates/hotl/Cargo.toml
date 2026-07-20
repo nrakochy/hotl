@@ -29,6 +29,7 @@ hotl-provider = { path = "../hotl-provider", version = "0.1.2" }
 hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.1.2" }
 hotl-provider-openai = { path = "../hotl-provider-openai", version = "0.1.2" }
 hotl-tools = { path = "../hotl-tools", version = "0.1.2" }
+hotl-mcp = { path = "../hotl-mcp", version = "0.1.2" }
 hotl-store = { path = "../hotl-store", version = "0.1.2" }
 hotl-context = { path = "../hotl-context", version = "0.1.2" }
 hotl-engine = { path = "../hotl-engine", version = "0.1.2" }

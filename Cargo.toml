@@ -11,6 +11,7 @@ members = [
     "crates/hotl-provider-anthropic",
     "crates/hotl-provider-openai",
     "crates/hotl-tools",
+    "crates/hotl-mcp",
     "crates/hotl-store",
     "crates/hotl-context",
     "crates/hotl-engine",
@@ -45,6 +46,7 @@ ulid = "1"
 tempfile = "3"
 async-stream = "0.3"
 libc = "0.2"
+sha2 = "0.10"
 
 [profile.release]
 strip = true

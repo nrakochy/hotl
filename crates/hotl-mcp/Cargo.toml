@@ -1,0 +1,23 @@
+[package]
+name = "hotl-mcp"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. M3a MCP client: stdio JSON-RPC, deferred loading, sanitizer chokepoint, trust store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hotl-tools = { path = "../hotl-tools", version = "0.1.2" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

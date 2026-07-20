@@ -55,7 +55,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
 
     let handle = spawn_session(SessionDeps {
         provider,
-        registry: Arc::new(Registry::builtin()),
+        registry: Arc::new(build_registry(&config_dir)),
         rules,
         sandbox_enforced,
         clock,
@@ -75,6 +75,20 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
 
     print_banner(&model, &session_id, &sandbox_status);
     surface.repl().await
+}
+
+/// Builtins + the `mcp` meta-tool when servers are configured (M3a).
+fn build_registry(config_dir: &std::path::Path) -> Registry {
+    let mut registry = Registry::builtin();
+    let (mcp, warning) = hotl_mcp::config::load(config_dir);
+    if let Some(warning) = warning {
+        eprintln!("hotl: {warning}");
+    }
+    if !mcp.servers.is_empty() {
+        let trust = hotl_mcp::trust::TrustStore::load(config_dir);
+        registry.register(Box::new(hotl_mcp::McpTool::new(mcp.servers, trust)));
+    }
+    registry
 }
 
 fn load_rules(config_dir: &std::path::Path) -> Arc<Rules> {
