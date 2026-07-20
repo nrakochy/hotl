@@ -9,6 +9,7 @@ pub mod shadow;
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use hotl_types::{new_ulid, Entry, EntryPayload, SessionHeader, FORMAT_VERSION};
@@ -143,6 +144,29 @@ impl SessionLog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Write an oversized tool result to a masked blob beside the log (T4;
+    /// ledger 15). Path: `<log stem>.blobs/<tool_use_id>.txt`, 0600, created on
+    /// first use. The store owns masking, so a secret in the result never lands
+    /// unmasked even in the blob. Returns the blob path.
+    pub fn write_blob(&self, tool_use_id: &str, content: &str) -> std::io::Result<PathBuf> {
+        let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+        let dir = self.path.with_file_name(format!("{stem}.blobs"));
+        std::fs::create_dir_all(&dir)?;
+        // Tool-use ids are provider-generated tokens; keep the filename safe.
+        let safe: String = tool_use_id.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
+        let path = dir.join(format!("{}.txt", if safe.is_empty() { "blob" } else { &safe }));
+        let masked = self.masker.apply(content);
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&path)?;
+        f.write_all(masked.as_bytes())?;
+        f.flush()?;
+        Ok(path)
     }
 
     /// Append one entry (chained via parent_id), masked, flushed.
@@ -405,6 +429,20 @@ mod tests {
             "a forged/edited log must warn, got {:?}",
             replayed.warnings
         );
+    }
+
+    #[test]
+    fn blob_is_masked_and_beside_the_log() {
+        std::env::set_var("HOTL_BLOB_SECRET", "sk-topsecret-value");
+        let masker = Masker::from_env();
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, masker, 1).unwrap();
+        let p = log.write_blob("toolu_1", "before sk-topsecret-value after").unwrap();
+        let on_disk = std::fs::read_to_string(&p).unwrap();
+        assert!(!on_disk.contains("sk-topsecret-value"), "secret leaked into the blob");
+        assert!(on_disk.contains("«masked:HOTL_BLOB_SECRET»"));
+        assert!(p.parent().unwrap().to_string_lossy().ends_with(".blobs"));
+        std::env::remove_var("HOTL_BLOB_SECRET");
     }
 
     #[test]

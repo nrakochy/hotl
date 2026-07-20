@@ -194,7 +194,8 @@ impl<'d> Turn<'d> {
                 results.push(pair(tu, "Not executed (turn stopped).", true));
                 continue;
             }
-            let outcome = self.execute_gated(tu).await;
+            let mut outcome = self.execute_gated(tu).await;
+            self.maybe_evict(tu, &mut outcome).await;
             let (content, failed) = self.apply_failure_budget(tu, outcome, &mut budget_blown);
             results.push(ToolResultItem { tool_use_id: tu.id.clone(), content, is_error: failed });
         }
@@ -430,6 +431,38 @@ impl<'d> Turn<'d> {
         }
     }
 
+    /// Evict an oversized *successful* tool result to a masked blob (T4),
+    /// replacing it in-context with a head preview + a read-it pointer. The
+    /// deliberate 3-chars/token overcount (M2) evicts a bit early. A failed
+    /// blob write leaves the full content in place — eviction is an
+    /// optimization, never a data-loss path.
+    async fn maybe_evict(&self, tu: &ToolUse, outcome: &mut ToolOutcome) {
+        let threshold = self.shared.config.evict_threshold_tokens;
+        if threshold == 0 || outcome.is_error {
+            return;
+        }
+        if hotl_context::tokens::estimate_text(&outcome.content) <= threshold {
+            return;
+        }
+        let (tx, rx) = oneshot::channel();
+        let cmd = SessionCmd::WriteBlob {
+            tool_use_id: tu.id.clone(),
+            content: outcome.content.clone(),
+            reply: tx,
+        };
+        if self.cmd_tx.send(cmd).await.is_err() {
+            return;
+        }
+        if let Ok(Some(path)) = rx.await {
+            let total = outcome.content.len();
+            let head = clip(&outcome.content, 2048);
+            outcome.content = format!(
+                "{head}\n<evicted total_bytes={total} file=\"{path}\">Full output saved. \
+                 Read it with the read tool ({path}); use offset to page.</evicted>"
+            );
+        }
+    }
+
     async fn snapshot(&self) -> Option<Arc<Vec<Item>>> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx.send(SessionCmd::Snapshot { reply: tx }).await.ok()?;
@@ -468,6 +501,18 @@ impl<'d> Turn<'d> {
         };
         self.emit(mapped).await;
     }
+}
+
+/// A head slice on a char boundary (never mid-UTF-8) — the eviction preview.
+fn clip(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 fn pair(tu: &ToolUse, message: &str, is_error: bool) -> ToolResultItem {

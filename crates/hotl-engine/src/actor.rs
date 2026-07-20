@@ -64,6 +64,16 @@ impl SharedDeps {
         let now = self.clock.now_ms();
         self.log.lock().expect("log mutex").append(payload, now).is_ok()
     }
+
+    /// Write an oversized tool result to a masked blob (T4); `None` on failure.
+    fn write_blob(&self, tool_use_id: &str, content: &str) -> Option<String> {
+        self.log
+            .lock()
+            .expect("log mutex")
+            .write_blob(tool_use_id, content)
+            .ok()
+            .map(|p| p.display().to_string())
+    }
 }
 
 pub(crate) async fn run(
@@ -102,26 +112,53 @@ pub(crate) async fn run(
             SessionCmd::Propose { entries, reply } => {
                 let _ = reply.send(commit(&shared, &mut items, entries));
             }
-            SessionCmd::TurnFinished { end, mut usage } => {
-                let outcome = match end {
-                    TurnEnd::Outcome(outcome) => Some(outcome),
-                    TurnEnd::Compact => {
-                        carry_usage += usage;
-                        usage = TokenUsage::default();
-                        try_compact(&shared, &mut items, &mut compact_streak, &cmd_tx, &events, &current_turn)
-                            .await
-                    }
-                };
-                if let Some(outcome) = outcome {
-                    compact_streak = 0;
-                    let mut total = usage;
-                    total += std::mem::take(&mut carry_usage);
-                    running =
-                        end_turn(&shared, &mut items, &mut queue, outcome, total, &cmd_tx, &events, &current_turn)
-                            .await;
-                }
+            SessionCmd::WriteBlob { tool_use_id, content, reply } => {
+                let _ = reply.send(shared.write_blob(&tool_use_id, &content));
+            }
+            SessionCmd::TurnFinished { end, usage } => {
+                on_turn_finished(TurnFinishedCtx {
+                    shared: &shared, items: &mut items, queue: &mut queue, running: &mut running,
+                    carry_usage: &mut carry_usage, compact_streak: &mut compact_streak,
+                    cmd_tx: &cmd_tx, events: &events, current_turn: &current_turn,
+                }, end, usage)
+                .await;
             }
         }
+    }
+}
+
+/// The mutable session state `on_turn_finished` threads back into the loop.
+struct TurnFinishedCtx<'a> {
+    shared: &'a Arc<SharedDeps>,
+    items: &'a mut Vec<Item>,
+    queue: &'a mut VecDeque<(String, Option<SyntheticReason>)>,
+    running: &'a mut bool,
+    carry_usage: &'a mut TokenUsage,
+    compact_streak: &'a mut u32,
+    cmd_tx: &'a mpsc::Sender<SessionCmd>,
+    events: &'a mpsc::Sender<EngineEvent>,
+    current_turn: &'a Arc<Mutex<CancellationToken>>,
+}
+
+/// A turn ended: either report it (and promote the queue) or, on a compaction
+/// request, fold and respawn the continuation.
+async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: TokenUsage) {
+    let outcome = match end {
+        TurnEnd::Outcome(outcome) => Some(outcome),
+        TurnEnd::Compact => {
+            *ctx.carry_usage += usage;
+            usage = TokenUsage::default();
+            try_compact(ctx.shared, ctx.items, ctx.compact_streak, ctx.cmd_tx, ctx.events, ctx.current_turn).await
+        }
+    };
+    if let Some(outcome) = outcome {
+        *ctx.compact_streak = 0;
+        let mut total = usage;
+        total += std::mem::take(ctx.carry_usage);
+        *ctx.running = end_turn(
+            ctx.shared, ctx.items, ctx.queue, outcome, total, ctx.cmd_tx, ctx.events, ctx.current_turn,
+        )
+        .await;
     }
 }
 

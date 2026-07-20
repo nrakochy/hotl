@@ -808,6 +808,49 @@ mod tests {
         h.assert_trajectory(&["write", "read"], TrajectoryMatch::Exact);
     }
 
+    /// Read a 60KB file with the given eviction threshold; return the first
+    /// tool result's content.
+    async fn read_big_with_threshold(threshold: u64) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big.txt");
+        std::fs::write(&big, "B".repeat(60_000)).unwrap();
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "read", json!({"path": big.to_str().unwrap()})),
+                ScriptedProvider::text_reply("read it"),
+            ],
+            EngineConfig { evict_threshold_tokens: threshold, max_turns: 6, ..Default::default() },
+        );
+        h.prompt_and_wait("read the big file").await;
+        std::mem::forget(dir);
+        let items = h.items();
+        let Item::ToolResults { results } = &items[2] else { panic!("expected results") };
+        // The blob (when evicted) lives beside the harness log.
+        if threshold != 0 {
+            let has_blobs = std::fs::read_dir(h.dir())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .any(|e| e.path().to_string_lossy().contains(".blobs"));
+            assert!(has_blobs, "a .blobs dir should exist beside the log after eviction");
+        }
+        results[0].content.clone()
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_result_is_evicted_to_a_blob() {
+        let content = read_big_with_threshold(5_000).await;
+        assert!(content.contains("<evicted"), "result should be evicted");
+        assert!(content.contains("Read it with the read tool"));
+        assert!(content.len() < 5_000, "in-context result is a preview, not the full 60KB");
+    }
+
+    #[tokio::test]
+    async fn eviction_disabled_at_threshold_zero() {
+        let content = read_big_with_threshold(0).await;
+        assert!(!content.contains("<evicted"), "threshold 0 disables eviction");
+        assert!(content.len() > 50_000, "the full result rides in-context when disabled");
+    }
+
     #[allow(dead_code)]
     fn silence_unused(_: StopReason, _: TokenUsage) {}
 }

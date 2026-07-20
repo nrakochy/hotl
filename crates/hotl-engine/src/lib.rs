@@ -44,6 +44,9 @@ pub struct EngineConfig {
     /// Include `context_used%` in the MOIM turn-context block (M4/#9).
     /// Default true = M2 behavior; false to avoid inducing context anxiety.
     pub show_context_pct: bool,
+    /// Evict a successful tool result larger than this (estimated tokens) to a
+    /// masked blob, leaving a head preview + read pointer (T4). `0` disables.
+    pub evict_threshold_tokens: u64,
 }
 
 impl Default for EngineConfig {
@@ -60,6 +63,7 @@ impl Default for EngineConfig {
             fast_model: None,
             compaction_reset: false,
             show_context_pct: true,
+            evict_threshold_tokens: 20_000,
         }
     }
 }
@@ -153,6 +157,10 @@ pub enum SessionCmd {
     Snapshot { reply: oneshot::Sender<Arc<Vec<Item>>> },
     /// Turn task → actor: commit these entries (durable-ack before reply).
     Propose { entries: Vec<EntryPayload>, reply: oneshot::Sender<bool> },
+    /// Turn task → actor: write an oversized tool result to a masked blob
+    /// (T4 — the actor owns the log, the turn never touches it directly).
+    /// Replies with the blob path, or None on write failure.
+    WriteBlob { tool_use_id: String, content: String, reply: oneshot::Sender<Option<String>> },
     /// Turn task → actor: the turn is over (or needs a compaction respawn).
     TurnFinished { end: TurnEnd, usage: TokenUsage },
 }

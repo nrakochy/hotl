@@ -842,6 +842,10 @@ fn engine_config(model: &str, secrets: &dyn SecretStore) -> EngineConfig {
         config.context_window = window;
     }
     config.fast_model = secrets.get("HOTL_FAST_MODEL");
+    // T4: HOTL_EVICT_TOKENS (0 disables eviction of oversized tool results).
+    if let Some(t) = secrets.get("HOTL_EVICT_TOKENS").and_then(|v| v.parse().ok()) {
+        config.evict_threshold_tokens = t;
+    }
     // M4/#9: opt into fresh-slate compaction and hiding the context gauge.
     config.compaction_reset = secrets.get("HOTL_COMPACTION_RESET").as_deref() == Some("1");
     config.show_context_pct = secrets.get("HOTL_HIDE_CONTEXT_PCT").as_deref() != Some("1");
