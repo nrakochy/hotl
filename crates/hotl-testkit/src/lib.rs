@@ -191,6 +191,55 @@ impl Harness {
             })
             .collect()
     }
+
+    /// (tool name, input) for every persisted assistant tool_use, in log order
+    /// — the *trajectory* a scenario produced (ledger 15, 0006 T3).
+    pub fn tool_calls(&self) -> Vec<(String, serde_json::Value)> {
+        self.items()
+            .iter()
+            .filter_map(|i| match i {
+                Item::Assistant { blocks } => Some(hotl_types::assistant_tool_uses(blocks)),
+                _ => None,
+            })
+            .flatten()
+            .map(|tu| (tu.name, tu.input))
+            .collect()
+    }
+
+    /// Assert on the tool-call sequence a scenario produced (not just entry
+    /// kinds). Panics — with both sequences — when the mode's relation fails.
+    pub fn assert_trajectory(&self, expected: &[&str], mode: TrajectoryMatch) {
+        let actual: Vec<String> = self.tool_calls().into_iter().map(|(n, _)| n).collect();
+        let ok = match mode {
+            TrajectoryMatch::Exact => actual.iter().map(String::as_str).eq(expected.iter().copied()),
+            TrajectoryMatch::Unordered => {
+                let mut a: Vec<&str> = actual.iter().map(String::as_str).collect();
+                let mut e = expected.to_vec();
+                a.sort_unstable();
+                e.sort_unstable();
+                a == e
+            }
+            TrajectoryMatch::Subset => is_subsequence(expected, &actual),
+        };
+        assert!(ok, "trajectory {mode:?} failed:\n expected: {expected:?}\n actual:   {actual:?}");
+    }
+}
+
+/// How `assert_trajectory` relates the expected names to the actual sequence.
+#[derive(Debug, Clone, Copy)]
+pub enum TrajectoryMatch {
+    /// Exactly this sequence, in order.
+    Exact,
+    /// The same multiset of names, any order.
+    Unordered,
+    /// These names appear in order (an in-order subsequence).
+    Subset,
+}
+
+/// Is `needles` an in-order subsequence of `haystack`?
+fn is_subsequence(needles: &[&str], haystack: &[String]) -> bool {
+    let mut it = haystack.iter();
+    needles.iter().all(|n| it.any(|h| h == n))
 }
 
 #[cfg(test)]
@@ -723,6 +772,40 @@ mod tests {
             "the denial reason must reach the model: {}",
             results[0].content
         );
+    }
+
+    async fn harness_read_then_write() -> Harness {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.txt");
+        std::fs::write(&f, "content").unwrap();
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "read", json!({"path": f.to_str().unwrap()})),
+                ScriptedProvider::tool_call("t2", "write", json!({"path": f.to_str().unwrap(), "content": "new"})),
+                ScriptedProvider::text_reply("did both"),
+            ],
+            EngineConfig { max_turns: 6, ..Default::default() },
+        );
+        std::mem::forget(dir);
+        h.prompt_and_wait("read then write").await;
+        h
+    }
+
+    #[tokio::test]
+    async fn trajectory_matches() {
+        let h = harness_read_then_write().await;
+        h.assert_trajectory(&["read", "write"], TrajectoryMatch::Exact);
+        h.assert_trajectory(&["write", "read"], TrajectoryMatch::Unordered);
+        h.assert_trajectory(&["write"], TrajectoryMatch::Subset);
+        assert_eq!(h.tool_calls()[0].0, "read");
+        assert_eq!(h.tool_calls()[1].1["content"], "new");
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "trajectory")]
+    async fn trajectory_exact_rejects_wrong_order() {
+        let h = harness_read_then_write().await;
+        h.assert_trajectory(&["write", "read"], TrajectoryMatch::Exact);
     }
 
     #[allow(dead_code)]
