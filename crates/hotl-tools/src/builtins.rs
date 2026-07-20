@@ -1,7 +1,14 @@
 //! The four M0 built-ins. Failure messages are prompts (they instruct the
 //! model); truncation carries continuation hints.
 
+use crate::sandbox::{self, SandboxStatus};
 use crate::{execute_later_reason, Permission, Tool, ToolOutcome};
+use std::sync::OnceLock;
+
+fn sandbox_status() -> &'static SandboxStatus {
+    static STATUS: OnceLock<SandboxStatus> = OnceLock::new();
+    STATUS.get_or_init(sandbox::probe)
+}
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -225,7 +232,7 @@ impl Tool for BashTool {
     fn permission(&self, input: &Value) -> Permission {
         let cmd = input.get("command").and_then(Value::as_str).unwrap_or("?");
         let short: String = cmd.chars().take(120).collect();
-        Permission::Ask { summary: format!("bash: {short}") }
+        Permission::Ask { summary: format!("bash [{}]: {short}", sandbox_status().label()) }
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
@@ -239,10 +246,8 @@ impl Tool for BashTool {
                 .unwrap_or(BASH_DEFAULT_TIMEOUT_MS)
                 .min(BASH_MAX_TIMEOUT_MS);
 
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c")
-                .arg(&command)
-                .stdin(std::process::Stdio::null())
+            let mut cmd = sandbox::build_command(&command, sandbox_status());
+            cmd.stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .kill_on_drop(true)
