@@ -4,7 +4,7 @@
 
 **Shape: event-log-as-canon, actor-as-serializer, ACP spine.** Session state is a projection of one append-only entry log (a tree via `parent_id`, with a movable leaf); the model transcript and the UI replay are two *projections* of it; compaction is an appended entry that re-points the projection, never a rewrite. One actor per session serializes admission and commits; turn tasks *propose* entries, only the actor commits them.
 
-Status: design settled (see [the blueprint](docs/design-docs/blueprint.md)); **M0 and M1 implemented** (see [0001](docs/exec-plans/active/0001-harness-build.md) for what each landed and the named residual gaps). This file is the map; the blueprint and the vendored research corpus ([docs/references/agent-framework/](docs/references/agent-framework/README.md)) are the source of record for design, the exec plan for build state.
+Status: design settled (see [the blueprint](docs/design-docs/blueprint.md)); **M0–M2 implemented, M3a started** (see [0001](docs/exec-plans/active/0001-harness-build.md) for what each landed and the named residual gaps). This file is the map; the blueprint and the vendored research corpus ([docs/references/agent-framework/](docs/references/agent-framework/README.md)) are the source of record for design, the exec plan for build state.
 
 ## The layers (build order)
 
@@ -31,9 +31,9 @@ Compilation targets: **native from day one; WASM (browser) is a gated post-M5 mi
 | Agent ↔ own sub/peer agents | Own spawn interface; agents-as-tools (MCP) / agents-as-providers (ACP) |
 | Agent ↔ un-owned peers | A2A — seam reserved, implementation deferred |
 
-## How a prompt flows (M1 runtime)
+## How a prompt flows (M1/M2 runtime)
 
-One cycle: prompt → actor commits it → turn task samples against a snapshot → deltas stream to the surface → tool calls pass rules/ask and run (bash confined) → results commit → re-snapshot (steers woven in) → repeat until done. Every write goes through the actor and hits disk before the projection advances; ctrl-c bypasses the mailbox entirely.
+One cycle: prompt → actor commits it → turn task samples against a snapshot → deltas stream to the surface → tool calls pass rules/ask and run (bash confined) → results commit → re-snapshot (steers woven in) → repeat until done. Every write goes through the actor and hits disk before the projection advances; ctrl-c bypasses the mailbox entirely. One M2 path is not drawn: when the next request won't fit the context window, the turn ends, the actor folds old history into a typed digest (appending a `compaction` entry — the log keeps everything), and respawns a continuation turn at step ③.
 
 ```mermaid
 flowchart TB
