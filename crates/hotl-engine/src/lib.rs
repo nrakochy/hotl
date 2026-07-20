@@ -8,6 +8,7 @@
 //! asks are events carrying a oneshot reply.
 
 mod actor;
+pub mod hooks;
 mod turn;
 
 use std::path::PathBuf;
@@ -157,6 +158,8 @@ pub struct SessionDeps {
     pub cwd: PathBuf,
     /// Shadow snapshots (M3b); None = run without undo support.
     pub snapshots: Option<Arc<dyn Snapshotter>>,
+    /// Extension hooks (M5); None = no hooks.
+    pub hooks: Option<Arc<dyn hooks::Hooks>>,
     pub initial_items: Vec<Item>,
     pub config: EngineConfig,
 }

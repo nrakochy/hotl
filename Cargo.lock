@@ -468,9 +468,12 @@ dependencies = [
  "hotl-watch-tui",
  "hotl-watch-types",
  "ratatui",
+ "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]

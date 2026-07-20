@@ -61,6 +61,24 @@ impl Harness {
         config: EngineConfig,
         initial_items: Vec<Item>,
     ) -> Self {
+        Self::build(scripts, config, initial_items, None)
+    }
+
+    /// Construct a harness with extension hooks (M5 scenarios).
+    pub fn with_hooks(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        hooks: Arc<dyn hotl_engine::hooks::Hooks>,
+    ) -> Self {
+        Self::build(scripts, config, Vec::new(), Some(hooks))
+    }
+
+    fn build(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+        hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
             .expect("session log");
@@ -77,6 +95,7 @@ impl Harness {
             system: "test-system".into(),
             cwd: dir.path().to_path_buf(),
             snapshots: Some(Arc::new(RecordingSnapshotter(snapshots.clone()))),
+            hooks,
             initial_items,
             config,
         };
@@ -625,6 +644,61 @@ mod tests {
         let tc = reqs[0].turn_context.as_deref().unwrap();
         assert!(!tc.contains("context_used"), "pct must be omitted: {tc}");
         assert!(tc.contains("sample="), "the rest of MOIM still rides");
+    }
+
+    #[tokio::test]
+    async fn pre_tool_hook_blocks_a_call() {
+        use hotl_engine::hooks::{InProcessHooks, PreToolDecision};
+        let hooks = Arc::new(InProcessHooks::new().on_pre_tool(|name, input| {
+            if name == "bash" && input.get("command").and_then(|c| c.as_str()) == Some("danger") {
+                PreToolDecision::Deny { message: "policy: no danger".into() }
+            } else {
+                PreToolDecision::Continue
+            }
+        }));
+        let mut h = Harness::with_hooks(
+            vec![
+                ScriptedProvider::tool_call("t1", "bash", json!({"command": "danger"})),
+                ScriptedProvider::text_reply("understood, blocked"),
+            ],
+            cfg(),
+            hooks,
+        );
+        let outcome = h.prompt_and_wait("do the dangerous thing").await;
+        assert!(matches!(outcome, Outcome::Done { .. }));
+        // The blocked call became an error tool result carrying the hook message.
+        let blocked = h.items().into_iter().any(|i| matches!(
+            i, Item::ToolResults { results } if results.iter().any(|r| r.is_error && r.content.contains("policy: no danger"))
+        ));
+        assert!(blocked, "the hook's denial reached the model as a tool result");
+    }
+
+    #[tokio::test]
+    async fn post_tool_hook_annotates_a_result() {
+        use hotl_engine::hooks::InProcessHooks;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("f.txt");
+        std::fs::write(&file, "secret content").unwrap();
+        let hooks = Arc::new(
+            InProcessHooks::new().on_post_tool(|name, _result| {
+                (name == "read").then(|| "[redacted by hook]".to_string())
+            }),
+        );
+        let mut h = Harness::with_hooks(
+            vec![
+                ScriptedProvider::tool_call("t1", "read", json!({"path": file.to_str().unwrap()})),
+                ScriptedProvider::text_reply("read the redacted file"),
+            ],
+            cfg(),
+            hooks,
+        );
+        h.prompt_and_wait("read it").await;
+        let redacted = h.items().into_iter().any(|i| matches!(
+            i, Item::ToolResults { results } if results.iter().any(|r| r.content.contains("[redacted by hook]"))
+        ));
+        assert!(redacted, "the post-tool hook replaced the result the model saw");
+        // The real content never reached the transcript.
+        assert!(!h.transcript().contains("secret content"));
     }
 
     #[allow(dead_code)]

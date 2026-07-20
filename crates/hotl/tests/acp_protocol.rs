@@ -39,6 +39,7 @@ fn scripted_factory() -> acp::SessionFactory {
             system: "sys".into(),
             cwd: std::env::temp_dir(),
             snapshots: None,
+            hooks: None,
             initial_items: Vec::new(),
             config: EngineConfig { max_turns: 6, ..Default::default() },
         }))
@@ -106,13 +107,20 @@ async fn initialize_new_prompt_permission_and_result() {
 
     // 4. unknown method → JSON-RPC error, no crash.
     send(&mut cwrite, json!({"jsonrpc":"2.0","id":9,"method":"bogus/method"})).await;
-    let err = loop {
-        let m = next(&mut lines).await;
-        if m.get("id") == Some(&json!(9)) {
-            break m;
-        }
-    };
+    let err = read_until_id(&mut lines, 9).await;
     assert!(err["error"]["message"].as_str().unwrap().contains("unknown method"));
+}
+
+async fn read_until_id(
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    id: u64,
+) -> Value {
+    loop {
+        let m = next(lines).await;
+        if m.get("id") == Some(&json!(id)) {
+            return m;
+        }
+    }
 }
 
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {

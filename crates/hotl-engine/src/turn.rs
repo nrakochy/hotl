@@ -238,18 +238,32 @@ impl<'d> Turn<'d> {
         (content, outcome.is_error)
     }
 
-    /// Permission (allow-rules first, then the human), then execution.
+    /// PreToolUse hook (M5) → permission (allow-rules first, then the human)
+    /// → execution → PostToolUse hook. A hook `Deny` skips execution; a
+    /// `Rewrite` swaps the input and re-enters the permission gate with it.
     async fn execute_gated(&mut self, tu: &ToolUse) -> ToolOutcome {
         let Some(tool) = self.shared.registry.get(&tu.name) else {
             return unknown_tool(&self.tool_defs, &tu.name);
         };
-        let (summary, why) = match tool.permission(&tu.input) {
+        // PreToolUse: a wrap-style intercept may block or rewrite the call.
+        let mut input = tu.input.clone();
+        if let Some(hooks) = &self.shared.hooks {
+            match hooks.pre_tool(&tu.name, &input).await {
+                crate::hooks::PreToolDecision::Continue => {}
+                crate::hooks::PreToolDecision::Deny { message } => {
+                    self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
+                    return ToolOutcome::err(format!("A hook blocked this tool call: {message}"));
+                }
+                crate::hooks::PreToolDecision::Rewrite { input: rewritten } => input = rewritten,
+            }
+        }
+        let (summary, why) = match tool.permission(&input) {
             Permission::None => (None, None),
             Permission::Ask { summary } => (Some(summary), None),
             Permission::AskProtected { summary, why } => (Some(summary), Some(why)),
         };
         if let Some(summary) = &summary {
-            if !self.approve(tu, summary.clone(), why).await {
+            if !self.approve_input(tu, &input, summary.clone(), why).await {
                 self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
                 return ToolOutcome::err(
                     "The user declined this tool call. Ask what they'd like to do instead, or proceed another way.",
@@ -261,15 +275,25 @@ impl<'d> Turn<'d> {
             summary: summary.unwrap_or_else(|| tu.name.clone()),
         })
         .await;
-        let outcome = tool.run(tu.input.clone(), self.cancel.clone()).await;
+        let mut outcome = tool.run(input, self.cancel.clone()).await;
+        // PostToolUse: a node-style proposal may replace a successful result.
+        if !outcome.is_error {
+            if let Some(hooks) = &self.shared.hooks {
+                if let Some(replacement) = hooks.post_tool(&tu.name, &outcome.content).await {
+                    outcome.content = replacement;
+                }
+            }
+        }
         self.emit(EngineEvent::ToolDone { name: tu.name.clone(), ok: !outcome.is_error }).await;
         outcome
     }
 
-    /// Allow-rules (deny-first, sandbox-gated, protected carve-out) or the ask.
-    async fn approve(&mut self, tu: &ToolUse, summary: String, why: Option<String>) -> bool {
+    /// Allow-rules (deny-first, sandbox-gated, protected carve-out) or the
+    /// ask, evaluated against `input` (which a PreToolUse hook may have
+    /// rewritten — a rewritten call re-enters the gate, never bypasses it).
+    async fn approve_input(&mut self, tu: &ToolUse, input: &Value, summary: String, why: Option<String>) -> bool {
         let protected = why.is_some();
-        match self.shared.rules.evaluate(&tu.name, &tu.input, self.shared.sandbox_enforced, protected) {
+        match self.shared.rules.evaluate(&tu.name, input, self.shared.sandbox_enforced, protected) {
             Verdict::Auto { rule } => {
                 self.emit(EngineEvent::ToolAutoAllowed { name: tu.name.clone(), rule }).await;
                 true

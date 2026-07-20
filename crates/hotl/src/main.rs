@@ -14,6 +14,7 @@
 mod acp;
 mod agent;
 mod doctor;
+mod shell_hooks;
 mod spawn;
 mod watch;
 

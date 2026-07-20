@@ -149,6 +149,7 @@ mod tests {
                 system: "child".into(),
                 cwd: std::env::temp_dir(),
                 snapshots: None,
+                hooks: None,
                 initial_items: Vec::new(),
                 config: EngineConfig { max_turns: 4, ..Default::default() },
             }))

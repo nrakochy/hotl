@@ -33,7 +33,9 @@ hotl-mcp = { path = "../hotl-mcp", version = "0.1.2" }
 hotl-store = { path = "../hotl-store", version = "0.1.2" }
 hotl-context = { path = "../hotl-context", version = "0.1.2" }
 hotl-engine = { path = "../hotl-engine", version = "0.1.2" }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }

@@ -78,26 +78,10 @@ pub async fn acp_main() -> i32 {
             return 1;
         }
     };
-    let clock = Arc::new(SystemClock);
-    let config_dir = config_dir();
-    let system = load_system_prompt(&config_dir);
-    let rules = load_rules(&config_dir);
-    let sandbox_enforced = matches!(sandbox::probe(), sandbox::SandboxStatus::Enforced(_));
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = engine_config(&model, &secrets);
-    let spawn_builder = child_builder(
-        provider.clone(),
-        rules.clone(),
-        clock.clone(),
-        config.clone(),
-        cwd.clone(),
-        config_dir.clone(),
-        system.clone(),
-        model.clone(),
-        sandbox_enforced,
-    );
-    let registry = Arc::new(build_registry(&config_dir, Some(spawn_builder)));
-
+    let scaffold = match scaffold(provider, model, &secrets) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         let resumed = match spec {
             crate::acp::SessionSpec::New => None,
@@ -108,27 +92,78 @@ pub async fn acp_main() -> i32 {
             }
         };
         let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
-        let log = SessionLog::create(&sessions_dir(), &model, parent_id, Masker::from_env(), clock.now_ms())
+        let log = SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, Masker::from_env(), scaffold.clock.now_ms())
             .map_err(|e| format!("could not create session log: {e}"))?;
         let session_id = log.session_id.clone();
-        let (snapshots, initial) = session_context(&session_id, &cwd, &config_dir, &resumed);
-        Ok(spawn_session(SessionDeps {
-            provider: provider.clone(),
-            registry: registry.clone(),
-            rules: rules.clone(),
-            sandbox_enforced,
-            clock: clock.clone(),
-            log,
-            system: system.clone(),
-            cwd: cwd.clone(),
-            snapshots,
-            initial_items: initial,
-            config: config.clone(),
-        }))
+        let (snapshots, initial) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+        Ok(spawn_session(scaffold.deps(log, snapshots, initial)))
     });
 
     crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory).await;
     0
+}
+
+/// The deps every session shares (provider, registry-with-spawn, rules, hooks,
+/// config, sandbox, cwd). Built once per process; `deps()` stamps a per-session
+/// log, snapshots, and initial items onto it.
+struct Scaffold {
+    provider: Arc<dyn hotl_provider::Provider>,
+    model: String,
+    clock: Arc<dyn Clock>,
+    config_dir: PathBuf,
+    system: String,
+    rules: Arc<Rules>,
+    sandbox_enforced: bool,
+    sandbox_status: sandbox::SandboxStatus,
+    cwd: PathBuf,
+    config: EngineConfig,
+    registry: Arc<Registry>,
+    hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+}
+
+fn scaffold(provider: Arc<dyn hotl_provider::Provider>, model: String, secrets: &dyn SecretStore) -> Result<Scaffold, i32> {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+    let config_dir = config_dir();
+    let system = load_system_prompt(&config_dir);
+    let rules = load_rules(&config_dir);
+    let sandbox_status = sandbox::probe();
+    let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let config = engine_config(&model, secrets);
+    let spawn_builder = child_builder(
+        provider.clone(), rules.clone(), clock.clone(), config.clone(),
+        cwd.clone(), config_dir.clone(), system.clone(), model.clone(), sandbox_enforced,
+    );
+    let registry = Arc::new(build_registry(&config_dir, Some(spawn_builder)));
+    let hooks = load_hooks(&config_dir);
+    Ok(Scaffold {
+        provider, model, clock, config_dir, system, rules, sandbox_enforced,
+        sandbox_status, cwd, config, registry, hooks,
+    })
+}
+
+impl Scaffold {
+    fn deps(
+        &self,
+        log: SessionLog,
+        snapshots: Option<Arc<dyn hotl_engine::Snapshotter>>,
+        initial_items: Vec<hotl_types::Item>,
+    ) -> SessionDeps {
+        SessionDeps {
+            provider: self.provider.clone(),
+            registry: self.registry.clone(),
+            rules: self.rules.clone(),
+            sandbox_enforced: self.sandbox_enforced,
+            clock: self.clock.clone(),
+            log,
+            system: self.system.clone(),
+            cwd: self.cwd.clone(),
+            snapshots,
+            hooks: self.hooks.clone(),
+            initial_items,
+            config: self.config.clone(),
+        }
+    }
 }
 
 fn age(t: std::time::SystemTime) -> String {
@@ -143,7 +178,6 @@ fn age(t: std::time::SystemTime) -> String {
 
 async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<Resumed>) -> i32 {
     let headless = prompt.is_some();
-
     let secrets = EnvSecrets;
     let (provider, model) = match select_provider(&secrets) {
         Ok(pair) => pair,
@@ -152,17 +186,13 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
             return 1;
         }
     };
-
-    let clock = Arc::new(SystemClock);
-    let config_dir = config_dir();
-    let system = load_system_prompt(&config_dir);
-    let rules = load_rules(&config_dir);
-    let sandbox_status = sandbox::probe();
-    let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let scaffold = match scaffold(provider, model, &secrets) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
 
     let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
-    let log = match SessionLog::create(&sessions_dir(), &model, parent_id, Masker::from_env(), clock.now_ms()) {
+    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, Masker::from_env(), scaffold.clock.now_ms()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl: could not create session log: {e}");
@@ -171,53 +201,24 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     };
     let session_id = log.session_id.clone();
     spawn_secret_audit(log.path().to_path_buf());
-    let (snapshots, initial_items) = session_context(&session_id, &cwd, &config_dir, &resumed);
-
-    let config = engine_config(&model, &secrets);
-    let spawn_builder = child_builder(
-        provider.clone(),
-        rules.clone(),
-        clock.clone(),
-        config.clone(),
-        cwd.clone(),
-        config_dir.clone(),
-        system.clone(),
-        model.clone(),
-        sandbox_enforced,
-    );
-    let handle = spawn_session(SessionDeps {
-        provider,
-        registry: Arc::new(build_registry(&config_dir, Some(spawn_builder))),
-        rules,
-        sandbox_enforced,
-        clock,
-        log,
-        system,
-        cwd: cwd.clone(),
-        snapshots,
-        initial_items,
-        config,
-    });
+    let (snapshots, initial_items) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
 
     let mut surface = Surface::new(handle, headless, json_events);
-
     if let Some(p) = prompt {
         surface.handle.prompt(p).await;
         return surface.run_until_idle().await;
     }
-
     if let Some(r) = &resumed {
         println!("resumed from session {} ({} items of context)", r.parent_id, r.items.len());
-        // #8: if the resumed session was cut off mid-turn (last item is a
-        // user prompt or tool results the model never answered), continue it
-        // rather than idling for a fresh prompt.
+        // #8: continue an interrupted turn (last item is the model's to answer).
         if hotl_engine::needs_continuation(&r.items) {
             println!("(continuing the interrupted turn…)");
             surface.handle.continue_turn().await;
             surface.turn_running = true;
         }
     }
-    print_banner(&model, &session_id, &sandbox_status);
+    print_banner(&scaffold.model, &session_id, &scaffold.sandbox_status);
     surface.repl().await
 }
 
@@ -276,6 +277,7 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
             system: self.system.clone(),
             cwd: self.cwd.clone(),
             snapshots: None,
+            hooks: None,
             initial_items: Vec::new(),
             config: self.config.clone(),
         }))
@@ -401,6 +403,12 @@ pub(crate) fn undo_main(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+/// Lane-2 shell hooks from `hooks.toml`, or None (M5).
+fn load_hooks(config_dir: &std::path::Path) -> Option<Arc<dyn hotl_engine::hooks::Hooks>> {
+    crate::shell_hooks::load(config_dir)
+        .map(|h| Arc::new(h) as Arc<dyn hotl_engine::hooks::Hooks>)
 }
 
 fn load_rules(config_dir: &std::path::Path) -> Arc<Rules> {
