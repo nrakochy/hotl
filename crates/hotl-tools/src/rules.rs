@@ -50,17 +50,16 @@ pub enum Verdict {
 }
 
 impl Rules {
-    pub fn load(config_dir: &Path) -> Self {
+    /// Load rules; a malformed file is ignored and reported back to the
+    /// caller (libraries don't print — the surface decides how to warn).
+    pub fn load(config_dir: &Path) -> (Self, Option<String>) {
         let path = config_dir.join("permissions.toml");
         match std::fs::read_to_string(&path) {
             Ok(text) => match toml::from_str::<Rules>(&text) {
-                Ok(rules) => rules,
-                Err(e) => {
-                    eprintln!("hotl: ignoring malformed {}: {e}", path.display());
-                    Rules::default()
-                }
+                Ok(rules) => (rules, None),
+                Err(e) => (Rules::default(), Some(format!("ignoring malformed {}: {e}", path.display()))),
             },
-            Err(_) => Rules::default(),
+            Err(_) => (Rules::default(), None),
         }
     }
 

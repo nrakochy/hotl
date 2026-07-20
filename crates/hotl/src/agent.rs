@@ -49,7 +49,11 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     let clock = Arc::new(SystemClock);
     let config_dir = config_dir();
     let system = load_system_prompt(&config_dir);
-    let rules = Arc::new(Rules::load(&config_dir));
+    let (rules, rules_warning) = Rules::load(&config_dir);
+    let rules = Arc::new(rules);
+    if let Some(warning) = rules_warning {
+        eprintln!("hotl: {warning}");
+    }
     let sandbox_status = sandbox::probe();
     let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
