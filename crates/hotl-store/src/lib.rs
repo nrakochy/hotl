@@ -136,6 +136,97 @@ impl SessionLog {
     }
 }
 
+/// Reconstruct the projection from a session log (M3b): items append,
+/// compactions and branch moves re-point, supersede digests append. This is
+/// the replay half of log-first — the projection is always derivable.
+pub struct Replayed {
+    pub header: hotl_types::SessionHeader,
+    pub items: Vec<hotl_types::Item>,
+}
+
+pub fn replay(path: &Path) -> Result<Replayed, String> {
+    let mut items = Vec::new();
+    let header = apply_log(path, &mut items)?;
+    Ok(Replayed { header, items })
+}
+
+/// Replay a session *and its ancestry*: a resumed session's log starts from
+/// the parent's projection, so entry indices (compaction, branch moves) are
+/// relative to inherited-plus-own items. Cycle/depth capped at 32.
+pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
+    let mut lineage = Vec::new();
+    let mut current = session_id.to_string();
+    for _ in 0..32 {
+        let path = dir.join(format!("{current}.jsonl"));
+        let raw = std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let first: Entry = raw
+            .lines()
+            .next()
+            .ok_or_else(|| format!("{}: empty log", path.display()))
+            .and_then(|l| serde_json::from_str(l).map_err(|e| format!("{}: {e}", path.display())))?;
+        let EntryPayload::Header { header } = first.payload else {
+            return Err(format!("{}: first entry is not a header", path.display()));
+        };
+        let parent = header.parent_session_id.clone();
+        lineage.push((path, header));
+        match parent {
+            Some(p) => current = p,
+            None => break,
+        }
+    }
+    let (_, newest_header) = lineage.first().cloned().ok_or("empty lineage")?;
+    let mut items = Vec::new();
+    for (path, _) in lineage.iter().rev() {
+        apply_log(path, &mut items)?;
+    }
+    Ok(Replayed { header: newest_header, items })
+}
+
+/// Apply one log's entries onto an existing projection; returns its header.
+fn apply_log(path: &Path, items: &mut Vec<hotl_types::Item>) -> Result<hotl_types::SessionHeader, String> {
+    let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut header = None;
+    for (n, line) in raw.lines().enumerate() {
+        let entry: Entry = serde_json::from_str(line)
+            .map_err(|e| format!("{}:{} unparseable entry: {e}", path.display(), n + 1))?;
+        match entry.payload {
+            EntryPayload::Header { header: h } => header = Some(h),
+            EntryPayload::Item { item } => items.push(item),
+            EntryPayload::Compaction { digest, prefix_end, kept_from, .. } => {
+                let prefix_end = prefix_end.min(items.len());
+                let kept_from = kept_from.clamp(prefix_end, items.len());
+                let tail = items.split_off(kept_from);
+                items.truncate(prefix_end);
+                items.extend(digest);
+                items.extend(tail);
+            }
+            EntryPayload::BranchMove { keep_items } => items.truncate(keep_items),
+            EntryPayload::Supersede { digest } => items.extend(digest),
+            EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {}
+        }
+    }
+    header.ok_or_else(|| format!("{}: no header entry", path.display()))
+}
+
+/// Session files in `dir`, newest first: (session id, path, modified).
+pub fn list_sessions(dir: &Path) -> Vec<(String, PathBuf, std::time::SystemTime)> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<(String, PathBuf, std::time::SystemTime)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension()? != "jsonl" {
+                return None;
+            }
+            let id = path.file_stem()?.to_str()?.to_string();
+            let modified = e.metadata().ok()?.modified().ok()?;
+            Some((id, path, modified))
+        })
+        .collect();
+    out.sort_by_key(|(_, _, modified)| std::cmp::Reverse(*modified));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,6 +264,50 @@ mod tests {
         assert!(matches!(lines[0].payload, EntryPayload::Header { .. }));
         assert_eq!(lines[1].parent_id.as_ref(), Some(&lines[0].id));
         std::env::remove_var("HOTL_TEST_API_KEY");
+    }
+
+    #[test]
+    fn replay_applies_items_compaction_and_branch_moves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let user = |t: &str| Item::User { text: t.into(), synthetic: None };
+        for text in ["one", "two", "three", "four"] {
+            log.append(EntryPayload::Item { item: user(text) }, 2).unwrap();
+        }
+        // Compaction: fold [0..2) into a digest, keep the tail.
+        log.append(
+            EntryPayload::Compaction {
+                digest: vec![user("digest-of-one-two")],
+                prefix_end: 0,
+                kept_from: 2,
+                degraded: false,
+            },
+            3,
+        )
+        .unwrap();
+        // Projection now: [digest, three, four]. Roll back to 2 items, record why.
+        log.append(EntryPayload::BranchMove { keep_items: 2 }, 4).unwrap();
+        log.append(
+            EntryPayload::Supersede { digest: vec![user("abandoned: four")] },
+            5,
+        )
+        .unwrap();
+
+        let replayed = replay(log.path()).expect("replay");
+        assert_eq!(replayed.header.model, "m");
+        let texts: Vec<_> = replayed
+            .items
+            .iter()
+            .map(|i| match i {
+                Item::User { text, .. } => text.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(texts, ["digest-of-one-two", "three", "abandoned: four"]);
+
+        let sessions = list_sessions(dir.path());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].0, replayed.header.session_id);
     }
 
     #[test]

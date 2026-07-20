@@ -17,11 +17,63 @@ use tokio::sync::mpsc;
 
 const ASK_TIMEOUT_SECS: u64 = 300;
 
+/// Context inherited from an earlier session (`hotl resume` — M3b).
+pub(crate) struct Resumed {
+    pub parent_id: String,
+    pub items: Vec<hotl_types::Item>,
+}
+
 pub async fn agent_main(args: Vec<String>) -> i32 {
     let (prompt, json_events) = match parse_args(args) {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
+    run_session(prompt, json_events, None).await
+}
+
+/// `hotl resume [id-prefix]`: bare lists recent sessions; with a prefix,
+/// replays that session's lineage into a fresh session's context.
+pub async fn resume_main(args: Vec<String>) -> i32 {
+    let dir = sessions_dir();
+    let sessions = hotl_store::list_sessions(&dir);
+    let Some(prefix) = args.first() else {
+        if sessions.is_empty() {
+            println!("no sessions yet — run `hotl` first");
+        } else {
+            println!("recent sessions (resume with `hotl resume <id-prefix>`):");
+            for (id, _, modified) in sessions.iter().take(10) {
+                println!("  {id}  ({})", age(*modified));
+            }
+        }
+        return 0;
+    };
+    let Some((id, _, _)) = sessions.iter().find(|(id, ..)| id.starts_with(prefix.as_str())) else {
+        eprintln!("hotl: no session starts with `{prefix}` (try bare `hotl resume` to list)");
+        return 1;
+    };
+    match hotl_store::replay_chain(&dir, id) {
+        Ok(replayed) => {
+            let resumed = Resumed { parent_id: replayed.header.session_id, items: replayed.items };
+            run_session(None, false, Some(resumed)).await
+        }
+        Err(e) => {
+            eprintln!("hotl: could not replay session: {e}");
+            1
+        }
+    }
+}
+
+fn age(t: std::time::SystemTime) -> String {
+    let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
+async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<Resumed>) -> i32 {
     let headless = prompt.is_some();
 
     let secrets = EnvSecrets;
@@ -41,7 +93,8 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
-    let log = match SessionLog::create(&sessions_dir(), &model, None, Masker::from_env(), clock.now_ms()) {
+    let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
+    let log = match SessionLog::create(&sessions_dir(), &model, parent_id, Masker::from_env(), clock.now_ms()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl: could not create session log: {e}");
@@ -51,7 +104,12 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     let session_id = log.session_id.clone();
 
     spawn_secret_audit(log.path().to_path_buf());
-    let initial_items = initial_items(&config_dir, &cwd);
+    // A resumed session inherits the replayed projection verbatim (it already
+    // carries the original memory/instructions); fresh sessions assemble anew.
+    let initial_items = match &resumed {
+        Some(r) => r.items.clone(),
+        None => initial_items(&config_dir, &cwd),
+    };
 
     let handle = spawn_session(SessionDeps {
         provider,
@@ -73,6 +131,9 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         return surface.run_until_idle().await;
     }
 
+    if let Some(r) = &resumed {
+        println!("resumed from session {} ({} items of context)", r.parent_id, r.items.len());
+    }
     print_banner(&model, &session_id, &sandbox_status);
     surface.repl().await
 }

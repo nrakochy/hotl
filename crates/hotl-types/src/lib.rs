@@ -178,6 +178,14 @@ pub enum EntryPayload {
         /// True when the summarize call failed and the floor was applied.
         degraded: bool,
     },
+    /// Re-point the projection to its first `keep_items` items — the
+    /// `branch_move` of the commit-protocol vocabulary, expressed against
+    /// the linear projection (M3b). Fork UIs arrive with M4; the entry and
+    /// its replay semantics are settled here.
+    BranchMove { keep_items: usize },
+    /// Digest of an abandoned branch, appended after a `branch_move` so the
+    /// lesson survives without the tokens (commit-protocol `supersede`).
+    Supersede { digest: Vec<Item> },
     #[serde(other)]
     Unknown,
 }
