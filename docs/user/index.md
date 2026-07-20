@@ -9,6 +9,7 @@ Docs here follow the five-mode framework (specs `docs/references/documentation-a
 | Run it the first time, start to finish | [quickstart.md](quickstart.md) | Tutorial |
 | Look up a config file, env var, subcommand, or exit code | [configuration.md](configuration.md) | Reference |
 | Understand the y/N gate, protected paths, and the sandbox — and what they don't cover | [permissions-and-sandbox.md](permissions-and-sandbox.md) | Explanation |
+| Run a session detached and reconnect later | [backgrounding.md](backgrounding.md) | How-to |
 | Connect an MCP tool server | [mcp.md](mcp.md) | How-to |
 | Run your own checks/policy on tool calls (diagnostics + hooks) | [hooks.md](hooks.md) | How-to |
 | Remove hotl and its data | [uninstall.md](uninstall.md) | How-to |

@@ -9,13 +9,19 @@
 //!   resume        continue an earlier session from its log (M3b)
 //!   undo          restore files to the last pre-batch snapshot (M3b)
 //!   acp           serve the ACP JSON-RPC protocol over stdio (M4)
+//!   bg            background a session as a detached socket server (attach later)
+//!   attach        connect to a backgrounded session (bare: list them)
+//!   serve         (internal) host a session on a unix socket — used by `bg`
 //!   setup         write default config (safe defaults; never silent) (MD)
 //!   update        show version + how to update (MD)
 //!   update        reserved (MD)
 
 mod acp;
 mod agent;
+mod attach;
+mod bg;
 mod doctor;
+mod session_server;
 mod setup;
 mod shell_hooks;
 mod spawn;
@@ -61,6 +67,12 @@ fn main() {
         Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
         Some("resume") => std::process::exit(block_on(agent::resume_main(args[1..].to_vec()))),
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
+        Some("bg") => std::process::exit(bg::bg_main(bg_prompt(&args))),
+        Some("attach") => std::process::exit(block_on(attach::attach_main(args.get(1).map(String::as_str)))),
+        Some("serve") => {
+            let (id, prompt) = parse_serve_args(&args);
+            std::process::exit(block_on(agent::serve_main(id, prompt)));
+        }
         Some("setup") => {
             let force = args.iter().any(|a| a == "--force" || a == "-f");
             std::process::exit(setup::setup_main(&agent::config_dir(), force));
@@ -76,29 +88,34 @@ fn main() {
                 }
             }
         }
-        Some("--help") | Some("-h") | Some("help") => {
-            println!(
-                "hotl — human on the loop\n\n\
-                 USAGE:\n  hotl                 agent REPL (execute)\n  \
-                 hotl -p \"prompt\"     headless one-shot (add --json for a JSONL event stream)\n  \
-                 hotl watch           tmux agent dashboard (watch)\n  \
-                 hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
-                 hotl doctor          check provider keys, sandbox, config, session store\n  \
-                 hotl setup           write default config (safe defaults)\n  \
-                 hotl resume [id]     continue an earlier session (bare: list recent)\n  \
-                 hotl undo            restore files to before the agent's last change\n  \
-                 hotl fleet           reserved (orchestrate)\n\n\
-                 ENV:\n  HOTL_MODEL             provider/model, e.g. anthropic/{} or openai/gpt-5\n  \
-                 ANTHROPIC_API_KEY      for the anthropic provider (the default)\n  \
-                 OPENAI_API_KEY         for openai; HOTL_OPENAI_BASE_URL for compatible endpoints\n  \
-                 HOTL_SANDBOX=off       disable the bash sandbox floor (marked in every ask)\n\n\
-                 REPL: type to prompt · type mid-turn to steer · ctrl-c interrupts a turn\n\
-                 Allow rules: ~/.config/hotl/permissions.toml (see docs)",
-                hotl_provider_anthropic::DEFAULT_MODEL
-            );
-        }
+        Some("--help") | Some("-h") | Some("help") => print_help(),
         _ => std::process::exit(block_on(agent::agent_main(args))),
     }
+}
+
+fn print_help() {
+    println!(
+        "hotl — human on the loop\n\n\
+         USAGE:\n  hotl                 agent REPL (execute)\n  \
+         hotl -p \"prompt\"     headless one-shot (add --json for a JSONL event stream)\n  \
+         hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
+         hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
+         hotl watch           tmux agent dashboard (watch)\n  \
+         hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
+         hotl doctor          check provider keys, sandbox, config, session store\n  \
+         hotl setup           write default config (safe defaults)\n  \
+         hotl resume [id]     continue an earlier session (bare: list recent)\n  \
+         hotl undo            restore files to before the agent's last change\n  \
+         hotl fleet           reserved (orchestrate)\n\n\
+         ENV:\n  HOTL_MODEL             provider/model, e.g. anthropic/{} or openai/gpt-5\n  \
+         ANTHROPIC_API_KEY      for the anthropic provider (the default)\n  \
+         OPENAI_API_KEY         for openai; HOTL_OPENAI_BASE_URL for compatible endpoints\n  \
+         HOTL_ASK_TIMEOUT=0     make permission asks wait indefinitely (backgrounded sessions)\n  \
+         HOTL_SANDBOX=off       disable the bash sandbox floor (marked in every ask)\n\n\
+         REPL: type to prompt · type mid-turn to steer · ctrl-c interrupts a turn\n\
+         Allow rules: ~/.config/hotl/permissions.toml (see docs)",
+        hotl_provider_anthropic::DEFAULT_MODEL
+    );
 }
 
 /// `hotl update`: report the current version, compare against `latest` if the
@@ -118,6 +135,26 @@ fn update_main(latest: Option<&str>) -> i32 {
          (automated self-update is not wired yet — it needs a signed release feed; MD.)"
     );
     0
+}
+
+/// The optional opening prompt for `hotl bg` (the first non-flag arg).
+fn bg_prompt(args: &[String]) -> Option<&str> {
+    args.get(1).map(String::as_str).filter(|a| !a.starts_with('-'))
+}
+
+/// `--id <id>` and `--prompt <p>` for `hotl serve`; a missing id is generated.
+fn parse_serve_args(args: &[String]) -> (String, Option<String>) {
+    let mut id = None;
+    let mut prompt = None;
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--id" => id = it.next().cloned(),
+            "--prompt" => prompt = it.next().cloned(),
+            _ => {}
+        }
+    }
+    (id.unwrap_or_else(|| format!("bg-{}", std::process::id())), prompt)
 }
 
 /// One-shot CLI paths run current_thread per the async policy (no pool

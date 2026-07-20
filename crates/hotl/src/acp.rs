@@ -192,7 +192,7 @@ async fn drain_events(
     }
 }
 
-fn update_payload(event: &EngineEvent) -> Option<Value> {
+pub(crate) fn update_payload(event: &EngineEvent) -> Option<Value> {
     Some(match event {
         EngineEvent::TextDelta(t) => json!({"type": "text_delta", "text": t}),
         EngineEvent::ThinkingDelta(_) => json!({"type": "thinking_delta"}),
@@ -208,7 +208,7 @@ fn update_payload(event: &EngineEvent) -> Option<Value> {
     })
 }
 
-fn outcome_tag(outcome: &Outcome) -> Value {
+pub(crate) fn outcome_tag(outcome: &Outcome) -> Value {
     match outcome {
         Outcome::Done { text } => json!({"kind": "done", "text": text}),
         Outcome::Cancelled => json!({"kind": "cancelled"}),

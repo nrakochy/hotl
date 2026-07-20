@@ -107,6 +107,34 @@ pub async fn acp_main() -> i32 {
     0
 }
 
+/// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a
+/// unix socket for `hotl attach` (the detached-session server behind `hotl bg`).
+pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
+    let secrets = EnvSecrets;
+    let (provider, model) = match select_provider(&secrets) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("hotl serve: {msg}");
+            return 1;
+        }
+    };
+    let scaffold = match scaffold(provider, model, &secrets) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, Masker::from_env(), scaffold.clock.now_ms()) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("hotl serve: could not create session log: {e}");
+            return 1;
+        }
+    };
+    let session_id = log.session_id.clone();
+    let (snapshots, initial_items) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
+    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
+    crate::session_server::serve(id, handle, prompt).await
+}
+
 /// The deps every session shares (provider, registry-with-spawn, rules, hooks,
 /// config, sandbox, cwd). Built once per process; `deps()` stamps a per-session
 /// log, snapshots, and initial items onto it.
@@ -444,6 +472,10 @@ struct Surface {
     stdin: mpsc::Receiver<String>,
     turn_running: bool,
     saw_text: bool,
+    /// How long an interactive permission ask waits before default-denying.
+    /// `None` = wait indefinitely (a backgrounded/detached session holds the
+    /// ask until you reattach and answer — `HOTL_ASK_TIMEOUT=0`).
+    ask_timeout: Option<std::time::Duration>,
 }
 
 impl Surface {
@@ -466,7 +498,15 @@ impl Surface {
                 }
             });
         }
-        Self { handle, headless, json, stdin: rx, turn_running: false, saw_text: false }
+        Self {
+            handle,
+            headless,
+            json,
+            stdin: rx,
+            turn_running: false,
+            saw_text: false,
+            ask_timeout: ask_timeout_from_env(&EnvSecrets),
+        }
     }
 
     /// Interactive loop. Lines while idle → prompts; lines mid-turn → steers.
@@ -635,14 +675,28 @@ impl Surface {
             eprintln!("⚠ PROTECTED PATH — {why}");
         }
         eprint!("allow {summary}? [y/N] ");
-        match tokio::time::timeout(std::time::Duration::from_secs(ASK_TIMEOUT_SECS), self.stdin.recv()).await {
+        // No timeout (backgrounded): wait indefinitely for the answer.
+        let Some(timeout) = self.ask_timeout else {
+            return matches!(self.stdin.recv().await.as_deref().map(str::trim), Some("y" | "Y" | "yes"));
+        };
+        match tokio::time::timeout(timeout, self.stdin.recv()).await {
             Ok(Some(line)) => matches!(line.trim(), "y" | "Y" | "yes"),
             Ok(None) => false,
             Err(_) => {
-                eprintln!("(no answer in {ASK_TIMEOUT_SECS}s — denied)");
+                eprintln!("(no answer in {}s — denied)", timeout.as_secs());
                 false
             }
         }
+    }
+}
+
+/// The interactive ask timeout from `HOTL_ASK_TIMEOUT` (seconds): unset →
+/// the 300s default; `0` → wait indefinitely (backgrounded/detached sessions).
+fn ask_timeout_from_env(secrets: &dyn SecretStore) -> Option<std::time::Duration> {
+    match secrets.get("HOTL_ASK_TIMEOUT").and_then(|v| v.parse::<u64>().ok()) {
+        Some(0) => None,
+        Some(n) => Some(std::time::Duration::from_secs(n)),
+        None => Some(std::time::Duration::from_secs(ASK_TIMEOUT_SECS)),
     }
 }
 
