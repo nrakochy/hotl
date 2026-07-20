@@ -186,6 +186,18 @@ pub enum EntryPayload {
     /// Digest of an abandoned branch, appended after a `branch_move` so the
     /// lesson survives without the tokens (commit-protocol `supersede`).
     Supersede { digest: Vec<Item> },
+    /// A permission ask committed **before** it surfaces (§2b durable asks,
+    /// ledger 15): if the process dies before a matching `ask_resolved`, replay
+    /// sees a dangling ask and resume re-surfaces it. Log-only (not a
+    /// projection item).
+    PendingAsk {
+        id: String,
+        summary: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        protected_why: Option<String>,
+    },
+    /// Resolution of a `pending_ask` (§2b): the human answered.
+    AskResolved { id: String, allowed: bool },
     #[serde(other)]
     Unknown,
 }

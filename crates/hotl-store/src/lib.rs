@@ -255,6 +255,9 @@ fn apply_log(
     let mut header = None;
     let mut prev_id: Option<String> = None;
     let mut chain_ok = true;
+    // §2b: an unresolved pending_ask at end-of-log means the session stopped
+    // mid-ask — surface it on resume (id → summary).
+    let mut pending_asks: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     for (n, line) in raw.lines().enumerate() {
         let entry: Entry = serde_json::from_str(line)
             .map_err(|e| format!("{}:{} unparseable entry: {e}", path.display(), n + 1))?;
@@ -280,8 +283,19 @@ fn apply_log(
             }
             EntryPayload::BranchMove { keep_items } => items.truncate(keep_items),
             EntryPayload::Supersede { digest } => items.extend(digest),
+            EntryPayload::PendingAsk { id, summary, .. } => {
+                pending_asks.insert(id, summary);
+            }
+            EntryPayload::AskResolved { id, .. } => {
+                pending_asks.remove(&id);
+            }
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {}
         }
+    }
+    for summary in pending_asks.into_values() {
+        warnings.push(format!(
+            "an unanswered permission request was pending when the session stopped: {summary}"
+        ));
     }
     header.ok_or_else(|| format!("{}: no header entry", path.display()))
 }
@@ -409,6 +423,30 @@ mod tests {
         let sessions = list_sessions(dir.path());
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].0, replayed.header.session_id);
+    }
+
+    #[test]
+    fn replay_surfaces_a_dangling_pending_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append(EntryPayload::Item { item: Item::User { text: "go".into(), synthetic: None } }, 2).unwrap();
+        // A pending_ask with no matching ask_resolved (the session stopped mid-ask).
+        log.append(EntryPayload::PendingAsk { id: "a1".into(), summary: "bash: rm -rf /".into(), protected_why: None }, 3).unwrap();
+
+        let replayed = replay(log.path()).expect("replay");
+        assert!(
+            replayed.warnings.iter().any(|w| w.contains("unanswered permission request") && w.contains("rm -rf")),
+            "a dangling pending_ask must surface on resume: {:?}",
+            replayed.warnings
+        );
+
+        // Resolving it clears the warning.
+        log.append(EntryPayload::AskResolved { id: "a1".into(), allowed: false }, 4).unwrap();
+        let replayed = replay(log.path()).expect("replay");
+        assert!(
+            !replayed.warnings.iter().any(|w| w.contains("unanswered permission request")),
+            "a resolved ask leaves no dangling warning"
+        );
     }
 
     #[test]

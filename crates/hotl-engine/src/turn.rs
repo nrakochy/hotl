@@ -478,13 +478,32 @@ impl<'d> Turn<'d> {
     }
 
     /// Ask the human via the event channel; a dropped reply means deny.
+    /// The ask is committed durably *before* it surfaces (§2b `pending_ask`)
+    /// and its resolution *after* (`ask_resolved`) — so a process that dies
+    /// mid-ask leaves a dangling record that resume re-surfaces. The log
+    /// records are best-effort: a sealed log never blocks the ask itself.
     async fn ask(&self, summary: String, why: Option<String>) -> AskReply {
+        let id = hotl_types::new_ulid();
+        let _ = self
+            .propose(vec![EntryPayload::PendingAsk {
+                id: id.clone(),
+                summary: summary.clone(),
+                protected_why: why.clone(),
+            }])
+            .await;
         let (tx, rx) = oneshot::channel();
         let event = EngineEvent::Ask { summary, protected_why: why, reply: tx };
-        if self.events.send(event).await.is_err() {
-            return AskReply::Deny { message: None };
-        }
-        rx.await.unwrap_or(AskReply::Deny { message: None })
+        let reply = if self.events.send(event).await.is_err() {
+            AskReply::Deny { message: None }
+        } else {
+            rx.await.unwrap_or(AskReply::Deny { message: None })
+        };
+        let allowed = matches!(
+            reply,
+            AskReply::Allow | AskReply::AllowEdited { .. } | AskReply::Respond { .. }
+        );
+        let _ = self.propose(vec![EntryPayload::AskResolved { id, allowed }]).await;
+        reply
     }
 
     async fn emit(&self, event: EngineEvent) {
