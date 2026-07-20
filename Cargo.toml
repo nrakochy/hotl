@@ -5,6 +5,9 @@ members = [
     "crates/watch-tmux",
     "crates/watch-listener",
     "crates/watch-tui",
+    "crates/hotl-types",
+    "crates/hotl-platform",
+    "crates/hotl-provider",
     "crates/hotl",
 ]
 
@@ -21,7 +24,20 @@ homepage = "https://github.com/nrakochy/hotl"
 ratatui = "0.29"
 crossterm = "0.28"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
+# Harness deps (execute capability). Why: tokio is the one async runtime the
+# ecosystem is shaped around (rust-specs); reqwest/rustls avoids openssl.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "signal", "time", "fs", "sync"] }
+tokio-util = "0.7"
+futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+thiserror = "2"
+anyhow = "1"
+ulid = "1"
+tempfile = "3"
+async-stream = "0.3"
+libc = "0.2"
 
 [profile.release]
 strip = true

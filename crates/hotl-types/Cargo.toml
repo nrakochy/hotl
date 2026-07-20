@@ -1,0 +1,15 @@
+[package]
+name = "hotl-types"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. L1 canonical conversation types: pure data + serde, no tokio, no I/O."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+ulid = { workspace = true }

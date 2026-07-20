@@ -1,0 +1,17 @@
+[package]
+name = "hotl-provider"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. L2 provider seam: trait, block-structured event enum, scripted test provider."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hotl-types = { path = "../hotl-types", version = "0.1.2" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+futures-util = { workspace = true }
