@@ -6,34 +6,9 @@
 //! sequence into `StreamEvent`s and the final verbatim block list.
 
 use hotl_provider::{ProviderError, StreamEvent};
+pub(crate) use hotl_provider::SseParser;
 use hotl_types::{StopReason, TokenUsage};
 use serde_json::Value;
-
-#[derive(Default)]
-pub(crate) struct SseParser {
-    buf: Vec<u8>,
-}
-
-impl SseParser {
-    /// Feed a chunk; return complete `data:` payloads.
-    pub(crate) fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
-        self.buf.extend_from_slice(chunk);
-        let mut out = Vec::new();
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line);
-            let line = line.trim_end_matches(['\n', '\r']);
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim_start();
-                if !data.is_empty() && data != "[DONE]" {
-                    out.push(data.to_string());
-                }
-            }
-            // `event:` lines are redundant — every payload carries "type".
-        }
-        out
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct Assembler {

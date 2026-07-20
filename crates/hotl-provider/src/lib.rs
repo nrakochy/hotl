@@ -145,3 +145,31 @@ impl Provider for ScriptedProvider {
         Box::pin(futures_util::stream::iter(script))
     }
 }
+
+/// SSE line parsing shared by HTTP providers: turns raw byte chunks into
+/// complete `data:` payload strings. Chunks can split mid-line (and mid-UTF-8
+/// code point), so bytes are buffered, not lossily decoded per chunk.
+#[derive(Default)]
+pub struct SseParser {
+    buf: Vec<u8>,
+}
+
+impl SseParser {
+    /// Feed a chunk; returns complete `data:` payloads (`[DONE]` filtered).
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim_end_matches(['\n', '\r']);
+            if let Some(data) = line.strip_prefix("data:") {
+                let data = data.trim_start();
+                if !data.is_empty() && data != "[DONE]" {
+                    out.push(data.to_string());
+                }
+            }
+        }
+        out
+    }
+}
