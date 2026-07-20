@@ -385,6 +385,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotl-context"
+version = "0.1.2"
+dependencies = [
+ "hotl-types",
+]
+
+[[package]]
 name = "hotl-platform"
 version = "0.1.2"
 
@@ -410,6 +417,15 @@ dependencies = [
  "reqwest",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "hotl-store"
+version = "0.1.2"
+dependencies = [
+ "hotl-types",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

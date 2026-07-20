@@ -1,0 +1,13 @@
+[package]
+name = "hotl-context"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. L6 context assembly, M0 slice: owner system prompt, AGENTS.md in the untrusted envelope, byte-stable prefix."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hotl-types = { path = "../hotl-types", version = "0.1.2" }
