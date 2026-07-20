@@ -7,13 +7,15 @@ One binary, three capabilities, and you on the loop for all of them:
 | Capability | Command | Status |
 |---|---|---|
 | **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it |
-| **Execute** | `hotl` | **Building (M0)** — a personal agent harness (event-log-as-canon, ACP-native, designed in [docs/](AGENTS.md)): streaming REPL + `-p` headless, 4 gated tools, append-only session log. Needs `ANTHROPIC_API_KEY` |
+| **Execute** | `hotl` | **Building (M0–M3 done)** — a personal agent harness (event-log-as-canon, ACP-native, designed in [docs/](AGENTS.md)): steering REPL + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → docs/user/](docs/user/index.md)** |
 | **Orchestrate** | `hotl fleet` | **Future** — drives fleets of agents over the same protocol any editor uses; only its seams exist today |
 
 > **Pre-1.0 — and a breaking change:** bare `hotl` is now the **agent**; the
-> dashboard moved to `hotl watch`. The harness is early M0 — every mutating or
-> executing tool call asks y/n (no allow-rules exist yet, by design; the kernel
-> sandbox lands at M1). Expect breaking changes at every 0.x minor.
+> dashboard moved to `hotl watch`. Every mutating or executing tool call asks
+> y/n; a kernel sandbox floor confines `bash` writes. The execute harness is
+> **not yet published** — `cargo install hotl` still installs the older
+> `watch`-only release; run the agent from a source build ([docs/user/quickstart.md](docs/user/quickstart.md))
+> until 0.2.0 ships. Expect breaking changes at every 0.x minor.
 
 ## Watch — quick start
 
