@@ -23,6 +23,7 @@ mod agent;
 mod attach;
 mod bg;
 mod doctor;
+mod keysource;
 mod session_server;
 mod setup;
 mod shell_hooks;
