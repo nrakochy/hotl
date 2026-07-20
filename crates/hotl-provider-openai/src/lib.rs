@@ -14,6 +14,8 @@
 //! - responses map back to canonical blocks (tool_calls → `tool_use` blocks),
 //!   so a session can cross dialects mid-conversation in either direction.
 
+pub mod responses;
+
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use hotl_provider::{Provider, ProviderError, SamplingRequest, SseAssembler, StreamEvent, ToolDef};

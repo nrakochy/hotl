@@ -99,6 +99,34 @@ pub fn first_run_hint(config_dir: &Path) -> Option<String> {
     ))
 }
 
+/// Expand `@[path]` tokens in a prompt to the file's contents (zsh `@[file]`
+/// capture, M1 residual). A missing/unreadable file leaves the token in place
+/// with an inline note — never silently dropped, never a hard error. Each
+/// captured file is wrapped so the model knows where the text came from.
+pub fn expand_file_refs(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find("@[") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find(']') else {
+            // No closing bracket: emit the rest verbatim and stop.
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let path = &after[..end];
+        match std::fs::read_to_string(path) {
+            Ok(content) => {
+                out.push_str(&format!("\n<file path=\"{path}\">\n{content}\n</file>\n"));
+            }
+            Err(e) => out.push_str(&format!("@[{path}] (could not read: {e})")),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Compare two `x.y.z` versions: is `latest` newer than `current`?
 /// Non-numeric/short versions compare by the parts that parse (missing = 0).
 pub fn is_newer(current: &str, latest: &str) -> bool {
@@ -135,6 +163,24 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(first_run_hint(&dir.path().join("nope")).is_some());
         assert!(first_run_hint(dir.path()).is_none());
+    }
+
+    #[test]
+    fn file_refs_expand_and_degrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("note.txt");
+        std::fs::write(&f, "hello from file").unwrap();
+        let prompt = format!("summarize @[{}] please", f.display());
+        let out = expand_file_refs(&prompt);
+        assert!(out.contains("hello from file") && out.contains("<file path="));
+        assert!(out.starts_with("summarize") && out.trim_end().ends_with("please"));
+        // A missing file leaves an inline note, not an error.
+        let missing = expand_file_refs("see @[/no/such/file]");
+        assert!(missing.contains("could not read"));
+        // Text with no token is untouched.
+        assert_eq!(expand_file_refs("plain prompt"), "plain prompt");
+        // Unclosed token is left verbatim.
+        assert_eq!(expand_file_refs("oops @[unclosed"), "oops @[unclosed");
     }
 
     #[test]

@@ -210,7 +210,7 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
 
     let mut surface = Surface::new(handle, headless, json_events);
     if let Some(p) = prompt {
-        surface.handle.prompt(p).await;
+        surface.handle.prompt(crate::setup::expand_file_refs(&p)).await;
         return surface.run_until_idle().await;
     }
     if let Some(r) = &resumed {
@@ -484,10 +484,10 @@ impl Surface {
                     if line.is_empty() { if !self.turn_running { self.prompt_marker(); } continue; }
                     if !self.turn_running && matches!(line.as_str(), "exit" | "quit") { return 0; }
                     if self.turn_running {
-                        self.handle.steer(line).await;
+                        self.handle.steer(crate::setup::expand_file_refs(&line)).await;
                         eprintln!("(steered — woven into the agent's next step)");
                     } else {
-                        self.handle.prompt(line).await;
+                        self.handle.prompt(crate::setup::expand_file_refs(&line)).await;
                         self.turn_running = true;
                     }
                 }
