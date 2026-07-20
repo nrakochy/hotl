@@ -1000,7 +1000,13 @@ pub(crate) fn select_provider(
                      Use https:// or an SSH tunnel."
                 );
             }
-            Ok((Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(base, key)), model))
+            Ok((
+                Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(
+                    base,
+                    Arc::new(hotl_provider::key::StaticKey(key)),
+                )),
+                model,
+            ))
         }
         other => Err(format!(
             "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, openai/<model> \

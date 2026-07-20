@@ -16,8 +16,11 @@
 
 pub mod responses;
 
+use std::sync::Arc;
+
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
+use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{Provider, ProviderError, SamplingRequest, SseAssembler, StreamEvent, ToolDef};
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
@@ -27,12 +30,12 @@ pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub struct OpenAiCompatProvider {
     client: reqwest::Client,
     base_url: String,
-    api_key: Option<String>,
+    key_source: Arc<dyn KeySource>,
 }
 
 impl OpenAiCompatProvider {
-    pub fn new(base_url: String, api_key: Option<String>) -> Self {
-        Self { client: reqwest::Client::new(), base_url, api_key }
+    pub fn new(base_url: String, key_source: Arc<dyn KeySource>) -> Self {
+        Self { client: reqwest::Client::new(), base_url, key_source }
     }
 
     fn build_body(req: &SamplingRequest) -> Value {
@@ -277,18 +280,48 @@ impl Provider for OpenAiCompatProvider {
     fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let client = self.client.clone();
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let api_key = self.api_key.clone();
         let body = Self::build_body(&req);
+        let source = self.key_source.clone();
 
         Box::pin(async_stream::stream! {
             let mut attempt: u32 = 0;
+            let mut auth_retry = AuthRetry::default();
             let response = loop {
                 attempt += 1;
-                match send_attempt(&client, &url, api_key.as_deref(), &body, attempt).await {
+                let key = match source.get().await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        yield Err(ProviderError::Auth(e.0));
+                        return;
+                    }
+                };
+                match send_attempt(&client, &url, key.as_deref(), &body, attempt).await {
                     Attempt::Ok(resp) => break resp,
                     Attempt::Retry { reason, wait_secs } => {
                         yield Ok(StreamEvent::Retrying { attempt, reason });
                         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                    }
+                    Attempt::Fail(ProviderError::Auth(msg)) => {
+                        match auth_retry.on_auth_error(source.refreshable()) {
+                            AuthAction::RefreshAndRetry => match source.refresh().await {
+                                Ok(()) => {
+                                    yield Ok(StreamEvent::Retrying {
+                                        attempt,
+                                        reason: "auth failed — re-running api_key_helper".into(),
+                                    });
+                                }
+                                Err(ke) => {
+                                    yield Err(ProviderError::Auth(format!(
+                                        "{msg} (key refresh also failed: {ke})"
+                                    )));
+                                    return;
+                                }
+                            },
+                            AuthAction::Surface => {
+                                yield Err(ProviderError::Auth(msg));
+                                return;
+                            }
+                        }
                     }
                     Attempt::Fail(e) => {
                         yield Err(e);
@@ -387,5 +420,92 @@ mod tests {
         assert_eq!(blocks[1]["input"]["path"], "a.rs");
         assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { .. })));
         assert!(events.iter().any(|e| matches!(e, StreamEvent::ToolInputDelta { .. })));
+    }
+
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use futures_util::future::BoxFuture;
+    use hotl_provider::key::{KeyError, KeySource};
+
+    /// Key source yielding key-1, then key-2 after refresh.
+    struct FlippingKey(StdMutex<u32>);
+    impl KeySource for FlippingKey {
+        fn get(&self) -> BoxFuture<'_, Result<Option<String>, KeyError>> {
+            let n = *self.0.lock().unwrap();
+            Box::pin(async move { Ok(Some(format!("key-{n}"))) })
+        }
+        fn refresh(&self) -> BoxFuture<'_, Result<(), KeyError>> {
+            *self.0.lock().unwrap() += 1;
+            Box::pin(async { Ok(()) })
+        }
+        fn refreshable(&self) -> bool { true }
+    }
+
+    const SSE_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1}}\n\ndata: [DONE]\n\n";
+    const AUTH_401: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad api key";
+
+    /// Serve `responses` to consecutive connections; record each request's
+    /// `authorization` header (lowercased) into `seen`.
+    async fn tcp_double(
+        responses: Vec<&'static str>,
+        seen: Arc<StdMutex<Vec<String>>>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut req = String::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if req.contains("\r\n\r\n") { break; }
+                }
+                let auth = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l.split_once(':').unwrap().1.trim().to_string())
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(auth);
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.shutdown().await.ok();
+            }
+        });
+        base
+    }
+
+    fn sampling_req() -> SamplingRequest {
+        SamplingRequest {
+            model: "m".into(),
+            max_tokens: 16,
+            system: "".into(),
+            items: std::sync::Arc::new(vec![Item::User { text: "hi".into(), synthetic: None }]),
+            tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
+            thinking: false,
+            cache_static: false,
+            turn_context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_401_refreshes_key_once_and_retries() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![AUTH_401, SSE_OK], seen.clone()).await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(FlippingKey(StdMutex::new(1))));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "no error expected: {events:?}");
+        assert_eq!(*seen.lock().unwrap(), vec!["Bearer key-1", "Bearer key-2"]);
+    }
+
+    #[tokio::test]
+    async fn static_source_auth_401_surfaces_immediately() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![AUTH_401], seen.clone()).await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(hotl_provider::key::StaticKey(Some("sk".into()))));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(matches!(events.last(), Some(Err(ProviderError::Auth(_)))));
+        assert_eq!(seen.lock().unwrap().len(), 1); // exactly one request — no blind retry
     }
 }
