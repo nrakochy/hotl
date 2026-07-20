@@ -1,0 +1,21 @@
+[package]
+name = "hotl-tools"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. L4 tool system: read/edit/write/bash built-ins, permission gate seam, protected execute-later paths."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hotl-provider = { path = "../hotl-provider", version = "0.1.2" }
+serde_json = { workspace = true }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

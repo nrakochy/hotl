@@ -9,6 +9,7 @@ members = [
     "crates/hotl-platform",
     "crates/hotl-provider",
     "crates/hotl-provider-anthropic",
+    "crates/hotl-tools",
     "crates/hotl",
 ]
 
