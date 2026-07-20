@@ -31,6 +31,14 @@ pub struct Harness {
 }
 
 impl Harness {
+    /// The harness working directory (the engine's `cwd` for subdir hints;
+    /// also a scratch space for files the scripted tools touch).
+    pub fn dir(&self) -> &std::path::Path {
+        self._dir.path()
+    }
+}
+
+impl Harness {
     pub fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>, config: EngineConfig) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
@@ -45,6 +53,7 @@ impl Harness {
             clock: Arc::new(SystemClock),
             log,
             system: "test-system".into(),
+            cwd: dir.path().to_path_buf(),
             initial_items: Vec::new(),
             config,
         };
@@ -364,6 +373,124 @@ mod tests {
         };
         let (a, b) = (make().await, make().await);
         assert_eq!(a, b, "normalized transcripts must be byte-identical across runs");
+    }
+
+    /// A tool-call sample whose Completed reports a chosen input_tokens —
+    /// compaction tests anchor on provider-reported usage (A12b), so the
+    /// script must be able to "report" a nearly-full window.
+    fn tool_call_reporting(
+        id: &str,
+        name: &str,
+        input: serde_json::Value,
+        input_tokens: u64,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
+        let mut script = ScriptedProvider::tool_call(id, name, input);
+        if let Some(Ok(StreamEvent::Completed { usage, .. })) = script.last_mut() {
+            usage.input_tokens = input_tokens;
+        }
+        script
+    }
+
+    #[tokio::test]
+    async fn compaction_folds_history_and_continues() {
+        // Window 1000 → trigger at 800, tail budget 300. A big first result,
+        // then a sample that "reports" 750 tokens: the next request estimate
+        // crosses 800, so the turn compacts. The plan folds the big early
+        // history and keeps the small recent exchange verbatim.
+        let cfg = EngineConfig { context_window: 1000, max_turns: 10, ..Default::default() };
+        let scripts = vec![
+            ScriptedProvider::tool_call("t1", "bash", json!({"command": format!("echo {}", "A".repeat(1100))})),
+            tool_call_reporting("t2", "bash", json!({"command": format!("echo {}", "B".repeat(200))}), 750),
+            ScriptedProvider::text_reply("GOAL: digest of earlier work"),
+            ScriptedProvider::text_reply("finished after compaction"),
+        ];
+        let mut h = Harness::new(scripts, cfg);
+        let outcome = h.prompt_and_wait("summarize both outputs").await;
+        assert_eq!(outcome, Outcome::Done { text: "finished after compaction".into() });
+        assert!(h.seen.iter().any(|e| e == "Compacted(false)"), "events: {:?}", h.seen);
+
+        // The log records the compaction; the projection was re-pointed.
+        assert!(h.kinds().iter().any(|k| k == "compaction"));
+        let requests = h.provider.requests();
+        assert_eq!(requests.len(), 4);
+        // Request 3 is the summarize call (its own tiny conversation)…
+        assert!(requests[2].system.contains("compress"));
+        // …and the continuation request opens with the digest, tail verbatim.
+        let continuation = &requests[3];
+        assert!(matches!(
+            &continuation.items[0],
+            Item::User { synthetic: Some(SyntheticReason::CompactionSummary), text }
+                if text.contains("GOAL: digest of earlier work")
+        ));
+        let flat = format!("{:?}", continuation.items);
+        assert!(!flat.contains(&"A".repeat(64)), "folded history must not ride along");
+        assert!(flat.contains(&"B".repeat(64)), "the tail stays verbatim");
+    }
+
+    #[tokio::test]
+    async fn compaction_floor_survives_summarize_failure() {
+        let scripts = vec![
+            ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo start"})),
+            tool_call_reporting("t2", "bash", json!({"command": "echo more"}), 900),
+            // Both summarize attempts fail: the floor placeholder applies.
+            vec![Err(ProviderError::Transport("summarizer down".into()))],
+            vec![Err(ProviderError::Transport("summarizer still down".into()))],
+            ScriptedProvider::text_reply("continued on the floor"),
+        ];
+        let mut h = Harness::new(
+            scripts,
+            EngineConfig { context_window: 1000, max_turns: 10, ..Default::default() },
+        );
+        // ~1500 estimated tokens of tool results pushes past the 800 trigger.
+        let outcome = h.prompt_and_wait(&"x".repeat(1200)).await;
+        assert_eq!(outcome, Outcome::Done { text: "continued on the floor".into() });
+        assert!(h.seen.iter().any(|e| e == "Compacted(true)"), "events: {:?}", h.seen);
+        let degraded = h.entries().iter().any(|e| matches!(
+            &e.payload,
+            hotl_types::EntryPayload::Compaction { degraded: true, .. }
+        ));
+        assert!(degraded, "the compaction entry records the floor");
+    }
+
+    #[tokio::test]
+    async fn moim_rides_the_request_but_never_the_log() {
+        let mut h = Harness::new(vec![ScriptedProvider::text_reply("hi")], cfg());
+        h.prompt_and_wait("hello").await;
+        let requests = h.provider.requests();
+        let tc = requests[0].turn_context.as_deref().expect("turn context attached");
+        assert!(tc.contains("sample=\"1\"") && tc.contains("context_used="), "was: {tc}");
+        assert!(!h.transcript().contains("<turn-context"), "MOIM must never persist");
+    }
+
+    #[tokio::test]
+    async fn subdir_agents_md_injected_on_first_touch() {
+        let mut h = Harness::new(vec![], cfg());
+        let sub = h.dir().join("web");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("AGENTS.md"), "web subproject rules").unwrap();
+        std::fs::write(sub.join("page.txt"), "content").unwrap();
+        let path = sub.join("page.txt");
+        h.provider.push_script(ScriptedProvider::tool_call(
+            "t1",
+            "read",
+            json!({"path": path.to_str().unwrap()}),
+        ));
+        h.provider.push_script(ScriptedProvider::text_reply("read it"));
+        let outcome = h.prompt_and_wait("read the page").await;
+        assert!(matches!(outcome, Outcome::Done { .. }));
+        drop(h.provider.requests());
+        let hint_items: Vec<_> = h
+            .items()
+            .into_iter()
+            .filter(|i| matches!(i, Item::User { synthetic: Some(SyntheticReason::SubdirInstructions), .. }))
+            .collect();
+        assert_eq!(hint_items.len(), 1, "items: {:#?}", h.items());
+        let Item::User { text, .. } = &hint_items[0] else { unreachable!() };
+        assert!(text.contains("web subproject rules") && text.contains("trust=\"untrusted\""));
+        // The second sample's request saw the hint.
+        let requests = h.provider.requests();
+        let flat = format!("{:?}", requests[1].items);
+        assert!(flat.contains("web subproject rules"));
     }
 
     #[allow(dead_code)]

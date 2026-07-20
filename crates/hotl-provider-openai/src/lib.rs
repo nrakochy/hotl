@@ -41,6 +41,9 @@ impl OpenAiCompatProvider {
         for item in &req.items {
             convert_item(item, &mut messages);
         }
+        if let Some(tc) = &req.turn_context {
+            messages.push(json!({"role": "user", "content": tc}));
+        }
         let mut body = json!({
             "model": req.model,
             "max_completion_tokens": req.max_tokens,
@@ -199,8 +202,9 @@ impl SseAssembler for Assembler {
             let input: Value = if args.trim().is_empty() {
                 json!({})
             } else {
-                serde_json::from_str(args).map_err(|e| {
-                    ProviderError::Parse(format!("tool arguments for `{name}` didn't parse: {e}"))
+                // Arg healing (M3a): conservative repair before giving up.
+                hotl_provider::repair::parse_or_repair(args).ok_or_else(|| {
+                    ProviderError::Parse(format!("tool arguments for `{name}` didn't parse"))
                 })?
             };
             blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
@@ -331,8 +335,13 @@ mod tests {
             tools: vec![ToolDef { name: "read".into(), description: "d".into(), input_schema: json!({"type":"object"}) }],
             thinking: true,
             cache_static: true,
+            turn_context: Some("<turn-context/>".into()),
         };
         let body = OpenAiCompatProvider::build_body(&req);
+        assert_eq!(
+            body["messages"].as_array().unwrap().last().unwrap()["content"],
+            "<turn-context/>"
+        );
         let s = body.to_string();
         assert!(!s.contains("secret chain"), "foreign thinking must not cross providers");
         let msgs = body["messages"].as_array().unwrap();

@@ -10,6 +10,7 @@
 mod actor;
 mod turn;
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use hotl_platform::Clock;
@@ -31,6 +32,10 @@ pub struct EngineConfig {
     pub fallback_models: Vec<String>,
     /// Consecutive failures of one tool before the turn stops.
     pub tool_failure_budget: u32,
+    /// Model context window in tokens; compaction triggers at 80% (M2).
+    pub context_window: u64,
+    /// Housekeeping model (compaction summarize); defaults to `model`.
+    pub fast_model: Option<String>,
 }
 
 impl Default for EngineConfig {
@@ -43,8 +48,19 @@ impl Default for EngineConfig {
             cache_static: true,
             fallback_models: Vec::new(),
             tool_failure_budget: 5,
+            context_window: 200_000,
+            fast_model: None,
         }
     }
+}
+
+/// How a turn task ended: with a user-facing outcome, or asking the actor
+/// to compact and respawn a continuation (M2 mid-turn = terminate → compact
+/// → respawn, per commit-protocol).
+#[derive(Debug)]
+pub enum TurnEnd {
+    Outcome(Outcome),
+    Compact,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +86,9 @@ pub enum EngineEvent {
     Retrying { attempt: u32, reason: String },
     FallbackModel { model: String },
     PromptQueued,
+    /// Context was compacted (digest + verbatim tail); `degraded` means the
+    /// summarize call failed and the floor placeholder was used (Sec #10).
+    Compacted { degraded: bool },
     Ask { summary: String, protected_why: Option<String>, reply: oneshot::Sender<bool> },
     TurnDone { outcome: Outcome, usage: TokenUsage },
 }
@@ -86,6 +105,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::Retrying { attempt, .. } => write!(f, "Retrying({attempt})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),
+            Self::Compacted { degraded } => write!(f, "Compacted({degraded})"),
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
         }
@@ -101,8 +121,8 @@ pub enum SessionCmd {
     Snapshot { reply: oneshot::Sender<Arc<Vec<Item>>> },
     /// Turn task → actor: commit these entries (durable-ack before reply).
     Propose { entries: Vec<EntryPayload>, reply: oneshot::Sender<bool> },
-    /// Turn task → actor: the turn is over.
-    TurnFinished { outcome: Outcome, usage: TokenUsage },
+    /// Turn task → actor: the turn is over (or needs a compaction respawn).
+    TurnFinished { end: TurnEnd, usage: TokenUsage },
 }
 
 pub struct SessionDeps {
@@ -113,6 +133,8 @@ pub struct SessionDeps {
     pub clock: Arc<dyn Clock>,
     pub log: SessionLog,
     pub system: String,
+    /// Working directory for subdir instruction hints (M2).
+    pub cwd: PathBuf,
     pub initial_items: Vec<Item>,
     pub config: EngineConfig,
 }

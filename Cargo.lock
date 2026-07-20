@@ -429,6 +429,7 @@ name = "hotl-context"
 version = "0.1.2"
 dependencies = [
  "hotl-types",
+ "serde_json",
 ]
 
 [[package]]
@@ -436,6 +437,7 @@ name = "hotl-engine"
 version = "0.1.2"
 dependencies = [
  "futures-util",
+ "hotl-context",
  "hotl-platform",
  "hotl-provider",
  "hotl-store",

@@ -1,6 +1,7 @@
 //! One turn: sample → tools → sample, until a terminal outcome.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::Path;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
@@ -16,7 +17,11 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::SharedDeps;
-use crate::{EngineEvent, Outcome, SessionCmd};
+use crate::{EngineEvent, Outcome, SessionCmd, TurnEnd};
+
+/// Compaction triggers when the estimated next request crosses this share of
+/// the window (M2; the estimate overcounts, so the miss direction is early).
+const COMPACT_TRIGGER: f64 = 0.8;
 
 pub(crate) async fn run(
     shared: Arc<SharedDeps>,
@@ -25,9 +30,9 @@ pub(crate) async fn run(
     cancel: CancellationToken,
 ) {
     let mut turn = Turn::new(&shared, cmd_tx.clone(), events, cancel);
-    let outcome = turn.drive().await;
+    let end = turn.drive().await;
     let usage = turn.usage;
-    let _ = cmd_tx.send(SessionCmd::TurnFinished { outcome, usage }).await;
+    let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
 }
 
 /// A sample's terminal result, or why it couldn't produce one.
@@ -36,6 +41,9 @@ enum SampleEnd {
     Cancelled,
     /// Availability-class failure: eligible for a model fallback.
     Unavailable(String),
+    /// The next request won't fit (threshold or provider overflow): the turn
+    /// ends and the actor compacts, then respawns a continuation.
+    ContextFull,
     Fatal(String),
 }
 
@@ -50,6 +58,14 @@ struct Turn<'d> {
     call_sigs: Vec<String>,
     consecutive_failures: HashMap<String, u32>,
     usage: TokenUsage,
+    /// (provider-reported tokens, projection length) at the last completed
+    /// sample — the anchor for context estimates (A12b).
+    anchor: Option<(u64, usize)>,
+    samples: u32,
+    /// Subdir hints already injected (per turn) + the latest snapshot for
+    /// cross-turn dedup against the projection.
+    injected_hints: HashSet<String>,
+    last_snapshot: Option<Arc<Vec<Item>>>,
 }
 
 impl<'d> Turn<'d> {
@@ -72,33 +88,40 @@ impl<'d> Turn<'d> {
             call_sigs: Vec::new(),
             consecutive_failures: HashMap::new(),
             usage: TokenUsage::default(),
+            anchor: None,
+            samples: 0,
+            injected_hints: HashSet::new(),
+            last_snapshot: None,
         }
     }
 
-    async fn drive(&mut self) -> Outcome {
+    async fn drive(&mut self) -> TurnEnd {
         for _ in 0..self.shared.config.max_turns {
             let (stop, blocks) = match self.sample().await {
                 SampleEnd::Completed { stop, blocks } => (stop, blocks),
-                SampleEnd::Cancelled => return Outcome::Cancelled,
+                SampleEnd::Cancelled => return TurnEnd::Outcome(Outcome::Cancelled),
+                SampleEnd::ContextFull => return TurnEnd::Compact,
                 SampleEnd::Unavailable(_) if self.model_idx + 1 < self.models.len() => {
                     self.model_idx += 1;
                     self.emit(EngineEvent::FallbackModel { model: self.models[self.model_idx].clone() })
                         .await;
                     continue;
                 }
-                SampleEnd::Unavailable(m) | SampleEnd::Fatal(m) => return Outcome::Error { message: m },
+                SampleEnd::Unavailable(m) | SampleEnd::Fatal(m) => {
+                    return TurnEnd::Outcome(Outcome::Error { message: m })
+                }
             };
             match stop {
                 StopReason::ToolUse => {
                     if let Some(outcome) = self.run_tool_phase(&blocks).await {
-                        return outcome;
+                        return TurnEnd::Outcome(outcome);
                     }
                 }
-                StopReason::Refusal => return Outcome::Refused,
-                _ => return Outcome::Done { text: assistant_text(&blocks) },
+                StopReason::Refusal => return TurnEnd::Outcome(Outcome::Refused),
+                _ => return TurnEnd::Outcome(Outcome::Done { text: assistant_text(&blocks) }),
             }
         }
-        Outcome::TurnLimit
+        TurnEnd::Outcome(Outcome::TurnLimit)
     }
 
     /// One provider sample against a fresh snapshot; commits the assistant
@@ -107,40 +130,25 @@ impl<'d> Turn<'d> {
         let Some(snapshot) = self.snapshot().await else {
             return SampleEnd::Fatal("session closed".into());
         };
-        let request = SamplingRequest {
-            model: self.models[self.model_idx].clone(),
-            max_tokens: self.shared.config.max_tokens,
-            system: self.shared.system.clone(),
-            items: (*snapshot).clone(),
-            tools: self.tool_defs.clone(),
-            thinking: self.shared.config.thinking,
-            cache_static: self.shared.config.cache_static,
+        self.samples += 1;
+        let request = match self.build_request(&snapshot) {
+            Ok(request) => request,
+            Err(end) => return end,
         };
+        self.last_snapshot = Some(snapshot.clone());
 
-        let mut stream = self.shared.provider.stream(request);
-        let mut completed = None;
-        loop {
-            tokio::select! {
-                biased;
-                _ = self.cancel.cancelled() => return SampleEnd::Cancelled,
-                next = stream.next() => match next {
-                    Some(Ok(event)) => {
-                        if let StreamEvent::Completed { stop, usage, blocks } = event {
-                            completed = Some((stop, usage, blocks));
-                        } else {
-                            self.forward(event).await;
-                        }
-                    }
-                    Some(Err(e)) if retry::is_availability(&e) => return SampleEnd::Unavailable(e.to_string()),
-                    Some(Err(e)) => return SampleEnd::Fatal(e.to_string()),
-                    None => break,
-                }
-            }
-        }
-        let Some((stop, usage, blocks)) = completed else {
-            return SampleEnd::Fatal("stream ended without completion".into());
+        let (stop, usage, blocks) = match self.collect_stream(request).await {
+            Ok(completed) => completed,
+            Err(end) => return end,
         };
         self.usage += usage;
+        // Anchor: what the provider says this request cost, plus its output —
+        // the base cost of the next request before any new items.
+        let reported = usage.input_tokens
+            + usage.cache_read_input_tokens
+            + usage.cache_creation_input_tokens
+            + usage.output_tokens;
+        self.anchor = Some((reported, snapshot.len() + 1));
         let assistant = Item::Assistant { blocks: blocks.clone() };
         if !self
             .propose(vec![EntryPayload::Item { item: assistant }, EntryPayload::Usage { usage }])
@@ -185,7 +193,11 @@ impl<'d> Turn<'d> {
             results.push(ToolResultItem { tool_use_id: tu.id.clone(), content, is_error: failed });
         }
         let cancelled = self.cancel.is_cancelled();
-        if !self.propose(vec![EntryPayload::Item { item: Item::ToolResults { results } }]).await {
+        let mut entries = vec![EntryPayload::Item { item: Item::ToolResults { results } }];
+        entries.extend(
+            self.subdir_hints(uses).into_iter().map(|item| EntryPayload::Item { item }),
+        );
+        if !self.propose(entries).await {
             return Some(Outcome::Error { message: "session log is sealed".into() });
         }
         if cancelled {
@@ -261,6 +273,106 @@ impl<'d> Turn<'d> {
     async fn abort_batch(&mut self, uses: &[ToolUse], message: &str) {
         let results = uses.iter().map(|tu| pair(tu, message, true)).collect();
         self.propose(vec![EntryPayload::Item { item: Item::ToolResults { results } }]).await;
+    }
+
+    /// Pre-flight: the compaction threshold check (M2), then the request with
+    /// the MOIM turn-context attached.
+    fn build_request(&self, snapshot: &Arc<Vec<Item>>) -> Result<SamplingRequest, SampleEnd> {
+        let window = self.shared.config.context_window.max(1);
+        let estimate = self.estimate_tokens(snapshot);
+        if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
+            return Err(SampleEnd::ContextFull);
+        }
+        let used_pct = (estimate.saturating_mul(100) / window).min(100) as u8;
+        let turn_context = hotl_context::turn_context(
+            self.shared.clock.now_ms(),
+            &self.shared.cwd,
+            used_pct,
+            self.samples,
+        );
+        Ok(SamplingRequest {
+            model: self.models[self.model_idx].clone(),
+            max_tokens: self.shared.config.max_tokens,
+            system: self.shared.system.clone(),
+            items: (**snapshot).clone(),
+            tools: self.tool_defs.clone(),
+            thinking: self.shared.config.thinking,
+            cache_static: self.shared.config.cache_static,
+            turn_context: Some(turn_context),
+        })
+    }
+
+    /// Drain the provider stream (cancel-biased), forwarding deltas.
+    async fn collect_stream(
+        &mut self,
+        request: SamplingRequest,
+    ) -> Result<(StopReason, TokenUsage, Vec<Value>), SampleEnd> {
+        let mut stream = self.shared.provider.stream(request);
+        let mut completed = None;
+        loop {
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => return Err(SampleEnd::Cancelled),
+                next = stream.next() => match next {
+                    Some(Ok(event)) => {
+                        if let StreamEvent::Completed { stop, usage, blocks } = event {
+                            completed = Some((stop, usage, blocks));
+                        } else {
+                            self.forward(event).await;
+                        }
+                    }
+                    Some(Err(e)) if retry::is_context_overflow(&e) => return Err(SampleEnd::ContextFull),
+                    Some(Err(e)) if retry::is_availability(&e) => return Err(SampleEnd::Unavailable(e.to_string())),
+                    Some(Err(e)) => return Err(SampleEnd::Fatal(e.to_string())),
+                    None => break,
+                }
+            }
+        }
+        completed.ok_or_else(|| SampleEnd::Fatal("stream ended without completion".into()))
+    }
+
+    /// Anchored context estimate for the next request: the provider-reported
+    /// cost of the last sample plus the (overcounting) estimate of everything
+    /// appended since. Falls back to a full estimate before the first sample.
+    fn estimate_tokens(&self, snapshot: &[Item]) -> u64 {
+        use hotl_context::tokens;
+        match self.anchor {
+            Some((reported, len)) if snapshot.len() >= len => {
+                reported + tokens::estimate_items(&snapshot[len..])
+            }
+            _ => tokens::estimate_text(&self.shared.system) + tokens::estimate_items(snapshot),
+        }
+    }
+
+    /// Just-in-time nested AGENTS.md injection (M2), deduped per turn and
+    /// against the projection (hints from earlier turns are in the snapshot).
+    fn subdir_hints(&mut self, uses: &[ToolUse]) -> Vec<Item> {
+        let mut out = Vec::new();
+        for tu in uses {
+            let Some(path) = tu.input.get("path").and_then(Value::as_str) else { continue };
+            let Some((marker, item)) =
+                hotl_context::nested_instructions(&self.shared.cwd, Path::new(path))
+            else {
+                continue;
+            };
+            if self.injected_hints.contains(&marker) || self.in_projection(&marker) {
+                continue;
+            }
+            self.injected_hints.insert(marker);
+            out.push(item);
+        }
+        out
+    }
+
+    fn in_projection(&self, marker: &str) -> bool {
+        let Some(snapshot) = &self.last_snapshot else { return false };
+        snapshot.iter().any(|i| {
+            matches!(
+                i,
+                Item::User { text, synthetic: Some(hotl_types::SyntheticReason::SubdirInstructions) }
+                    if text.contains(marker)
+            )
+        })
     }
 
     async fn snapshot(&self) -> Option<Arc<Vec<Item>>> {

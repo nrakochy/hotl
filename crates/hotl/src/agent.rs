@@ -7,7 +7,7 @@ use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use hotl_context::{load_system_prompt, project_instructions};
+use hotl_context::{load_memory, load_system_prompt, project_instructions};
 use hotl_engine::{spawn_session, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
 use hotl_platform::{Clock, EnvSecrets, SecretStore, SystemClock};
 use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
@@ -18,24 +18,11 @@ use tokio::sync::mpsc;
 const ASK_TIMEOUT_SECS: u64 = 300;
 
 pub async fn agent_main(args: Vec<String>) -> i32 {
-    let mut prompt: Option<String> = None;
-    let mut json_events = false;
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-p" | "--print" => prompt = iter.next(),
-            "--json" => json_events = true,
-            other => {
-                eprintln!("hotl: unknown argument `{other}` (try --help)");
-                return 2;
-            }
-        }
-    }
+    let (prompt, json_events) = match parse_args(args) {
+        Ok(parsed) => parsed,
+        Err(code) => return code,
+    };
     let headless = prompt.is_some();
-    if headless && prompt.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        eprintln!("hotl: -p requires a prompt");
-        return 2;
-    }
 
     let secrets = EnvSecrets;
     let (provider, model) = match select_provider(&secrets) {
@@ -49,11 +36,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     let clock = Arc::new(SystemClock);
     let config_dir = config_dir();
     let system = load_system_prompt(&config_dir);
-    let (rules, rules_warning) = Rules::load(&config_dir);
-    let rules = Arc::new(rules);
-    if let Some(warning) = rules_warning {
-        eprintln!("hotl: {warning}");
-    }
+    let rules = load_rules(&config_dir);
     let sandbox_status = sandbox::probe();
     let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -67,10 +50,8 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     };
     let session_id = log.session_id.clone();
 
-    let mut initial_items = Vec::new();
-    if let Some(instructions) = project_instructions(&cwd) {
-        initial_items.push(instructions);
-    }
+    spawn_secret_audit(log.path().to_path_buf());
+    let initial_items = initial_items(&config_dir, &cwd);
 
     let handle = spawn_session(SessionDeps {
         provider,
@@ -80,8 +61,9 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         clock,
         log,
         system,
+        cwd: cwd.clone(),
         initial_items,
-        config: EngineConfig { model: model.clone(), ..Default::default() },
+        config: engine_config(&model, &secrets),
     });
 
     let mut surface = Surface::new(handle, headless, json_events);
@@ -91,15 +73,27 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         return surface.run_until_idle().await;
     }
 
+    print_banner(&model, &session_id, &sandbox_status);
+    surface.repl().await
+}
+
+fn load_rules(config_dir: &std::path::Path) -> Arc<Rules> {
+    let (rules, warning) = Rules::load(config_dir);
+    if let Some(warning) = warning {
+        eprintln!("hotl: {warning}");
+    }
+    Arc::new(rules)
+}
+
+fn print_banner(model: &str, session_id: &str, status: &sandbox::SandboxStatus) {
     println!(
         "hotl · {model} · session {session_id} · {}",
-        match &sandbox_status {
+        match status {
             sandbox::SandboxStatus::Enforced(m) => format!("sandbox:{m}"),
             other => other.label(),
         }
     );
     println!("type to prompt · type mid-turn to steer · ctrl-c interrupts · ctrl-d exits");
-    surface.repl().await
 }
 
 struct Surface {
@@ -227,30 +221,39 @@ impl Surface {
             EngineEvent::Retrying { attempt, reason } => eprintln!("· retrying ({attempt}): {reason}"),
             EngineEvent::FallbackModel { model } => eprintln!("· falling back to {model}"),
             EngineEvent::PromptQueued => eprintln!("(queued — runs after the current turn)"),
+            EngineEvent::Compacted { degraded } => {
+                if degraded {
+                    eprintln!("(context compacted — summary failed, earlier history dropped)");
+                } else {
+                    eprintln!("(context compacted — earlier history summarized)");
+                }
+            }
             EngineEvent::Ask { summary, protected_why, reply } => {
                 let answer = self.ask_human(&summary, protected_why.as_deref()).await;
                 let _ = reply.send(answer);
             }
-            EngineEvent::TurnDone { outcome, usage } => {
-                self.turn_running = false;
-                match &outcome {
-                    Outcome::Done { .. } => {}
-                    Outcome::Cancelled => eprintln!("\n(interrupted)"),
-                    Outcome::TurnLimit => eprintln!("\nhotl: stopped at max_turns — break the task into smaller prompts."),
-                    Outcome::Refused => eprintln!("\nhotl: the model declined this request."),
-                    Outcome::DoomLoop { pattern } => eprintln!("\nhotl: stopped — the model kept repeating: {pattern}"),
-                    Outcome::ToolFailureBudget { tool } => {
-                        eprintln!("\nhotl: stopped — `{tool}` failed too many times in a row.")
-                    }
-                    Outcome::Error { message } => eprintln!("\nhotl: {message}"),
-                }
-                eprintln!(
-                    "[in {} out {} cache-read {}]",
-                    usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
-                );
-                self.prompt_marker();
-            }
+            EngineEvent::TurnDone { outcome, usage } => self.render_turn_done(outcome, usage),
         }
+    }
+
+    fn render_turn_done(&mut self, outcome: Outcome, usage: hotl_types::TokenUsage) {
+        self.turn_running = false;
+        match &outcome {
+            Outcome::Done { .. } => {}
+            Outcome::Cancelled => eprintln!("\n(interrupted)"),
+            Outcome::TurnLimit => eprintln!("\nhotl: stopped at max_turns — break the task into smaller prompts."),
+            Outcome::Refused => eprintln!("\nhotl: the model declined this request."),
+            Outcome::DoomLoop { pattern } => eprintln!("\nhotl: stopped — the model kept repeating: {pattern}"),
+            Outcome::ToolFailureBudget { tool } => {
+                eprintln!("\nhotl: stopped — `{tool}` failed too many times in a row.")
+            }
+            Outcome::Error { message } => eprintln!("\nhotl: {message}"),
+        }
+        eprintln!(
+            "[in {} out {} cache-read {}]",
+            usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
+        );
+        self.prompt_marker();
     }
 
     fn render_json(&mut self, event: EngineEvent) {
@@ -264,6 +267,7 @@ impl Surface {
             EngineEvent::Retrying { attempt, reason } => serde_json::json!({"type":"retrying","attempt":attempt,"reason":reason}),
             EngineEvent::FallbackModel { model } => serde_json::json!({"type":"fallback_model","model":model}),
             EngineEvent::PromptQueued => serde_json::json!({"type":"prompt_queued"}),
+            EngineEvent::Compacted { degraded } => serde_json::json!({"type":"compacted","degraded":degraded}),
             EngineEvent::Ask { summary, reply, .. } => {
                 // JSON mode is headless automation: default-deny, emit the record.
                 let _ = reply.send(false);
@@ -295,6 +299,72 @@ impl Surface {
             }
         }
     }
+}
+
+/// `(-p prompt, --json)`; `Err(exit_code)` on bad usage.
+fn parse_args(args: Vec<String>) -> Result<(Option<String>, bool), i32> {
+    let mut prompt: Option<String> = None;
+    let mut json_events = false;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "-p" | "--print" => prompt = iter.next(),
+            "--json" => json_events = true,
+            other => {
+                eprintln!("hotl: unknown argument `{other}` (try --help)");
+                return Err(2);
+            }
+        }
+    }
+    if prompt.is_some() && prompt.as_deref().map(str::trim).unwrap_or("").is_empty() {
+        eprintln!("hotl: -p requires a prompt");
+        return Err(2);
+    }
+    Ok((prompt, json_events))
+}
+
+/// Secrets-at-rest audit (M2): warn about earlier logs holding values that
+/// are secrets *now* — append-only logs can't be scrubbed; the remedy is
+/// rotation. Runs off-thread; the current session is masked and excluded.
+fn spawn_secret_audit(current_log: PathBuf) {
+    std::thread::spawn(move || {
+        let masker = Masker::from_env();
+        let hits: Vec<_> = hotl_store::audit_secrets(&sessions_dir(), &masker)
+            .into_iter()
+            .filter(|p| *p != current_log)
+            .collect();
+        if !hits.is_empty() {
+            eprintln!(
+                "hotl: WARNING — {} earlier session log(s) contain values that are now \
+                 secrets (written before masking could apply). Rotate those secrets. First: {}",
+                hits.len(),
+                hits[0].display()
+            );
+        }
+    });
+}
+
+/// Session-start context: user memory (M2), then project instructions.
+fn initial_items(config_dir: &std::path::Path, cwd: &std::path::Path) -> Vec<hotl_types::Item> {
+    let mut items = Vec::new();
+    if let Some(memory) = load_memory(config_dir) {
+        items.push(memory);
+    }
+    if let Some(instructions) = project_instructions(cwd) {
+        items.push(instructions);
+    }
+    items
+}
+
+/// Engine knobs from the environment: HOTL_CONTEXT_WINDOW (tokens) and
+/// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
+fn engine_config(model: &str, secrets: &dyn SecretStore) -> EngineConfig {
+    let mut config = EngineConfig { model: model.to_string(), ..Default::default() };
+    if let Some(window) = secrets.get("HOTL_CONTEXT_WINDOW").and_then(|v| v.parse().ok()) {
+        config.context_window = window;
+    }
+    config.fast_model = secrets.get("HOTL_FAST_MODEL");
+    config
 }
 
 fn exit_code(outcome: &Outcome) -> i32 {

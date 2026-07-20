@@ -111,8 +111,9 @@ impl Assembler {
         let index = index_of(v);
         if let Some(partial) = self.partial_json.remove(&index) {
             if !partial.trim().is_empty() {
-                let input: Value = serde_json::from_str(&partial).map_err(|e| {
-                    ProviderError::Parse(format!("tool input didn't parse at block {index}: {e}"))
+                // Arg healing (M3a): conservative repair before giving up.
+                let input = hotl_provider::repair::parse_or_repair(&partial).ok_or_else(|| {
+                    ProviderError::Parse(format!("tool input didn't parse at block {index}"))
                 })?;
                 if let Some(b) = self.blocks.get_mut(index) {
                     b["input"] = input;

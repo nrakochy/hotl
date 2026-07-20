@@ -37,6 +37,9 @@ pub struct SamplingRequest {
     /// M0 static cache placement: system block + latest user block
     /// (explicit-cache providers; system-design §L2 cache policy).
     pub cache_static: bool,
+    /// MOIM (M2): ephemeral per-turn context, sent as a trailing user block
+    /// after the cache marker. Never persisted — it exists only on the wire.
+    pub turn_context: Option<String>,
 }
 
 /// The unified, channel-tagged, block-structured event enum.
@@ -94,6 +97,12 @@ impl ScriptedProvider {
 
     pub fn requests(&self) -> Vec<SamplingRequest> {
         self.requests.lock().expect("requests mutex").clone()
+    }
+
+    /// Append a script after construction (tests that need the harness's
+    /// paths before the scripts can be written).
+    pub fn push_script(&self, script: Vec<Result<StreamEvent, ProviderError>>) {
+        self.scripts.lock().expect("scripted provider mutex").push_back(script);
     }
 
     /// Convenience: a one-sample script that answers with plain text.
@@ -208,9 +217,42 @@ pub mod retry {
         ) || matches!(err, ProviderError::Transport(_))
     }
 
+    /// Context-overflow detection (M2 compaction trigger). Both dialects
+    /// report overflow as a 400 whose message names the context/length limit;
+    /// this matches on *wire error* text (structured API data, not model
+    /// prose — the RELIABILITY.md rule concerns the latter). A miss is safe:
+    /// the pre-sample threshold catches what this doesn't.
+    pub fn is_context_overflow(err: &ProviderError) -> bool {
+        let ProviderError::Http { status: 400, message, .. } = err else {
+            return false;
+        };
+        let m = message.to_lowercase();
+        ["too long", "context length", "context window", "tokens exceed"]
+            .iter()
+            .any(|needle| m.contains(needle))
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        #[test]
+        fn overflow_detection() {
+            let overflow = ProviderError::Http {
+                status: 400,
+                message: r#"{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#.into(),
+                retry_after: None,
+            };
+            assert!(is_context_overflow(&overflow));
+            let oai = ProviderError::Http {
+                status: 400,
+                message: "This model's maximum context length is 128000 tokens".into(),
+                retry_after: None,
+            };
+            assert!(is_context_overflow(&oai));
+            let plain_400 = ProviderError::Http { status: 400, message: "bad schema".into(), retry_after: None };
+            assert!(!is_context_overflow(&plain_400));
+        }
 
         #[test]
         fn classify_rules() {
@@ -268,6 +310,122 @@ pub mod transform {
             assert_eq!(out.len(), 2);
             assert_eq!(out[0]["type"], "text");
             assert_eq!(out[1]["type"], "tool_use");
+        }
+    }
+}
+
+/// Arg healing at the erasure boundary (M3a; corpus 05): streamed tool
+/// arguments sometimes arrive as *almost*-JSON. Repair is conservative —
+/// only unambiguous damage is fixed; anything else stays a parse error that
+/// feeds back to the model as a tool result.
+pub mod repair {
+    use serde_json::Value;
+
+    /// Strict parse, then repairs: strip trailing commas, then close
+    /// truncated strings/objects/arrays (streams cut mid-argument).
+    pub fn parse_or_repair(raw: &str) -> Option<Value> {
+        if let Ok(v) = serde_json::from_str(raw) {
+            return Some(v);
+        }
+        let without_commas = strip_trailing_commas(raw);
+        if let Ok(v) = serde_json::from_str(&without_commas) {
+            return Some(v);
+        }
+        serde_json::from_str(&close_truncation(&without_commas)).ok()
+    }
+
+    /// `{"a": 1,}` / `[1, 2,]` → valid. Only commas directly before a closer.
+    fn strip_trailing_commas(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut in_string = false;
+        let mut escaped = false;
+        for c in s.chars() {
+            if in_string {
+                out.push(c);
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => {
+                    in_string = true;
+                    out.push(c);
+                }
+                '}' | ']' => {
+                    while out.ends_with(char::is_whitespace) || out.ends_with(',') {
+                        if out.ends_with(',') {
+                            out.pop();
+                            break;
+                        }
+                        out.pop();
+                    }
+                    out.push(c);
+                }
+                _ => out.push(c),
+            }
+        }
+        out
+    }
+
+    /// Close an unterminated string and any open brackets, in nesting order.
+    fn close_truncation(s: &str) -> String {
+        let mut stack = Vec::new();
+        let mut in_string = false;
+        let mut escaped = false;
+        for c in s.chars() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if c == '\\' {
+                    escaped = true;
+                } else if c == '"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match c {
+                '"' => in_string = true,
+                '{' => stack.push('}'),
+                '[' => stack.push(']'),
+                '}' | ']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let mut out = s.to_string();
+        if in_string {
+            out.push('"');
+        }
+        while let Some(closer) = stack.pop() {
+            out.push(closer);
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn repairs_common_damage_and_rejects_garbage() {
+            assert_eq!(parse_or_repair(r#"{"path": "a.rs"}"#).unwrap()["path"], "a.rs");
+            assert_eq!(parse_or_repair(r#"{"path": "a.rs",}"#).unwrap()["path"], "a.rs");
+            assert_eq!(parse_or_repair(r#"{"items": [1, 2,]}"#).unwrap()["items"][1], 2);
+            // Truncated mid-string (stream cut): closed and parsed.
+            let v = parse_or_repair(r#"{"command": "cargo tes"#).unwrap();
+            assert_eq!(v["command"], "cargo tes");
+            // A comma inside a string is untouched.
+            assert_eq!(parse_or_repair(r#"{"t": "a,}"}"#).unwrap()["t"], "a,}");
+            // Escaped quotes don't confuse the scanner.
+            let v = parse_or_repair(r#"{"t": "say \"hi\"",}"#).unwrap();
+            assert_eq!(v["t"], "say \"hi\"");
+            assert!(parse_or_repair("not json at all").is_none());
         }
     }
 }

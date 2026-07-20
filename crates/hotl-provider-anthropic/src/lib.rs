@@ -32,11 +32,17 @@ impl AnthropicProvider {
     }
 
     fn build_body(req: &SamplingRequest) -> Value {
+        let mut messages = build_messages(&req.items, req.cache_static);
+        // MOIM rides after the cache marker: it changes every sample without
+        // invalidating the cached prefix (suffix position — corpus 04).
+        if let Some(tc) = &req.turn_context {
+            messages.push(json!({"role": "user", "content": [{"type": "text", "text": tc}]}));
+        }
         let mut body = json!({
             "model": req.model,
             "max_tokens": req.max_tokens,
             "stream": true,
-            "messages": build_messages(&req.items, req.cache_static),
+            "messages": messages,
         });
         if !req.system.is_empty() {
             let mut sys = json!({"type": "text", "text": req.system});
@@ -46,7 +52,16 @@ impl AnthropicProvider {
             body["system"] = json!([sys]);
         }
         if !req.tools.is_empty() {
-            body["tools"] = json!(req.tools.iter().map(tool_json).collect::<Vec<_>>());
+            let mut tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
+            // Auto breakpoint on the last tool def (M2 cache policy): tools
+            // render before system in the prefix, so this seals the whole
+            // tool block. 3 markers total (tools/system/latest-user) ≤ 4.
+            if req.cache_static {
+                if let Some(last) = tools.last_mut() {
+                    last["cache_control"] = json!({"type": "ephemeral"});
+                }
+            }
+            body["tools"] = json!(tools);
         }
         if req.thinking {
             body["thinking"] = json!({"type": "adaptive"});
@@ -233,18 +248,28 @@ mod tests {
                 Item::Assistant { blocks: vec![serde_json::json!({"type":"text","text":"ok"})] },
                 Item::ToolResults { results: vec![ToolResultItem { tool_use_id: "t1".into(), content: "out".into(), is_error: false }] },
             ],
-            tools: vec![],
+            tools: vec![ToolDef {
+                name: "read".into(),
+                description: "d".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }],
             thinking: true,
             cache_static: true,
+            turn_context: Some("<turn-context sample=\"1\"/>".into()),
         };
         let body = AnthropicProvider::build_body(&req);
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "adaptive");
-        // system block carries the cache marker
+        // system block carries a cache marker; so does the last tool def
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
-        // last user-role message (the tool results) carries the second marker
+        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
+        // 3 items + the ephemeral MOIM block at the end
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[3]["content"][0]["text"], "<turn-context sample=\"1\"/>");
+        assert!(msgs[3]["content"][0].get("cache_control").is_none(), "MOIM is never cached");
+        // last *item* user-role message (the tool results) carries the marker —
+        // the MOIM block after it doesn't shift the cache point
         let last = &msgs[2];
         assert_eq!(last["role"], "user");
         assert_eq!(last["content"][0]["type"], "tool_result");
