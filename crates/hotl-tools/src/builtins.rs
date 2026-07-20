@@ -336,8 +336,8 @@ fn combined_output(output: &std::process::Output) -> String {
 }
 
 /// Kill the child's whole process group (spawned with process_group(0),
-/// so its pgid == its pid).
-fn kill_group(pid: Option<u32>) {
+/// so its pgid == its pid). Shared with the diagnostics runner (H-11).
+pub(crate) fn kill_group(pid: Option<u32>) {
     if let Some(pid) = pid {
         // SAFETY: plain syscall; negative pid targets the process group.
         unsafe {

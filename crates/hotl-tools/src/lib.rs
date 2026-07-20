@@ -112,9 +112,10 @@ impl Registry {
     }
 }
 
-/// The execute-later class (0001 §M0): files whose *write* is benign-looking
-/// but whose *execution* happens later, outside any gate. Writes here get the
-/// escalated ask.
+/// The execute-later class (0001 §M0; extended M3a per security-evaluation
+/// H-04): files whose *write* is benign-looking but whose later effect —
+/// execution, authentication, or credential theft — happens outside any gate.
+/// Writes here get the escalated warning ask instead of an ordinary one.
 pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     let p = path.trim_start_matches("./");
     let file = p.rsplit('/').next().unwrap_or(p);
@@ -124,6 +125,11 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     if matches!(file, "Makefile" | "makefile" | "GNUmakefile" | "justfile" | "Justfile") {
         return Some("build entrypoint: runs on your next make/just invocation");
     }
+    // Build-time code entrypoints: a diagnostic or a plain `cargo build` /
+    // `pytest` compiles and runs these (H-11's write-now/execute-later path).
+    if matches!(file, "build.rs" | "conftest.py") || file.ends_with(".gyp") {
+        return Some("build-time code: compiled and run by your build/test tooling");
+    }
     if matches!(file, "AGENTS.md" | "CLAUDE.md") {
         return Some("agent instructions: injected into future model contexts");
     }
@@ -132,6 +138,26 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     }
     if file.ends_with(".zshrc") || file.ends_with(".bashrc") || file.ends_with(".profile") {
         return Some("shell startup file: runs in every new shell");
+    }
+    // SSH: authorized_keys grants login; config can rewrite where ssh connects.
+    if p.contains(".ssh/") {
+        return Some("SSH config/keys: can grant login or redirect your connections");
+    }
+    // Cloud + package-registry credentials: write-to-steal or token planting.
+    if p.contains(".aws/")
+        || p.contains(".config/gcloud/")
+        || p.contains(".azure/")
+        || matches!(file, ".npmrc" | ".pypirc" | ".netrc" | ".dockercfg")
+    {
+        return Some("credentials file: writing here can steal or plant auth tokens");
+    }
+    // git config aliases / hooksPath run as commands on the next git call.
+    if file == ".gitconfig" || p.contains(".git/config") {
+        return Some("git config: aliases here run as commands on your next git call");
+    }
+    // Schedulers and service definitions run code on a timer / at boot.
+    if p.contains("/cron.") || file == "crontab" || p.contains("/systemd/") || file.ends_with(".service") {
+        return Some("scheduler/service unit: runs code on a timer or at boot");
     }
     None
 }
@@ -148,5 +174,30 @@ mod tests {
         assert!(execute_later_reason(".hotl/settings.json").is_some());
         assert!(execute_later_reason("src/main.rs").is_none());
         assert!(execute_later_reason("docs/notes.md").is_none());
+    }
+
+    #[test]
+    fn protected_paths_cover_creds_and_build_entrypoints() {
+        // The H-04 additions: credential, scheduler, and build-code targets.
+        for p in [
+            "home/user/.ssh/authorized_keys",
+            "home/user/.ssh/config",
+            "home/user/.aws/credentials",
+            "home/user/.config/gcloud/creds",
+            "project/.npmrc",
+            "home/user/.pypirc",
+            "home/user/.netrc",
+            "home/user/.gitconfig",
+            "repo/.git/config",
+            "etc/cron.d/job",
+            "etc/systemd/system/x.service",
+            "crate/build.rs",
+            "tests/conftest.py",
+        ] {
+            assert!(execute_later_reason(p).is_some(), "{p} should be protected");
+        }
+        // Ordinary source and docs stay unescalated.
+        assert!(execute_later_reason("src/lib.rs").is_none());
+        assert!(execute_later_reason("README.md").is_none());
     }
 }
