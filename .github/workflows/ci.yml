@@ -3,6 +3,10 @@ name: CI
 # Build, test, and lint on every push and pull request. Publishing is a
 # separate, tag-triggered workflow (see publish.yml) — this one just keeps the
 # default branch green.
+#
+# Watch and harness run as separate jobs (merge plan 0002 phase 1): a red
+# harness must never block a `hotl watch` hotfix, and vice versa. The binary
+# crate depends on both, so it builds in the harness job (the bigger tree).
 on:
   push:
     branches: ["**"]
@@ -17,7 +21,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  watch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -25,7 +29,24 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: Test
-        run: cargo test --workspace --locked
+        with:
+          key: watch
+      - name: Clippy (watch crates)
+        run: cargo clippy -p hotl-watch-types -p hotl-watch-tmux -p hotl-watch-listener -p hotl-watch-tui --all-targets -- -D warnings
+      - name: Test (watch crates)
+        run: cargo test -p hotl-watch-types -p hotl-watch-tmux -p hotl-watch-listener -p hotl-watch-tui --locked
+
+  harness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: harness
+      - name: Clippy (harness crates + binary)
+        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl --all-targets -- -D warnings
+      - name: Test (harness crates + binary)
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl --locked
