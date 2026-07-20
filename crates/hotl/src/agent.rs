@@ -66,6 +66,60 @@ pub async fn resume_main(args: Vec<String>) -> i32 {
     }
 }
 
+/// `hotl acp`: serve the ACP JSON-RPC protocol over stdio (M4). Wires the
+/// real engine deps into a session factory and hands the streams to the
+/// protocol loop. One connection, one process (process-per-session).
+pub async fn acp_main() -> i32 {
+    let secrets = EnvSecrets;
+    let (provider, model) = match select_provider(&secrets) {
+        Ok(pair) => pair,
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            return 1;
+        }
+    };
+    let clock = Arc::new(SystemClock);
+    let config_dir = config_dir();
+    let system = load_system_prompt(&config_dir);
+    let rules = load_rules(&config_dir);
+    let sandbox_enforced = matches!(sandbox::probe(), sandbox::SandboxStatus::Enforced(_));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let config = engine_config(&model, &secrets);
+    let registry = Arc::new(build_registry(&config_dir));
+
+    let factory: crate::acp::SessionFactory = Box::new(move |spec| {
+        let resumed = match spec {
+            crate::acp::SessionSpec::New => None,
+            crate::acp::SessionSpec::Load(sid) => {
+                let replayed = hotl_store::replay_chain(&sessions_dir(), &sid)
+                    .map_err(|e| format!("could not load session {sid}: {e}"))?;
+                Some(Resumed { parent_id: replayed.header.session_id, items: replayed.items })
+            }
+        };
+        let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
+        let log = SessionLog::create(&sessions_dir(), &model, parent_id, Masker::from_env(), clock.now_ms())
+            .map_err(|e| format!("could not create session log: {e}"))?;
+        let session_id = log.session_id.clone();
+        let (snapshots, initial) = session_context(&session_id, &cwd, &config_dir, &resumed);
+        Ok(spawn_session(SessionDeps {
+            provider: provider.clone(),
+            registry: registry.clone(),
+            rules: rules.clone(),
+            sandbox_enforced,
+            clock: clock.clone(),
+            log,
+            system: system.clone(),
+            cwd: cwd.clone(),
+            snapshots,
+            initial_items: initial,
+            config: config.clone(),
+        }))
+    });
+
+    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory).await;
+    0
+}
+
 fn age(t: std::time::SystemTime) -> String {
     let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
     match secs {

@@ -8,8 +8,10 @@
 //!   doctor        environment/setup checks (MD)
 //!   resume        continue an earlier session from its log (M3b)
 //!   undo          restore files to the last pre-batch snapshot (M3b)
+//!   acp           serve the ACP JSON-RPC protocol over stdio (M4)
 //!   update        reserved (MD)
 
+mod acp;
 mod agent;
 mod doctor;
 mod watch;
@@ -44,6 +46,7 @@ fn main() {
         Some("doctor") => std::process::exit(doctor::doctor_main()),
         Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
         Some("resume") => std::process::exit(block_on(agent::resume_main(args[1..].to_vec()))),
+        Some("acp") => std::process::exit(block_on(agent::acp_main())),
         Some("update") => {
             eprintln!("`hotl update` is reserved for the distribution milestone (MD) and not built yet.");
             std::process::exit(2);

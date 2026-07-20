@@ -1,0 +1,245 @@
+//! `hotl acp` — the ACP-shaped protocol surface (M4; 0005 §2).
+//!
+//! A JSON-RPC 2.0 line protocol over stdio that drives the *same* engine the
+//! REPL does: an editor or orchestrator is just another client of
+//! `SessionHandle`. One session per connection (process-per-session — the
+//! orchestrator pattern, 0005 §decisions). Model output and tool status
+//! arrive as `session/update` notifications carrying a `schema_version`
+//! (Tier-1 stable, not a side-channel); permission asks are
+//! `session/request_permission` round-trips to the client.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use hotl_engine::{EngineEvent, Outcome, SessionHandle};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::{mpsc, oneshot, Mutex};
+
+/// Stable schema version of `session/update` / prompt-result payloads (an MD
+/// Tier-1 contract — bump only on a breaking change).
+pub const UPDATE_SCHEMA_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: &str = "0.1";
+
+type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
+/// The JSON-RPC id of the in-flight prompt request, answered on TurnDone.
+type PendingPrompt = Arc<std::sync::Mutex<Option<Value>>>;
+
+/// What a client asked the factory to produce.
+pub enum SessionSpec {
+    New,
+    Load(String),
+}
+
+/// Builds a session per the client's request. The real binary wires engine
+/// deps here; tests inject a scripted-provider session.
+pub type SessionFactory = Box<dyn FnMut(SessionSpec) -> Result<SessionHandle, String> + Send>;
+
+/// Drive the protocol over one connection until the client hangs up.
+pub async fn serve(
+    read: impl AsyncRead + Send + Unpin + 'static,
+    write: impl AsyncWrite + Send + Unpin + 'static,
+    mut factory: SessionFactory,
+) {
+    let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
+    let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pending_prompt: PendingPrompt = Arc::new(std::sync::Mutex::new(None));
+    let mut next_id: u64 = 1;
+    let mut session: Option<SessionState> = None;
+
+    let mut lines = BufReader::new(read).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue; // unparseable frame, no id to reply to
+        };
+        // A client response to one of our permission requests?
+        if msg.get("method").is_none() {
+            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                if let Some(reply) = pending.lock().expect("pending").remove(&id) {
+                    let allow = msg.pointer("/result/allow").and_then(Value::as_bool).unwrap_or(false);
+                    let _ = reply.send(allow);
+                }
+            }
+            continue;
+        }
+        handle_request(&msg, &writer, &mut factory, &mut session, &pending, &pending_prompt, &mut next_id)
+            .await;
+    }
+}
+
+struct SessionState {
+    id: String,
+    handle: Arc<SessionHandle>,
+    _drain: tokio::task::JoinHandle<()>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_request(
+    msg: &Value,
+    writer: &Writer,
+    factory: &mut SessionFactory,
+    session: &mut Option<SessionState>,
+    pending: &Pending,
+    pending_prompt: &PendingPrompt,
+    next_id: &mut u64,
+) {
+    let id = msg.get("id").cloned().unwrap_or(Value::Null);
+    match msg.get("method").and_then(Value::as_str).unwrap_or("") {
+        "initialize" => {
+            reply_ok(writer, id, json!({"protocolVersion": PROTOCOL_VERSION, "schemaVersion": UPDATE_SCHEMA_VERSION})).await;
+        }
+        method @ ("session/new" | "session/load") => {
+            let spec = if method == "session/load" {
+                match msg.pointer("/params/sessionId").and_then(Value::as_str) {
+                    Some(sid) => SessionSpec::Load(sid.to_string()),
+                    None => return reply_err(writer, id, "session/load requires params.sessionId").await,
+                }
+            } else {
+                SessionSpec::New
+            };
+            match factory(spec) {
+                Ok(handle) => {
+                    let state = start_session(handle, writer.clone(), pending.clone(), pending_prompt.clone(), next_id);
+                    let sid = state.id.clone();
+                    *session = Some(state);
+                    reply_ok(writer, id, json!({"sessionId": sid})).await;
+                }
+                Err(e) => reply_err(writer, id, &e).await,
+            }
+        }
+        "session/prompt" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let Some(text) = msg.pointer("/params/text").and_then(Value::as_str) else {
+                return reply_err(writer, id, "session/prompt requires params.text").await;
+            };
+            // Stash the id; the drain task answers it on TurnDone so the read
+            // loop stays free to service permission responses meanwhile.
+            *pending_prompt.lock().expect("prompt") = Some(id);
+            state.handle.prompt(text.to_string()).await;
+        }
+        "session/cancel" => {
+            if let Some(state) = session.as_ref() {
+                state.handle.interrupt();
+            }
+            reply_ok(writer, id, json!({"cancelled": true})).await;
+        }
+        other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
+    }
+}
+
+fn start_session(
+    mut handle: SessionHandle,
+    writer: Writer,
+    pending: Pending,
+    pending_prompt: PendingPrompt,
+    next_id: &mut u64,
+) -> SessionState {
+    let id = format!("acp-{}", *next_id);
+    // Permission request ids for this session are disjoint from every other id.
+    let req_id_seed = *next_id * 1_000_000;
+    *next_id += 1;
+    let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
+    let sid = id.clone();
+    let drain = tokio::spawn(drain_events(events, writer, pending, pending_prompt, sid, req_id_seed));
+    SessionState { id, handle: Arc::new(handle), _drain: drain }
+}
+
+/// Map engine events to `session/update` notifications, turn permission asks
+/// into `session/request_permission` requests, and answer the pending prompt
+/// on TurnDone.
+async fn drain_events(
+    mut events: mpsc::Receiver<EngineEvent>,
+    writer: Writer,
+    pending: Pending,
+    pending_prompt: PendingPrompt,
+    session_id: String,
+    mut req_id: u64,
+) {
+    while let Some(event) = events.recv().await {
+        match event {
+            EngineEvent::Ask { summary, protected_why, reply } => {
+                req_id += 1;
+                pending.lock().expect("pending").insert(req_id, reply);
+                send(&writer, &json!({
+                    "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
+                    "params": {"sessionId": session_id, "summary": summary, "protectedWhy": protected_why},
+                }))
+                .await;
+            }
+            EngineEvent::TurnDone { outcome, usage } => {
+                notify(&writer, &session_id, json!({"type": "turn_done", "outcome": outcome_tag(&outcome)})).await;
+                // Take the id and drop the guard *before* awaiting (a
+                // std::sync guard held across .await would make this non-Send).
+                let prompt_id = pending_prompt.lock().expect("prompt").take();
+                if let Some(id) = prompt_id {
+                    reply_ok(
+                        &writer,
+                        id,
+                        json!({"schemaVersion": UPDATE_SCHEMA_VERSION, "outcome": outcome_tag(&outcome), "usage": usage}),
+                    )
+                    .await;
+                }
+            }
+            other => {
+                if let Some(update) = update_payload(&other) {
+                    notify(&writer, &session_id, update).await;
+                }
+            }
+        }
+    }
+}
+
+fn update_payload(event: &EngineEvent) -> Option<Value> {
+    Some(match event {
+        EngineEvent::TextDelta(t) => json!({"type": "text_delta", "text": t}),
+        EngineEvent::ThinkingDelta(_) => json!({"type": "thinking_delta"}),
+        EngineEvent::ToolStart { name, summary } => json!({"type": "tool_start", "name": name, "summary": summary}),
+        EngineEvent::ToolDone { name, ok } => json!({"type": "tool_done", "name": name, "ok": ok}),
+        EngineEvent::ToolDenied { name } => json!({"type": "tool_denied", "name": name}),
+        EngineEvent::ToolAutoAllowed { name, rule } => json!({"type": "tool_auto_allowed", "name": name, "rule": rule}),
+        EngineEvent::Retrying { attempt, reason } => json!({"type": "retrying", "attempt": attempt, "reason": reason}),
+        EngineEvent::FallbackModel { model } => json!({"type": "fallback_model", "model": model}),
+        EngineEvent::PromptQueued => json!({"type": "prompt_queued"}),
+        EngineEvent::Compacted { degraded } => json!({"type": "compacted", "degraded": degraded}),
+        EngineEvent::Ask { .. } | EngineEvent::TurnDone { .. } => return None,
+    })
+}
+
+fn outcome_tag(outcome: &Outcome) -> Value {
+    match outcome {
+        Outcome::Done { text } => json!({"kind": "done", "text": text}),
+        Outcome::Cancelled => json!({"kind": "cancelled"}),
+        Outcome::TurnLimit => json!({"kind": "turn_limit"}),
+        Outcome::Refused => json!({"kind": "refused"}),
+        Outcome::DoomLoop { pattern } => json!({"kind": "doom_loop", "pattern": pattern}),
+        Outcome::ToolFailureBudget { tool } => json!({"kind": "tool_failure_budget", "tool": tool}),
+        Outcome::Error { message } => json!({"kind": "error", "message": message}),
+    }
+}
+
+async fn notify(writer: &Writer, session_id: &str, update: Value) {
+    send(writer, &json!({
+        "jsonrpc": "2.0", "method": "session/update",
+        "params": {"schemaVersion": UPDATE_SCHEMA_VERSION, "sessionId": session_id, "update": update},
+    }))
+    .await;
+}
+
+async fn reply_ok(writer: &Writer, id: Value, result: Value) {
+    send(writer, &json!({"jsonrpc": "2.0", "id": id, "result": result})).await;
+}
+
+async fn reply_err(writer: &Writer, id: Value, message: &str) {
+    send(writer, &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": message}})).await;
+}
+
+async fn send(writer: &Writer, msg: &Value) {
+    let mut line = msg.to_string();
+    line.push('\n');
+    let mut w = writer.lock().await;
+    let _ = w.write_all(line.as_bytes()).await;
+    let _ = w.flush().await;
+}
