@@ -29,6 +29,8 @@ pub enum SyntheticReason {
     DoomLoopNudge,
     RetryFeedback,
     Moim,
+    Memory,
+    SubdirInstructions,
     #[serde(other)]
     Unknown,
 }
@@ -163,6 +165,19 @@ pub enum EntryPayload {
     Item { item: Item },
     Usage { usage: TokenUsage },
     Cancelled { reason: String },
+    /// Compaction re-points the projection: history before `kept_from` is
+    /// replaced by `digest` items; the log itself keeps everything.
+    Compaction {
+        digest: Vec<Item>,
+        /// Leading items of the pre-compaction projection preserved verbatim.
+        prefix_end: usize,
+        /// Index into the pre-compaction projection where the verbatim tail
+        /// starts. Both indices are relative to the projection *at compaction
+        /// time*; replay reconstructs by applying compactions in log order.
+        kept_from: usize,
+        /// True when the summarize call failed and the floor was applied.
+        degraded: bool,
+    },
     #[serde(other)]
     Unknown,
 }
