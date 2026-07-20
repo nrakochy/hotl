@@ -193,20 +193,22 @@ async fn edit_impl(input: &Value) -> ToolResult {
     let content = tokio::fs::read_to_string(path).await.map_err(|e| {
         ToolOutcome::err(format!("Could not read `{path}`: {e}. Read the file first to confirm the path."))
     })?;
-    match content.matches(old).count() {
-        0 => Err(ToolOutcome::err(format!(
-            "`old_string` was not found in `{path}`. Read the file and copy the exact text, including whitespace and indentation."
+    match crate::matcher::find(&content, old) {
+        crate::matcher::Match::None => Err(ToolOutcome::err(format!(
+            "`old_string` was not found in `{path}` (even with whitespace-tolerant matching). \
+             Read the file and copy the exact text."
         ))),
-        1 => {
-            let updated = content.replacen(old, new, 1);
+        crate::matcher::Match::Ambiguous(n) => Err(ToolOutcome::err(format!(
+            "`old_string` matches {n} places in `{path}`. Add surrounding lines so it matches exactly once."
+        ))),
+        crate::matcher::Match::Unique { start, end, exact } => {
+            let updated = format!("{}{new}{}", &content[..start], &content[end..]);
             tokio::fs::write(path, updated)
                 .await
                 .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
-            Ok(ToolOutcome::ok(format!("Edited {path}.")))
+            let note = if exact { "" } else { " (whitespace-tolerant match)" };
+            Ok(ToolOutcome::ok(format!("Edited {path}.{note}")))
         }
-        n => Err(ToolOutcome::err(format!(
-            "`old_string` appears {n} times in `{path}`. Add surrounding lines so it matches exactly once."
-        ))),
     }
 }
 
@@ -343,7 +345,7 @@ mod tests {
 
         let dup = run(&EditTool, json!({"path": p, "old_string": "aaa", "new_string": "ccc"}));
         assert!(dup.is_error);
-        assert!(dup.content.contains("2 times"));
+        assert!(dup.content.contains("matches 2 places"));
 
         let missing = run(&EditTool, json!({"path": p, "old_string": "zzz", "new_string": "ccc"}));
         assert!(missing.is_error && missing.content.contains("not found"));

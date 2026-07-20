@@ -6,6 +6,7 @@
 //! corpus 14). Erasure happens once: tools are `dyn Tool` in the registry.
 
 mod builtins;
+pub(crate) mod matcher;
 pub mod rules;
 pub mod sandbox;
 
