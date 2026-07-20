@@ -66,6 +66,7 @@ Everything that flows into the model's context from a source other than the user
 | MCP server output → context | sanitizer chokepoint (below) |
 | sub-agent result → parent context | `<subagent-result trust="untrusted">` envelope |
 | bash/tool output → context | human gated the *command*; output enters context unsanitized — the model treats tool results as data by system-prompt instruction only (see gaps) |
+| api_key_helper command (config/env) → key | editor-written planes only (config.toml is a protected path); runs as harness infrastructure outside the tool sandbox, never model-initiated; stdout registered with the ingestion masker (startup key), stderr console-only |
 
 ## MCP
 

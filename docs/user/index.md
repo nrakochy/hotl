@@ -11,6 +11,7 @@ Docs here follow a five-mode framework — one doc, one mode. Read by need:
 | Understand the y/N gate, protected paths, and the sandbox — and what they don't cover | [permissions-and-sandbox.md](permissions-and-sandbox.md) | Explanation |
 | Run a session detached and reconnect later | [backgrounding.md](backgrounding.md) | How-to |
 | Connect an MCP tool server | [mcp.md](mcp.md) | How-to |
+| Run through a gateway / fetch keys from a command | [gateway.md](gateway.md) | How-to |
 | Run your own checks/policy on tool calls (diagnostics + hooks) | [hooks.md](hooks.md) | How-to |
 | Remove hotl and its data | [uninstall.md](uninstall.md) | How-to |
 | Fix an error you hit | [troubleshooting.md](troubleshooting.md) | Reference (error → cause → fix) |
