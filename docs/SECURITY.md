@@ -2,6 +2,10 @@
 
 Core belief 12: **defaults are the safety design.** Enforcement ships ON with a curated default policy. The cautionary tale is Forge (11): a well-built policy engine behind a default-off flag with an allow-all policy file is equivalent to nothing.
 
+## What the sandbox is not (read this first)
+
+The kernel sandbox floor is **write-confinement, not data-loss prevention.** A `bash` command that the human approves (or that an allow-rule matches) can **read any file the user can read and send it anywhere over the network** — reads and network egress are open by design (the agent legitimately reads the tree and fetches dependencies). The floor stops the agent *tampering with the filesystem outside the working directory*; it does **not** stop *exfiltration*. Treat the human approval prompt, not the sandbox, as the exfiltration boundary — and know that a plausible-looking approved command (`run the tests`, which also `curl`s) exfiltrates freely. A network-egress allowlist is the M5 answer; until then, do not run hotl against secrets you would not paste into a command yourself. (security-evaluation H-01.)
+
 ## M0 routing table (the rows for surfaces that exist today — r2 R2)
 
 | Untrusted path | Where it flows | M0 control | Hardening milestone |
@@ -29,8 +33,8 @@ Layers (02, 09, 12):
 | MCP server binary → execution | child process on your machine | trust store first-use screen (below); server binaries run **outside** the bash sandbox floor (they are user-installed programs, not model-directed commands) — installing one is the trust decision | hash-change re-prompt |
 | MCP tool descriptions/schemas → model context | the `mcp` tool's listing output | same sanitizer chokepoint (descriptions are server-authored text — a poisoned description is the classic MCP attack) | listed only on demand (deferred loading) |
 | `tools/list_changed` notification → tool surface | schema cache invalidation | notification only marks the cache stale; the refreshed listing re-passes the sanitizer; **new tools never auto-run** — every MCP call remains gated per call | |
-| skills / owner config files → context | `skill` tool output | owner-authored, still enveloped (files quote external content) | M3b |
-| shadow snapshot store at rest | `~/.local/share/hotl/shadow/` | **not masked** — deliberately: snapshots hold the user's own workspace files, already at rest unmasked in the workspace itself; masking applies to *transcripts* (model-visible text), not to the user's own file mirror | M3b row |
+| skills / owner config files → context | `skill` tool output | owner-authored, still enveloped (files quote external content); closing-delimiter defang | M3b |
+| shadow snapshot store at rest | `~/.local/share/hotl/shadow/` | **content not masked, but secret-bearing files are excluded from the snapshot** (`.env`, `*.pem`, `*.key`, `id_*`, `.ssh/`, `.aws/`, `.npmrc`/`.pypirc`/`.netrc`, `secrets.*`, `credentials`). Rationale: the shadow mirrors the user's own workspace files, but git history means a transient secret would persist in shadow objects after the workspace file is deleted or rotated — so credentials are kept out entirely rather than masked. Retention/GC of old shadow repos is still owed (M3b). (security-evaluation H-13.) | M3b |
 
 **Sanitizer spec (input classes × transforms):** input classes are (a) tool-call result content, (b) tool listings (names, descriptions, schemas), (c) server-sent errors. Transforms, applied in order to every class: (1) strip ANSI escapes and C0 control characters except `\n`/`\t` (terminal-injection defense); (2) enforce a per-result byte cap (default 50 KB) with an explicit `[truncated N bytes]` marker (context-flooding defense); (3) wrap in the untrusted-content envelope with `source="mcp:<server>/<tool>"` and the standing non-authority statement (prompt-injection defense — same wording discipline as repo instruction files). Injection point: exactly one, the `mcp` tool's result assembly; there is no code path from a server response to the transcript that skips it.
 
@@ -39,6 +43,7 @@ Layers (02, 09, 12):
 **Not yet specified — each bound to a named milestone gate, not floating debt (r2 R5):** cross-agent-message routing rows are an **M4 exit gate**; the default policy file contents + the remaining trust-prompt screens (extension install, workspace trust — the MCP first-use screen shipped with M3a) + parameterized capabilities (fs scoped to path globs, http to host allowlists) are an **M5 entry gate**. These prompts and defaults *are* the real boundary — undesigned, they are the Forge failure recursed (Sec #12); gated, they cannot be silently skipped.
 
 Other standing rules:
+- **`hotl watch` is a single-user tool on a single-user assumption.** It runs `ps -axo …` (every user's process command lines) and `tmux capture-pane` (whatever is on screen). On a shared/multi-user host these can surface other users' secrets (`mysql -pPASSWORD`, `--token=…`) and arbitrary scrollback. All `ps`/`tmux` calls use argv arrays (no shell interpolation — no command injection), so this is local information disclosure inherent to a process dashboard, not an execution risk. Don't run `hotl watch` on a host where you shouldn't see other users' process arguments. (security-evaluation H-10.)
 - Permission mediation lives in the embedding protocol, keyed by transcript-stable IDs, surviving reconnects (05).
 - Extension trust is granular: metadata-visible / execution-blocked when untrusted; content-hash revocation on file change (03, 11); identity env vars applied last (03).
 - Supply chain: pinned deps; SHA-pinned remote installs default ON (grok's discipline, 03); lifecycle-script allowlists (Pi, 08).

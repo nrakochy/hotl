@@ -47,6 +47,25 @@ jobs:
         with:
           key: harness
       - name: Clippy (harness crates + binary)
-        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
+        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl-testkit -p hotl --locked
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-engine -p hotl-testkit -p hotl --locked
+
+  # Dependency vulnerability scan (security-evaluation H-08, SCA half). Runs
+  # cargo-audit against the committed Cargo.lock. cargo-audit installs from
+  # crates.io — the same trust root as the build — so this adds no new
+  # third-party GitHub Action to the supply chain.
+  #
+  # The other half of H-08 (pin actions by commit SHA rather than mutable tag)
+  # is intentionally left to Dependabot: resolving each action's current SHA
+  # needs network access this repo's authors do the pin from, and Dependabot
+  # keeps SHAs current after. Tracked in the evaluation response.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit --deny warnings
