@@ -102,18 +102,8 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
         }
     };
     let session_id = log.session_id.clone();
-
     spawn_secret_audit(log.path().to_path_buf());
-    let snapshots = shadow_snapshotter(&session_id, &cwd);
-    if snapshots.is_none() {
-        eprintln!("hotl: git not found — `hotl undo` snapshots disabled this session");
-    }
-    // A resumed session inherits the replayed projection verbatim (it already
-    // carries the original memory/instructions); fresh sessions assemble anew.
-    let initial_items = match &resumed {
-        Some(r) => r.items.clone(),
-        None => initial_items(&config_dir, &cwd),
-    };
+    let (snapshots, initial_items) = session_context(&session_id, &cwd, &config_dir, &resumed);
 
     let handle = spawn_session(SessionDeps {
         provider,
@@ -158,6 +148,26 @@ fn build_registry(config_dir: &std::path::Path) -> Registry {
         registry.register(Box::new(hotl_tools::skills::SkillTool::new(config_dir)));
     }
     registry
+}
+
+/// Snapshotter + starting context for a session. A resumed session inherits
+/// the replayed projection verbatim (it already carries the original memory
+/// and instructions); fresh sessions assemble anew.
+fn session_context(
+    session_id: &str,
+    cwd: &std::path::Path,
+    config_dir: &std::path::Path,
+    resumed: &Option<Resumed>,
+) -> (Option<Arc<dyn hotl_engine::Snapshotter>>, Vec<hotl_types::Item>) {
+    let snapshots = shadow_snapshotter(session_id, cwd);
+    if snapshots.is_none() {
+        eprintln!("hotl: git not found — `hotl undo` snapshots disabled this session");
+    }
+    let items = match resumed {
+        Some(r) => r.items.clone(),
+        None => initial_items(config_dir, cwd),
+    };
+    (snapshots, items)
 }
 
 /// Shadow-git snapshotter (M3b): blocking git work runs on the blocking

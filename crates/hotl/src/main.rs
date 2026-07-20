@@ -43,14 +43,7 @@ fn main() {
         }
         Some("doctor") => std::process::exit(doctor::doctor_main()),
         Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
-        Some("resume") => {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            let code = rt.block_on(agent::resume_main(args[1..].to_vec()));
-            std::process::exit(code);
-        }
+        Some("resume") => std::process::exit(block_on(agent::resume_main(args[1..].to_vec()))),
         Some("update") => {
             eprintln!("`hotl update` is reserved for the distribution milestone (MD) and not built yet.");
             std::process::exit(2);
@@ -85,15 +78,16 @@ fn main() {
                 hotl_provider_anthropic::DEFAULT_MODEL
             );
         }
-        _ => {
-            // The agent surface. One-shot CLI runs current_thread per the
-            // async policy (no pool spinup on the cold-start path).
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("tokio runtime");
-            let code = rt.block_on(agent::agent_main(args));
-            std::process::exit(code);
-        }
+        _ => std::process::exit(block_on(agent::agent_main(args))),
     }
+}
+
+/// One-shot CLI paths run current_thread per the async policy (no pool
+/// spinup on the cold-start path).
+fn block_on(f: impl std::future::Future<Output = i32>) -> i32 {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+        .block_on(f)
 }
