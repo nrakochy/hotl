@@ -73,6 +73,21 @@ pub enum TurnEnd {
     Compact,
 }
 
+/// A human's answer to a permission ask (ledger 15, 0006 T1). Widened from a
+/// bare `bool` so a denial can carry the reason to the model as tool-result
+/// feedback — a steer fused with a "no". §2b (M4) extends this with
+/// `AllowEdited`/`Respond`; callers should treat it as non-exhaustive.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AskReply {
+    Allow,
+    Deny { message: Option<String> },
+    /// The human approved but rewrote the tool input (§2b).
+    AllowEdited { input: serde_json::Value },
+    /// The human answered *as* the tool — skip execution, use this as the
+    /// tool result (§2b).
+    Respond { content: String },
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
     Done { text: String },
@@ -99,7 +114,7 @@ pub enum EngineEvent {
     /// Context was compacted (digest + verbatim tail); `degraded` means the
     /// summarize call failed and the floor placeholder was used (Sec #10).
     Compacted { degraded: bool },
-    Ask { summary: String, protected_why: Option<String>, reply: oneshot::Sender<bool> },
+    Ask { summary: String, protected_why: Option<String>, reply: oneshot::Sender<AskReply> },
     TurnDone { outcome: Outcome, usage: TokenUsage },
 }
 

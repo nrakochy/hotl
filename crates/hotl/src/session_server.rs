@@ -31,7 +31,7 @@ struct Shared {
     handle: Arc<SessionHandle>,
     client: ClientWriter,
     /// Parked permission asks: id → (reply channel, the request frame to re-send).
-    pending: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<bool>, Value)>>,
+    pending: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<hotl_engine::AskReply>, Value)>>,
     next_ask: AtomicU64,
     session_id: String,
 }
@@ -138,7 +138,14 @@ async fn handle_client(read: impl AsyncRead + Unpin, shared: &Arc<Shared>) -> bo
             "ask_reply" => {
                 if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                     if let Some((reply, _)) = shared.pending.lock().expect("pending").remove(&id) {
-                        let _ = reply.send(msg.get("allow").and_then(Value::as_bool).unwrap_or(false));
+                        let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
+                        let deny_msg = msg.get("message").and_then(Value::as_str).map(String::from);
+                        let ans = if allow {
+                            hotl_engine::AskReply::Allow
+                        } else {
+                            hotl_engine::AskReply::Deny { message: deny_msg }
+                        };
+                        let _ = reply.send(ans);
                     }
                 }
             }

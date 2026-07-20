@@ -11,7 +11,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use hotl_engine::{EngineEvent, Outcome, SessionHandle};
+use hotl_engine::{AskReply, EngineEvent, Outcome, SessionHandle};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -22,7 +22,24 @@ pub const UPDATE_SCHEMA_VERSION: u32 = 1;
 pub const PROTOCOL_VERSION: &str = "0.1";
 
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
-type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<bool>>>>;
+type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AskReply>>>>;
+
+/// Map an ACP client's permission `result` to an `AskReply` (T1/§2b): a client
+/// may `{"allow":true}`, `{"allow":false,"message":"…"}`, provide edited
+/// `{"input":{…}}` (AllowEdited), or answer as the tool `{"respond":"…"}`.
+fn ask_reply_from_result(result: Option<&Value>) -> AskReply {
+    let Some(r) = result else { return AskReply::Deny { message: None } };
+    if let Some(content) = r.get("respond").and_then(Value::as_str) {
+        return AskReply::Respond { content: content.to_string() };
+    }
+    if let Some(input) = r.get("input") {
+        return AskReply::AllowEdited { input: input.clone() };
+    }
+    if r.get("allow").and_then(Value::as_bool) == Some(true) {
+        return AskReply::Allow;
+    }
+    AskReply::Deny { message: r.get("message").and_then(Value::as_str).map(String::from) }
+}
 /// The JSON-RPC id of the in-flight prompt request, answered on TurnDone.
 type PendingPrompt = Arc<std::sync::Mutex<Option<Value>>>;
 
@@ -57,8 +74,7 @@ pub async fn serve(
         if msg.get("method").is_none() {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                 if let Some(reply) = pending.lock().expect("pending").remove(&id) {
-                    let allow = msg.pointer("/result/allow").and_then(Value::as_bool).unwrap_or(false);
-                    let _ = reply.send(allow);
+                    let _ = reply.send(ask_reply_from_result(msg.get("result")));
                 }
             }
             continue;

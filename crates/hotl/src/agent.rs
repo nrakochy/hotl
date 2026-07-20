@@ -651,7 +651,7 @@ impl Surface {
             EngineEvent::Compacted { degraded } => serde_json::json!({"type":"compacted","degraded":degraded}),
             EngineEvent::Ask { summary, reply, .. } => {
                 // JSON mode is headless automation: default-deny, emit the record.
-                let _ = reply.send(false);
+                let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
                 serde_json::json!({"type":"ask_denied","summary":summary})
             }
             EngineEvent::TurnDone { outcome, usage } => {
@@ -666,28 +666,45 @@ impl Surface {
         println!("{framed}");
     }
 
-    async fn ask_human(&mut self, summary: &str, protected_why: Option<&str>) -> bool {
+    async fn ask_human(&mut self, summary: &str, protected_why: Option<&str>) -> hotl_engine::AskReply {
+        use hotl_engine::AskReply;
         if self.headless || !std::io::stdin().is_terminal() {
             eprintln!("hotl: denied (headless): {summary}");
-            return false;
+            return AskReply::Deny { message: None };
         }
         if let Some(why) = protected_why {
             eprintln!("⚠ PROTECTED PATH — {why}");
         }
-        eprint!("allow {summary}? [y/N] ");
-        // No timeout (backgrounded): wait indefinitely for the answer.
+        // A bare `n` denies; `n <reason>` sends the reason to the model (T1).
+        eprint!("allow {summary}? [y/N — add a reason after 'n' to tell the model why] ");
         let Some(timeout) = self.ask_timeout else {
-            return matches!(self.stdin.recv().await.as_deref().map(str::trim), Some("y" | "Y" | "yes"));
+            return reply_from_line(self.stdin.recv().await.as_deref());
         };
         match tokio::time::timeout(timeout, self.stdin.recv()).await {
-            Ok(Some(line)) => matches!(line.trim(), "y" | "Y" | "yes"),
-            Ok(None) => false,
+            Ok(line) => reply_from_line(line.as_deref()),
             Err(_) => {
                 eprintln!("(no answer in {}s — denied)", timeout.as_secs());
-                false
+                AskReply::Deny { message: None }
             }
         }
     }
+}
+
+/// Parse a permission answer line into an `AskReply` (T1): `y`/`yes` allows;
+/// `n <reason>` / `no <reason>` denies with the reason for the model; anything
+/// else (incl. a bare `n` or EOF) is a plain deny.
+fn reply_from_line(line: Option<&str>) -> hotl_engine::AskReply {
+    use hotl_engine::AskReply;
+    let Some(t) = line.map(str::trim) else { return AskReply::Deny { message: None } };
+    if matches!(t, "y" | "Y" | "yes") {
+        return AskReply::Allow;
+    }
+    let message = t
+        .strip_prefix("n ")
+        .or_else(|| t.strip_prefix("no "))
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty());
+    AskReply::Deny { message }
 }
 
 /// The interactive ask timeout from `HOTL_ASK_TIMEOUT` (seconds): unset →

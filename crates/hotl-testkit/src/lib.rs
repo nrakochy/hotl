@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use hotl_engine::{spawn_session, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
+use hotl_engine::{spawn_session, AskReply, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
 use hotl_platform::SystemClock;
 use hotl_provider::{ProviderError, ScriptedProvider, StreamEvent};
 use hotl_store::{Masker, SessionLog};
@@ -24,8 +24,8 @@ pub struct Harness {
     pub seen: Vec<String>,
     log_path: std::path::PathBuf,
     _dir: tempfile::TempDir,
-    /// Answer for every Ask event.
-    pub ask_answer: bool,
+    /// Answer for every Ask event (T1: defaults to Allow).
+    pub ask_reply: AskReply,
     /// One-shot steer to send when the next ToolStart is observed.
     pub steer_on_tool_start: Option<String>,
     /// Labels of every shadow snapshot the engine requested, in order.
@@ -106,7 +106,7 @@ impl Harness {
             seen: Vec::new(),
             log_path,
             _dir: dir,
-            ask_answer: true,
+            ask_reply: AskReply::Allow,
             steer_on_tool_start: None,
             snapshots,
         }
@@ -127,7 +127,7 @@ impl Harness {
             self.seen.push(format!("{event:?}"));
             match event {
                 EngineEvent::Ask { reply, .. } => {
-                    let _ = reply.send(self.ask_answer);
+                    let _ = reply.send(self.ask_reply.clone());
                 }
                 EngineEvent::ToolStart { .. } => {
                     if let Some(steer) = self.steer_on_tool_start.take() {
@@ -236,7 +236,7 @@ mod tests {
             ],
             cfg(),
         );
-        h.ask_answer = false;
+        h.ask_reply = AskReply::Deny { message: None };
         let outcome = h.prompt_and_wait("clean up").await;
         assert!(matches!(outcome, Outcome::Done { .. }));
         let items = h.items();
@@ -308,7 +308,7 @@ mod tests {
             .map(|_| ScriptedProvider::tool_call("t", "read", json!({"path": "/same"})))
             .collect();
         let mut h = Harness::new(scripts, EngineConfig { max_turns: 10, ..Default::default() });
-        h.ask_answer = false;
+        h.ask_reply = AskReply::Deny { message: None };
         let outcome = h.prompt_and_wait("go").await;
         assert!(matches!(outcome, Outcome::DoomLoop { .. }), "got {outcome:?}");
         assert!(h.entries().iter().any(|e| matches!(
@@ -397,7 +397,7 @@ mod tests {
                 .expect("closed");
             h.seen.push(format!("{ev:?}"));
             match ev {
-                EngineEvent::Ask { reply, .. } => { let _ = reply.send(true); }
+                EngineEvent::Ask { reply, .. } => { let _ = reply.send(AskReply::Allow); }
                 EngineEvent::ToolStart { .. } => break,
                 _ => {}
             }
@@ -699,6 +699,30 @@ mod tests {
         assert!(redacted, "the post-tool hook replaced the result the model saw");
         // The real content never reached the transcript.
         assert!(!h.transcript().contains("secret content"));
+    }
+
+    #[tokio::test]
+    async fn deny_with_message_reaches_the_model() {
+        // A denial that carries a reason surfaces as the tool-result feedback
+        // (a steer fused with a "no" — ledger 15 / 0006 T1).
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "write", json!({"path": "a.md", "content": "x"})),
+                ScriptedProvider::text_reply("understood, using notes.md"),
+            ],
+            cfg(),
+        );
+        h.ask_reply = AskReply::Deny { message: Some("wrong file — use notes.md".into()) };
+        let outcome = h.prompt_and_wait("write it").await;
+        assert!(matches!(outcome, Outcome::Done { .. }));
+        let items = h.items();
+        let Item::ToolResults { results } = &items[2] else { panic!("expected results") };
+        assert!(results[0].is_error);
+        assert!(
+            results[0].content.contains("declined this tool call: wrong file — use notes.md"),
+            "the denial reason must reach the model: {}",
+            results[0].content
+        );
     }
 
     #[allow(dead_code)]

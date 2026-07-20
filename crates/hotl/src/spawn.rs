@@ -70,7 +70,13 @@ async fn drain_child(child: &mut SessionHandle, cancel: &CancellationToken) -> O
                 return Outcome::Cancelled;
             }
             event = child.events.recv() => match event {
-                Some(EngineEvent::Ask { reply, .. }) => { let _ = reply.send(false); }
+                Some(EngineEvent::Ask { reply, .. }) => {
+                    // A sub-agent has no human on the loop — deny with a reason
+                    // the sub-agent's model can act on.
+                    let _ = reply.send(hotl_engine::AskReply::Deny {
+                        message: Some("sub-agents cannot ask for permission; do only auto-allowed or read-only work".into()),
+                    });
+                }
                 Some(EngineEvent::TurnDone { outcome, .. }) => return outcome,
                 Some(_) => {}
                 None => return Outcome::Error { message: "sub-agent ended without an outcome".into() },

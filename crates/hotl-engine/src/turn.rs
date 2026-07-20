@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::SharedDeps;
-use crate::{EngineEvent, Outcome, SessionCmd, TurnEnd};
+use crate::{AskReply, EngineEvent, Outcome, SessionCmd, TurnEnd};
 
 /// Compaction triggers when the estimated next request crosses this share of
 /// the window (M2; the estimate overcounts, so the miss direction is early).
@@ -166,10 +166,10 @@ impl<'d> Turn<'d> {
             self.call_sigs.push(format!("{}({})", tu.name, tu.input));
         }
         if let Some(pattern) = detect_doom_loop(&self.call_sigs) {
-            if !self
+            let cont = self
                 .ask(format!("the agent keeps repeating: {pattern} — let it continue?"), None)
-                .await
-            {
+                .await;
+            if !matches!(cont, AskReply::Allow | AskReply::AllowEdited { .. }) {
                 self.abort_batch(&uses, "Stopped: the user declined to continue a repeating tool-call loop.")
                     .await;
                 return Some(Outcome::DoomLoop { pattern });
@@ -263,11 +263,23 @@ impl<'d> Turn<'d> {
             Permission::AskProtected { summary, why } => (Some(summary), Some(why)),
         };
         if let Some(summary) = &summary {
-            if !self.approve_input(tu, &input, summary.clone(), why).await {
-                self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
-                return ToolOutcome::err(
-                    "The user declined this tool call. Ask what they'd like to do instead, or proceed another way.",
-                );
+            match self.approve_input(tu, &input, summary.clone(), why).await {
+                AskReply::Allow => {}
+                AskReply::AllowEdited { input: edited } => input = edited, // §2b
+                AskReply::Respond { content } => {
+                    // §2b: the human answered as the tool — skip execution.
+                    self.emit(EngineEvent::ToolDone { name: tu.name.clone(), ok: true }).await;
+                    return ToolOutcome::ok(content);
+                }
+                AskReply::Deny { message } => {
+                    self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
+                    return match message {
+                        Some(m) => ToolOutcome::err(format!("The user declined this tool call: {m}")),
+                        None => ToolOutcome::err(
+                            "The user declined this tool call. Ask what they'd like to do instead, or proceed another way.",
+                        ),
+                    };
+                }
             }
         }
         self.emit(EngineEvent::ToolStart {
@@ -291,12 +303,12 @@ impl<'d> Turn<'d> {
     /// Allow-rules (deny-first, sandbox-gated, protected carve-out) or the
     /// ask, evaluated against `input` (which a PreToolUse hook may have
     /// rewritten — a rewritten call re-enters the gate, never bypasses it).
-    async fn approve_input(&mut self, tu: &ToolUse, input: &Value, summary: String, why: Option<String>) -> bool {
+    async fn approve_input(&mut self, tu: &ToolUse, input: &Value, summary: String, why: Option<String>) -> AskReply {
         let protected = why.is_some();
         match self.shared.rules.evaluate(&tu.name, input, self.shared.sandbox_enforced, protected) {
             Verdict::Auto { rule } => {
                 self.emit(EngineEvent::ToolAutoAllowed { name: tu.name.clone(), rule }).await;
-                true
+                AskReply::Allow
             }
             Verdict::Ask => self.ask(summary, why).await,
         }
@@ -433,13 +445,13 @@ impl<'d> Turn<'d> {
     }
 
     /// Ask the human via the event channel; a dropped reply means deny.
-    async fn ask(&self, summary: String, why: Option<String>) -> bool {
+    async fn ask(&self, summary: String, why: Option<String>) -> AskReply {
         let (tx, rx) = oneshot::channel();
         let event = EngineEvent::Ask { summary, protected_why: why, reply: tx };
         if self.events.send(event).await.is_err() {
-            return false;
+            return AskReply::Deny { message: None };
         }
-        rx.await.unwrap_or(false)
+        rx.await.unwrap_or(AskReply::Deny { message: None })
     }
 
     async fn emit(&self, event: EngineEvent) {
