@@ -31,6 +31,12 @@ pub const DEFAULT_CONFIG: &str = "\
 # ask_timeout_secs = 300     # 0 = wait forever for a permission answer
 # sandbox = true             # false disables the bash sandbox floor
 
+[network]
+# Egress for bash commands: \"open\" (default), \"off\" (loopback + unix sockets
+# only), or \"allowlist\" (loopback + the hosts below, via a local proxy).
+# egress = \"open\"
+# allow = [\"github.com\", \"*.crates.io\"]
+
 [retention]
 # Prune old sessions/shadows/blobs (run `hotl gc`, or auto at startup once set).
 # max_age_days = 30

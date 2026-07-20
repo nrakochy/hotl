@@ -77,7 +77,8 @@ impl Diagnostics {
     }
 
     async fn run(&self, command: &str) -> Outcome {
-        let mut cmd = sandbox::build_command(command, crate::builtins::sandbox_status());
+        let egress = crate::net::egress_state().await;
+        let mut cmd = sandbox::build_command(command, crate::builtins::sandbox_status(), &egress);
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

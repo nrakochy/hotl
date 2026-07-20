@@ -1,7 +1,7 @@
 //! The single config file: `~/.config/hotl/config.toml`.
 //!
 //! One place for every hand-editable setting — provider, context/compaction,
-//! behavior, retention — plus the domain sections (`[[allow]]`, `[[mcp]]`,
+//! behavior, retention, network egress — plus the domain sections (`[[allow]]`, `[[mcp]]`,
 //! `[[hook]]`, `[diagnostics]`) that used to live in their own files. The
 //! prose/data that isn't really "settings" stays separate: `system-prompt.md`,
 //! `memory/`, `skills/`, and the machine-written `trust.toml`.
@@ -26,6 +26,8 @@ pub struct Config {
     pub behavior: BehaviorCfg,
     #[serde(default)]
     pub retention: RetentionCfg,
+    #[serde(default)]
+    pub network: NetworkCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
     raw: Option<toml::Value>,
@@ -62,6 +64,36 @@ pub struct BehaviorCfg {
 pub struct RetentionCfg {
     pub max_age_days: Option<u64>,
     pub max_sessions: Option<usize>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct NetworkCfg {
+    /// `"open"` (default) | `"off"` | `"allowlist"`.
+    pub egress: Option<String>,
+    /// Hosts reachable in allowlist mode (`"github.com"`, `"*.crates.io"`).
+    #[serde(default)]
+    pub allow: Vec<String>,
+}
+
+impl NetworkCfg {
+    /// Resolve `[network]` to the process egress policy. An unknown mode
+    /// fails **closed** to `Off` with a loud warning — a typo must never
+    /// mean "open".
+    pub fn egress_policy(&self) -> (hotl_tools::net::EgressPolicy, Option<String>) {
+        use hotl_tools::net::EgressPolicy;
+        match self.egress.as_deref() {
+            None | Some("open") => (EgressPolicy::Open, None),
+            Some("off") => (EgressPolicy::Off, None),
+            Some("allowlist") => (EgressPolicy::Allowlist(self.allow.clone()), None),
+            Some(other) => (
+                EgressPolicy::Off,
+                Some(format!(
+                    "config.toml [network].egress = \"{other}\" is not a mode \
+                     (open | off | allowlist) — failing closed to \"off\""
+                )),
+            ),
+        }
+    }
 }
 
 impl Config {
@@ -180,6 +212,30 @@ mod tests {
         assert!(cfg.mcp_toml().unwrap().contains("[[server]]") && cfg.mcp_toml().unwrap().contains("docs"));
         let hooks = cfg.hooks_toml().unwrap();
         assert!(hooks.contains("pre_tool") && hooks.contains("cargo check"));
+    }
+
+    #[test]
+    fn network_egress_parses_and_unknown_fails_closed() {
+        use hotl_tools::net::EgressPolicy;
+        // Absent section: Open, no warning (the default is today's behavior).
+        let (policy, warning) = cfg_with("").network.egress_policy();
+        assert_eq!(policy, EgressPolicy::Open);
+        assert!(warning.is_none());
+        // Explicit modes.
+        let (policy, warning) = cfg_with("[network]\negress = \"off\"\n").network.egress_policy();
+        assert_eq!(policy, EgressPolicy::Off);
+        assert!(warning.is_none());
+        let cfg = cfg_with("[network]\negress = \"allowlist\"\nallow = [\"github.com\", \"*.crates.io\"]\n");
+        let (policy, warning) = cfg.network.egress_policy();
+        assert_eq!(
+            policy,
+            EgressPolicy::Allowlist(vec!["github.com".into(), "*.crates.io".into()])
+        );
+        assert!(warning.is_none());
+        // Unknown value: fail closed to Off, loudly — never open.
+        let (policy, warning) = cfg_with("[network]\negress = \"opne\"\n").network.egress_policy();
+        assert_eq!(policy, EgressPolicy::Off);
+        assert!(warning.unwrap().contains("opne"));
     }
 
     #[test]

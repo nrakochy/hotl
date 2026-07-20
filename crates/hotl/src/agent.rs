@@ -225,7 +225,20 @@ fn scaffold(
     let system = load_system_prompt(&config_dir);
     let rules = load_rules(&cfg);
     let sandbox_status = sandbox::probe();
-    let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_));
+    // [network] egress policy — installed process-wide (set-once) before any
+    // command can run; child sessions inherit it via the global, and nothing
+    // downstream can re-init it back to Open.
+    let (egress_policy, egress_warning) = cfg.network.egress_policy();
+    if let Some(warning) = &egress_warning {
+        eprintln!("hotl: WARNING — {warning}");
+    }
+    hotl_tools::net::init(egress_policy);
+    // Bash auto-allow needs the whole posture honest: the write floor
+    // enforced AND any configured egress restriction kernel-backed (a policy
+    // the kernel can't enforce drops bash rules back to asks, mirroring the
+    // UNSANDBOXED carve-out).
+    let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_))
+        && hotl_tools::net::auto_allow_permitted(&sandbox_status);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = engine_config(&model, secrets, &cfg);
     let spawn_builder = child_builder(

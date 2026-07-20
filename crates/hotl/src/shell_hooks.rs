@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use futures_util::future::BoxFuture;
 use hotl_engine::hooks::{cap_payload, Hooks, PreToolDecision};
-use hotl_tools::sandbox;
+use hotl_tools::{net, sandbox};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -87,7 +87,8 @@ impl ShellHook {
         if self.strikes.load(Ordering::Relaxed) >= MAX_STRIKES {
             return None; // evicted for the session
         }
-        let mut cmd = sandbox::build_command(&self.command, &sandbox::probe());
+        let egress = net::egress_state().await;
+        let mut cmd = sandbox::build_command(&self.command, &sandbox::probe(), &egress);
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())

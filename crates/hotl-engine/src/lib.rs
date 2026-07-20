@@ -177,6 +177,8 @@ pub struct SessionDeps {
     pub provider: Arc<dyn Provider>,
     pub registry: Arc<Registry>,
     pub rules: Arc<Rules>,
+    /// Gates bash allow-rules: true only while the kernel write floor is
+    /// enforced *and* any configured egress restriction is kernel-backed.
     pub sandbox_enforced: bool,
     pub clock: Arc<dyn Clock>,
     pub log: SessionLog,

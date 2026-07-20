@@ -271,7 +271,14 @@ impl Tool for BashTool {
     fn permission(&self, input: &Value) -> Permission {
         let cmd = input.get("command").and_then(Value::as_str).unwrap_or("?");
         let short: String = cmd.chars().take(120).collect();
-        Permission::Ask { summary: format!("bash [{}]: {short}", sandbox_status().label()) }
+        // The egress marker joins the label only when a policy is configured
+        // (`net:off`, `net:allow(N)`, or a loud NET:UNENFORCED); with the
+        // default Open policy the label is unchanged.
+        let label = match crate::net::label_suffix() {
+            Some(net) => format!("{} {net}", sandbox_status().label()),
+            None => sandbox_status().label(),
+        };
+        Permission::Ask { summary: format!("bash [{label}]: {short}") }
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move { done(bash_impl(&input, cancel).await) })
@@ -286,7 +293,8 @@ async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
         .unwrap_or(BASH_DEFAULT_TIMEOUT_MS)
         .min(BASH_MAX_TIMEOUT_MS);
 
-    let mut cmd = sandbox::build_command(command, sandbox_status());
+    let egress = crate::net::egress_state().await;
+    let mut cmd = sandbox::build_command(command, sandbox_status(), &egress);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
