@@ -175,6 +175,10 @@ async fn run_one(
             eprintln!("\nhotl: the model declined this request (safety classifiers).");
             1
         }
+        Ok(Outcome::DoomLoop { pattern }) => {
+            eprintln!("\nhotl: stopped — the model kept repeating: {pattern}");
+            1
+        }
         Err(e) => {
             eprintln!("\nhotl: {e}");
             1

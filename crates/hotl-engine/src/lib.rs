@@ -58,6 +58,28 @@ pub enum Outcome {
     TurnLimit,
     /// The model refused (safety classifiers); surface, don't retry.
     Refused,
+    /// A repeating tool-call pattern was detected and the human declined to
+    /// continue (Forge's detector, surfaced as an ask — corpus 10/11).
+    DoomLoop { pattern: String },
+}
+
+/// Detect a repeating suffix pattern over tool-call signatures: any period
+/// p ≤ 3 whose block repeats 3× at the tail. Returns a human-readable
+/// description of the repeating block.
+fn detect_doom_loop(sigs: &[String]) -> Option<String> {
+    const REPEATS: usize = 3;
+    for period in 1..=3usize {
+        let need = period * REPEATS;
+        if sigs.len() < need {
+            continue;
+        }
+        let tail = &sigs[sigs.len() - need..];
+        let block = &tail[..period];
+        if tail.chunks(period).all(|c| c == block) {
+            return Some(block.join(" → "));
+        }
+    }
+    None
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -96,6 +118,8 @@ impl<'a> Engine<'a> {
 
         let tool_defs: Vec<ToolDef> = self.registry.defs();
         let mut total_usage = TokenUsage::default();
+        // Tool-call signatures across the whole prompt, for doom-loop detection.
+        let mut call_sigs: Vec<String> = Vec::new();
 
         for _turn in 0..self.config.max_turns {
             let req = SamplingRequest {
@@ -144,6 +168,41 @@ impl<'a> Engine<'a> {
             match stop {
                 StopReason::ToolUse => {
                     let uses = assistant_tool_uses(&blocks);
+                    for tu in &uses {
+                        call_sigs.push(format!("{}({})", tu.name, tu.input));
+                    }
+                    if let Some(pattern) = detect_doom_loop(&call_sigs) {
+                        let allowed = self
+                            .gate
+                            .ask(
+                                &format!("the agent keeps repeating: {pattern} — let it continue?"),
+                                None,
+                            )
+                            .await;
+                        if !allowed {
+                            log.append(
+                                EntryPayload::Cancelled { reason: format!("doom loop: {pattern}") },
+                                self.clock.now_ms(),
+                            )?;
+                            // Complete protocol pairing so the log stays replayable.
+                            let results = uses
+                                .iter()
+                                .map(|tu| ToolResultItem {
+                                    tool_use_id: tu.id.clone(),
+                                    content: "Stopped: the user declined to continue a repeating tool-call loop.".into(),
+                                    is_error: true,
+                                })
+                                .collect();
+                            let item = Item::ToolResults { results };
+                            log.append(EntryPayload::Item { item: item.clone() }, self.clock.now_ms())?;
+                            items.push(item);
+                            on_event(EngineEvent::TurnDone { usage: total_usage });
+                            return Ok(Outcome::DoomLoop { pattern });
+                        }
+                        // Human said continue: reset the window so the same
+                        // pattern doesn't immediately re-trigger.
+                        call_sigs.clear();
+                    }
                     let mut results = Vec::with_capacity(uses.len());
                     for tu in &uses {
                         let outcome = self.execute_gated(tu, &cancel, on_event).await;
@@ -333,6 +392,53 @@ mod tests {
         } else {
             panic!("expected tool results");
         }
+    }
+
+    #[test]
+    fn doom_detector_finds_periods() {
+        let a = "read({\"path\":\"x\"})".to_string();
+        let b = "bash({\"command\":\"ls\"})".to_string();
+        // period 1: three identical
+        assert!(detect_doom_loop(&[a.clone(), a.clone(), a.clone()]).is_some());
+        // period 2: ababab
+        let sigs = vec![a.clone(), b.clone(), a.clone(), b.clone(), a.clone(), b.clone()];
+        assert!(detect_doom_loop(&sigs).is_some());
+        // no loop: distinct tail
+        let sigs = vec![a.clone(), a.clone(), b.clone()];
+        assert!(detect_doom_loop(&sigs).is_none());
+        // two repeats only: not yet a loop
+        assert!(detect_doom_loop(&[a.clone(), a.clone()]).is_none());
+    }
+
+    #[tokio::test]
+    async fn doom_loop_surfaced_as_ask_and_stops_on_deny() {
+        // Model repeats the identical read call; gate (headless) denies the
+        // continue-ask at the third repetition.
+        let scripts: Vec<_> = (0..5)
+            .map(|_| ScriptedProvider::tool_call("t", "read", json!({"path": "/same"})))
+            .collect();
+        let provider = ScriptedProvider::new(scripts);
+        let registry = Registry::builtin();
+        let gate = StaticGate(false);
+        let clock = SystemClock;
+        let engine = Engine {
+            provider: &provider,
+            registry: &registry,
+            gate: &gate,
+            clock: &clock,
+            config: EngineConfig { max_turns: 10, ..Default::default() },
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut items = Vec::new();
+        let mut log = setup_log(dir.path());
+        let outcome = engine
+            .run_prompt(&mut items, &mut log, "sys", "go".into(), CancellationToken::new(), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(outcome, Outcome::DoomLoop { .. }), "got {outcome:?}");
+        // The log records the stop and stays protocol-paired.
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        assert!(content.contains("doom loop"));
     }
 
     #[tokio::test]
