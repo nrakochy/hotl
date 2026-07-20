@@ -7,6 +7,7 @@
 
 mod builtins;
 pub mod diagnostics;
+pub mod skills;
 pub(crate) mod matcher;
 pub mod rules;
 pub mod sandbox;

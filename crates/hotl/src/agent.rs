@@ -154,6 +154,9 @@ fn build_registry(config_dir: &std::path::Path) -> Registry {
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
         registry.register(Box::new(hotl_mcp::McpTool::new(mcp.servers, trust)));
     }
+    if hotl_tools::skills::SkillTool::has_skills(config_dir) {
+        registry.register(Box::new(hotl_tools::skills::SkillTool::new(config_dir)));
+    }
     registry
 }
 
