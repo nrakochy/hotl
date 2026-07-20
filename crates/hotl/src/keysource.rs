@@ -8,8 +8,6 @@
 //! tool sandbox. Stderr goes to the error string shown to the human, never
 //! into model context.
 
-#![allow(dead_code)] // wired up in Task 5/6
-
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 

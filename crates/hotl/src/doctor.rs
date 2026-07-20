@@ -65,7 +65,7 @@ pub fn doctor_main() -> i32 {
 fn provider_check() -> Check {
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
     match crate::agent::select_provider(&cfg, &EnvSecrets) {
-        Ok((_, model)) => ok(format!("provider: {model} selected (keys present)")),
+        Ok((_, model, _source)) => ok(format!("provider: {model} selected (keys present)")),
         Err(msg) => fail(format!("provider: {}", msg.lines().next().unwrap_or(&msg))),
     }
 }

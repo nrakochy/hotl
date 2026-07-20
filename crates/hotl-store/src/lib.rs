@@ -30,21 +30,10 @@ impl Masker {
     pub fn from_env() -> Self {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (name, value) in std::env::vars() {
-            if value.len() < MIN_SECRET_LEN
-                || !SECRET_NAME_MARKERS.iter().any(|m| name.to_uppercase().contains(m))
-            {
+            if !SECRET_NAME_MARKERS.iter().any(|m| name.to_uppercase().contains(m)) {
                 continue;
             }
-            let replacement = format!("«masked:{name}»");
-            // Masking runs against the *serialized* JSON line, so a secret
-            // containing `"`, `\`, or a newline appears there in its escaped
-            // form. Register both the raw value and its JSON-encoded body so
-            // the substring match can't be evaded by escaping (H-05).
-            pairs.push((value.clone(), replacement.clone()));
-            let encoded = json_body(&value);
-            if encoded != value {
-                pairs.push((encoded, replacement));
-            }
+            push_pair(&mut pairs, &name, &value);
         }
         // Longest first so a secret that contains another secret masks whole,
         // and the encoded (longer) form is tried before the raw one.
@@ -54,6 +43,14 @@ impl Masker {
 
     pub fn empty() -> Self {
         Self { pairs: Vec::new() }
+    }
+
+    /// Register a runtime-acquired secret (e.g. an api-key-helper's output)
+    /// under `name`. Same length guard and escaping rules as `from_env`.
+    pub fn with_value(mut self, name: &str, value: &str) -> Self {
+        push_pair(&mut self.pairs, name, value);
+        self.pairs.sort_by_key(|(v, _)| std::cmp::Reverse(v.len()));
+        self
     }
 
     pub fn apply(&self, text: &str) -> String {
@@ -74,6 +71,26 @@ impl Masker {
     /// only case a line-by-line scan could miss.
     fn has_multiline_secret(&self) -> bool {
         self.pairs.iter().any(|(secret, _)| secret.contains('\n'))
+    }
+}
+
+/// Register `value` under `name` in `pairs` (raw + JSON-encoded forms),
+/// skipping values too short to mask safely. Shared by `from_env` (which
+/// filters by name marker before calling this) and `with_value` (which
+/// registers a specific known secret regardless of its name).
+fn push_pair(pairs: &mut Vec<(String, String)>, name: &str, value: &str) {
+    if value.len() < MIN_SECRET_LEN {
+        return;
+    }
+    let replacement = format!("«masked:{name}»");
+    // Masking runs against the *serialized* JSON line, so a secret
+    // containing `"`, `\`, or a newline appears there in its escaped
+    // form. Register both the raw value and its JSON-encoded body so
+    // the substring match can't be evaded by escaping (H-05).
+    pairs.push((value.to_string(), replacement.clone()));
+    let encoded = json_body(value);
+    if encoded != value {
+        pairs.push((encoded, replacement));
     }
 }
 
@@ -391,6 +408,19 @@ mod tests {
         assert!(matches!(lines[0].payload, EntryPayload::Header { .. }));
         assert_eq!(lines[1].parent_id.as_ref(), Some(&lines[0].id));
         std::env::remove_var("HOTL_TEST_API_KEY");
+    }
+
+    #[test]
+    fn with_value_masks_runtime_secret() {
+        let m = Masker::empty().with_value("HOTL_API_KEY_HELPER", "vk-live-12345678");
+        assert_eq!(m.apply("key is vk-live-12345678."), "key is «masked:HOTL_API_KEY_HELPER».");
+    }
+
+    #[test]
+    fn with_value_ignores_short_values() {
+        // below MIN_SECRET_LEN — masking "ok" would shred ordinary text
+        let m = Masker::empty().with_value("X", "short");
+        assert_eq!(m.apply("short stays"), "short stays");
     }
 
     #[test]

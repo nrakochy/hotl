@@ -41,6 +41,12 @@ pub struct ProviderCfg {
     pub base_url: Option<String>,
     /// Cheap model for compaction summaries.
     pub fast_model: Option<String>,
+    /// Command whose stdout (trimmed) is the API key. When set, it beats the
+    /// static key env vars: configuring a helper is a deliberate act.
+    pub api_key_helper: Option<String>,
+    /// Re-run the helper when the cached key is older than this. Absent =
+    /// refresh only at startup and on auth failure.
+    pub api_key_helper_ttl_secs: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -212,6 +218,13 @@ mod tests {
         assert!(cfg.mcp_toml().unwrap().contains("[[server]]") && cfg.mcp_toml().unwrap().contains("docs"));
         let hooks = cfg.hooks_toml().unwrap();
         assert!(hooks.contains("pre_tool") && hooks.contains("cargo check"));
+    }
+
+    #[test]
+    fn provider_helper_keys_parse() {
+        let cfg = cfg_with("[provider]\napi_key_helper = \"mint-key --gw\"\napi_key_helper_ttl_secs = 300\n");
+        assert_eq!(cfg.provider.api_key_helper.as_deref(), Some("mint-key --gw"));
+        assert_eq!(cfg.provider.api_key_helper_ttl_secs, Some(300));
     }
 
     #[test]

@@ -54,18 +54,18 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
     };
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
-    let (provider, model) = match select_provider(&cfg, &secrets) {
-        Ok(pair) => pair,
+    let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
+        Ok(triple) => triple,
         Err(msg) => {
             eprintln!("hotl: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets, cfg) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, Masker::from_env(), scaffold.clock.now_ms()) {
+    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, scaffold.masker(), scaffold.clock.now_ms()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl: could not create session log: {e}");
@@ -128,14 +128,14 @@ pub async fn resume_main(args: Vec<String>) -> i32 {
 pub async fn acp_main() -> i32 {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
-    let (provider, model) = match select_provider(&cfg, &secrets) {
-        Ok(pair) => pair,
+    let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
+        Ok(triple) => triple,
         Err(msg) => {
             eprintln!("hotl: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets, cfg) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(code) => return code,
     };
@@ -149,7 +149,7 @@ pub async fn acp_main() -> i32 {
             }
         };
         let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
-        let log = SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, Masker::from_env(), scaffold.clock.now_ms())
+        let log = SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, scaffold.masker(), scaffold.clock.now_ms())
             .map_err(|e| format!("could not create session log: {e}"))?;
         let session_id = log.session_id.clone();
         let (snapshots, initial) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
@@ -165,18 +165,18 @@ pub async fn acp_main() -> i32 {
 pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
-    let (provider, model) = match select_provider(&cfg, &secrets) {
-        Ok(pair) => pair,
+    let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
+        Ok(triple) => triple,
         Err(msg) => {
             eprintln!("hotl serve: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets, cfg) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, Masker::from_env(), scaffold.clock.now_ms()) {
+    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, scaffold.masker(), scaffold.clock.now_ms()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl serve: could not create session log: {e}");
@@ -208,14 +208,29 @@ struct Scaffold {
     /// The parsed config.toml, loaded once per process and shared with every
     /// helper that used to re-read the file.
     cfg: crate::config::Config,
+    /// The api-key-helper's key, acquired once at startup validation below.
+    /// `None` for a static key source (nothing to register: it's already a
+    /// process env var and `Masker::from_env()` already covers it).
+    initial_helper_key: Option<String>,
 }
 
-fn scaffold(
+/// Builds the process-wide scaffold, validating `key_source` first: a broken
+/// helper fails here, with its own message, before any session log or
+/// registry exists — not mid-turn.
+async fn scaffold(
     provider: Arc<dyn hotl_provider::Provider>,
     model: String,
     secrets: &dyn SecretStore,
     cfg: crate::config::Config,
+    key_source: Arc<dyn hotl_provider::key::KeySource>,
 ) -> Result<Scaffold, i32> {
+    let initial_helper_key = match key_source.get().await {
+        Ok(k) => k.filter(|_| key_source.refreshable()),
+        Err(e) => {
+            eprintln!("hotl: {e}");
+            return Err(1);
+        }
+    };
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let config_dir = config_dir();
     // config.toml [behavior].sandbox = false disables the floor (env still wins).
@@ -244,16 +259,24 @@ fn scaffold(
     let spawn_builder = child_builder(
         provider.clone(), rules.clone(), clock.clone(), config.clone(),
         cwd.clone(), cfg.hooks_toml(), system.clone(), model.clone(), sandbox_enforced,
+        initial_helper_key.clone(),
     );
     let registry = Arc::new(build_registry(&cfg, &config_dir, Some(spawn_builder)));
     let hooks = load_hooks(&cfg);
     Ok(Scaffold {
         provider, model, clock, config_dir, system, rules, sandbox_enforced,
-        sandbox_status, cwd, config, registry, hooks, cfg,
+        sandbox_status, cwd, config, registry, hooks, cfg, initial_helper_key,
     })
 }
 
 impl Scaffold {
+    /// Session masker: env-named secrets plus the helper-acquired key.
+    /// Refreshed keys are NOT re-registered: keys never enter log entries;
+    /// this registration is defense-in-depth for the startup key.
+    pub(crate) fn masker(&self) -> Masker {
+        masker_with_helper(self.initial_helper_key.as_deref())
+    }
+
     fn deps(
         &self,
         log: SessionLog,
@@ -277,6 +300,16 @@ impl Scaffold {
     }
 }
 
+/// Env-named secrets plus, when a helper minted this process's key, that
+/// value too — it never appears as a process env var, so `Masker::from_env()`
+/// alone would miss it.
+fn masker_with_helper(initial_helper_key: Option<&str>) -> Masker {
+    match initial_helper_key {
+        Some(k) => Masker::from_env().with_value("HOTL_API_KEY_HELPER", k),
+        None => Masker::from_env(),
+    }
+}
+
 fn age(t: std::time::SystemTime) -> String {
     let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
     match secs {
@@ -291,20 +324,20 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     let headless = prompt.is_some();
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
-    let (provider, model) = match select_provider(&cfg, &secrets) {
-        Ok(pair) => pair,
+    let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
+        Ok(triple) => triple,
         Err(msg) => {
             eprintln!("hotl: {msg}");
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets, cfg) {
+    let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(code) => return code,
     };
 
     let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
-    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, Masker::from_env(), scaffold.clock.now_ms()) {
+    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, scaffold.masker(), scaffold.clock.now_ms()) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl: could not create session log: {e}");
@@ -387,11 +420,22 @@ struct HotlChildBuilder {
     system: String,
     model: String,
     sandbox_enforced: bool,
+    /// See `Scaffold::initial_helper_key` — passed down at construction since
+    /// a child builder is captured by the spawn tool ahead of any session.
+    initial_helper_key: Option<String>,
+}
+
+impl HotlChildBuilder {
+    /// Same masking as `Scaffold::masker` — a child session can echo the
+    /// same acquired key into its own log.
+    fn masker(&self) -> Masker {
+        masker_with_helper(self.initial_helper_key.as_deref())
+    }
 }
 
 impl crate::spawn::ChildBuilder for HotlChildBuilder {
     fn build(&self, _brief: &str) -> Result<hotl_engine::SessionHandle, String> {
-        let log = SessionLog::create(&sessions_dir(), &self.model, None, Masker::from_env(), self.clock.now_ms())
+        let log = SessionLog::create(&sessions_dir(), &self.model, None, self.masker(), self.clock.now_ms())
             .map_err(|e| format!("child session log: {e}"))?;
         let diagnostics = self
             .hooks_toml
@@ -427,6 +471,7 @@ fn child_builder(
     system: String,
     model: String,
     sandbox_enforced: bool,
+    initial_helper_key: Option<String>,
 ) -> Arc<dyn crate::spawn::ChildBuilder> {
     Arc::new(HotlChildBuilder {
         provider,
@@ -438,6 +483,7 @@ fn child_builder(
         system,
         model,
         sandbox_enforced,
+        initial_helper_key,
     })
 }
 
@@ -949,15 +995,42 @@ fn exit_code(outcome: &Outcome) -> i32 {
     }
 }
 
+/// Helper-wins precedence: a configured api-key-helper (env > config.toml)
+/// beats static key env vars. `fallback_key` is the provider's static env key.
+fn key_source_for(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+    fallback_key: Option<String>,
+) -> Arc<dyn hotl_provider::key::KeySource> {
+    let cmd = secrets.get("HOTL_API_KEY_HELPER").or_else(|| cfg.provider.api_key_helper.clone());
+    match cmd {
+        Some(cmd) => {
+            let ttl = secrets
+                .get("HOTL_API_KEY_HELPER_TTL_SECS")
+                .and_then(|s| s.parse::<u64>().ok())
+                .or(cfg.provider.api_key_helper_ttl_secs)
+                .map(std::time::Duration::from_secs);
+            Arc::new(crate::keysource::HelperKey::new(cmd, ttl))
+        }
+        None => Arc::new(hotl_provider::key::StaticKey(fallback_key)),
+    }
+}
+
+type ProviderAndSource = (Arc<dyn hotl_provider::Provider>, Arc<dyn hotl_provider::key::KeySource>);
+type SelectedProvider = (Arc<dyn hotl_provider::Provider>, String, Arc<dyn hotl_provider::key::KeySource>);
+
 /// Provider/model selection. `HOTL_MODEL` accepts `provider/model`:
-///   anthropic/claude-…   needs ANTHROPIC_API_KEY
-///   openai/gpt-…         needs OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for
-///                        keyless OpenAI-compatible endpoints (Ollama etc.)
+///   anthropic/claude-…   needs ANTHROPIC_API_KEY (or [provider] api_key_helper)
+///   openai/gpt-…         needs OPENAI_API_KEY (or api_key_helper), or
+///                        HOTL_OPENAI_BASE_URL for keyless OpenAI-compatible
+///                        endpoints (Ollama etc.)
 /// A bare model string means Anthropic; unset means the Anthropic default.
+/// Returns the provider, the selected model, and the key source that backs
+/// it (so a caller can validate/refresh it once at startup).
 pub(crate) fn select_provider(
     cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
-) -> Result<(Arc<dyn hotl_provider::Provider>, String), String> {
+) -> Result<SelectedProvider, String> {
     // Precedence: env HOTL_MODEL > config.toml [provider].model > default.
     let raw = secrets
         .get("HOTL_MODEL")
@@ -967,55 +1040,60 @@ pub(crate) fn select_provider(
         Some((p, m)) => (p.to_ascii_lowercase(), m.to_string()),
         None => ("anthropic".to_string(), raw),
     };
-    match provider_name.as_str() {
-        "anthropic" => {
-            let key = secrets.get("ANTHROPIC_API_KEY").ok_or_else(|| {
-                "ANTHROPIC_API_KEY is not set.\n\
-                 Export it, or select another provider, e.g. HOTL_MODEL=openai/<model> \
-                 (with OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for a local endpoint). \
-                 `hotl watch` needs no key."
-                    .to_string()
-            })?;
-            Ok((
-                Arc::new(AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some(key))))),
-                model,
+    let (provider, source) = match provider_name.as_str() {
+        "anthropic" => resolve_anthropic(cfg, secrets)?,
+        "openai" | "oai" => resolve_openai(cfg, secrets)?,
+        other => {
+            return Err(format!(
+                "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, \
+                 openai/<model> (openai covers any OpenAI-compatible endpoint via \
+                 HOTL_OPENAI_BASE_URL)."
             ))
         }
-        "openai" | "oai" => {
-            let base = secrets
-                .get("HOTL_OPENAI_BASE_URL")
-                .or_else(|| cfg.provider.base_url.clone())
-                .unwrap_or_else(|| hotl_provider_openai::DEFAULT_BASE_URL.to_string());
-            let key = secrets.get("OPENAI_API_KEY");
-            if key.is_none() && base == hotl_provider_openai::DEFAULT_BASE_URL {
-                return Err("OPENAI_API_KEY is not set (required for api.openai.com; \
-                            keyless works only with HOTL_OPENAI_BASE_URL pointing at a \
-                            local/compatible endpoint, e.g. http://localhost:11434/v1 for Ollama)."
-                    .to_string());
-            }
-            // H-09: a bearer key over cleartext http:// to a non-loopback host
-            // crosses the network unencrypted. Warn loudly (don't silently
-            // send it); loopback http is the normal local-endpoint case.
-            if key.is_some() && cleartext_nonloopback(&base) {
-                eprintln!(
-                    "hotl: WARNING — HOTL_OPENAI_BASE_URL is a non-loopback http:// URL and \
-                     OPENAI_API_KEY is set; the key will cross the network unencrypted. \
-                     Use https:// or an SSH tunnel."
-                );
-            }
-            Ok((
-                Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(
-                    base,
-                    Arc::new(hotl_provider::key::StaticKey(key)),
-                )),
-                model,
-            ))
-        }
-        other => Err(format!(
-            "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, openai/<model> \
-             (openai covers any OpenAI-compatible endpoint via HOTL_OPENAI_BASE_URL)."
-        )),
+    };
+    Ok((provider, model, source))
+}
+
+fn resolve_anthropic(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Result<ProviderAndSource, String> {
+    let key = secrets.get("ANTHROPIC_API_KEY");
+    let source = key_source_for(cfg, secrets, key.clone());
+    if !source.refreshable() && key.is_none() {
+        return Err(
+            "ANTHROPIC_API_KEY is not set and no api_key_helper is configured.\n\
+             Export the key, set [provider] api_key_helper in config.toml, or select \
+             another provider, e.g. HOTL_MODEL=openai/<model> (with OPENAI_API_KEY, or \
+             HOTL_OPENAI_BASE_URL for a local endpoint). `hotl watch` needs no key."
+                .to_string(),
+        );
     }
+    Ok((Arc::new(AnthropicProvider::new(source.clone())), source))
+}
+
+fn resolve_openai(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Result<ProviderAndSource, String> {
+    let base = secrets
+        .get("HOTL_OPENAI_BASE_URL")
+        .or_else(|| cfg.provider.base_url.clone())
+        .unwrap_or_else(|| hotl_provider_openai::DEFAULT_BASE_URL.to_string());
+    let key = secrets.get("OPENAI_API_KEY");
+    let source = key_source_for(cfg, secrets, key.clone());
+    if !source.refreshable() && key.is_none() && base == hotl_provider_openai::DEFAULT_BASE_URL {
+        return Err("OPENAI_API_KEY is not set (required for api.openai.com; keyless works \
+                     only with HOTL_OPENAI_BASE_URL pointing at a local/compatible endpoint, \
+                     e.g. http://localhost:11434/v1 for Ollama), or configure [provider] \
+                     api_key_helper."
+            .to_string());
+    }
+    // H-09: a bearer key over cleartext http:// to a non-loopback host
+    // crosses the network unencrypted. Warn loudly (don't silently send
+    // it); loopback http is the normal local-endpoint case.
+    if key.is_some() && cleartext_nonloopback(&base) {
+        eprintln!(
+            "hotl: WARNING — HOTL_OPENAI_BASE_URL is a non-loopback http:// URL and \
+             OPENAI_API_KEY is set; the key will cross the network unencrypted. \
+             Use https:// or an SSH tunnel."
+        );
+    }
+    Ok((Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(base, source.clone())), source))
 }
 
 /// A cleartext base URL pointing somewhere other than the local machine.
@@ -1039,4 +1117,76 @@ pub(crate) fn sessions_dir() -> PathBuf {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("hotl/sessions")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// In-memory `SecretStore` for tests — no real env mutation, no races
+    /// between tests running in parallel.
+    #[derive(Default)]
+    struct MapSecrets(std::collections::HashMap<String, String>);
+
+    impl<const N: usize> From<[(&str, &str); N]> for MapSecrets {
+        fn from(pairs: [(&str, &str); N]) -> Self {
+            MapSecrets(pairs.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+        }
+    }
+
+    impl SecretStore for MapSecrets {
+        fn get(&self, name: &str) -> Option<String> {
+            self.0.get(name).cloned()
+        }
+    }
+
+    /// Same construction the `config.rs` tests use: write the TOML to a
+    /// tempdir and load it, so `[provider]` parsing goes through the real path.
+    fn config_from_toml(toml: &str) -> crate::config::Config {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), toml).unwrap();
+        crate::config::Config::load(dir.path())
+    }
+
+    #[test]
+    fn helper_beats_static_key_env() {
+        let cfg = config_from_toml("[provider]\napi_key_helper = \"echo k\"\n");
+        let secrets = MapSecrets::from([
+            ("OPENAI_API_KEY", "sk-static"),
+            ("HOTL_MODEL", "openai/m"),
+            ("HOTL_OPENAI_BASE_URL", "http://localhost:1/v1"),
+        ]);
+        let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
+        assert!(source.refreshable(), "helper must win over the static env key");
+    }
+
+    #[test]
+    fn helper_env_var_activates_without_config() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_API_KEY_HELPER", "echo k"),
+            ("HOTL_MODEL", "openai/m"),
+            ("HOTL_OPENAI_BASE_URL", "http://localhost:1/v1"),
+        ]);
+        let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
+        assert!(source.refreshable());
+    }
+
+    #[test]
+    fn keyless_openai_default_base_error_mentions_helper() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([("HOTL_MODEL", "openai/m")]);
+        // `Arc<dyn Provider>` isn't `Debug`, so `unwrap_err()` (which needs
+        // the Ok side to be `Debug` for its panic message) doesn't apply.
+        let err = select_provider(&cfg, &secrets).err().unwrap();
+        assert!(err.contains("api_key_helper"), "{err}");
+    }
+
+    #[test]
+    fn anthropic_without_key_or_helper_errors_with_instruction() {
+        let cfg = config_from_toml("");
+        let err = select_provider(&cfg, &MapSecrets::default()).err().unwrap();
+        assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
+        assert!(err.contains("api_key_helper"), "{err}");
+    }
 }

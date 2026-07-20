@@ -20,6 +20,10 @@ pub const DEFAULT_CONFIG: &str = "\
 # model = \"openai/gpt-5\"
 # base_url = \"http://localhost:11434/v1\"   # e.g. Ollama (openai provider)
 # fast_model = \"...\"                        # cheap model for compaction summaries
+# Run a command to obtain the API key (stdout = key). Beats the static env
+# key when set. For gateways with short-lived keys, see docs/user/gateway.md.
+# api_key_helper = \"my-mint-key\"
+# api_key_helper_ttl_secs = 300
 
 [context]
 # window = 200000            # your model's context size, in tokens
