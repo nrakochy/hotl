@@ -48,6 +48,32 @@ impl Masker {
         }
         out
     }
+
+    pub fn contains_secret(&self, text: &str) -> bool {
+        self.pairs.iter().any(|(secret, _)| text.contains(secret.as_str()))
+    }
+}
+
+/// Secrets-at-rest audit (M2; Sec #8 second half): scan existing session
+/// logs for *current* secret values — entries written before a value became
+/// a secret (or before masking existed) can't be rewritten in an append-only
+/// store, so the honest remedy is a loud warning and rotation.
+pub fn audit_secrets(dir: &Path, masker: &Masker) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut hits = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "jsonl") {
+            continue;
+        }
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            if masker.contains_secret(&content) {
+                hits.push(path);
+            }
+        }
+    }
+    hits.sort();
+    hits
 }
 
 pub struct SessionLog {
@@ -147,5 +173,20 @@ mod tests {
         assert!(matches!(lines[0].payload, EntryPayload::Header { .. }));
         assert_eq!(lines[1].parent_id.as_ref(), Some(&lines[0].id));
         std::env::remove_var("HOTL_TEST_API_KEY");
+    }
+
+    #[test]
+    fn audit_finds_pre_masking_leaks() {
+        let dir = tempfile::tempdir().unwrap();
+        // A log written before `leaked-value-9` became a secret.
+        std::fs::write(dir.path().join("old.jsonl"), r#"{"text":"key is leaked-value-9"}"#).unwrap();
+        std::fs::write(dir.path().join("clean.jsonl"), r#"{"text":"nothing here"}"#).unwrap();
+        std::fs::write(dir.path().join("notes.txt"), "leaked-value-9").unwrap();
+
+        let masker = Masker { pairs: vec![("leaked-value-9".into(), "«masked:X»".into())] };
+        let hits = audit_secrets(dir.path(), &masker);
+        assert_eq!(hits.len(), 1, "only the jsonl with the live secret");
+        assert!(hits[0].ends_with("old.jsonl"));
+        assert!(audit_secrets(dir.path(), &Masker::empty()).is_empty());
     }
 }
