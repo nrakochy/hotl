@@ -48,4 +48,4 @@
 | `hotl undo`: `no shadow snapshots found` | git wasn't available when the session ran, so nothing was snapshotted. | Install `git`; `hotl doctor` warns when snapshots are disabled. |
 | `hotl undo` didn't remove a file the agent created | By design: undo restores tracked files but never deletes new ones. | Delete the unwanted new file by hand; undo lists what it changed. |
 
-**Report a bug hotl mislabels or a fix that's wrong:** the harness treats a repeated failure as a docs/behavior bug (specs core belief). File it against the repo. **Not covered here:** live-provider quirks — no real model has driven hotl end to end yet, so novel model behavior is expected and worth reporting.
+**Report a bug hotl mislabels or a fix that's wrong:** the harness treats a repeated failure as a docs/behavior bug — file it against the repo. **Not covered here:** live-provider quirks — no real model has driven hotl end to end yet, so novel model behavior is expected and worth reporting.

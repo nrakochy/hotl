@@ -9,16 +9,16 @@
 Layers depend upward, with one recorded exception: L3 _triggers_ compaction, L6 _implements_ it:
 
 1. **Canonical types** — provider-neutral conversation/message model, structural provenance tags, forward-compat serde from day one.
-2. **Provider trait** — `stream(request) → EventStream`; M0 ships one real provider (Anthropic) + a scripted test provider, the second real provider lands M1 to keep the trait honest; central `transformMessages`-style canonicalization pre-pass (M1, with provider #2); catalog deferred (ledger: catalog-later).
+2. **Provider trait** — `stream(request) → EventStream`; two real providers (Anthropic, OpenAI-compatible) + a scripted test provider — a second real provider exists precisely to keep the trait honest; central `transformMessages`-style canonicalization pre-pass; a provider catalog is deferred.
 3. **Turn engine** — one loop per session; typed steer/queue inbox (durable admission/promotion) on an **out-of-band control lane** so cancel/ask never wedge behind data commands; budgeted recovery; _triggers_ compaction (implemented in L6).
 4. **Tool system** — typed tools with one erasure boundary; edit cascade; post-mutation format+diagnostics injection; json-repair + schema coercion at the arg boundary; MCP client with deferred loading.
 5. **Persistence** — one append-only session log (tree with movable leaf); the model transcript and the UI replay are two _projections_ of it, per the Shape header — no second store; shadow-git snapshots for undo.
 6. **Context assembly** — byte-stable prefix; AGENTS.md-as-map; auto memory with load budget (loaded in an untrusted-content envelope); **compaction** (typed digest + verbatim tail + last-resort degradation floor so a failed compaction can't brick the session); ephemeral per-turn context block (MOIM).
 7. **Headless/protocol surface before TUI** — ACP-shaped contract with permission mediation; `-p`/JSON modes; capability advertisement; shell-plugin mode early, TUI last.
 
-Cross-cutting: in-process hooks primary + Claude-compatible shell-hook adapter **scoped to the events actually used, not the full 35-event schema** + WASM components as the third-party plugin lane **(gated on the browser milestone, not v0)**; permission rules + inspector pipeline + kernel sandbox floor (native), on by default — **the floor lands M1; until it exists every exec is individually human-gated and allow-rule persistence is disabled**; spawn interface where topology/depth are data (subagent / fork / teammate).
+Cross-cutting: in-process hooks primary + Claude-compatible shell-hook adapter **scoped to the events actually used, not the full 35-event schema** + WASM components as the third-party plugin lane **(deferred until the browser target ships, not v0)**; permission rules + inspector pipeline + kernel sandbox floor (native), on by default — **where the floor cannot be enforced, every exec is individually human-gated and allow-rule persistence is disabled**; spawn interface where topology/depth are data (subagent / fork / teammate).
 
-Compilation targets: **native from day one; WASM (browser) is a gated post-M5 milestone** — core crates sit behind platform traits (fs/exec/http/clock/storage) throughout so the seam stays clean; browser, when it ships, is a reduced-capability profile where tools requiring unavailable capabilities drop out of the registry.
+Compilation targets: **native from day one; WASM (browser) is a deferred future target** — core crates sit behind platform traits (fs/exec/http/clock/storage) throughout so the seam stays clean; browser, when it ships, is a reduced-capability profile where tools requiring unavailable capabilities drop out of the registry.
 
 ## The connective planes
 
@@ -29,9 +29,9 @@ Compilation targets: **native from day one; WASM (browser) is a gated post-M5 mi
 | Agent ↔ own sub/peer agents | Own spawn interface; agents-as-tools (MCP) / agents-as-providers (ACP) |
 | Agent ↔ un-owned peers      | A2A — seam reserved, implementation deferred                           |
 
-## How a prompt flows (M1/M2 runtime)
+## How a prompt flows
 
-One cycle: prompt → actor commits it → turn task samples against a snapshot → deltas stream to the surface → tool calls pass rules/ask and run (bash confined) → results commit → re-snapshot (steers woven in) → repeat until done. Every write goes through the actor and hits disk before the projection advances; ctrl-c bypasses the mailbox entirely. One M2 path is not drawn: when the next request won't fit the context window, the turn ends, the actor folds old history into a typed digest (appending a `compaction` entry — the log keeps everything), and respawns a continuation turn at step ③.
+One cycle: prompt → actor commits it → turn task samples against a snapshot → deltas stream to the surface → tool calls pass rules/ask and run (bash confined) → results commit → re-snapshot (steers woven in) → repeat until done. Every write goes through the actor and hits disk before the projection advances; ctrl-c bypasses the mailbox entirely. One path is not drawn: when the next request won't fit the context window, the turn ends, the actor folds old history into a typed digest (appending a `compaction` entry — the log keeps everything), and respawns a continuation turn at step ③.
 
 ```mermaid
 flowchart TB
@@ -92,7 +92,7 @@ flowchart TB
 ## The other two capability stacks
 
 - **Watch — W1–W4, shipped:** observation types + `Surface` trait → surface backends (tmux) → listener (ratatui-free, the non-TUI consumer seam) → Elm TUI; wired by `hotl watch`. Invariants: observe-from-outside; zero shared crates/types with the harness.
-- **Orchestrate — O, reserved:** `hotl fleet` will be an ACP client of the harness; its only present footprint is the four M4 orchestrator-as-client seams; its natural view layer is W3's listener.
+- **Orchestrate — O, reserved:** `hotl fleet` will be an ACP client of the harness; its only present footprint is the orchestrator-as-client seams; its natural view layer is W3's listener.
 
 ## What this system is not
 

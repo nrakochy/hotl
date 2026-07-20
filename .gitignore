@@ -1,5 +1,5 @@
 /target
-.DS_STORE
+.DS_Store
 
 # Private planning/design corpus — kept on disk for local agents, never
 # published. Held out of this repo and its history on purpose.

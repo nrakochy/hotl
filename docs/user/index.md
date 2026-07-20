@@ -15,4 +15,4 @@ Docs here follow a five-mode framework — one doc, one mode. Read by need:
 | Remove hotl and its data | [uninstall.md](uninstall.md) | How-to |
 | Fix an error you hit | [troubleshooting.md](troubleshooting.md) | Reference (error → cause → fix) |
 
-**Status (2026-07-20):** milestones M0–M5 implemented (M4 surfaces/orchestration and M5 extension hooks landed); pre-1.0. The execute harness is **not yet published to crates.io** — `cargo install hotl` still installs the older `watch`-only release. Until 0.2.0 ships, run the agent from a source build ([quickstart.md](quickstart.md)). Advanced surfaces (`hotl acp`, `spawn` sub-agents) are not yet documented here.
+**Status (2026-07-20):** pre-1.0; the core harness, the headless/ACP surfaces, and the extension hooks described here are implemented. The execute harness is **not yet published to crates.io** — `cargo install hotl` still installs the older `watch`-only release. Until 0.2.0 ships, run the agent from a source build ([quickstart.md](quickstart.md)). Advanced surfaces (`hotl acp`, `spawn` sub-agents) are not yet documented here.
