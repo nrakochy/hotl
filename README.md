@@ -2,7 +2,12 @@
 
 [![crates.io](https://img.shields.io/crates/v/hotl.svg)](https://crates.io/crates/hotl)
 
-One binary, three capabilities, and you on the loop for all of them:
+Running one agent is easy. Running several, all day, is a supervision
+problem: knowing which one is blocked on you, trusting what they're allowed
+to do, and recovering when one goes sideways. hotl is one binary that takes
+that problem in three stages — watch the agents you already run, run its own
+agent with guardrails you can see, and eventually orchestrate fleets — with
+you on the loop at every stage:
 
 | Capability | Command | Status |
 |---|---|---|
@@ -16,6 +21,35 @@ One binary, three capabilities, and you on the loop for all of them:
 > **not yet published** — `cargo install hotl` still installs the older
 > `watch`-only release; run the agent from a source build ([docs/user/quickstart.md](docs/user/quickstart.md))
 > until 0.2.0 ships. Expect breaking changes at every 0.x minor.
+
+## Why hotl
+
+**Stay in charge without babysitting.** Agents earn their keep on long runs,
+but long runs block on you at unpredictable moments — and the usual answer is
+cycling through panes to check. `hotl watch` replaces that with a dashboard:
+it discovers every agent across your tmux session, shows who's working and
+who's waiting, pings when one needs you, and `enter` jumps focus straight to
+it. Your attention goes where it's actually needed.
+
+**Safety is the default, not a flag.** Every mutating or executing tool call
+asks y/n before it runs. `bash` executes under a kernel sandbox floor
+(Seatbelt on macOS, Landlock on Linux) that confines writes to the working
+directory. Writes to execute-later paths — git hooks, shell rc, Makefiles,
+agent-instruction files — always escalate with a warning that says why.
+Secret-named env values are masked before bytes ever land on disk. And the
+stance is written down honestly, including what the sandbox does **not**
+cover: [`docs/SECURITY.md`](docs/SECURITY.md).
+
+**Nothing is ever lost.** Resume any session, `undo` the agent's file
+changes, steer mid-turn without losing the thread. This works because every
+session is recorded as an append-only log that nothing rewrites — even
+context compaction adds a summary on top instead of destroying history, so
+a failed compaction can't brick a session.
+
+**Standard protocols, any model.** Anthropic or any OpenAI-compatible
+endpoint (OpenAI, Groq, Ollama, a local server — it's just a base URL). MCP
+for tools, ACP for embedding in editors — the same contract the future
+`hotl fleet` orchestrator will speak, so the seams are already in place.
 
 ## Watch — quick start
 

@@ -2,78 +2,94 @@
 
 **Defaults are the safety design.** Enforcement ships ON with a curated default policy. A cautionary example: a well-built policy engine behind a default-off flag with an allow-all policy file is equivalent to nothing.
 
+This document describes the controls as they exist in the code today. Gaps are listed at the end, loudly, not hidden.
+
 ## What the sandbox is not (read this first)
 
-The kernel sandbox floor is **write-confinement, not data-loss prevention.** A `bash` command that the human approves (or that an allow-rule matches) can **read any file the user can read and send it anywhere over the network** — reads and network egress are open by design (the agent legitimately reads the tree and fetches dependencies). The floor stops the agent *tampering with the filesystem outside the working directory*; it does **not** stop *exfiltration*. Treat the human approval prompt, not the sandbox, as the exfiltration boundary — and know that a plausible-looking approved command (`run the tests`, which also `curl`s) exfiltrates freely. A network-egress allowlist is the M5 answer; until then, do not run hotl against secrets you would not paste into a command yourself.
+The kernel sandbox floor is **write-confinement, not data-loss prevention.** A `bash` command that the human approves (or that an allow-rule matches) can **read any file the user can read and send it anywhere over the network** — reads and network egress are open by design (the agent legitimately reads the tree and fetches dependencies). The floor stops the agent *tampering with the filesystem outside the working directory*; it does **not** stop *exfiltration*. Treat the human approval prompt, not the sandbox, as the exfiltration boundary — and know that a plausible-looking approved command (`run the tests`, which also `curl`s) exfiltrates freely. A network-egress allowlist is a planned control (see gaps); until it exists, do not run hotl against secrets you would not paste into a command yourself.
 
-## M0 routing table (surfaces that exist today)
+## The permission gate
 
-| Untrusted path | Where it flows | M0 control | Hardening milestone |
-|---|---|---|---|
-| bash/tool output → model context | tool results, verbatim | human gated the *command*; output enters context unsanitized — model treats tool results as data by system-prompt instruction only | M5 inspector/sanitizer |
-| repo instruction files (AGENTS.md/CLAUDE.md) → context | tagged user item | untrusted-content envelope (wrapping + explicit non-authority statement), `SyntheticReason::ProjectInstructions` provenance | M2 (auto-memory joins the same envelope) |
-| write-now / execute-later files | disk → future execution outside any gate | protected-paths class escalates the ask with a *why* warning (git hooks, Makefile-class, agent-instruction files, shell rc, harness settings); no allow-rule persistence exists | M1 sandbox floor + allow rules |
-| session log at rest (JSONL, permanent by design) | `~/.local/share/hotl/sessions/` | secret sentinel-masking at ingestion (secret-named env values replaced before bytes land) | M2 store audit; M3b retention/GC |
-| headless `-p` stdout → shells/CI logs | caller's environment | asks default-deny (nothing interactive ever blocks or leaks a prompt); output is the model's answer only | MD (`--json` schema freeze) |
-| zsh scrollback → transcript | *(surface not built yet — cut-line item)* | n/a until the plugin ships; row reserved | with the plugin |
+Every mutating or executing tool call passes one fixed pipeline before it runs:
 
-**Build-phase reality (stated loudly, not hidden):** the kernel sandbox floor lands **M1**. During M0, every exec/mutating tool call is individually human-gated (y/n; headless default-denies on timeout) and **allow-rule persistence is disabled** — "always allow" does not exist until the floor exists, so ask-fatigue cannot manufacture an ungoverned allowlist. What M0 *does* ship: the routing-table rows for its actual surfaces (bash-output→context, repo-instruction-files→context, zsh-scrollback→transcript, JSONL-at-rest, headless-stdout), the protected-paths execute-later class (`.git/hooks/`, hook/settings files, Makefile-class, AGENTS.md — writes escalate to a warning ask), the untrusted-content envelope on repo instruction files, and secret sentinel-masking at transcript ingestion.
+1. **PreToolUse hooks** (in-process, then owner-configured shell hooks) may deny or rewrite the call. A rewritten call **re-enters the gate** — a hook cannot launder a call past the ask.
+2. **Allow rules** (`[[allow]]` in `~/.config/hotl/config.toml`) may auto-approve it, narrated. Rules are deliberately editor-written only — there is no in-REPL "always allow," so ask-fatigue cannot manufacture an ungoverned allowlist. Rule matching defends against shell-operator smuggling after an allowed prefix (`ls && curl …` does not match an `ls` rule) and `..` path traversal.
+3. **Protected paths** are checked *before* allow rules and **never auto-approve**. Writes that could execute later outside any gate escalate the ask with a *why* warning. The class covers: `.git/hooks/`, Makefile-class files (`Makefile`, `justfile`, `build.rs`, `conftest.py`, `*.gyp`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), harness/editor settings (`.hotl/`, `.claude/`, `settings.json`), shell rc files, `.ssh/`, credential stores (`.aws/`, `.config/gcloud/`, `.azure/`, `.npmrc`, `.pypirc`, `.netrc`, `.dockercfg`), git config, and cron/systemd units.
+4. **The human ask** — y/N with the sandbox status in the prompt. Headless (`-p`, `--json`, or non-TTY stdin) **default-denies immediately**: nothing interactive ever blocks or leaks a prompt into CI logs. Interactive asks deny on timeout (`HOTL_ASK_TIMEOUT`, default 300 s).
 
-Layers:
+Asks are durable: a `pending_ask` entry is committed to the session log before the question is surfaced and an `ask_resolved` entry after — a crash mid-ask is visible on replay, never silently resolved.
 
-1. **Permission rules** — allow/ask/deny with pattern matching; deny-first evaluation; protected-paths tier checked *before* allow rules; workspace trust gates project-supplied capability grants.
-2. **Inspector pipeline** — composable checks voting deny > ask > allow: rule-based, AST command scanning (tree-sitter), repetition, and LLM judges with adversarially-stripped inputs (tool results withheld from the judge).
-3. **Kernel sandbox floor (native only; lands M1 — see build-phase reality above)** — Seatbelt (macOS) / Landlock (Linux ≥5.13, incl. WSL2) isolation for execution, with sandbox-aware auto-approve; credential masking via proxy sentinels so secrets never enter the sandboxed process. **Hosts where the floor is unavailable (older Linux kernels) degrade fail-closed to the M0 posture permanently: every exec individually human-gated, allow-rule persistence disabled, loud banner. Windows native is unsupported (no floor designed); WSL2 is the Windows path**. The browser profile has no kernel sandbox and relies on the browser's own — with the compensating controls owed (proxy + plugin confinement) before browser ships.
+A repetition detector (doom-loop) halts a turn that repeats the same tool-call cycle and asks the human whether to continue; a per-tool consecutive-failure budget ends turns that keep failing the same way.
 
-## M3a routing rows + MCP sanitizer spec (the exit-gate artifacts)
+## The kernel sandbox floor
 
-| Untrusted path | Where it flows | Control | Notes |
-|---|---|---|---|
-| MCP server result → model context | tool results | **one named chokepoint**: `hotl_mcp::sanitize` — every string a server returns passes it before entering the transcript | see spec below; bypassing it is a bug by definition |
-| MCP server binary → execution | child process on your machine | trust store first-use screen (below); server binaries run **outside** the bash sandbox floor (they are user-installed programs, not model-directed commands) — installing one is the trust decision | hash-change re-prompt |
-| MCP tool descriptions/schemas → model context | the `mcp` tool's listing output | same sanitizer chokepoint (descriptions are server-authored text — a poisoned description is the classic MCP attack) | listed only on demand (deferred loading) |
-| `tools/list_changed` notification → tool surface | schema cache invalidation | notification only marks the cache stale; the refreshed listing re-passes the sanitizer; **new tools never auto-run** — every MCP call remains gated per call | |
-| skills / owner config files → context | `skill` tool output | owner-authored, still enveloped (files quote external content); closing-delimiter defang | M3b |
-| shadow snapshot store at rest | `~/.local/share/hotl/shadow/` | **content not masked, but secret-bearing files are excluded from the snapshot** (`.env`, `*.pem`, `*.key`, `id_*`, `.ssh/`, `.aws/`, `.npmrc`/`.pypirc`/`.netrc`, `secrets.*`, `credentials`). Rationale: the shadow mirrors the user's own workspace files, but git history means a transient secret would persist in shadow objects after the workspace file is deleted or rotated — so credentials are kept out entirely rather than masked. Old shadow repos are pruned by `hotl gc` / the `[retention]` policy (whole-session prune: log + `.blobs` + `.git` shadow). | done |
+`bash` executes confined — **Seatbelt** on macOS (deny all file writes, then re-allow the working directory, temp, and `/dev`), **Landlock** on Linux ≥ 5.13 including WSL2 (same shape). Reads and network stay open (see "what the sandbox is not").
 
-**Sanitizer spec (input classes × transforms):** input classes are (a) tool-call result content, (b) tool listings (names, descriptions, schemas), (c) server-sent errors. Transforms, applied in order to every class: (1) strip ANSI escapes and C0 control characters except `\n`/`\t` (terminal-injection defense); (2) enforce a per-result byte cap (default 50 KB) with an explicit `[truncated N bytes]` marker (context-flooding defense); (3) wrap in the untrusted-content envelope with `source="mcp:<server>/<tool>"` and the standing non-authority statement (prompt-injection defense — same wording discipline as repo instruction files). Injection point: exactly one, the `mcp` tool's result assembly; there is no code path from a server response to the transcript that skips it.
+Hosts where the floor is unavailable (older Linux kernels) **degrade fail-closed**: every exec is individually human-gated with an `UNSANDBOXED` banner in the ask, and `bash` allow-rules stop applying — auto-approval of commands exists only while the sandbox is enforced. `HOTL_SANDBOX=off` is an explicit escape hatch and is labeled as such in every ask. Windows native is unsupported (no floor designed); WSL2 is the Windows path.
 
-**Trust-store first-use screen:** the first call to a server raises a *protected* ask (never auto-allowable by rules): server name, binary path, SHA-256 of the binary, and what approval means ("this program will run on your machine and its output will enter the model's context"). Approval is recorded in `~/.config/hotl/trust.toml` keyed by server name → binary hash. A changed hash re-raises the screen (content-hash revocation, the standing rule below). Denial simply fails the call back to the model.
+Owner-configured shell hooks run under the same floor.
 
-## M4 cross-agent routing rows (the exit-gate artifact)
+## Untrusted input → model context
 
-| Untrusted path | Where it flows | Control | Notes |
-|---|---|---|---|
-| sub-agent result → parent context | tool result on the parent's `spawn` call | wrapped in the untrusted-content envelope (`<subagent-result trust="untrusted">`) with closing-delimiter defang; the parent treats it as data, not the user's word | `hotl-tools`-style envelope in the `spawn` tool (M4) |
-| sub-agent → tool execution | child engine on the same machine | the child has **no human on the loop**, so its permission asks **default-deny** (headless posture); it runs only auto-allowed/read-only tools. It inherits the parent's sandbox floor and allow-rules but gets a builtins-only registry (no `spawn`, no MCP) — it cannot recurse or reach external servers | structural depth cap = 1 |
-| ACP client → session | the `hotl acp` protocol surface | the client answers `session/request_permission` round-trips — it *is* the human-on-the-loop for that session, exactly like the REPL; a client that never answers is a dropped oneshot = deny | one session per connection |
-| orchestrator mailbox / task-list content → context | *(when `hotl fleet` ships)* | **reserved**: mailbox and task-list text is untrusted-envelope input on arrival, same as a sub-agent result — an orchestrator is not a trusted principal | M4 seam; fleet is future |
+Everything that flows into the model's context from a source other than the user is wrapped in an **untrusted-content envelope**: a provenance-tagged wrapper (`trust="untrusted"`, `source=…`) carrying an explicit non-authority statement — the content cannot authorize tool use, override the user's instructions, or change the rules — with closing-delimiter defang (a zero-width space inserted into `</`) so the content cannot fake its own closing tag.
 
-The spawn depth cap is **structural, not a counter**: children are built without a `spawn` tool, so "a sub-agent spawning sub-agents forever" cannot happen — the capability simply isn't in the child's registry. `fork` (seed a child from the parent projection) and `teammate` (hotl as an ACP *client* of another agent) are reserved topologies.
+| Untrusted path | Control |
+|---|---|
+| repo instruction files (`AGENTS.md`/`CLAUDE.md`, incl. nested) → context | untrusted-content envelope |
+| auto-memory files → context | same envelope; clipped to a 16 KB load budget |
+| MCP server output → context | sanitizer chokepoint (below) |
+| sub-agent result → parent context | `<subagent-result trust="untrusted">` envelope |
+| bash/tool output → context | human gated the *command*; output enters context unsanitized — the model treats tool results as data by system-prompt instruction only (see gaps) |
 
-## M5 entry-gate artifacts (extensions)
+## MCP
 
-The **default policy file** is a minimal, read-only-by-default `config.toml` starter — "defaults are the safety design" made concrete. The two remaining **trust-prompt screens** (the MCP first-use screen shipped with M3a):
+**Sanitizer — one named chokepoint.** Every string a server returns — call results, `tools/list` listings (names, descriptions, schemas), and errors — passes `hotl_mcp::sanitize` before entering the transcript; a code path that skips it is a bug by definition. Transforms, in order: (1) strip ANSI escapes and C0 control characters except `\n`/`\t` (terminal-injection defense); (2) enforce a 50 KB per-result byte cap with an explicit `[truncated N bytes]` marker (context-flooding defense); (3) wrap in the untrusted-content envelope with `source="mcp:<server>/<tool>"` (prompt-injection defense). Tool listings load only on demand (deferred loading), and a `tools/list_changed` notification only marks the cache stale — the refreshed listing re-passes the sanitizer, and every MCP call remains gated per call; new tools never auto-run.
 
-- **Extension-install screen** — before a hook (lane 1 registered in owner config, or a lane-2 shell command) first runs, a *protected* ask shows: the hook's trigger event (e.g. `PreToolUse`), what it can do (deny/rewrite a tool call, block a turn), and for a shell hook the command + its binary path. Approving is per-hook; a changed command re-asks. Never auto-allowable.
-- **Workspace-trust screen** — the first time hotl runs in a repo that ships its own `.hotl/` config (hooks, settings), a *protected* ask surfaces what that config would enable before any of it takes effect. Untrusted until approved; the config is metadata-visible / execution-blocked until then (the trust-degradation posture).
+**Trust store — first-use screen.** The first call to a server raises a *protected* ask (never auto-allowable): server name, binary path, SHA-256 of the binary, and what approval means ("this program will run on your machine and its output will enter the model's context"). Approval is recorded in `~/.config/hotl/trust.toml` keyed by server name → binary hash; a changed hash re-raises the screen. An unreadable binary is recorded honestly as having no integrity check; a failed trust-store write keeps the grant in memory only and re-asks next session. Server binaries run **outside** the bash sandbox floor — they are user-installed programs, not model-directed commands; installing one is the trust decision.
 
-**Hook routing rows:**
+## Sub-agents and protocol clients
 
-| Untrusted path | Where it flows | Control |
+**`spawn` (sub-agents).** The child has **no human on the loop**, so its permission asks default-deny — it runs only auto-allowed/read-only tools under the parent's sandbox floor and rules. The depth cap is **structural, not a counter**: children are built with a builtins-only tool registry — no `spawn`, no MCP — so a child cannot recurse or reach external servers; the capability simply isn't in its registry. Results return to the parent inside the untrusted envelope. `fork` and `teammate` are reserved topologies.
+
+**`hotl acp` (protocol surface).** The connected client answers `session/request_permission` round-trips — it *is* the human-on-the-loop for that session, exactly like the REPL. A missing or malformed reply, or a client that hangs up, resolves to deny.
+
+## Hooks
+
+Two lanes, both owner-authored in `~/.config/hotl/config.toml` — hotl does not load configuration from the repository it runs in, so a repo cannot ship hooks or settings that change behavior:
+
+- **In-process hooks** (`PreToolUse`/`PostToolUse`), payload-capped.
+- **Shell-command hooks** — JSON over stdio, run under the sandbox floor with a 10 s timeout. Three consecutive failures evict the hook for the session. Malformed output is a no-op: **fail-open on the decision, never on permission** — a broken hook cannot grant, only fail to block.
+
+## Data at rest
+
+| Artifact | Location | Control |
 |---|---|---|
-| repo `.hotl/` hook config → behavior | hook registry | workspace-trust screen; execution-blocked until approved |
-| model tool call → PreToolUse hook | hook sees the call, may deny/rewrite | the hook is owner-authored (trusted logic) but its *trigger* is model-controlled; a rewritten call re-enters the normal permission gate — a hook cannot launder a call past the y/N ask |
-| lane-2 shell hook output → decision | hook stdout → allow/deny/rewrite | runs under the sandbox floor; repeat-offender eviction (3 failures → dropped for the session, RELIABILITY.md); malformed output = no-op (fail-open on *decision*, never on *permission* — a hook that errors cannot grant, only fail to block) |
+| session log (append-only JSONL, permanent by design) | `~/.local/share/hotl/sessions/` | secret masking at ingestion: values of secret-named env vars (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTH`…, ≥ 8 chars) are replaced with `«masked:NAME»` — including their JSON-escaped forms — before bytes land |
+| evicted oversized tool results | `<session>.blobs/` | same masking; files written `0600`; blob filenames sanitized against path injection |
+| shadow snapshot store (powers `undo`) | per-session bare git repo | secret-bearing files are **excluded entirely, not masked** (`.env*`, `*.pem`, `*.key`, `id_*`, `*.p12`/`*.pfx`, `.ssh/`, `.aws/`, `.npmrc`, `.pypirc`, `.netrc`, `secrets.*`, `credentials`) — git history would keep a transient secret alive after the workspace file is deleted or rotated, so credentials never enter |
 
-**Still deferred (not M5-blocking):** parameterized capabilities (fs scoped to path globs, http to host allowlists) attach to the browser/http lanes that need them, not to compiled-in hooks. Recorded, not floating.
+The log carries a hash chain: replay verifies each entry chains to its parent and warns if a log was edited or truncated after being written. A secrets audit flags older logs that still contain a *current* secret value (append-only means they can't be scrubbed — the remedy is rotation, and the tool says so).
 
-Other standing rules:
-- **`hotl watch` is a single-user tool on a single-user assumption.** It runs `ps -axo …` (every user's process command lines) and `tmux capture-pane` (whatever is on screen). On a shared/multi-user host these can surface other users' secrets (`mysql -pPASSWORD`, `--token=…`) and arbitrary scrollback. All `ps`/`tmux` calls use argv arrays (no shell interpolation — no command injection), so this is local information disclosure inherent to a process dashboard, not an execution risk. Don't run `hotl watch` on a host where you shouldn't see other users' process arguments.
-- Permission mediation lives in the embedding protocol, keyed by transcript-stable IDs, surviving reconnects.
-- Extension trust is granular: metadata-visible / execution-blocked when untrusted; content-hash revocation on file change; identity env vars applied last.
+Retention is explicit: `hotl gc` (with `--dry-run`) and a `[retention]` policy (`max_age_days` / `max_sessions`) prune whole sessions — log, blobs, and shadow repo together. The default is keep-everything; a configured policy also runs automatically at startup.
+
+## `hotl watch`
+
+A single-user tool on a single-user assumption. It runs `ps` (every user's process command lines) and `tmux capture-pane` (whatever is on screen); on a shared host these can surface other users' secrets (`mysql -pPASSWORD`, `--token=…`) and scrollback. All `ps`/`tmux` calls use argv arrays — no shell interpolation, so no command injection — making this local information disclosure inherent to a process dashboard, not an execution risk. Don't run it on a host where you shouldn't see other users' process arguments.
+
+## Known gaps (planned, not shipped)
+
+- **No network-egress allowlist.** The sandbox leaves network open; the approval prompt is the only exfiltration control. This is the largest gap — see "what the sandbox is not."
+- **Native tool output is not sanitized.** bash/read results enter context verbatim; only MCP output passes the sanitizer chokepoint. The system prompt instructs the model to treat tool results as data — an instruction, not an enforcement.
+- **The permission pipeline has no AST or LLM inspectors.** Command scanning is heuristic (shell-operator detection), not tree-sitter-based; there are no LLM judges voting on calls.
+- **No third-party extension trust screens.** Moot today — hooks and settings load only from owner config, never from the repo — but required before any repo-supplied or third-party extension lane ships.
+- **Browser/WASM profile does not exist** and has no kernel sandbox story yet; it will not ship without compensating controls.
+
+## Standing rules
+
+- Tool descriptions must not promise protections the executor doesn't implement — tested as an invariant.
 - Supply chain: pinned deps; SHA-pinned remote installs default ON; lifecycle-script allowlists.
-- Tool descriptions must not promise protections the executor doesn't implement — tested as an invariant (11's drift lesson).
 - No telemetry. Secret-scrubbing in logs stays. Crash dumps are local, secret-scrubbed, and only ever shared manually by the user; the update *check* defaults off.
 
-**Reporting a vulnerability (from first public release):** GitHub private security advisories on the repo, or email the owner (address in the repo README once public). Coordinated disclosure, 90-day default window. Report before publishing; good-faith research against your own installation is welcome.
+## Reporting a vulnerability
+
+GitHub private security advisories on the repo, or email the owner (address in the repo README). Coordinated disclosure, 90-day default window. Report before publishing; good-faith research against your own installation is welcome.

@@ -1,20 +1,18 @@
 # ARCHITECTURE.md — the harness at a glance
 
-**Product frame (hotl = watch · execute · orchestrate):** this file describes the **execute** capability — the harness behind the bare `hotl` command. The other two capabilities sit *outside* this architecture by design: **watch** (`hotl watch`, the shipped tmux dashboard, layers W1–W4) observes agents from outside the process — pane titles, process state, captured output; never the harness's internal types; **orchestrate** (`hotl fleet`, future) will be an ACP *client* of the harness like any other frontend, using the orchestrator-as-client seams. One binary hosts all three; only this one has layers.
+**Product frame (hotl = watch · execute · orchestrate):** this file describes the **execute** capability — the harness behind the bare `hotl` command. The other two capabilities sit _outside_ this architecture by design: **watch** (`hotl watch`, the shipped tmux dashboard, layers W1–W4) observes agents from outside the process — pane titles, process state, captured output; never the harness's internal types; **orchestrate** (`hotl fleet`, future) will be an ACP _client_ of the harness like any other frontend, using the orchestrator-as-client seams. One binary hosts all three; only this one has layers.
 
-**Shape: event-log-as-canon, actor-as-serializer, ACP spine.** Session state is a projection of one append-only entry log (a tree via `parent_id`, with a movable leaf); the model transcript and the UI replay are two *projections* of it; compaction is an appended entry that re-points the projection, never a rewrite. One actor per session serializes admission and commits; turn tasks *propose* entries, only the actor commits them.
-
-Status: design settled; **M0–M5 implemented, MD partially** (M4 surfaces/orchestration + M5 extension hooks landed 2026-07-20; some items still in progress). This file is the architecture map; the [user docs](docs/user/index.md) cover installing and running the agent.
+**Shape: event-log-as-canon, actor-as-serializer, ACP spine.** Session state is a projection of one append-only entry log (a tree via `parent_id`, with a movable leaf); the model transcript and the UI replay are two _projections_ of it; compaction is an appended entry that re-points the projection, never a rewrite. One actor per session serializes admission and commits; turn tasks _propose_ entries, only the actor commits them.
 
 ## The layers (build order)
 
-Layers depend upward, with one recorded exception: L3 *triggers* compaction, L6 *implements* it:
+Layers depend upward, with one recorded exception: L3 _triggers_ compaction, L6 _implements_ it:
 
 1. **Canonical types** — provider-neutral conversation/message model, structural provenance tags, forward-compat serde from day one.
 2. **Provider trait** — `stream(request) → EventStream`; M0 ships one real provider (Anthropic) + a scripted test provider, the second real provider lands M1 to keep the trait honest; central `transformMessages`-style canonicalization pre-pass (M1, with provider #2); catalog deferred (ledger: catalog-later).
-3. **Turn engine** — one loop per session; typed steer/queue inbox (durable admission/promotion) on an **out-of-band control lane** so cancel/ask never wedge behind data commands; budgeted recovery; *triggers* compaction (implemented in L6).
+3. **Turn engine** — one loop per session; typed steer/queue inbox (durable admission/promotion) on an **out-of-band control lane** so cancel/ask never wedge behind data commands; budgeted recovery; _triggers_ compaction (implemented in L6).
 4. **Tool system** — typed tools with one erasure boundary; edit cascade; post-mutation format+diagnostics injection; json-repair + schema coercion at the arg boundary; MCP client with deferred loading.
-5. **Persistence** — one append-only session log (tree with movable leaf); the model transcript and the UI replay are two *projections* of it, per the Shape header — no second store; shadow-git snapshots for undo.
+5. **Persistence** — one append-only session log (tree with movable leaf); the model transcript and the UI replay are two _projections_ of it, per the Shape header — no second store; shadow-git snapshots for undo.
 6. **Context assembly** — byte-stable prefix; AGENTS.md-as-map; auto memory with load budget (loaded in an untrusted-content envelope); **compaction** (typed digest + verbatim tail + last-resort degradation floor so a failed compaction can't brick the session); ephemeral per-turn context block (MOIM).
 7. **Headless/protocol surface before TUI** — ACP-shaped contract with permission mediation; `-p`/JSON modes; capability advertisement; shell-plugin mode early, TUI last.
 
@@ -24,12 +22,12 @@ Compilation targets: **native from day one; WASM (browser) is a gated post-M5 mi
 
 ## The connective planes
 
-| Plane | Protocol |
-|---|---|
-| Agent ↔ tools | MCP |
-| Agent ↔ frontend | ACP (Zed's) — the embedding contract |
+| Plane                       | Protocol                                                               |
+| --------------------------- | ---------------------------------------------------------------------- |
+| Agent ↔ tools               | MCP                                                                    |
+| Agent ↔ frontend            | ACP (Zed's) — the embedding contract                                   |
 | Agent ↔ own sub/peer agents | Own spawn interface; agents-as-tools (MCP) / agents-as-providers (ACP) |
-| Agent ↔ un-owned peers | A2A — seam reserved, implementation deferred |
+| Agent ↔ un-owned peers      | A2A — seam reserved, implementation deferred                           |
 
 ## How a prompt flows (M1/M2 runtime)
 
