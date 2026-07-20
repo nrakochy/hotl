@@ -17,6 +17,10 @@ use tokio::sync::mpsc;
 
 const ASK_TIMEOUT_SECS: u64 = 300;
 
+/// Stable schema version of the `-p --json` event stream (MD Tier-1 contract;
+/// bump only on a breaking change to a frame's shape).
+pub const JSON_STREAM_SCHEMA_VERSION: u32 = 1;
+
 /// Context inherited from an earlier session (`hotl resume` — M3b).
 pub(crate) struct Resumed {
     pub parent_id: String,
@@ -217,6 +221,9 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
             surface.handle.continue_turn().await;
             surface.turn_running = true;
         }
+    }
+    if let Some(hint) = crate::setup::first_run_hint(&scaffold.config_dir) {
+        eprintln!("hotl: {hint}");
     }
     print_banner(&scaffold.model, &session_id, &scaffold.sandbox_status);
     surface.repl().await
@@ -612,7 +619,11 @@ impl Surface {
                 serde_json::json!({"type":"turn_done","outcome":format!("{outcome:?}"),"usage":usage})
             }
         };
-        println!("{v}");
+        // MD contract freeze: every -p/--json frame carries the stable stream
+        // schema version so a consumer can pin to it (Tier-1 contract).
+        let mut framed = v;
+        framed["schema_version"] = serde_json::json!(JSON_STREAM_SCHEMA_VERSION);
+        println!("{framed}");
     }
 
     async fn ask_human(&mut self, summary: &str, protected_why: Option<&str>) -> bool {

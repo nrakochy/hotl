@@ -9,11 +9,14 @@
 //!   resume        continue an earlier session from its log (M3b)
 //!   undo          restore files to the last pre-batch snapshot (M3b)
 //!   acp           serve the ACP JSON-RPC protocol over stdio (M4)
+//!   setup         write default config (safe defaults; never silent) (MD)
+//!   update        show version + how to update (MD)
 //!   update        reserved (MD)
 
 mod acp;
 mod agent;
 mod doctor;
+mod setup;
 mod shell_hooks;
 mod spawn;
 mod watch;
@@ -49,9 +52,27 @@ fn main() {
         Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
         Some("resume") => std::process::exit(block_on(agent::resume_main(args[1..].to_vec()))),
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
+        Some("setup") => {
+            let force = args.iter().any(|a| a == "--force" || a == "-f");
+            std::process::exit(setup::setup_main(&agent::config_dir(), force));
+        }
         Some("update") => {
-            eprintln!("`hotl update` is reserved for the distribution milestone (MD) and not built yet.");
-            std::process::exit(2);
+            let current = env!("CARGO_PKG_VERSION");
+            println!("hotl {current}");
+            // A caller (or a future release-feed fetch) can pass the latest
+            // known version to get a real up-to-date/outdated verdict.
+            if let Some(latest) = args.get(1) {
+                if setup::is_newer(current, latest) {
+                    println!("a newer version is available: {latest}");
+                } else {
+                    println!("up to date (latest: {latest}).");
+                }
+            }
+            println!(
+                "to update: `cargo install --locked hotl`, or re-run the installer script.\n\
+                 (automated self-update is not wired yet — it needs a signed release feed; MD.)"
+            );
+            std::process::exit(0);
         }
         Some("init") => {
             // Binary-generated shell integration (0001 §M1, Forge's `:` prefix).
@@ -71,6 +92,7 @@ fn main() {
                  hotl watch           tmux agent dashboard (watch)\n  \
                  hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
                  hotl doctor          check provider keys, sandbox, config, session store\n  \
+                 hotl setup           write default config (safe defaults)\n  \
                  hotl resume [id]     continue an earlier session (bare: list recent)\n  \
                  hotl undo            restore files to before the agent's last change\n  \
                  hotl fleet           reserved (orchestrate)\n\n\
