@@ -2,11 +2,11 @@
 
 **Defaults are the safety design.** Enforcement ships ON with a curated default policy. A cautionary example: a well-built policy engine behind a default-off flag with an allow-all policy file is equivalent to nothing.
 
-This document describes the controls as they exist in the code today. Gaps are listed at the end, loudly, not hidden.
+This document describes the controls as they exist in the code today. Gaps are listed at the end.
 
 ## What the sandbox is not (read this first)
 
-The kernel sandbox floor is **write-confinement, not data-loss prevention.** A `bash` command that the human approves (or that an allow-rule matches) can **read any file the user can read and send it anywhere over the network** — reads and network egress are open by design (the agent legitimately reads the tree and fetches dependencies). The floor stops the agent *tampering with the filesystem outside the working directory*; it does **not** stop *exfiltration*. Treat the human approval prompt, not the sandbox, as the exfiltration boundary — and know that a plausible-looking approved command (`run the tests`, which also `curl`s) exfiltrates freely. A network-egress allowlist is a planned control (see gaps); until it exists, do not run hotl against secrets you would not paste into a command yourself.
+The kernel sandbox floor is **write-confinement, not data-loss prevention.** A `bash` command that the human approves (or that an allow-rule matches) can **read any file the user can read and send it anywhere over the network** — reads and network egress are open by design (the agent legitimately reads the tree and fetches dependencies). The floor stops the agent *tampering with the filesystem outside the working directory*; it does **not** stop *exfiltration*. Treat the human approval prompt, not the sandbox, as the exfiltration boundary — and know that a plausible-looking approved command (`run the tests`, which also `curl`s) exfiltrates freely. Egress restriction exists but is **opt-in** (`[network]` in config.toml — see "Network egress" below); the default is open. Under the default policy, do not run hotl against secrets you would not paste into a command yourself.
 
 ## The permission gate
 
@@ -23,11 +23,37 @@ A repetition detector (doom-loop) halts a turn that repeats the same tool-call c
 
 ## The kernel sandbox floor
 
-`bash` executes confined — **Seatbelt** on macOS (deny all file writes, then re-allow the working directory, temp, and `/dev`), **Landlock** on Linux ≥ 5.13 including WSL2 (same shape). Reads and network stay open (see "what the sandbox is not").
+`bash` executes confined — **Seatbelt** on macOS (deny all file writes, then re-allow the working directory, temp, and `/dev`), **Landlock** on Linux ≥ 5.13 including WSL2 (same shape). Reads stay open; network egress is open by default and restrictable per host (see "Network egress" below and "what the sandbox is not").
 
 Hosts where the floor is unavailable (older Linux kernels) **degrade fail-closed**: every exec is individually human-gated with an `UNSANDBOXED` banner in the ask, and `bash` allow-rules stop applying — auto-approval of commands exists only while the sandbox is enforced. `HOTL_SANDBOX=off` is an explicit escape hatch and is labeled as such in every ask. Windows native is unsupported (no floor designed); WSL2 is the Windows path.
 
 Owner-configured shell hooks run under the same floor.
+
+### Network egress
+
+`[network].egress` in `~/.config/hotl/config.toml` selects one of three modes. The default is **open** — egress hardening is opt-in. That is a considered decision, not an oversight:
+
+- A restricted default breaks the first prompt a new user runs: `cargo build`, `npm install`, `git clone` all reach the network, and `allowlist` mode breaks **git over SSH remotes unconditionally** (SSH does not speak the HTTP proxy, and the kernel blocks the direct connection) — no list fixes that.
+- A default allowlist generous enough to not break workflows (`github.com`, the package registries) is itself an exfiltration channel — an agent that can reach github.com can push to an attacker's repo. Shipping that as the default would manufacture a false sense of security while adding friction: the worst combination.
+- On Linux kernels < 6.7 a restricted default would land every user in `NET:UNENFORCED` — disabling their bash allow-rules by the fail-closed rule below — based on kernel version alone.
+
+So the human gate (not the sandbox) stays the *default* exfiltration boundary, and egress restriction is the opt-in structural backstop for running against material where that gate alone is not acceptable; "what the sandbox is not" tells you when that is. The control is **connection-granular, not payload-aware**: it restricts *all* egress to unlisted hosts (legitimate fetches included) and none to listed ones (exfiltration included) — it narrows destinations, it does not classify traffic.
+
+- **`open`** (default) — egress unrestricted; exactly the behavior described above.
+- **`off`** — no egress: the kernel confines the command to loopback and unix-domain sockets.
+- **`allowlist`** (`allow = ["github.com", "*.crates.io"]`) — the same kernel loopback-only confinement, plus a local filtering HTTP proxy for the listed hosts. Matching is case-insensitive and host-granular (no ports, no paths); `*.example.com` matches the apex and any subdomain depth; an empty list allows nothing.
+
+**Kernel backing.** macOS: Seatbelt network clauses — deny all network, then re-allow unix-domain sockets and loopback. Linux: Landlock net (ABI v4, kernel ≥ 6.7), handled as a **hard requirement** — `ConnectTcp` with zero allowed ports for `off`, exactly the proxy port for `allowlist`; a kernel without the net ABI can never silently skip net enforcement.
+
+**The proxy is not the control; the kernel is.** The proxy (127.0.0.1, ephemeral port) filters `CONNECT` and absolute-form HTTP by host for *cooperating* clients — those honoring the `HTTP(S)_PROXY`/`ALL_PROXY` variables hotl injects into the command's environment (curl, git, pip, cargo…). A non-cooperating client that ignores the proxy env hits the kernel loopback-only wall and **fails closed**. A denied request gets a `403` whose body — `hotl egress: "HOST" is not in [network].allow` — is an errors-as-prompts message the model sees in tool output.
+
+**Degradation is fail-closed**, mirroring the UNSANDBOXED posture: when `off`/`allowlist` is configured but the kernel can't back it (no seatbelt, Landlock without the net ABI, `HOTL_SANDBOX=off`), every bash ask is loudly marked `NET:UNENFORCED(reason)` and bash allow-rules stop auto-approving. An unknown `egress` value fails closed to `off` with a startup warning — a typo never means open. While a restriction is active and enforced, the ask label carries `net:off` or `net:allow(N)`.
+
+**Honest limits.**
+- macOS: DNS resolution rides the mDNSResponder unix-domain socket, which stays allowed — name *resolution* still works under `off`/`allowlist` and is not exfil-confined (a DNS tunnel can leak data even in `off` mode).
+- Linux: Landlock net is **TCP-only** — UDP, including DNS and DNS-tunnel exfiltration, is not confined — and **port-scoped, not address-scoped**: the proxy port *number* is connectable on any host, and `off` blocks loopback TCP too (unix-domain sockets stay open).
+- The allowlist is host-granular: an allowed host is fully reachable, any path, any method — and therefore also usable as an exfiltration destination (an allowed `github.com` accepts pushes to any repo). List hosts you trust with your data, not merely hosts you fetch from.
+- The proxy is HTTP-only: `git` over SSH remotes, and any other non-HTTP protocol, cannot traverse it — under `off`/`allowlist` they fail at the kernel wall regardless of the list. Use HTTPS remotes when running restricted.
 
 ## Untrusted input → model context
 
@@ -78,7 +104,7 @@ A single-user tool on a single-user assumption. It runs `ps` (every user's proce
 
 ## Known gaps (planned, not shipped)
 
-- **No network-egress allowlist.** The sandbox leaves network open; the approval prompt is the only exfiltration control. This is the largest gap — see "what the sandbox is not."
+- **No egress ask.** A host not on the allowlist gets a flat 403; there is no y/N ask ("bash wants to reach `host` — allow for this session?") the way tool permissions have. That interaction is what would make `allowlist` livable as the *default* — the first `cargo build` would ask once about crates.io instead of failing — and is the recorded path to flipping the egress default, along with a story for the SSH gap. Until it ships, egress restriction stays opt-in.
 - **Native tool output is not sanitized.** bash/read results enter context verbatim; only MCP output passes the sanitizer chokepoint. The system prompt instructs the model to treat tool results as data — an instruction, not an enforcement.
 - **The permission pipeline has no AST or LLM inspectors.** Command scanning is heuristic (shell-operator detection), not tree-sitter-based; there are no LLM judges voting on calls.
 - **No third-party extension trust screens.** Moot today — hooks and settings load only from owner config, never from the repo — but required before any repo-supplied or third-party extension lane ships.

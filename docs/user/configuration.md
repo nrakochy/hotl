@@ -43,6 +43,10 @@ show_used_pct = true       # show context-fullness in each turn's status
 ask_timeout_secs = 300     # 0 = wait forever for a permission answer
 sandbox = true             # false disables the bash sandbox floor
 
+[network]
+egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
+allow = ["github.com", "*.crates.io"]   # hosts reachable in allowlist mode
+
 [retention]
 max_age_days = 30          # prune sessions older than this (hotl gc)
 max_sessions = 200         # keep at most this many
@@ -106,7 +110,7 @@ path_prefix = "src/"       # auto-allow writes/edits under src/
 
 Rules that do **not** auto-allow, even with a matching rule (safety carve-outs):
 - A `bash` command containing a shell control operator (`;`, `|`, `&`, `<`, `>`, backtick, `$(`, braces, newline) — it does more than the prefix implies.
-- A `bash` rule at all when the sandbox floor is not enforced.
+- A `bash` rule at all when the sandbox floor is not enforced, or when a configured `[network]` egress restriction cannot be kernel-enforced on this host.
 - A `write`/`edit` path that resolves outside the prefix after `..` normalization, or is absolute against a relative prefix.
 - Any write to a protected (execute-later) path — always asks. See [permissions-and-sandbox.md](permissions-and-sandbox.md#protected-paths).
 
@@ -117,6 +121,10 @@ Declare external tool servers. Each is exposed to the model through one `mcp` to
 ### Post-edit diagnostics (`[diagnostics]`) and hooks (`[[hook]]`)
 
 `[diagnostics]` runs a check command after a successful `edit`/`write` (under the sandbox floor, 30 s timeout). `[[hook]]` intercepts tool calls. Full guide: [hooks.md](hooks.md).
+
+### Network egress (`[network]`)
+
+Restricts what `bash` commands (and diagnostics/hooks, which run under the same floor) may reach over the network. `egress` is one of `open` (default; unrestricted), `off` (loopback and unix-domain sockets only), or `allowlist` (loopback plus the hosts in `allow`, reached through a local filtering proxy). `allow` entries are hostnames or `*.domain` wildcards — a wildcard matches the apex and any subdomain depth; no ports; matching is case-insensitive; an empty list allows nothing. An unknown `egress` value fails closed to `off` with a startup warning. While a restriction is configured, the bash ask label carries `net:off` / `net:allow(N)` — or `NET:UNENFORCED(reason)` on hosts where the kernel cannot back it (Linux needs kernel ≥ 6.7 for Landlock net; `HOTL_SANDBOX=off` also unenforces it), in which case `bash` allow-rules stop auto-approving. A denied fetch returns `hotl egress: "HOST" is not in [network].allow`. Why and limits: [permissions-and-sandbox.md](permissions-and-sandbox.md#opting-out-of-open-egress).
 
 ### Retention (`[retention]`)
 
