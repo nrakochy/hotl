@@ -75,6 +75,23 @@ pub fn run_jump(pane: &Pane) -> io::Result<()> {
     }
 }
 
+// A job-control-stopped agent leaves its pane at the shell prompt that the
+// suspension produced, so typing `fg` there is what resumes it. `fg` is sent
+// as a literal word (not a key name) — send-keys only interprets its known
+// key names, so this types f, g, then Enter.
+pub fn foreground_argv(pane_id: &str) -> Vec<String> {
+    vec!["send-keys".into(), "-t".into(), pane_id.into(), "fg".into(), "Enter".into()]
+}
+
+pub fn run_foreground(pane_id: &str) -> io::Result<()> {
+    let status = Command::new("tmux").args(foreground_argv(pane_id)).status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("tmux send-keys failed"))
+    }
+}
+
 pub fn tmux_available() -> bool {
     Command::new("tmux")
         .arg("-V")
@@ -154,6 +171,14 @@ base-0\u{1f}0\u{1f}zsh\u{1f}4\u{1f}%55\u{1f}80031\u{1f}zsh\u{1f}/Users/nrakochy/
     #[test]
     fn empty_input_yields_no_panes() {
         assert!(parse_panes("").is_empty());
+    }
+
+    #[test]
+    fn builds_foreground_argv() {
+        assert_eq!(
+            foreground_argv("%54"),
+            vec!["send-keys", "-t", "%54", "fg", "Enter"]
+        );
     }
 
     #[test]

@@ -22,7 +22,7 @@ impl Default for Settings {
         Settings {
             ping_on_blocked: true,
             poll_interval_ms: 1000,
-            agents: vec!["claude".into(), "codex".into()],
+            agents: vec!["claude".into(), "codex".into(), "hotl".into()],
             vim_mode: true,
             theme: ThemeConfig::default(),
         }
@@ -232,7 +232,7 @@ mod tests {
         let c = HotlConfig::parse("");
         assert!(c.settings.ping_on_blocked);
         assert_eq!(c.settings.poll_interval_ms, 1000);
-        assert_eq!(c.settings.agents, vec!["claude".to_string(), "codex".to_string()]);
+        assert_eq!(c.settings.agents, vec!["claude".to_string(), "codex".to_string(), "hotl".to_string()]);
         assert_eq!(c.settings.theme.resolve().0.active, "#f2c14e");
     }
 
@@ -241,7 +241,7 @@ mod tests {
         let c = HotlConfig::parse("[settings]\nping_on_blocked = false\npoll_interval_ms = 500\n");
         assert!(!c.settings.ping_on_blocked);
         assert_eq!(c.settings.poll_interval_ms, 500);
-        assert_eq!(c.settings.agents, vec!["claude".to_string(), "codex".to_string()]);
+        assert_eq!(c.settings.agents, vec!["claude".to_string(), "codex".to_string(), "hotl".to_string()]);
     }
 
     #[test]

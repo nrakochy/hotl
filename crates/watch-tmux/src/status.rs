@@ -48,6 +48,26 @@ impl StatusDetector for ClaudeDetector {
     }
 }
 
+// hotl's permission ask renders as `allow <summary>? [y/N — …]`.
+fn tail_is_hotl_ask(tail: &str) -> bool {
+    tail.to_lowercase().contains("[y/n")
+}
+
+pub struct HotlDetector;
+impl StatusDetector for HotlDetector {
+    fn classify(&self, sig: &Signals) -> Status {
+        if title_is_working(sig.title) {
+            Status::Working
+        } else if tail_is_hotl_ask(sig.tail) {
+            Status::Blocked
+        } else if tail_is_idle(sig.tail) {
+            Status::Idle
+        } else {
+            Status::Unknown
+        }
+    }
+}
+
 pub struct GenericDetector;
 impl StatusDetector for GenericDetector {
     fn classify(&self, sig: &Signals) -> Status {
@@ -64,6 +84,7 @@ impl StatusDetector for GenericDetector {
 pub fn detector_for(agent_name: &str) -> Box<dyn StatusDetector> {
     match agent_name {
         "claude" => Box::new(ClaudeDetector),
+        "hotl" => Box::new(HotlDetector),
         _ => Box::new(GenericDetector),
     }
 }
@@ -129,6 +150,32 @@ enter to select · esc to cancel · ↑↓ to navigate";
     fn generic_detector_detects_working_and_idle() {
         assert_eq!(classify("codex", "\u{2809}", ""), Status::Working);
         assert_eq!(classify("codex", "plain", IDLE_TAIL), Status::Idle);
+    }
+
+    const HOTL_ASK_TAIL: &str = "\
+● bash: cargo test
+⚠ PROTECTED PATH — writes to .git/hooks/ execute later
+allow bash: cargo test? [y/N — add a reason after 'n' to tell the model why] ";
+
+    #[test]
+    fn hotl_blocked_on_permission_ask() {
+        assert_eq!(classify("hotl", "plain", HOTL_ASK_TAIL), Status::Blocked);
+    }
+
+    #[test]
+    fn hotl_idle_on_prompt_marker() {
+        assert_eq!(classify("hotl", "plain", "some output\n❯ "), Status::Idle);
+    }
+
+    #[test]
+    fn hotl_ask_takes_precedence_over_idle_prompt() {
+        let tail = format!("❯ \n{HOTL_ASK_TAIL}");
+        assert_eq!(classify("hotl", "plain", &tail), Status::Blocked);
+    }
+
+    #[test]
+    fn hotl_unknown_when_no_signals() {
+        assert_eq!(classify("hotl", "plain", "streaming model output…"), Status::Unknown);
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use crate::panes::{list_panes, run_jump, Pane};
+use crate::panes::{list_panes, run_foreground, run_jump, Pane};
 use crate::procs::{agent_for, read_proc_table, ProcTable};
 use crate::status::classify;
 use watch_types::{AgentObservation, Location, LocationHandle, Source, Surface, SurfaceError};
@@ -81,7 +81,20 @@ impl Surface for TmuxSurface {
                     window_active: false,
                     title: String::new(),
                 };
-                run_jump(&pane).map_err(|e| SurfaceError(e.to_string()))
+                run_jump(&pane).map_err(|e| SurfaceError(e.to_string()))?;
+                // A suspended (ctrl-z'd) agent leaves the pane at a shell
+                // prompt — the jump alone would land there with the agent
+                // still stopped. Re-check the process state now (not the
+                // possibly stale observation) and resume it with `fg` so
+                // go-to foregrounds the process as well. A failed re-read
+                // skips the resume rather than failing the jump.
+                let stopped = read_proc_table()
+                    .map(|t| t.stopped.contains(&obs.agent.pid))
+                    .unwrap_or(false);
+                if stopped {
+                    run_foreground(pane_id).map_err(|e| SurfaceError(e.to_string()))?;
+                }
+                Ok(())
             }
         }
     }
@@ -101,7 +114,7 @@ mod tests {
     const PANES: &str = "\
 base-0\u{1f}0\u{1f}zsh\u{1f}0\u{1f}%25\u{1f}35580\u{1f}claude\u{1f}/tmp/a\u{1f}0\u{1f}1\u{1f}✳ task a
 work\u{1f}0\u{1f}edit\u{1f}0\u{1f}%60\u{1f}40000\u{1f}claude\u{1f}/tmp/d\u{1f}1\u{1f}1\u{1f}\u{2809} task d";
-    const PS: &str = "  PID  PPID COMMAND\n35580 1 claude\n40000 1 claude";
+    const PS: &str = "  PID  PPID STAT COMMAND\n35580 1 S+ claude\n40000 1 S+ claude";
 
     #[test]
     fn maps_panes_to_observations() {
@@ -154,7 +167,7 @@ some output
         let panes = parse_panes(
             "s\u{1f}0\u{1f}w\u{1f}0\u{1f}%9\u{1f}999\u{1f}zsh\u{1f}/tmp\u{1f}0\u{1f}1\u{1f}title",
         );
-        let procs = parse_ps("  PID  PPID COMMAND\n999 1 -zsh");
+        let procs = parse_ps("  PID  PPID STAT COMMAND\n999 1 S -zsh");
         let obs = observations(&panes, &procs, &["claude".to_string()], &|_| String::new());
         assert!(obs.is_empty());
     }
