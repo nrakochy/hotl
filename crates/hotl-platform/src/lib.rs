@@ -23,7 +23,7 @@ impl Clock for SystemClock {
     }
 }
 
-/// Resolution order (distribution.md §D5): env var → SecretStore → prompt.
+/// Resolution order: env var → SecretStore → prompt.
 /// M0 ships the env implementation; Keychain/secret-service land at MD.
 pub trait SecretStore: Send + Sync {
     fn get(&self, name: &str) -> Option<String>;

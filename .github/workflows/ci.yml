@@ -4,7 +4,7 @@ name: CI
 # separate, tag-triggered workflow (see publish.yml) — this one just keeps the
 # default branch green.
 #
-# Watch and harness run as separate jobs (merge plan 0002 phase 1): a red
+# Watch and harness run as separate jobs: a red
 # harness must never block a `hotl watch` hotfix, and vice versa. The binary
 # crate depends on both, so it builds in the harness job (the bigger tree).
 on:
@@ -51,7 +51,7 @@ jobs:
       - name: Test (harness crates + binary)
         run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-engine -p hotl-testkit -p hotl --locked
 
-  # Dependency vulnerability scan (security-evaluation H-08, SCA half). Runs
+  # Dependency vulnerability scan. Runs
   # cargo-audit against the committed Cargo.lock. cargo-audit installs from
   # crates.io — the same trust root as the build — so this adds no new
   # third-party GitHub Action to the supply chain.

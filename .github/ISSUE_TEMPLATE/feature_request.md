@@ -1,20 +1,18 @@
 ---
-name: Feature request / ledger proposal
+name: Feature request
 about: Propose a change to what hotl does
 title: ''
 labels: enhancement
 ---
 
-hotl's scope is **ledger-governed**: features are adopted/rejected explicitly in [docs/design-docs/feature-ledger.md](../../docs/design-docs/feature-ledger.md) before they're built. This issue is where a proposed ledger row is discussed — please read CONTRIBUTING.md first.
+hotl is **personal-first** and deliberately small — every feature is an explicit decision. Please read CONTRIBUTING.md first; this issue is where a proposed change is discussed before any code.
 
 **The problem** (in your own words, not a solution):
 
-**Who has it** — is this an owner-operator need, or a platform/enterprise one? (hotl is personal-first; see the ledger's "rejected" columns for what's deliberately out.)
+**Who has it** — is this an owner-operator need, or a platform/enterprise one? (hotl is personal-first; some things are deliberately out of scope — see CONTRIBUTING.md.)
 
-**Proposed adoption** — what would the ledger row say? Which source/harness (if any) does it come from?
+**Proposed change** — what would hotl do differently?
 
 **Why it's worth the complexity** — what does it cost to own forever?
 
 **Alternatives considered:**
-
-> If this matches something already in the "rejected" columns, say why hotl's situation differs — that's the useful discussion.

@@ -1,5 +1,5 @@
 //! The `mcp` meta-tool: one registry entry covers every configured server
-//! (deferred loading, corpus 09). `{server}` lists a server's tools;
+//! (deferred loading). `{server}` lists a server's tools;
 //! `{server, tool, arguments}` calls one. Results, listings, and errors all
 //! pass the sanitizer chokepoint; first use of a server is a protected ask.
 

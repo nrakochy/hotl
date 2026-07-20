@@ -1,4 +1,4 @@
-//! L2 — the provider seam (system-design §L2).
+//! L2 — the provider seam.
 //!
 //! `stream()` is the one required method. Events carry block structure
 //! (review Arch #6): every delta names its block index, and the provider —
@@ -35,7 +35,7 @@ pub struct SamplingRequest {
     /// Adaptive thinking on models that support it.
     pub thinking: bool,
     /// M0 static cache placement: system block + latest user block
-    /// (explicit-cache providers; system-design §L2 cache policy).
+    /// (explicit-cache providers).
     pub cache_static: bool,
     /// MOIM (M2): ephemeral per-turn context, sent as a trailing user block
     /// after the cache marker. Never persisted — it exists only on the wire.
@@ -179,7 +179,7 @@ impl SseParser {
     }
 }
 
-/// Pure-data retry classification (RELIABILITY.md; corpus 06 — never regex
+/// Pure-data retry classification (RELIABILITY.md — never regex
 /// on prose). Both HTTP providers consult this; budgets reset per sample.
 pub mod retry {
     use super::ProviderError;
@@ -209,7 +209,7 @@ pub mod retry {
     }
 
     /// Availability-class errors are the only ones that justify falling back
-    /// to another model (never auth/billing/parse — corpus 12).
+    /// to another model (never auth/billing/parse).
     pub fn is_availability(err: &ProviderError) -> bool {
         matches!(
             err,
@@ -271,8 +271,8 @@ pub mod retry {
     }
 }
 
-/// The named cross-provider canonicalization stage (system-design §L2
-/// `transform_messages`, Pi corpus 08 Q4). Canonical assistant blocks are
+/// The named cross-provider canonicalization stage (`transform_messages`).
+/// Canonical assistant blocks are
 /// Anthropic-shaped; when a request targets a *different* provider than the
 /// one that produced a block, provider-bound reasoning must not cross.
 pub mod transform {
@@ -314,7 +314,7 @@ pub mod transform {
     }
 }
 
-/// Arg healing at the erasure boundary (M3a; corpus 05): streamed tool
+/// Arg healing at the erasure boundary (M3a): streamed tool
 /// arguments sometimes arrive as *almost*-JSON. Repair is conservative —
 /// only unambiguous damage is fixed; anything else stays a parse error that
 /// feeds back to the model as a tool result.

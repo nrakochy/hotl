@@ -9,7 +9,7 @@
 //! are dropped (the full history is in the session log); pending asks are not.
 //!
 //! One session per process (process-per-session — the ACP model). Restart-
-//! durability (surviving a reboot) is the review-gated 0006 durable-asks work
+//! durability (surviving a reboot) is planned durable-asks work
 //! and is deliberately out of scope; this parks in memory, in the live server.
 
 use std::collections::HashMap;

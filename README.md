@@ -7,7 +7,7 @@ One binary, three capabilities, and you on the loop for all of them:
 | Capability | Command | Status |
 |---|---|---|
 | **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it |
-| **Execute** | `hotl` | **Building (M0–M3 done)** — a personal agent harness (event-log-as-canon, ACP-native, designed in [docs/](AGENTS.md)): steering REPL + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → docs/user/](docs/user/index.md)** |
+| **Execute** | `hotl` | **Building** — a personal agent harness (event-log-as-canon, ACP-native): steering REPL + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → docs/user/](docs/user/index.md)** |
 | **Orchestrate** | `hotl fleet` | **Future** — drives fleets of agents over the same protocol any editor uses; only its seams exist today |
 
 > **Pre-1.0 — and a breaking change:** bare `hotl` is now the **agent**; the
@@ -40,7 +40,7 @@ Keys: `j`/`k` (or ↓/↑) move · `enter` jump to the selected agent · `r` ref
 
 ## The docs
 
-[`AGENTS.md`](AGENTS.md) is the map. The short version: [`ARCHITECTURE.md`](ARCHITECTURE.md) is the harness at a glance; [`docs/design-docs/`](docs/design-docs/index.md) holds the settled design (including the vendored six-harness research corpus it cites); [`docs/exec-plans/`](docs/PLANS.md) holds the master plan, the merge plan, and two rounds of adversarial review with responses.
+[`ARCHITECTURE.md`](ARCHITECTURE.md) is the harness at a glance — the layers, the connective planes, and how a prompt flows through the system. The [user docs](docs/user/index.md) cover installing and running the agent, and [`docs/SECURITY.md`](docs/SECURITY.md) is the security stance.
 
 ## Releasing
 

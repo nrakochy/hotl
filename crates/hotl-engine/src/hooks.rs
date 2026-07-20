@@ -1,4 +1,4 @@
-//! Extension hooks (M5; 0007 §4). The engine consults a `Hooks` impl at two
+//! Extension hooks (M5). The engine consults a `Hooks` impl at two
 //! points in the tool phase — before a call runs and after it returns —
 //! scoped to the events actually used, not a 35-event schema (Delivery #5).
 //!
@@ -11,7 +11,7 @@
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 
-/// Default cap on the bytes of a tool result a hook is shown (0006 M5 pin #1).
+/// Default cap on the bytes of a tool result a hook is shown.
 pub const HOOK_PAYLOAD_CAP: usize = 2048;
 
 /// A `PreToolUse` decision (wrap-style intercept). A `Rewrite` re-enters the
@@ -44,7 +44,7 @@ pub fn cap_payload(s: &str) -> &str {
     &s[..end]
 }
 
-/// Lane 1 — in-process Rust hooks (0007 §4): the compiled-in registry that the
+/// Lane 1 — in-process Rust hooks: the compiled-in registry that the
 /// shell adapter (lane 2) and any future third-party lane register against.
 #[derive(Default)]
 pub struct InProcessHooks {

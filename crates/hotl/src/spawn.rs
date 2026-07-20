@@ -1,4 +1,4 @@
-//! The spawn interface (M4; 0005 §3): topology as data. A `spawn` tool hands
+//! The spawn interface (M4): topology as data. A `spawn` tool hands
 //! a self-contained subtask to a fresh sub-agent — its own engine, its own
 //! session log, its own isolated context — and returns only the final result.
 //!

@@ -217,7 +217,7 @@ impl<'d> Turn<'d> {
     }
 
     /// Track per-tool consecutive failures; attach `<retry attempts_left>`
-    /// feedback (Forge, corpus 11) and flag the budget when it hits zero.
+    /// feedback and flag the budget when it hits zero.
     fn apply_failure_budget(
         &mut self,
         tu: &ToolUse,
@@ -544,7 +544,7 @@ fn unknown_tool(defs: &[ToolDef], name: &str) -> ToolOutcome {
 }
 
 /// Repeating suffix patterns over tool-call signatures: any period p ≤ 3
-/// whose block repeats 3× at the tail (Forge's detector, corpus 11).
+/// whose block repeats 3× at the tail (a repetition detector).
 fn detect_doom_loop(sigs: &[String]) -> Option<String> {
     const REPEATS: usize = 3;
     for period in 1..=3usize {

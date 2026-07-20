@@ -5,11 +5,11 @@
 //! no key needed). The base URL is configurable; auth is optional for
 //! non-default bases.
 //!
-//! Cross-provider translation (system-design §L2 `transform_messages`) lives
+//! Cross-provider translation (`transform_messages`) lives
 //! in this crate's converters, where the corpus says it belongs:
 //! - canonical assistant blocks are Anthropic-shaped; text and tool_use map
 //!   to `content` / `tool_calls`, and **foreign thinking blocks are dropped**
-//!   (signed reasoning never crosses providers — corpus 06/08 Q4);
+//!   (signed reasoning never crosses providers);
 //! - tool results become one `role:"tool"` message per result;
 //! - responses map back to canonical blocks (tool_calls → `tool_use` blocks),
 //!   so a session can cross dialects mid-conversation in either direction.

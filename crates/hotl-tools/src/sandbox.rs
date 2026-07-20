@@ -1,4 +1,4 @@
-//! The kernel sandbox floor for `bash` (SECURITY.md layer 3; 0001 §M1).
+//! The kernel sandbox floor for `bash` (SECURITY.md layer 3).
 //!
 //! Write-confinement: the command (and its whole process tree) can read
 //! everywhere but write only under the working directory, the temp dir, and
@@ -10,7 +10,7 @@
 //! - Linux: Landlock (kernel ≥ 5.13), applied in `pre_exec` after fork.
 //! - Anywhere else, or kernels without Landlock: **fail-closed degradation**
 //!   to the M0 posture — the command still runs only behind the y/n gate, and
-//!   the ask is loudly marked UNSANDBOXED (distribution.md §D3).
+//!   the ask is loudly marked UNSANDBOXED.
 //!
 //! `HOTL_SANDBOX=off` is the documented escape hatch (marked in the ask).
 

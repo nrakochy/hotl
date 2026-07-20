@@ -1,4 +1,4 @@
-//! Edit-match cascade (M3a; corpus 05 — OpenCode/Crush replacer ladder).
+//! Edit-match cascade (M3a — an OpenCode/Crush-style replacer ladder).
 //!
 //! Models reproduce *content* faithfully and *whitespace* unreliably (tabs
 //! vs spaces, trailing spaces, re-indented blocks). The cascade tries exact

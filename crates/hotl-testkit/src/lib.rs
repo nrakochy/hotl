@@ -1,4 +1,4 @@
-//! Golden-transcript testkit (system-design §Verification; Forge's orch_spec).
+//! Golden-transcript testkit.
 //!
 //! Scripted completions drive the *real* actor/turn/persistence stack; tests
 //! assert on the normalized persisted transcript — the log is the canon, so
@@ -193,7 +193,7 @@ impl Harness {
     }
 
     /// (tool name, input) for every persisted assistant tool_use, in log order
-    /// — the *trajectory* a scenario produced (ledger 15, 0006 T3).
+    /// — the *trajectory* a scenario produced.
     pub fn tool_calls(&self) -> Vec<(String, serde_json::Value)> {
         self.items()
             .iter()
@@ -753,7 +753,7 @@ mod tests {
     #[tokio::test]
     async fn deny_with_message_reaches_the_model() {
         // A denial that carries a reason surfaces as the tool-result feedback
-        // (a steer fused with a "no" — ledger 15 / 0006 T1).
+        // (a steer fused with a "no").
         let mut h = Harness::new(
             vec![
                 ScriptedProvider::tool_call("t1", "write", json!({"path": "a.md", "content": "x"})),

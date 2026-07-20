@@ -34,7 +34,7 @@ impl AnthropicProvider {
     fn build_body(req: &SamplingRequest) -> Value {
         let mut messages = build_messages(&req.items, req.cache_static);
         // MOIM rides after the cache marker: it changes every sample without
-        // invalidating the cached prefix (suffix position — corpus 04).
+        // invalidating the cached prefix (suffix position).
         if let Some(tc) = &req.turn_context {
             messages.push(json!({"role": "user", "content": [{"type": "text", "text": tc}]}));
         }

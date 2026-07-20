@@ -1,4 +1,4 @@
-//! The execute surface (0001 §M0/M1): a steering REPL and `-p` headless.
+//! The execute surface: a steering REPL and `-p` headless.
 //!
 //! The surface is a client of the session actor: it renders events, answers
 //! asks, and turns typed lines into prompts (idle) or steers (mid-turn).
@@ -317,7 +317,7 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
 
 /// Builtins + the `mcp` meta-tool (M3a) + the `spawn` tool (M4) when a child
 /// builder is supplied. `spawn` is omitted for child sessions, so sub-agents
-/// cannot recurse (structural depth cap — 0005 §3).
+/// cannot recurse (structural depth cap).
 fn build_registry(
     config_dir: &std::path::Path,
     spawn_builder: Option<Arc<dyn crate::spawn::ChildBuilder>>,

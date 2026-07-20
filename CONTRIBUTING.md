@@ -2,11 +2,11 @@
 
 Thanks for looking. hotl is a **personal-first, owner-operator** tool published for other owner-operators — not a platform chasing feature breadth. That shapes what belongs here.
 
-## Scope is ledger-governed
+## Scope
 
-Every feature is an explicit decision recorded in [docs/design-docs/feature-ledger.md](docs/design-docs/feature-ledger.md) (adopted/rejected, per source) and scheduled in [docs/exec-plans/active/0001-harness-build.md](docs/exec-plans/active/0001-harness-build.md) (the milestone-scope authority). **If a change isn't on the ledger as adopted, it isn't in the plan** — open an issue proposing the ledger row *before* a PR, so scope is agreed before code. This isn't bureaucracy; it's how a small tool stays small. A PR that adds an un-adopted feature will be asked to start with the ledger discussion.
+hotl is deliberately small, and every feature is an explicit decision. **Before a PR that adds a feature, open an issue proposing it** so scope is agreed before code. This isn't bureaucracy; it's how a small tool stays small. A PR that adds an un-agreed feature will be asked to start with that discussion.
 
-Things deliberately **not** in scope (see the ledger's "rejected" columns and [docs/design-docs/blueprint.md](docs/design-docs/blueprint.md) §skip list): telemetry, a plugin marketplace, hosted/enterprise config, RAG memory, a leader daemon. Please don't PR these.
+Things deliberately **not** in scope: telemetry, a plugin marketplace, hosted/enterprise config, RAG memory, a leader daemon. Please don't PR these.
 
 ## The bar for code
 
@@ -23,7 +23,7 @@ Local conventions on top of that:
 - **Errors are prompts.** Every error string a model can see must instruct it what to do next (a tested invariant).
 - **No string-sniffing for provenance.** Injected items carry a `SyntheticReason`; never parse text to learn where something came from.
 - **Forward-compat serde on anything persisted** (`#[serde(other)] Unknown`, default + skip-when-none).
-- **Rust practices** follow [docs/references/rust-specs/](docs/references/rust-specs/README.md).
+- **Rust practices** — idiomatic and warning-clean; no `unsafe` without a written justification.
 - **Tests are golden and deterministic.** The engine is tested by driving the real actor/turn/persistence stack with a scripted provider (`hotl-testkit`) and asserting on the normalized log. Add a scenario there for behavior changes.
 
 ## Security-relevant changes
@@ -36,4 +36,4 @@ Do **not** open a public issue for a security bug. Use GitHub private security a
 
 ## Commits and PRs
 
-Scoped, revertible commits with a clear subject (`feat(engine): …`, `fix(tools): …`, `docs: …`). Reference the ledger row or exec-plan item the change implements. Keep the decision log in the relevant plan updated when you make a design call — decisions count only once written down.
+Scoped, revertible commits with a clear subject (`feat(engine): …`, `fix(tools): …`, `docs: …`). When you make a design call, write the rationale into the PR — decisions count only once written down.

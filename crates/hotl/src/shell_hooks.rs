@@ -1,10 +1,10 @@
-//! Lane 2 — the Claude-compatible shell-hook adapter (M5; 0007 §5).
+//! Lane 2 — the Claude-compatible shell-hook adapter (M5).
 //!
 //! Owner-configured commands in config.toml's `[[hook]]` run at the same two events lane 1
 //! exposes. A hook command receives the event as JSON on stdin and returns a
 //! decision as JSON on stdout, runs **under the sandbox floor** (it is a
-//! command, not trusted-by-position), sees byte-capped payloads (0006 M5 pin
-//! #1), and is **evicted after 3 failures in a session** (RELIABILITY.md
+//! command, not trusted-by-position), sees byte-capped payloads,
+//! and is **evicted after 3 failures in a session** (RELIABILITY.md
 //! repeat-offender rule). A malformed or failed decision is a no-op — a shell
 //! hook can *block* but can never *grant* (fail-open on decision, never on
 //! permission).

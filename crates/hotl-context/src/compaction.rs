@@ -1,4 +1,4 @@
-//! Compaction planning + assembly (M2; system-design §L6, Sec #10).
+//! Compaction planning + assembly (M2).
 //!
 //! Pure functions: the engine owns the trigger and the summarize call; this
 //! module decides *what* folds and assembles the new projection. The shape is
@@ -136,7 +136,7 @@ pub fn digest_item(summary: &str) -> Item {
     }
 }
 
-/// The degradation floor (Sec #10): every summarize attempt failed, so the
+/// The degradation floor: every summarize attempt failed, so the
 /// session continues with an honest placeholder instead of bricking.
 pub fn floor_digest() -> Item {
     Item::User {

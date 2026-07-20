@@ -1,4 +1,4 @@
-//! L1 — canonical conversation types (system-design §L1).
+//! L1 — canonical conversation types.
 //!
 //! Pure data + serde. No tokio, no I/O. Forward-compat serde is policy:
 //! `#[serde(other)] Unknown` on persisted enums, `format_version` in the
@@ -186,8 +186,8 @@ pub enum EntryPayload {
     /// Digest of an abandoned branch, appended after a `branch_move` so the
     /// lesson survives without the tokens (commit-protocol `supersede`).
     Supersede { digest: Vec<Item> },
-    /// A permission ask committed **before** it surfaces (§2b durable asks,
-    /// ledger 15): if the process dies before a matching `ask_resolved`, replay
+    /// A permission ask committed **before** it surfaces (durable asks):
+    /// if the process dies before a matching `ask_resolved`, replay
     /// sees a dangling ask and resume re-surfaces it. Log-only (not a
     /// projection item).
     PendingAsk {

@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Paths excluded from every snapshot, via `info/exclude`. Two purposes:
-/// heavy build dirs that make snapshots slow and undo useless, and — added
-/// for security-evaluation H-13 — secret-bearing files that must not be
+/// heavy build dirs that make snapshots slow and undo useless, and
+/// secret-bearing files that must not be
 /// duplicated into a second, history-retaining location. The shadow repo
 /// mirrors the user's own files, but git history means a transient secret
 /// persists in shadow objects after the workspace file is deleted or rotated,

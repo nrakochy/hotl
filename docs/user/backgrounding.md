@@ -38,5 +38,5 @@ A backgrounded session parks asks indefinitely, so you can `hotl bg` a task, wal
 ## Limits
 
 - **One attacher at a time.** A second `hotl attach` waits until the first detaches.
-- **Not restart-durable.** A backgrounded session lives in a running process — it does **not** survive a machine reboot or the process being killed. Its full history is in the session log, so `hotl resume <id>` reconstructs the conversation into a fresh session, but a mid-turn ask that was parked in memory is lost across a reboot. (Log-backed asks that survive a restart are planned — see the 0006 durable-asks work.)
+- **Not restart-durable.** A backgrounded session lives in a running process — it does **not** survive a machine reboot or the process being killed. Its full history is in the session log, so `hotl resume <id>` reconstructs the conversation into a fresh session, but a mid-turn ask that was parked in memory is lost across a reboot. (Log-backed asks that survive a restart are planned.)
 - **Fire-and-forget without attaching** is also possible for pre-authorized tasks: `hotl -p "…" &` with allow-rules covering what it needs (headless denies anything not pre-approved).

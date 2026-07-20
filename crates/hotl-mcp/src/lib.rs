@@ -1,4 +1,4 @@
-//! M3a — MCP client (system-design §L4; sub-plan 0003; SECURITY.md §M3a).
+//! M3a — MCP client (SECURITY.md §M3a).
 //!
 //! Shape: one `mcp` meta-tool covers every configured server (deferred
 //! loading — the tool block stays small and cache-stable; schemas enter

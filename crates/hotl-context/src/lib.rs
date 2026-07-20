@@ -1,9 +1,9 @@
-//! L6 — context assembly, M0 slice (system-design §L6).
+//! L6 — context assembly, M0 slice.
 //!
 //! Byte-stable prefix: a small owner system prompt (a file, Pi-style) and
 //! ALL dynamics as `SyntheticReason`-tagged user messages. Repo instruction
 //! files load inside the untrusted-content envelope from the milestone that
-//! first loads them — this one (Sec #1, r2 R4).
+//! first loads them — this one.
 
 pub mod compaction;
 pub mod tokens;
@@ -11,7 +11,7 @@ pub mod tokens;
 use hotl_types::{Item, SyntheticReason};
 use std::path::{Path, PathBuf};
 
-/// Small on purpose: the harness stays out of the model's way (Pi, corpus 08).
+/// Small on purpose: the harness stays out of the model's way.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are hotl, a coding agent running in the user's terminal.
 
@@ -78,7 +78,7 @@ fn clip_bytes(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// Dynamic subdir hints (M2; Goose, corpus 11): the first time a tool touches
+/// Dynamic subdir hints (M2): the first time a tool touches
 /// a file under a directory carrying its own AGENTS.md/CLAUDE.md, that file
 /// is injected just-in-time. Returns `(source_marker, item)` — the caller
 /// dedupes by checking the projection for the marker.
@@ -107,7 +107,7 @@ pub fn nested_instructions(cwd: &Path, touched: &Path) -> Option<(String, Item)>
     None
 }
 
-/// The MOIM ephemeral turn-context block (M2; corpus 04): attached to the
+/// The MOIM ephemeral turn-context block (M2): attached to the
 /// request only — never persisted, never cached (it rides after the cache
 /// marker by construction).
 /// `context_used_pct` is optional (tech-debt #9): broadcasting how full the
@@ -139,7 +139,7 @@ fn envelope(source: &str, content: &str) -> String {
 /// Neutralize any closing-delimiter sequence the wrapped content might carry,
 /// so untrusted text can't forge its way *out* of the envelope with a literal
 /// `</project-instructions>` (or any `</…>`) followed by text that appears to
-/// be trusted (security-evaluation H-06). The human gate is the real backstop;
+/// be trusted. The human gate is the real backstop;
 /// this removes the cheap escape. Deterministic (no nonce) so transcripts stay
 /// golden-comparable: any `</` becomes `<\u{200b}/` (a zero-width space breaks
 /// the tag for a parser while staying visually identical and harmless as text).

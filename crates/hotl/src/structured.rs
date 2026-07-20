@@ -1,5 +1,5 @@
 //! `hotl -p "…" --json-schema <file>` — structured output with validation and
-//! bounded retry (ledger 15, 0006 T2). The schema rides into context as a
+//! bounded retry. The schema rides into context as a
 //! tagged instruction item; the final answer is validated against it; a
 //! validation error feeds back as `RetryFeedback` for up to 2 retries
 //! (LangChain `ToolStrategy.handle_errors` shape). Valid JSON → stdout;

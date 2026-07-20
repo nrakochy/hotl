@@ -1,5 +1,5 @@
-//! Post-mutation diagnostics (M3a; corpus 05's format+diagnostics injection,
-//! config-driven — no LSP until the ledger row justifies one).
+//! Post-mutation diagnostics (M3a; format+diagnostics injection,
+//! config-driven — no LSP for now).
 //!
 //! The `[diagnostics]` table of `~/.config/hotl/config.toml` maps file
 //! extensions to a check command:

@@ -1,9 +1,9 @@
-//! L4 — the tool system (system-design §L4), M0 slice.
+//! L4 — the tool system.
 //!
 //! Four built-ins (read / edit / write / bash), a permission-gate seam, and
-//! the protected execute-later path class (SECURITY.md, r2 R3). Every failure
-//! message is a prompt: it tells the model what to do next (core belief,
-//! corpus 14). Erasure happens once: tools are `dyn Tool` in the registry.
+//! the protected execute-later path class (SECURITY.md). Every failure
+//! message is a prompt: it tells the model what to do next. Erasure happens
+//! once: tools are `dyn Tool` in the registry.
 
 mod builtins;
 pub mod diagnostics;
@@ -55,8 +55,8 @@ pub trait Tool: Send + Sync {
 }
 
 /// The human on the loop. Native CLI implements a y/n prompt; headless
-/// default-denies (Sec #11). No allow-rule persistence exists until the
-/// M1 sandbox floor (r2 R3) — every ask is asked.
+/// default-denies. No allow-rule persistence exists until the
+/// M1 sandbox floor — every ask is asked.
 pub trait PermissionGate: Send + Sync {
     fn ask<'a>(&'a self, summary: &'a str, protected_why: Option<&'a str>) -> BoxFuture<'a, bool>;
 }
@@ -112,8 +112,8 @@ impl Registry {
     }
 }
 
-/// The execute-later class (0001 §M0; extended M3a per security-evaluation
-/// H-04): files whose *write* is benign-looking but whose later effect —
+/// The execute-later class: files whose *write* is benign-looking but
+/// whose later effect —
 /// execution, authentication, or credential theft — happens outside any gate.
 /// Writes here get the escalated warning ask instead of an ordinary one.
 pub fn execute_later_reason(path: &str) -> Option<&'static str> {

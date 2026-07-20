@@ -1,9 +1,9 @@
-//! `hotl acp` — the ACP-shaped protocol surface (M4; 0005 §2).
+//! `hotl acp` — the ACP-shaped protocol surface (M4).
 //!
 //! A JSON-RPC 2.0 line protocol over stdio that drives the *same* engine the
 //! REPL does: an editor or orchestrator is just another client of
 //! `SessionHandle`. One session per connection (process-per-session — the
-//! orchestrator pattern, 0005 §decisions). Model output and tool status
+//! orchestrator pattern). Model output and tool status
 //! arrive as `session/update` notifications carrying a `schema_version`
 //! (Tier-1 stable, not a side-channel); permission asks are
 //! `session/request_permission` round-trips to the client.

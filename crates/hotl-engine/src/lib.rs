@@ -77,7 +77,7 @@ pub enum TurnEnd {
     Compact,
 }
 
-/// A human's answer to a permission ask (ledger 15, 0006 T1). Widened from a
+/// A human's answer to a permission ask. Widened from a
 /// bare `bool` so a denial can carry the reason to the model as tool-result
 /// feedback — a steer fused with a "no". §2b (M4) extends this with
 /// `AllowEdited`/`Respond`; callers should treat it as non-exhaustive.
@@ -116,7 +116,7 @@ pub enum EngineEvent {
     FallbackModel { model: String },
     PromptQueued,
     /// Context was compacted (digest + verbatim tail); `degraded` means the
-    /// summarize call failed and the floor placeholder was used (Sec #10).
+    /// summarize call failed and the floor placeholder was used.
     Compacted { degraded: bool },
     Ask { summary: String, protected_why: Option<String>, reply: oneshot::Sender<AskReply> },
     TurnDone { outcome: Outcome, usage: TokenUsage },

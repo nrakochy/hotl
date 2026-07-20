@@ -1,7 +1,7 @@
 //! L5 — persistence, M0 slice: one append-only JSONL file per session.
 //!
 //! The log is permanent by design (log-first spine), which is exactly why
-//! secrets are masked **at ingestion, before bytes land** (Sec #8, r2 R6):
+//! secrets are masked **at ingestion, before bytes land**:
 //! a later cleanup pass can never reach what was already written. Durable-ack
 //! commit semantics arrive with the M1 writer actor; M0 flushes per entry.
 
@@ -84,7 +84,7 @@ fn json_body(value: &str) -> String {
         .to_string()
 }
 
-/// Secrets-at-rest audit (M2; Sec #8 second half): scan existing session
+/// Secrets-at-rest audit (M2): scan existing session
 /// logs for *current* secret values — entries written before a value became
 /// a secret (or before masking existed) can't be rewritten in an append-only
 /// store, so the honest remedy is a loud warning and rotation.
@@ -147,8 +147,8 @@ impl SessionLog {
         &self.path
     }
 
-    /// Write an oversized tool result to a masked blob beside the log (T4;
-    /// ledger 15). Path: `<log stem>.blobs/<tool_use_id>.txt`, 0600, created on
+    /// Write an oversized tool result to a masked blob beside the log.
+    /// Path: `<log stem>.blobs/<tool_use_id>.txt`, 0600, created on
     /// first use. The store owns masking, so a secret in the result never lands
     /// unmasked even in the blob. Returns the blob path.
     pub fn write_blob(&self, tool_use_id: &str, content: &str) -> std::io::Result<PathBuf> {

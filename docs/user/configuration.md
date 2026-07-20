@@ -150,4 +150,4 @@ Bounds the growth of the session/shadow/blob stores. `hotl gc` prunes on demand;
 
 **Engine defaults (not user-configurable via env yet):** max 25 turns per prompt, 32000 max output tokens, adaptive thinking on, static prompt caching on, a tool that fails 5 times consecutively stops the turn.
 
-**Not covered here:** the full MCP setup guide, the hooks cookbook, and uninstall — tracked as open items for the distribution milestone (`docs/design-docs/distribution.md §D7`).
+**See also:** [mcp.md](mcp.md) for connecting MCP tool servers, [hooks.md](hooks.md) for diagnostics and hooks, and [uninstall.md](uninstall.md) for removal.

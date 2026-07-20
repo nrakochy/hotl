@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-/// The shipped default allow-rules (design-docs/default-policy.md). Read-only
+/// The shipped default allow-rules. Read-only
 /// conveniences only; everything that runs code or writes files is commented
 /// out for the owner to enable deliberately.
 pub const DEFAULT_CONFIG: &str = "\

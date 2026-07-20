@@ -1,4 +1,4 @@
-//! Allow-rule persistence (0001 §M1; unlocked by the sandbox floor — r2 R3).
+//! Allow-rule persistence (unlocked by the sandbox floor).
 //!
 //! Deliberately config-only: rules live in the `[[allow]]` section of
 //! `~/.config/hotl/config.toml` and are written by the human with an editor,
