@@ -15,7 +15,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 futures-util = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 libc = { workspace = true }
 
