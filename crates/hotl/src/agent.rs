@@ -35,16 +35,15 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     }
 
     let secrets = EnvSecrets;
-    let Some(api_key) = secrets.get("ANTHROPIC_API_KEY") else {
-        eprintln!(
-            "hotl: ANTHROPIC_API_KEY is not set.\n\
-             Export it (or use `hotl watch` for the dashboard, which needs no key)."
-        );
-        return 1;
-    };
-
-    let model = secrets.get("HOTL_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let provider = AnthropicProvider::new(api_key);
+    let (provider, model): (Box<dyn hotl_provider::Provider>, String) =
+        match select_provider(&secrets) {
+            Ok(pair) => pair,
+            Err(msg) => {
+                eprintln!("hotl: {msg}");
+                return 1;
+            }
+        };
+    let provider = &*provider;
     let registry = Registry::builtin();
     let clock = SystemClock;
     let config_dir = config_dir();
@@ -66,7 +65,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
 
     let gate = CliGate { headless };
     let engine = Engine {
-        provider: &provider,
+        provider,
         registry: &registry,
         gate: &gate,
         clock: &clock,
@@ -180,6 +179,49 @@ async fn run_one(
             eprintln!("\nhotl: {e}");
             1
         }
+    }
+}
+
+/// Provider/model selection (distribution.md §D5 resolution order applies to
+/// keys). `HOTL_MODEL` accepts `provider/model`:
+///   anthropic/claude-…   needs ANTHROPIC_API_KEY
+///   openai/gpt-…         needs OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for
+///                        keyless OpenAI-compatible endpoints (Ollama etc.)
+/// A bare model string means Anthropic; unset means the Anthropic default.
+fn select_provider(secrets: &dyn SecretStore) -> Result<(Box<dyn hotl_provider::Provider>, String), String> {
+    let raw = secrets.get("HOTL_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let (provider_name, model) = match raw.split_once('/') {
+        Some((p, m)) => (p.to_ascii_lowercase(), m.to_string()),
+        None => ("anthropic".to_string(), raw),
+    };
+    match provider_name.as_str() {
+        "anthropic" => {
+            let key = secrets.get("ANTHROPIC_API_KEY").ok_or_else(|| {
+                "ANTHROPIC_API_KEY is not set.\n\
+                 Export it, or select another provider, e.g. HOTL_MODEL=openai/<model> \
+                 (with OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for a local endpoint). \
+                 `hotl watch` needs no key."
+                    .to_string()
+            })?;
+            Ok((Box::new(AnthropicProvider::new(key)), model))
+        }
+        "openai" | "oai" => {
+            let base = secrets
+                .get("HOTL_OPENAI_BASE_URL")
+                .unwrap_or_else(|| hotl_provider_openai::DEFAULT_BASE_URL.to_string());
+            let key = secrets.get("OPENAI_API_KEY");
+            if key.is_none() && base == hotl_provider_openai::DEFAULT_BASE_URL {
+                return Err("OPENAI_API_KEY is not set (required for api.openai.com; \
+                            keyless works only with HOTL_OPENAI_BASE_URL pointing at a \
+                            local/compatible endpoint, e.g. http://localhost:11434/v1 for Ollama)."
+                    .to_string());
+            }
+            Ok((Box::new(hotl_provider_openai::OpenAiCompatProvider::new(base, key)), model))
+        }
+        other => Err(format!(
+            "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, openai/<model> \
+             (openai covers any OpenAI-compatible endpoint via HOTL_OPENAI_BASE_URL)."
+        )),
     }
 }
 

@@ -1,0 +1,19 @@
+[package]
+name = "hotl-provider-openai"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. OpenAI-compatible chat-completions provider (OpenAI, Groq, Ollama, any compatible endpoint)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hotl-types = { path = "../hotl-types", version = "0.1.2" }
+hotl-provider = { path = "../hotl-provider", version = "0.1.2" }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }
+tokio = { workspace = true }
