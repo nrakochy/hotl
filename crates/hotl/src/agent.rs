@@ -53,6 +53,9 @@ pub async fn resume_main(args: Vec<String>) -> i32 {
     };
     match hotl_store::replay_chain(&dir, id) {
         Ok(replayed) => {
+            for warning in &replayed.warnings {
+                eprintln!("hotl: WARNING — {warning}");
+            }
             let resumed = Resumed { parent_id: replayed.header.session_id, items: replayed.items };
             run_session(None, false, Some(resumed)).await
         }

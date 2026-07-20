@@ -11,8 +11,40 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Dirs that make snapshots slow and undo useless; excluded via info/exclude.
-const EXCLUDES: &str = ".git/\ntarget/\nnode_modules/\n.venv/\ndist/\nbuild/\n.DS_Store\n";
+/// Paths excluded from every snapshot, via `info/exclude`. Two purposes:
+/// heavy build dirs that make snapshots slow and undo useless, and — added
+/// for security-evaluation H-13 — secret-bearing files that must not be
+/// duplicated into a second, history-retaining location. The shadow repo
+/// mirrors the user's own files, but git history means a transient secret
+/// persists in shadow objects after the workspace file is deleted or rotated,
+/// so credentials are kept out of it entirely.
+const EXCLUDES: &str = "\
+.git/
+target/
+node_modules/
+.venv/
+dist/
+build/
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
+id_rsa
+id_dsa
+id_ecdsa
+id_ed25519
+*.p12
+*.pfx
+.ssh/
+.aws/
+.npmrc
+.pypirc
+.netrc
+secrets.*
+*.secret
+credentials
+";
 
 pub struct Shadow {
     git_dir: PathBuf,
@@ -152,6 +184,32 @@ pub fn latest_session(shadow_root: &Path) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_files_are_excluded_from_snapshots() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("main.rs"), "fn main() {}").unwrap();
+        std::fs::write(work.path().join(".env"), "SECRET=leaked-value-9").unwrap();
+        std::fs::create_dir_all(work.path().join(".ssh")).unwrap();
+        std::fs::write(work.path().join(".ssh/id_rsa"), "PRIVATE KEY").unwrap();
+
+        let shadow = Shadow::create(root.path(), "SEC", work.path()).expect("create");
+        shadow.snapshot("pre batch 1").expect("snapshot");
+
+        let listing = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", root.path().join("SEC.git").display()))
+            .args(["ls-files"])
+            .output()
+            .unwrap();
+        let tracked = String::from_utf8_lossy(&listing.stdout);
+        assert!(tracked.contains("main.rs"), "workspace source should snapshot");
+        assert!(!tracked.contains(".env"), ".env must be excluded (H-13)");
+        assert!(!tracked.contains("id_rsa"), "private keys must be excluded (H-13)");
+    }
 
     #[test]
     fn snapshot_and_undo_roundtrip() {
