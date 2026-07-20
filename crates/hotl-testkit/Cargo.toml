@@ -1,0 +1,21 @@
+[package]
+name = "hotl-testkit"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. Golden-transcript test harness: scripted provider + real engine + normalized persisted transcripts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hotl-types = { path = "../hotl-types", version = "0.1.2" }
+hotl-platform = { path = "../hotl-platform", version = "0.1.2" }
+hotl-provider = { path = "../hotl-provider", version = "0.1.2" }
+hotl-tools = { path = "../hotl-tools", version = "0.1.2" }
+hotl-store = { path = "../hotl-store", version = "0.1.2" }
+hotl-engine = { path = "../hotl-engine", version = "0.1.2" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tempfile = { workspace = true }

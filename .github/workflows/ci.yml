@@ -47,6 +47,6 @@ jobs:
         with:
           key: harness
       - name: Clippy (harness crates + binary)
-        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl --all-targets -- -D warnings
+        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl --locked
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-engine -p hotl-testkit -p hotl --locked

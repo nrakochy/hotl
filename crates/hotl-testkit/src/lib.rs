@@ -1,0 +1,371 @@
+//! Golden-transcript testkit (system-design §Verification; Forge's orch_spec).
+//!
+//! Scripted completions drive the *real* actor/turn/persistence stack; tests
+//! assert on the normalized persisted transcript — the log is the canon, so
+//! the log is what gets golden-checked. Determinism comes from the commit
+//! protocol: the log fixes exactly one order for every interleaving the
+//! harness can produce.
+
+use std::sync::Arc;
+
+use hotl_engine::{spawn_session, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
+use hotl_platform::SystemClock;
+use hotl_provider::{ProviderError, ScriptedProvider, StreamEvent};
+use hotl_store::{Masker, SessionLog};
+use hotl_tools::{rules::Rules, Registry};
+use hotl_types::{Entry, Item};
+
+pub use hotl_provider::ScriptedProvider as Scripted;
+
+pub struct Harness {
+    pub handle: SessionHandle,
+    pub provider: Arc<ScriptedProvider>,
+    /// Debug strings of every event seen, in order.
+    pub seen: Vec<String>,
+    log_path: std::path::PathBuf,
+    _dir: tempfile::TempDir,
+    /// Answer for every Ask event.
+    pub ask_answer: bool,
+    /// One-shot steer to send when the next ToolStart is observed.
+    pub steer_on_tool_start: Option<String>,
+}
+
+impl Harness {
+    pub fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>, config: EngineConfig) -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
+            .expect("session log");
+        let log_path = log.path().to_path_buf();
+        let provider = Arc::new(ScriptedProvider::new(scripts));
+        let deps = SessionDeps {
+            provider: provider.clone(),
+            registry: Arc::new(Registry::builtin()),
+            rules: Arc::new(Rules::default()),
+            sandbox_enforced: false,
+            clock: Arc::new(SystemClock),
+            log,
+            system: "test-system".into(),
+            initial_items: Vec::new(),
+            config,
+        };
+        let handle = spawn_session(deps);
+        Self {
+            handle,
+            provider,
+            seen: Vec::new(),
+            log_path,
+            _dir: dir,
+            ask_answer: true,
+            steer_on_tool_start: None,
+        }
+    }
+
+    /// Send a prompt and drain events until the turn finishes.
+    pub async fn prompt_and_wait(&mut self, text: &str) -> Outcome {
+        self.handle.prompt(text.to_string()).await;
+        self.wait_for_outcome().await
+    }
+
+    pub async fn wait_for_outcome(&mut self) -> Outcome {
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(10), self.handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            self.seen.push(format!("{event:?}"));
+            match event {
+                EngineEvent::Ask { reply, .. } => {
+                    let _ = reply.send(self.ask_answer);
+                }
+                EngineEvent::ToolStart { .. } => {
+                    if let Some(steer) = self.steer_on_tool_start.take() {
+                        self.handle.steer(steer).await;
+                    }
+                }
+                EngineEvent::TurnDone { outcome, .. } => return outcome,
+                _ => {}
+            }
+        }
+    }
+
+    /// The persisted entry kinds, in order — the coarse golden signature.
+    pub fn kinds(&self) -> Vec<String> {
+        self.entries()
+            .iter()
+            .map(|e| {
+                serde_json::to_value(&e.payload)
+                    .ok()
+                    .and_then(|v| v.get("kind").and_then(|k| k.as_str().map(String::from)))
+                    .unwrap_or_else(|| "?".into())
+            })
+            .collect()
+    }
+
+    /// The full normalized transcript: ids/parents/timestamps zeroed so runs
+    /// are byte-comparable.
+    pub fn transcript(&self) -> String {
+        self.entries()
+            .iter()
+            .map(|e| {
+                let mut v = serde_json::to_value(e).expect("entry to value");
+                v["id"] = "ID".into();
+                v["parent_id"] = if e.parent_id.is_some() { "PARENT".into() } else { serde_json::Value::Null };
+                v["ts_ms"] = 0.into();
+                if let Some(h) = v.pointer_mut("/payload/header") {
+                    h["session_id"] = "SESSION".into();
+                    h["created_at_ms"] = 0.into();
+                }
+                v.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn entries(&self) -> Vec<Entry> {
+        std::fs::read_to_string(&self.log_path)
+            .expect("read log")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("parse entry"))
+            .collect()
+    }
+
+    /// Conversation items as persisted, in order.
+    pub fn items(&self) -> Vec<Item> {
+        self.entries()
+            .into_iter()
+            .filter_map(|e| match e.payload {
+                hotl_types::EntryPayload::Item { item } => Some(item),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hotl_types::{StopReason, SyntheticReason, TokenUsage};
+    use serde_json::json;
+
+    fn cfg() -> EngineConfig {
+        EngineConfig { max_turns: 6, ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn golden_tool_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, "hello from disk\n").unwrap();
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "read", json!({"path": file.to_str().unwrap()})),
+                ScriptedProvider::text_reply("The file says hello."),
+            ],
+            cfg(),
+        );
+        let outcome = h.prompt_and_wait("what does hello.txt say?").await;
+        assert_eq!(outcome, Outcome::Done { text: "The file says hello.".into() });
+        assert_eq!(
+            h.kinds(),
+            ["header", "item", "item", "usage", "item", "item", "usage"]
+        );
+        // Golden: the normalized transcript is stable across runs.
+        let t1 = h.transcript();
+        assert!(t1.contains("hello from disk"));
+        assert!(t1.contains("tool_use"));
+    }
+
+    #[tokio::test]
+    async fn denied_ask_feeds_error_back() {
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "bash", json!({"command": "rm -rf /"})),
+                ScriptedProvider::text_reply("Understood."),
+            ],
+            cfg(),
+        );
+        h.ask_answer = false;
+        let outcome = h.prompt_and_wait("clean up").await;
+        assert!(matches!(outcome, Outcome::Done { .. }));
+        let items = h.items();
+        let Item::ToolResults { results } = &items[2] else { panic!("expected results") };
+        assert!(results[0].is_error && results[0].content.contains("declined"));
+        assert!(h.seen.iter().any(|e| e.starts_with("Ask(")));
+    }
+
+    #[tokio::test]
+    async fn steer_mid_turn_reaches_next_sample() {
+        // Turn 1 runs a (slow-ish) bash; the harness steers when ToolStart
+        // appears; sample 2 must include the steer in its request items.
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "bash", json!({"command": "sleep 0.2; echo done"})),
+                ScriptedProvider::text_reply("Done, and noted your steer."),
+            ],
+            cfg(),
+        );
+        h.steer_on_tool_start = Some("also check the README".into());
+        let outcome = h.prompt_and_wait("run the thing").await;
+        assert!(matches!(outcome, Outcome::Done { .. }));
+
+        // The steer is durably recorded with provenance…
+        let steer_items: Vec<_> = h
+            .items()
+            .into_iter()
+            .filter(|i| matches!(i, Item::User { synthetic: Some(SyntheticReason::Steer), .. }))
+            .collect();
+        assert_eq!(steer_items.len(), 1);
+
+        // …and the SECOND sample's request actually contained it (rebase row
+        // of the conflict table: woven into the next sample, not the current).
+        let requests = h.provider.requests();
+        assert_eq!(requests.len(), 2);
+        let saw_in_first = requests[0].items.iter().any(is_steer);
+        let saw_in_second = requests[1].items.iter().any(is_steer);
+        assert!(!saw_in_first, "steer must not appear in the sample that was already running");
+        assert!(saw_in_second, "steer must be woven into the next sample");
+    }
+
+    fn is_steer(i: &Item) -> bool {
+        matches!(i, Item::User { synthetic: Some(SyntheticReason::Steer), .. })
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_promotes_after_turn() {
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "bash", json!({"command": "sleep 0.2"})),
+                ScriptedProvider::text_reply("first done"),
+                ScriptedProvider::text_reply("second done"),
+            ],
+            cfg(),
+        );
+        h.handle.prompt("first".into()).await;
+        // Queue a second prompt immediately (turn is running).
+        h.handle.prompt("second".into()).await;
+        let first = h.wait_for_outcome().await;
+        assert_eq!(first, Outcome::Done { text: "first done".into() });
+        let second = h.wait_for_outcome().await;
+        assert_eq!(second, Outcome::Done { text: "second done".into() });
+        assert!(h.seen.iter().any(|e| e == "PromptQueued"));
+    }
+
+    #[tokio::test]
+    async fn doom_loop_stops_on_deny() {
+        let scripts: Vec<_> = (0..5)
+            .map(|_| ScriptedProvider::tool_call("t", "read", json!({"path": "/same"})))
+            .collect();
+        let mut h = Harness::new(scripts, EngineConfig { max_turns: 10, ..Default::default() });
+        h.ask_answer = false;
+        let outcome = h.prompt_and_wait("go").await;
+        assert!(matches!(outcome, Outcome::DoomLoop { .. }), "got {outcome:?}");
+        assert!(h.entries().iter().any(|e| matches!(
+            &e.payload,
+            hotl_types::EntryPayload::Cancelled { reason } if reason.contains("doom")
+        )));
+    }
+
+    #[tokio::test]
+    async fn fallback_model_on_availability_error() {
+        let mut h = Harness::new(
+            vec![
+                vec![Err(ProviderError::Transport("connection reset".into()))],
+                ScriptedProvider::text_reply("served by fallback"),
+            ],
+            EngineConfig {
+                fallback_models: vec!["backup-model".into()],
+                ..cfg()
+            },
+        );
+        let outcome = h.prompt_and_wait("hi").await;
+        assert_eq!(outcome, Outcome::Done { text: "served by fallback".into() });
+        assert!(h.seen.iter().any(|e| e.contains("FallbackModel(backup-model)")));
+        let reqs = h.provider.requests();
+        assert_eq!(reqs[1].model, "backup-model");
+    }
+
+    #[tokio::test]
+    async fn auth_error_does_not_fall_back() {
+        let mut h = Harness::new(
+            vec![vec![Err(ProviderError::Auth("bad key".into()))]],
+            EngineConfig { fallback_models: vec!["backup".into()], ..cfg() },
+        );
+        let outcome = h.prompt_and_wait("hi").await;
+        assert!(matches!(outcome, Outcome::Error { .. }));
+        assert!(!h.seen.iter().any(|e| e.contains("FallbackModel")));
+    }
+
+    #[tokio::test]
+    async fn tool_failure_budget_stops_turn() {
+        // Distinct paths so the doom detector (identical sigs) stays quiet.
+        let scripts: Vec<_> = (0..6)
+            .map(|i| ScriptedProvider::tool_call(&format!("t{i}"), "read", json!({"path": format!("/nope{i}")})))
+            .collect();
+        let mut h = Harness::new(
+            scripts,
+            EngineConfig { max_turns: 10, tool_failure_budget: 3, ..Default::default() },
+        );
+        let outcome = h.prompt_and_wait("read them all").await;
+        assert_eq!(outcome, Outcome::ToolFailureBudget { tool: "read".into() });
+        // Feedback element present in the failing results.
+        let items = h.items();
+        let with_feedback = items.iter().any(|i| matches!(
+            i, Item::ToolResults { results } if results.iter().any(|r| r.content.contains("<retry attempts_left="))
+        ));
+        assert!(with_feedback);
+    }
+
+    #[tokio::test]
+    async fn max_turns_caps_runaway() {
+        let scripts: Vec<_> = (0..10)
+            .map(|i| {
+                // Alternate two calls so neither doom (period ≤3 needs 3 repeats
+                // of a block) nor the failure budget trips first… actually use
+                // successful bash echoes: no failures, distinct args.
+                ScriptedProvider::tool_call(&format!("t{i}"), "bash", json!({"command": format!("echo {i}")}))
+            })
+            .collect();
+        let mut h = Harness::new(scripts, EngineConfig { max_turns: 3, ..Default::default() });
+        let outcome = h.prompt_and_wait("loop").await;
+        assert_eq!(outcome, Outcome::TurnLimit);
+    }
+
+    #[tokio::test]
+    async fn interrupt_cancels_running_turn() {
+        let mut h = Harness::new(
+            vec![ScriptedProvider::tool_call("t1", "bash", json!({"command": "sleep 30"}))],
+            cfg(),
+        );
+        h.handle.prompt("run forever".into()).await;
+        // Wait until the tool starts, then interrupt out-of-band.
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), h.handle.events.recv())
+                .await
+                .expect("timeout")
+                .expect("closed");
+            h.seen.push(format!("{ev:?}"));
+            match ev {
+                EngineEvent::Ask { reply, .. } => { let _ = reply.send(true); }
+                EngineEvent::ToolStart { .. } => break,
+                _ => {}
+            }
+        }
+        h.handle.interrupt();
+        let outcome = h.wait_for_outcome().await;
+        assert_eq!(outcome, Outcome::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn transcript_normalization_is_deterministic() {
+        let make = || async {
+            let mut h = Harness::new(vec![ScriptedProvider::text_reply("stable")], cfg());
+            h.prompt_and_wait("say something stable").await;
+            h.transcript()
+        };
+        let (a, b) = (make().await, make().await);
+        assert_eq!(a, b, "normalized transcripts must be byte-identical across runs");
+    }
+
+    #[allow(dead_code)]
+    fn silence_unused(_: StopReason, _: TokenUsage) {}
+}
