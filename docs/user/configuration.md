@@ -1,6 +1,6 @@
 # Configuration reference — `hotl` the agent
 
-**Mode: reference.** Facts about the command surface, config files, and environment variables of the `hotl` agent, in the system's own structure. It states what each thing is; it does not teach a workflow (see [quickstart.md](quickstart.md)) or argue for a choice (see [permissions-and-sandbox.md](permissions-and-sandbox.md)). All paths are literal; `~` is the invoking user's home. Behavior described is as of the M0–M3 build, 2026-07-20.
+**Mode: reference.** Facts about the command surface, config files, and environment variables of the `hotl` agent, in the system's own structure. It states what each thing is; it does not teach a workflow (see [quickstart.md](quickstart.md)) or argue for a choice (see [permissions-and-sandbox.md](permissions-and-sandbox.md)). All paths are literal; `~` is the invoking user's home. Behavior described is as of the M0–M5 build, 2026-07-20.
 
 ## Subcommands
 
@@ -12,47 +12,89 @@
 | `hotl resume` | List recent sessions (id + age), newest first. |
 | `hotl resume <id-prefix>` | Start a new session seeded with an earlier session's full context (replayed from its log and ancestry). |
 | `hotl undo` | Restore workspace files to before the most recent session's last mutating step. Confirm-gated; `--force`/`-f` skips the prompt. |
+| `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](backgrounding.md). |
+| `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
+| `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/shadows/blobs per `[retention]`. See [below](#hotl-gc). |
+| `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
 | `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, memory, secrets audit, undo/git. Exit 1 if any check FAILs. |
 | `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
 | `hotl watch` | The tmux dashboard (separate capability; [crates/hotl/README.md](../../crates/hotl/README.md)). |
+| `hotl update [ver]` | Print the version + how to update (compares against `ver` if given). |
 | `hotl fleet` | Reserved (orchestrate); not built — exits 2. |
-| `hotl update` | Reserved (distribution milestone); not built — exits 2. |
 | `hotl --help` | Usage summary. |
 
-## Environment variables
+## One config file: `config.toml`
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `HOTL_MODEL` | `claude-opus-4-8` | `provider/model`. `anthropic/<model>` or `openai/<model>`. A bare value (no `/`) means anthropic. `openai` covers any OpenAI-compatible endpoint. |
-| `ANTHROPIC_API_KEY` | — | Required when the provider is `anthropic`. |
-| `OPENAI_API_KEY` | — | Required for `openai/…` against `api.openai.com`. Optional for other base URLs. |
-| `HOTL_OPENAI_BASE_URL` | `https://api.openai.com/v1` | Endpoint for the `openai` provider. Set it to a local server (e.g. `http://localhost:11434/v1` for Ollama) to run keyless. `requires network:` unless loopback. A non-loopback `http://` URL with a key set triggers a cleartext-key warning. |
-| `HOTL_CONTEXT_WINDOW` | `200000` | Model context size in tokens. The agent compacts old history at ~80% of this. Set it to your model's real window so compaction fires at the right time. |
-| `HOTL_FAST_MODEL` | (= `HOTL_MODEL`) | A cheaper model used only for compaction summaries. |
-| `HOTL_SANDBOX` | (unset) | `off` disables the bash sandbox floor. Every `bash` ask is then marked `UNSANDBOXED`. |
-| `XDG_CONFIG_HOME` | `~/.config` | Base for the config dir (`$XDG_CONFIG_HOME/hotl`). |
-| `XDG_DATA_HOME` | `~/.local/share` | Base for session logs and shadow snapshots (`$XDG_DATA_HOME/hotl`). |
+Everything hand-editable lives in **`~/.config/hotl/config.toml`** (or `$XDG_CONFIG_HOME/hotl/config.toml`). `hotl setup` writes a commented starter. It's the only settings file — there is no `permissions.toml`/`mcp.toml`/`hooks.toml`; those are sections here now. A malformed file is ignored with a warning, never half-applied.
 
-## Config files
+```toml
+[provider]
+model = "openai/gpt-5"                      # provider/model
+base_url = "http://localhost:11434/v1"      # OpenAI-compatible endpoint
+fast_model = "..."                          # cheap model for compaction summaries
 
-All optional. Location: `~/.config/hotl/` (or `$XDG_CONFIG_HOME/hotl/`). Missing files mean "feature off"; a malformed file is ignored with a warning, never half-applied.
+[context]
+window = 200000            # your model's context size in tokens
+evict_tokens = 20000       # offload tool results larger than this (0 disables)
+compaction_reset = false   # fresh-slate compaction instead of in-place
+show_used_pct = true       # show context-fullness in each turn's status
+
+[behavior]
+ask_timeout_secs = 300     # 0 = wait forever for a permission answer
+sandbox = true             # false disables the bash sandbox floor
+
+[retention]
+max_age_days = 30          # prune sessions older than this (hotl gc)
+max_sessions = 200         # keep at most this many
+
+[[allow]]                  # allow-rules (see below)
+tool = "bash"
+prefix = "cargo "
+
+[[mcp]]                    # MCP servers (see below)
+name = "docs"
+command = "/usr/local/bin/docs-mcp"
+args = ["--stdio"]
+description = "project documentation search"
+
+[[hook]]                   # tool-call hooks (see hooks.md)
+event = "pre_tool"
+command = "/usr/local/bin/guard"
+
+[diagnostics]              # post-edit checks (see hooks.md)
+rs = "cargo check -q --message-format=short"
+```
+
+**Precedence for the scalar settings: environment variable > config.toml > default.** So a `HOTL_MODEL` in the shell overrides `[provider].model`, and CI can override anything without editing the file.
+
+### Other files (not "config", so not in config.toml)
 
 | File | Purpose |
 |---|---|
-| `system-prompt.md` | Replaces the built-in instructions to the agent. Non-empty content wins; otherwise the default is used. |
-| `permissions.toml` | Allow-rules — auto-approve trusted tool calls. See [below](#allow-rules-permissionstoml). |
-| `memory/MEMORY.md` | Loaded into every session's starting context (capped at 16 KB), wrapped as untrusted content. |
-| `mcp.toml` | External MCP tool servers. See [below](#mcp-servers-mcptoml). |
-| `hooks.toml` | Post-edit check commands by file extension. See [below](#post-edit-diagnostics-hookstoml). |
-| `trust.toml` | Written by hotl, not you: records which MCP server binaries you've approved (by SHA-256). |
-| `skills/*.md` | One procedure per file; the `skill` tool lists them and loads one by name on request. |
+| `system-prompt.md` | Replaces the built-in agent instructions (prose). |
+| `memory/MEMORY.md` | Loaded into every session's starting context (capped at 16 KB), enveloped. |
+| `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. |
+| `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
 
-### Allow-rules (`permissions.toml`)
+### Environment variables
 
-Auto-approve tool calls so you aren't prompted for trusted operations. Deliberately file-only — there is no in-REPL "always allow" (that is by design; see [permissions-and-sandbox.md](permissions-and-sandbox.md#why-allow-rules-are-a-file-you-edit)).
+| Variable | Overrides | Meaning |
+|---|---|---|
+| `HOTL_MODEL` | `[provider].model` | `provider/model`; `openai/…` covers any OpenAI-compatible endpoint. |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | Provider keys (never put keys in config.toml). |
+| `HOTL_OPENAI_BASE_URL` | `[provider].base_url` | OpenAI-compatible endpoint. A non-loopback `http://` URL with a key set warns (cleartext). |
+| `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. |
+| `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
+| `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
+| `HOTL_ASK_TIMEOUT` | `[behavior].ask_timeout_secs` | `0` = wait forever (backgrounded sessions). |
+| `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
+| `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
+
+### Allow-rules (`[[allow]]`)
+
+Auto-approve tool calls so you aren't prompted for trusted operations. Deliberately config-only — there is no in-REPL "always allow" (that is by design; see [permissions-and-sandbox.md](permissions-and-sandbox.md#why-allow-rules-are-a-file-you-edit)).
 
 ```toml
-# ~/.config/hotl/permissions.toml
 [[allow]]
 tool = "bash"
 prefix = "cargo "          # auto-allow bash commands beginning with "cargo "
@@ -68,37 +110,25 @@ Rules that do **not** auto-allow, even with a matching rule (safety carve-outs):
 - A `write`/`edit` path that resolves outside the prefix after `..` normalization, or is absolute against a relative prefix.
 - Any write to a protected (execute-later) path — always asks. See [permissions-and-sandbox.md](permissions-and-sandbox.md#protected-paths).
 
-### MCP servers (`mcp.toml`)
+### MCP servers (`[[mcp]]`)
 
-Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve its binary (shown with its SHA-256), and a changed binary re-prompts. Server output is sanitized before it reaches the model.
+Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve its binary (shown with its SHA-256), and a changed binary re-prompts. Server output is sanitized before it reaches the model. Full guide: [mcp.md](mcp.md).
 
-```toml
-# ~/.config/hotl/mcp.toml
-[[server]]
-name = "docs"
-command = "/usr/local/bin/docs-mcp"
-args = ["--stdio"]
-description = "project documentation search"
-```
+### Post-edit diagnostics (`[diagnostics]`) and hooks (`[[hook]]`)
 
-Transport is stdio JSON-RPC only. *(Full MCP how-to guide: not yet written — this table is the current reference.)*
+`[diagnostics]` runs a check command after a successful `edit`/`write` (under the sandbox floor, 30 s timeout). `[[hook]]` intercepts tool calls. Full guide: [hooks.md](hooks.md).
 
-### Post-edit diagnostics (`hooks.toml`)
+### Retention (`[retention]`)
 
-After a successful `edit`/`write`, run a check command for that file's extension and show the agent the result. The command runs under the same sandbox floor as `bash` and is killed after 30 s.
+Bounds the growth of the session/shadow/blob stores. `hotl gc` prunes on demand; with a `[retention]` policy set, a prune also runs quietly at startup. See [`hotl gc`](#hotl-gc).
 
-```toml
-# ~/.config/hotl/hooks.toml
-[diagnostics]
-rs = "cargo check -q --message-format=short"
-py = "ruff check ."
-```
+## hotl gc
 
-*(Extended hooks guide: not yet written.)*
+`hotl gc [--dry-run] [--days N] [--keep N]` prunes whole sessions (log + evicted-result blobs + shadow snapshot repo) older than `max_age_days` or beyond `max_sessions`, and sweeps dead backgrounded-session sockets. Flags override `[retention]`. With no policy and no flags it's a no-op that tells you so. `--dry-run` lists what would go without deleting.
 
 ## Headless (`-p` / `--json`)
 
-`hotl -p "PROMPT"` runs one turn and exits. Because no human is present, **every permission ask is auto-denied** — headless runs cannot perform gated actions unless an allow-rule covers them. Configure `permissions.toml` for anything a headless run must do.
+`hotl -p "PROMPT"` runs one turn and exits. Because no human is present, **every permission ask is auto-denied** — headless runs cannot perform gated actions unless an allow-rule covers them. Configure `[[allow]]` rules in config.toml for anything a headless run must do.
 
 `--json` emits one JSON object per line (a stable-ish event stream for scripts): event types include `text_delta`, `tool_start`, `tool_done`, `ask_denied`, `compacted`, and a terminal `turn_done` carrying the outcome and token usage.
 

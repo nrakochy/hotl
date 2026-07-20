@@ -46,7 +46,7 @@ Expected — the provider line reads `ok`, and the sandbox line names a mechanis
 hotl 0.1.2 — doctor
   ok    provider: llama3.1 selected (keys present)
   ok    sandbox: enforced (seatbelt)
-  ok    config: /Users/you/.config/hotl (default system prompt)
+  ok    config: none at /Users/you/.config/hotl/config.toml (defaults; run `hotl setup`)
   ok    allow rules: none (every gated tool call asks)
   ok    sessions: /Users/you/.local/share/hotl/sessions (writable)
   ok    memory: none (create /Users/you/.config/hotl/memory/MEMORY.md to enable)
@@ -108,7 +108,7 @@ It asks to confirm, lists `main.rs`, and restores the file to before the edit. `
 Type a request → the agent reads freely → it **asks before changing anything** → you approve per step → every change is snapshotted for `undo`. That approve-each-step rhythm is the core of the tool.
 
 **Next:**
-- Tired of approving trusted commands every time? → allow-rules in [configuration.md](configuration.md#allow-rules-permissionstoml).
+- Tired of approving trusted commands every time? → allow-rules in [configuration.md](configuration.md#allow-rules-allow).
 - Want to know exactly what the y/N gate and sandbox protect (and what they don't)? → [permissions-and-sandbox.md](permissions-and-sandbox.md).
 - Running it in a script instead of interactively? → headless mode in [configuration.md](configuration.md#headless--p----json).
 

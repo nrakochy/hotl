@@ -13,10 +13,12 @@
 //!   attach        connect to a backgrounded session (bare: list them)
 //!   serve         (internal) host a session on a unix socket — used by `bg`
 //!   setup         write default config (safe defaults; never silent) (MD)
+//!   gc            prune old sessions/shadows/blobs per [retention] (retention)
 //!   update        show version + how to update (MD)
-//!   update        reserved (MD)
 
 mod acp;
+mod config;
+mod gc;
 mod agent;
 mod attach;
 mod bg;
@@ -78,6 +80,7 @@ fn main() {
             let force = args.iter().any(|a| a == "--force" || a == "-f");
             std::process::exit(setup::setup_main(&agent::config_dir(), force));
         }
+        Some("gc") => std::process::exit(gc::gc_main(&args)),
         Some("update") => std::process::exit(update_main(args.get(1).map(String::as_str))),
         Some("init") => {
             // Binary-generated shell integration (0001 §M1, Forge's `:` prefix).
@@ -105,17 +108,15 @@ fn print_help() {
          hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
+         hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
          hotl resume [id]     continue an earlier session (bare: list recent)\n  \
          hotl undo            restore files to before the agent's last change\n  \
          hotl fleet           reserved (orchestrate)\n\n\
-         ENV:\n  HOTL_MODEL             provider/model, e.g. anthropic/{} or openai/gpt-5\n  \
-         ANTHROPIC_API_KEY      for the anthropic provider (the default)\n  \
-         OPENAI_API_KEY         for openai; HOTL_OPENAI_BASE_URL for compatible endpoints\n  \
-         HOTL_ASK_TIMEOUT=0     make permission asks wait indefinitely (backgrounded sessions)\n  \
-         HOTL_SANDBOX=off       disable the bash sandbox floor (marked in every ask)\n\n\
-         REPL: type to prompt · type mid-turn to steer · ctrl-c interrupts a turn\n\
-         Allow rules: ~/.config/hotl/permissions.toml (see docs)",
-        hotl_provider_anthropic::DEFAULT_MODEL
+         CONFIG: ~/.config/hotl/config.toml (one file: [provider] [context] [behavior]\n  \
+         [retention], plus [[allow]] [[mcp]] [[hook]] [diagnostics]). Env vars override\n  \
+         (HOTL_MODEL, ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL,\n  \
+         HOTL_ASK_TIMEOUT=0, HOTL_SANDBOX=off). Run `hotl setup` to write a starter.\n\n\
+         REPL: type to prompt · type mid-turn to steer · ctrl-c interrupts a turn"
     );
 }
 

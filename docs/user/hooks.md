@@ -4,7 +4,7 @@
 
 ## Post-edit diagnostics (the simple one)
 
-Make the agent see your project's own check output right after it edits a file. In `~/.config/hotl/hooks.toml`:
+Make the agent see your project's own check output right after it edits a file. In `~/.config/hotl/config.toml`:
 
 ```toml
 [diagnostics]
@@ -16,7 +16,7 @@ After a successful `edit`/`write` to a `.rs` file, `cargo check` runs (under the
 
 ## Hooks (intercept tool calls)
 
-A hook runs at one of two moments: **before** a tool call (`pre_tool` — you can allow, block, or rewrite it) or **after** (`post_tool` — you can replace the result). In `~/.config/hotl/hooks.toml`:
+A hook runs at one of two moments: **before** a tool call (`pre_tool` — you can allow, block, or rewrite it) or **after** (`post_tool` — you can replace the result). In `~/.config/hotl/config.toml`:
 
 ```toml
 [[hook]]

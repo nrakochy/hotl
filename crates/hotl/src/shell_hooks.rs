@@ -1,6 +1,6 @@
 //! Lane 2 — the Claude-compatible shell-hook adapter (M5; 0007 §5).
 //!
-//! Owner-configured commands in `hooks.toml` run at the same two events lane 1
+//! Owner-configured commands in config.toml's `[[hook]]` run at the same two events lane 1
 //! exposes. A hook command receives the event as JSON on stdin and returns a
 //! decision as JSON on stdout, runs **under the sandbox floor** (it is a
 //! command, not trusted-by-position), sees byte-capped payloads (0006 M5 pin
@@ -10,7 +10,7 @@
 //! permission).
 //!
 //! ```toml
-//! # ~/.config/hotl/hooks.toml
+//! # ~/.config/hotl/config.toml
 //! [[hook]]
 //! event = "pre_tool"          # or "post_tool"
 //! command = "/usr/local/bin/guard"
@@ -25,7 +25,6 @@
 //!            | {"decision":"rewrite","input":{...}}
 //!   post_tool: {"result":"replacement"}   (absent/empty ⇒ unchanged)
 
-use std::path::Path;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use futures_util::future::BoxFuture;
@@ -59,10 +58,10 @@ pub struct ShellHooks {
     post: Vec<ShellHook>,
 }
 
-/// Load configured shell hooks, or `None` if none are configured.
-pub fn load(config_dir: &Path) -> Option<ShellHooks> {
-    let raw = std::fs::read_to_string(config_dir.join("hooks.toml")).ok()?;
-    let parsed: HooksFile = toml::from_str(&raw).ok()?;
+/// Parse shell hooks from a TOML string (the `[[hook]]` section of config.toml,
+/// fed in by the binary). `None` if none are configured.
+pub fn load_str(raw: &str) -> Option<ShellHooks> {
+    let parsed: HooksFile = toml::from_str(raw).ok()?;
     let mut pre = Vec::new();
     let mut post = Vec::new();
     for spec in parsed.hooks {
@@ -179,43 +178,31 @@ impl Hooks for ShellHooks {
 mod tests {
     use super::*;
 
-    fn config_with(hooks_toml: &str) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("hooks.toml"), hooks_toml).unwrap();
-        dir
-    }
-
     #[tokio::test]
     async fn pre_hook_denies_over_stdio() {
         // A hook that reads the event on stdin and denies bash calls.
-        let dir = config_with(
+        let hooks = load_str(
             "[[hook]]\nevent = \"pre_tool\"\n\
              command = \"cat >/dev/null; echo '{\\\"decision\\\":\\\"deny\\\",\\\"message\\\":\\\"shell says no\\\"}'\"\n",
-        );
-        let hooks = load(dir.path()).expect("hooks configured");
+        ).expect("hooks configured");
         let decision = hooks.pre_tool("bash", &json!({"command": "ls"})).await;
         assert_eq!(decision, PreToolDecision::Deny { message: "shell says no".into() });
     }
 
     #[tokio::test]
     async fn post_hook_replaces_result_and_none_when_unconfigured() {
-        let dir = config_with(
+        let hooks = load_str(
             "[[hook]]\nevent = \"post_tool\"\n\
              command = \"cat >/dev/null; echo '{\\\"result\\\":\\\"cleaned\\\"}'\"\n",
-        );
-        let hooks = load(dir.path()).unwrap();
+        ).unwrap();
         assert_eq!(hooks.post_tool("read", "raw output").await.as_deref(), Some("cleaned"));
         // A config with no hooks loads as None.
-        let empty = config_with("# no hooks here\n");
-        assert!(load(empty.path()).is_none());
+        assert!(load_str("# no hooks here\n").is_none());
     }
 
     #[tokio::test]
     async fn failing_hook_is_evicted_after_three_strikes() {
-        let dir = config_with(
-            "[[hook]]\nevent = \"pre_tool\"\ncommand = \"exit 1\"\n",
-        );
-        let hooks = load(dir.path()).unwrap();
+        let hooks = load_str("[[hook]]\nevent = \"pre_tool\"\ncommand = \"exit 1\"\n").unwrap();
         // A failing hook is a no-op (continue), and after 3 strikes it's evicted
         // (still continue — a hook can block but never grant).
         for _ in 0..5 {

@@ -16,7 +16,7 @@
 
 | Message or symptom | Cause | Fix |
 |---|---|---|
-| The agent's action was `(denied)` and you never saw a prompt | Headless (`-p`) or non-interactive terminal — asks auto-deny. | Run interactively, or add an allow-rule in `permissions.toml` for the action the run needs. See [configuration.md](configuration.md#allow-rules-permissionstoml). |
+| The agent's action was `(denied)` and you never saw a prompt | Headless (`-p`) or non-interactive terminal — asks auto-deny. | Run interactively, or add an allow-rule in `config.toml` for the action the run needs. See [configuration.md](configuration.md#allow-rules-allow). |
 | An allow-rule you wrote still prompts | The command has a shell operator, the path escapes the prefix via `..`, the target is a protected path, or (for `bash`) the sandbox isn't enforced. | Expected — these are the carve-outs. See [permissions-and-sandbox.md](permissions-and-sandbox.md). Simplify the command, or approve it by hand. |
 | Ask shows `UNSANDBOXED` | No kernel sandbox on this host, or `HOTL_SANDBOX=off`. | On older Linux, none is available; on macOS ensure `/usr/bin/sandbox-exec` exists. `bash` allow-rules are disabled while unsandboxed, by design. |
 | `⚠ PROTECTED PATH —` before an ask | The write targets a write-now/execute-later file (git hook, build.rs, ssh, creds, …). | Intended. Approve only if you meant to write that file; it can run code or grant access later. |
@@ -35,7 +35,7 @@
 
 | Message or symptom | Cause | Fix |
 |---|---|---|
-| `mcp.toml ignored (parse error)` | Malformed `mcp.toml`. | Fix the TOML; a bad file is ignored wholesale (fail-closed), so no servers load until it parses. |
+| `config.toml ignored (parse error)` | Malformed `config.toml`. | Fix the TOML; a bad file is ignored wholesale (fail-closed), so no servers load until it parses. |
 | First `mcp` use shows a `PROTECTED PATH`-style screen with a hash | First use of that server (or its binary changed). | Expected — approving runs that binary and lets its output into context. Verify the path/hash, then approve. |
 | MCP call returns `… timed out after 30s` | The server didn't respond. | Check the server runs standalone; hotl won't hang on it. |
 

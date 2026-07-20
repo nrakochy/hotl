@@ -6,7 +6,7 @@ use std::path::Path;
 
 use hotl_platform::EnvSecrets;
 use hotl_store::Masker;
-use hotl_tools::{rules::Rules, sandbox};
+use hotl_tools::sandbox;
 
 enum Status {
     Ok,
@@ -82,22 +82,21 @@ fn sandbox_check() -> Check {
 }
 
 fn config_check(config_dir: &Path) -> Check {
-    let prompt = config_dir.join("system-prompt.md");
-    if prompt.is_file() {
-        ok(format!("config: {} (custom system prompt)", config_dir.display()))
+    let cfg = config_dir.join("config.toml");
+    if cfg.is_file() {
+        ok(format!("config: {} loaded", cfg.display()))
     } else {
-        ok(format!("config: {} (default system prompt)", config_dir.display()))
+        ok(format!("config: none at {} (defaults; run `hotl setup`)", cfg.display()))
     }
 }
 
 fn rules_check(config_dir: &Path) -> Check {
-    let path = config_dir.join("permissions.toml");
-    if !path.is_file() {
-        return ok("allow rules: none (every gated tool call asks)".into());
-    }
-    match Rules::load(config_dir) {
-        (_, Some(warning)) => warn(format!("allow rules: {warning}")),
-        (_, None) => ok(format!("allow rules: {} loaded", path.display())),
+    match crate::config::Config::load(config_dir).allow_toml() {
+        None => ok("allow rules: none (every gated tool call asks)".into()),
+        Some(t) => match hotl_tools::rules::Rules::from_toml(&t) {
+            Ok(_) => ok("allow rules: [[allow]] in config.toml loaded".into()),
+            Err(e) => warn(format!("allow rules: config.toml [[allow]] ignored: {e}")),
+        },
     }
 }
 

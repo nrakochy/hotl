@@ -1,9 +1,10 @@
 //! Allow-rule persistence (0001 §M1; unlocked by the sandbox floor — r2 R3).
 //!
-//! Deliberately file-only: rules live in `~/.config/hotl/permissions.toml`
-//! and are written by the human with an editor, never by an in-REPL "always
-//! allow" reflex — ask-fatigue was the attack the round-2 review flagged, so
-//! persistence is an act of deliberate configuration, not a keystroke.
+//! Deliberately config-only: rules live in the `[[allow]]` section of
+//! `~/.config/hotl/config.toml` and are written by the human with an editor,
+//! never by an in-REPL "always allow" reflex — ask-fatigue was the attack the
+//! round-2 review flagged, so persistence is deliberate configuration, not a
+//! keystroke.
 //!
 //! Evaluation is deny-first with two hard carve-outs:
 //! 1. **Protected execute-later paths never auto-allow**, no matter what a
@@ -12,7 +13,7 @@
 //!    on an unsandboxed host every bash call still asks.
 //!
 //! ```toml
-//! # ~/.config/hotl/permissions.toml
+//! # ~/.config/hotl/config.toml
 //! [[allow]]
 //! tool = "bash"
 //! prefix = "cargo "        # command prefix
@@ -24,7 +25,6 @@
 
 use serde::Deserialize;
 use serde_json::Value;
-use std::path::Path;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Rules {
@@ -50,19 +50,8 @@ pub enum Verdict {
 }
 
 impl Rules {
-    /// Load rules; a malformed file is ignored and reported back to the
-    /// caller (libraries don't print — the surface decides how to warn).
-    pub fn load(config_dir: &Path) -> (Self, Option<String>) {
-        let path = config_dir.join("permissions.toml");
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str::<Rules>(&text) {
-                Ok(rules) => (rules, None),
-                Err(e) => (Rules::default(), Some(format!("ignoring malformed {}: {e}", path.display()))),
-            },
-            Err(_) => (Rules::default(), None),
-        }
-    }
-
+    /// Parse allow-rules from a TOML string (the `[[allow]]` section of the
+    /// single config.toml — the binary feeds that section in).
     pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
         toml::from_str(text)
     }

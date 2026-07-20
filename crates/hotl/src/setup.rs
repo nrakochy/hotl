@@ -10,13 +10,35 @@ use std::path::Path;
 /// The shipped default allow-rules (design-docs/default-policy.md). Read-only
 /// conveniences only; everything that runs code or writes files is commented
 /// out for the owner to enable deliberately.
-pub const DEFAULT_PERMISSIONS: &str = "\
-# ~/.config/hotl/permissions.toml — hotl allow-rules (see docs/user/).
-# Rules auto-approve a class of tool call. They are TRUST GRANTS, not scopes.
-# Anything not matched here still asks. Delete this file to make all ask.
-# Protected paths (ssh/creds/build.rs/git hooks/…) ALWAYS ask, rule or not.
+pub const DEFAULT_CONFIG: &str = "\
+# ~/.config/hotl/config.toml — the single hotl config file (see docs/user/).
+# Every hand-editable setting lives here. Env vars override these (HOTL_MODEL,
+# ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL, HOTL_SANDBOX=off).
 
-# --- read-only inspection: safe to auto-allow ---
+[provider]
+# provider/model. `openai/…` covers any OpenAI-compatible endpoint.
+# model = \"openai/gpt-5\"
+# base_url = \"http://localhost:11434/v1\"   # e.g. Ollama (openai provider)
+# fast_model = \"...\"                        # cheap model for compaction summaries
+
+[context]
+# window = 200000            # your model's context size, in tokens
+# evict_tokens = 20000       # offload tool results larger than this (0 disables)
+# compaction_reset = false   # fresh-slate compaction instead of in-place
+# show_used_pct = true       # show context-fullness in each turn's status
+
+[behavior]
+# ask_timeout_secs = 300     # 0 = wait forever for a permission answer
+# sandbox = true             # false disables the bash sandbox floor
+
+[retention]
+# Prune old sessions/shadows/blobs (run `hotl gc`, or auto at startup once set).
+# max_age_days = 30
+# max_sessions = 200
+
+# --- allow-rules: auto-approve trusted tool calls (TRUST GRANTS, not scopes) ---
+# Anything not matched still asks. Protected paths (ssh/creds/build.rs/git hooks)
+# ALWAYS ask, rule or not. Read-only conveniences are safe to auto-allow:
 [[allow]]
 tool = \"bash\"
 prefix = \"ls \"
@@ -37,34 +59,49 @@ prefix = \"git diff\"
 tool = \"bash\"
 prefix = \"git log\"
 
-# --- build/test in THIS project (runs code — opt in by uncommenting) ---
+# build/test runs code — opt in deliberately:
 # [[allow]]
 # tool = \"bash\"
 # prefix = \"cargo test\"
-
-# --- editing your own source tree (scope to what you want edited freely) ---
+#
 # [[allow]]
 # tool = \"edit\"
 # path_prefix = \"src/\"
+
+# --- MCP tool servers (first use asks, shows the binary + hash) ---
+# [[mcp]]
+# name = \"docs\"
+# command = \"/usr/local/bin/docs-mcp\"
+# args = [\"--stdio\"]
+# description = \"project documentation search\"
+
+# --- post-edit diagnostics: run your check command after edits ---
+# [diagnostics]
+# rs = \"cargo check -q --message-format=short\"
+
+# --- hooks: intercept tool calls (pre_tool: deny/rewrite; post_tool: replace) ---
+# [[hook]]
+# event = \"pre_tool\"
+# command = \"/usr/local/bin/guard\"
 ";
 
-/// `hotl setup [--force]`: write the default config, reporting each file.
+/// `hotl setup [--force]`: write the default config.toml, never silently.
 pub fn setup_main(config_dir: &Path, force: bool) -> i32 {
     if let Err(e) = std::fs::create_dir_all(config_dir) {
         eprintln!("hotl: could not create {}: {e}", config_dir.display());
         return 1;
     }
-    let perms = config_dir.join("permissions.toml");
-    match write_if_absent(&perms, DEFAULT_PERMISSIONS, force) {
-        Wrote::Created => println!("wrote {}", perms.display()),
-        Wrote::Exists => println!("kept existing {} (use --force to overwrite)", perms.display()),
+    let cfg = config_dir.join("config.toml");
+    match write_if_absent(&cfg, DEFAULT_CONFIG, force) {
+        Wrote::Created => println!("wrote {}", cfg.display()),
+        Wrote::Exists => println!("kept existing {} (use --force to overwrite)", cfg.display()),
         Wrote::Failed(e) => {
-            eprintln!("hotl: could not write {}: {e}", perms.display());
+            eprintln!("hotl: could not write {}: {e}", cfg.display());
             return 1;
         }
     }
     println!(
-        "config dir: {}\nnext: set a provider (HOTL_MODEL + a key, or HOTL_OPENAI_BASE_URL), \
+        "config dir: {}\nnext: set a provider in [provider] (or HOTL_MODEL + a key), \
          then `hotl doctor` to verify.",
         config_dir.display()
     );
@@ -148,14 +185,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("hotl");
         assert_eq!(setup_main(&cfg, false), 0);
-        assert!(cfg.join("permissions.toml").exists());
+        assert!(cfg.join("config.toml").exists());
         // Second run without --force keeps the (possibly edited) file.
-        std::fs::write(cfg.join("permissions.toml"), "# edited\n").unwrap();
+        std::fs::write(cfg.join("config.toml"), "# edited\n").unwrap();
         setup_main(&cfg, false);
-        assert_eq!(std::fs::read_to_string(cfg.join("permissions.toml")).unwrap(), "# edited\n");
+        assert_eq!(std::fs::read_to_string(cfg.join("config.toml")).unwrap(), "# edited\n");
         // --force overwrites.
         setup_main(&cfg, true);
-        assert!(std::fs::read_to_string(cfg.join("permissions.toml")).unwrap().contains("allow"));
+        assert!(std::fs::read_to_string(cfg.join("config.toml")).unwrap().contains("allow"));
     }
 
     #[test]

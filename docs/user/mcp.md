@@ -8,17 +8,17 @@ An MCP (Model Context Protocol) server is a separate program that exposes tools 
 
 ## 1. Declare the server
 
-Create `~/.config/hotl/mcp.toml`:
+Create the `[[mcp]]` section of `~/.config/hotl/config.toml`:
 
 ```toml
-[[server]]
+[[mcp]]
 name = "docs"                       # how you'll refer to it
 command = "/usr/local/bin/docs-mcp" # the server program (absolute path recommended)
 args = ["--stdio"]                  # optional launch args
 description = "project documentation search"
 ```
 
-Add one `[[server]]` block per server. A malformed file is ignored **whole** (fail-closed) with a warning — no servers load until it parses.
+Add one `[[mcp]]` block per server. A malformed file is ignored **whole** (fail-closed) with a warning — no servers load until it parses.
 
 ## 2. Verify it's seen
 
@@ -26,7 +26,7 @@ Add one `[[server]]` block per server. A malformed file is ignored **whole** (fa
 hotl doctor
 ```
 
-There's no dedicated MCP line yet, but a parse error in `mcp.toml` prints a warning at startup. Start a session and the model will see your servers named in the `mcp` tool's description.
+There's no dedicated MCP line yet, but a parse error in `config.toml` prints a warning at startup. Start a session and the model will see your servers named in the `mcp` tool's description.
 
 ## 3. First use → approve the binary
 

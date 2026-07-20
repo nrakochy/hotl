@@ -1,7 +1,8 @@
 //! Post-mutation diagnostics (M3a; corpus 05's format+diagnostics injection,
 //! config-driven — no LSP until the ledger row justifies one).
 //!
-//! `~/.config/hotl/hooks.toml` maps file extensions to a check command:
+//! The `[diagnostics]` table of `~/.config/hotl/config.toml` maps file
+//! extensions to a check command:
 //!
 //! ```toml
 //! [diagnostics]
@@ -28,11 +29,12 @@ pub struct Diagnostics {
 }
 
 impl Diagnostics {
-    pub fn load(config_dir: &Path) -> Self {
-        let path = config_dir.join("hooks.toml");
-        let commands = std::fs::read_to_string(path)
+    /// Parse the `[diagnostics]` table from a TOML string (the binary feeds the
+    /// relevant slice of config.toml).
+    pub fn from_toml(text: &str) -> Self {
+        let commands = text
+            .parse::<toml::Table>()
             .ok()
-            .and_then(|raw| raw.parse::<toml::Table>().ok())
             .and_then(|t| t.get("diagnostics").cloned())
             .and_then(|d| d.as_table().cloned())
             .map(|table| {
@@ -114,18 +116,7 @@ mod tests {
     use super::*;
 
     fn diag(toml: &str) -> Diagnostics {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static N: AtomicU32 = AtomicU32::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "hotl-diag-{}-{}",
-            std::process::id(),
-            N.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("hooks.toml"), toml).unwrap();
-        let d = Diagnostics::load(&dir);
-        std::fs::remove_dir_all(&dir).ok();
-        d
+        Diagnostics::from_toml(toml)
     }
 
     #[tokio::test]

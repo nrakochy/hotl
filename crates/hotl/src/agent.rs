@@ -206,6 +206,12 @@ struct Scaffold {
 fn scaffold(provider: Arc<dyn hotl_provider::Provider>, model: String, secrets: &dyn SecretStore) -> Result<Scaffold, i32> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let config_dir = config_dir();
+    // config.toml [behavior].sandbox = false disables the floor (env still wins).
+    if crate::config::Config::load(&config_dir).behavior.sandbox == Some(false)
+        && secrets.get("HOTL_SANDBOX").is_none()
+    {
+        std::env::set_var("HOTL_SANDBOX", "off");
+    }
     let system = load_system_prompt(&config_dir);
     let rules = load_rules(&config_dir);
     let sandbox_status = sandbox::probe();
@@ -283,6 +289,8 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     };
     let session_id = log.session_id.clone();
     spawn_secret_audit(log.path().to_path_buf());
+    let gc_config_dir = scaffold.config_dir.clone();
+    std::thread::spawn(move || crate::gc::auto_gc(&gc_config_dir)); // retention, off the hot path
     let (snapshots, initial_items) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
     let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
 
@@ -314,14 +322,21 @@ fn build_registry(
     config_dir: &std::path::Path,
     spawn_builder: Option<Arc<dyn crate::spawn::ChildBuilder>>,
 ) -> Registry {
-    let mut registry = Registry::builtin_with(hotl_tools::diagnostics::Diagnostics::load(config_dir));
-    let (mcp, warning) = hotl_mcp::config::load(config_dir);
-    if let Some(warning) = warning {
-        eprintln!("hotl: {warning}");
-    }
-    if !mcp.servers.is_empty() {
+    let cfg = crate::config::Config::load(config_dir);
+    // Everything is config.toml: [diagnostics] and [[mcp]] sections.
+    let diagnostics = cfg
+        .hooks_toml()
+        .map(|t| hotl_tools::diagnostics::Diagnostics::from_toml(&t))
+        .unwrap_or_default();
+    let mut registry = Registry::builtin_with(diagnostics);
+    let servers = cfg
+        .mcp_toml()
+        .and_then(|t| toml::from_str::<hotl_mcp::config::McpConfig>(&t).ok())
+        .map(|c| c.servers)
+        .unwrap_or_default();
+    if !servers.is_empty() {
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
-        registry.register(Box::new(hotl_mcp::McpTool::new(mcp.servers, trust)));
+        registry.register(Box::new(hotl_mcp::McpTool::new(servers, trust)));
     }
     if hotl_tools::skills::SkillTool::has_skills(config_dir) {
         registry.register(Box::new(hotl_tools::skills::SkillTool::new(config_dir)));
@@ -351,7 +366,11 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
     fn build(&self, _brief: &str) -> Result<hotl_engine::SessionHandle, String> {
         let log = SessionLog::create(&sessions_dir(), &self.model, None, Masker::from_env(), self.clock.now_ms())
             .map_err(|e| format!("child session log: {e}"))?;
-        let registry = Registry::builtin_with(hotl_tools::diagnostics::Diagnostics::load(&self.config_dir));
+        let diagnostics = crate::config::Config::load(&self.config_dir)
+            .hooks_toml()
+            .map(|t| hotl_tools::diagnostics::Diagnostics::from_toml(&t))
+            .unwrap_or_default();
+        let registry = Registry::builtin_with(diagnostics);
         Ok(spawn_session(SessionDeps {
             provider: self.provider.clone(),
             registry: Arc::new(registry),
@@ -490,17 +509,24 @@ pub(crate) fn undo_main(args: Vec<String>) -> i32 {
     }
 }
 
-/// Lane-2 shell hooks from `hooks.toml`, or None (M5).
+/// Lane-2 shell hooks from config.toml `[[hook]]`, or None (M5).
 fn load_hooks(config_dir: &std::path::Path) -> Option<Arc<dyn hotl_engine::hooks::Hooks>> {
-    crate::shell_hooks::load(config_dir)
+    let cfg = crate::config::Config::load(config_dir);
+    cfg.hooks_toml()
+        .and_then(|t| crate::shell_hooks::load_str(&t))
         .map(|h| Arc::new(h) as Arc<dyn hotl_engine::hooks::Hooks>)
 }
 
+/// Allow-rules from config.toml `[[allow]]`.
 fn load_rules(config_dir: &std::path::Path) -> Arc<Rules> {
-    let (rules, warning) = Rules::load(config_dir);
-    if let Some(warning) = warning {
-        eprintln!("hotl: {warning}");
-    }
+    let cfg = crate::config::Config::load(config_dir);
+    let rules = match cfg.allow_toml() {
+        Some(t) => Rules::from_toml(&t).unwrap_or_else(|e| {
+            eprintln!("hotl: config.toml [[allow]] ignored: {e}");
+            Rules::default()
+        }),
+        None => Rules::default(),
+    };
     Arc::new(rules)
 }
 
@@ -760,7 +786,11 @@ fn reply_from_line(line: Option<&str>) -> hotl_engine::AskReply {
 /// The interactive ask timeout from `HOTL_ASK_TIMEOUT` (seconds): unset →
 /// the 300s default; `0` → wait indefinitely (backgrounded/detached sessions).
 fn ask_timeout_from_env(secrets: &dyn SecretStore) -> Option<std::time::Duration> {
-    match secrets.get("HOTL_ASK_TIMEOUT").and_then(|v| v.parse::<u64>().ok()) {
+    let secs = secrets
+        .get("HOTL_ASK_TIMEOUT")
+        .and_then(|v| v.parse::<u64>().ok())
+        .or_else(|| crate::config::Config::load(&config_dir()).behavior.ask_timeout_secs);
+    match secs {
         Some(0) => None,
         Some(n) => Some(std::time::Duration::from_secs(n)),
         None => Some(std::time::Duration::from_secs(ASK_TIMEOUT_SECS)),
@@ -836,19 +866,26 @@ fn initial_items(config_dir: &std::path::Path, cwd: &std::path::Path) -> Vec<hot
 
 /// Engine knobs from the environment: HOTL_CONTEXT_WINDOW (tokens) and
 /// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
+/// Build the engine config from `config.toml [context]` with env overrides
+/// (env > config.toml > default).
 fn engine_config(model: &str, secrets: &dyn SecretStore) -> EngineConfig {
+    let cfg = crate::config::Config::load(&config_dir());
     let mut config = EngineConfig { model: model.to_string(), ..Default::default() };
-    if let Some(window) = secrets.get("HOTL_CONTEXT_WINDOW").and_then(|v| v.parse().ok()) {
+    if let Some(window) = secrets.get("HOTL_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).or(cfg.context.window) {
         config.context_window = window;
     }
-    config.fast_model = secrets.get("HOTL_FAST_MODEL");
-    // T4: HOTL_EVICT_TOKENS (0 disables eviction of oversized tool results).
-    if let Some(t) = secrets.get("HOTL_EVICT_TOKENS").and_then(|v| v.parse().ok()) {
+    config.fast_model = secrets.get("HOTL_FAST_MODEL").or_else(|| cfg.provider.fast_model.clone());
+    if let Some(t) = secrets.get("HOTL_EVICT_TOKENS").and_then(|v| v.parse().ok()).or(cfg.context.evict_tokens) {
         config.evict_threshold_tokens = t;
     }
-    // M4/#9: opt into fresh-slate compaction and hiding the context gauge.
-    config.compaction_reset = secrets.get("HOTL_COMPACTION_RESET").as_deref() == Some("1");
-    config.show_context_pct = secrets.get("HOTL_HIDE_CONTEXT_PCT").as_deref() != Some("1");
+    config.compaction_reset = match secrets.get("HOTL_COMPACTION_RESET").as_deref() {
+        Some(v) => v == "1",
+        None => cfg.context.compaction_reset.unwrap_or(false),
+    };
+    config.show_context_pct = match secrets.get("HOTL_HIDE_CONTEXT_PCT").as_deref() {
+        Some(v) => v != "1",
+        None => cfg.context.show_used_pct.unwrap_or(true),
+    };
     config
 }
 
@@ -868,7 +905,12 @@ fn exit_code(outcome: &Outcome) -> i32 {
 pub(crate) fn select_provider(
     secrets: &dyn SecretStore,
 ) -> Result<(Arc<dyn hotl_provider::Provider>, String), String> {
-    let raw = secrets.get("HOTL_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    let cfg = crate::config::Config::load(&config_dir());
+    // Precedence: env HOTL_MODEL > config.toml [provider].model > default.
+    let raw = secrets
+        .get("HOTL_MODEL")
+        .or_else(|| cfg.provider.model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     let (provider_name, model) = match raw.split_once('/') {
         Some((p, m)) => (p.to_ascii_lowercase(), m.to_string()),
         None => ("anthropic".to_string(), raw),
@@ -887,6 +929,7 @@ pub(crate) fn select_provider(
         "openai" | "oai" => {
             let base = secrets
                 .get("HOTL_OPENAI_BASE_URL")
+                .or_else(|| cfg.provider.base_url.clone())
                 .unwrap_or_else(|| hotl_provider_openai::DEFAULT_BASE_URL.to_string());
             let key = secrets.get("OPENAI_API_KEY");
             if key.is_none() && base == hotl_provider_openai::DEFAULT_BASE_URL {

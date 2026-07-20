@@ -28,13 +28,13 @@ On hosts with no sandbox mechanism (older Linux kernels, or `HOTL_SANDBOX=off`),
 
 Writing a file is usually harmless until *later*. A `.git/hooks/pre-commit`, a `Makefile`, a `build.rs`, your `~/.zshrc`, an `~/.ssh/authorized_keys` — writing these is benign, but the *next* git command, build, shell, or login runs code or grants access you never explicitly approved. This is the "write-now, execute-later" trap.
 
-hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule — it always asks, no matter what your `permissions.toml` says. The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), shell startup files, SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
+hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule — it always asks, no matter what your `config.toml's [[allow]]` says. The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), shell startup files, SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
 
 ## Why allow-rules are a file you edit
 
 Approving every `cargo test` gets tedious, and tedium is a security problem: a person mashing `y` to clear prompts will eventually approve something they shouldn't. That's *ask-fatigue*, and it's how well-meaning tools grow an ungoverned "allow everything" habit.
 
-hotl's answer: you can pre-approve trusted command families and file scopes — but **only by editing `~/.config/hotl/permissions.toml` deliberately.** There is no in-REPL "always allow this" button, because a button is exactly the fatigue-driven reflex we want to avoid. Persisting trust should be a considered act with an editor, not a keystroke mid-task.
+hotl's answer: you can pre-approve trusted command families and file scopes — but **only by editing the `[[allow]]` section of `~/.config/hotl/config.toml` deliberately.** There is no in-REPL "always allow this" button, because a button is exactly the fatigue-driven reflex we want to avoid. Persisting trust should be a considered act with an editor, not a keystroke mid-task.
 
 Even then, allow-rules are trust *grants*, not fine scopes, and hotl treats them cautiously:
 - A `bash` prefix like `cargo ` is a grant to that command family — so a command that tacks on `; curl … | sh` or `&& rm -rf ~` (any shell chaining/redirection) drops back to asking. The prefix isn't a leash on the rest of the line.
