@@ -12,6 +12,7 @@ members = [
     "crates/hotl-tools",
     "crates/hotl-store",
     "crates/hotl-context",
+    "crates/hotl-engine",
     "crates/hotl",
 ]
 

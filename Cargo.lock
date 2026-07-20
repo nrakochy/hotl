@@ -392,6 +392,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotl-engine"
+version = "0.1.2"
+dependencies = [
+ "futures-util",
+ "hotl-platform",
+ "hotl-provider",
+ "hotl-store",
+ "hotl-tools",
+ "hotl-types",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "hotl-platform"
 version = "0.1.2"
 
