@@ -14,6 +14,9 @@ const READ_MAX_LINES: usize = 2000;
 const BASH_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const BASH_MAX_TIMEOUT_MS: u64 = 600_000;
 const BASH_MAX_OUTPUT: usize = 50 * 1024;
+/// Slack past the truncation point so `combined_output` still sees "over the
+/// cap" and appends its marker exactly as before.
+const BASH_OUTPUT_SLACK: usize = 1024;
 
 /// Errors double as results: `Err(ToolOutcome)` is the errors-as-prompts
 /// channel, letting tool bodies use `?`.
@@ -23,7 +26,7 @@ fn done(result: ToolResult) -> ToolOutcome {
     result.unwrap_or_else(|e| e)
 }
 
-fn sandbox_status() -> &'static SandboxStatus {
+pub(crate) fn sandbox_status() -> &'static SandboxStatus {
     static STATUS: OnceLock<SandboxStatus> = OnceLock::new();
     STATUS.get_or_init(sandbox::probe)
 }
@@ -52,7 +55,7 @@ impl Tool for ReadTool {
     fn name(&self) -> &'static str {
         "read"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Read a text file from the local filesystem. Returns at most 2000 lines / 200KB per call; use `offset` (1-indexed start line) to continue a truncated read."
     }
     fn schema(&self) -> Value {
@@ -74,40 +77,51 @@ impl Tool for ReadTool {
 }
 
 async fn read_impl(input: &Value) -> ToolResult {
+    use tokio::io::AsyncBufReadExt;
     let path = str_arg(input, "path")?;
     let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
-    let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+    let read_err = |e: std::io::Error| {
         ToolOutcome::err(format!(
             "Could not read `{path}`: {e}. Check the path (use `bash` with `ls` to explore) and try again."
         ))
-    })?;
-    let lines: Vec<&str> = content.lines().collect();
-    let total = lines.len();
+    };
+    // Stream line by line: nothing before `offset` or past the caps is ever
+    // retained, but lines are still counted to the end for honest totals.
+    let file = tokio::fs::File::open(path).await.map_err(read_err)?;
+    let mut lines = tokio::io::BufReader::new(file).lines();
+    let mut out = String::new();
+    let mut taken = 0usize;
+    let mut total = 0usize;
+    // 0-based index of the first line the caps excluded.
+    let mut truncated_at: Option<usize> = None;
+    while let Some(line) = lines.next_line().await.map_err(read_err)? {
+        let i = total;
+        total += 1;
+        if i + 1 < offset || truncated_at.is_some() {
+            continue;
+        }
+        if taken >= READ_MAX_LINES || out.len() + line.len() > READ_MAX_BYTES {
+            truncated_at = Some(i);
+            continue;
+        }
+        out.push_str(&format!("{:>6}\t{line}\n", i + 1));
+        taken += 1;
+    }
     if offset > total && total > 0 {
         return Err(ToolOutcome::err(format!(
             "`{path}` has only {total} lines; offset {offset} is past the end."
         )));
     }
-    Ok(ToolOutcome::ok(render_lines(&lines, offset, total)))
-}
-
-fn render_lines(lines: &[&str], offset: usize, total: usize) -> String {
-    let mut out = String::new();
-    for (i, line) in lines.iter().enumerate().skip(offset - 1) {
-        let taken = i - (offset - 1);
-        if taken >= READ_MAX_LINES || out.len() + line.len() > READ_MAX_BYTES {
-            out.push_str(&format!(
-                "\n[truncated: showing lines {offset}-{i} of {total}; continue with offset={}]",
-                i + 1
-            ));
-            break;
-        }
-        out.push_str(&format!("{:>6}\t{line}\n", i + 1));
+    if let Some(i) = truncated_at {
+        out.push_str(&format!(
+            "\n[truncated: showing lines {offset}-{i} of {total}; continue with offset={}]",
+            i + 1
+        ));
     }
     if out.is_empty() {
         out = "[empty file]".into();
     }
-    out
+    Ok(ToolOutcome::ok(out))
 }
 
 #[derive(Default)]
@@ -119,7 +133,7 @@ impl Tool for WriteTool {
     fn name(&self) -> &'static str {
         "write"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Write a file (creating parent directories), overwriting any existing content. For partial changes to an existing file prefer `edit`."
     }
     fn schema(&self) -> Value {
@@ -165,7 +179,7 @@ impl Tool for EditTool {
     fn name(&self) -> &'static str {
         "edit"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Exact string replacement in a file. `old_string` must match exactly once, including whitespace; include surrounding lines to make it unique."
     }
     fn schema(&self) -> Value {
@@ -241,7 +255,7 @@ impl Tool for BashTool {
     fn name(&self) -> &'static str {
         "bash"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Run a shell command (`sh -c`). Default timeout 120s (`timeout_ms` overrides, max 600s); the whole process group is killed on timeout or cancel. Output is stdout+stderr combined, truncated at 50KB."
     }
     fn schema(&self) -> Value {
@@ -282,7 +296,7 @@ async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
         .spawn()
         .map_err(|e| ToolOutcome::err(format!("Could not start shell: {e}.")))?;
     let pid = child.id();
-    let wait = child.wait_with_output();
+    let wait = collect_output(child, BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK);
     tokio::pin!(wait);
 
     tokio::select! {
@@ -299,6 +313,42 @@ async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
             Err(ToolOutcome::err("Command cancelled by the user."))
         }
     }
+}
+
+/// Incrementally read the child's stdout/stderr (capped at `cap` bytes each)
+/// and then wait for its exit status. Unlike `wait_with_output`, this never
+/// buffers unbounded output: past the cap the pipes are still drained (and
+/// discarded) so the child can't block on a full pipe. Shared with the
+/// diagnostics runner (H-11).
+pub(crate) async fn collect_output(
+    mut child: tokio::process::Child,
+    cap: usize,
+) -> std::io::Result<std::process::Output> {
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (stdout, stderr) = tokio::join!(drain_capped(stdout, cap), drain_capped(stderr, cap));
+    let status = child.wait().await?;
+    Ok(std::process::Output { status, stdout, stderr })
+}
+
+/// Read a pipe to EOF in 8KB chunks, keeping at most `cap` bytes.
+async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>, cap: usize) -> Vec<u8> {
+    use tokio::io::AsyncReadExt;
+    let mut buf = Vec::new();
+    let Some(mut reader) = reader else { return buf };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = n.min(cap - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    buf
 }
 
 fn shell_outcome(result: std::io::Result<std::process::Output>) -> ToolOutcome {

@@ -46,12 +46,14 @@ fn find_lines(content: &str, old: &str, normalize: fn(&str) -> String) -> Match 
     if old_lines.is_empty() || content_lines.len() < old_lines.len() {
         return Match::None;
     }
+    // Normalize each content line once; windows then compare as slices.
+    let normalized: Vec<String> = content_lines.iter().map(|(text, ..)| normalize(text)).collect();
     let mut found: Option<(usize, usize)> = None;
     let mut count = 0usize;
     for window_start in 0..=(content_lines.len() - old_lines.len()) {
-        let window = &content_lines[window_start..window_start + old_lines.len()];
-        if window.iter().map(|(text, ..)| normalize(text)).eq(old_lines.iter().cloned()) {
+        if normalized[window_start..window_start + old_lines.len()] == old_lines[..] {
             count += 1;
+            let window = &content_lines[window_start..window_start + old_lines.len()];
             let (_, start, _) = window[0];
             let (_, _, end) = window[window.len() - 1];
             found = Some((start, end));

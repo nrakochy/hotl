@@ -12,7 +12,7 @@ use tokio_util::sync::CancellationToken;
 
 pub struct SkillTool {
     dir: PathBuf,
-    description: &'static str,
+    description: String,
 }
 
 impl SkillTool {
@@ -23,12 +23,9 @@ impl SkillTool {
             .map(|(name, first_line)| format!("`{name}` ({first_line})"))
             .collect::<Vec<_>>()
             .join(", ");
-        let description = Box::leak(
-            format!(
-                "Load one of the user's saved skills (procedures/checklists): {names}. \
-                 Call with {{\"name\"}} to load one; no arguments lists them."
-            )
-            .into_boxed_str(),
+        let description = format!(
+            "Load one of the user's saved skills (procedures/checklists): {names}. \
+             Call with {{\"name\"}} to load one; no arguments lists them."
         );
         Self { dir, description }
     }
@@ -65,8 +62,8 @@ impl Tool for SkillTool {
     fn name(&self) -> &'static str {
         "skill"
     }
-    fn description(&self) -> &'static str {
-        self.description
+    fn description(&self) -> &str {
+        &self.description
     }
     fn schema(&self) -> Value {
         json!({

@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -17,8 +17,8 @@ use tokio::sync::oneshot;
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>>;
-type Writer = Arc<tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
+type Pending = Mutex<HashMap<u64, oneshot::Sender<Value>>>;
+type Writer = tokio::sync::Mutex<Box<dyn AsyncWrite + Send + Unpin>>;
 
 pub struct Client {
     next_id: AtomicU64,
@@ -44,6 +44,7 @@ impl Client {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| format!("could not start `{command}`: {e}"))?;
         let stdin = child.stdin.take().ok_or("no stdin")?;
@@ -66,12 +67,15 @@ impl Client {
     ) -> Arc<Self> {
         let client = Arc::new(Self {
             next_id: AtomicU64::new(1),
-            pending: Arc::new(Mutex::new(HashMap::new())),
-            writer: Arc::new(tokio::sync::Mutex::new(Box::new(write) as Box<_>)),
+            pending: Mutex::new(HashMap::new()),
+            writer: tokio::sync::Mutex::new(Box::new(write) as Box<_>),
             tools_stale: AtomicBool::new(false),
             _child: child,
         });
-        tokio::spawn(reader_task(read, client.clone()));
+        // The reader holds only a Weak: when the last user drops the client,
+        // the child's stdin drops with it (a server that exits on stdin EOF
+        // sees it) and the reader task winds down instead of pinning both.
+        tokio::spawn(reader_task(read, Arc::downgrade(&client)));
         client
     }
 
@@ -86,13 +90,18 @@ impl Client {
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().expect("pending mutex").insert(id, tx);
+        self.pending.lock().unwrap_or_else(PoisonError::into_inner).insert(id, tx);
+        // Every early return (send failure, timeout) must remove the entry
+        // again or it leaks forever; the guard makes that unskippable.
+        let guard = PendingGuard { pending: &self.pending, id: Some(id) };
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
         let reply = tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), rx)
             .await
             .map_err(|_| format!("`{method}` timed out after {REQUEST_TIMEOUT_SECS}s"))?
             .map_err(|_| "server disconnected".to_string())?;
+        // A reply means the reader already removed the entry.
+        guard.disarm();
         if let Some(err) = reply.get("error") {
             let msg = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
             return Err(format!("server error on `{method}`: {msg}"));
@@ -121,15 +130,23 @@ impl Client {
     pub async fn list_tools(&self) -> Result<Vec<RemoteTool>, String> {
         self.tools_stale.store(false, Ordering::Relaxed);
         let result = self.request("tools/list", json!({})).await?;
-        let tools = result.get("tools").and_then(Value::as_array).cloned().unwrap_or_default();
-        Ok(tools
-            .iter()
-            .map(|t| RemoteTool {
-                name: str_field(t, "name"),
-                description: str_field(t, "description"),
-                input_schema: t.get("inputSchema").cloned().unwrap_or(json!({"type": "object"})),
+        Ok(result
+            .get("tools")
+            .and_then(Value::as_array)
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|t| RemoteTool {
+                        name: str_field(t, "name"),
+                        description: str_field(t, "description"),
+                        input_schema: t
+                            .get("inputSchema")
+                            .cloned()
+                            .unwrap_or(json!({"type": "object"})),
+                    })
+                    .collect()
             })
-            .collect())
+            .unwrap_or_default())
     }
 
     /// Returns (joined text content, is_error).
@@ -158,16 +175,42 @@ fn str_field(v: &Value, field: &str) -> String {
     v.get(field).and_then(Value::as_str).unwrap_or_default().to_string()
 }
 
-async fn reader_task(read: impl AsyncRead + Send + Unpin, client: Arc<Client>) {
+/// Removes its id from the pending map on drop unless disarmed — so no early
+/// return out of `request` can leak the entry.
+struct PendingGuard<'a> {
+    pending: &'a Pending,
+    id: Option<u64>,
+}
+
+impl PendingGuard<'_> {
+    fn disarm(mut self) {
+        self.id = None;
+    }
+}
+
+impl Drop for PendingGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(id) = self.id {
+            self.pending.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+        }
+    }
+}
+
+async fn reader_task(read: impl AsyncRead + Send + Unpin, client: Weak<Client>) {
     let mut lines = BufReader::new(read).lines();
     while let Ok(Some(line)) = lines.next_line().await {
+        // Upgrade per message: a Weak here means the last user is gone and
+        // the task must not keep the client (and the child's stdin) alive.
+        let Some(client) = client.upgrade() else { return };
         let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
         let id = msg.get("id").and_then(Value::as_u64);
         let method = msg.get("method").and_then(Value::as_str);
         match (id, method) {
             // Response to one of our requests.
             (Some(id), None) => {
-                if let Some(tx) = client.pending.lock().expect("pending mutex").remove(&id) {
+                if let Some(tx) =
+                    client.pending.lock().unwrap_or_else(PoisonError::into_inner).remove(&id)
+                {
                     let _ = tx.send(msg);
                 }
             }
@@ -188,5 +231,7 @@ async fn reader_task(read: impl AsyncRead + Send + Unpin, client: Arc<Client>) {
         }
     }
     // EOF: fail everything pending so callers see a clean error.
-    client.pending.lock().expect("pending mutex").clear();
+    if let Some(client) = client.upgrade() {
+        client.pending.lock().unwrap_or_else(PoisonError::into_inner).clear();
+    }
 }

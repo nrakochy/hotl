@@ -48,7 +48,7 @@ impl ToolOutcome {
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
-    fn description(&self) -> &'static str;
+    fn description(&self) -> &str;
     fn schema(&self) -> Value;
     fn permission(&self, input: &Value) -> Permission;
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome>;

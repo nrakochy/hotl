@@ -46,14 +46,13 @@ impl TrustStore {
 /// recorded, so the screen shows honestly that no integrity check applies.
 pub fn binary_hash(command: &str) -> String {
     let path = resolve(command);
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            let mut hasher = Sha256::new();
-            hasher.update(&bytes);
-            format!("sha256:{:x}", hasher.finalize())
-        }
-        Err(e) => format!("unavailable:{e}"),
-    }
+    let hash = |path: &Path| -> std::io::Result<String> {
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        std::io::copy(&mut file, &mut hasher)?;
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    };
+    hash(&path).unwrap_or_else(|e| format!("unavailable:{e}"))
 }
 
 fn resolve(command: &str) -> PathBuf {

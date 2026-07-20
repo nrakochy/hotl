@@ -21,6 +21,9 @@ use crate::sandbox;
 
 const TIMEOUT_SECS: u64 = 30;
 const MAX_REPORT_LINES: usize = 30;
+/// Per-stream capture cap: only the first `MAX_REPORT_LINES` lines survive,
+/// so anything past a generous head is discarded while draining.
+const MAX_CAPTURE_BYTES: usize = 64 * 1024;
 
 #[derive(Default)]
 pub struct Diagnostics {
@@ -74,8 +77,7 @@ impl Diagnostics {
     }
 
     async fn run(&self, command: &str) -> Outcome {
-        let status = sandbox::probe();
-        let mut cmd = sandbox::build_command(command, &status);
+        let mut cmd = sandbox::build_command(command, crate::builtins::sandbox_status());
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -86,7 +88,7 @@ impl Diagnostics {
             Err(e) => return Outcome::Failed(e.to_string()),
         };
         let pid = child.id();
-        let wait = child.wait_with_output();
+        let wait = crate::builtins::collect_output(child, MAX_CAPTURE_BYTES);
         tokio::pin!(wait);
         tokio::select! {
             result = &mut wait => match result {

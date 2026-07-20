@@ -4,7 +4,7 @@
 //! pass the sanitizer chokepoint; first use of a server is a protected ask.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use futures_util::future::BoxFuture;
 use hotl_tools::{Permission, Tool, ToolOutcome};
@@ -19,17 +19,21 @@ use crate::trust::{binary_hash, TrustStore};
 type Connector =
     Box<dyn Fn(ServerConfig) -> BoxFuture<'static, Result<Arc<Client>, String>> + Send + Sync>;
 
+/// One connect slot per server: the outer map lock is held only to fetch the
+/// slot, so a slow connect to one server never stalls calls to the others,
+/// while the `OnceCell` dedupes concurrent first-connects of the same server.
+type ClientSlot = Arc<tokio::sync::OnceCell<Arc<Client>>>;
+
 pub struct McpTool {
     servers: Vec<ServerConfig>,
-    clients: tokio::sync::Mutex<HashMap<String, Arc<Client>>>,
+    clients: tokio::sync::Mutex<HashMap<String, ClientSlot>>,
     trust: Mutex<TrustStore>,
     /// Binary hash per server, computed once and reused for the trust screen
     /// and the recorded grant (H-07): the value the user is shown is exactly
     /// the value persisted, and the file isn't re-read on every call.
     hashes: Mutex<HashMap<String, String>>,
     connector: Connector,
-    /// Leaked once at construction: the Tool trait hands out &'static str.
-    description: &'static str,
+    description: String,
 }
 
 impl McpTool {
@@ -54,13 +58,10 @@ impl McpTool {
             .map(|s| format!("`{}` ({})", s.name, s.description))
             .collect::<Vec<_>>()
             .join(", ");
-        let description = Box::leak(
-            format!(
-                "Call tools on the user's configured MCP servers: {listing}. \
-                 Call with only {{\"server\"}} first to see that server's tools; \
-                 then {{\"server\", \"tool\", \"arguments\"}} to invoke one."
-            )
-            .into_boxed_str(),
+        let description = format!(
+            "Call tools on the user's configured MCP servers: {listing}. \
+             Call with only {{\"server\"}} first to see that server's tools; \
+             then {{\"server\", \"tool\", \"arguments\"}} to invoke one."
         );
         Self {
             servers,
@@ -76,29 +77,44 @@ impl McpTool {
         self.servers.iter().find(|s| s.name == name)
     }
 
-    /// Cached binary hash for a server (computed once per session).
+    /// Cached binary hash for a server (computed once per session). The hash
+    /// is computed before taking the lock — racing computes are idempotent —
+    /// so a slow file read never holds the cache against other servers.
     fn hash_of(&self, cfg: &ServerConfig) -> String {
-        let mut cache = self.hashes.lock().expect("hash cache");
-        cache
+        if let Some(hash) =
+            self.hashes.lock().unwrap_or_else(PoisonError::into_inner).get(&cfg.name)
+        {
+            return hash.clone();
+        }
+        let hash = binary_hash(&cfg.command);
+        self.hashes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(cfg.name.clone())
-            .or_insert_with(|| binary_hash(&cfg.command))
+            .or_insert(hash)
             .clone()
     }
 
     async fn ensure_client(&self, cfg: &ServerConfig) -> Result<Arc<Client>, String> {
-        let mut clients = self.clients.lock().await;
-        if let Some(client) = clients.get(&cfg.name) {
-            return Ok(client.clone());
-        }
-        let client = (self.connector)(cfg.clone()).await?;
-        // Reaching run() means the (protected) ask was approved upstream —
-        // record the grant now, keyed to the *same* hash the screen showed
-        // (H-07: shown value == recorded value, from one read).
-        self.trust
-            .lock()
-            .expect("trust mutex")
-            .record(&cfg.name, &self.hash_of(cfg));
-        clients.insert(cfg.name.clone(), client.clone());
+        let slot: ClientSlot = {
+            let mut clients = self.clients.lock().await;
+            clients.entry(cfg.name.clone()).or_default().clone()
+        };
+        let client = slot
+            .get_or_try_init(|| async {
+                let client = (self.connector)(cfg.clone()).await?;
+                // Reaching run() means the (protected) ask was approved
+                // upstream — record the grant now, keyed to the *same* hash
+                // the screen showed (H-07: shown value == recorded value,
+                // from one read).
+                let hash = self.hash_of(cfg);
+                self.trust
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .record(&cfg.name, &hash);
+                Ok::<_, String>(client)
+            })
+            .await?;
         Ok(client.clone())
     }
 
@@ -153,8 +169,8 @@ impl Tool for McpTool {
     fn name(&self) -> &'static str {
         "mcp"
     }
-    fn description(&self) -> &'static str {
-        self.description
+    fn description(&self) -> &str {
+        &self.description
     }
     fn schema(&self) -> Value {
         json!({
@@ -179,7 +195,7 @@ impl Tool for McpTool {
             return Permission::None;
         };
         let hash = self.hash_of(cfg);
-        if self.trust.lock().expect("trust mutex").is_trusted(server, &hash) {
+        if self.trust.lock().unwrap_or_else(PoisonError::into_inner).is_trusted(server, &hash) {
             Permission::Ask { summary }
         } else {
             Permission::AskProtected {

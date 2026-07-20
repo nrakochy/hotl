@@ -119,35 +119,63 @@ fn seatbelt_command(command: &str) -> tokio::process::Command {
 
 #[cfg(target_os = "linux")]
 fn landlock_command(command: &str) -> tokio::process::Command {
+    use std::os::unix::io::{AsRawFd, OwnedFd};
+
     use landlock::{
         Access, AccessFs, PathFd, Ruleset, RulesetAttr, RulesetCreatedAttr, ABI,
     };
-    let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let tmp = canon(std::env::temp_dir());
+
+    /// Build the fully-populated ruleset **in the parent**: `pre_exec` runs
+    /// between fork and exec in a multithreaded process, where allocation
+    /// (malloc lock) and other non-async-signal-safe work can deadlock, so
+    /// everything that allocates happens here, before the spawn.
+    fn build_ruleset() -> Option<OwnedFd> {
+        let abi = ABI::V2;
+        let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let tmp = canon(std::env::temp_dir());
+        let mut ruleset =
+            Ruleset::default().handle_access(AccessFs::from_all(abi)).ok()?.create().ok()?;
+        // Read + execute everywhere.
+        ruleset = ruleset
+            .add_rule(landlock::PathBeneath::new(PathFd::new("/").ok()?, AccessFs::from_read(abi)))
+            .ok()?;
+        // Full access under cwd, tmp, /dev.
+        for p in [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")] {
+            if let Ok(fd) = PathFd::new(p) {
+                ruleset = ruleset
+                    .add_rule(landlock::PathBeneath::new(fd, AccessFs::from_all(abi)))
+                    .ok()?;
+            }
+        }
+        // Extract the ruleset fd; None when the kernel can't enforce it.
+        ruleset.into()
+    }
+
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(command);
+    // The OwnedFd is captured by the closure, so it stays open across every
+    // spawn of this Command (pre_exec runs after fork, before exec — a
+    // parent-owned fd is still open in the child there). Fail-closed: with
+    // no usable fd the child refuses to exec rather than run unconfined.
+    let ruleset_fd: Option<OwnedFd> = build_ruleset();
+    let apply = move || {
+        // Async-signal-safe only from here: raw syscalls, no allocation.
+        let Some(fd) = ruleset_fd.as_ref().map(|f| f.as_raw_fd()) else {
+            return Err(std::io::Error::from_raw_os_error(libc::ENOSYS));
+        };
+        // SAFETY: plain syscalls with no memory handed to the kernel beyond
+        // the fd and integer flags.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, fd, 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    };
+    // SAFETY: `apply` performs only async-signal-safe operations (see above).
     unsafe {
-        cmd.pre_exec(move || {
-            let abi = ABI::V2;
-            let apply = || -> Result<(), Box<dyn std::error::Error>> {
-                let mut ruleset = Ruleset::default().handle_access(AccessFs::from_all(abi))?.create()?;
-                // Read + execute everywhere.
-                ruleset = ruleset.add_rule(landlock::PathBeneath::new(
-                    PathFd::new("/")?,
-                    AccessFs::from_read(abi),
-                ))?;
-                // Full access under cwd, tmp, /dev.
-                for p in [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")] {
-                    if let Ok(fd) = PathFd::new(p) {
-                        ruleset = ruleset
-                            .add_rule(landlock::PathBeneath::new(fd, AccessFs::from_all(abi)))?;
-                    }
-                }
-                ruleset.restrict_self()?;
-                Ok(())
-            };
-            apply().map_err(|e| std::io::Error::other(format!("landlock: {e}")))
-        });
+        cmd.pre_exec(apply);
     }
     cmd
 }

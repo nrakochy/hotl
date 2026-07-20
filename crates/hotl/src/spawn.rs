@@ -100,7 +100,7 @@ impl Tool for SpawnTool {
     fn name(&self) -> &'static str {
         "spawn"
     }
-    fn description(&self) -> &'static str {
+    fn description(&self) -> &str {
         "Delegate a self-contained subtask to a fresh sub-agent with its own isolated context. \
          It runs to completion and returns only its final result. Use for focused, separable work \
          (research a question, summarize a large file) that would otherwise crowd your context. \
