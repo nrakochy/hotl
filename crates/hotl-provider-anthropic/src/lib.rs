@@ -107,6 +107,63 @@ fn build_messages(items: &[Item], cache_static: bool) -> Vec<Value> {
     out
 }
 
+
+/// One send attempt, classified. Keeps the stream generator small while
+/// letting it yield `Retrying` events live (during the backoff, not after).
+enum Attempt {
+    Ok(reqwest::Response),
+    Retry { reason: String, wait_secs: u64 },
+    Fail(ProviderError),
+}
+
+fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
+    match hotl_provider::retry::classify(&err, attempt) {
+        hotl_provider::retry::Decision::Retry { after_secs } => Attempt::Retry { reason, wait_secs: after_secs },
+        hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
+    }
+}
+
+async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
+    if resp.status().is_success() {
+        return Attempt::Ok(resp);
+    }
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    let message = resp.text().await.unwrap_or_default();
+    if status == 401 || status == 403 {
+        return Attempt::Fail(ProviderError::Auth(message));
+    }
+    let err = ProviderError::Http { status, message, retry_after };
+    classify_send(err, attempt, format!("HTTP {status}"))
+}
+
+async fn send_attempt(
+    client: &reqwest::Client,
+    api_key: &str,
+    body: &Value,
+    attempt: u32,
+) -> Attempt {
+    let sent = client
+        .post(API_URL)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", API_VERSION)
+        .header("content-type", "application/json")
+        .json(body)
+        .send()
+        .await;
+    match sent {
+        Ok(resp) => classify_response(resp, attempt).await,
+        Err(e) => {
+            let reason = e.to_string();
+            classify_send(ProviderError::Transport(reason.clone()), attempt, reason)
+        }
+    }
+}
+
 impl Provider for AnthropicProvider {
     fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let client = self.client.clone();
@@ -117,89 +174,23 @@ impl Provider for AnthropicProvider {
             let mut attempt: u32 = 0;
             let response = loop {
                 attempt += 1;
-                let sent = client
-                    .post(API_URL)
-                    .header("x-api-key", &api_key)
-                    .header("anthropic-version", API_VERSION)
-                    .header("content-type", "application/json")
-                    .json(&body)
-                    .send()
-                    .await;
-                match sent {
-                    Ok(resp) if resp.status().is_success() => break resp,
-                    Ok(resp) => {
-                        let status = resp.status().as_u16();
-                        let retry_after = resp
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.parse::<u64>().ok());
-                        let message = resp.text().await.unwrap_or_default();
-                        if status == 401 || status == 403 {
-                            yield Err(ProviderError::Auth(message));
-                            return;
-                        }
-                        let err = ProviderError::Http { status, message, retry_after };
-                        match hotl_provider::retry::classify(&err, attempt) {
-                            hotl_provider::retry::Decision::Retry { after_secs } => {
-                                yield Ok(StreamEvent::Retrying { attempt, reason: format!("HTTP {status}") });
-                                tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
-                                continue;
-                            }
-                            hotl_provider::retry::Decision::Fatal => {
-                                yield Err(err);
-                                return;
-                            }
-                        }
+                match send_attempt(&client, &api_key, &body, attempt).await {
+                    Attempt::Ok(resp) => break resp,
+                    Attempt::Retry { reason, wait_secs } => {
+                        yield Ok(StreamEvent::Retrying { attempt, reason });
+                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
                     }
-                    Err(e) => {
-                        let err = ProviderError::Transport(e.to_string());
-                        match hotl_provider::retry::classify(&err, attempt) {
-                            hotl_provider::retry::Decision::Retry { after_secs } => {
-                                yield Ok(StreamEvent::Retrying { attempt, reason: e.to_string() });
-                                tokio::time::sleep(std::time::Duration::from_secs(after_secs)).await;
-                                continue;
-                            }
-                            hotl_provider::retry::Decision::Fatal => {
-                                yield Err(err);
-                                return;
-                            }
-                        }
+                    Attempt::Fail(e) => {
+                        yield Err(e);
+                        return;
                     }
                 }
             };
-
             yield Ok(StreamEvent::Started);
-
-            let mut assembler = sse::Assembler::default();
-            let mut parser = sse::SseParser::default();
-            let mut bytes = response.bytes_stream();
-            while let Some(chunk) = bytes.next().await {
-                let chunk = match chunk {
-                    Ok(c) => c,
-                    Err(e) => {
-                        yield Err(ProviderError::Transport(format!("stream interrupted: {e}")));
-                        return;
-                    }
-                };
-                for data in parser.feed(&chunk) {
-                    match assembler.handle(&data) {
-                        Ok(events) => {
-                            for ev in events {
-                                yield Ok(ev);
-                            }
-                        }
-                        Err(e) => {
-                            yield Err(e);
-                            return;
-                        }
-                    }
-                }
-            }
-            if let Some(done) = assembler.finish() {
-                yield Ok(done);
-            } else {
-                yield Err(ProviderError::Parse("stream ended before message_stop".into()));
+            let inner = hotl_provider::drive_sse(response.bytes_stream(), sse::Assembler::default());
+            futures_util::pin_mut!(inner);
+            while let Some(ev) = inner.next().await {
+                yield ev;
             }
         })
     }

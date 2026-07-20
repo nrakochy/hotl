@@ -5,8 +5,7 @@
 //! buffered, not lossily decoded). `Assembler` folds the Messages-API event
 //! sequence into `StreamEvent`s and the final verbatim block list.
 
-use hotl_provider::{ProviderError, StreamEvent};
-pub(crate) use hotl_provider::SseParser;
+use hotl_provider::{ProviderError, SseAssembler, StreamEvent};
 use hotl_types::{StopReason, TokenUsage};
 use serde_json::Value;
 
@@ -20,93 +19,124 @@ pub(crate) struct Assembler {
     done: Option<StreamEvent>,
 }
 
-impl Assembler {
-    pub(crate) fn handle(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
+fn index_of(v: &Value) -> usize {
+    v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize
+}
+
+impl SseAssembler for Assembler {
+    /// Dispatch one wire event; unknown kinds (ping, future events) are ignored.
+    fn handle(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
         let v: Value = serde_json::from_str(data)
             .map_err(|e| ProviderError::Parse(format!("bad SSE json: {e}")))?;
-        let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
-        let mut out = Vec::new();
-        match kind {
+        match v.get("type").and_then(Value::as_str).unwrap_or("") {
             "message_start" => {
                 if let Some(u) = v.pointer("/message/usage") {
                     crate::merge_usage(&mut self.usage, u);
                 }
+                Ok(vec![])
             }
-            "content_block_start" => {
-                let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let block = v.get("content_block").cloned().unwrap_or(Value::Null);
-                let block_kind = block.get("type").and_then(Value::as_str).unwrap_or("").to_string();
-                if self.blocks.len() <= index {
-                    self.blocks.resize(index + 1, Value::Null);
-                }
-                self.blocks[index] = block;
-                out.push(StreamEvent::BlockStart { index, kind: block_kind });
-            }
-            "content_block_delta" => {
-                let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                let delta = v.get("delta").cloned().unwrap_or(Value::Null);
-                match delta.get("type").and_then(Value::as_str).unwrap_or("") {
-                    "text_delta" => {
-                        let text = delta.get("text").and_then(Value::as_str).unwrap_or("").to_string();
-                        self.append_str(index, "text", &text);
-                        out.push(StreamEvent::TextDelta { index, text });
-                    }
-                    "thinking_delta" => {
-                        let text = delta.get("thinking").and_then(Value::as_str).unwrap_or("").to_string();
-                        self.append_str(index, "thinking", &text);
-                        out.push(StreamEvent::ThinkingDelta { index, text });
-                    }
-                    "input_json_delta" => {
-                        let json = delta.get("partial_json").and_then(Value::as_str).unwrap_or("").to_string();
-                        self.partial_json.entry(index).or_default().push_str(&json);
-                        out.push(StreamEvent::ToolInputDelta { index, json });
-                    }
-                    "signature_delta" => {
-                        let sig = delta.get("signature").and_then(Value::as_str).unwrap_or("");
-                        self.append_str(index, "signature", sig);
-                    }
-                    // Unknown delta kinds: skipped, not fatal (forward compat).
-                    _ => {}
-                }
-            }
-            "content_block_stop" => {
-                let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-                // Seal accumulated tool input into the block's `input`.
-                if let Some(partial) = self.partial_json.remove(&index) {
-                    if !partial.trim().is_empty() {
-                        let input: Value = serde_json::from_str(&partial).map_err(|e| {
-                            ProviderError::Parse(format!("tool input didn't parse at block {index}: {e}"))
-                        })?;
-                        if let Some(b) = self.blocks.get_mut(index) {
-                            b["input"] = input;
-                        }
-                    }
-                }
-                out.push(StreamEvent::BlockEnd { index });
-            }
+            "content_block_start" => Ok(vec![self.on_block_start(&v)]),
+            "content_block_delta" => Ok(self.on_block_delta(&v)),
+            "content_block_stop" => self.on_block_stop(&v).map(|ev| vec![ev]),
             "message_delta" => {
-                if let Some(u) = v.get("usage") {
-                    crate::merge_usage(&mut self.usage, u);
-                }
-                if let Some(s) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                    self.stop = Some(crate::stop_reason_from_wire(s));
-                }
+                self.on_message_delta(&v);
+                Ok(vec![])
             }
             "message_stop" => {
-                self.done = Some(StreamEvent::Completed {
-                    stop: self.stop.unwrap_or(StopReason::EndTurn),
-                    usage: self.usage,
-                    blocks: self.blocks.iter().filter(|b| !b.is_null()).cloned().collect(),
-                });
+                self.seal();
+                Ok(vec![])
             }
             "error" => {
                 let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("unknown");
-                return Err(ProviderError::Http { status: 200, message: format!("in-stream error: {msg}"), retry_after: None });
+                Err(ProviderError::Http {
+                    status: 200,
+                    message: format!("in-stream error: {msg}"),
+                    retry_after: None,
+                })
             }
-            // ping and future event types: ignore.
-            _ => {}
+            _ => Ok(vec![]),
         }
-        Ok(out)
+    }
+
+    fn finish(mut self) -> Result<StreamEvent, ProviderError> {
+        self.done
+            .take()
+            .ok_or_else(|| ProviderError::Parse("stream ended before message_stop".into()))
+    }
+}
+
+impl Assembler {
+    fn on_block_start(&mut self, v: &Value) -> StreamEvent {
+        let index = index_of(v);
+        let block = v.get("content_block").cloned().unwrap_or(Value::Null);
+        let kind = block.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+        if self.blocks.len() <= index {
+            self.blocks.resize(index + 1, Value::Null);
+        }
+        self.blocks[index] = block;
+        StreamEvent::BlockStart { index, kind }
+    }
+
+    fn on_block_delta(&mut self, v: &Value) -> Vec<StreamEvent> {
+        let index = index_of(v);
+        let delta = v.get("delta").cloned().unwrap_or(Value::Null);
+        let text_of = |field: &str| delta.get(field).and_then(Value::as_str).unwrap_or("").to_string();
+        match delta.get("type").and_then(Value::as_str).unwrap_or("") {
+            "text_delta" => {
+                let text = text_of("text");
+                self.append_str(index, "text", &text);
+                vec![StreamEvent::TextDelta { index, text }]
+            }
+            "thinking_delta" => {
+                let text = text_of("thinking");
+                self.append_str(index, "thinking", &text);
+                vec![StreamEvent::ThinkingDelta { index, text }]
+            }
+            "input_json_delta" => {
+                let json = text_of("partial_json");
+                self.partial_json.entry(index).or_default().push_str(&json);
+                vec![StreamEvent::ToolInputDelta { index, json }]
+            }
+            "signature_delta" => {
+                self.append_str(index, "signature", &text_of("signature"));
+                vec![]
+            }
+            // Unknown delta kinds: skipped, not fatal (forward compat).
+            _ => vec![],
+        }
+    }
+
+    /// Seal accumulated tool input into the block's `input`.
+    fn on_block_stop(&mut self, v: &Value) -> Result<StreamEvent, ProviderError> {
+        let index = index_of(v);
+        if let Some(partial) = self.partial_json.remove(&index) {
+            if !partial.trim().is_empty() {
+                let input: Value = serde_json::from_str(&partial).map_err(|e| {
+                    ProviderError::Parse(format!("tool input didn't parse at block {index}: {e}"))
+                })?;
+                if let Some(b) = self.blocks.get_mut(index) {
+                    b["input"] = input;
+                }
+            }
+        }
+        Ok(StreamEvent::BlockEnd { index })
+    }
+
+    fn on_message_delta(&mut self, v: &Value) {
+        if let Some(u) = v.get("usage") {
+            crate::merge_usage(&mut self.usage, u);
+        }
+        if let Some(s) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+            self.stop = Some(crate::stop_reason_from_wire(s));
+        }
+    }
+
+    fn seal(&mut self) {
+        self.done = Some(StreamEvent::Completed {
+            stop: self.stop.unwrap_or(StopReason::EndTurn),
+            usage: self.usage,
+            blocks: self.blocks.iter().filter(|b| !b.is_null()).cloned().collect(),
+        });
     }
 
     fn append_str(&mut self, index: usize, field: &str, s: &str) {
@@ -119,11 +149,8 @@ impl Assembler {
             }
         }
     }
-
-    pub(crate) fn finish(&mut self) -> Option<StreamEvent> {
-        self.done.take()
-    }
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -131,7 +158,7 @@ mod tests {
 
     #[test]
     fn parses_split_chunks_and_assembles_blocks() {
-        let mut p = SseParser::default();
+        let mut p = hotl_provider::SseParser::default();
         let mut a = Assembler::default();
         // A realistic stream, deliberately split mid-line across chunks.
         let wire = concat!(

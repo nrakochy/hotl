@@ -75,17 +75,6 @@ pub enum ProviderError {
     Parse(String),
 }
 
-impl ProviderError {
-    /// M0 dumb retry cap: 429 / 5xx / transport are retryable, nothing else.
-    pub fn retryable(&self) -> bool {
-        match self {
-            ProviderError::Http { status, .. } => *status == 429 || *status >= 500,
-            ProviderError::Transport(_) => true,
-            _ => false,
-        }
-    }
-}
-
 pub trait Provider: Send + Sync {
     fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>>;
 }
@@ -280,5 +269,46 @@ pub mod transform {
             assert_eq!(out[0]["type"], "text");
             assert_eq!(out[1]["type"], "tool_use");
         }
+    }
+}
+
+/// Wire-format folding, implemented per provider: turn one SSE `data:`
+/// payload into events, and produce the terminal `Completed` at end-of-stream.
+pub trait SseAssembler {
+    fn handle(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError>;
+    fn finish(self) -> Result<StreamEvent, ProviderError>;
+}
+
+/// Drive an SSE byte stream through the line parser and an assembler.
+/// Shared by every HTTP provider; wasm-clean (no HTTP client dependency).
+pub fn drive_sse<B, E, A>(
+    bytes: B,
+    mut assembler: A,
+) -> impl futures_util::Stream<Item = Result<StreamEvent, ProviderError>>
+where
+    B: futures_util::Stream<Item = Result<bytes::Bytes, E>>,
+    E: std::fmt::Display,
+    A: SseAssembler,
+{
+    async_stream::stream! {
+        let mut parser = SseParser::default();
+        futures_util::pin_mut!(bytes);
+        use futures_util::StreamExt;
+        while let Some(chunk) = bytes.next().await {
+            let chunk = match chunk {
+                Ok(c) => c,
+                Err(e) => {
+                    yield Err(ProviderError::Transport(format!("stream interrupted: {e}")));
+                    return;
+                }
+            };
+            for data in parser.feed(&chunk) {
+                match assembler.handle(&data) {
+                    Ok(events) => for ev in events { yield Ok(ev); },
+                    Err(e) => { yield Err(e); return; }
+                }
+            }
+        }
+        yield assembler.finish();
     }
 }

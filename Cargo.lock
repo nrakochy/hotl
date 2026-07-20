@@ -456,6 +456,8 @@ version = "0.1.2"
 name = "hotl-provider"
 version = "0.1.2"
 dependencies = [
+ "async-stream",
+ "bytes",
  "futures-util",
  "hotl-types",
  "serde",
