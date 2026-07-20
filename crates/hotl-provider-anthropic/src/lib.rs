@@ -11,8 +11,11 @@
 
 mod sse;
 
+use std::sync::Arc;
+
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
+use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{Provider, ProviderError, SamplingRequest, StreamEvent, ToolDef};
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
@@ -23,12 +26,19 @@ const API_VERSION: &str = "2023-06-01";
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: String,
+    key_source: Arc<dyn KeySource>,
+    api_url: String,
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: String) -> Self {
-        Self { client: reqwest::Client::new(), api_key }
+    pub fn new(key_source: Arc<dyn KeySource>) -> Self {
+        Self { client: reqwest::Client::new(), key_source, api_url: API_URL.to_string() }
+    }
+
+    #[cfg(test)]
+    fn with_api_url(mut self, url: String) -> Self {
+        self.api_url = url;
+        self
     }
 
     fn build_body(req: &SamplingRequest) -> Value {
@@ -158,12 +168,13 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
 
 async fn send_attempt(
     client: &reqwest::Client,
+    url: &str,
     api_key: &str,
     body: &Value,
     attempt: u32,
 ) -> Attempt {
     let sent = client
-        .post(API_URL)
+        .post(url)
         .header("x-api-key", api_key)
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
@@ -179,21 +190,63 @@ async fn send_attempt(
     }
 }
 
+/// Handles one `Attempt::Fail(Auth)` outcome: refresh-and-retry once per
+/// request (via `auth_retry`), or surface. `Ok(reason)` means the key was
+/// refreshed — yield a `Retrying` event with `reason` and loop again.
+/// `Err` means surface the auth error and stop.
+async fn handle_auth_fail(
+    source: &Arc<dyn KeySource>,
+    auth_retry: &mut AuthRetry,
+    msg: String,
+) -> Result<String, ProviderError> {
+    match auth_retry.on_auth_error(source.refreshable()) {
+        AuthAction::RefreshAndRetry => match source.refresh().await {
+            Ok(()) => Ok("auth failed — re-running api_key_helper".into()),
+            Err(ke) => Err(ProviderError::Auth(format!("{msg} (key refresh also failed: {ke})"))),
+        },
+        AuthAction::Surface => Err(ProviderError::Auth(msg)),
+    }
+}
+
 impl Provider for AnthropicProvider {
     fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let client = self.client.clone();
-        let api_key = self.api_key.clone();
         let body = Self::build_body(&req);
+        let source = self.key_source.clone();
+        let api_url = self.api_url.clone();
 
         Box::pin(async_stream::stream! {
             let mut attempt: u32 = 0;
+            let mut auth_retry = AuthRetry::default();
             let response = loop {
                 attempt += 1;
-                match send_attempt(&client, &api_key, &body, attempt).await {
+                let key = match source.get().await {
+                    Ok(Some(k)) => k,
+                    Ok(None) => {
+                        yield Err(ProviderError::Auth(
+                            "no Anthropic key: set ANTHROPIC_API_KEY or configure [provider] api_key_helper".into(),
+                        ));
+                        return;
+                    }
+                    Err(e) => {
+                        yield Err(ProviderError::Auth(e.0));
+                        return;
+                    }
+                };
+                match send_attempt(&client, &api_url, &key, &body, attempt).await {
                     Attempt::Ok(resp) => break resp,
                     Attempt::Retry { reason, wait_secs } => {
                         yield Ok(StreamEvent::Retrying { attempt, reason });
                         tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                    }
+                    Attempt::Fail(ProviderError::Auth(msg)) => {
+                        match handle_auth_fail(&source, &mut auth_retry, msg).await {
+                            Ok(reason) => yield Ok(StreamEvent::Retrying { attempt, reason }),
+                            Err(e) => {
+                                yield Err(e);
+                                return;
+                            }
+                        }
                     }
                     Attempt::Fail(e) => {
                         yield Err(e);
@@ -236,6 +289,93 @@ pub(crate) fn merge_usage(into: &mut TokenUsage, v: &Value) {
 mod tests {
     use super::*;
     use hotl_types::ToolResultItem;
+
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use futures_util::future::BoxFuture;
+    use hotl_provider::key::{KeyError, KeySource};
+
+    /// Key source yielding key-1, then key-2 after refresh.
+    struct FlippingKey(StdMutex<u32>);
+    impl KeySource for FlippingKey {
+        fn get(&self) -> BoxFuture<'_, Result<Option<String>, KeyError>> {
+            let n = *self.0.lock().unwrap();
+            Box::pin(async move { Ok(Some(format!("key-{n}"))) })
+        }
+        fn refresh(&self) -> BoxFuture<'_, Result<(), KeyError>> {
+            *self.0.lock().unwrap() += 1;
+            Box::pin(async { Ok(()) })
+        }
+        fn refreshable(&self) -> bool { true }
+    }
+
+    const SSE_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    const AUTH_401: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad api key";
+
+    /// Serve `responses` to consecutive connections; record each request's
+    /// `x-api-key` header (lowercased) into `seen`.
+    async fn tcp_double(
+        responses: Vec<&'static str>,
+        seen: Arc<StdMutex<Vec<String>>>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut req = String::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if req.contains("\r\n\r\n") { break; }
+                }
+                let auth = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("x-api-key:"))
+                    .map(|l| l.split_once(':').unwrap().1.trim().to_string())
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(auth);
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.shutdown().await.ok();
+            }
+        });
+        base
+    }
+
+    fn sampling_req() -> SamplingRequest {
+        SamplingRequest {
+            model: "m".into(),
+            max_tokens: 16,
+            system: "".into(),
+            items: std::sync::Arc::new(vec![Item::User { text: "hi".into(), synthetic: None }]),
+            tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
+            thinking: false,
+            cache_static: false,
+            turn_context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_401_refreshes_key_once_and_retries() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![AUTH_401, SSE_OK], seen.clone()).await;
+        let p = AnthropicProvider::new(Arc::new(FlippingKey(StdMutex::new(1)))).with_api_url(format!("{base}/messages"));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        assert_eq!(*seen.lock().unwrap(), vec!["key-1", "key-2"]);
+    }
+
+    #[tokio::test]
+    async fn keyless_source_is_an_auth_error_with_instruction() {
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        match events.last() {
+            Some(Err(ProviderError::Auth(m))) => assert!(m.contains("ANTHROPIC_API_KEY"), "{m}"),
+            other => panic!("expected Auth error, got {other:?}"),
+        }
+    }
 
     #[test]
     fn body_shape_and_cache_placement() {

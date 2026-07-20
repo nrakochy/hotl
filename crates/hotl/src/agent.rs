@@ -976,7 +976,10 @@ pub(crate) fn select_provider(
                  `hotl watch` needs no key."
                     .to_string()
             })?;
-            Ok((Arc::new(AnthropicProvider::new(key)), model))
+            Ok((
+                Arc::new(AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some(key))))),
+                model,
+            ))
         }
         "openai" | "oai" => {
             let base = secrets
