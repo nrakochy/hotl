@@ -23,3 +23,16 @@ watch_listener = { package = "hotl-watch-listener", path = "../watch-listener", 
 watch_tui = { package = "hotl-watch-tui", path = "../watch-tui", version = "0.1.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+hotl-types = { path = "../hotl-types", version = "0.1.2" }
+hotl-platform = { path = "../hotl-platform", version = "0.1.2" }
+hotl-provider = { path = "../hotl-provider", version = "0.1.2" }
+hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.1.2" }
+hotl-tools = { path = "../hotl-tools", version = "0.1.2" }
+hotl-store = { path = "../hotl-store", version = "0.1.2" }
+hotl-context = { path = "../hotl-context", version = "0.1.2" }
+hotl-engine = { path = "../hotl-engine", version = "0.1.2" }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+anyhow = { workspace = true }
