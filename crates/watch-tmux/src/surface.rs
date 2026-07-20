@@ -1,7 +1,7 @@
 use crate::panes::{list_panes, run_jump, Pane};
 use crate::procs::{agent_for, read_proc_table, ProcTable};
 use crate::status::classify;
-use types::{AgentObservation, Location, LocationHandle, Source, Surface, SurfaceError};
+use watch_types::{AgentObservation, Location, LocationHandle, Source, Surface, SurfaceError};
 
 pub struct TmuxSurface {
     agents: Vec<String>,
@@ -96,7 +96,7 @@ mod tests {
     use super::*;
     use crate::panes::parse_panes;
     use crate::procs::parse_ps;
-    use types::Status;
+    use watch_types::Status;
 
     const PANES: &str = "\
 base-0\u{1f}0\u{1f}zsh\u{1f}0\u{1f}%25\u{1f}35580\u{1f}claude\u{1f}/tmp/a\u{1f}0\u{1f}1\u{1f}✳ task a

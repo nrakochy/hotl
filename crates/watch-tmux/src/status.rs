@@ -1,4 +1,4 @@
-use types::Status;
+use watch_types::Status;
 
 pub struct Signals<'a> {
     pub title: &'a str,

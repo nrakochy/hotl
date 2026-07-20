@@ -1,5 +1,5 @@
 use crossterm::event::{KeyCode, KeyModifiers};
-use types::{AgentObservation, Status};
+use watch_types::{AgentObservation, Status};
 
 #[derive(Debug, Default)]
 pub struct AppState {
@@ -24,7 +24,7 @@ impl AppState {
 
     fn id(o: &AgentObservation) -> String {
         match &o.location.handle {
-            types::LocationHandle::Tmux { pane_id, .. } => format!("tmux:{pane_id}"),
+            watch_types::LocationHandle::Tmux { pane_id, .. } => format!("tmux:{pane_id}"),
         }
     }
 
@@ -62,7 +62,7 @@ pub enum Msg {
     // Ctrl-h/j/k/l: vim-tmux-navigator style. Move within the list when the
     // direction has somewhere to go; otherwise hand off to the neighboring
     // tmux pane. Left/right always hand off (the list is one-dimensional).
-    CtrlNav(types::Dir),
+    CtrlNav(watch_types::Dir),
     Refresh,
     Quit,
     // Ok carries observations plus any per-surface partial-failure warnings.
@@ -79,7 +79,7 @@ pub enum Cmd {
     // Boxed: AgentObservation is large relative to the other variants, so
     // boxing keeps Cmd small (avoids clippy::large_enum_variant).
     Jump(Box<AgentObservation>),
-    SelectPane(types::Dir),
+    SelectPane(watch_types::Dir),
     Ping,
     Quit,
 }
@@ -148,10 +148,10 @@ pub fn decode_key(
         *pending = None;
         return match code {
             KeyCode::Char('c') => Msg::Quit,
-            KeyCode::Char('j') => Msg::CtrlNav(types::Dir::Down),
-            KeyCode::Char('k') => Msg::CtrlNav(types::Dir::Up),
-            KeyCode::Char('h') => Msg::CtrlNav(types::Dir::Left),
-            KeyCode::Char('l') => Msg::CtrlNav(types::Dir::Right),
+            KeyCode::Char('j') => Msg::CtrlNav(watch_types::Dir::Down),
+            KeyCode::Char('k') => Msg::CtrlNav(watch_types::Dir::Up),
+            KeyCode::Char('h') => Msg::CtrlNav(watch_types::Dir::Left),
+            KeyCode::Char('l') => Msg::CtrlNav(watch_types::Dir::Right),
             _ => Msg::Ignored,
         };
     }
@@ -194,7 +194,7 @@ pub fn decode_key(
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers};
-    use types::{Agent, Location, LocationHandle, Source};
+    use watch_types::{Agent, Location, LocationHandle, Source};
 
     fn obs(pane: &str, status: Status) -> AgentObservation {
         AgentObservation {
@@ -304,7 +304,7 @@ mod tests {
     fn ctrl_nav_always_selects_neighbor_pane() {
         let mut s = AppState::new(true, true);
         update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
-        for dir in [types::Dir::Up, types::Dir::Down, types::Dir::Left, types::Dir::Right] {
+        for dir in [watch_types::Dir::Up, watch_types::Dir::Down, watch_types::Dir::Left, watch_types::Dir::Right] {
             assert_eq!(update(&mut s, Msg::CtrlNav(dir)), vec![Cmd::SelectPane(dir)]);
             assert_eq!(s.cursor, 0, "Ctrl-nav never moves the list cursor");
         }
@@ -338,10 +338,10 @@ mod tests {
     fn ctrl_chords_decode_to_directional_nav_regardless_of_vim_mode() {
         let mut p = None;
         let c = KeyModifiers::CONTROL;
-        assert_eq!(dk(KeyCode::Char('j'), c, false, &mut p), Msg::CtrlNav(types::Dir::Down));
-        assert_eq!(dk(KeyCode::Char('k'), c, false, &mut p), Msg::CtrlNav(types::Dir::Up));
-        assert_eq!(dk(KeyCode::Char('h'), c, false, &mut p), Msg::CtrlNav(types::Dir::Left));
-        assert_eq!(dk(KeyCode::Char('l'), c, false, &mut p), Msg::CtrlNav(types::Dir::Right));
+        assert_eq!(dk(KeyCode::Char('j'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Down));
+        assert_eq!(dk(KeyCode::Char('k'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Up));
+        assert_eq!(dk(KeyCode::Char('h'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Left));
+        assert_eq!(dk(KeyCode::Char('l'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Right));
     }
 
     #[test]

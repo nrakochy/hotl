@@ -17,9 +17,9 @@ name = "hotl"
 path = "src/main.rs"
 
 [dependencies]
-types = { package = "hotl-types", path = "../hotl-types", version = "0.1.0" }
-tmux = { package = "hotl-tmux", path = "../hotl-tmux", version = "0.1.0" }
-listener = { package = "hotl-listener", path = "../hotl-listener", version = "0.1.0" }
-tui = { package = "hotl-tui", path = "../hotl-tui", version = "0.1.0" }
+watch_types = { package = "hotl-watch-types", path = "../watch-types", version = "0.1.0" }
+watch_tmux = { package = "hotl-watch-tmux", path = "../watch-tmux", version = "0.1.0" }
+watch_listener = { package = "hotl-watch-listener", path = "../watch-listener", version = "0.1.0" }
+watch_tui = { package = "hotl-watch-tui", path = "../watch-tui", version = "0.1.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }

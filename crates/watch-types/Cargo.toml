@@ -1,6 +1,6 @@
 [package]
-name = "hotl-tmux"
-description = "tmux/ps shims and agent status detection for hotl."
+name = "hotl-watch-types"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. Core config, observation model, and surface trait for hotl."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,8 +12,9 @@ keywords = ["tmux", "agent", "dashboard"]
 categories = ["command-line-utilities"]
 
 [lib]
-name = "tmux"
+name = "watch_types"
 path = "src/lib.rs"
 
 [dependencies]
-types = { package = "hotl-types", path = "../hotl-types", version = "0.1.0" }
+serde = { workspace = true }
+toml = { workspace = true }

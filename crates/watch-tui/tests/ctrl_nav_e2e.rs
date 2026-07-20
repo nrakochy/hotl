@@ -1,8 +1,8 @@
 // End-to-end: a raw Ctrl-k / Ctrl-j keystroke flows through decode_key and
 // update to a pane switch, while plain j/k stay list navigation.
 use crossterm::event::{KeyCode, KeyModifiers};
-use tui::{decode_key, update, AppState, Cmd, Msg};
-use types::{Agent, AgentObservation, Dir, Location, LocationHandle, Source, Status};
+use watch_tui::{decode_key, update, AppState, Cmd, Msg};
+use watch_types::{Agent, AgentObservation, Dir, Location, LocationHandle, Source, Status};
 
 fn obs(pane: &str) -> AgentObservation {
     AgentObservation {

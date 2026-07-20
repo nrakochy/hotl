@@ -1,4 +1,4 @@
-use types::{AgentObservation, Surface, SurfaceError};
+use watch_types::{AgentObservation, Surface, SurfaceError};
 
 /// Result of polling every surface: the observations that succeeded, plus a
 /// warning for each surface that failed. A single broken surface degrades the
@@ -53,7 +53,7 @@ impl Listener {
 mod tests {
     use super::*;
     use std::cell::RefCell;
-    use types::{Agent, Location, LocationHandle, Source, Status};
+    use watch_types::{Agent, Location, LocationHandle, Source, Status};
 
     fn obs(cwd: &str) -> AgentObservation {
         AgentObservation {

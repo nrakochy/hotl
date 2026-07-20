@@ -33,12 +33,12 @@ fn matched_agent_name(command: &str, agent_names: &[String]) -> Option<String> {
     agent_names.iter().find(|n| n.as_str() == base).cloned()
 }
 
-pub fn agent_for(pane_pid: u32, procs: &ProcTable, agent_names: &[String]) -> Option<types::Agent> {
+pub fn agent_for(pane_pid: u32, procs: &ProcTable, agent_names: &[String]) -> Option<watch_types::Agent> {
     let mut stack = vec![pane_pid];
     while let Some(pid) = stack.pop() {
         if let Some(cmd) = procs.cmd.get(&pid) {
             if let Some(name) = matched_agent_name(cmd, agent_names) {
-                return Some(types::Agent { name, pid, argv: cmd.clone() });
+                return Some(watch_types::Agent { name, pid, argv: cmd.clone() });
             }
         }
         if let Some(kids) = procs.children.get(&pid) {

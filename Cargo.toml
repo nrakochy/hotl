@@ -1,10 +1,10 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/hotl-types",
-    "crates/hotl-tmux",
-    "crates/hotl-listener",
-    "crates/hotl-tui",
+    "crates/watch-types",
+    "crates/watch-tmux",
+    "crates/watch-listener",
+    "crates/watch-tui",
     "crates/hotl",
 ]
 

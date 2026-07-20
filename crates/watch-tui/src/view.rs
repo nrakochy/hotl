@@ -1,7 +1,7 @@
 use crate::app::AppState;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use types::{AgentObservation, Status, Theme};
+use watch_types::{AgentObservation, Status, Theme};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Row {
@@ -55,7 +55,7 @@ pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
 }
 
 fn hex(s: &str, default: Color) -> Color {
-    match types::parse_hex(s) {
+    match watch_types::parse_hex(s) {
         Some([r, g, b]) => Color::Rgb(r, g, b),
         None => default,
     }
@@ -170,7 +170,7 @@ fn row_line(row: &Row, p: &Palette, width: u16) -> Line<'static> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use types::{Agent, Location, LocationHandle, Source};
+    use watch_types::{Agent, Location, LocationHandle, Source};
 
     fn obs(group: &str, sub: &str, cwd: &str, status: Status) -> AgentObservation {
         AgentObservation {

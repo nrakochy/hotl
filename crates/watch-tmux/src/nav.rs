@@ -1,6 +1,6 @@
 use std::io;
 use std::process::Command;
-use types::Dir;
+use watch_types::Dir;
 
 pub fn select_pane_argv(dir: Dir) -> Vec<String> {
     let flag = match dir {

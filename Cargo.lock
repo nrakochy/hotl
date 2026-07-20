@@ -164,38 +164,38 @@ name = "hotl"
 version = "0.1.2"
 dependencies = [
  "crossterm",
- "hotl-listener",
- "hotl-tmux",
- "hotl-tui",
- "hotl-types",
+ "hotl-watch-listener",
+ "hotl-watch-tmux",
+ "hotl-watch-tui",
+ "hotl-watch-types",
  "ratatui",
 ]
 
 [[package]]
-name = "hotl-listener"
+name = "hotl-watch-listener"
 version = "0.1.2"
 dependencies = [
- "hotl-types",
+ "hotl-watch-types",
 ]
 
 [[package]]
-name = "hotl-tmux"
+name = "hotl-watch-tmux"
 version = "0.1.2"
 dependencies = [
- "hotl-types",
+ "hotl-watch-types",
 ]
 
 [[package]]
-name = "hotl-tui"
+name = "hotl-watch-tui"
 version = "0.1.2"
 dependencies = [
  "crossterm",
- "hotl-types",
+ "hotl-watch-types",
  "ratatui",
 ]
 
 [[package]]
-name = "hotl-types"
+name = "hotl-watch-types"
 version = "0.1.2"
 dependencies = [
  "serde",
