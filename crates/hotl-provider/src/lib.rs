@@ -452,6 +452,8 @@ pub mod repair {
     }
 }
 
+pub mod key;
+
 /// Wire-format folding, implemented per provider: turn one SSE `data:`
 /// payload into events, and produce the terminal `Completed` at end-of-stream.
 pub trait SseAssembler {

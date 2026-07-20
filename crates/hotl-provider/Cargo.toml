@@ -17,3 +17,6 @@ thiserror = { workspace = true }
 futures-util = { workspace = true }
 async-stream = { workspace = true }
 bytes = "1"
+
+[dev-dependencies]
+tokio = { workspace = true }
