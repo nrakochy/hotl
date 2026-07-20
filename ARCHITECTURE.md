@@ -39,6 +39,66 @@ flowchart LR
     CORE -- "spawn interface<br/>(topology as data)" --> AGENTS["Subagents / forks / teams<br/>other harnesses via ACP or MCP"]
 ```
 
+## How a prompt flows (M1 runtime)
+
+One cycle: prompt → actor commits it → turn task samples against a snapshot → deltas stream to the surface → tool calls pass rules/ask and run (bash confined) → results commit → re-snapshot (steers woven in) → repeat until done. Every write goes through the actor and hits disk before the projection advances; ctrl-c bypasses the mailbox entirely.
+
+```mermaid
+flowchart TB
+    YOU((you))
+
+    subgraph SURFACE["surface — the hotl binary"]
+        REPL["REPL · -p headless · --json<br/>zsh ':' prefix"]
+    end
+
+    subgraph ENGINE["engine — hotl-engine"]
+        HANDLE["SessionHandle"]
+        ACTOR["session actor<br/>sole committer · owns the projection<br/>steer/queue inbox"]
+        TURN["turn task<br/>sample → tools, until done"]
+    end
+
+    subgraph PROVIDERS["providers — one trait, three impls"]
+        P{{"Provider trait"}}
+        A["Anthropic (SSE)"]
+        O["OpenAI-compatible (SSE)<br/>any base URL: OpenAI, Groq, Ollama…"]
+        S["scripted (tests)"]
+    end
+
+    subgraph TOOLS["tools — hotl-tools"]
+        RULES["allow-rules<br/>deny-first · protected paths never auto"]
+        T["read · edit · write · bash"]
+        SBX["sandbox floor<br/>Seatbelt / Landlock<br/>writes: cwd + tmp only"]
+    end
+
+    LOG[("session log<br/>append-only JSONL<br/>secrets masked at ingestion")]
+    CTX["context assembly<br/>system-prompt file<br/>AGENTS.md in untrusted envelope"]
+
+    YOU -->|"① type a prompt — or a steer mid-turn"| REPL
+    REPL -->|"prompt / steer"| HANDLE
+    HANDLE -->|"commands (bounded mailbox)"| ACTOR
+    HANDLE -.->|"ctrl-c → interrupt token<br/>(out-of-band, never queued)"| TURN
+    CTX -->|"initial items at session start"| ACTOR
+    ACTOR -->|"② durable append first,<br/>then advance projection"| LOG
+    ACTOR -->|"③ spawn one turn"| TURN
+    TURN -->|"④ snapshot at every sample boundary<br/>(steers admitted since ④ appear here)"| ACTOR
+    TURN -->|"⑤ SamplingRequest"| P
+    P --> A
+    P --> O
+    P --> S
+    A -->|"streamed blocks<br/>(verbatim, thinking intact)"| TURN
+    O -->|"streamed blocks<br/>(canonicalized)"| TURN
+    TURN -->|"⑥ text deltas · tool status ·<br/>asks (with reply channel)"| REPL
+    REPL -->|"⑦ y/N answer"| TURN
+    TURN -->|"⑧ each tool call"| RULES
+    RULES -->|"auto-allow (narrated)<br/>or ask via ⑥"| T
+    T -->|"bash runs confined"| SBX
+    T -->|"results — errors instruct the model"| TURN
+    TURN -->|"⑨ propose assistant blocks + results<br/>(committed via ②, then back to ④)"| ACTOR
+    ACTOR -->|"⑩ TurnDone (outcome + usage)"| REPL
+```
+
+`hotl watch` observes from outside this diagram entirely (pane titles, process state — never these internals); `hotl fleet` will one day sit where the surface box is, speaking the same events over ACP.
+
 ## The other two capability stacks (unified layer vocabulary: system-design §Capability namespaces)
 
 - **Watch — W1–W4, shipped** ([system-design §Watch](docs/design-docs/system-design.md); behavior: [product-specs/watch.md](docs/product-specs/watch.md)): observation types + `Surface` trait → surface backends (tmux) → listener (ratatui-free, the non-TUI consumer seam) → Elm TUI; wired by `hotl watch`. Invariants: observe-from-outside; zero shared crates/types with the harness.
