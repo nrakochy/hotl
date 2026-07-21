@@ -2,7 +2,7 @@
 title: 'Run hotl through a gateway — hotl the agent'
 ---
 
-**Mode: how-to.** Point hotl at any OpenAI-compatible gateway (Bifrost,
+Point hotl at any OpenAI-compatible gateway (Bifrost,
 LiteLLM, OpenRouter, a corporate proxy) instead of a provider directly, and
 optionally obtain the API key from a command instead of an env var. Nothing
 here is gateway-specific: a gateway is a base URL, and a key is whatever your

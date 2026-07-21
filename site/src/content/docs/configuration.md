@@ -2,7 +2,7 @@
 title: 'Configuration reference — hotl the agent'
 ---
 
-**Mode: reference.** Facts about the command surface, config files, and environment variables of the `hotl` agent, in the system's own structure. It states what each thing is; it does not teach a workflow (see [quickstart.md](../quickstart/)) or argue for a choice (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). All paths are literal; `~` is the invoking user's home. Behavior described is as of the 2026-07-20 source build.
+Reference for the command surface, config files, and environment variables of the `hotl` agent. For a guided first run see [quickstart.md](../quickstart/); for the reasoning behind the safety model see [permissions-and-sandbox.md](../permissions-and-sandbox/). All paths are literal; `~` is the invoking user's home.
 
 ## Subcommands
 

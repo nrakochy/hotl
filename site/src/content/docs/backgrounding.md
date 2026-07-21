@@ -2,7 +2,7 @@
 title: 'Backgrounding a session'
 ---
 
-**Mode: how-to.** Run a `hotl` agent detached from your terminal, then reconnect to it later — without tmux. Assumes a working agent ([quickstart.md](../quickstart/)).
+Run a `hotl` agent detached from your terminal, then reconnect to it later — without tmux. Assumes a working agent ([quickstart.md](../quickstart/)).
 
 ## The model
 

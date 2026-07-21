@@ -2,7 +2,7 @@
 title: 'Uninstalling hotl'
 ---
 
-**Mode: how-to.** Remove the `hotl` agent and its data. `destructive:` the data steps delete session history and undo snapshots — read before running.
+Remove the `hotl` agent and its data. `destructive:` the data steps delete session history and undo snapshots — read before running.
 
 ## 1. Remove the binary
 

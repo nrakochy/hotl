@@ -2,13 +2,13 @@
 title: 'Quickstart — your first hotl session'
 ---
 
-**Mode: tutorial.** This walks you from nothing installed to a completed agent task, once, with no forks. Every command is copy-runnable and paired with the output you should see. Why things work the way they do is deliberately deferred — see [permissions-and-sandbox.md](../permissions-and-sandbox/) and [configuration.md](../configuration/) once you've finished.
+From nothing installed to a completed agent task. Every command is copy-runnable and paired with the output you should see; the why behind things lives in [permissions-and-sandbox.md](../permissions-and-sandbox/) and [configuration.md](../configuration/).
 
 **Preconditions:**
 - macOS or Linux, a terminal, and `git`.
 - A model to talk to — one of: a local [Ollama](https://ollama.com) server, or an API key for any OpenAI-compatible endpoint. You do **not** need an Anthropic key for this tutorial.
 
-`mutates:` this installs the `hotl` binary, creates config files under `~/.config/hotl/` and a session log under `~/.local/share/hotl/`, and (in the last step) edits a file in a throwaway git repo.
+`mutates:` this installs the `hotl` binary, creates config files under `~/.config/hotl/` and a session log under `~/.local/share/hotl/`, and (in the last step) makes one approved edit in a git repo of your choosing.
 
 ## 1. Install the binary
 
@@ -72,44 +72,29 @@ hotl 0.2.0 — doctor
 
 If the provider line says `FAIL`, your `HOTL_MODEL`/key env vars aren't set — redo step 2 in this same shell. Do not continue past a `FAIL` provider line.
 
-## 4. Make a throwaway workspace
+## 4. Run one task
 
-So the agent has something safe to change, and `undo` has you covered:
-
-```
-mkdir -p /tmp/hotl-demo && cd /tmp/hotl-demo && git init -q
-printf 'fn main() {\n    println!("helo world");\n}\n' > main.rs
-```
-
-## 5. Run one task
-
-Start the agent (interactive):
+`cd` into any git repository (`undo` snapshots ride on git), start the agent:
 
 ```
 hotl
 ```
 
-You'll see a banner and a `❯` prompt. Type this and press enter:
+You'll see a banner and a `❯` prompt. Ask for something small and concrete — a typo fix, a comment, a rename:
 
 ```
-fix the typo in main.rs
+fix the typo in README.md
 ```
 
-The agent will read the file, then ask before it edits — you'll see a line like:
+The agent reads freely, then asks before it edits — you'll see a line like:
 
 ```
-allow edit main.rs? [y/N]
+allow edit README.md? [y/N]
 ```
 
-Type `y` and enter. It applies the edit and reports what it changed. Confirm:
+Type `y` and enter. It applies the edit and reports what it changed. Confirm with `git diff`.
 
-```
-cat /tmp/hotl-demo/main.rs
-```
-
-Expected: `helo` is now `hello`.
-
-## 6. Undo it
+## 5. Undo it
 
 Leave the agent (`Ctrl-D`), then:
 
@@ -117,7 +102,7 @@ Leave the agent (`Ctrl-D`), then:
 hotl undo
 ```
 
-It asks to confirm, lists `main.rs`, and restores the file to before the edit. `cat main.rs` shows `helo` again. That snapshot was taken automatically around the edit in step 5.
+It asks to confirm, lists the files it touched, and restores them to before the edit — `git diff` is clean again. That snapshot was taken automatically around the edit in step 4.
 
 ## You've now seen the whole loop
 

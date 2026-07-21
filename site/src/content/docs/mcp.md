@@ -2,7 +2,7 @@
 title: 'Connecting MCP tool servers'
 ---
 
-**Mode: how-to.** Steps to give the `hotl` agent extra tools from an MCP server. Assumes you have a working agent (see [quickstart.md](../quickstart/)) and an MCP server program on your machine. For the security model behind the approval prompts, see [permissions-and-sandbox.md](../permissions-and-sandbox/).
+Give the `hotl` agent extra tools from an MCP server. Assumes you have a working agent (see [quickstart.md](../quickstart/)) and an MCP server program on your machine. For the security model behind the approval prompts, see [permissions-and-sandbox.md](../permissions-and-sandbox/).
 
 ## What MCP gives you
 
