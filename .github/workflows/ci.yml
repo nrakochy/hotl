@@ -50,6 +50,10 @@ jobs:
         run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
         run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-engine -p hotl-testkit -p hotl --locked
+      - name: Test (security-enforced feature)
+        run: |
+          cargo test -p hotl-tools --features security-enforced --locked
+          cargo test -p hotl --features security-enforced --locked
 
   # Dependency vulnerability scan. Runs
   # cargo-audit against the committed Cargo.lock. cargo-audit installs from

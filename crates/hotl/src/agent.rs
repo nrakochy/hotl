@@ -1377,6 +1377,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(not(feature = "security-enforced"))] // asserts the auto default
     fn load_rules_merges_trusted_admin_file_and_reports_untrusted() {
         let dir = tempfile::tempdir().unwrap();
         let admin = dir.path().join("preapproved.toml");

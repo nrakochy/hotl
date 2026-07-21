@@ -122,6 +122,14 @@ impl Rules {
     /// coerces `Auto` to `Ask` here — this builder is the single runtime
     /// enforcement point.
     pub fn with_mode(mut self, mode: PermissionMode) -> Self {
+        // The security-enforced build's whole contract is one line: auto
+        // cannot exist at runtime. Config, env, and callers all pass
+        // through here.
+        #[cfg(feature = "security-enforced")]
+        let mode = match mode {
+            PermissionMode::Auto => PermissionMode::Ask,
+            other => other,
+        };
         self.mode = mode;
         self
     }
@@ -367,6 +375,18 @@ path_prefix = "src/"
     }
 
     #[test]
+    #[cfg(feature = "security-enforced")]
+    fn enforced_build_cannot_enter_auto_mode() {
+        let r = Rules::default().with_mode(PermissionMode::Auto);
+        assert_eq!(r.mode(), PermissionMode::Ask);
+        assert!(enforced_build());
+        assert_eq!(
+            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            Verdict::Ask
+        );
+    }
+
+    #[test]
     fn admin_tier_grants_denies_and_locks() {
         let admin = AdminRules::from_toml(
             "lock_user_allows = true\n\n[[allow]]\ntool = \"bash\"\nprefix = \"git \"\n\n[[deny]]\ntool = \"bash\"\nprefix = \"git push\"\n",
@@ -397,6 +417,7 @@ path_prefix = "src/"
     }
 
     #[test]
+    #[cfg(not(feature = "security-enforced"))] // asserts fall-through to auto
     fn deny_rules_refuse_without_asking_and_over_match() {
         let r = Rules::from_toml(
             "[[deny]]\ntool = \"bash\"\nprefix = \"curl \"\n\n[[deny]]\ntool = \"write\"\npath_prefix = \".ssh/\"\n",
@@ -426,6 +447,7 @@ path_prefix = "src/"
     }
 
     #[test]
+    #[cfg(not(feature = "security-enforced"))] // auto cannot exist in that build
     fn auto_mode_allows_ordinary_calls_but_never_protected() {
         let r = Rules::default().with_mode(PermissionMode::Auto);
         // Ordinary write: auto, tagged with the mode rule.
@@ -443,6 +465,7 @@ path_prefix = "src/"
     }
 
     #[test]
+    #[cfg(not(feature = "security-enforced"))] // auto cannot exist in that build
     fn auto_mode_bash_requires_the_sandbox_floor() {
         let r = Rules::default().with_mode(PermissionMode::Auto);
         let input = json!({"command": "cargo test"});

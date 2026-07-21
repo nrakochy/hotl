@@ -131,7 +131,12 @@ fn print_help() {
 /// caller supplied one, and point at the update path.
 fn update_main(latest: Option<&str>) -> i32 {
     let current = env!("CARGO_PKG_VERSION");
-    println!("hotl {current}");
+    let enforced = if hotl_tools::rules::enforced_build() {
+        " (security-enforced)"
+    } else {
+        ""
+    };
+    println!("hotl {current}{enforced}");
     if let Some(latest) = latest {
         if setup::is_newer(current, latest) {
             println!("a newer version is available: {latest}");
