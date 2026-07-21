@@ -252,18 +252,22 @@ impl Turn {
             self.call_sigs.pop_front();
         }
         if let Some(pattern) = detect_doom_loop(self.call_sigs.make_contiguous()) {
-            let cont = self
-                .ask(
-                    format!("the agent keeps repeating: {pattern} — let it continue?"),
-                    None,
-                )
-                .await;
-            if !matches!(cont, AskReply::Allow | AskReply::AllowEdited { .. }) {
-                self.abort_batch(
-                    &uses,
-                    "Stopped: the user declined to continue a repeating tool-call loop.",
-                )
-                .await;
+            // Auto mode has nobody watching: the doom guard is a malfunction
+            // brake, not a permission — stop the turn instead of asking.
+            let stop = if self.shared.rules.mode() == hotl_tools::rules::PermissionMode::Auto {
+                true
+            } else {
+                let cont = self
+                    .ask(
+                        format!("the agent keeps repeating: {pattern} — let it continue?"),
+                        None,
+                    )
+                    .await;
+                !matches!(cont, AskReply::Allow | AskReply::AllowEdited { .. })
+            };
+            if stop {
+                self.abort_batch(&uses, "Stopped: a repeating tool-call loop was detected.")
+                    .await;
                 return Some(Outcome::DoomLoop { pattern });
             }
             self.call_sigs.clear();

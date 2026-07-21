@@ -112,12 +112,33 @@ impl Harness {
         Self::build_with(scripts, config, initial_items, hooks, Registry::builtin())
     }
 
+    /// Construct a harness with custom permission rules (mode/deny/admin
+    /// scenarios).
+    pub fn with_rules(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        rules: Rules,
+    ) -> Self {
+        Self::build_full(scripts, config, Vec::new(), None, Registry::builtin(), rules)
+    }
+
     fn build_with(
         scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
         config: EngineConfig,
         initial_items: Vec<Item>,
         hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
         registry: Registry,
+    ) -> Self {
+        Self::build_full(scripts, config, initial_items, hooks, registry, Rules::default())
+    }
+
+    fn build_full(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+        hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+        registry: Registry,
+        rules: Rules,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
@@ -128,7 +149,7 @@ impl Harness {
         let deps = SessionDeps {
             provider: provider.clone(),
             registry: Arc::new(registry),
-            rules: Arc::new(Rules::default()),
+            rules: Arc::new(rules),
             sandbox_enforced: false,
             clock: Arc::new(SystemClock),
             log,
@@ -457,6 +478,72 @@ mod tests {
                 .iter()
                 .all(|r| r.is_error && r.content.contains("did not overlap")),
             "{results:?}"
+        );
+    }
+
+    fn auto_rules() -> hotl_tools::rules::Rules {
+        hotl_tools::rules::Rules::default().with_mode(hotl_tools::rules::PermissionMode::Auto)
+    }
+
+    #[tokio::test]
+    async fn auto_mode_runs_mutating_calls_without_asking() {
+        // write (not bash): the harness runs unsandboxed, and auto mode
+        // deliberately excludes unsandboxed bash — covered by rules tests.
+        let mut h = Harness::with_rules(
+            vec![
+                ScriptedProvider::tool_call("t1", "write", json!({"path": "notes.txt", "content": "x"})),
+                ScriptedProvider::text_reply("ran silently"),
+            ],
+            cfg(),
+            auto_rules(),
+        );
+        let outcome = h.prompt_and_wait("write the note").await;
+        assert_eq!(outcome, Outcome::Done { text: "ran silently".into() });
+        // No ask fired; the transcript shows who silenced it.
+        assert!(!h.seen.iter().any(|e| e.starts_with("Ask(")), "events: {:?}", h.seen);
+        assert!(
+            h.seen.iter().any(|e| e.contains("permissions.mode=auto")),
+            "events: {:?}",
+            h.seen
+        );
+        // The undo safety net still brackets the batch.
+        assert_eq!(*h.snapshots.lock().unwrap(), vec!["pre batch 1", "post batch 1"]);
+    }
+
+    #[tokio::test]
+    async fn auto_mode_protected_write_still_asks() {
+        let mut h = Harness::with_rules(
+            vec![
+                ScriptedProvider::tool_call("t1", "write", json!({"path": "Makefile", "content": "x"})),
+                ScriptedProvider::text_reply("done"),
+            ],
+            cfg(),
+            auto_rules(),
+        );
+        h.prompt_and_wait("write the makefile").await;
+        assert!(
+            h.seen.iter().any(|e| e.starts_with("Ask(")),
+            "protected must ask: {:?}",
+            h.seen
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_mode_doom_loop_stops_without_asking() {
+        let scripts: Vec<_> = (0..5)
+            .map(|_| ScriptedProvider::tool_call("t", "read", json!({"path": "/same"})))
+            .collect();
+        let mut h = Harness::with_rules(
+            scripts,
+            EngineConfig { max_turns: 10, ..Default::default() },
+            auto_rules(),
+        );
+        let outcome = h.prompt_and_wait("go").await;
+        assert!(matches!(outcome, Outcome::DoomLoop { .. }), "got {outcome:?}");
+        assert!(
+            !h.seen.iter().any(|e| e.starts_with("Ask(")),
+            "no human to ask in auto: {:?}",
+            h.seen
         );
     }
 
