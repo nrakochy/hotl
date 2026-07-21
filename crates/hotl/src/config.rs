@@ -28,9 +28,37 @@ pub struct Config {
     pub retention: RetentionCfg,
     #[serde(default)]
     pub network: NetworkCfg,
+    #[serde(default)]
+    pub permissions: PermissionsCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
     raw: Option<toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct PermissionsCfg {
+    /// `"auto"` (default — no ordinary prompts) | `"ask"`.
+    pub mode: Option<String>,
+}
+
+impl PermissionsCfg {
+    /// Resolve the mode: env (`HOTL_PERMISSIONS`) > config > default `auto`.
+    /// An unknown value fails **closed** to `Ask` with a warning — a typo
+    /// must never silently mean "don't prompt".
+    pub fn resolve(&self, env: Option<&str>) -> (hotl_tools::rules::PermissionMode, Option<String>) {
+        use hotl_tools::rules::PermissionMode;
+        let source = env.or(self.mode.as_deref());
+        match source {
+            None | Some("auto") => (PermissionMode::Auto, None),
+            Some("ask") => (PermissionMode::Ask, None),
+            Some(other) => (
+                PermissionMode::Ask,
+                Some(format!(
+                    "[permissions].mode = \"{other}\" is not a mode (auto | ask) — failing closed to \"ask\""
+                )),
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -267,6 +295,25 @@ mod tests {
             .egress_policy();
         assert_eq!(policy, EgressPolicy::Off);
         assert!(warning.unwrap().contains("opne"));
+    }
+
+    #[test]
+    fn permissions_mode_resolves_with_env_and_fails_closed() {
+        use hotl_tools::rules::PermissionMode;
+        // Absent → the product default: auto, no warning.
+        let (m, w) = cfg_with("").permissions.resolve(None);
+        assert_eq!(m, PermissionMode::Auto);
+        assert!(w.is_none());
+        // Explicit ask.
+        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n").permissions.resolve(None);
+        assert_eq!(m, PermissionMode::Ask);
+        // Env beats config.
+        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n").permissions.resolve(Some("auto"));
+        assert_eq!(m, PermissionMode::Auto);
+        // Typo fails closed to ask, loudly — never silently auto.
+        let (m, w) = cfg_with("[permissions]\nmode = \"atuo\"\n").permissions.resolve(None);
+        assert_eq!(m, PermissionMode::Ask);
+        assert!(w.unwrap().contains("atuo"));
     }
 
     #[test]

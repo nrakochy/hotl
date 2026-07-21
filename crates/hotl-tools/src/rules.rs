@@ -26,6 +26,15 @@
 use serde::Deserialize;
 use serde_json::Value;
 
+/// Whether ordinary (unprotected) tool calls prompt. `Ask` is the library
+/// default; the binary resolves the product default from config.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PermissionMode {
+    #[default]
+    Ask,
+    Auto,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct Rules {
     #[serde(default)]
