@@ -52,6 +52,13 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
     fn permission(&self, input: &Value) -> Permission;
+    /// May calls to this tool run concurrently with other parallel-safe calls
+    /// in the same assistant batch? Only for tools whose calls cannot observe
+    /// or affect each other (pure reads, isolated child sessions). Mutating or
+    /// executing tools stay serial: the default is the safe answer.
+    fn parallel_safe(&self) -> bool {
+        false
+    }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome>;
 }
 

@@ -55,6 +55,9 @@ impl Tool for ReadTool {
     fn name(&self) -> &'static str {
         "read"
     }
+    fn parallel_safe(&self) -> bool {
+        true
+    }
     fn description(&self) -> &str {
         "Read a text file from the local filesystem. Returns at most 2000 lines / 200KB per call; use `offset` (1-indexed start line) to continue a truncated read."
     }
@@ -446,6 +449,16 @@ mod tests {
         let r = run(&ReadTool, json!({"path": p}));
         assert!(!r.is_error);
         assert!(r.content.contains("one") && r.content.contains("two"));
+    }
+
+    #[test]
+    fn only_read_is_parallel_safe_among_builtins() {
+        // read has no side effects, so calls in one batch may overlap; the
+        // mutating/executing builtins must stay serial within a batch.
+        assert!(ReadTool.parallel_safe());
+        assert!(!EditTool::default().parallel_safe());
+        assert!(!WriteTool::default().parallel_safe());
+        assert!(!BashTool.parallel_safe());
     }
 
     #[test]
