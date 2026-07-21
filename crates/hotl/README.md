@@ -91,18 +91,25 @@ waiting on you.
 
 ## tmux + vim-tmux-navigator
 
-`hotl` handles `Ctrl-h/j/k/l` itself by switching tmux panes, so it works out
-of the box. If you also use
-[vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator), add
-`hotl` to its `vim_pattern` so tmux forwards those keys **into** `hotl` (which
+`hotl watch` handles `Ctrl-h/j/k/l` itself by switching tmux panes, so it works
+out of the box. If you also use
+[vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator), extend
+its `is_vim` check so tmux forwards those keys **into** `hotl watch` (which
 does the pane switch) instead of stepping around it — this keeps movement
-seamless whether the focused pane is Vim, another navigator-aware app, or
-`hotl`. In `~/.config/tmux/tmux.conf`:
+seamless whether the focused pane is Vim, another navigator-aware app, or the
+dashboard. Match the full argv (`ps -o args=`), **not** a bare `hotl` in
+`vim_pattern`: the name check matches every hotl surface, and the other
+surfaces — the line-based REPL, `hotl tui` — don't handle the chords, so a
+name match would swallow your navigation keys whenever one of those panes is
+focused. Left unmatched, they fall through to tmux's own `select-pane` and
+navigation just works. In `~/.config/tmux/tmux.conf`:
 
-    # add `hotl` to the alternation (…|fzf|hotl)
-    vim_pattern='(\S+/)?g?\.?(view|l?n?vim?x?|fzf|hotl)(diff)?(-wrapped)?'
+    vim_pattern='(\S+/)?g?\.?(view|l?n?vim?x?|fzf)(diff)?(-wrapped)?'
+    hotl_watch_pattern='(\S+/)?hotl watch( |$)'
     is_vim="ps -o state= -o comm= -t '#{pane_tty}' \
-        | grep -iqE '^[^TXZ ]+ +${vim_pattern}$'"
+        | grep -iqE '^[^TXZ ]+ +${vim_pattern}$' \
+        || ps -o state= -o args= -t '#{pane_tty}' \
+        | grep -iqE '^[^TXZ ]+ +${hotl_watch_pattern}'"
     bind-key -n 'C-h' if-shell "$is_vim" 'send-keys C-h' 'select-pane -L'
     bind-key -n 'C-j' if-shell "$is_vim" 'send-keys C-j' 'select-pane -D'
     bind-key -n 'C-k' if-shell "$is_vim" 'send-keys C-k' 'select-pane -U'
