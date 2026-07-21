@@ -1,6 +1,7 @@
 // Regression: a 6-byte, non-char-boundary color must not panic and must warn.
 // This is the exact input that crashed the TUI via view::hex before the fix.
-use watch_types::{parse_hex, HotlConfig};
+use hotl_theme::parse_hex;
+use watch_types::HotlConfig;
 
 #[test]
 fn multibyte_color_config_does_not_panic_and_warns() {
@@ -14,7 +15,7 @@ fn multibyte_color_config_does_not_panic_and_warns() {
     let (theme, warn) = cfg.settings.theme.resolve();
     assert_eq!(
         theme.active,
-        watch_types::Theme::default().active,
+        hotl_theme::Theme::default().active,
         "bad color keeps base"
     );
     assert!(

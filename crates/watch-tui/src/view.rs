@@ -1,7 +1,8 @@
 use crate::app::AppState;
+use hotl_theme::Palette;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
-use watch_types::{AgentObservation, Status, Theme};
+use watch_types::{AgentObservation, Status};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Row {
@@ -68,37 +69,6 @@ pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
     out
 }
 
-fn hex(s: &str, default: Color) -> Color {
-    match watch_types::parse_hex(s) {
-        Some([r, g, b]) => Color::Rgb(r, g, b),
-        None => default,
-    }
-}
-
-struct Palette {
-    active: Color,
-    blocked: Color,
-    idle: Color,
-    ink: Color,
-    muted: Color,
-    faint: Color,
-    accent: Color,
-    band: Color,
-}
-
-fn palette(theme: &Theme) -> Palette {
-    Palette {
-        active: hex(&theme.active, Color::Rgb(0xf2, 0xc1, 0x4e)),
-        blocked: hex(&theme.blocked, Color::Rgb(0xe0, 0x6c, 0x6c)),
-        idle: hex(&theme.idle, Color::Rgb(0x7e, 0xe0, 0x7e)),
-        ink: hex(&theme.ink, Color::Rgb(0xe6, 0xe9, 0xf0)),
-        muted: hex(&theme.muted, Color::Rgb(0x8a, 0x92, 0xa6)),
-        faint: hex(&theme.faint, Color::Rgb(0x59, 0x60, 0x72)),
-        accent: hex(&theme.accent, Color::Rgb(0x6c, 0x8c, 0xff)),
-        band: hex(&theme.band, Color::Rgb(0x1b, 0x22, 0x33)),
-    }
-}
-
 fn status_color(p: &Palette, s: Status) -> Color {
     match s {
         Status::Working => p.active,
@@ -130,8 +100,7 @@ fn title_line(agents: &[AgentObservation], p: &Palette) -> Line<'static> {
     Line::from(spans)
 }
 
-pub fn view(state: &AppState, theme: &Theme, frame: &mut Frame) {
-    let p = palette(theme);
+pub fn view(state: &AppState, p: &Palette, frame: &mut Frame) {
     let area = frame.area();
     let chunks = Layout::vertical([
         Constraint::Length(1),
@@ -140,7 +109,7 @@ pub fn view(state: &AppState, theme: &Theme, frame: &mut Frame) {
     ])
     .split(area);
 
-    frame.render_widget(Paragraph::new(title_line(&state.agents, &p)), chunks[0]);
+    frame.render_widget(Paragraph::new(title_line(&state.agents, p)), chunks[0]);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -159,7 +128,7 @@ pub fn view(state: &AppState, theme: &Theme, frame: &mut Frame) {
     } else {
         let lines: Vec<Line> = rows(&state.agents, state.cursor, state.spinner_tick)
             .iter()
-            .map(|r| row_line(r, &p, inner.width))
+            .map(|r| row_line(r, p, inner.width))
             .collect();
         frame.render_widget(Paragraph::new(lines), inner);
     }
@@ -290,7 +259,7 @@ mod tests {
 
     #[test]
     fn title_is_just_wordmark_for_single_session() {
-        let pal = palette(&Theme::default());
+        let pal = Palette::default();
         let a = vec![
             obs("base-0", "w", "/tmp/a", Status::Blocked),
             obs("base-0", "w", "/tmp/b", Status::Idle),
@@ -315,7 +284,7 @@ mod tests {
 
     #[test]
     fn title_breadcrumb_appears_with_multiple_sessions() {
-        let pal = palette(&Theme::default());
+        let pal = Palette::default();
         let a = vec![
             obs("base-0", "w", "/tmp/a", Status::Idle),
             obs("work", "w", "/tmp/b", Status::Idle),
@@ -390,11 +359,5 @@ mod tests {
     fn non_working_glyph_is_static_across_ticks() {
         let a = obs_sl("g", "w (0)", "/tmp/lca", Status::Idle, None);
         assert_eq!(agent_glyph(&a, 0), agent_glyph(&a, 5));
-    }
-
-    #[test]
-    fn bad_hex_falls_back() {
-        assert_eq!(hex("nonsense", Color::Rgb(1, 2, 3)), Color::Rgb(1, 2, 3));
-        assert_eq!(hex("#7ee07e", Color::Black), Color::Rgb(0x7e, 0xe0, 0x7e));
     }
 }

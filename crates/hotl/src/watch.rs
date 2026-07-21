@@ -83,7 +83,8 @@ fn run(
     config_warning: Option<String>,
 ) -> io::Result<()> {
     let tick = Duration::from_millis(cfg.settings.poll_interval_ms_clamped());
-    let (theme, _) = cfg.settings.theme.resolve();
+    // Resolved once — the render loop reuses the converted palette per frame.
+    let palette = hotl_theme::Palette::from(&cfg.settings.theme.resolve().0);
     let mut state = AppState::new(cfg.settings.ping_on_blocked, cfg.settings.vim_mode);
     if let Some(warn) = config_warning {
         state.status = warn;
@@ -132,7 +133,7 @@ fn run(
         if state.should_quit {
             break;
         }
-        terminal.draw(|f| watch_tui::view(&state, &theme, f))?;
+        terminal.draw(|f| watch_tui::view(&state, &palette, f))?;
     }
     Ok(())
 }
