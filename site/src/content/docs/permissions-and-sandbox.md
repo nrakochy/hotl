@@ -70,7 +70,7 @@ hotl keeps a list of these **protected paths** and escalates their write ask wit
 
 Approving every `cargo test` gets tedious, and tedium is a security problem: a person mashing `y` to clear prompts will eventually approve something they shouldn't. That's *ask-fatigue*, and it's how well-meaning tools grow an ungoverned "allow everything" habit.
 
-hotl's answer: you can pre-approve trusted command families and file scopes — but **only by editing the `[[allow]]` section of `~/.config/hotl/config.toml` deliberately.** There is no in-REPL "always allow this" button, because a button is exactly the fatigue-driven reflex we want to avoid. Persisting trust should be a considered act with an editor, not a keystroke mid-task.
+hotl's answer: you can pre-approve trusted command families and file scopes — but **only by editing the `[[allow]]` section of `~/.config/hotl/config.toml` deliberately.** There is no in-console "always allow this" button, because a button is exactly the fatigue-driven reflex we want to avoid. Persisting trust should be a considered act with an editor, not a keystroke mid-task.
 
 Even then, allow-rules are trust *grants*, not fine scopes, and hotl treats them cautiously:
 - A `bash` prefix like `cargo ` is a grant to that command family — so a command that tacks on `; curl … | sh` or `&& rm -rf ~` (any shell chaining/redirection) drops back to asking. The prefix isn't a leash on the rest of the line.
@@ -89,7 +89,7 @@ Approval is a judgment call, and judgment is fallible. So hotl photographs your 
 | Agent writes outside the project | the sandbox floor (bash) | — |
 | Agent reads a secret and exfiltrates it | **your reading of each approved command**, plus `[network].egress` if you set it | the default sandbox (reads + egress open unless you opt in) |
 | A benign-looking write that runs code later | protected-path escalation | — |
-| Ask-fatigue growing a blanket allowlist | file-only allow-rules, no in-REPL button | — |
+| Ask-fatigue growing a blanket allowlist | file-only allow-rules, no in-console button | — |
 
 The gate is the wall. The sandbox, protected paths, and undo make the wall livable and the mistakes recoverable. None of them replaces you looking at what you approve.
 

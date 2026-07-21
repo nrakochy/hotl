@@ -25,7 +25,7 @@ hotl attach            # list live backgrounded sessions
 hotl attach bg-12345   # connect to one (an id prefix works)
 ```
 
-Once attached, it behaves like the normal REPL: type to prompt, type mid-turn to steer, answer `y`/`N` when it asks. Anything that happened while you were detached is in the session log (the live view starts from when you attach).
+Once attached, it behaves like a line console: type to prompt, type mid-turn to steer, answer `y`/`N` when it asks. Anything that happened while you were detached is in the session log (the live view starts from when you attach).
 
 ## Detach, reattach, stop
 
@@ -35,7 +35,7 @@ Once attached, it behaves like the normal REPL: type to prompt, type mid-turn to
 
 ## Answering asks without staying attached
 
-A backgrounded session parks asks indefinitely, so you can `hotl bg` a task, walk away, and approve its steps when you next attach. (The plain interactive REPL default-denies an unanswered ask after 5 minutes; set `HOTL_ASK_TIMEOUT=0` to make *it* wait forever too — `hotl bg` already does this for its sessions.)
+A backgrounded session parks asks indefinitely, so you can `hotl bg` a task, walk away, and approve its steps when you next attach. (The console's ask modal also waits until you answer; only headless `-p` default-denies.)
 
 ## Limits
 

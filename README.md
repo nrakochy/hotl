@@ -12,7 +12,7 @@ you on the loop at every stage:
 | Capability | Command | Status |
 |---|---|---|
 | **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it |
-| **Execute** | `hotl` | **Building** — a personal agent harness (event-log-as-canon, ACP-native): steering REPL + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
+| **Execute** | `hotl` | **Building** — a personal agent harness (event-log-as-canon, ACP-native): steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
 | **Orchestrate** | `hotl fleet` | **Future** — drives fleets of agents over the same protocol any editor uses; only its seams exist today |
 
 > **Pre-1.0 — and a breaking change:** bare `hotl` is now the **agent**; the

@@ -1,5 +1,5 @@
 ---
-title: 'The console: hotl tui'
+title: 'The console: hotl'
 ---
 
 **Mode: how-to.** Drive the agent from a full-screen terminal console — streaming transcript, a loop-motif activity strip, modal permission asks, and a vim-style input editor. Assumes a working agent ([quickstart.md](../quickstart/)).
@@ -7,12 +7,27 @@ title: 'The console: hotl tui'
 ## Launch
 
 ```
-hotl tui                  # new session
-hotl tui <id-prefix>      # continue a specific earlier session
-hotl tui --resume         # pick from recent sessions (numbered list, newest first)
+hotl                  # new session
+hotl <id-prefix>      # continue a specific earlier session
+hotl --resume         # pick from recent sessions (numbered list, newest first)
+hotl resume [id]      # same thing, spelled as a subcommand
 ```
 
-The console is a pure ACP client of the same engine the REPL uses — same permission gate, same session logs, same `hotl undo` afterwards.
+Bare `hotl` **is** the console (the `tui` subcommand and the old line-based REPL are gone). It needs a real terminal: piped stdin/stdout exits with a pointer at `hotl -p "prompt"`, the headless path for scripts and CI.
+
+The console is a pure ACP client of the same engine `-p` headless uses — same permission gate, same session logs, same `hotl undo` afterwards.
+
+## Theming
+
+The console wears the same palette as `hotl watch`, from the same `[settings.theme]` table in `~/.config/hotl/config.toml`:
+
+```toml
+[settings.theme]
+preset = "nord"       # default | tokyo-night | catppuccin | gruvbox | nord | dracula
+accent = "#88c0d0"    # optional per-slot #rrggbb overrides
+```
+
+Eight slots: `active` (working), `blocked` (waiting on you), `idle` (settled), `ink`/`muted`/`faint` (text tiers), `accent`, and `band` (the strip background). An unknown preset or invalid color falls back with a one-line warning — the console always launches.
 
 ## The screen
 

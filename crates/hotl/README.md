@@ -98,10 +98,9 @@ its `is_vim` check so tmux forwards those keys **into** `hotl watch` (which
 does the pane switch) instead of stepping around it — this keeps movement
 seamless whether the focused pane is Vim, another navigator-aware app, or the
 dashboard. Match the full argv (`ps -o args=`), **not** a bare `hotl` in
-`vim_pattern`: the name check matches every hotl surface, and the other
-surfaces — the line-based REPL, `hotl tui` — don't handle the chords, so a
-name match would swallow your navigation keys whenever one of those panes is
-focused. Left unmatched, they fall through to tmux's own `select-pane` and
+`vim_pattern`: the name check matches every hotl surface, and the execute
+console (bare `hotl`) doesn't handle the chords, so a name match would
+swallow your navigation keys whenever a console pane is focused. Left unmatched, they fall through to tmux's own `select-pane` and
 navigation just works. In `~/.config/tmux/tmux.conf`:
 
     vim_pattern='(\S+/)?g?\.?(view|l?n?vim?x?|fzf)(diff)?(-wrapped)?'

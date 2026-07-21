@@ -8,13 +8,11 @@ title: 'Configuration reference — hotl the agent'
 
 | Command | Effect |
 |---|---|
-| `hotl` | Interactive agent REPL. Type to prompt; type again mid-turn to steer; `Ctrl-C` interrupts the running turn; `Ctrl-D` or `exit`/`quit` leaves. |
+| `hotl [id-prefix\|--resume]` | The full-screen console: streaming transcript, activity strip, modal asks, vim input. Needs a terminal (no TTY → exit 2, use `-p`). See [tui.md](../tui/). |
 | `hotl -p "PROMPT"` | Headless one-shot: run PROMPT to completion, print the answer, exit. See [Headless](#headless--p----json). |
 | `hotl -p "PROMPT" --json` | Headless with a JSONL event stream on stdout instead of prose. |
-| `hotl resume` | List recent sessions (id + age), newest first. |
-| `hotl resume <id-prefix>` | Start a new session seeded with an earlier session's full context (replayed from its log and ancestry). |
+| `hotl resume [id-prefix]` | Continue an earlier session in the console (bare: pick from a numbered list). The seeded session replays the earlier one's full context from its log and ancestry. |
 | `hotl undo` | Restore workspace files to before the most recent session's last mutating step. Confirm-gated; `--force`/`-f` skips the prompt. |
-| `hotl tui [id-prefix\|--resume]` | Full-screen console: streaming transcript, activity strip, modal asks, vim input. See [tui.md](../tui/). |
 | `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](../backgrounding/). |
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
 | `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/shadows/blobs per `[retention]`. See [below](#hotl-gc). |
@@ -45,9 +43,8 @@ compaction_reset = false   # fresh-slate compaction instead of in-place
 show_used_pct = true       # show context-fullness in each turn's status
 
 [behavior]
-ask_timeout_secs = 300     # 0 = wait forever for a permission answer
 sandbox = true             # false disables the bash sandbox floor
-vim_mode = true            # vim-style keys in the `hotl tui` input editor
+vim_mode = true            # vim-style keys in the console's input editor
 
 [permissions]
 mode = "auto"   # no per-action y/N; protected paths + sandbox still guard.
@@ -78,6 +75,11 @@ command = "/usr/local/bin/guard"
 
 [diagnostics]              # post-edit checks (see hooks.md)
 rs = "cargo check -q --message-format=short"
+
+[settings.theme]           # palette for the console AND `hotl watch` (see tui.md)
+preset = "nord"            # default | tokyo-night | catppuccin | gruvbox | nord | dracula
+accent = "#88c0d0"         # optional per-slot #rrggbb overrides: active blocked idle
+                           # ink muted faint accent band
 ```
 
 **Precedence for the scalar settings: environment variable > config.toml > default.** So a `HOTL_MODEL` in the shell overrides `[provider].model`, and CI can override anything without editing the file.
@@ -116,14 +118,13 @@ with:
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
-| `HOTL_ASK_TIMEOUT` | `[behavior].ask_timeout_secs` | `0` = wait forever (backgrounded sessions). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) or `ask`; a typo fails closed to `ask`. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 
 ### Allow-rules (`[[allow]]`)
 
-Auto-approve tool calls so you aren't prompted for trusted operations. Deliberately config-only — there is no in-REPL "always allow" (that is by design; see [permissions-and-sandbox.md](../permissions-and-sandbox/#why-allow-rules-are-a-file-you-edit)).
+Auto-approve tool calls so you aren't prompted for trusted operations. Deliberately config-only — there is no in-console "always allow" (that is by design; see [permissions-and-sandbox.md](../permissions-and-sandbox/#why-allow-rules-are-a-file-you-edit)).
 
 ```toml
 [[allow]]

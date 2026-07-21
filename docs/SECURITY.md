@@ -33,9 +33,9 @@ The kernel sandbox floor is **write-confinement, not data-loss prevention.** A `
 Every mutating or executing tool call passes one fixed pipeline before it runs:
 
 1. **PreToolUse hooks** (in-process, then owner-configured shell hooks) may deny or rewrite the call. A rewritten call **re-enters the gate** — a hook cannot launder a call past the ask.
-2. **Allow rules** (`[[allow]]` in `~/.config/hotl/config.toml`) may auto-approve it, narrated. Rules are deliberately editor-written only — there is no in-REPL "always allow," so ask-fatigue cannot manufacture an ungoverned allowlist. Rule matching defends against shell-operator smuggling after an allowed prefix (`ls && curl …` does not match an `ls` rule) and `..` path traversal.
+2. **Allow rules** (`[[allow]]` in `~/.config/hotl/config.toml`) may auto-approve it, narrated. Rules are deliberately editor-written only — there is no in-console "always allow," so ask-fatigue cannot manufacture an ungoverned allowlist. Rule matching defends against shell-operator smuggling after an allowed prefix (`ls && curl …` does not match an `ls` rule) and `..` path traversal.
 3. **Protected paths** are checked *before* allow rules and **never auto-approve**. Writes that could execute later outside any gate escalate the ask with a *why* warning. The class covers: `.git/hooks/`, Makefile-class files (`Makefile`, `justfile`, `build.rs`, `conftest.py`, `*.gyp`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), harness/editor settings (`.hotl/`, `.claude/`, `settings.json`), shell rc files, `.ssh/`, credential stores (`.aws/`, `.config/gcloud/`, `.azure/`, `.npmrc`, `.pypirc`, `.netrc`, `.dockercfg`), git config, and cron/systemd units.
-4. **The human ask** — y/N with the sandbox status in the prompt. Headless (`-p`, `--json`, or non-TTY stdin) **default-denies immediately**: nothing interactive ever blocks or leaks a prompt into CI logs. Interactive asks deny on timeout (`HOTL_ASK_TIMEOUT`, default 300 s).
+4. **The human ask** — a y/N modal in the console, escalated with a `⚠` line when a protected path is involved. Headless (`-p`, `--json`, or non-TTY stdin) **default-denies immediately**: nothing interactive ever blocks or leaks a prompt into CI logs. Interactive asks (the console modal, an attached `hotl bg` session) wait until you answer.
 
 Asks are durable: a `pending_ask` entry is committed to the session log before the question is surfaced and an `ask_resolved` entry after — a crash mid-ask is visible on replay, never silently resolved.
 
@@ -98,7 +98,7 @@ Everything that flows into the model's context from a source other than the user
 
 **`spawn` (sub-agents).** The child has **no human on the loop**, so its permission asks default-deny — it runs only auto-allowed/read-only tools under the parent's sandbox floor and rules. The depth cap is **structural, not a counter**: children are built with a builtins-only tool registry — no `spawn`, no MCP — so a child cannot recurse or reach external servers; the capability simply isn't in its registry. Results return to the parent inside the untrusted envelope. `fork` and `teammate` are reserved topologies.
 
-**`hotl acp` (protocol surface).** The connected client answers `session/request_permission` round-trips — it *is* the human-on-the-loop for that session, exactly like the REPL. A missing or malformed reply, or a client that hangs up, resolves to deny.
+**`hotl acp` (protocol surface).** The connected client answers `session/request_permission` round-trips — it *is* the human-on-the-loop for that session, exactly like the console. A missing or malformed reply, or a client that hangs up, resolves to deny.
 
 ## Hooks
 
