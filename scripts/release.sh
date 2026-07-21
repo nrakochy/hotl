@@ -53,6 +53,11 @@ for f in crates/*/Cargo.toml; do
     "$f" > "$f.tmp" && mv "$f.tmp" "$f"
 done
 
+# The docs hero's crates.io button carries the version literally.
+sed -E 's/(text: crates\.io v)[0-9]+\.[0-9]+\.[0-9]+/\1'"$new"'/' \
+  site/src/content/docs/index.mdx > site/src/content/docs/index.mdx.tmp \
+  && mv site/src/content/docs/index.mdx.tmp site/src/content/docs/index.mdx
+
 cargo build --quiet            # sync Cargo.lock to the new version
 git commit -aqm "release: $tag"
 git tag -a "$tag" -m "$tag"

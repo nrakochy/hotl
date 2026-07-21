@@ -1,7 +1,15 @@
 // @ts-check
+import { readFileSync } from 'node:fs';
 import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 import starlightLinksValidator from 'starlight-links-validator';
+
+// The released version, read from the workspace manifest at build time.
+// docs.yml builds from the release tag, so this always matches what
+// `cargo install hotl` delivers.
+const hotlVersion = readFileSync(new URL('../Cargo.toml', import.meta.url), 'utf8').match(
+	/^version = "([^"]+)"/m,
+)?.[1];
 
 // Host-specific values (GitHub Pages). On the Cloudflare Pages + custom domain
 // migration, point `site` at the domain and drop `base`.
@@ -13,7 +21,14 @@ export default defineConfig({
 			title: 'hotl',
 			description:
 				'A human-on-the-loop terminal AI agent: gated tools under a kernel sandbox floor, an append-only session log with resume and undo, MCP/ACP, any Anthropic or OpenAI-compatible model.',
-			social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/nrakochy/hotl' }],
+			social: [
+				{ icon: 'github', label: 'GitHub', href: 'https://github.com/nrakochy/hotl' },
+				{
+					icon: 'seti:rust',
+					label: `crates.io — hotl v${hotlVersion}`,
+					href: 'https://crates.io/crates/hotl',
+				},
+			],
 			// Relative links are intentional: they stay correct when `base` changes hosts.
 			plugins: [starlightLinksValidator({ errorOnRelativeLinks: false })],
 			sidebar: [
