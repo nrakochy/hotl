@@ -65,7 +65,6 @@ pub struct BehaviorCfg {
     /// `false` disables the bash sandbox floor.
     pub sandbox: Option<bool>,
     /// Vim-style keys in the TUI input editor (default on, matching watch).
-    #[allow(dead_code)] // read by `hotl tui` (tui.rs) once the runtime lands
     pub vim_mode: Option<bool>,
 }
 

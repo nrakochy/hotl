@@ -33,6 +33,7 @@ hotl-mcp = { path = "../hotl-mcp", version = "0.1.2" }
 hotl-store = { path = "../hotl-store", version = "0.1.2" }
 hotl-context = { path = "../hotl-context", version = "0.1.2" }
 hotl-engine = { path = "../hotl-engine", version = "0.1.2" }
+hotl-tui = { path = "../hotl-tui", version = "0.1.2" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }

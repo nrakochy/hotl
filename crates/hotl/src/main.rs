@@ -29,6 +29,7 @@ mod setup;
 mod shell_hooks;
 mod spawn;
 mod structured;
+mod tui;
 mod watch;
 
 /// The zsh `:` prefix: a line starting with `: ` becomes
@@ -71,6 +72,7 @@ fn main() {
         Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
         Some("resume") => std::process::exit(block_on(agent::resume_main(args[1..].to_vec()))),
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
+        Some("tui") => std::process::exit(block_on(tui::tui_main(args[1..].to_vec()))),
         Some("bg") => std::process::exit(bg::bg_main(bg_prompt(&args))),
         Some("attach") => std::process::exit(block_on(attach::attach_main(args.get(1).map(String::as_str)))),
         Some("serve") => {

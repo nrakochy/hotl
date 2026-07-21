@@ -126,19 +126,31 @@ pub async fn resume_main(args: Vec<String>) -> i32 {
 /// real engine deps into a session factory and hands the streams to the
 /// protocol loop. One connection, one process (process-per-session).
 pub async fn acp_main() -> i32 {
+    let (factory, _model) = match acp_factory().await {
+        Ok(pair) => pair,
+        Err(code) => return code,
+    };
+    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory).await;
+    0
+}
+
+/// The real-engine session factory `hotl acp` and `hotl tui` share, plus the
+/// resolved model name. Prints its own errors; `Err` carries the exit code.
+pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String), i32> {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
         Ok(triple) => triple,
         Err(msg) => {
             eprintln!("hotl: {msg}");
-            return 1;
+            return Err(1);
         }
     };
     let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
-        Err(code) => return code,
+        Err(code) => return Err(code),
     };
+    let model = scaffold.model.clone();
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         let resumed = match spec {
             crate::acp::SessionSpec::New => None,
@@ -155,9 +167,7 @@ pub async fn acp_main() -> i32 {
         let (snapshots, initial) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
         Ok(spawn_session(scaffold.deps(log, snapshots, initial)))
     });
-
-    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory).await;
-    0
+    Ok((factory, model))
 }
 
 /// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a
