@@ -489,6 +489,11 @@ impl Turn {
                 .await;
                 AskReply::Allow
             }
+            Verdict::Deny { rule } => AskReply::Deny {
+                message: Some(format!(
+                    "a deny rule refused this call ({rule}); do not retry it"
+                )),
+            },
             Verdict::Ask => self.ask(summary, why).await,
         }
     }

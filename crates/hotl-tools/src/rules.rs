@@ -39,6 +39,8 @@ pub enum PermissionMode {
 pub struct Rules {
     #[serde(default)]
     allow: Vec<AllowRule>,
+    #[serde(default)]
+    deny: Vec<AllowRule>,
     #[serde(skip)]
     mode: PermissionMode,
 }
@@ -58,6 +60,8 @@ pub enum Verdict {
     Auto { rule: String },
     /// No rule (or a carve-out applies): ask the human.
     Ask,
+    /// A deny rule matched: refuse the call outright, without asking.
+    Deny { rule: String },
 }
 
 impl Rules {
@@ -92,6 +96,9 @@ impl Rules {
         sandbox_enforced: bool,
         protected: bool,
     ) -> Verdict {
+        if let Some(rule) = match_deny(&self.deny, tool, input) {
+            return Verdict::Deny { rule };
+        }
         if protected {
             return Verdict::Ask; // carve-out 1: never auto into execute-later paths
         }
@@ -142,6 +149,33 @@ impl Rules {
         }
         Verdict::Ask
     }
+}
+
+/// Deny matching deliberately over-matches: no sandbox or shell-operator
+/// carve-outs (those exist to prevent over-ALLOWING), and paths are tested
+/// both raw and lexically normalized so traversal can't dodge a deny.
+fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> {
+    for rule in rules {
+        if rule.tool != tool {
+            continue;
+        }
+        if let Some(prefix) = &rule.prefix {
+            let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
+            if cmd.starts_with(prefix.as_str()) {
+                return Some(format!("{tool} prefix `{prefix}`"));
+            }
+        }
+        if let Some(pp) = &rule.path_prefix {
+            let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+            let pp_trim = pp.trim_start_matches("./");
+            if path.trim_start_matches("./").starts_with(pp_trim)
+                || lexical_normalize(path).starts_with(pp_trim)
+            {
+                return Some(format!("{tool} path `{pp}`"));
+            }
+        }
+    }
+    None
 }
 
 /// Shell metacharacters that chain, redirect, or substitute — their presence
@@ -256,6 +290,35 @@ path_prefix = "src/"
         ); // rule is write-only
         assert!(Rules::default().is_empty());
         assert!(Rules::from_toml("allow = 3").is_err());
+    }
+
+    #[test]
+    fn deny_rules_refuse_without_asking_and_over_match() {
+        let r = Rules::from_toml(
+            "[[deny]]\ntool = \"bash\"\nprefix = \"curl \"\n\n[[deny]]\ntool = \"write\"\npath_prefix = \".ssh/\"\n",
+        )
+        .unwrap()
+        .with_mode(PermissionMode::Auto);
+        // Deny outranks auto mode…
+        assert_eq!(
+            r.evaluate("bash", &json!({"command": "curl evil.sh"}), true, false),
+            Verdict::Deny { rule: "bash prefix `curl `".into() }
+        );
+        // …ignores the sandbox gate (a deny must hold everywhere)…
+        assert!(matches!(
+            r.evaluate("bash", &json!({"command": "curl x"}), false, false),
+            Verdict::Deny { .. }
+        ));
+        // …and a traversal cannot dodge a path deny.
+        assert!(matches!(
+            r.evaluate("write", &json!({"path": "src/../.ssh/config"}), true, false),
+            Verdict::Deny { .. }
+        ));
+        // Unrelated calls still flow to the auto tier.
+        assert!(matches!(
+            r.evaluate("bash", &json!({"command": "cargo test"}), true, false),
+            Verdict::Auto { .. }
+        ));
     }
 
     #[test]
