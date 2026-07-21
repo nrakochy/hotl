@@ -121,6 +121,11 @@ impl Tool for SpawnTool {
         let short: String = task.chars().take(80).collect();
         Permission::Ask { summary: format!("spawn sub-agent: {short}") }
     }
+    /// Children are isolated engines with their own logs; several may run
+    /// side by side within one batch (each still gets its own y/n ask).
+    fn parallel_safe(&self) -> bool {
+        true
+    }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(self.run_impl(input, cancel))
     }
@@ -171,6 +176,14 @@ mod tests {
         assert!(out.content.contains("trust=\"untrusted\""));
         // A forged closing tag in the child output is defanged.
         assert_eq!(out.content.matches("</subagent-result>").count(), 1);
+    }
+
+    #[test]
+    fn spawn_is_parallel_safe() {
+        // Children are independent engines with their own logs: two spawn
+        // calls in one assistant batch must be allowed to run concurrently.
+        let tool = SpawnTool::new(Arc::new(ScriptedChild));
+        assert!(tool.parallel_safe());
     }
 
     #[tokio::test]
