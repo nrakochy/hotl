@@ -1,8 +1,10 @@
 //! Pure view: transcript viewport, activity strip, bordered input, hint row,
 //! plus the ask modal and help overlay. Renders only from `State` — no clocks,
-//! no I/O. Theme is deliberately 3 fields and local to this crate (a shared
-//! theme crate with watch is future work).
+//! no I/O. Colors come from the shared `hotl_theme::Palette` resolved from
+//! `[settings.theme]` — the same palette `hotl watch` wears. Status slots keep
+//! watch's semantics: active = working, blocked = needs you, idle = settled.
 
+use hotl_theme::Palette;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
@@ -10,25 +12,9 @@ use crate::anim;
 use crate::app::{Phase, Scroll, State, ToolStatus, TranscriptItem};
 use crate::vim::Mode;
 
-pub struct Theme {
-    pub accent: Color,
-    pub dim: Color,
-    pub fg: Color,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme {
-            accent: Color::Cyan,
-            dim: Color::DarkGray,
-            fg: Color::Gray,
-        }
-    }
-}
-
 const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
-pub fn view(state: &State, theme: &Theme, frame: &mut Frame) {
+pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     let [transcript, strip, input, hint] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
@@ -36,108 +22,112 @@ pub fn view(state: &State, theme: &Theme, frame: &mut Frame) {
         Constraint::Length(1),
     ])
     .areas(frame.area());
-    render_transcript(state, theme, frame, transcript);
-    render_strip(state, theme, frame, strip);
-    render_input(state, theme, frame, input);
-    render_hint(state, theme, frame, hint);
+    render_transcript(state, p, frame, transcript);
+    render_strip(state, p, frame, strip);
+    render_input(state, p, frame, input);
+    render_hint(state, p, frame, hint);
     if matches!(state.phase, Phase::WaitingAsk { .. }) {
-        render_ask(state, theme, frame, transcript);
+        render_ask(state, p, frame, transcript);
     }
     if state.help_open {
-        render_help(theme, frame, transcript);
+        render_help(p, frame, transcript);
     }
 }
 
-fn render_transcript(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_transcript(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     let lines: Vec<Line> = state
         .transcript
         .iter()
-        .flat_map(|i| item_lines(i, theme))
+        .flat_map(|i| item_lines(i, p))
         .collect();
     let skip = match state.scroll {
         Scroll::Follow => lines.len().saturating_sub(area.height as usize),
         Scroll::At(item) => state.transcript[..item.min(state.transcript.len())]
             .iter()
-            .map(|i| item_lines(i, theme).len())
+            .map(|i| item_lines(i, p).len())
             .sum::<usize>()
             .min(lines.len().saturating_sub(1)),
     };
     frame.render_widget(Paragraph::new(lines).scroll((skip as u16, 0)), area);
 }
 
-fn item_lines<'a>(item: &TranscriptItem, theme: &Theme) -> Vec<Line<'a>> {
+fn item_lines<'a>(item: &TranscriptItem, p: &Palette) -> Vec<Line<'a>> {
     match item {
         TranscriptItem::User { text } => text
             .split('\n')
             .enumerate()
             .map(|(i, l)| {
                 let prefix = if i == 0 { "❯ " } else { "  " };
-                Line::styled(format!("{prefix}{l}"), Style::new().fg(theme.fg).bold())
+                Line::styled(format!("{prefix}{l}"), Style::new().fg(p.ink).bold())
             })
             .collect(),
         TranscriptItem::Steer { text, queued: true } => vec![Line::styled(
             format!("⤷ {text} — steer queued, applies at next step"),
-            Style::new().fg(theme.dim),
+            Style::new().fg(p.muted),
         )],
         TranscriptItem::Steer {
             text,
             queued: false,
         } => {
-            vec![Line::styled(
-                format!("⤷ {text}"),
-                Style::new().fg(theme.accent),
-            )]
+            vec![Line::styled(format!("⤷ {text}"), Style::new().fg(p.accent))]
         }
-        TranscriptItem::Assistant { text } => {
-            text.split('\n').map(|l| Line::raw(l.to_string())).collect()
-        }
+        TranscriptItem::Assistant { text } => text
+            .split('\n')
+            .map(|l| Line::styled(l.to_string(), Style::new().fg(p.ink)))
+            .collect(),
         TranscriptItem::Tool {
             name,
             summary,
             status,
             ticks,
         } => {
-            let marker = match status {
-                ToolStatus::Running | ToolStatus::AutoAllowed { .. } => SPIN[(*ticks % 4) as usize],
-                ToolStatus::Done => "✓",
-                ToolStatus::Failed => "✗",
-                ToolStatus::Denied => "⛔",
+            let (marker, color) = match status {
+                ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
+                    (SPIN[(*ticks % 4) as usize], p.active)
+                }
+                ToolStatus::Done => ("✓", p.idle),
+                ToolStatus::Failed => ("✗", p.blocked),
+                ToolStatus::Denied => ("⛔", p.blocked),
             };
-            let mut line = format!("[{marker} {name}] {summary}");
+            let mut tail = format!(" {summary}");
             if let ToolStatus::AutoAllowed { rule } = status {
-                line.push_str(&format!(" · auto-allowed: {rule}"));
+                tail.push_str(&format!(" · auto-allowed: {rule}"));
             }
             if !matches!(status, ToolStatus::Denied) {
-                line.push_str(&format!(" · {}s", ticks / 8));
+                tail.push_str(&format!(" · {}s", ticks / 8));
             }
-            vec![Line::styled(line, Style::new().fg(theme.fg))]
+            vec![Line::from(vec![
+                Span::styled(format!("[{marker} {name}]"), Style::new().fg(color)),
+                Span::styled(tail, Style::new().fg(p.ink)),
+            ])]
         }
         TranscriptItem::Notice { text } => {
             vec![Line::styled(
                 text.clone(),
-                Style::new().fg(theme.dim).italic(),
+                Style::new().fg(p.muted).italic(),
             )]
         }
     }
 }
 
-fn render_strip(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
+    // The band background is the watch look; blocked = "waiting on you".
     let style = match state.phase {
-        Phase::WaitingAsk { .. } => Style::new().fg(theme.accent).bold(),
-        Phase::Idle => Style::new().fg(theme.dim),
-        _ => Style::new().fg(theme.fg),
+        Phase::WaitingAsk { .. } => Style::new().fg(p.blocked).bg(p.band).bold(),
+        Phase::Idle => Style::new().fg(p.muted).bg(p.band),
+        _ => Style::new().fg(p.ink).bg(p.band),
     };
     frame.render_widget(Paragraph::new(anim::strip_line(state)).style(style), area);
 }
 
-fn render_input(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let mut block = Block::bordered().border_style(Style::new().fg(theme.dim));
+fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
+    let mut block = Block::bordered().border_style(Style::new().fg(p.faint));
     if state.vim_mode {
         let mode = match state.editor.mode() {
             Mode::Insert => "-- INSERT --",
             Mode::Normal => "-- NORMAL --",
         };
-        block = block.title(mode);
+        block = block.title(Span::styled(mode, Style::new().fg(p.accent).bold()));
     }
     let inner = block.inner(area);
     let (row, col) = state.editor.cursor();
@@ -151,7 +141,7 @@ fn render_input(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
     }
 }
 
-fn render_hint(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
+fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
         (Phase::WaitingAsk { .. }, ..) => {
             "y allow · n deny · type a reason after n · ctrl-c cancel"
@@ -159,10 +149,10 @@ fn render_hint(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "ctrl-e editor · esc interrupt · ? help",
     };
-    frame.render_widget(Paragraph::new(hint).style(Style::new().fg(theme.dim)), area);
+    frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
 }
 
-fn render_ask(state: &State, theme: &Theme, frame: &mut Frame, over: Rect) {
+fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let Phase::WaitingAsk {
         summary,
         protected_why,
@@ -173,39 +163,36 @@ fn render_ask(state: &State, theme: &Theme, frame: &mut Frame, over: Rect) {
     else {
         return;
     };
-    let mut lines = vec![Line::styled(
-        summary.clone(),
-        Style::new().fg(theme.fg).bold(),
-    )];
+    let mut lines = vec![Line::styled(summary.clone(), Style::new().fg(p.ink).bold())];
     if let Some(why) = protected_why {
         lines.push(Line::styled(
             format!("⚠ {why}"),
-            Style::new().fg(theme.accent).bold(),
+            Style::new().fg(p.blocked).bold(),
         ));
     }
     lines.push(Line::raw(""));
     if *denying {
         lines.push(Line::styled(
             format!("deny reason: {input}▏"),
-            Style::new().fg(theme.fg),
+            Style::new().fg(p.ink),
         ));
     } else {
         lines.push(Line::styled(
             "y allow · n deny · type a reason after n",
-            Style::new().fg(theme.dim),
+            Style::new().fg(p.faint),
         ));
     }
     let area = centered(over, 60, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(" waiting on you ")
-        .border_style(Style::new().fg(theme.accent));
+        .border_style(Style::new().fg(p.blocked));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_help(theme: &Theme, frame: &mut Frame, over: Rect) {
+fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
     let lines: Vec<Line> = [
         "enter send · shift/alt-enter newline",
         "esc normal mode · esc (empty) interrupt turn",
@@ -216,13 +203,13 @@ fn render_help(theme: &Theme, frame: &mut Frame, over: Rect) {
         "any key closes this help",
     ]
     .into_iter()
-    .map(Line::raw)
+    .map(|l| Line::styled(l, Style::new().fg(p.ink)))
     .collect();
     let area = centered(over, 70, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(" keys ")
-        .border_style(Style::new().fg(theme.accent));
+        .border_style(Style::new().fg(p.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -250,12 +237,16 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    fn draw(state: &State) -> Vec<String> {
+    fn draw_buffer(state: &State) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| view(state, &Theme::default(), f))
+            .draw(|f| view(state, &Palette::default(), f))
             .unwrap();
-        let buffer = terminal.backend().buffer().clone();
+        terminal.backend().buffer().clone()
+    }
+
+    fn draw(state: &State) -> Vec<String> {
+        let buffer = draw_buffer(state);
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -346,6 +337,33 @@ mod tests {
         assert!(
             !rows.contains("steer queued"),
             "queued tag gone once admitted"
+        );
+    }
+
+    #[test]
+    fn strip_wears_band_and_running_tool_marker_is_active() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::Tool {
+            name: "bash".into(),
+            summary: "echo hi".into(),
+            status: ToolStatus::Running,
+            ticks: 0,
+        });
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 0,
+        };
+        let buf = draw_buffer(&s);
+        let p = Palette::default();
+        assert_eq!(
+            buf.cell((0, 19)).unwrap().style().bg,
+            Some(p.band),
+            "strip band bg"
+        );
+        assert_eq!(
+            buf.cell((0, 0)).unwrap().style().fg,
+            Some(p.active),
+            "tool marker active"
         );
     }
 

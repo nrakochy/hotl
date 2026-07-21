@@ -15,9 +15,10 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
 };
+use hotl_theme::Palette;
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
 use hotl_tui::client::{read_server_msg, AcpClient, ServerMsg};
-use hotl_tui::view::{view, Theme};
+use hotl_tui::view::view;
 use ratatui::prelude::*;
 use serde_json::{json, Value};
 use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
@@ -39,6 +40,13 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         .behavior
         .vim_mode
         .unwrap_or(true);
+    // Same [settings.theme] table (and warning behavior) as `hotl watch`;
+    // warnings print as plain lines before the alternate screen owns stdout.
+    let (watch_cfg, theme_warn) = watch_types::HotlConfig::load_with_warning();
+    if let Some(w) = theme_warn {
+        eprintln!("hotl: {w}");
+    }
+    let palette = Palette::from(&watch_cfg.settings.theme.resolve().0);
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
@@ -69,6 +77,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         keys,
         &suspended,
         state,
+        palette,
     )
     .await;
     drop(guard);
@@ -112,6 +121,7 @@ async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, St
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     guard: &mut TerminalGuard,
     client: &mut Client,
@@ -119,14 +129,14 @@ async fn run_loop(
     mut keys: mpsc::Receiver<Event>,
     suspended: &AtomicBool,
     mut state: State,
+    palette: Palette,
 ) -> io::Result<i32> {
-    let theme = Theme::default();
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     // 8 ticks/sec, armed only while a turn runs — idle schedules no wakeups.
     let mut ticker = tokio::time::interval(Duration::from_millis(125));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        guard.terminal.draw(|f| view(&state, &theme, f))?;
+        guard.terminal.draw(|f| view(&state, &palette, f))?;
         let msg = tokio::select! {
             ev = keys.recv() => match ev {
                 Some(Event::Key(k)) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),

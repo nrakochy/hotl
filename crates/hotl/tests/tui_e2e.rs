@@ -10,10 +10,11 @@ use hotl_engine::{spawn_session, EngineConfig, SessionDeps};
 use hotl_platform::SystemClock;
 use hotl_provider::ScriptedProvider;
 use hotl_store::{Masker, SessionLog};
+use hotl_theme::Palette;
 use hotl_tools::{rules::Rules, Registry};
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
 use hotl_tui::client::{read_server_msg, AcpClient, ServerMsg};
-use hotl_tui::view::{view, Theme};
+use hotl_tui::view::view;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use serde_json::{json, Value};
@@ -153,7 +154,7 @@ async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64
 fn draw(state: &State) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
-        .draw(|f| view(state, &Theme::default(), f))
+        .draw(|f| view(state, &Palette::default(), f))
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     (0..buffer.area.height)

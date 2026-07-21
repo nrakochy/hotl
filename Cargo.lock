@@ -718,6 +718,7 @@ name = "hotl-tui"
 version = "0.1.2"
 dependencies = [
  "crossterm",
+ "hotl-theme",
  "ratatui",
  "serde_json",
  "tokio",
