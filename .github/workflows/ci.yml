@@ -21,6 +21,18 @@ permissions:
   contents: read
 
 jobs:
+  # Workspace-wide formatting gate. Separate from the build jobs so a
+  # style-only failure is legible at a glance, and cheap (no build cache).
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - name: rustfmt
+        run: cargo fmt --all --check
+
   watch:
     runs-on: ubuntu-latest
     steps:
@@ -32,9 +44,13 @@ jobs:
         with:
           key: watch
       - name: Clippy (watch crates)
-        run: cargo clippy -p hotl-watch-types -p hotl-watch-tmux -p hotl-watch-listener -p hotl-watch-tui --all-targets -- -D warnings
+        run: cargo clippy -p hotl-theme -p hotl-watch-types -p hotl-watch-tmux -p hotl-watch-listener -p hotl-watch-tui --all-targets -- -D warnings
       - name: Test (watch crates)
-        run: cargo test -p hotl-watch-types -p hotl-watch-tmux -p hotl-watch-listener -p hotl-watch-tui --locked
+        run: cargo test -p hotl-theme -p hotl-watch-types -p hotl-watch-tmux -p hotl-watch-listener -p hotl-watch-tui --locked
+      - name: Test (hotl-theme without the ratatui feature)
+        # Alone in the invocation so feature unification with the TUI crates
+        # can't mask a featureless-build breakage.
+        run: cargo test -p hotl-theme --locked
 
   harness:
     runs-on: ubuntu-latest
@@ -47,9 +63,9 @@ jobs:
         with:
           key: harness
       - name: Clippy (harness crates + binary)
-        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
+        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-engine -p hotl-testkit -p hotl --locked
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked
       - name: Test (security-enforced feature)
         run: |
           cargo test -p hotl-tools --features security-enforced --locked
