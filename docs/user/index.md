@@ -10,6 +10,7 @@ Docs here follow a five-mode framework — one doc, one mode. Read by need:
 | Look up a config file, env var, subcommand, or exit code | [configuration.md](configuration.md) | Reference |
 | Understand the y/N gate, protected paths, and the sandbox — and what they don't cover | [permissions-and-sandbox.md](permissions-and-sandbox.md) | Explanation |
 | Run a session detached and reconnect later | [backgrounding.md](backgrounding.md) | How-to |
+| Drive the agent from a full-screen console | [tui.md](tui.md) | How-to |
 | Connect an MCP tool server | [mcp.md](mcp.md) | How-to |
 | Run through a gateway / fetch keys from a command | [gateway.md](gateway.md) | How-to |
 | Run your own checks/policy on tool calls (diagnostics + hooks) | [hooks.md](hooks.md) | How-to |

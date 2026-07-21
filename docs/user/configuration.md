@@ -12,6 +12,7 @@
 | `hotl resume` | List recent sessions (id + age), newest first. |
 | `hotl resume <id-prefix>` | Start a new session seeded with an earlier session's full context (replayed from its log and ancestry). |
 | `hotl undo` | Restore workspace files to before the most recent session's last mutating step. Confirm-gated; `--force`/`-f` skips the prompt. |
+| `hotl tui [id-prefix\|--resume]` | Full-screen console: streaming transcript, activity strip, modal asks, vim input. See [tui.md](tui.md). |
 | `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](backgrounding.md). |
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
 | `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/shadows/blobs per `[retention]`. See [below](#hotl-gc). |
@@ -44,6 +45,7 @@ show_used_pct = true       # show context-fullness in each turn's status
 [behavior]
 ask_timeout_secs = 300     # 0 = wait forever for a permission answer
 sandbox = true             # false disables the bash sandbox floor
+vim_mode = true            # vim-style keys in the `hotl tui` input editor
 
 [network]
 egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
