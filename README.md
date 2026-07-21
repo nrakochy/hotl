@@ -31,14 +31,17 @@ it discovers every agent across your tmux session, shows who's working and
 who's waiting, pings when one needs you, and `enter` jumps focus straight to
 it. Your attention goes where it's actually needed.
 
-**Safety is the default, not a flag.** Every mutating or executing tool call
-asks y/n before it runs. `bash` executes under a kernel sandbox floor
-(Seatbelt on macOS, Landlock on Linux) that confines writes to the working
-directory. Writes to execute-later paths — git hooks, shell rc, Makefiles,
-agent-instruction files — always escalate with a warning that says why.
-Secret-named env values are masked before bytes ever land on disk. And the
-stance is written down honestly, including what the sandbox does **not**
-cover: [`docs/SECURITY.md`](docs/SECURITY.md).
+**A safety floor that never turns off — and prompts only if you want them.**
+By default hotl runs uninterrupted: no per-action y/n. What always holds:
+`bash` executes under a kernel sandbox floor (Seatbelt on macOS, Landlock on
+Linux) confining writes to the working directory; writes to execute-later
+paths — git hooks, shell rc, Makefiles, agent-instruction files — always
+stop and ask, in every mode; every silenced prompt is visible in the
+transcript; and `hotl undo` reverses any approved-by-default change. Prefer
+per-action approval? `[permissions] mode = "ask"`. Need it guaranteed?
+Compile with `--features security-enforced` and prompting cannot be disabled
+by any config. The stance is written down honestly, including what the
+sandbox does **not** cover: [`docs/SECURITY.md`](docs/SECURITY.md).
 
 **Nothing is ever lost.** Resume any session, `undo` the agent's file
 changes, steer mid-turn without losing the thread. This works because every

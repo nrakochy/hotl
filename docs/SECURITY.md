@@ -1,8 +1,28 @@
 # SECURITY.md — stance
 
-**Defaults are the safety design.** Enforcement ships ON with a curated default policy. A cautionary example: a well-built policy engine behind a default-off flag with an allow-all policy file is equivalent to nothing.
+**The floor is the safety design.** What ships ON in every mode and cannot be configured off: the kernel sandbox, protected-path escalations, deny rules, undo snapshots, secret masking, and transcript visibility of every silenced prompt. Per-action *prompting* is a mode (see "Permission modes" below): opt-in for the daily driver, mandatory in the `security-enforced` build. The cautionary example still binds — a control that can silently lapse is equivalent to nothing — which is why the floor has no off switch and every mode change is visible at startup.
 
 This document describes the controls as they exist in the code today. Gaps are listed at the end.
+
+## Permission modes
+
+Prompting is a *mode*, not the identity of the tool. The trust boundary moves
+with it:
+
+| | default build, `mode="auto"` (default) | default build, `mode="ask"` | `security-enforced` build |
+|---|---|---|---|
+| Ordinary bash/write/edit/MCP | runs, no prompt, `ToolAutoAllowed` in transcript | y/N ask per action | y/N ask per action (config cannot change this) |
+| Protected execute-later paths | **always asks** (headless: denies) | always asks | always asks |
+| Admin preapproved (`/etc/hotl/preapproved.toml`) | grants apply (redundant under auto) | grants silence matching asks | grants are the admin's no-prompt channel |
+| Admin/user deny rules | refuse the call outright, with the rule named in the tool result | same | same |
+| Kernel sandbox / egress / undo / masking | on | on | on |
+
+In `auto`, the boundary is **sandbox + protected asks + deny rules + undo**,
+not per-action approval. The README's "safety" claim holds unconditionally
+only for the `security-enforced` build; the default build's floor is the row
+above. `/etc/hotl/preapproved.toml` is trusted only when root-owned and not
+group/world-writable; otherwise it is refused loudly at startup and in
+`hotl doctor`.
 
 ## What the sandbox is not (read this first)
 
