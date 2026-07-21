@@ -10,6 +10,10 @@ The gate is *fail-closed*. When there's no human to ask — headless `-p` mode, 
 
 Everything else below exists to make that gate trustworthy: to keep an approved action from doing more than you thought, and to give you a way back if you approve something you shouldn't have.
 
+### Approved work runs concurrently where that's safe
+
+Within one model turn the agent often issues several tool calls at once. hotl runs the read-only ones concurrently — a batch of five file reads doesn't queue behind itself — while anything that mutates or executes (`bash`, `write`, `edit`) runs strictly one at a time, in source order, and never overlaps with anything else. Permission asks are unaffected: every approval is still presented to you one at a time, before the calls it gates run. Concurrency never changes *what* is allowed — only how long the allowed work takes.
+
 ## The sandbox floor: write-confinement, *not* a security wall
 
 When you approve a `bash` command, it runs inside a kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines **writes** to your working directory, the temp dir, and `/dev`. A command can't scribble over files elsewhere on disk.

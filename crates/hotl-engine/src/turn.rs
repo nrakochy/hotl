@@ -30,10 +30,37 @@ pub(crate) async fn run(
     events: mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
 ) {
-    let mut turn = Turn::new(&shared, cmd_tx.clone(), events, cancel);
+    let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel);
     let end = turn.drive().await;
     let usage = turn.usage;
     let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
+}
+
+/// One gated call: ready to execute with its (possibly hook-rewritten or
+/// human-edited) input, or already answered without running.
+enum Gate {
+    Ready { input: Value, summary: String },
+    Resolved(ToolOutcome),
+}
+
+/// Chunk a batch for execution: contiguous runs of parallel-safe calls form
+/// one chunk (they may overlap); every other call is its own single-entry
+/// chunk, keeping strict source order around anything mutating or unknown.
+fn parallel_chunks<'a>(uses: &'a [ToolUse], registry: &hotl_tools::Registry) -> Vec<&'a [ToolUse]> {
+    let safe = |tu: &ToolUse| registry.get(&tu.name).is_some_and(|t| t.parallel_safe());
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < uses.len() {
+        let mut end = start + 1;
+        if safe(&uses[start]) {
+            while end < uses.len() && safe(&uses[end]) {
+                end += 1;
+            }
+        }
+        chunks.push(&uses[start..end]);
+        start = end;
+    }
+    chunks
 }
 
 /// A sample's terminal result, or why it couldn't produce one.
@@ -48,8 +75,8 @@ enum SampleEnd {
     Fatal(String),
 }
 
-struct Turn<'d> {
-    shared: &'d SharedDeps,
+struct Turn {
+    shared: Arc<SharedDeps>,
     cmd_tx: mpsc::Sender<SessionCmd>,
     events: mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
@@ -71,9 +98,9 @@ struct Turn<'d> {
     last_snapshot: Option<Arc<Vec<Item>>>,
 }
 
-impl<'d> Turn<'d> {
+impl Turn {
     fn new(
-        shared: &'d SharedDeps,
+        shared: Arc<SharedDeps>,
         cmd_tx: mpsc::Sender<SessionCmd>,
         events: mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
@@ -81,11 +108,11 @@ impl<'d> Turn<'d> {
         let mut models = vec![shared.config.model.clone()];
         models.extend(shared.config.fallback_models.iter().cloned());
         Self {
+            tool_defs: shared.registry.defs().into(),
             shared,
             cmd_tx,
             events,
             cancel,
-            tool_defs: shared.registry.defs().into(),
             models,
             model_idx: 0,
             call_sigs: VecDeque::new(),
@@ -185,7 +212,10 @@ impl<'d> Turn<'d> {
         self.run_tool_batch(&uses).await
     }
 
-    /// Execute the batch in source order; every call gets a paired result.
+    /// Execute the batch with results paired in source order. The batch is
+    /// split into chunks: contiguous runs of parallel-safe calls (pure reads,
+    /// isolated children) execute concurrently; everything else runs alone,
+    /// in order. Gating stays serial — asks are one-at-a-time human moments.
     /// Mutating batches (anything beyond `read`) are bracketed by shadow
     /// snapshots so `hotl undo` can restore the pre-batch tree (M3b).
     async fn run_tool_batch(&mut self, uses: &[ToolUse]) -> Option<Outcome> {
@@ -195,15 +225,28 @@ impl<'d> Turn<'d> {
         }
         let mut results = Vec::with_capacity(uses.len());
         let mut budget_blown: Option<String> = None;
-        for tu in uses {
+        for chunk in parallel_chunks(uses, &self.shared.registry) {
             if self.cancel.is_cancelled() || budget_blown.is_some() {
-                results.push(pair(tu, "Not executed (turn stopped).", true));
+                for tu in chunk {
+                    results.push(pair(tu, "Not executed (turn stopped).", true));
+                }
                 continue;
             }
-            let mut outcome = self.execute_gated(tu).await;
-            self.maybe_evict(tu, &mut outcome).await;
-            let (content, failed) = self.apply_failure_budget(tu, outcome, &mut budget_blown);
-            results.push(ToolResultItem { tool_use_id: tu.id.clone(), content, is_error: failed });
+            let mut gates = Vec::with_capacity(chunk.len());
+            for tu in chunk {
+                gates.push(self.gate(tu).await);
+            }
+            // A chunk is one serial call or a run of parallel-safe calls that
+            // overlap; join_all returns outcomes in source order either way.
+            let outcomes = futures_util::future::join_all(
+                chunk.iter().zip(gates).map(|(tu, gate)| self.execute(tu, gate)),
+            )
+            .await;
+            for (tu, mut outcome) in chunk.iter().zip(outcomes) {
+                self.maybe_evict(tu, &mut outcome).await;
+                let (content, failed) = self.apply_failure_budget(tu, outcome, &mut budget_blown);
+                results.push(ToolResultItem { tool_use_id: tu.id.clone(), content, is_error: failed });
+            }
         }
         if mutating {
             self.snap(format!("post batch {}", self.samples)).await;
@@ -236,7 +279,9 @@ impl<'d> Turn<'d> {
             *n += 1;
             let left = self.shared.config.tool_failure_budget.saturating_sub(*n);
             content.push_str(&format!("\n<retry attempts_left={left}>"));
-            if left == 0 {
+            // A parallel chunk may keep reporting after the first blow —
+            // the outcome names the tool that blew the budget first.
+            if left == 0 && budget_blown.is_none() {
                 *budget_blown = Some(tu.name.clone());
             }
         } else {
@@ -246,12 +291,13 @@ impl<'d> Turn<'d> {
         (content, outcome.is_error)
     }
 
-    /// PreToolUse hook (M5) → permission (allow-rules first, then the human)
-    /// → execution → PostToolUse hook. A hook `Deny` skips execution; a
-    /// `Rewrite` swaps the input and re-enters the permission gate with it.
-    async fn execute_gated(&mut self, tu: &ToolUse) -> ToolOutcome {
+    /// PreToolUse hook (M5) → permission (allow-rules first, then the human).
+    /// A hook `Deny` skips execution; a `Rewrite` swaps the input and
+    /// re-enters the permission gate with it. Runs serially per call, before
+    /// any execution in its chunk — the ask is a one-at-a-time human moment.
+    async fn gate(&self, tu: &ToolUse) -> Gate {
         let Some(tool) = self.shared.registry.get(&tu.name) else {
-            return unknown_tool(&self.tool_defs, &tu.name);
+            return Gate::Resolved(unknown_tool(&self.tool_defs, &tu.name));
         };
         // PreToolUse: a wrap-style intercept may block or rewrite the call.
         let mut input = tu.input.clone();
@@ -260,7 +306,9 @@ impl<'d> Turn<'d> {
                 crate::hooks::PreToolDecision::Continue => {}
                 crate::hooks::PreToolDecision::Deny { message } => {
                     self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
-                    return ToolOutcome::err(format!("A hook blocked this tool call: {message}"));
+                    return Gate::Resolved(ToolOutcome::err(format!(
+                        "A hook blocked this tool call: {message}"
+                    )));
                 }
                 crate::hooks::PreToolDecision::Rewrite { input: rewritten } => input = rewritten,
             }
@@ -270,31 +318,42 @@ impl<'d> Turn<'d> {
             Permission::Ask { summary } => (Some(summary), None),
             Permission::AskProtected { summary, why } => (Some(summary), Some(why)),
         };
-        if let Some(summary) = &summary {
-            match self.approve_input(tu, &input, summary.clone(), why).await {
+        let display = summary.clone().unwrap_or_else(|| tu.name.clone());
+        if let Some(summary) = summary {
+            match self.approve_input(tu, &input, summary, why).await {
                 AskReply::Allow => {}
                 AskReply::AllowEdited { input: edited } => input = edited, // §2b
                 AskReply::Respond { content } => {
                     // §2b: the human answered as the tool — skip execution.
                     self.emit(EngineEvent::ToolDone { name: tu.name.clone(), ok: true }).await;
-                    return ToolOutcome::ok(content);
+                    return Gate::Resolved(ToolOutcome::ok(content));
                 }
                 AskReply::Deny { message } => {
                     self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
-                    return match message {
+                    return Gate::Resolved(match message {
                         Some(m) => ToolOutcome::err(format!("The user declined this tool call: {m}")),
                         None => ToolOutcome::err(
                             "The user declined this tool call. Ask what they'd like to do instead, or proceed another way.",
                         ),
-                    };
+                    });
                 }
             }
         }
-        self.emit(EngineEvent::ToolStart {
-            name: tu.name.clone(),
-            summary: summary.unwrap_or_else(|| tu.name.clone()),
-        })
-        .await;
+        Gate::Ready { input, summary: display }
+    }
+
+    /// Execute an approved call: ToolStart → run → PostToolUse hook →
+    /// ToolDone. `&self` only, so approved parallel-safe calls in one chunk
+    /// can run concurrently; a call the gate already resolved passes through.
+    async fn execute(&self, tu: &ToolUse, gate: Gate) -> ToolOutcome {
+        let Gate::Ready { input, summary } = gate else {
+            let Gate::Resolved(outcome) = gate else { unreachable!() };
+            return outcome;
+        };
+        self.emit(EngineEvent::ToolStart { name: tu.name.clone(), summary }).await;
+        let Some(tool) = self.shared.registry.get(&tu.name) else {
+            return unknown_tool(&self.tool_defs, &tu.name); // gate checked; defensive
+        };
         let mut outcome = tool.run(input, self.cancel.clone()).await;
         // PostToolUse: a node-style proposal may replace a successful result.
         if !outcome.is_error {
@@ -311,7 +370,7 @@ impl<'d> Turn<'d> {
     /// Allow-rules (deny-first, sandbox-gated, protected carve-out) or the
     /// ask, evaluated against `input` (which a PreToolUse hook may have
     /// rewritten — a rewritten call re-enters the gate, never bypasses it).
-    async fn approve_input(&mut self, tu: &ToolUse, input: &Value, summary: String, why: Option<String>) -> AskReply {
+    async fn approve_input(&self, tu: &ToolUse, input: &Value, summary: String, why: Option<String>) -> AskReply {
         let protected = why.is_some();
         match self.shared.rules.evaluate(&tu.name, input, self.shared.sandbox_enforced, protected) {
             Verdict::Auto { rule } => {

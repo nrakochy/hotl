@@ -79,7 +79,17 @@ impl Harness {
         config: EngineConfig,
         hooks: Arc<dyn hotl_engine::hooks::Hooks>,
     ) -> Self {
-        Self::build(scripts, config, Vec::new(), Some(hooks))
+        Self::build_with(scripts, config, Vec::new(), Some(hooks), Registry::builtin())
+    }
+
+    /// Construct a harness with a custom tool registry (concurrency probes,
+    /// scripted tools).
+    pub fn with_registry(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        registry: Registry,
+    ) -> Self {
+        Self::build_with(scripts, config, Vec::new(), None, registry)
     }
 
     fn build(
@@ -87,6 +97,16 @@ impl Harness {
         config: EngineConfig,
         initial_items: Vec<Item>,
         hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    ) -> Self {
+        Self::build_with(scripts, config, initial_items, hooks, Registry::builtin())
+    }
+
+    fn build_with(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+        hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+        registry: Registry,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
@@ -96,7 +116,7 @@ impl Harness {
         let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
         let deps = SessionDeps {
             provider: provider.clone(),
-            registry: Arc::new(Registry::builtin()),
+            registry: Arc::new(registry),
             rules: Arc::new(Rules::default()),
             sandbox_enforced: false,
             clock: Arc::new(SystemClock),
@@ -246,6 +266,24 @@ pub enum TrajectoryMatch {
     Subset,
 }
 
+/// A one-sample script whose assistant turn calls several tools in one batch.
+pub fn tool_batch(calls: &[(&str, &str, serde_json::Value)]) -> Vec<Result<StreamEvent, ProviderError>> {
+    let blocks: Vec<serde_json::Value> = calls
+        .iter()
+        .map(|(id, name, input)| {
+            serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+        })
+        .collect();
+    vec![
+        Ok(StreamEvent::Started),
+        Ok(StreamEvent::Completed {
+            stop: hotl_types::StopReason::ToolUse,
+            usage: hotl_types::TokenUsage { input_tokens: 10, output_tokens: 8, ..Default::default() },
+            blocks,
+        }),
+    ]
+}
+
 /// Is `needles` an in-order subsequence of `haystack`?
 fn is_subsequence(needles: &[&str], haystack: &[String]) -> bool {
     let mut it = haystack.iter();
@@ -260,6 +298,112 @@ mod tests {
 
     fn cfg() -> EngineConfig {
         EngineConfig { max_turns: 6, ..Default::default() }
+    }
+
+    /// A concurrency probe: each call bumps a shared running-counter and
+    /// records the high-water mark, then waits (bounded) for the mark to hit
+    /// 2. Overlapping calls drive the mark to 2; serial execution never does.
+    /// The mark is monotonic, so a fast partner can't be missed between
+    /// polls, and no cross-call state survives a timeout (unlike a barrier).
+    struct OverlapProbe {
+        safe: bool,
+        running: Arc<std::sync::atomic::AtomicUsize>,
+        peak: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl hotl_tools::Tool for OverlapProbe {
+        fn name(&self) -> &'static str {
+            "probe"
+        }
+        fn description(&self) -> &str {
+            "waits for a partner call"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn permission(&self, _: &serde_json::Value) -> hotl_tools::Permission {
+            hotl_tools::Permission::None
+        }
+        fn parallel_safe(&self) -> bool {
+            self.safe
+        }
+        fn run<'a>(
+            &'a self,
+            _input: serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> futures_util::future::BoxFuture<'a, hotl_tools::ToolOutcome> {
+            use std::sync::atomic::Ordering;
+            Box::pin(async move {
+                let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(now, Ordering::SeqCst);
+                let mut saw_partner = self.peak.load(Ordering::SeqCst) >= 2;
+                for _ in 0..50 {
+                    if saw_partner {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    saw_partner = self.peak.load(Ordering::SeqCst) >= 2;
+                }
+                self.running.fetch_sub(1, Ordering::SeqCst);
+                if saw_partner {
+                    hotl_tools::ToolOutcome::ok("overlapped")
+                } else {
+                    hotl_tools::ToolOutcome::err("did not overlap")
+                }
+            })
+        }
+    }
+
+    fn probe_registry(safe: bool) -> Registry {
+        let mut reg = Registry::builtin();
+        reg.register(Box::new(OverlapProbe {
+            safe,
+            running: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }));
+        reg
+    }
+
+    #[tokio::test]
+    async fn parallel_safe_calls_in_one_batch_overlap() {
+        let mut h = Harness::with_registry(
+            vec![
+                tool_batch(&[("t1", "probe", json!({})), ("t2", "probe", json!({}))]),
+                ScriptedProvider::text_reply("both ran"),
+            ],
+            cfg(),
+            probe_registry(true),
+        );
+        let outcome = h.prompt_and_wait("probe twice").await;
+        assert_eq!(outcome, Outcome::Done { text: "both ran".into() });
+        let items = h.items();
+        let Item::ToolResults { results } = &items[2] else { panic!("expected results, got {items:#?}") };
+        // Both calls passed the barrier — they ran concurrently…
+        assert!(results.iter().all(|r| !r.is_error && r.content == "overlapped"), "{results:?}");
+        // …and the paired results keep assistant source order.
+        let ids: Vec<_> = results.iter().map(|r| r.tool_use_id.as_str()).collect();
+        assert_eq!(ids, ["t1", "t2"]);
+    }
+
+    #[tokio::test]
+    async fn unsafe_calls_in_one_batch_stay_serial() {
+        let mut h = Harness::with_registry(
+            vec![
+                tool_batch(&[("t1", "probe", json!({})), ("t2", "probe", json!({}))]),
+                ScriptedProvider::text_reply("done"),
+            ],
+            cfg(),
+            probe_registry(false),
+        );
+        let outcome = h.prompt_and_wait("probe twice").await;
+        assert_eq!(outcome, Outcome::Done { text: "done".into() });
+        let items = h.items();
+        let Item::ToolResults { results } = &items[2] else { panic!("expected results, got {items:#?}") };
+        // Neither call may see the other running: both time out at the barrier.
+        assert!(
+            results.iter().all(|r| r.is_error && r.content.contains("did not overlap")),
+            "{results:?}"
+        );
     }
 
     #[tokio::test]
