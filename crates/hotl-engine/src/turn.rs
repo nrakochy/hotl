@@ -23,6 +23,10 @@ use crate::{AskReply, EngineEvent, Outcome, SessionCmd, TurnEnd};
 /// Compaction triggers when the estimated next request crosses this share of
 /// the window (M2; the estimate overcounts, so the miss direction is early).
 const COMPACT_TRIGGER: f64 = 0.8;
+/// Speculative compaction starts here: the digest summarize fires in the
+/// background so it is (usually) already done when [`COMPACT_TRIGGER`] hits,
+/// and the fold needs no blocking model call.
+const SPECULATE_TRIGGER: f64 = 0.6;
 
 pub(crate) async fn run(
     shared: Arc<SharedDeps>,
@@ -32,6 +36,10 @@ pub(crate) async fn run(
 ) {
     let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel);
     let end = turn.drive().await;
+    // A speculation the turn never consumed has no fold to serve — stop it.
+    if let Some(handle) = turn.speculation.take() {
+        handle.abort();
+    }
     let usage = turn.usage;
     let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
 }
@@ -61,6 +69,24 @@ fn parallel_chunks<'a>(uses: &'a [ToolUse], registry: &hotl_tools::Registry) -> 
         start = end;
     }
     chunks
+}
+
+/// Fire the compaction summarize against the current snapshot in the
+/// background. The plan is fixed now; items appended later simply extend the
+/// verbatim tail the fold keeps. `None` when there is nothing to fold yet.
+fn spawn_speculation(
+    shared: &Arc<SharedDeps>,
+    snapshot: &Arc<Vec<Item>>,
+) -> Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>> {
+    let tail_budget = (shared.config.context_window as f64 * crate::actor::TAIL_RATIO) as u64;
+    let plan = hotl_context::compaction::plan(snapshot, tail_budget)?;
+    let shared = Arc::clone(shared);
+    let snapshot = Arc::clone(snapshot);
+    Some(tokio::spawn(async move {
+        let folded = &snapshot[plan.prefix_end..plan.kept_from];
+        let text = crate::actor::summarize(&shared, folded).await?;
+        Some(crate::SpecDigest { prefix_end: plan.prefix_end, kept_from: plan.kept_from, text })
+    }))
 }
 
 /// A sample's terminal result, or why it couldn't produce one.
@@ -96,6 +122,10 @@ struct Turn {
     /// cross-turn dedup against the projection.
     injected_hints: HashSet<String>,
     last_snapshot: Option<Arc<Vec<Item>>>,
+    /// In-flight speculative compaction digest: fired once the estimate
+    /// crosses [`SPECULATE_TRIGGER`], consumed when the turn ends in
+    /// `Compact`, aborted otherwise.
+    speculation: Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>>,
 }
 
 impl Turn {
@@ -122,6 +152,7 @@ impl Turn {
             samples: 0,
             injected_hints: HashSet::new(),
             last_snapshot: None,
+            speculation: None,
         }
     }
 
@@ -130,7 +161,9 @@ impl Turn {
             let (stop, blocks) = match self.sample().await {
                 SampleEnd::Completed { stop, blocks } => (stop, blocks),
                 SampleEnd::Cancelled => return TurnEnd::Outcome(Outcome::Cancelled),
-                SampleEnd::ContextFull => return TurnEnd::Compact,
+                SampleEnd::ContextFull => {
+                    return TurnEnd::Compact { spec: self.take_speculation().await }
+                }
                 SampleEnd::Unavailable(_) if self.model_idx + 1 < self.models.len() => {
                     self.model_idx += 1;
                     self.emit(EngineEvent::FallbackModel { model: self.models[self.model_idx].clone() })
@@ -388,12 +421,19 @@ impl Turn {
     }
 
     /// Pre-flight: the compaction threshold check (M2), then the request with
-    /// the MOIM turn-context attached.
-    fn build_request(&self, snapshot: &Arc<Vec<Item>>) -> Result<SamplingRequest, SampleEnd> {
+    /// the MOIM turn-context attached. Past the speculation threshold the
+    /// digest summarize starts here, overlapping the samples still to come.
+    fn build_request(&mut self, snapshot: &Arc<Vec<Item>>) -> Result<SamplingRequest, SampleEnd> {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
         if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
             return Err(SampleEnd::ContextFull);
+        }
+        if self.speculation.is_none()
+            && !self.shared.config.compaction_reset
+            && estimate > (window as f64 * SPECULATE_TRIGGER) as u64
+        {
+            self.speculation = spawn_speculation(&self.shared, snapshot);
         }
         let used_pct = self
             .shared
@@ -535,6 +575,13 @@ impl Turn {
             // Actor gone mid-write (session closing): keep the preview.
             Err(_) => outcome.content = head,
         }
+    }
+
+    /// The speculative digest, if one was fired and succeeded. Awaiting the
+    /// residual is still a win: the task has had whole samples to run in.
+    async fn take_speculation(&mut self) -> Option<crate::SpecDigest> {
+        let handle = self.speculation.take()?;
+        handle.await.ok().flatten()
     }
 
     async fn snapshot(&self) -> Option<Arc<Vec<Item>>> {

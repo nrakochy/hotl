@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{turn, EngineConfig, EngineEvent, Outcome, SessionCmd, SessionDeps, TurnEnd};
 
 /// Verbatim tail kept through a compaction, as a share of the window.
-const TAIL_RATIO: f64 = 0.3;
+pub(crate) const TAIL_RATIO: f64 = 0.3;
 const SUMMARIZE_ATTEMPTS: u32 = 2;
 const SUMMARIZE_MAX_TOKENS: u32 = 2_000;
 /// Compactions without an intervening completed sample before giving up —
@@ -138,10 +138,10 @@ struct TurnFinishedCtx<'a> {
 async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: TokenUsage) {
     let outcome = match end {
         TurnEnd::Outcome(outcome) => Some(outcome),
-        TurnEnd::Compact => {
+        TurnEnd::Compact { spec } => {
             *ctx.carry_usage += usage;
             usage = TokenUsage::default();
-            try_compact(ctx.shared, ctx.log, ctx.items, ctx.compact_streak, ctx.cmd_tx, ctx.events, ctx.current_turn).await
+            try_compact(ctx.shared, ctx.log, ctx.items, ctx.compact_streak, spec, ctx.cmd_tx, ctx.events, ctx.current_turn).await
         }
     };
     if let Some(outcome) = outcome {
@@ -164,6 +164,7 @@ async fn try_compact(
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
     compact_streak: &mut u32,
+    spec: Option<crate::SpecDigest>,
     cmd_tx: &mpsc::Sender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
@@ -172,7 +173,7 @@ async fn try_compact(
     let compacted = if *compact_streak > MAX_COMPACT_STREAK {
         Err("context window exhausted — compaction can no longer make room".into())
     } else {
-        compact(shared, log, items).await
+        compact(shared, log, items, spec).await
     };
     match compacted {
         Ok(degraded) => {
@@ -250,10 +251,39 @@ fn annotate(shared: &SharedDeps, log: &mut SessionLog, outcome: &Outcome) {
 /// Compact the projection (M2): fold `[prefix..kept_from)` into a typed
 /// digest via the fast model, floor to a placeholder if summarize fails, and
 /// re-point the projection with an appended `compaction` entry — the log
-/// keeps everything. Runs inline in the actor: no turn is in flight, and
-/// admission blocking during the summarize call is the serialization working
-/// as designed.
-async fn compact(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>) -> Result<bool, String> {
+/// keeps everything. A digest the turn speculatively precomputed folds
+/// instantly; otherwise the summarize runs inline in the actor (no turn is
+/// in flight, and admission blocking during that call is the serialization
+/// working as designed).
+async fn compact(
+    shared: &SharedDeps,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
+    spec: Option<crate::SpecDigest>,
+) -> Result<bool, String> {
+    // Speculative hit: the digest was planned against this same projection
+    // lineage (it only appends between folds), so its indices still name the
+    // same items. Reset mode folds a wider span than the speculation covered,
+    // so it never uses one; the turn doesn't speculate in reset mode.
+    if !shared.config.compaction_reset {
+        if let Some(spec) = spec {
+            if spec.prefix_end < spec.kept_from && spec.kept_from <= items.len() {
+                let digest = vec![compaction::digest_item(&spec.text)];
+                let payload = EntryPayload::Compaction {
+                    digest: digest.clone(),
+                    prefix_end: spec.prefix_end,
+                    kept_from: spec.kept_from,
+                    degraded: false,
+                };
+                if !shared.append(log, &payload) {
+                    return Err("session log is sealed".into());
+                }
+                let plan = compaction::Plan { prefix_end: spec.prefix_end, kept_from: spec.kept_from };
+                *items = Arc::new(compaction::apply(items, &plan, &digest));
+                return Ok(false);
+            }
+        }
+    }
     let tail_budget = (shared.config.context_window as f64 * TAIL_RATIO) as u64;
     let Some(plan) = compaction::plan(items, tail_budget) else {
         return Err("context window exhausted — nothing left to compact".into());
@@ -284,7 +314,7 @@ async fn compact(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<
     Ok(degraded)
 }
 
-async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
+pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
     let model =
         shared.config.fast_model.clone().unwrap_or_else(|| shared.config.model.clone());
     let request = SamplingRequest {

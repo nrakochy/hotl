@@ -74,7 +74,20 @@ impl Default for EngineConfig {
 #[derive(Debug)]
 pub enum TurnEnd {
     Outcome(Outcome),
-    Compact,
+    /// Compact, folding with the speculative digest when the turn managed to
+    /// precompute one — `None` falls back to the inline summarize.
+    Compact { spec: Option<SpecDigest> },
+}
+
+/// A compaction digest computed speculatively *during* the turn, overlapping
+/// the summarize call with the turn's own samples. Indices refer to the
+/// projection the digest was planned against; the projection only appends
+/// between folds, so they stay valid until the fold that consumes them.
+#[derive(Debug)]
+pub struct SpecDigest {
+    pub prefix_end: usize,
+    pub kept_from: usize,
+    pub text: String,
 }
 
 /// A human's answer to a permission ask. Widened from a
