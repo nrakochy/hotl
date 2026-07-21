@@ -30,9 +30,18 @@ pub struct Config {
     pub network: NetworkCfg,
     #[serde(default)]
     pub permissions: PermissionsCfg,
+    #[serde(default)]
+    pub skills: SkillsCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
     raw: Option<toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct SkillsCfg {
+    /// `false` stops reading Claude Code skill roots (`~/.claude/skills`,
+    /// the plugin cache). Default: read them when present.
+    pub claude: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
