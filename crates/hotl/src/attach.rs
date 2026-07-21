@@ -144,7 +144,10 @@ fn render(msg: &Value, pending_ask: &mut Option<u64>, turn_running: &mut bool) -
                 if let Some(why) = msg.get("protectedWhy").and_then(Value::as_str) {
                     eprintln!("⚠ PROTECTED PATH — {why}");
                 }
-                eprint!("allow {}? [y/N] ", msg.get("summary").and_then(Value::as_str).unwrap_or("?"));
+                eprint!(
+                    "allow {}? [y/N] ",
+                    msg.get("summary").and_then(Value::as_str).unwrap_or("?")
+                );
                 let _ = std::io::Write::flush(&mut std::io::stderr());
                 *pending_ask = Some(id);
             }
@@ -156,7 +159,10 @@ fn render(msg: &Value, pending_ask: &mut Option<u64>, turn_running: &mut bool) -
         }
         "turn_done" => {
             *turn_running = false;
-            let kind = msg.pointer("/outcome/kind").and_then(Value::as_str).unwrap_or("done");
+            let kind = msg
+                .pointer("/outcome/kind")
+                .and_then(Value::as_str)
+                .unwrap_or("done");
             if kind != "done" {
                 eprintln!("\n[turn ended: {kind}]");
             }
@@ -171,10 +177,16 @@ fn render(msg: &Value, pending_ask: &mut Option<u64>, turn_running: &mut bool) -
 fn render_update(update: &Value) {
     match update.get("type").and_then(Value::as_str).unwrap_or("") {
         "text_delta" => {
-            print!("{}", update.get("text").and_then(Value::as_str).unwrap_or(""));
+            print!(
+                "{}",
+                update.get("text").and_then(Value::as_str).unwrap_or("")
+            );
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
-        "tool_start" => eprintln!("\n· {}", update.get("summary").and_then(Value::as_str).unwrap_or("")),
+        "tool_start" => eprintln!(
+            "\n· {}",
+            update.get("summary").and_then(Value::as_str).unwrap_or("")
+        ),
         "tool_done" => {
             if update.get("ok").and_then(Value::as_bool) == Some(false) {
                 eprintln!("  (tool error — fed back to the model)");
@@ -191,10 +203,7 @@ async fn detach(write: &mut tokio::net::unix::OwnedWriteHalf) -> i32 {
     0
 }
 
-async fn send(
-    write: &mut tokio::net::unix::OwnedWriteHalf,
-    frame: Value,
-) -> std::io::Result<()> {
+async fn send(write: &mut tokio::net::unix::OwnedWriteHalf, frame: Value) -> std::io::Result<()> {
     let mut line = frame.to_string();
     line.push('\n');
     write.write_all(line.as_bytes()).await?;

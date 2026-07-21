@@ -196,7 +196,11 @@ async fn handle_conn(mut client: TcpStream, patterns: &'static [String]) {
         let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await else {
             return respond(&mut client, "502 Bad Gateway", "upstream connect failed").await;
         };
-        if client.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await.is_err() {
+        if client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .is_err()
+        {
             return;
         }
         // Bytes the client pipelined past the head belong to the tunnel.
@@ -258,7 +262,9 @@ fn http_target(target: &str, head: &str) -> Option<(String, u16)> {
 fn host_header(head: &str) -> Option<String> {
     head.lines().skip(1).find_map(|line| {
         let (name, value) = line.split_once(':')?;
-        name.trim().eq_ignore_ascii_case("host").then(|| value.trim().to_string())
+        name.trim()
+            .eq_ignore_ascii_case("host")
+            .then(|| value.trim().to_string())
     })
 }
 
@@ -299,14 +305,17 @@ mod tests {
         // Exact.
         assert!(host_allowed("github.com", &p));
         assert!(!host_allowed("api.github.com", &p)); // exact is not a wildcard
-        // Wildcard covers the apex and every subdomain depth.
+                                                      // Wildcard covers the apex and every subdomain depth.
         assert!(host_allowed("crates.io", &p));
         assert!(host_allowed("static.crates.io", &p));
         assert!(host_allowed("a.b.crates.io", &p));
         // Case-insensitive both sides; trailing dot stripped.
         assert!(host_allowed("GitHub.COM", &p));
         assert!(host_allowed("github.com.", &p));
-        assert!(host_allowed("Static.Crates.IO", &patterns(&["*.CRATES.io"])));
+        assert!(host_allowed(
+            "Static.Crates.IO",
+            &patterns(&["*.CRATES.io"])
+        ));
         // No suffix tricks: evilcrates.io is not *.crates.io.
         assert!(!host_allowed("evilcrates.io", &p));
         assert!(!host_allowed("crates.io.evil.example", &p));
@@ -319,18 +328,33 @@ mod tests {
     fn head_and_target_parsing() {
         assert_eq!(find_head_end(b"GET / HTTP/1.1\r\n\r\nbody"), Some(18));
         assert_eq!(find_head_end(b"partial\r\n"), None);
-        assert_eq!(split_host_port("example.com:443", None), Some(("example.com".into(), 443)));
+        assert_eq!(
+            split_host_port("example.com:443", None),
+            Some(("example.com".into(), 443))
+        );
         assert_eq!(split_host_port("example.com", None), None); // CONNECT needs a port
-        assert_eq!(split_host_port("example.com", Some(80)), Some(("example.com".into(), 80)));
-        assert_eq!(split_host_port("[::1]:8080", None), Some(("::1".into(), 8080)));
+        assert_eq!(
+            split_host_port("example.com", Some(80)),
+            Some(("example.com".into(), 80))
+        );
+        assert_eq!(
+            split_host_port("[::1]:8080", None),
+            Some(("::1".into(), 8080))
+        );
         assert_eq!(
             http_target("http://example.com:8080/path", ""),
             Some(("example.com".into(), 8080))
         );
-        assert_eq!(http_target("http://example.com/path", ""), Some(("example.com".into(), 80)));
+        assert_eq!(
+            http_target("http://example.com/path", ""),
+            Some(("example.com".into(), 80))
+        );
         // Origin-form falls back to the Host header.
         assert_eq!(
-            http_target("/path", "GET /path HTTP/1.1\r\nHost: fallback.example:81\r\n"),
+            http_target(
+                "/path",
+                "GET /path HTTP/1.1\r\nHost: fallback.example:81\r\n"
+            ),
             Some(("fallback.example".into(), 81))
         );
         assert_eq!(http_target("/path", "GET /path HTTP/1.1\r\n"), None);
@@ -381,7 +405,10 @@ mod tests {
             .await
             .unwrap();
         let reply = read_until_head_end(&mut client).await;
-        assert!(reply.starts_with("HTTP/1.1 200"), "expected tunnel established, got: {reply}");
+        assert!(
+            reply.starts_with("HTTP/1.1 200"),
+            "expected tunnel established, got: {reply}"
+        );
         client.write_all(b"ping").await.unwrap();
         let mut buf = [0u8; 4];
         client.read_exact(&mut buf).await.unwrap();
@@ -392,7 +419,10 @@ mod tests {
     async fn connect_to_unlisted_host_is_403() {
         let proxy = test_proxy(&["127.0.0.1"]).await;
         let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
-        client.write_all(b"CONNECT evil.example:443 HTTP/1.1\r\n\r\n").await.unwrap();
+        client
+            .write_all(b"CONNECT evil.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
         let mut reply = String::new();
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 403"), "got: {reply}");
@@ -410,8 +440,13 @@ mod tests {
         tokio::spawn(async move {
             let (mut s, _) = origin.accept().await.unwrap();
             let head = read_until_head_end(&mut s).await;
-            assert!(head.starts_with("GET "), "origin should see the GET: {head}");
-            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok").await.unwrap();
+            assert!(
+                head.starts_with("GET "),
+                "origin should see the GET: {head}"
+            );
+            s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
         });
 
         let proxy = test_proxy(&["127.0.0.1"]).await;

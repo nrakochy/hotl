@@ -20,13 +20,22 @@ struct Check {
 }
 
 fn ok(line: String) -> Check {
-    Check { status: Status::Ok, line }
+    Check {
+        status: Status::Ok,
+        line,
+    }
 }
 fn warn(line: String) -> Check {
-    Check { status: Status::Warn, line }
+    Check {
+        status: Status::Warn,
+        line,
+    }
 }
 fn fail(line: String) -> Check {
-    Check { status: Status::Fail, line }
+    Check {
+        status: Status::Fail,
+        line,
+    }
 }
 
 pub fn doctor_main() -> i32 {
@@ -71,7 +80,11 @@ pub fn doctor_main() -> i32 {
 }
 
 fn source_kind(refreshable: bool) -> &'static str {
-    if refreshable { "helper" } else { "static env key" }
+    if refreshable {
+        "helper"
+    } else {
+        "static env key"
+    }
 }
 
 fn probe_line(base: &str, result: Result<u16, String>) -> String {
@@ -89,26 +102,34 @@ fn probe_line(base: &str, result: Result<u16, String>) -> String {
 fn provider_check() -> Check {
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
     match crate::agent::select_provider(&cfg, &EnvSecrets) {
-        Ok((_, model, source)) => {
-            ok(format!("provider: {model} selected (key source: {})", source_kind(source.refreshable())))
-        }
+        Ok((_, model, source)) => ok(format!(
+            "provider: {model} selected (key source: {})",
+            source_kind(source.refreshable())
+        )),
         Err(msg) => fail(format!("provider: {}", msg.lines().next().unwrap_or(&msg))),
     }
 }
 
 fn key_helper_check(rt: &tokio::runtime::Runtime) -> Check {
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
-    let helper = EnvSecrets.get("HOTL_API_KEY_HELPER").or_else(|| cfg.provider.api_key_helper.clone());
+    let helper = EnvSecrets
+        .get("HOTL_API_KEY_HELPER")
+        .or_else(|| cfg.provider.api_key_helper.clone());
     let Some(_) = helper else {
         return ok("key helper: not configured (static env keys)".into());
     };
     let (_, _, source) = match crate::agent::select_provider(&cfg, &EnvSecrets) {
         Ok(t) => t,
-        Err(_) => return warn("key helper: configured, but provider selection failed (see above)".into()),
+        Err(_) => {
+            return warn("key helper: configured, but provider selection failed (see above)".into())
+        }
     };
     let start = std::time::Instant::now();
     match rt.block_on(source.get()) {
-        Ok(Some(_)) => ok(format!("key helper: OK ({:.1}s, key masked)", start.elapsed().as_secs_f32())),
+        Ok(Some(_)) => ok(format!(
+            "key helper: OK ({:.1}s, key masked)",
+            start.elapsed().as_secs_f32()
+        )),
         Ok(None) => warn("key helper: ran but produced no key".into()),
         Err(e) => fail(format!("key helper: {e}")),
     }
@@ -116,7 +137,10 @@ fn key_helper_check(rt: &tokio::runtime::Runtime) -> Check {
 
 fn gateway_check(rt: &tokio::runtime::Runtime) -> Check {
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
-    let base = match EnvSecrets.get("HOTL_OPENAI_BASE_URL").or_else(|| cfg.provider.base_url.clone()) {
+    let base = match EnvSecrets
+        .get("HOTL_OPENAI_BASE_URL")
+        .or_else(|| cfg.provider.base_url.clone())
+    {
         Some(b) if b != hotl_provider_openai::DEFAULT_BASE_URL => b,
         _ => return ok("gateway: no custom base_url (direct provider)".into()),
     };
@@ -131,7 +155,11 @@ fn gateway_check(rt: &tokio::runtime::Runtime) -> Check {
     }
 }
 
-fn gateway_probe(rt: &tokio::runtime::Runtime, base: &str, key: Option<&str>) -> Result<u16, String> {
+fn gateway_probe(
+    rt: &tokio::runtime::Runtime,
+    base: &str,
+    key: Option<&str>,
+) -> Result<u16, String> {
     rt.block_on(async {
         let client = reqwest::Client::new();
         let mut req = client
@@ -140,7 +168,10 @@ fn gateway_probe(rt: &tokio::runtime::Runtime, base: &str, key: Option<&str>) ->
         if let Some(k) = key {
             req = req.bearer_auth(k);
         }
-        req.send().await.map(|r| r.status().as_u16()).map_err(|e| e.to_string())
+        req.send()
+            .await
+            .map(|r| r.status().as_u16())
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -150,9 +181,9 @@ fn sandbox_check() -> Check {
         sandbox::SandboxStatus::Disabled => {
             warn("sandbox: disabled via HOTL_SANDBOX=off — every exec is individually gated".into())
         }
-        sandbox::SandboxStatus::Unavailable(reason) => {
-            warn(format!("sandbox: unavailable ({reason}) — every exec is individually gated"))
-        }
+        sandbox::SandboxStatus::Unavailable(reason) => warn(format!(
+            "sandbox: unavailable ({reason}) — every exec is individually gated"
+        )),
     }
 }
 
@@ -161,7 +192,10 @@ fn config_check(config_dir: &Path) -> Check {
     if cfg.is_file() {
         ok(format!("config: {} loaded", cfg.display()))
     } else {
-        ok(format!("config: none at {} (defaults; run `hotl setup`)", cfg.display()))
+        ok(format!(
+            "config: none at {} (defaults; run `hotl setup`)",
+            cfg.display()
+        ))
     }
 }
 
@@ -177,7 +211,10 @@ fn rules_check(config_dir: &Path) -> Check {
 
 fn sessions_check(sessions_dir: &Path) -> Check {
     if let Err(e) = std::fs::create_dir_all(sessions_dir) {
-        return fail(format!("sessions: cannot create {}: {e}", sessions_dir.display()));
+        return fail(format!(
+            "sessions: cannot create {}: {e}",
+            sessions_dir.display()
+        ));
     }
     let probe = sessions_dir.join(".doctor-probe");
     match std::fs::write(&probe, b"ok") {
@@ -185,7 +222,10 @@ fn sessions_check(sessions_dir: &Path) -> Check {
             let _ = std::fs::remove_file(&probe);
             ok(format!("sessions: {} (writable)", sessions_dir.display()))
         }
-        Err(e) => fail(format!("sessions: {} not writable: {e}", sessions_dir.display())),
+        Err(e) => fail(format!(
+            "sessions: {} not writable: {e}",
+            sessions_dir.display()
+        )),
     }
 }
 
@@ -240,6 +280,7 @@ mod tests {
             probe_line("http://localhost:8080/v1", Ok(401)),
             "gateway: http://localhost:8080/v1/models reachable but rejected the key (HTTP 401) — check the key source"
         );
-        assert!(probe_line("http://x/v1", Err("connection refused".into())).contains("connection refused"));
+        assert!(probe_line("http://x/v1", Err("connection refused".into()))
+            .contains("connection refused"));
     }
 }

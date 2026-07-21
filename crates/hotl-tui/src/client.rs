@@ -14,9 +14,16 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub enum ServerMsg {
     /// The `params.update` object of a `session/update` notification.
     Update(Value),
-    PermissionRequest { req_id: u64, summary: String, protected_why: Option<String> },
+    PermissionRequest {
+        req_id: u64,
+        summary: String,
+        protected_why: Option<String>,
+    },
     /// A reply to one of our requests (including the prompt result).
-    Response { id: u64, result: Result<Value, String> },
+    Response {
+        id: u64,
+        result: Result<Value, String>,
+    },
 }
 
 pub struct AcpClient<W: AsyncWrite + Unpin> {
@@ -46,7 +53,8 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         if let Some(m) = message {
             result["message"] = json!(m);
         }
-        self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result})).await;
+        self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
+            .await;
     }
 
     async fn send(&mut self, msg: &Value) {
@@ -65,7 +73,9 @@ pub async fn read_server_msg<R: AsyncBufRead + Unpin>(r: &mut R) -> Option<Serve
         if r.read_line(&mut line).await.ok()? == 0 {
             return None;
         }
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         if let Some(decoded) = decode(&msg) {
             return Some(decoded);
         }
@@ -77,14 +87,25 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
         Some("session/update") => Some(ServerMsg::Update(msg.pointer("/params/update")?.clone())),
         Some("session/request_permission") => Some(ServerMsg::PermissionRequest {
             req_id: msg.get("id").and_then(Value::as_u64)?,
-            summary: msg.pointer("/params/summary").and_then(Value::as_str).unwrap_or("").to_string(),
-            protected_why: msg.pointer("/params/protectedWhy").and_then(Value::as_str).map(String::from),
+            summary: msg
+                .pointer("/params/summary")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            protected_why: msg
+                .pointer("/params/protectedWhy")
+                .and_then(Value::as_str)
+                .map(String::from),
         }),
         Some(_) => None,
         None => {
             let id = msg.get("id").and_then(Value::as_u64)?;
             let result = match msg.get("error") {
-                Some(e) => Err(e.get("message").and_then(Value::as_str).unwrap_or("error").to_string()),
+                Some(e) => Err(e
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string()),
                 None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
             };
             Some(ServerMsg::Response { id, result })
@@ -102,12 +123,23 @@ mod tests {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
         assert_eq!(client.request("initialize", Value::Null).await, 1);
-        assert_eq!(client.request("session/prompt", json!({"text": "go"})).await, 2);
+        assert_eq!(
+            client
+                .request("session/prompt", json!({"text": "go"}))
+                .await,
+            2
+        );
         drop(client);
         let mut out = String::new();
         read.read_to_string(&mut out).await.unwrap();
-        let lines: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(lines[0], json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"}));
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines[0],
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+        );
         assert_eq!(
             lines[1],
             json!({"jsonrpc": "2.0", "id": 2, "method": "session/prompt", "params": {"text": "go"}})
@@ -118,17 +150,24 @@ mod tests {
     async fn read_decodes_update_permission_and_response() {
         let (client, mut server) = tokio::io::duplex(4096);
         let feed = concat!(
-            r#"{"jsonrpc":"2.0","method":"session/update","params":{"schemaVersion":1,"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"schemaVersion":1,"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#,
+            "\n",
             "this is not json\n",
-            r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s","summary":"run bash","protectedWhy":"prod"}}"#, "\n",
-            r#"{"jsonrpc":"2.0","id":2,"result":{"outcome":{"kind":"done"}}}"#, "\n",
+            r#"{"jsonrpc":"2.0","id":7,"method":"session/request_permission","params":{"sessionId":"s","summary":"run bash","protectedWhy":"prod"}}"#,
+            "\n",
+            r#"{"jsonrpc":"2.0","id":2,"result":{"outcome":{"kind":"done"}}}"#,
+            "\n",
         );
-        tokio::io::AsyncWriteExt::write_all(&mut server, feed.as_bytes()).await.unwrap();
+        tokio::io::AsyncWriteExt::write_all(&mut server, feed.as_bytes())
+            .await
+            .unwrap();
         drop(server);
         let mut r = BufReader::new(client);
         assert_eq!(
             read_server_msg(&mut r).await,
-            Some(ServerMsg::Update(json!({"type": "text_delta", "text": "hi"})))
+            Some(ServerMsg::Update(
+                json!({"type": "text_delta", "text": "hi"})
+            ))
         );
         assert_eq!(
             read_server_msg(&mut r).await,
@@ -141,7 +180,10 @@ mod tests {
         );
         assert_eq!(
             read_server_msg(&mut r).await,
-            Some(ServerMsg::Response { id: 2, result: Ok(json!({"outcome": {"kind": "done"}})) })
+            Some(ServerMsg::Response {
+                id: 2,
+                result: Ok(json!({"outcome": {"kind": "done"}}))
+            })
         );
         assert_eq!(read_server_msg(&mut r).await, None, "EOF");
     }
@@ -151,12 +193,20 @@ mod tests {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
         client.reply_permission(7, true, None).await;
-        client.reply_permission(8, false, Some("wrong dir".into())).await;
+        client
+            .reply_permission(8, false, Some("wrong dir".into()))
+            .await;
         drop(client);
         let mut out = String::new();
         read.read_to_string(&mut out).await.unwrap();
-        let lines: Vec<Value> = out.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(lines[0], json!({"jsonrpc": "2.0", "id": 7, "result": {"allow": true}}));
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines[0],
+            json!({"jsonrpc": "2.0", "id": 7, "result": {"allow": true}})
+        );
         assert_eq!(
             lines[1],
             json!({"jsonrpc": "2.0", "id": 8, "result": {"allow": false, "message": "wrong dir"}})

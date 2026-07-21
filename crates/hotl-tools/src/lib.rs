@@ -7,11 +7,11 @@
 
 mod builtins;
 pub mod diagnostics;
-pub mod skills;
 pub(crate) mod matcher;
 pub mod net;
 pub mod rules;
 pub mod sandbox;
+pub mod skills;
 
 pub use builtins::{BashTool, EditTool, ReadTool, WriteTool};
 
@@ -39,11 +39,17 @@ pub struct ToolOutcome {
 
 impl ToolOutcome {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
     }
     /// Errors-as-prompts: `content` must tell the model how to proceed.
     pub fn err(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: true }
+        Self {
+            content: content.into(),
+            is_error: true,
+        }
     }
 }
 
@@ -116,7 +122,10 @@ impl Registry {
     }
 
     pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.iter().find(|t| t.name() == name).map(|b| b.as_ref())
+        self.tools
+            .iter()
+            .find(|t| t.name() == name)
+            .map(|b| b.as_ref())
     }
 }
 
@@ -130,7 +139,10 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     if p.contains(".git/hooks/") {
         return Some("git hook: runs on your next git command");
     }
-    if matches!(file, "Makefile" | "makefile" | "GNUmakefile" | "justfile" | "Justfile") {
+    if matches!(
+        file,
+        "Makefile" | "makefile" | "GNUmakefile" | "justfile" | "Justfile"
+    ) {
         return Some("build entrypoint: runs on your next make/just invocation");
     }
     // Build-time code entrypoints: a diagnostic or a plain `cargo build` /
@@ -169,7 +181,11 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
         return Some("git config: aliases here run as commands on your next git call");
     }
     // Schedulers and service definitions run code on a timer / at boot.
-    if p.contains("/cron.") || file == "crontab" || p.contains("/systemd/") || file.ends_with(".service") {
+    if p.contains("/cron.")
+        || file == "crontab"
+        || p.contains("/systemd/")
+        || file.ends_with(".service")
+    {
         return Some("scheduler/service unit: runs code on a timer or at boot");
     }
     None

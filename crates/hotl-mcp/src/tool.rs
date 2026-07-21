@@ -52,7 +52,11 @@ impl McpTool {
     }
 
     /// Tests inject an in-process transport here.
-    pub fn with_connector(servers: Vec<ServerConfig>, trust: TrustStore, connector: Connector) -> Self {
+    pub fn with_connector(
+        servers: Vec<ServerConfig>,
+        trust: TrustStore,
+        connector: Connector,
+    ) -> Self {
         let listing = servers
             .iter()
             .map(|s| format!("`{}` ({})", s.name, s.description))
@@ -81,8 +85,11 @@ impl McpTool {
     /// is computed before taking the lock — racing computes are idempotent —
     /// so a slow file read never holds the cache against other servers.
     fn hash_of(&self, cfg: &ServerConfig) -> String {
-        if let Some(hash) =
-            self.hashes.lock().unwrap_or_else(PoisonError::into_inner).get(&cfg.name)
+        if let Some(hash) = self
+            .hashes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&cfg.name)
         {
             return hash.clone();
         }
@@ -120,7 +127,9 @@ impl McpTool {
 
     async fn run_impl(&self, input: Value) -> ToolOutcome {
         let Some(server_name) = input.get("server").and_then(Value::as_str) else {
-            return ToolOutcome::err("`server` is required. See the tool description for configured servers.");
+            return ToolOutcome::err(
+                "`server` is required. See the tool description for configured servers.",
+            );
         };
         let Some(cfg) = self.server(server_name) else {
             let known: Vec<_> = self.servers.iter().map(|s| s.name.as_str()).collect();
@@ -153,7 +162,10 @@ impl McpTool {
             Ok(tools) => {
                 let mut out = String::new();
                 for t in &tools {
-                    out.push_str(&format!("{} — {}\n  schema: {}\n", t.name, t.description, t.input_schema));
+                    out.push_str(&format!(
+                        "{} — {}\n  schema: {}\n",
+                        t.name, t.description, t.input_schema
+                    ));
                 }
                 if tools.is_empty() {
                     out = "(this server exposes no tools)".into();
@@ -188,14 +200,22 @@ impl Tool for McpTool {
     /// the protected first-use screen, never auto-allowable (SECURITY §M3a).
     fn permission(&self, input: &Value) -> Permission {
         let server = input.get("server").and_then(Value::as_str).unwrap_or("?");
-        let tool = input.get("tool").and_then(Value::as_str).unwrap_or("tools/list");
+        let tool = input
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or("tools/list");
         let summary = format!("mcp: {server}.{tool}");
         let Some(cfg) = self.server(server) else {
             // Unknown server: run() errors without side effects.
             return Permission::None;
         };
         let hash = self.hash_of(cfg);
-        if self.trust.lock().unwrap_or_else(PoisonError::into_inner).is_trusted(server, &hash) {
+        if self
+            .trust
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_trusted(server, &hash)
+        {
             Permission::Ask { summary }
         } else {
             Permission::AskProtected {

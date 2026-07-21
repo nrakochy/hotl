@@ -109,7 +109,9 @@ impl Config {
     /// (fail-closed: a typo never silently changes a setting).
     pub fn load(config_dir: &Path) -> Self {
         let path = config_dir.join("config.toml");
-        let Ok(text) = std::fs::read_to_string(&path) else { return Self::default() };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return Self::default();
+        };
         match text.parse::<toml::Value>() {
             Ok(raw) => {
                 // Parse the typed settings from the same source string (no
@@ -217,15 +219,23 @@ mod tests {
         assert_eq!(cfg.retention.max_sessions, Some(100));
         // Domain sections reserialize to their loaders' shapes.
         assert!(cfg.allow_toml().unwrap().contains("prefix = \"cargo \""));
-        assert!(cfg.mcp_toml().unwrap().contains("[[server]]") && cfg.mcp_toml().unwrap().contains("docs"));
+        assert!(
+            cfg.mcp_toml().unwrap().contains("[[server]]")
+                && cfg.mcp_toml().unwrap().contains("docs")
+        );
         let hooks = cfg.hooks_toml().unwrap();
         assert!(hooks.contains("pre_tool") && hooks.contains("cargo check"));
     }
 
     #[test]
     fn provider_helper_keys_parse() {
-        let cfg = cfg_with("[provider]\napi_key_helper = \"mint-key --gw\"\napi_key_helper_ttl_secs = 300\n");
-        assert_eq!(cfg.provider.api_key_helper.as_deref(), Some("mint-key --gw"));
+        let cfg = cfg_with(
+            "[provider]\napi_key_helper = \"mint-key --gw\"\napi_key_helper_ttl_secs = 300\n",
+        );
+        assert_eq!(
+            cfg.provider.api_key_helper.as_deref(),
+            Some("mint-key --gw")
+        );
         assert_eq!(cfg.provider.api_key_helper_ttl_secs, Some(300));
     }
 
@@ -237,10 +247,14 @@ mod tests {
         assert_eq!(policy, EgressPolicy::Open);
         assert!(warning.is_none());
         // Explicit modes.
-        let (policy, warning) = cfg_with("[network]\negress = \"off\"\n").network.egress_policy();
+        let (policy, warning) = cfg_with("[network]\negress = \"off\"\n")
+            .network
+            .egress_policy();
         assert_eq!(policy, EgressPolicy::Off);
         assert!(warning.is_none());
-        let cfg = cfg_with("[network]\negress = \"allowlist\"\nallow = [\"github.com\", \"*.crates.io\"]\n");
+        let cfg = cfg_with(
+            "[network]\negress = \"allowlist\"\nallow = [\"github.com\", \"*.crates.io\"]\n",
+        );
         let (policy, warning) = cfg.network.egress_policy();
         assert_eq!(
             policy,
@@ -248,7 +262,9 @@ mod tests {
         );
         assert!(warning.is_none());
         // Unknown value: fail closed to Off, loudly — never open.
-        let (policy, warning) = cfg_with("[network]\negress = \"opne\"\n").network.egress_policy();
+        let (policy, warning) = cfg_with("[network]\negress = \"opne\"\n")
+            .network
+            .egress_policy();
         assert_eq!(policy, EgressPolicy::Off);
         assert!(warning.unwrap().contains("opne"));
     }
@@ -264,7 +280,9 @@ mod tests {
     fn empty_or_absent_config_is_defaults_and_none_sections() {
         let cfg = Config::load(std::path::Path::new("/no/such/dir"));
         assert!(cfg.provider.model.is_none());
-        assert!(cfg.allow_toml().is_none() && cfg.mcp_toml().is_none() && cfg.hooks_toml().is_none());
+        assert!(
+            cfg.allow_toml().is_none() && cfg.mcp_toml().is_none() && cfg.hooks_toml().is_none()
+        );
         assert!(cfg.retention.max_age_days.is_none());
     }
 }

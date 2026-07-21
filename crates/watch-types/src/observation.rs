@@ -7,7 +7,11 @@ pub enum Source {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LocationHandle {
-    Tmux { pane_id: String, session: String, window_index: u32 },
+    Tmux {
+        pane_id: String,
+        session: String,
+        window_index: u32,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,7 +38,11 @@ mod tests {
 
     fn obs() -> AgentObservation {
         AgentObservation {
-            agent: Agent { name: "claude".into(), pid: 1, argv: "claude".into() },
+            agent: Agent {
+                name: "claude".into(),
+                pid: 1,
+                argv: "claude".into(),
+            },
             cwd: "/tmp/proj".into(),
             status: Status::Idle,
             status_line: None,

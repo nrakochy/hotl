@@ -85,13 +85,20 @@ fn spawn_speculation(
     Some(tokio::spawn(async move {
         let folded = &snapshot[plan.prefix_end..plan.kept_from];
         let text = crate::actor::summarize(&shared, folded).await?;
-        Some(crate::SpecDigest { prefix_end: plan.prefix_end, kept_from: plan.kept_from, text })
+        Some(crate::SpecDigest {
+            prefix_end: plan.prefix_end,
+            kept_from: plan.kept_from,
+            text,
+        })
     }))
 }
 
 /// A sample's terminal result, or why it couldn't produce one.
 enum SampleEnd {
-    Completed { stop: StopReason, blocks: Vec<Value> },
+    Completed {
+        stop: StopReason,
+        blocks: Vec<Value>,
+    },
     Cancelled,
     /// Availability-class failure: eligible for a model fallback.
     Unavailable(String),
@@ -162,12 +169,16 @@ impl Turn {
                 SampleEnd::Completed { stop, blocks } => (stop, blocks),
                 SampleEnd::Cancelled => return TurnEnd::Outcome(Outcome::Cancelled),
                 SampleEnd::ContextFull => {
-                    return TurnEnd::Compact { spec: self.take_speculation().await }
+                    return TurnEnd::Compact {
+                        spec: self.take_speculation().await,
+                    }
                 }
                 SampleEnd::Unavailable(_) if self.model_idx + 1 < self.models.len() => {
                     self.model_idx += 1;
-                    self.emit(EngineEvent::FallbackModel { model: self.models[self.model_idx].clone() })
-                        .await;
+                    self.emit(EngineEvent::FallbackModel {
+                        model: self.models[self.model_idx].clone(),
+                    })
+                    .await;
                     continue;
                 }
                 SampleEnd::Unavailable(m) | SampleEnd::Fatal(m) => {
@@ -181,7 +192,11 @@ impl Turn {
                     }
                 }
                 StopReason::Refusal => return TurnEnd::Outcome(Outcome::Refused),
-                _ => return TurnEnd::Outcome(Outcome::Done { text: assistant_text(&blocks) }),
+                _ => {
+                    return TurnEnd::Outcome(Outcome::Done {
+                        text: assistant_text(&blocks),
+                    })
+                }
             }
         }
         TurnEnd::Outcome(Outcome::TurnLimit)
@@ -212,9 +227,14 @@ impl Turn {
             + usage.cache_creation_input_tokens
             + usage.output_tokens;
         self.anchor = Some((reported, snapshot.len() + 1));
-        let assistant = Item::Assistant { blocks: blocks.clone() };
+        let assistant = Item::Assistant {
+            blocks: blocks.clone(),
+        };
         if !self
-            .propose(vec![EntryPayload::Item { item: assistant }, EntryPayload::Usage { usage }])
+            .propose(vec![
+                EntryPayload::Item { item: assistant },
+                EntryPayload::Usage { usage },
+            ])
             .await
         {
             return SampleEnd::Fatal("session log is sealed".into());
@@ -233,11 +253,17 @@ impl Turn {
         }
         if let Some(pattern) = detect_doom_loop(self.call_sigs.make_contiguous()) {
             let cont = self
-                .ask(format!("the agent keeps repeating: {pattern} — let it continue?"), None)
+                .ask(
+                    format!("the agent keeps repeating: {pattern} — let it continue?"),
+                    None,
+                )
                 .await;
             if !matches!(cont, AskReply::Allow | AskReply::AllowEdited { .. }) {
-                self.abort_batch(&uses, "Stopped: the user declined to continue a repeating tool-call loop.")
-                    .await;
+                self.abort_batch(
+                    &uses,
+                    "Stopped: the user declined to continue a repeating tool-call loop.",
+                )
+                .await;
                 return Some(Outcome::DoomLoop { pattern });
             }
             self.call_sigs.clear();
@@ -272,25 +298,38 @@ impl Turn {
             // A chunk is one serial call or a run of parallel-safe calls that
             // overlap; join_all returns outcomes in source order either way.
             let outcomes = futures_util::future::join_all(
-                chunk.iter().zip(gates).map(|(tu, gate)| self.execute(tu, gate)),
+                chunk
+                    .iter()
+                    .zip(gates)
+                    .map(|(tu, gate)| self.execute(tu, gate)),
             )
             .await;
             for (tu, mut outcome) in chunk.iter().zip(outcomes) {
                 self.maybe_evict(tu, &mut outcome).await;
                 let (content, failed) = self.apply_failure_budget(tu, outcome, &mut budget_blown);
-                results.push(ToolResultItem { tool_use_id: tu.id.clone(), content, is_error: failed });
+                results.push(ToolResultItem {
+                    tool_use_id: tu.id.clone(),
+                    content,
+                    is_error: failed,
+                });
             }
         }
         if mutating {
             self.snap(format!("post batch {}", self.samples)).await;
         }
         let cancelled = self.cancel.is_cancelled();
-        let mut entries = vec![EntryPayload::Item { item: Item::ToolResults { results } }];
+        let mut entries = vec![EntryPayload::Item {
+            item: Item::ToolResults { results },
+        }];
         entries.extend(
-            self.subdir_hints(uses).into_iter().map(|item| EntryPayload::Item { item }),
+            self.subdir_hints(uses)
+                .into_iter()
+                .map(|item| EntryPayload::Item { item }),
         );
         if !self.propose(entries).await {
-            return Some(Outcome::Error { message: "session log is sealed".into() });
+            return Some(Outcome::Error {
+                message: "session log is sealed".into(),
+            });
         }
         if cancelled {
             return Some(Outcome::Cancelled);
@@ -308,7 +347,10 @@ impl Turn {
     ) -> (String, bool) {
         let mut content = outcome.content;
         if outcome.is_error {
-            let n = self.consecutive_failures.entry(tu.name.clone()).or_insert(0);
+            let n = self
+                .consecutive_failures
+                .entry(tu.name.clone())
+                .or_insert(0);
             *n += 1;
             let left = self.shared.config.tool_failure_budget.saturating_sub(*n);
             content.push_str(&format!("\n<retry attempts_left={left}>"));
@@ -338,7 +380,10 @@ impl Turn {
             match hooks.pre_tool(&tu.name, &input).await {
                 crate::hooks::PreToolDecision::Continue => {}
                 crate::hooks::PreToolDecision::Deny { message } => {
-                    self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
+                    self.emit(EngineEvent::ToolDenied {
+                        name: tu.name.clone(),
+                    })
+                    .await;
                     return Gate::Resolved(ToolOutcome::err(format!(
                         "A hook blocked this tool call: {message}"
                     )));
@@ -358,11 +403,18 @@ impl Turn {
                 AskReply::AllowEdited { input: edited } => input = edited, // §2b
                 AskReply::Respond { content } => {
                     // §2b: the human answered as the tool — skip execution.
-                    self.emit(EngineEvent::ToolDone { name: tu.name.clone(), ok: true }).await;
+                    self.emit(EngineEvent::ToolDone {
+                        name: tu.name.clone(),
+                        ok: true,
+                    })
+                    .await;
                     return Gate::Resolved(ToolOutcome::ok(content));
                 }
                 AskReply::Deny { message } => {
-                    self.emit(EngineEvent::ToolDenied { name: tu.name.clone() }).await;
+                    self.emit(EngineEvent::ToolDenied {
+                        name: tu.name.clone(),
+                    })
+                    .await;
                     return Gate::Resolved(match message {
                         Some(m) => ToolOutcome::err(format!("The user declined this tool call: {m}")),
                         None => ToolOutcome::err(
@@ -372,7 +424,10 @@ impl Turn {
                 }
             }
         }
-        Gate::Ready { input, summary: display }
+        Gate::Ready {
+            input,
+            summary: display,
+        }
     }
 
     /// Execute an approved call: ToolStart → run → PostToolUse hook →
@@ -380,10 +435,16 @@ impl Turn {
     /// can run concurrently; a call the gate already resolved passes through.
     async fn execute(&self, tu: &ToolUse, gate: Gate) -> ToolOutcome {
         let Gate::Ready { input, summary } = gate else {
-            let Gate::Resolved(outcome) = gate else { unreachable!() };
+            let Gate::Resolved(outcome) = gate else {
+                unreachable!()
+            };
             return outcome;
         };
-        self.emit(EngineEvent::ToolStart { name: tu.name.clone(), summary }).await;
+        self.emit(EngineEvent::ToolStart {
+            name: tu.name.clone(),
+            summary,
+        })
+        .await;
         let Some(tool) = self.shared.registry.get(&tu.name) else {
             return unknown_tool(&self.tool_defs, &tu.name); // gate checked; defensive
         };
@@ -396,18 +457,36 @@ impl Turn {
                 }
             }
         }
-        self.emit(EngineEvent::ToolDone { name: tu.name.clone(), ok: !outcome.is_error }).await;
+        self.emit(EngineEvent::ToolDone {
+            name: tu.name.clone(),
+            ok: !outcome.is_error,
+        })
+        .await;
         outcome
     }
 
     /// Allow-rules (deny-first, sandbox-gated, protected carve-out) or the
     /// ask, evaluated against `input` (which a PreToolUse hook may have
     /// rewritten — a rewritten call re-enters the gate, never bypasses it).
-    async fn approve_input(&self, tu: &ToolUse, input: &Value, summary: String, why: Option<String>) -> AskReply {
+    async fn approve_input(
+        &self,
+        tu: &ToolUse,
+        input: &Value,
+        summary: String,
+        why: Option<String>,
+    ) -> AskReply {
         let protected = why.is_some();
-        match self.shared.rules.evaluate(&tu.name, input, self.shared.sandbox_enforced, protected) {
+        match self
+            .shared
+            .rules
+            .evaluate(&tu.name, input, self.shared.sandbox_enforced, protected)
+        {
             Verdict::Auto { rule } => {
-                self.emit(EngineEvent::ToolAutoAllowed { name: tu.name.clone(), rule }).await;
+                self.emit(EngineEvent::ToolAutoAllowed {
+                    name: tu.name.clone(),
+                    rule,
+                })
+                .await;
                 AskReply::Allow
             }
             Verdict::Ask => self.ask(summary, why).await,
@@ -417,7 +496,10 @@ impl Turn {
     /// Complete protocol pairing for a batch that will not execute.
     async fn abort_batch(&mut self, uses: &[ToolUse], message: &str) {
         let results = uses.iter().map(|tu| pair(tu, message, true)).collect();
-        self.propose(vec![EntryPayload::Item { item: Item::ToolResults { results } }]).await;
+        self.propose(vec![EntryPayload::Item {
+            item: Item::ToolResults { results },
+        }])
+        .await;
     }
 
     /// Pre-flight: the compaction threshold check (M2), then the request with
@@ -505,7 +587,9 @@ impl Turn {
     fn subdir_hints(&mut self, uses: &[ToolUse]) -> Vec<Item> {
         let mut out = Vec::new();
         for tu in uses {
-            let Some(path) = tu.input.get("path").and_then(Value::as_str) else { continue };
+            let Some(path) = tu.input.get("path").and_then(Value::as_str) else {
+                continue;
+            };
             let Some((marker, item)) =
                 hotl_context::nested_instructions(&self.shared.cwd, Path::new(path))
             else {
@@ -521,7 +605,9 @@ impl Turn {
     }
 
     fn in_projection(&self, marker: &str) -> bool {
-        let Some(snapshot) = &self.last_snapshot else { return false };
+        let Some(snapshot) = &self.last_snapshot else {
+            return false;
+        };
         snapshot.iter().any(|i| {
             matches!(
                 i,
@@ -556,7 +642,11 @@ impl Turn {
         let total = content.len();
         let head = clip(&content, 2048).to_string();
         let (tx, rx) = oneshot::channel();
-        let cmd = SessionCmd::WriteBlob { tool_use_id: tu.id.clone(), content, reply: tx };
+        let cmd = SessionCmd::WriteBlob {
+            tool_use_id: tu.id.clone(),
+            content,
+            reply: tx,
+        };
         if let Err(mpsc::error::SendError(cmd)) = self.cmd_tx.send(cmd).await {
             if let SessionCmd::WriteBlob { content, .. } = cmd {
                 outcome.content = content;
@@ -586,13 +676,21 @@ impl Turn {
 
     async fn snapshot(&self) -> Option<Arc<Vec<Item>>> {
         let (tx, rx) = oneshot::channel();
-        self.cmd_tx.send(SessionCmd::Snapshot { reply: tx }).await.ok()?;
+        self.cmd_tx
+            .send(SessionCmd::Snapshot { reply: tx })
+            .await
+            .ok()?;
         rx.await.ok()
     }
 
     async fn propose(&self, entries: Vec<EntryPayload>) -> bool {
         let (tx, rx) = oneshot::channel();
-        if self.cmd_tx.send(SessionCmd::Propose { entries, reply: tx }).await.is_err() {
+        if self
+            .cmd_tx
+            .send(SessionCmd::Propose { entries, reply: tx })
+            .await
+            .is_err()
+        {
             return false;
         }
         rx.await.unwrap_or(false)
@@ -613,7 +711,11 @@ impl Turn {
             }])
             .await;
         let (tx, rx) = oneshot::channel();
-        let event = EngineEvent::Ask { summary, protected_why: why, reply: tx };
+        let event = EngineEvent::Ask {
+            summary,
+            protected_why: why,
+            reply: tx,
+        };
         let reply = if self.events.send(event).await.is_err() {
             AskReply::Deny { message: None }
         } else {
@@ -623,7 +725,9 @@ impl Turn {
             reply,
             AskReply::Allow | AskReply::AllowEdited { .. } | AskReply::Respond { .. }
         );
-        let _ = self.propose(vec![EntryPayload::AskResolved { id, allowed }]).await;
+        let _ = self
+            .propose(vec![EntryPayload::AskResolved { id, allowed }])
+            .await;
         reply
     }
 
@@ -656,12 +760,19 @@ fn clip(s: &str, max: usize) -> &str {
 }
 
 fn pair(tu: &ToolUse, message: &str, is_error: bool) -> ToolResultItem {
-    ToolResultItem { tool_use_id: tu.id.clone(), content: message.to_string(), is_error }
+    ToolResultItem {
+        tool_use_id: tu.id.clone(),
+        content: message.to_string(),
+        is_error,
+    }
 }
 
 fn unknown_tool(defs: &[ToolDef], name: &str) -> ToolOutcome {
     let available: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
-    ToolOutcome::err(format!("Unknown tool `{name}`. Available tools: {}.", available.join(", ")))
+    ToolOutcome::err(format!(
+        "Unknown tool `{name}`. Available tools: {}.",
+        available.join(", ")
+    ))
 }
 
 /// Doom-loop lookback: max period (3) × required repeats (3). The detector
@@ -682,7 +793,10 @@ impl CallSig {
         let display = format!("{}({})", tu.name, tu.input);
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         display.hash(&mut hasher);
-        Self { hash: hasher.finish(), display }
+        Self {
+            hash: hasher.finish(),
+            display,
+        }
     }
 }
 
@@ -698,9 +812,16 @@ fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
         let tail = &sigs[sigs.len() - need..];
         let block = &tail[..period];
         let same = |a: &CallSig, b: &CallSig| a.hash == b.hash;
-        if tail.chunks(period).all(|c| c.iter().zip(block).all(|(a, b)| same(a, b))) {
+        if tail
+            .chunks(period)
+            .all(|c| c.iter().zip(block).all(|(a, b)| same(a, b)))
+        {
             return Some(
-                block.iter().map(|s| s.display.as_str()).collect::<Vec<_>>().join(" → "),
+                block
+                    .iter()
+                    .map(|s| s.display.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" → "),
             );
         }
     }
@@ -713,7 +834,11 @@ mod tests {
     use serde_json::json;
 
     fn sig(name: &str, input: Value) -> CallSig {
-        CallSig::new(&ToolUse { id: "t".into(), name: name.into(), input })
+        CallSig::new(&ToolUse {
+            id: "t".into(),
+            name: name.into(),
+            input,
+        })
     }
 
     #[test]

@@ -76,7 +76,9 @@ pub enum TurnEnd {
     Outcome(Outcome),
     /// Compact, folding with the speculative digest when the turn managed to
     /// precompute one — `None` falls back to the inline summarize.
-    Compact { spec: Option<SpecDigest> },
+    Compact {
+        spec: Option<SpecDigest>,
+    },
 }
 
 /// A compaction digest computed speculatively *during* the turn, overlapping
@@ -97,12 +99,18 @@ pub struct SpecDigest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AskReply {
     Allow,
-    Deny { message: Option<String> },
+    Deny {
+        message: Option<String>,
+    },
     /// The human approved but rewrote the tool input (§2b).
-    AllowEdited { input: serde_json::Value },
+    AllowEdited {
+        input: serde_json::Value,
+    },
     /// The human answered *as* the tool — skip execution, use this as the
     /// tool result (§2b).
-    Respond { content: String },
+    Respond {
+        content: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -121,18 +129,43 @@ pub enum Outcome {
 pub enum EngineEvent {
     TextDelta(String),
     ThinkingDelta(String),
-    ToolStart { name: String, summary: String },
-    ToolDone { name: String, ok: bool },
-    ToolDenied { name: String },
-    ToolAutoAllowed { name: String, rule: String },
-    Retrying { attempt: u32, reason: String },
-    FallbackModel { model: String },
+    ToolStart {
+        name: String,
+        summary: String,
+    },
+    ToolDone {
+        name: String,
+        ok: bool,
+    },
+    ToolDenied {
+        name: String,
+    },
+    ToolAutoAllowed {
+        name: String,
+        rule: String,
+    },
+    Retrying {
+        attempt: u32,
+        reason: String,
+    },
+    FallbackModel {
+        model: String,
+    },
     PromptQueued,
     /// Context was compacted (digest + verbatim tail); `degraded` means the
     /// summarize call failed and the floor placeholder was used.
-    Compacted { degraded: bool },
-    Ask { summary: String, protected_why: Option<String>, reply: oneshot::Sender<AskReply> },
-    TurnDone { outcome: Outcome, usage: TokenUsage },
+    Compacted {
+        degraded: bool,
+    },
+    Ask {
+        summary: String,
+        protected_why: Option<String>,
+        reply: oneshot::Sender<AskReply>,
+    },
+    TurnDone {
+        outcome: Outcome,
+        usage: TokenUsage,
+    },
 }
 
 impl std::fmt::Debug for EngineEvent {
@@ -159,7 +192,10 @@ pub enum SessionCmd {
     Prompt(String),
     /// A prompt whose committed item carries a provenance tag (T2: schema
     /// contract + validation-retry feedback ride in as tagged user items).
-    PromptTagged { text: String, synthetic: hotl_types::SyntheticReason },
+    PromptTagged {
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+    },
     /// Continue an interrupted turn (M4/#8): sample against the current
     /// projection with no new user item — used on resume when the last item
     /// is a user/tool turn the model never answered. No-op if already running.
@@ -167,14 +203,23 @@ pub enum SessionCmd {
     /// Mid-turn guidance: admitted durably now, woven into the next sample.
     Steer(String),
     /// Turn task → actor: sample-boundary snapshot refresh.
-    Snapshot { reply: oneshot::Sender<Arc<Vec<Item>>> },
+    Snapshot {
+        reply: oneshot::Sender<Arc<Vec<Item>>>,
+    },
     /// Turn task → actor: commit these entries (durable-ack before reply).
-    Propose { entries: Vec<EntryPayload>, reply: oneshot::Sender<bool> },
+    Propose {
+        entries: Vec<EntryPayload>,
+        reply: oneshot::Sender<bool>,
+    },
     /// Turn task → actor: write an oversized tool result to a masked blob
     /// (T4 — the actor owns the log, the turn never touches it directly).
     /// Replies `Ok(path)` on success; on write failure the content is handed
     /// back in `Err` so eviction never loses data.
-    WriteBlob { tool_use_id: String, content: String, reply: oneshot::Sender<Result<String, String>> },
+    WriteBlob {
+        tool_use_id: String,
+        content: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     /// Turn task → actor: the turn is over (or needs a compaction respawn).
     TurnFinished { end: TurnEnd, usage: TokenUsage },
 }
@@ -218,7 +263,10 @@ impl SessionHandle {
     }
     /// A prompt whose committed user item carries a provenance tag (T2).
     pub async fn prompt_tagged(&self, text: String, synthetic: hotl_types::SyntheticReason) {
-        let _ = self.cmd.send(SessionCmd::PromptTagged { text, synthetic }).await;
+        let _ = self
+            .cmd
+            .send(SessionCmd::PromptTagged { text, synthetic })
+            .await;
     }
     pub async fn steer(&self, text: String) {
         let _ = self.cmd.send(SessionCmd::Steer(text)).await;
@@ -230,7 +278,10 @@ impl SessionHandle {
     /// Out-of-band interrupt of the in-flight turn (never queued behind data).
     pub fn interrupt(&self) {
         // A poisoned lock is fine: the token has no invariants to protect.
-        self.current_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner).cancel();
+        self.current_turn
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .cancel();
     }
 }
 
@@ -239,13 +290,26 @@ impl SessionHandle {
 /// — i.e. an interrupted turn worth continuing on resume. A projection ending
 /// in an assistant item (or holding only instructions) is complete.
 pub fn needs_continuation(items: &[Item]) -> bool {
-    matches!(items.last(), Some(Item::User { .. } | Item::ToolResults { .. }))
+    matches!(
+        items.last(),
+        Some(Item::User { .. } | Item::ToolResults { .. })
+    )
 }
 
 pub fn spawn_session(deps: SessionDeps) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (event_tx, event_rx) = mpsc::channel(256);
     let current_turn = Arc::new(Mutex::new(CancellationToken::new()));
-    tokio::spawn(actor::run(deps, cmd_rx, cmd_tx.clone(), event_tx, current_turn.clone()));
-    SessionHandle { cmd: cmd_tx, events: event_rx, current_turn }
+    tokio::spawn(actor::run(
+        deps,
+        cmd_rx,
+        cmd_tx.clone(),
+        event_tx,
+        current_turn.clone(),
+    ));
+    SessionHandle {
+        cmd: cmd_tx,
+        events: event_rx,
+        current_turn,
+    }
 }

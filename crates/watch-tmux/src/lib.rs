@@ -9,5 +9,7 @@ pub use panes::{
     capture_pane, jump_argv, list_panes, parse_panes, run_jump, tmux_available, Pane, PANE_FORMAT,
 };
 pub use procs::{agent_for, parse_ps, read_proc_table, ProcTable};
-pub use status::{classify, detector_for, ClaudeDetector, GenericDetector, Signals, StatusDetector};
+pub use status::{
+    classify, detector_for, ClaudeDetector, GenericDetector, Signals, StatusDetector,
+};
 pub use surface::{observations, TmuxSurface};

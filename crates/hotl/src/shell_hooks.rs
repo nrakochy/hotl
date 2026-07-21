@@ -67,7 +67,10 @@ pub fn load_str(raw: &str) -> Option<ShellHooks> {
     let mut pre = Vec::new();
     let mut post = Vec::new();
     for spec in parsed.hooks {
-        let hook = ShellHook { command: spec.command, strikes: AtomicU32::new(0) };
+        let hook = ShellHook {
+            command: spec.command,
+            strikes: AtomicU32::new(0),
+        };
         match spec.event.as_str() {
             "pre_tool" => pre.push(hook),
             "post_tool" => post.push(hook),
@@ -106,18 +109,18 @@ impl ShellHook {
         // Read stdout capped rather than wait_with_output: past the cap the
         // pipe closes, an over-chatty hook dies on SIGPIPE, and it strikes.
         let mut stdout = child.stdout.take();
-        let out = tokio::time::timeout(
-            std::time::Duration::from_secs(HOOK_TIMEOUT_SECS),
-            async {
-                use tokio::io::AsyncReadExt;
-                let mut buf = Vec::new();
-                if let Some(so) = stdout.as_mut() {
-                    let _ = so.take((HOOK_MAX_OUTPUT + 1) as u64).read_to_end(&mut buf).await;
-                }
-                drop(stdout);
-                (child.wait().await, buf)
-            },
-        )
+        let out = tokio::time::timeout(std::time::Duration::from_secs(HOOK_TIMEOUT_SECS), async {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            if let Some(so) = stdout.as_mut() {
+                let _ = so
+                    .take((HOOK_MAX_OUTPUT + 1) as u64)
+                    .read_to_end(&mut buf)
+                    .await;
+            }
+            drop(stdout);
+            (child.wait().await, buf)
+        })
         .await;
         match out {
             Ok((Ok(status), buf)) if status.success() && buf.len() <= HOOK_MAX_OUTPUT => {
@@ -136,7 +139,10 @@ impl ShellHook {
     fn strike(&self) {
         let n = self.strikes.fetch_add(1, Ordering::Relaxed) + 1;
         if n == MAX_STRIKES {
-            eprintln!("hotl: hook `{}` failed {MAX_STRIKES}× — evicted for this session", self.command);
+            eprintln!(
+                "hotl: hook `{}` failed {MAX_STRIKES}× — evicted for this session",
+                self.command
+            );
         }
     }
 }
@@ -146,7 +152,9 @@ impl Hooks for ShellHooks {
         Box::pin(async move {
             let payload = json!({"event": "pre_tool", "tool": name, "input": input});
             for hook in &self.pre {
-                let Some(decision) = hook.invoke(&payload).await else { continue };
+                let Some(decision) = hook.invoke(&payload).await else {
+                    continue;
+                };
                 match decision.get("decision").and_then(Value::as_str) {
                     Some("deny") => {
                         let message = decision
@@ -158,7 +166,9 @@ impl Hooks for ShellHooks {
                     }
                     Some("rewrite") => {
                         if let Some(new_input) = decision.get("input") {
-                            return PreToolDecision::Rewrite { input: new_input.clone() };
+                            return PreToolDecision::Rewrite {
+                                input: new_input.clone(),
+                            };
                         }
                     }
                     _ => {} // "continue"/unknown → next hook
@@ -200,7 +210,12 @@ mod tests {
              command = \"cat >/dev/null; echo '{\\\"decision\\\":\\\"deny\\\",\\\"message\\\":\\\"shell says no\\\"}'\"\n",
         ).expect("hooks configured");
         let decision = hooks.pre_tool("bash", &json!({"command": "ls"})).await;
-        assert_eq!(decision, PreToolDecision::Deny { message: "shell says no".into() });
+        assert_eq!(
+            decision,
+            PreToolDecision::Deny {
+                message: "shell says no".into()
+            }
+        );
     }
 
     #[tokio::test]
@@ -208,8 +223,12 @@ mod tests {
         let hooks = load_str(
             "[[hook]]\nevent = \"post_tool\"\n\
              command = \"cat >/dev/null; echo '{\\\"result\\\":\\\"cleaned\\\"}'\"\n",
-        ).unwrap();
-        assert_eq!(hooks.post_tool("read", "raw output").await.as_deref(), Some("cleaned"));
+        )
+        .unwrap();
+        assert_eq!(
+            hooks.post_tool("read", "raw output").await.as_deref(),
+            Some("cleaned")
+        );
         // A config with no hooks loads as None.
         assert!(load_str("# no hooks here\n").is_none());
     }

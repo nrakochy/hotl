@@ -48,9 +48,17 @@ fn parse_line(line: &str) -> Option<Pane> {
 pub fn jump_argv(pane: &Pane) -> Vec<String> {
     let win_target = format!("{}:{}", pane.session, pane.window_index);
     vec![
-        "switch-client".into(), "-t".into(), pane.session.clone(), ";".into(),
-        "select-window".into(), "-t".into(), win_target, ";".into(),
-        "select-pane".into(), "-t".into(), pane.pane_id.clone(),
+        "switch-client".into(),
+        "-t".into(),
+        pane.session.clone(),
+        ";".into(),
+        "select-window".into(),
+        "-t".into(),
+        win_target,
+        ";".into(),
+        "select-pane".into(),
+        "-t".into(),
+        pane.pane_id.clone(),
     ]
 }
 
@@ -80,11 +88,19 @@ pub fn run_jump(pane: &Pane) -> io::Result<()> {
 // as a literal word (not a key name) — send-keys only interprets its known
 // key names, so this types f, g, then Enter.
 pub fn foreground_argv(pane_id: &str) -> Vec<String> {
-    vec!["send-keys".into(), "-t".into(), pane_id.into(), "fg".into(), "Enter".into()]
+    vec![
+        "send-keys".into(),
+        "-t".into(),
+        pane_id.into(),
+        "fg".into(),
+        "Enter".into(),
+    ]
 }
 
 pub fn run_foreground(pane_id: &str) -> io::Result<()> {
-    let status = Command::new("tmux").args(foreground_argv(pane_id)).status()?;
+    let status = Command::new("tmux")
+        .args(foreground_argv(pane_id))
+        .status()?;
     if status.success() {
         Ok(())
     } else {
@@ -159,8 +175,17 @@ base-0\u{1f}0\u{1f}zsh\u{1f}4\u{1f}%55\u{1f}80031\u{1f}zsh\u{1f}/Users/nrakochy/
     fn field_containing_pipe_is_not_dropped() {
         let sep = '\u{1f}';
         let fields = [
-            "base-0", "0", "zsh", "0", "%25", "35580", "claude",
-            "/tmp/weird|dir", "0", "1", "title",
+            "base-0",
+            "0",
+            "zsh",
+            "0",
+            "%25",
+            "35580",
+            "claude",
+            "/tmp/weird|dir",
+            "0",
+            "1",
+            "title",
         ];
         let line = fields.join(&sep.to_string());
         let panes = parse_panes(&line);
@@ -199,9 +224,17 @@ base-0\u{1f}0\u{1f}zsh\u{1f}4\u{1f}%55\u{1f}80031\u{1f}zsh\u{1f}/Users/nrakochy/
         assert_eq!(
             jump_argv(&p),
             vec![
-                "switch-client", "-t", "base-0", ";",
-                "select-window", "-t", "base-0:3", ";",
-                "select-pane", "-t", "%54",
+                "switch-client",
+                "-t",
+                "base-0",
+                ";",
+                "select-window",
+                "-t",
+                "base-0:3",
+                ";",
+                "select-pane",
+                "-t",
+                "%54",
             ]
         );
     }

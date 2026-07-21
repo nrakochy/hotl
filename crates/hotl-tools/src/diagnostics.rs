@@ -127,8 +127,14 @@ mod tests {
         let d = diag("[diagnostics]\nfoo = \"echo broken; exit 1\"\nbar = \"true\"\n");
         let report = d.check("src/thing.foo").await.expect("failure reported");
         assert!(report.contains("FAILED") && report.contains("broken"));
-        assert!(d.check("src/thing.bar").await.is_none(), "clean + quiet = silent");
-        assert!(d.check("src/thing.unknown").await.is_none(), "unconfigured ext = silent");
+        assert!(
+            d.check("src/thing.bar").await.is_none(),
+            "clean + quiet = silent"
+        );
+        assert!(
+            d.check("src/thing.unknown").await.is_none(),
+            "unconfigured ext = silent"
+        );
         assert!(d.check("no-extension").await.is_none());
     }
 
@@ -143,7 +149,9 @@ mod tests {
             return;
         }
         // Home is outside the cwd/tmp/dev write set the floor permits.
-        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else { return };
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
         let outside = home.join(format!(".hotl-diag-escape-{}", std::process::id()));
         let _ = std::fs::remove_file(&outside);
         let d = diag(&format!(

@@ -28,17 +28,25 @@ type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AskReply>>>>;
 /// may `{"allow":true}`, `{"allow":false,"message":"…"}`, provide edited
 /// `{"input":{…}}` (AllowEdited), or answer as the tool `{"respond":"…"}`.
 fn ask_reply_from_result(result: Option<&Value>) -> AskReply {
-    let Some(r) = result else { return AskReply::Deny { message: None } };
+    let Some(r) = result else {
+        return AskReply::Deny { message: None };
+    };
     if let Some(content) = r.get("respond").and_then(Value::as_str) {
-        return AskReply::Respond { content: content.to_string() };
+        return AskReply::Respond {
+            content: content.to_string(),
+        };
     }
     if let Some(input) = r.get("input") {
-        return AskReply::AllowEdited { input: input.clone() };
+        return AskReply::AllowEdited {
+            input: input.clone(),
+        };
     }
     if r.get("allow").and_then(Value::as_bool) == Some(true) {
         return AskReply::Allow;
     }
-    AskReply::Deny { message: r.get("message").and_then(Value::as_str).map(String::from) }
+    AskReply::Deny {
+        message: r.get("message").and_then(Value::as_str).map(String::from),
+    }
 }
 /// JSON-RPC ids of in-flight prompt requests, answered in order on TurnDone
 /// (the engine queues overlapping prompts and finishes them FIFO).
@@ -74,14 +82,26 @@ pub async fn serve(
         // A client response to one of our permission requests?
         if msg.get("method").is_none() {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some(reply) = pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id) {
+                if let Some(reply) = pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id)
+                {
                     let _ = reply.send(ask_reply_from_result(msg.get("result")));
                 }
             }
             continue;
         }
-        handle_request(&msg, &writer, &mut factory, &mut session, &pending, &pending_prompt, &mut next_id)
-            .await;
+        handle_request(
+            &msg,
+            &writer,
+            &mut factory,
+            &mut session,
+            &pending,
+            &pending_prompt,
+            &mut next_id,
+        )
+        .await;
     }
 }
 
@@ -110,7 +130,10 @@ async fn handle_request(
             let spec = if method == "session/load" {
                 match msg.pointer("/params/sessionId").and_then(Value::as_str) {
                     Some(sid) => SessionSpec::Load(sid.to_string()),
-                    None => return reply_err(writer, id, "session/load requires params.sessionId").await,
+                    None => {
+                        return reply_err(writer, id, "session/load requires params.sessionId")
+                            .await
+                    }
                 }
             } else {
                 SessionSpec::New
@@ -123,10 +146,22 @@ async fn handle_request(
                     // answered with the new session's first TurnDone.
                     if let Some(old) = session.take() {
                         old.drain.abort();
-                        pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
-                        pending_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clear();
+                        pending
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
+                        pending_prompt
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
                     }
-                    let state = start_session(handle, writer.clone(), pending.clone(), pending_prompt.clone(), next_id);
+                    let state = start_session(
+                        handle,
+                        writer.clone(),
+                        pending.clone(),
+                        pending_prompt.clone(),
+                        next_id,
+                    );
                     let sid = state.id.clone();
                     *session = Some(state);
                     reply_ok(writer, id, json!({"sessionId": sid})).await;
@@ -143,7 +178,10 @@ async fn handle_request(
             };
             // Stash the id; the drain task answers it on TurnDone so the read
             // loop stays free to service permission responses meanwhile.
-            pending_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(id);
+            pending_prompt
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push_back(id);
             state.handle.prompt(text.to_string()).await;
         }
         "session/steer" => {
@@ -179,7 +217,14 @@ fn start_session(
     *next_id += 1;
     let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
     let sid = id.clone();
-    let drain = tokio::spawn(drain_events(events, writer, pending, pending_prompt, sid, req_id_seed));
+    let drain = tokio::spawn(drain_events(
+        events,
+        writer,
+        pending,
+        pending_prompt,
+        sid,
+        req_id_seed,
+    ));
     SessionState { id, handle, drain }
 }
 
@@ -196,9 +241,16 @@ async fn drain_events(
 ) {
     while let Some(event) = events.recv().await {
         match event {
-            EngineEvent::Ask { summary, protected_why, reply } => {
+            EngineEvent::Ask {
+                summary,
+                protected_why,
+                reply,
+            } => {
                 req_id += 1;
-                pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(req_id, reply);
+                pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(req_id, reply);
                 send(&writer, &json!({
                     "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
                     "params": {"sessionId": session_id, "summary": summary, "protectedWhy": protected_why},
@@ -212,10 +264,18 @@ async fn drain_events(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
-                notify(&writer, &session_id, json!({"type": "turn_done", "outcome": outcome_tag(&outcome)})).await;
+                notify(
+                    &writer,
+                    &session_id,
+                    json!({"type": "turn_done", "outcome": outcome_tag(&outcome)}),
+                )
+                .await;
                 // Take the id and drop the guard *before* awaiting (a
                 // std::sync guard held across .await would make this non-Send).
-                let prompt_id = pending_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop_front();
+                let prompt_id = pending_prompt
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .pop_front();
                 if let Some(id) = prompt_id {
                     reply_ok(
                         &writer,
@@ -238,11 +298,17 @@ pub(crate) fn update_payload(event: &EngineEvent) -> Option<Value> {
     Some(match event {
         EngineEvent::TextDelta(t) => json!({"type": "text_delta", "text": t}),
         EngineEvent::ThinkingDelta(_) => json!({"type": "thinking_delta"}),
-        EngineEvent::ToolStart { name, summary } => json!({"type": "tool_start", "name": name, "summary": summary}),
+        EngineEvent::ToolStart { name, summary } => {
+            json!({"type": "tool_start", "name": name, "summary": summary})
+        }
         EngineEvent::ToolDone { name, ok } => json!({"type": "tool_done", "name": name, "ok": ok}),
         EngineEvent::ToolDenied { name } => json!({"type": "tool_denied", "name": name}),
-        EngineEvent::ToolAutoAllowed { name, rule } => json!({"type": "tool_auto_allowed", "name": name, "rule": rule}),
-        EngineEvent::Retrying { attempt, reason } => json!({"type": "retrying", "attempt": attempt, "reason": reason}),
+        EngineEvent::ToolAutoAllowed { name, rule } => {
+            json!({"type": "tool_auto_allowed", "name": name, "rule": rule})
+        }
+        EngineEvent::Retrying { attempt, reason } => {
+            json!({"type": "retrying", "attempt": attempt, "reason": reason})
+        }
         EngineEvent::FallbackModel { model } => json!({"type": "fallback_model", "model": model}),
         EngineEvent::PromptQueued => json!({"type": "prompt_queued"}),
         EngineEvent::Compacted { degraded } => json!({"type": "compacted", "degraded": degraded}),
@@ -271,11 +337,19 @@ async fn notify(writer: &Writer, session_id: &str, update: Value) {
 }
 
 async fn reply_ok(writer: &Writer, id: Value, result: Value) {
-    send(writer, &json!({"jsonrpc": "2.0", "id": id, "result": result})).await;
+    send(
+        writer,
+        &json!({"jsonrpc": "2.0", "id": id, "result": result}),
+    )
+    .await;
 }
 
 async fn reply_err(writer: &Writer, id: Value, message: &str) {
-    send(writer, &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": message}})).await;
+    send(
+        writer,
+        &json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32600, "message": message}}),
+    )
+    .await;
 }
 
 async fn send(writer: &Writer, msg: &Value) {

@@ -114,29 +114,41 @@ mod tests {
     async fn pre_hook_denies_rewrites_or_continues() {
         let hooks = InProcessHooks::new().on_pre_tool(|name, input| {
             if name == "bash" && input.get("command").and_then(Value::as_str) == Some("rm -rf /") {
-                PreToolDecision::Deny { message: "no destructive commands".into() }
+                PreToolDecision::Deny {
+                    message: "no destructive commands".into(),
+                }
             } else if name == "write" {
-                PreToolDecision::Rewrite { input: json!({"path": "safe.txt", "content": "x"}) }
+                PreToolDecision::Rewrite {
+                    input: json!({"path": "safe.txt", "content": "x"}),
+                }
             } else {
                 PreToolDecision::Continue
             }
         });
         assert_eq!(
-            hooks.pre_tool("bash", &json!({"command": "rm -rf /"})).await,
-            PreToolDecision::Deny { message: "no destructive commands".into() }
+            hooks
+                .pre_tool("bash", &json!({"command": "rm -rf /"}))
+                .await,
+            PreToolDecision::Deny {
+                message: "no destructive commands".into()
+            }
         );
         assert!(matches!(
-            hooks.pre_tool("write", &json!({"path": "x", "content": "y"})).await,
+            hooks
+                .pre_tool("write", &json!({"path": "x", "content": "y"}))
+                .await,
             PreToolDecision::Rewrite { .. }
         ));
-        assert_eq!(hooks.pre_tool("read", &json!({})).await, PreToolDecision::Continue);
+        assert_eq!(
+            hooks.pre_tool("read", &json!({})).await,
+            PreToolDecision::Continue
+        );
     }
 
     #[tokio::test]
     async fn post_hook_caps_and_replaces() {
-        let hooks = InProcessHooks::new().on_post_tool(|_n, result| {
-            Some(format!("[annotated] {} chars", result.len()))
-        });
+        let hooks = InProcessHooks::new()
+            .on_post_tool(|_n, result| Some(format!("[annotated] {} chars", result.len())));
         let big = "z".repeat(HOOK_PAYLOAD_CAP * 2);
         let out = hooks.post_tool("read", &big).await.unwrap();
         // The hook only ever saw the capped payload.

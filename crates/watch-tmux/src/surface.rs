@@ -9,7 +9,9 @@ pub struct TmuxSurface {
 
 impl TmuxSurface {
     pub fn new(agents: &[String]) -> Self {
-        TmuxSurface { agents: agents.to_vec() }
+        TmuxSurface {
+            agents: agents.to_vec(),
+        }
     }
 }
 
@@ -67,7 +69,11 @@ impl Surface for TmuxSurface {
 
     fn focus(&self, obs: &AgentObservation) -> Result<(), SurfaceError> {
         match &obs.location.handle {
-            LocationHandle::Tmux { pane_id, session, window_index } => {
+            LocationHandle::Tmux {
+                pane_id,
+                session,
+                window_index,
+            } => {
                 let pane = Pane {
                     session: session.clone(),
                     window_index: *window_index,
@@ -122,7 +128,11 @@ work\u{1f}0\u{1f}edit\u{1f}0\u{1f}%60\u{1f}40000\u{1f}claude\u{1f}/tmp/d\u{1f}1\
         let procs = parse_ps(PS);
         let names = vec!["claude".to_string()];
         let tail_for = |id: &str| -> String {
-            if id == "%25" { "❯\n  [I] .../tmp/a [main] ctx:9%".to_string() } else { String::new() }
+            if id == "%25" {
+                "❯\n  [I] .../tmp/a [main] ctx:9%".to_string()
+            } else {
+                String::new()
+            }
         };
         let obs = observations(&panes, &procs, &names, &tail_for);
         assert_eq!(obs.len(), 2);
@@ -138,7 +148,10 @@ work\u{1f}0\u{1f}edit\u{1f}0\u{1f}%60\u{1f}40000\u{1f}claude\u{1f}/tmp/d\u{1f}1\
             LocationHandle::Tmux { pane_id, .. } => assert_eq!(pane_id, "%60"),
         }
 
-        assert_eq!(a.status_line.as_deref(), Some("[I] .../tmp/a [main] ctx:9%"));
+        assert_eq!(
+            a.status_line.as_deref(),
+            Some("[I] .../tmp/a [main] ctx:9%")
+        );
         assert_eq!(d.status_line, None);
     }
 

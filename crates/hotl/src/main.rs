@@ -17,12 +17,12 @@
 //!   update        show version + how to update (MD)
 
 mod acp;
-mod config;
-mod gc;
 mod agent;
 mod attach;
 mod bg;
+mod config;
 mod doctor;
+mod gc;
 mod keysource;
 mod session_server;
 mod setup;
@@ -74,7 +74,9 @@ fn main() {
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
         Some("tui") => std::process::exit(block_on(tui::tui_main(args[1..].to_vec()))),
         Some("bg") => std::process::exit(bg::bg_main(bg_prompt(&args))),
-        Some("attach") => std::process::exit(block_on(attach::attach_main(args.get(1).map(String::as_str)))),
+        Some("attach") => std::process::exit(block_on(attach::attach_main(
+            args.get(1).map(String::as_str),
+        ))),
         Some("serve") => {
             let (id, prompt) = parse_serve_args(&args);
             std::process::exit(block_on(agent::serve_main(id, prompt)));
@@ -90,7 +92,9 @@ fn main() {
             match args.get(1).map(String::as_str) {
                 Some("zsh") => print!("{}", ZSH_PLUGIN),
                 _ => {
-                    eprintln!("usage: hotl init zsh   # then: eval \"$(hotl init zsh)\" in ~/.zshrc");
+                    eprintln!(
+                        "usage: hotl init zsh   # then: eval \"$(hotl init zsh)\" in ~/.zshrc"
+                    );
                     std::process::exit(2);
                 }
             }
@@ -144,7 +148,9 @@ fn update_main(latest: Option<&str>) -> i32 {
 
 /// The optional opening prompt for `hotl bg` (the first non-flag arg).
 fn bg_prompt(args: &[String]) -> Option<&str> {
-    args.get(1).map(String::as_str).filter(|a| !a.starts_with('-'))
+    args.get(1)
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
 }
 
 /// `--id <id>` and `--prompt <p>` for `hotl serve`; a missing id is generated.
@@ -159,7 +165,10 @@ fn parse_serve_args(args: &[String]) -> (String, Option<String>) {
             _ => {}
         }
     }
-    (id.unwrap_or_else(|| format!("bg-{}", std::process::id())), prompt)
+    (
+        id.unwrap_or_else(|| format!("bg-{}", std::process::id())),
+        prompt,
+    )
 }
 
 /// One-shot CLI paths run current_thread per the async policy (no pool

@@ -115,7 +115,10 @@ impl ThemeConfig {
             None => (Theme::default(), None),
             Some(n) => match preset(n) {
                 Some(t) => (t, None),
-                None => (Theme::default(), Some(format!("unknown theme '{n}' — using default"))),
+                None => (
+                    Theme::default(),
+                    Some(format!("unknown theme '{n}' — using default")),
+                ),
             },
         };
 
@@ -165,7 +168,10 @@ impl HotlConfig {
     pub fn parse_checked(toml_str: &str) -> (HotlConfig, Option<String>) {
         match toml::from_str(toml_str) {
             Ok(cfg) => (cfg, None),
-            Err(e) => (HotlConfig::default(), Some(format!("config parse error: {e}"))),
+            Err(e) => (
+                HotlConfig::default(),
+                Some(format!("config parse error: {e}")),
+            ),
         }
     }
 
@@ -174,10 +180,11 @@ impl HotlConfig {
     }
 
     pub fn load_with_warning() -> (HotlConfig, Option<String>) {
-        let (cfg, parse_warn) = match dirs_config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
-            Some(s) => HotlConfig::parse_checked(&s),
-            None => (HotlConfig::default(), None),
-        };
+        let (cfg, parse_warn) =
+            match dirs_config_path().and_then(|p| std::fs::read_to_string(p).ok()) {
+                Some(s) => HotlConfig::parse_checked(&s),
+                None => (HotlConfig::default(), None),
+            };
         let warn = parse_warn.or_else(|| cfg.settings.theme.resolve().1);
         (cfg, warn)
     }
@@ -186,7 +193,9 @@ impl HotlConfig {
 fn dirs_config_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+        })?;
     Some(base.join("hotl").join("config.toml"))
 }
 
@@ -195,29 +204,54 @@ pub fn preset(name: &str) -> Option<Theme> {
     Some(match name {
         "default" => Theme::default(),
         "tokyo-night" => Theme {
-            active: "#e0af68".into(), blocked: "#f7768e".into(), idle: "#9ece6a".into(),
-            ink: "#c0caf5".into(), muted: "#787c99".into(), faint: "#565f89".into(),
-            accent: "#7aa2f7".into(), band: "#292e42".into(),
+            active: "#e0af68".into(),
+            blocked: "#f7768e".into(),
+            idle: "#9ece6a".into(),
+            ink: "#c0caf5".into(),
+            muted: "#787c99".into(),
+            faint: "#565f89".into(),
+            accent: "#7aa2f7".into(),
+            band: "#292e42".into(),
         },
         "catppuccin" => Theme {
-            active: "#f9e2af".into(), blocked: "#f38ba8".into(), idle: "#a6e3a1".into(),
-            ink: "#cdd6f4".into(), muted: "#a6adc8".into(), faint: "#6c7086".into(),
-            accent: "#89b4fa".into(), band: "#313244".into(),
+            active: "#f9e2af".into(),
+            blocked: "#f38ba8".into(),
+            idle: "#a6e3a1".into(),
+            ink: "#cdd6f4".into(),
+            muted: "#a6adc8".into(),
+            faint: "#6c7086".into(),
+            accent: "#89b4fa".into(),
+            band: "#313244".into(),
         },
         "gruvbox" => Theme {
-            active: "#d79921".into(), blocked: "#cc241d".into(), idle: "#98971a".into(),
-            ink: "#ebdbb2".into(), muted: "#a89984".into(), faint: "#665c54".into(),
-            accent: "#458588".into(), band: "#3c3836".into(),
+            active: "#d79921".into(),
+            blocked: "#cc241d".into(),
+            idle: "#98971a".into(),
+            ink: "#ebdbb2".into(),
+            muted: "#a89984".into(),
+            faint: "#665c54".into(),
+            accent: "#458588".into(),
+            band: "#3c3836".into(),
         },
         "nord" => Theme {
-            active: "#ebcb8b".into(), blocked: "#bf616a".into(), idle: "#a3be8c".into(),
-            ink: "#eceff4".into(), muted: "#d8dee9".into(), faint: "#4c566a".into(),
-            accent: "#88c0d0".into(), band: "#3b4252".into(),
+            active: "#ebcb8b".into(),
+            blocked: "#bf616a".into(),
+            idle: "#a3be8c".into(),
+            ink: "#eceff4".into(),
+            muted: "#d8dee9".into(),
+            faint: "#4c566a".into(),
+            accent: "#88c0d0".into(),
+            band: "#3b4252".into(),
         },
         "dracula" => Theme {
-            active: "#f1fa8c".into(), blocked: "#ff5555".into(), idle: "#50fa7b".into(),
-            ink: "#f8f8f2".into(), muted: "#b8b8c0".into(), faint: "#6272a4".into(),
-            accent: "#bd93f9".into(), band: "#44475a".into(),
+            active: "#f1fa8c".into(),
+            blocked: "#ff5555".into(),
+            idle: "#50fa7b".into(),
+            ink: "#f8f8f2".into(),
+            muted: "#b8b8c0".into(),
+            faint: "#6272a4".into(),
+            accent: "#bd93f9".into(),
+            band: "#44475a".into(),
         },
         _ => return None,
     })
@@ -232,7 +266,14 @@ mod tests {
         let c = HotlConfig::parse("");
         assert!(c.settings.ping_on_blocked);
         assert_eq!(c.settings.poll_interval_ms, 1000);
-        assert_eq!(c.settings.agents, vec!["claude".to_string(), "codex".to_string(), "hotl".to_string()]);
+        assert_eq!(
+            c.settings.agents,
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "hotl".to_string()
+            ]
+        );
         assert_eq!(c.settings.theme.resolve().0.active, "#f2c14e");
     }
 
@@ -241,7 +282,14 @@ mod tests {
         let c = HotlConfig::parse("[settings]\nping_on_blocked = false\npoll_interval_ms = 500\n");
         assert!(!c.settings.ping_on_blocked);
         assert_eq!(c.settings.poll_interval_ms, 500);
-        assert_eq!(c.settings.agents, vec!["claude".to_string(), "codex".to_string(), "hotl".to_string()]);
+        assert_eq!(
+            c.settings.agents,
+            vec![
+                "claude".to_string(),
+                "codex".to_string(),
+                "hotl".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -311,7 +359,14 @@ mod tests {
     }
     #[test]
     fn all_named_presets_exist() {
-        for name in ["default","tokyo-night","catppuccin","gruvbox","nord","dracula"] {
+        for name in [
+            "default",
+            "tokyo-night",
+            "catppuccin",
+            "gruvbox",
+            "nord",
+            "dracula",
+        ] {
             assert!(preset(name).is_some(), "missing {name}");
         }
     }
@@ -323,21 +378,31 @@ mod tests {
     }
     #[test]
     fn resolve_known_preset() {
-        let tc = ThemeConfig { preset: Some("gruvbox".into()), ..Default::default() };
+        let tc = ThemeConfig {
+            preset: Some("gruvbox".into()),
+            ..Default::default()
+        };
         let (theme, warn) = tc.resolve();
         assert_eq!(theme, preset("gruvbox").unwrap());
         assert!(warn.is_none());
     }
     #[test]
     fn resolve_unknown_preset_defaults_with_warning() {
-        let tc = ThemeConfig { preset: Some("typo".into()), ..Default::default() };
+        let tc = ThemeConfig {
+            preset: Some("typo".into()),
+            ..Default::default()
+        };
         let (theme, warn) = tc.resolve();
         assert_eq!(theme, Theme::default());
         assert!(warn.as_deref().unwrap().contains("typo"));
     }
     #[test]
     fn resolve_preset_with_override() {
-        let tc = ThemeConfig { preset: Some("gruvbox".into()), blocked: Some("#ff0000".into()), ..Default::default() };
+        let tc = ThemeConfig {
+            preset: Some("gruvbox".into()),
+            blocked: Some("#ff0000".into()),
+            ..Default::default()
+        };
         let (theme, _) = tc.resolve();
         assert_eq!(theme.blocked, "#ff0000");
         assert_eq!(theme.idle, preset("gruvbox").unwrap().idle);
@@ -383,11 +448,21 @@ mod tests {
 
     #[test]
     fn resolve_ignores_invalid_color_and_warns() {
-        let tc = ThemeConfig { active: Some("notacolor".into()), ..Default::default() };
+        let tc = ThemeConfig {
+            active: Some("notacolor".into()),
+            ..Default::default()
+        };
         let (theme, warn) = tc.resolve();
-        assert_eq!(theme.active, Theme::default().active, "bad color keeps base");
+        assert_eq!(
+            theme.active,
+            Theme::default().active,
+            "bad color keeps base"
+        );
         let w = warn.expect("invalid color should warn");
-        assert!(w.contains("active"), "warning names the offending slot: {w}");
+        assert!(
+            w.contains("active"),
+            "warning names the offending slot: {w}"
+        );
     }
 
     #[test]

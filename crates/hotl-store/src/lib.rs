@@ -22,15 +22,25 @@ pub struct Masker {
     pairs: Vec<(String, String)>, // (secret value, replacement)
 }
 
-const SECRET_NAME_MARKERS: [&str; 7] =
-    ["KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH"];
+const SECRET_NAME_MARKERS: [&str; 7] = [
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+];
 const MIN_SECRET_LEN: usize = 8;
 
 impl Masker {
     pub fn from_env() -> Self {
         let mut pairs: Vec<(String, String)> = Vec::new();
         for (name, value) in std::env::vars() {
-            if !SECRET_NAME_MARKERS.iter().any(|m| name.to_uppercase().contains(m)) {
+            if !SECRET_NAME_MARKERS
+                .iter()
+                .any(|m| name.to_uppercase().contains(m))
+            {
                 continue;
             }
             push_pair(&mut pairs, &name, &value);
@@ -64,7 +74,9 @@ impl Masker {
     }
 
     pub fn contains_secret(&self, text: &str) -> bool {
-        self.pairs.iter().any(|(secret, _)| text.contains(secret.as_str()))
+        self.pairs
+            .iter()
+            .any(|(secret, _)| text.contains(secret.as_str()))
     }
 
     /// Whether any registered secret spans lines (e.g. a raw PEM key) — the
@@ -113,7 +125,9 @@ fn json_body(value: &str) -> String {
 /// a secret (or before masking existed) can't be rewritten in an append-only
 /// store, so the honest remedy is a loud warning and rotation.
 pub fn audit_secrets(dir: &Path, masker: &Masker) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut hits = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -134,7 +148,9 @@ fn log_contains_secret(path: &Path, masker: &Masker) -> bool {
     if masker.has_multiline_secret() {
         return std::fs::read_to_string(path).is_ok_and(|c| masker.contains_secret(&c));
     }
-    let Ok(file) = File::open(path) else { return false };
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
     for line in BufReader::new(file).lines() {
         match line {
             Ok(line) if masker.contains_secret(&line) => return true,
@@ -165,8 +181,17 @@ impl SessionLog {
         std::fs::create_dir_all(dir)?;
         let session_id = new_ulid();
         let path = dir.join(format!("{session_id}.jsonl"));
-        let file = OpenOptions::new().create_new(true).append(true).open(&path)?;
-        let mut log = Self { file, path, masker, last_id: None, session_id: session_id.clone() };
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(&path)?;
+        let mut log = Self {
+            file,
+            path,
+            masker,
+            last_id: None,
+            session_id: session_id.clone(),
+        };
         log.append(
             &EntryPayload::Header {
                 header: SessionHeader {
@@ -191,12 +216,22 @@ impl SessionLog {
     /// first use. The store owns masking, so a secret in the result never lands
     /// unmasked even in the blob. Returns the blob path.
     pub fn write_blob(&self, tool_use_id: &str, content: &str) -> std::io::Result<PathBuf> {
-        let stem = self.path.file_stem().and_then(|s| s.to_str()).unwrap_or("session");
+        let stem = self
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("session");
         let dir = self.path.with_file_name(format!("{stem}.blobs"));
         std::fs::create_dir_all(&dir)?;
         // Tool-use ids are provider-generated tokens; keep the filename safe.
-        let safe: String = tool_use_id.chars().filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-').collect();
-        let path = dir.join(format!("{}.txt", if safe.is_empty() { "blob" } else { &safe }));
+        let safe: String = tool_use_id
+            .chars()
+            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+            .collect();
+        let path = dir.join(format!(
+            "{}.txt",
+            if safe.is_empty() { "blob" } else { &safe }
+        ));
         let masked = self.masker.apply(content);
         let mut f = OpenOptions::new()
             .create(true)
@@ -222,7 +257,12 @@ impl SessionLog {
             payload: &'a EntryPayload,
         }
         let id = new_ulid();
-        let entry = EntryRef { id: &id, parent_id: self.last_id.as_deref(), ts_ms: now_ms, payload };
+        let entry = EntryRef {
+            id: &id,
+            parent_id: self.last_id.as_deref(),
+            ts_ms: now_ms,
+            payload,
+        };
         let line = serde_json::to_string(&entry)
             .map_err(|e| std::io::Error::other(format!("serialize entry: {e}")))?;
         let masked = self.masker.apply(&line);
@@ -251,7 +291,11 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let header = apply_log(path, &mut items, &mut warnings)?;
-    Ok(Replayed { header, items, warnings })
+    Ok(Replayed {
+        header,
+        items,
+        warnings,
+    })
 }
 
 /// Replay a session *and its ancestry*: a resumed session's log starts from
@@ -289,7 +333,11 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     for (path, _) in lineage.iter().rev() {
         apply_log(path, &mut items, &mut warnings)?;
     }
-    Ok(Replayed { header: newest_header, items, warnings })
+    Ok(Replayed {
+        header: newest_header,
+        items,
+        warnings,
+    })
 }
 
 /// Apply one log's entries onto an existing projection; returns its header.
@@ -308,7 +356,8 @@ fn apply_log(
     let mut chain_ok = true;
     // §2b: an unresolved pending_ask at end-of-log means the session stopped
     // mid-ask — surface it on resume (id → summary).
-    let mut pending_asks: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut pending_asks: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (n, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
         let entry: Entry = serde_json::from_str(&line)
@@ -325,7 +374,12 @@ fn apply_log(
         match entry.payload {
             EntryPayload::Header { header: h } => header = Some(h),
             EntryPayload::Item { item } => items.push(item),
-            EntryPayload::Compaction { digest, prefix_end, kept_from, .. } => {
+            EntryPayload::Compaction {
+                digest,
+                prefix_end,
+                kept_from,
+                ..
+            } => {
                 let prefix_end = prefix_end.min(items.len());
                 let kept_from = kept_from.clamp(prefix_end, items.len());
                 let tail = items.split_off(kept_from);
@@ -341,7 +395,8 @@ fn apply_log(
             EntryPayload::AskResolved { id, .. } => {
                 pending_asks.remove(&id);
             }
-            EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {}
+            EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {
+            }
         }
     }
     for summary in pending_asks.into_values() {
@@ -354,7 +409,9 @@ fn apply_log(
 
 /// Session files in `dir`, newest first: (session id, path, modified).
 pub fn list_sessions(dir: &Path) -> Vec<(String, PathBuf, std::time::SystemTime)> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<(String, PathBuf, std::time::SystemTime)> = entries
         .flatten()
         .filter_map(|e| {
@@ -396,7 +453,10 @@ mod tests {
         .unwrap();
 
         let content = std::fs::read_to_string(log.path()).unwrap();
-        assert!(!content.contains("sk-super-secret-12345"), "secret leaked into the log");
+        assert!(
+            !content.contains("sk-super-secret-12345"),
+            "secret leaked into the log"
+        );
         assert!(content.contains("«masked:HOTL_TEST_API_KEY»"));
 
         // Entries chain: line 2's parent is line 1's id.
@@ -413,7 +473,10 @@ mod tests {
     #[test]
     fn with_value_masks_runtime_secret() {
         let m = Masker::empty().with_value("HOTL_API_KEY_HELPER", "vk-live-12345678");
-        assert_eq!(m.apply("key is vk-live-12345678."), "key is «masked:HOTL_API_KEY_HELPER».");
+        assert_eq!(
+            m.apply("key is vk-live-12345678."),
+            "key is «masked:HOTL_API_KEY_HELPER»."
+        );
     }
 
     #[test]
@@ -433,13 +496,19 @@ mod tests {
         let mut log = SessionLog::create(dir.path(), "m", None, masker, 1).unwrap();
         log.append(
             &EntryPayload::Item {
-                item: Item::User { text: r#"key is p@ss"w0rd\x"#.into(), synthetic: None },
+                item: Item::User {
+                    text: r#"key is p@ss"w0rd\x"#.into(),
+                    synthetic: None,
+                },
             },
             2,
         )
         .unwrap();
         let content = std::fs::read_to_string(log.path()).unwrap();
-        assert!(!content.contains(r#"p@ss\"w0rd\\x"#), "escaped secret leaked");
+        assert!(
+            !content.contains(r#"p@ss\"w0rd\\x"#),
+            "escaped secret leaked"
+        );
         assert!(!content.contains("w0rd"), "secret body leaked in any form");
         assert!(content.contains("«masked:HOTL_TEST_TOKEN»"));
         std::env::remove_var("HOTL_TEST_TOKEN");
@@ -449,9 +518,13 @@ mod tests {
     fn replay_applies_items_compaction_and_branch_moves() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
-        let user = |t: &str| Item::User { text: t.into(), synthetic: None };
+        let user = |t: &str| Item::User {
+            text: t.into(),
+            synthetic: None,
+        };
         for text in ["one", "two", "three", "four"] {
-            log.append(&EntryPayload::Item { item: user(text) }, 2).unwrap();
+            log.append(&EntryPayload::Item { item: user(text) }, 2)
+                .unwrap();
         }
         // Compaction: fold [0..2) into a digest, keep the tail.
         log.append(
@@ -465,9 +538,12 @@ mod tests {
         )
         .unwrap();
         // Projection now: [digest, three, four]. Roll back to 2 items, record why.
-        log.append(&EntryPayload::BranchMove { keep_items: 2 }, 4).unwrap();
+        log.append(&EntryPayload::BranchMove { keep_items: 2 }, 4)
+            .unwrap();
         log.append(
-            &EntryPayload::Supersede { digest: vec![user("abandoned: four")] },
+            &EntryPayload::Supersede {
+                digest: vec![user("abandoned: four")],
+            },
             5,
         )
         .unwrap();
@@ -494,22 +570,52 @@ mod tests {
     fn replay_surfaces_a_dangling_pending_ask() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
-        log.append(&EntryPayload::Item { item: Item::User { text: "go".into(), synthetic: None } }, 2).unwrap();
+        log.append(
+            &EntryPayload::Item {
+                item: Item::User {
+                    text: "go".into(),
+                    synthetic: None,
+                },
+            },
+            2,
+        )
+        .unwrap();
         // A pending_ask with no matching ask_resolved (the session stopped mid-ask).
-        log.append(&EntryPayload::PendingAsk { id: "a1".into(), summary: "bash: rm -rf /".into(), protected_why: None }, 3).unwrap();
+        log.append(
+            &EntryPayload::PendingAsk {
+                id: "a1".into(),
+                summary: "bash: rm -rf /".into(),
+                protected_why: None,
+            },
+            3,
+        )
+        .unwrap();
 
         let replayed = replay(log.path()).expect("replay");
         assert!(
-            replayed.warnings.iter().any(|w| w.contains("unanswered permission request") && w.contains("rm -rf")),
+            replayed
+                .warnings
+                .iter()
+                .any(|w| w.contains("unanswered permission request") && w.contains("rm -rf")),
             "a dangling pending_ask must surface on resume: {:?}",
             replayed.warnings
         );
 
         // Resolving it clears the warning.
-        log.append(&EntryPayload::AskResolved { id: "a1".into(), allowed: false }, 4).unwrap();
+        log.append(
+            &EntryPayload::AskResolved {
+                id: "a1".into(),
+                allowed: false,
+            },
+            4,
+        )
+        .unwrap();
         let replayed = replay(log.path()).expect("replay");
         assert!(
-            !replayed.warnings.iter().any(|w| w.contains("unanswered permission request")),
+            !replayed
+                .warnings
+                .iter()
+                .any(|w| w.contains("unanswered permission request")),
             "a resolved ask leaves no dangling warning"
         );
     }
@@ -528,7 +634,10 @@ mod tests {
         let replayed = replay(&path).expect("replay still succeeds");
         assert_eq!(replayed.items.len(), 1);
         assert!(
-            replayed.warnings.iter().any(|w| w.contains("broken parent_id chain")),
+            replayed
+                .warnings
+                .iter()
+                .any(|w| w.contains("broken parent_id chain")),
             "a forged/edited log must warn, got {:?}",
             replayed.warnings
         );
@@ -540,9 +649,14 @@ mod tests {
         let masker = Masker::from_env();
         let dir = tempfile::tempdir().unwrap();
         let log = SessionLog::create(dir.path(), "m", None, masker, 1).unwrap();
-        let p = log.write_blob("toolu_1", "before sk-topsecret-value after").unwrap();
+        let p = log
+            .write_blob("toolu_1", "before sk-topsecret-value after")
+            .unwrap();
         let on_disk = std::fs::read_to_string(&p).unwrap();
-        assert!(!on_disk.contains("sk-topsecret-value"), "secret leaked into the blob");
+        assert!(
+            !on_disk.contains("sk-topsecret-value"),
+            "secret leaked into the blob"
+        );
         assert!(on_disk.contains("«masked:HOTL_BLOB_SECRET»"));
         assert!(p.parent().unwrap().to_string_lossy().ends_with(".blobs"));
         std::env::remove_var("HOTL_BLOB_SECRET");
@@ -552,11 +666,17 @@ mod tests {
     fn audit_finds_pre_masking_leaks() {
         let dir = tempfile::tempdir().unwrap();
         // A log written before `leaked-value-9` became a secret.
-        std::fs::write(dir.path().join("old.jsonl"), r#"{"text":"key is leaked-value-9"}"#).unwrap();
+        std::fs::write(
+            dir.path().join("old.jsonl"),
+            r#"{"text":"key is leaked-value-9"}"#,
+        )
+        .unwrap();
         std::fs::write(dir.path().join("clean.jsonl"), r#"{"text":"nothing here"}"#).unwrap();
         std::fs::write(dir.path().join("notes.txt"), "leaked-value-9").unwrap();
 
-        let masker = Masker { pairs: vec![("leaked-value-9".into(), "«masked:X»".into())] };
+        let masker = Masker {
+            pairs: vec![("leaked-value-9".into(), "«masked:X»".into())],
+        };
         let hits = audit_secrets(dir.path(), &masker);
         assert_eq!(hits.len(), 1, "only the jsonl with the live secret");
         assert!(hits[0].ends_with("old.jsonl"));

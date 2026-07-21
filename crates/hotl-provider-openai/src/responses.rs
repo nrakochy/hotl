@@ -42,10 +42,16 @@ impl SseAssembler for ResponsesAssembler {
                 if !text.is_empty() {
                     if !self.text_started {
                         self.text_started = true;
-                        out.push(StreamEvent::BlockStart { index: 0, kind: "text".into() });
+                        out.push(StreamEvent::BlockStart {
+                            index: 0,
+                            kind: "text".into(),
+                        });
                     }
                     self.text.push_str(text);
-                    out.push(StreamEvent::TextDelta { index: 0, text: text.to_string() });
+                    out.push(StreamEvent::TextDelta {
+                        index: 0,
+                        text: text.to_string(),
+                    });
                 }
             }
             "response.output_item.added" => {
@@ -54,7 +60,10 @@ impl SseAssembler for ResponsesAssembler {
                         let id = str_at(item, "call_id");
                         let name = str_at(item, "name");
                         self.tools.push((id, name, String::new()));
-                        out.push(StreamEvent::BlockStart { index: self.tools.len(), kind: "tool_use".into() });
+                        out.push(StreamEvent::BlockStart {
+                            index: self.tools.len(),
+                            kind: "tool_use".into(),
+                        });
                     }
                 }
             }
@@ -62,7 +71,10 @@ impl SseAssembler for ResponsesAssembler {
                 if let Some((_, _, args)) = self.tools.last_mut() {
                     let delta = v.get("delta").and_then(Value::as_str).unwrap_or("");
                     args.push_str(delta);
-                    out.push(StreamEvent::ToolInputDelta { index: self.tools.len(), json: delta.to_string() });
+                    out.push(StreamEvent::ToolInputDelta {
+                        index: self.tools.len(),
+                        json: delta.to_string(),
+                    });
                 }
             }
             "response.completed" => {
@@ -74,7 +86,11 @@ impl SseAssembler for ResponsesAssembler {
                         self.usage.output_tokens = n;
                     }
                 }
-                self.stop = Some(if self.tools.is_empty() { StopReason::EndTurn } else { StopReason::ToolUse });
+                self.stop = Some(if self.tools.is_empty() {
+                    StopReason::EndTurn
+                } else {
+                    StopReason::ToolUse
+                });
                 self.done = true;
             }
             _ => {} // ping / other events: ignored (forward compat)
@@ -84,7 +100,9 @@ impl SseAssembler for ResponsesAssembler {
 
     fn finish(self) -> Result<StreamEvent, ProviderError> {
         if !self.done {
-            return Err(ProviderError::Parse("Responses stream ended before response.completed".into()));
+            return Err(ProviderError::Parse(
+                "Responses stream ended before response.completed".into(),
+            ));
         }
         let mut blocks = Vec::new();
         if !self.text.is_empty() {
@@ -94,8 +112,9 @@ impl SseAssembler for ResponsesAssembler {
             let input: Value = if args.trim().is_empty() {
                 json!({})
             } else {
-                hotl_provider::repair::parse_or_repair(args)
-                    .ok_or_else(|| ProviderError::Parse(format!("tool args for `{name}` didn't parse")))?
+                hotl_provider::repair::parse_or_repair(args).ok_or_else(|| {
+                    ProviderError::Parse(format!("tool args for `{name}` didn't parse"))
+                })?
             };
             blocks.push(json!({"type": "tool_use", "id": id, "name": name, "input": input}));
         }
@@ -108,7 +127,10 @@ impl SseAssembler for ResponsesAssembler {
 }
 
 fn str_at(v: &Value, field: &str) -> String {
-    v.get(field).and_then(Value::as_str).unwrap_or_default().to_string()
+    v.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[cfg(test)]
@@ -131,7 +153,12 @@ mod tests {
         for e in events {
             streamed.extend(a.handle(e).unwrap());
         }
-        let StreamEvent::Completed { stop, usage, blocks } = a.finish().unwrap() else {
+        let StreamEvent::Completed {
+            stop,
+            usage,
+            blocks,
+        } = a.finish().unwrap()
+        else {
             panic!("wrong terminal event")
         };
         // Same contract as every other dialect: verbatim blocks + usage + stop.
@@ -145,14 +172,22 @@ mod tests {
         assert_eq!(blocks[1]["name"], "read");
         assert_eq!(blocks[1]["input"]["path"], "a.rs");
         // Deltas surfaced for live display, just like the other dialects.
-        assert!(streamed.iter().any(|e| matches!(e, StreamEvent::TextDelta { .. })));
-        assert!(streamed.iter().any(|e| matches!(e, StreamEvent::ToolInputDelta { .. })));
+        assert!(streamed
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { .. })));
+        assert!(streamed
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolInputDelta { .. })));
     }
 
     #[test]
     fn truncated_stream_is_an_honest_error() {
         let mut a = ResponsesAssembler::default();
-        a.handle(r#"{"type":"response.output_text.delta","delta":"hi"}"#).unwrap();
-        assert!(a.finish().is_err(), "no response.completed → error, not a silent empty result");
+        a.handle(r#"{"type":"response.output_text.delta","delta":"hi"}"#)
+            .unwrap();
+        assert!(
+            a.finish().is_err(),
+            "no response.completed → error, not a silent empty result"
+        );
     }
 }

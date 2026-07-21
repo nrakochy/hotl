@@ -83,17 +83,27 @@ impl Client {
         let mut line = msg.to_string();
         line.push('\n');
         let mut w = self.writer.lock().await;
-        w.write_all(line.as_bytes()).await.map_err(|e| format!("server pipe closed: {e}"))?;
-        w.flush().await.map_err(|e| format!("server pipe closed: {e}"))
+        w.write_all(line.as_bytes())
+            .await
+            .map_err(|e| format!("server pipe closed: {e}"))?;
+        w.flush()
+            .await
+            .map_err(|e| format!("server pipe closed: {e}"))
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap_or_else(PoisonError::into_inner).insert(id, tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(id, tx);
         // Every early return (send failure, timeout) must remove the entry
         // again or it leaks forever; the guard makes that unskippable.
-        let guard = PendingGuard { pending: &self.pending, id: Some(id) };
+        let guard = PendingGuard {
+            pending: &self.pending,
+            id: Some(id),
+        };
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
         let reply = tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), rx)
@@ -103,14 +113,18 @@ impl Client {
         // A reply means the reader already removed the entry.
         guard.disarm();
         if let Some(err) = reply.get("error") {
-            let msg = err.get("message").and_then(Value::as_str).unwrap_or("unknown error");
+            let msg = err
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error");
             return Err(format!("server error on `{method}`: {msg}"));
         }
         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
     }
 
     pub async fn notify(&self, method: &str) -> Result<(), String> {
-        self.send(&json!({"jsonrpc": "2.0", "method": method})).await
+        self.send(&json!({"jsonrpc": "2.0", "method": method}))
+            .await
     }
 
     /// The MCP handshake: `initialize` request, then the initialized notice.
@@ -154,7 +168,10 @@ impl Client {
         let result = self
             .request("tools/call", json!({"name": name, "arguments": arguments}))
             .await?;
-        let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
+        let is_error = result
+            .get("isError")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let text = result
             .get("content")
             .and_then(Value::as_array)
@@ -172,7 +189,10 @@ impl Client {
 }
 
 fn str_field(v: &Value, field: &str) -> String {
-    v.get(field).and_then(Value::as_str).unwrap_or_default().to_string()
+    v.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Removes its id from the pending map on drop unless disarmed — so no early
@@ -191,7 +211,10 @@ impl PendingGuard<'_> {
 impl Drop for PendingGuard<'_> {
     fn drop(&mut self) {
         if let Some(id) = self.id {
-            self.pending.lock().unwrap_or_else(PoisonError::into_inner).remove(&id);
+            self.pending
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&id);
         }
     }
 }
@@ -201,15 +224,22 @@ async fn reader_task(read: impl AsyncRead + Send + Unpin, client: Weak<Client>) 
     while let Ok(Some(line)) = lines.next_line().await {
         // Upgrade per message: a Weak here means the last user is gone and
         // the task must not keep the client (and the child's stdin) alive.
-        let Some(client) = client.upgrade() else { return };
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let Some(client) = client.upgrade() else {
+            return;
+        };
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         let id = msg.get("id").and_then(Value::as_u64);
         let method = msg.get("method").and_then(Value::as_str);
         match (id, method) {
             // Response to one of our requests.
             (Some(id), None) => {
-                if let Some(tx) =
-                    client.pending.lock().unwrap_or_else(PoisonError::into_inner).remove(&id)
+                if let Some(tx) = client
+                    .pending
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&id)
                 {
                     let _ = tx.send(msg);
                 }
@@ -232,6 +262,10 @@ async fn reader_task(read: impl AsyncRead + Send + Unpin, client: Weak<Client>) 
     }
     // EOF: fail everything pending so callers see a clean error.
     if let Some(client) = client.upgrade() {
-        client.pending.lock().unwrap_or_else(PoisonError::into_inner).clear();
+        client
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
     }
 }

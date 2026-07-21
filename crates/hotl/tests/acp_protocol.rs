@@ -41,7 +41,10 @@ fn scripted_factory() -> acp::SessionFactory {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
-            config: EngineConfig { max_turns: 6, ..Default::default() },
+            config: EngineConfig {
+                max_turns: 6,
+                ..Default::default()
+            },
         }))
     })
 }
@@ -63,17 +66,32 @@ async fn initialize_new_prompt_permission_and_result() {
     let mut lines = BufReader::new(cread).lines();
 
     // 1. initialize → carries the stable schema version.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":1,"method":"initialize"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
     let init = next(&mut lines).await;
     assert_eq!(init["result"]["schemaVersion"], acp::UPDATE_SCHEMA_VERSION);
 
     // 2. session/new → a session id.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":2,"method":"session/new"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
     let new = next(&mut lines).await;
-    let session_id = new["result"]["sessionId"].as_str().expect("session id").to_string();
+    let session_id = new["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
 
     // 3. session/prompt → streams updates, requests permission, resolves.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"go"}})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
 
     let mut saw_tool_start = false;
     let mut prompt_result: Option<Value> = None;
@@ -85,7 +103,11 @@ async fn initialize_new_prompt_permission_and_result() {
                 // The bash call is gated → the server asks us. Approve it.
                 assert_eq!(msg["params"]["sessionId"], session_id);
                 let rid = msg["id"].clone();
-                send(&mut cwrite, json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}})).await;
+                send(
+                    &mut cwrite,
+                    json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+                )
+                .await;
             }
             Some("session/update") => {
                 assert_eq!(msg["params"]["schemaVersion"], acp::UPDATE_SCHEMA_VERSION);
@@ -101,14 +123,27 @@ async fn initialize_new_prompt_permission_and_result() {
     let result = prompt_result.unwrap();
     assert_eq!(result["result"]["outcome"]["kind"], "done");
     assert_eq!(result["result"]["outcome"]["text"], "all done via acp");
-    assert_eq!(result["result"]["schemaVersion"], acp::UPDATE_SCHEMA_VERSION);
-    assert!(result["result"].get("usage").is_some(), "usage rides in the stable result");
+    assert_eq!(
+        result["result"]["schemaVersion"],
+        acp::UPDATE_SCHEMA_VERSION
+    );
+    assert!(
+        result["result"].get("usage").is_some(),
+        "usage rides in the stable result"
+    );
     assert!(saw_tool_start, "tool status streamed as an update");
 
     // 4. unknown method → JSON-RPC error, no crash.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":9,"method":"bogus/method"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":9,"method":"bogus/method"}),
+    )
+    .await;
     let err = read_until_id(&mut lines, 9).await;
-    assert!(err["error"]["message"].as_str().unwrap().contains("unknown method"));
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("unknown method"));
 }
 
 /// Two prompts in flight: the engine queues the second, and each prompt
@@ -135,7 +170,10 @@ async fn overlapping_prompts_resolve_in_order() {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
-            config: EngineConfig { max_turns: 6, ..Default::default() },
+            config: EngineConfig {
+                max_turns: 6,
+                ..Default::default()
+            },
         }))
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -145,10 +183,22 @@ async fn overlapping_prompts_resolve_in_order() {
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":1,"method":"session/new"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+    )
+    .await;
     read_until_id(&mut lines, 1).await;
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"a"}})).await;
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"b"}})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"a"}}),
+    )
+    .await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"b"}}),
+    )
+    .await;
 
     let first = read_until_id(&mut lines, 2).await;
     assert_eq!(first["result"]["outcome"]["text"], "first turn");
@@ -168,12 +218,23 @@ async fn replacing_a_session_clears_parked_state() {
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":1,"method":"session/new"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+    )
+    .await;
     let first = read_until_id(&mut lines, 1).await;
-    let first_sid = first["result"]["sessionId"].as_str().expect("session id").to_string();
+    let first_sid = first["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
 
     // Prompt; wait for the gated bash call's permission request — leave it parked.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"go"}})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
     loop {
         let msg = next(&mut lines).await;
         if msg.get("method").and_then(Value::as_str) == Some("session/request_permission") {
@@ -182,19 +243,38 @@ async fn replacing_a_session_clears_parked_state() {
     }
 
     // Replace the session while the ask is parked.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":3,"method":"session/new"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+    )
+    .await;
     let second = read_until_id(&mut lines, 3).await;
-    let second_sid = second["result"]["sessionId"].as_str().expect("session id").to_string();
+    let second_sid = second["result"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
     assert_ne!(first_sid, second_sid);
 
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"text":"again"}})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"text":"again"}}),
+    )
+    .await;
     let result = loop {
         let msg = next(&mut lines).await;
-        assert_ne!(msg.get("id"), Some(&json!(2)), "stale prompt answered: {msg}");
+        assert_ne!(
+            msg.get("id"),
+            Some(&json!(2)),
+            "stale prompt answered: {msg}"
+        );
         if msg.get("method").and_then(Value::as_str) == Some("session/request_permission") {
             assert_eq!(msg["params"]["sessionId"], second_sid);
             let rid = msg["id"].clone();
-            send(&mut cwrite, json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}})).await;
+            send(
+                &mut cwrite,
+                json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+            )
+            .await;
         } else if msg.get("id") == Some(&json!(4)) {
             break msg;
         }
@@ -215,18 +295,37 @@ async fn steer_is_acknowledged_and_reaches_engine() {
     let mut lines = BufReader::new(cread).lines();
 
     // Steering with NO session is an error naming the missing session.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":1,"method":"session/steer","params":{"text":"go left"}})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/steer","params":{"text":"go left"}}),
+    )
+    .await;
     let err = read_until_id(&mut lines, 1).await;
-    assert!(err["error"]["message"].as_str().unwrap().contains("session"));
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("session"));
 
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":2,"method":"session/new"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
     read_until_id(&mut lines, 2).await;
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":3,"method":"session/steer","params":{"text":"go left"}})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/steer","params":{"text":"go left"}}),
+    )
+    .await;
     let ack = read_until_id(&mut lines, 3).await;
     assert_eq!(ack["result"], json!({"queued": true}));
 
     // Missing params.text is an error too.
-    send(&mut cwrite, json!({"jsonrpc":"2.0","id":4,"method":"session/steer"})).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/steer"}),
+    )
+    .await;
     let err = read_until_id(&mut lines, 4).await;
     assert!(err["error"]["message"].as_str().unwrap().contains("text"));
 }

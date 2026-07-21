@@ -38,12 +38,17 @@ struct Shared {
 
 /// Directory holding one `<id>.sock` per live backgrounded session.
 pub fn run_dir() -> PathBuf {
-    crate::agent::sessions_dir().parent().map(|p| p.join("run")).unwrap_or_else(|| PathBuf::from("run"))
+    crate::agent::sessions_dir()
+        .parent()
+        .map(|p| p.join("run"))
+        .unwrap_or_else(|| PathBuf::from("run"))
 }
 
 /// Live backgrounded sessions (their socket ids), from the run dir.
 pub fn list_live() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(run_dir()) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(run_dir()) else {
+        return Vec::new();
+    };
     let mut ids: Vec<String> = entries
         .flatten()
         .filter_map(|e| {
@@ -111,7 +116,9 @@ impl Drop for SockGuard {
 
 async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
         let (read, write) = stream.into_split();
         *shared.client.lock().await = Some(write);
         resend_pending(&shared).await;
@@ -129,7 +136,9 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
 async fn handle_client(read: impl AsyncRead + Unpin, shared: &Arc<Shared>) -> bool {
     let mut lines = BufReader::new(read).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
+        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
         match msg.get("t").and_then(Value::as_str).unwrap_or("") {
             "prompt" => shared.handle.prompt(str_field(&msg, "text")).await,
             "steer" => shared.handle.steer(str_field(&msg, "text")).await,
@@ -137,7 +146,12 @@ async fn handle_client(read: impl AsyncRead + Unpin, shared: &Arc<Shared>) -> bo
             "cancel" => shared.handle.interrupt(),
             "ask_reply" => {
                 if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                    if let Some((reply, _)) = shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&id) {
+                    if let Some((reply, _)) = shared
+                        .pending
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&id)
+                    {
                         let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
                         let deny_msg = msg.get("message").and_then(Value::as_str).map(String::from);
                         let ans = if allow {
@@ -162,12 +176,19 @@ async fn resend_pending(shared: &Arc<Shared>) {
     let frames: Vec<Value> = {
         // Prune asks whose reply channel died (turn cancelled/ended) so a
         // reattach never sees an ask that can no longer be answered.
-        let mut pending = shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pending = shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.retain(|_, (tx, _)| !tx.is_closed());
         pending.values().map(|(_, f)| f.clone()).collect()
     };
     // Tell the client the current session id first (a lightweight hello).
-    send(shared, &json!({"t": "hello", "sessionId": shared.session_id})).await;
+    send(
+        shared,
+        &json!({"t": "hello", "sessionId": shared.session_id}),
+    )
+    .await;
     for frame in frames {
         send(shared, &frame).await;
     }
@@ -176,12 +197,20 @@ async fn resend_pending(shared: &Arc<Shared>) {
 async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shared: Arc<Shared>) {
     while let Some(event) = events.recv().await {
         match event {
-            EngineEvent::Ask { summary, protected_why, reply } => {
+            EngineEvent::Ask {
+                summary,
+                protected_why,
+                reply,
+            } => {
                 let id = shared.next_ask.fetch_add(1, Ordering::Relaxed);
                 let frame = json!({
                     "t": "ask", "id": id, "summary": summary, "protectedWhy": protected_why,
                 });
-                shared.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id, (reply, frame.clone()));
+                shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, (reply, frame.clone()));
                 send(&shared, &frame).await; // no-op if detached; re-sent on attach
             }
             EngineEvent::TurnDone { outcome, usage } => {
@@ -192,12 +221,15 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, (tx, _)| !tx.is_closed());
-                send(&shared, &json!({
-                    "t": "turn_done",
-                    "schemaVersion": UPDATE_SCHEMA_VERSION,
-                    "outcome": outcome_tag(&outcome),
-                    "usage": usage,
-                }))
+                send(
+                    &shared,
+                    &json!({
+                        "t": "turn_done",
+                        "schemaVersion": UPDATE_SCHEMA_VERSION,
+                        "outcome": outcome_tag(&outcome),
+                        "usage": usage,
+                    }),
+                )
                 .await;
             }
             other => {
@@ -222,7 +254,10 @@ async fn send(shared: &Arc<Shared>, frame: &Value) {
 }
 
 fn str_field(v: &Value, field: &str) -> String {
-    v.get(field).and_then(Value::as_str).unwrap_or_default().to_string()
+    v.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The socket path for a session id (used by the attach client).
@@ -264,11 +299,16 @@ mod tests {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
-            config: EngineConfig { max_turns: 6, ..Default::default() },
+            config: EngineConfig {
+                max_turns: 6,
+                ..Default::default()
+            },
         })
     }
 
-    async fn next(lines: &mut tokio::io::Lines<tokio::io::BufReader<impl AsyncRead + Unpin>>) -> Value {
+    async fn next(
+        lines: &mut tokio::io::Lines<tokio::io::BufReader<impl AsyncRead + Unpin>>,
+    ) -> Value {
         let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
             .await
             .expect("frame timeout")
@@ -316,7 +356,10 @@ mod tests {
                 break f["id"].as_u64().unwrap();
             }
         };
-        assert_eq!(reissued, ask_id, "the same parked ask must re-issue on reattach");
+        assert_eq!(
+            reissued, ask_id,
+            "the same parked ask must re-issue on reattach"
+        );
 
         // Answer it → the turn completes.
         send(&mut w2, json!({"t":"ask_reply","id":reissued,"allow":true})).await;

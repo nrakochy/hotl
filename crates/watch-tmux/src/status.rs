@@ -17,19 +17,21 @@ fn title_is_working(title: &str) -> bool {
 fn tail_is_blocked(tail: &str) -> bool {
     let t = tail.to_lowercase();
     t.contains("esc to cancel")
-        && (t.contains("enter to select")
-            || t.contains("to navigate")
-            || t.contains("↑↓"))
+        && (t.contains("enter to select") || t.contains("to navigate") || t.contains("↑↓"))
 }
 
 fn tail_is_idle(tail: &str) -> bool {
     tail.lines().any(|l| {
         let t = l.trim();
-        let Some(rest) = t.strip_prefix('❯') else { return false };
+        let Some(rest) = t.strip_prefix('❯') else {
+            return false;
+        };
         // "❯ 1. …" is a selection-menu item, not an idle prompt.
         let rest = rest.trim_start();
         !(rest.chars().next().is_some_and(|c| c.is_ascii_digit())
-            && rest.trim_start_matches(|c: char| c.is_ascii_digit()).starts_with('.'))
+            && rest
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .starts_with('.'))
     })
 }
 
@@ -112,7 +114,10 @@ enter to select · esc to cancel · ↑↓ to navigate";
 
     #[test]
     fn working_when_title_has_braille_spinner() {
-        assert_eq!(classify("claude", "\u{2809} Refactoring", IDLE_TAIL), Status::Working);
+        assert_eq!(
+            classify("claude", "\u{2809} Refactoring", IDLE_TAIL),
+            Status::Working
+        );
     }
 
     #[test]
@@ -122,7 +127,10 @@ enter to select · esc to cancel · ↑↓ to navigate";
 
     #[test]
     fn blocked_when_selection_form_present() {
-        assert_eq!(classify("claude", "✳ Some task", BLOCKED_TAIL), Status::Blocked);
+        assert_eq!(
+            classify("claude", "✳ Some task", BLOCKED_TAIL),
+            Status::Blocked
+        );
     }
 
     #[test]
@@ -133,12 +141,18 @@ enter to select · esc to cancel · ↑↓ to navigate";
 
     #[test]
     fn working_takes_precedence_over_blocked() {
-        assert_eq!(classify("claude", "\u{2809}", BLOCKED_TAIL), Status::Working);
+        assert_eq!(
+            classify("claude", "\u{2809}", BLOCKED_TAIL),
+            Status::Working
+        );
     }
 
     #[test]
     fn unknown_when_no_signals() {
-        assert_eq!(classify("claude", "plain title", "just some log output"), Status::Unknown);
+        assert_eq!(
+            classify("claude", "plain title", "just some log output"),
+            Status::Unknown
+        );
     }
 
     #[test]
@@ -175,7 +189,10 @@ allow bash: cargo test? [y/N — add a reason after 'n' to tell the model why] "
 
     #[test]
     fn hotl_unknown_when_no_signals() {
-        assert_eq!(classify("hotl", "plain", "streaming model output…"), Status::Unknown);
+        assert_eq!(
+            classify("hotl", "plain", "streaming model output…"),
+            Status::Unknown
+        );
     }
 
     #[test]

@@ -18,7 +18,11 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme { accent: Color::Cyan, dim: Color::DarkGray, fg: Color::Gray }
+        Theme {
+            accent: Color::Cyan,
+            dim: Color::DarkGray,
+            fg: Color::Gray,
+        }
     }
 }
 
@@ -45,7 +49,11 @@ pub fn view(state: &State, theme: &Theme, frame: &mut Frame) {
 }
 
 fn render_transcript(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = state.transcript.iter().flat_map(|i| item_lines(i, theme)).collect();
+    let lines: Vec<Line> = state
+        .transcript
+        .iter()
+        .flat_map(|i| item_lines(i, theme))
+        .collect();
     let skip = match state.scroll {
         Scroll::Follow => lines.len().saturating_sub(area.height as usize),
         Scroll::At(item) => state.transcript[..item.min(state.transcript.len())]
@@ -71,11 +79,24 @@ fn item_lines<'a>(item: &TranscriptItem, theme: &Theme) -> Vec<Line<'a>> {
             format!("⤷ {text} — steer queued, applies at next step"),
             Style::new().fg(theme.dim),
         )],
-        TranscriptItem::Steer { text, queued: false } => {
-            vec![Line::styled(format!("⤷ {text}"), Style::new().fg(theme.accent))]
+        TranscriptItem::Steer {
+            text,
+            queued: false,
+        } => {
+            vec![Line::styled(
+                format!("⤷ {text}"),
+                Style::new().fg(theme.accent),
+            )]
         }
-        TranscriptItem::Assistant { text } => text.split('\n').map(|l| Line::raw(l.to_string())).collect(),
-        TranscriptItem::Tool { name, summary, status, ticks } => {
+        TranscriptItem::Assistant { text } => {
+            text.split('\n').map(|l| Line::raw(l.to_string())).collect()
+        }
+        TranscriptItem::Tool {
+            name,
+            summary,
+            status,
+            ticks,
+        } => {
             let marker = match status {
                 ToolStatus::Running | ToolStatus::AutoAllowed { .. } => SPIN[(*ticks % 4) as usize],
                 ToolStatus::Done => "✓",
@@ -92,7 +113,10 @@ fn item_lines<'a>(item: &TranscriptItem, theme: &Theme) -> Vec<Line<'a>> {
             vec![Line::styled(line, Style::new().fg(theme.fg))]
         }
         TranscriptItem::Notice { text } => {
-            vec![Line::styled(text.clone(), Style::new().fg(theme.dim).italic())]
+            vec![Line::styled(
+                text.clone(),
+                Style::new().fg(theme.dim).italic(),
+            )]
         }
     }
 }
@@ -129,7 +153,9 @@ fn render_input(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
 
 fn render_hint(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
-        (Phase::WaitingAsk { .. }, ..) => "y allow · n deny · type a reason after n · ctrl-c cancel",
+        (Phase::WaitingAsk { .. }, ..) => {
+            "y allow · n deny · type a reason after n · ctrl-c cancel"
+        }
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "ctrl-e editor · esc interrupt · ? help",
     };
@@ -137,20 +163,43 @@ fn render_hint(state: &State, theme: &Theme, frame: &mut Frame, area: Rect) {
 }
 
 fn render_ask(state: &State, theme: &Theme, frame: &mut Frame, over: Rect) {
-    let Phase::WaitingAsk { summary, protected_why, input, denying, .. } = &state.phase else { return };
-    let mut lines = vec![Line::styled(summary.clone(), Style::new().fg(theme.fg).bold())];
+    let Phase::WaitingAsk {
+        summary,
+        protected_why,
+        input,
+        denying,
+        ..
+    } = &state.phase
+    else {
+        return;
+    };
+    let mut lines = vec![Line::styled(
+        summary.clone(),
+        Style::new().fg(theme.fg).bold(),
+    )];
     if let Some(why) = protected_why {
-        lines.push(Line::styled(format!("⚠ {why}"), Style::new().fg(theme.accent).bold()));
+        lines.push(Line::styled(
+            format!("⚠ {why}"),
+            Style::new().fg(theme.accent).bold(),
+        ));
     }
     lines.push(Line::raw(""));
     if *denying {
-        lines.push(Line::styled(format!("deny reason: {input}▏"), Style::new().fg(theme.fg)));
+        lines.push(Line::styled(
+            format!("deny reason: {input}▏"),
+            Style::new().fg(theme.fg),
+        ));
     } else {
-        lines.push(Line::styled("y allow · n deny · type a reason after n", Style::new().fg(theme.dim)));
+        lines.push(Line::styled(
+            "y allow · n deny · type a reason after n",
+            Style::new().fg(theme.dim),
+        ));
     }
     let area = centered(over, 60, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
-    let block = Block::bordered().title(" waiting on you ").border_style(Style::new().fg(theme.accent));
+    let block = Block::bordered()
+        .title(" waiting on you ")
+        .border_style(Style::new().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -171,7 +220,9 @@ fn render_help(theme: &Theme, frame: &mut Frame, over: Rect) {
     .collect();
     let area = centered(over, 70, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
-    let block = Block::bordered().title(" keys ").border_style(Style::new().fg(theme.accent));
+    let block = Block::bordered()
+        .title(" keys ")
+        .border_style(Style::new().fg(theme.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -183,7 +234,12 @@ fn centered(over: Rect, pct: u16, height: u16) -> Rect {
     let height = height.min(over.height);
     let x = over.x + (over.width - width) / 2;
     let y = over.y + (over.height - height) / 2;
-    Rect { x, y, width, height }
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
 }
 
 #[cfg(test)]
@@ -196,10 +252,16 @@ mod tests {
 
     fn draw(state: &State) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|f| view(state, &Theme::default(), f)).unwrap();
+        terminal
+            .draw(|f| view(state, &Theme::default(), f))
+            .unwrap();
         let buffer = terminal.backend().buffer().clone();
         (0..buffer.area.height)
-            .map(|y| (0..buffer.area.width).map(|x| buffer.cell((x, y)).unwrap().symbol()).collect())
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
             .collect()
     }
 
@@ -211,9 +273,17 @@ mod tests {
     #[test]
     fn idle_layout_shows_resting_glyph_and_hint_row() {
         let rows = draw(&State::new(true, "m".into()));
-        assert!(rows[STRIP].contains("· ─ ·"), "resting glyph: {}", rows[STRIP]);
+        assert!(
+            rows[STRIP].contains("· ─ ·"),
+            "resting glyph: {}",
+            rows[STRIP]
+        );
         assert!(rows[HINT].contains("? help"), "hint row: {}", rows[HINT]);
-        assert!(rows[INPUT_TOP].contains("-- INSERT --"), "mode title: {}", rows[INPUT_TOP]);
+        assert!(
+            rows[INPUT_TOP].contains("-- INSERT --"),
+            "mode title: {}",
+            rows[INPUT_TOP]
+        );
     }
 
     #[test]
@@ -242,29 +312,53 @@ mod tests {
             status: ToolStatus::Running,
             ticks: 16,
         });
-        s.phase = Phase::Tool { name: "bash".into(), ticks: 16 };
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 16,
+        };
         let rows = draw(&s);
-        assert!(rows[STRIP].contains("bash · 2s"), "strip elapsed: {}", rows[STRIP]);
-        assert!(rows.iter().any(|r| r.contains("bash] echo hi · 2s")), "card elapsed");
+        assert!(
+            rows[STRIP].contains("bash · 2s"),
+            "strip elapsed: {}",
+            rows[STRIP]
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("bash] echo hi · 2s")),
+            "card elapsed"
+        );
     }
 
     #[test]
     fn steer_chip_renders_until_admitted() {
         let mut s = State::new(true, "m".into());
-        s.transcript.push(TranscriptItem::Steer { text: "go left".into(), queued: true });
+        s.transcript.push(TranscriptItem::Steer {
+            text: "go left".into(),
+            queued: true,
+        });
         let rows = draw(&s).join("\n");
         assert!(rows.contains("⤷ go left — steer queued"), "pinned chip");
-        s.transcript[0] = TranscriptItem::Steer { text: "go left".into(), queued: false };
+        s.transcript[0] = TranscriptItem::Steer {
+            text: "go left".into(),
+            queued: false,
+        };
         let rows = draw(&s).join("\n");
         assert!(rows.contains("⤷ go left"), "chip stays");
-        assert!(!rows.contains("steer queued"), "queued tag gone once admitted");
+        assert!(
+            !rows.contains("steer queued"),
+            "queued tag gone once admitted"
+        );
     }
 
     #[test]
     fn normal_mode_titles_input() {
         let mut s = State::new(true, "m".into());
-        s.editor.handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        s.editor
+            .handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         let rows = draw(&s);
-        assert!(rows[INPUT_TOP].contains("-- NORMAL --"), "{}", rows[INPUT_TOP]);
+        assert!(
+            rows[INPUT_TOP].contains("-- NORMAL --"),
+            "{}",
+            rows[INPUT_TOP]
+        );
     }
 }

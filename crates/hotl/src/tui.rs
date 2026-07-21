@@ -35,7 +35,10 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         Ok(pair) => pair,
         Err(code) => return code,
     };
-    let vim_mode = crate::config::Config::load(&crate::agent::config_dir()).behavior.vim_mode.unwrap_or(true);
+    let vim_mode = crate::config::Config::load(&crate::agent::config_dir())
+        .behavior
+        .vim_mode
+        .unwrap_or(true);
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
@@ -59,7 +62,15 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         }
     };
     let state = State::new(vim_mode, model);
-    let result = run_loop(&mut guard, &mut client, &mut reader, keys, &suspended, state).await;
+    let result = run_loop(
+        &mut guard,
+        &mut client,
+        &mut reader,
+        keys,
+        &suspended,
+        state,
+    )
+    .await;
     drop(guard);
     match result {
         Ok(code) => code,
@@ -72,12 +83,20 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 
 /// initialize + session/new|load before entering raw mode, so wiring errors
 /// print as plain lines instead of corrupting an alt-screen.
-async fn handshake(client: &mut Client, reader: &mut ServerReader, spec: Option<String>) -> Result<(), String> {
+async fn handshake(
+    client: &mut Client,
+    reader: &mut ServerReader,
+    spec: Option<String>,
+) -> Result<(), String> {
     let init = client.request("initialize", Value::Null).await;
     wait_response(reader, init).await?;
     let open = match spec {
         None => client.request("session/new", Value::Null).await,
-        Some(sid) => client.request("session/load", json!({"sessionId": sid})).await,
+        Some(sid) => {
+            client
+                .request("session/load", json!({"sessionId": sid}))
+                .await
+        }
     };
     wait_response(reader, open).await?;
     Ok(())
@@ -125,7 +144,11 @@ async fn run_loop(
         while let Some(cmd) = queue.pop_front() {
             match cmd {
                 Cmd::SendPrompt(text) => {
-                    prompt_ids.push_back(client.request("session/prompt", json!({"text": text})).await);
+                    prompt_ids.push_back(
+                        client
+                            .request("session/prompt", json!({"text": text}))
+                            .await,
+                    );
                 }
                 Cmd::SendSteer(text) => {
                     client.request("session/steer", json!({"text": text})).await;
@@ -133,7 +156,11 @@ async fn run_loop(
                 Cmd::Cancel => {
                     client.request("session/cancel", Value::Null).await;
                 }
-                Cmd::ReplyPermission { req_id, allow, message } => client.reply_permission(req_id, allow, message).await,
+                Cmd::ReplyPermission {
+                    req_id,
+                    allow,
+                    message,
+                } => client.reply_permission(req_id, allow, message).await,
                 Cmd::SetTitle(title) => {
                     let _ = execute!(io::stdout(), SetTitle(&title));
                 }
@@ -150,9 +177,15 @@ async fn run_loop(
 fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
     match msg {
         ServerMsg::Update(v) => Some(Msg::Update(v)),
-        ServerMsg::PermissionRequest { req_id, summary, protected_why } => {
-            Some(Msg::PermissionRequest { req_id, summary, protected_why })
-        }
+        ServerMsg::PermissionRequest {
+            req_id,
+            summary,
+            protected_why,
+        } => Some(Msg::PermissionRequest {
+            req_id,
+            summary,
+            protected_why,
+        }),
         ServerMsg::Response { id, result } => {
             // Only prompt replies become messages; steer/cancel acks are noise.
             let pos = prompt_ids.iter().position(|&p| p == id)?;
@@ -170,12 +203,20 @@ fn prompt_result_msg(result: Result<Value, String>) -> Msg {
                 .find_map(|k| v.pointer(&format!("/outcome/{k}")).and_then(Value::as_str))
                 .map(String::from);
             Msg::PromptResult {
-                outcome_kind: v.pointer("/outcome/kind").and_then(Value::as_str).unwrap_or("error").to_string(),
+                outcome_kind: v
+                    .pointer("/outcome/kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
                 outcome_text: text,
                 usage: v.get("usage").cloned().unwrap_or(Value::Null),
             }
         }
-        Err(e) => Msg::PromptResult { outcome_kind: "error".into(), outcome_text: Some(e), usage: Value::Null },
+        Err(e) => Msg::PromptResult {
+            outcome_kind: "error".into(),
+            outcome_text: Some(e),
+            usage: Value::Null,
+        },
     }
 }
 
@@ -204,7 +245,11 @@ fn spawn_key_reader(suspended: Arc<AtomicBool>) -> mpsc::Receiver<Event> {
     rx
 }
 
-fn suspended_editor(guard: &mut TerminalGuard, suspended: &AtomicBool, text: &str) -> Option<String> {
+fn suspended_editor(
+    guard: &mut TerminalGuard,
+    suspended: &AtomicBool,
+    text: &str,
+) -> Option<String> {
     suspended.store(true, Ordering::Relaxed);
     guard.suspend();
     let content = run_external_editor(text);
@@ -243,7 +288,10 @@ fn resolve_spec(args: &[String]) -> Result<Option<String>, i32> {
 
 fn by_prefix(prefix: &str) -> Result<String, i32> {
     let sessions = newest_first();
-    let matches: Vec<_> = sessions.iter().filter(|(id, ..)| id.starts_with(prefix)).collect();
+    let matches: Vec<_> = sessions
+        .iter()
+        .filter(|(id, ..)| id.starts_with(prefix))
+        .collect();
     match matches.len() {
         1 => Ok(matches[0].0.clone()),
         0 => {

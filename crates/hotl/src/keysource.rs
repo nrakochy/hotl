@@ -26,7 +26,12 @@ pub struct HelperKey {
 
 impl HelperKey {
     pub fn new(command: String, ttl: Option<Duration>) -> Self {
-        Self { command, ttl, timeout: HELPER_TIMEOUT, cache: Mutex::new(None) }
+        Self {
+            command,
+            ttl,
+            timeout: HELPER_TIMEOUT,
+            cache: Mutex::new(None),
+        }
     }
 
     #[cfg(test)]
@@ -174,7 +179,8 @@ mod tests {
 
     #[tokio::test]
     async fn timeout_kills_helper() {
-        let h = HelperKey::new("sleep 30".into(), None).with_timeout(std::time::Duration::from_millis(100));
+        let h = HelperKey::new("sleep 30".into(), None)
+            .with_timeout(std::time::Duration::from_millis(100));
         let e = h.get().await.unwrap_err();
         assert!(e.0.contains("timed out"), "{}", e.0);
     }

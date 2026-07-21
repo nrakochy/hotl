@@ -43,11 +43,19 @@ pub fn strip_line(state: &State) -> String {
             Some(usage) => format!("{RESTING} · {usage}"),
             None => RESTING.to_string(),
         },
-        Phase::Sampling { ticks } => format!("{glyph} thinking · {}s · esc to interrupt", secs(*ticks)),
-        Phase::Streaming { ticks, chars } => {
-            format!("{glyph} writing · ~{} tok · {}s · esc to interrupt", chars / 4, secs(*ticks))
+        Phase::Sampling { ticks } => {
+            format!("{glyph} thinking · {}s · esc to interrupt", secs(*ticks))
         }
-        Phase::Tool { name, ticks } => format!("{glyph} {name} · {}s · esc to interrupt", secs(*ticks)),
+        Phase::Streaming { ticks, chars } => {
+            format!(
+                "{glyph} writing · ~{} tok · {}s · esc to interrupt",
+                chars / 4,
+                secs(*ticks)
+            )
+        }
+        Phase::Tool { name, ticks } => {
+            format!("{glyph} {name} · {}s · esc to interrupt", secs(*ticks))
+        }
         Phase::WaitingAsk { .. } => format!("{GAP} waiting on you"),
         Phase::Compacting { .. } => format!("{glyph} folding history…"),
     }
@@ -89,9 +97,18 @@ mod tests {
         assert_eq!(strip_line(&s), "· ─ · · 120 in · 45 out tok");
         s.phase = Phase::Sampling { ticks: 8 };
         assert_eq!(strip_line(&s), "─╮╭ ╯╰ thinking · 1s · esc to interrupt");
-        s.phase = Phase::Streaming { ticks: 16, chars: 200 };
-        assert_eq!(strip_line(&s), "─╮╭ ╯╰ writing · ~50 tok · 2s · esc to interrupt");
-        s.phase = Phase::Tool { name: "bash".into(), ticks: 4 };
+        s.phase = Phase::Streaming {
+            ticks: 16,
+            chars: 200,
+        };
+        assert_eq!(
+            strip_line(&s),
+            "─╮╭ ╯╰ writing · ~50 tok · 2s · esc to interrupt"
+        );
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 4,
+        };
         assert_eq!(strip_line(&s), "●─╮╰─╯ bash · 0s · esc to interrupt");
         s.phase = Phase::WaitingAsk {
             req_id: 1,

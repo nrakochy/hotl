@@ -97,17 +97,32 @@ fn newly_blocked(prev: &[AgentObservation], next: &[AgentObservation]) -> bool {
 pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
     match msg {
         Msg::Tick | Msg::Refresh => vec![Cmd::Scan],
-        Msg::Up => { state.move_up(); vec![] }
-        Msg::Down => { state.move_down(); vec![] }
-        Msg::Top => { state.move_top(); vec![] }
-        Msg::Bottom => { state.move_bottom(); vec![] }
+        Msg::Up => {
+            state.move_up();
+            vec![]
+        }
+        Msg::Down => {
+            state.move_down();
+            vec![]
+        }
+        Msg::Top => {
+            state.move_top();
+            vec![]
+        }
+        Msg::Bottom => {
+            state.move_bottom();
+            vec![]
+        }
         Msg::Jump => match state.selected() {
             Some(o) => vec![Cmd::Jump(Box::new(o.clone()))],
             None => vec![],
         },
         // Ctrl-h/j/k/l always switch tmux panes; list nav is plain j/k.
         Msg::CtrlNav(dir) => vec![Cmd::SelectPane(dir)],
-        Msg::Quit => { state.should_quit = true; vec![Cmd::Quit] }
+        Msg::Quit => {
+            state.should_quit = true;
+            vec![Cmd::Quit]
+        }
         Msg::Scanned(Ok((next, warnings))) => {
             let ping = state.ping_on_blocked && newly_blocked(&state.agents, &next);
             let selected_id = state.selected().map(AppState::id);
@@ -120,18 +135,35 @@ pub fn update(state: &mut AppState, msg: Msg) -> Vec<Cmd> {
                 format!("{n} agent{}", if n == 1 { "" } else { "s" })
             } else {
                 // A surface degraded; keep the healthy count visible but flag it.
-                format!("{n} agent{} ({})", if n == 1 { "" } else { "s" }, warnings.join("; "))
+                format!(
+                    "{n} agent{} ({})",
+                    if n == 1 { "" } else { "s" },
+                    warnings.join("; ")
+                )
             };
-            if ping { vec![Cmd::Ping] } else { vec![] }
+            if ping {
+                vec![Cmd::Ping]
+            } else {
+                vec![]
+            }
         }
-        Msg::Scanned(Err(e)) => { state.status = format!("scan error: {e}"); vec![] }
-        Msg::Jumped(Ok(id)) => { state.status = format!("jumped to {id}"); vec![] }
+        Msg::Scanned(Err(e)) => {
+            state.status = format!("scan error: {e}");
+            vec![]
+        }
+        Msg::Jumped(Ok(id)) => {
+            state.status = format!("jumped to {id}");
+            vec![]
+        }
         Msg::Jumped(Err(e)) => {
             // Pane likely vanished; rescan rather than leaving a stale list.
             state.status = format!("jump failed ({e}) — rescanning");
             vec![Cmd::Scan]
         }
-        Msg::PaneSelectFailed(e) => { state.status = format!("pane select failed: {e}"); vec![] }
+        Msg::PaneSelectFailed(e) => {
+            state.status = format!("pane select failed: {e}");
+            vec![]
+        }
         Msg::Ignored => vec![],
     }
 }
@@ -198,7 +230,11 @@ mod tests {
 
     fn obs(pane: &str, status: Status) -> AgentObservation {
         AgentObservation {
-            agent: Agent { name: "claude".into(), pid: 1, argv: "claude".into() },
+            agent: Agent {
+                name: "claude".into(),
+                pid: 1,
+                argv: "claude".into(),
+            },
             cwd: format!("/tmp/{pane}"),
             status,
             status_line: None,
@@ -229,7 +265,10 @@ mod tests {
     #[test]
     fn scanned_updates_and_counts() {
         let mut s = AppState::new(true, true);
-        update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
+        update(
+            &mut s,
+            scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]),
+        );
         assert_eq!(s.agents.len(), 2);
         assert_eq!(s.status, "2 agents");
     }
@@ -237,10 +276,17 @@ mod tests {
     #[test]
     fn scanned_partial_failure_keeps_agents_and_flags_status() {
         let mut s = AppState::new(true, true);
-        let msg = Msg::Scanned(Ok((vec![obs("%1", Status::Idle)], vec!["surface x down".into()])));
+        let msg = Msg::Scanned(Ok((
+            vec![obs("%1", Status::Idle)],
+            vec!["surface x down".into()],
+        )));
         update(&mut s, msg);
         assert_eq!(s.agents.len(), 1, "healthy agents still shown");
-        assert!(s.status.contains("surface x down"), "warning surfaced: {}", s.status);
+        assert!(
+            s.status.contains("surface x down"),
+            "warning surfaced: {}",
+            s.status
+        );
     }
 
     #[test]
@@ -270,7 +316,10 @@ mod tests {
     #[test]
     fn selection_follows_identity_across_scan() {
         let mut s = AppState::new(true, true);
-        update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
+        update(
+            &mut s,
+            scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]),
+        );
         s.move_down();
         assert_eq!(AppState::id(s.selected().unwrap()), "tmux:%2");
         update(&mut s, scanned(vec![obs("%2", Status::Idle)]));
@@ -291,9 +340,14 @@ mod tests {
     #[test]
     fn top_and_bottom_move_cursor_to_ends() {
         let mut s = AppState::new(true, true);
-        update(&mut s, scanned(vec![
-            obs("%1", Status::Idle), obs("%2", Status::Idle), obs("%3", Status::Idle),
-        ]));
+        update(
+            &mut s,
+            scanned(vec![
+                obs("%1", Status::Idle),
+                obs("%2", Status::Idle),
+                obs("%3", Status::Idle),
+            ]),
+        );
         update(&mut s, Msg::Bottom);
         assert_eq!(s.cursor, 2);
         update(&mut s, Msg::Top);
@@ -303,9 +357,20 @@ mod tests {
     #[test]
     fn ctrl_nav_always_selects_neighbor_pane() {
         let mut s = AppState::new(true, true);
-        update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
-        for dir in [watch_types::Dir::Up, watch_types::Dir::Down, watch_types::Dir::Left, watch_types::Dir::Right] {
-            assert_eq!(update(&mut s, Msg::CtrlNav(dir)), vec![Cmd::SelectPane(dir)]);
+        update(
+            &mut s,
+            scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]),
+        );
+        for dir in [
+            watch_types::Dir::Up,
+            watch_types::Dir::Down,
+            watch_types::Dir::Left,
+            watch_types::Dir::Right,
+        ] {
+            assert_eq!(
+                update(&mut s, Msg::CtrlNav(dir)),
+                vec![Cmd::SelectPane(dir)]
+            );
             assert_eq!(s.cursor, 0, "Ctrl-nav never moves the list cursor");
         }
     }
@@ -313,7 +378,10 @@ mod tests {
     #[test]
     fn plain_jk_navigate_the_list() {
         let mut s = AppState::new(true, true);
-        update(&mut s, scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]));
+        update(
+            &mut s,
+            scanned(vec![obs("%1", Status::Idle), obs("%2", Status::Idle)]),
+        );
         assert_eq!(update(&mut s, Msg::Down), vec![]);
         assert_eq!(s.cursor, 1);
         assert_eq!(update(&mut s, Msg::Up), vec![]);
@@ -327,28 +395,58 @@ mod tests {
     #[test]
     fn arrows_and_enter_always_work() {
         let mut p = None;
-        assert_eq!(dk(KeyCode::Down, KeyModifiers::NONE, false, &mut p), Msg::Down);
+        assert_eq!(
+            dk(KeyCode::Down, KeyModifiers::NONE, false, &mut p),
+            Msg::Down
+        );
         assert_eq!(dk(KeyCode::Up, KeyModifiers::NONE, false, &mut p), Msg::Up);
-        assert_eq!(dk(KeyCode::Enter, KeyModifiers::NONE, false, &mut p), Msg::Jump);
-        assert_eq!(dk(KeyCode::Char('q'), KeyModifiers::NONE, false, &mut p), Msg::Quit);
-        assert_eq!(dk(KeyCode::Char('r'), KeyModifiers::NONE, false, &mut p), Msg::Refresh);
+        assert_eq!(
+            dk(KeyCode::Enter, KeyModifiers::NONE, false, &mut p),
+            Msg::Jump
+        );
+        assert_eq!(
+            dk(KeyCode::Char('q'), KeyModifiers::NONE, false, &mut p),
+            Msg::Quit
+        );
+        assert_eq!(
+            dk(KeyCode::Char('r'), KeyModifiers::NONE, false, &mut p),
+            Msg::Refresh
+        );
     }
 
     #[test]
     fn ctrl_chords_decode_to_directional_nav_regardless_of_vim_mode() {
         let mut p = None;
         let c = KeyModifiers::CONTROL;
-        assert_eq!(dk(KeyCode::Char('j'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Down));
-        assert_eq!(dk(KeyCode::Char('k'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Up));
-        assert_eq!(dk(KeyCode::Char('h'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Left));
-        assert_eq!(dk(KeyCode::Char('l'), c, false, &mut p), Msg::CtrlNav(watch_types::Dir::Right));
+        assert_eq!(
+            dk(KeyCode::Char('j'), c, false, &mut p),
+            Msg::CtrlNav(watch_types::Dir::Down)
+        );
+        assert_eq!(
+            dk(KeyCode::Char('k'), c, false, &mut p),
+            Msg::CtrlNav(watch_types::Dir::Up)
+        );
+        assert_eq!(
+            dk(KeyCode::Char('h'), c, false, &mut p),
+            Msg::CtrlNav(watch_types::Dir::Left)
+        );
+        assert_eq!(
+            dk(KeyCode::Char('l'), c, false, &mut p),
+            Msg::CtrlNav(watch_types::Dir::Right)
+        );
     }
 
     #[test]
     fn ctrl_c_quits() {
         let mut p = None;
-        assert_eq!(dk(KeyCode::Char('c'), KeyModifiers::CONTROL, false, &mut p), Msg::Quit);
-        assert_eq!(dk(KeyCode::Char('c'), KeyModifiers::CONTROL, true, &mut p), Msg::Quit);
+        assert_eq!(
+            dk(KeyCode::Char('c'), KeyModifiers::CONTROL, false, &mut p),
+            Msg::Quit
+        );
+        assert_eq!(
+            dk(KeyCode::Char('c'), KeyModifiers::CONTROL, true, &mut p),
+            Msg::Quit
+        );
     }
 
     #[test]

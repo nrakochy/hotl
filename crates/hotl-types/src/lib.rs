@@ -161,10 +161,18 @@ pub struct Entry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntryPayload {
-    Header { header: SessionHeader },
-    Item { item: Item },
-    Usage { usage: TokenUsage },
-    Cancelled { reason: String },
+    Header {
+        header: SessionHeader,
+    },
+    Item {
+        item: Item,
+    },
+    Usage {
+        usage: TokenUsage,
+    },
+    Cancelled {
+        reason: String,
+    },
     /// Compaction re-points the projection: history before `kept_from` is
     /// replaced by `digest` items; the log itself keeps everything.
     Compaction {
@@ -182,10 +190,14 @@ pub enum EntryPayload {
     /// `branch_move` of the commit-protocol vocabulary, expressed against
     /// the linear projection (M3b). Fork UIs arrive with M4; the entry and
     /// its replay semantics are settled here.
-    BranchMove { keep_items: usize },
+    BranchMove {
+        keep_items: usize,
+    },
     /// Digest of an abandoned branch, appended after a `branch_move` so the
     /// lesson survives without the tokens (commit-protocol `supersede`).
-    Supersede { digest: Vec<Item> },
+    Supersede {
+        digest: Vec<Item>,
+    },
     /// A permission ask committed **before** it surfaces (durable asks):
     /// if the process dies before a matching `ask_resolved`, replay
     /// sees a dangling ask and resume re-surfaces it. Log-only (not a
@@ -197,7 +209,10 @@ pub enum EntryPayload {
         protected_why: Option<String>,
     },
     /// Resolution of a `pending_ask` (§2b): the human answered.
-    AskResolved { id: String, allowed: bool },
+    AskResolved {
+        id: String,
+        allowed: bool,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -214,15 +229,23 @@ mod tests {
         let a = serde_json::to_string(v).unwrap();
         let back: T = serde_json::from_str(&a).unwrap();
         let b = serde_json::to_string(&back).unwrap();
-        assert_eq!(a, b, "serialize → deserialize → serialize must be byte-identical");
+        assert_eq!(
+            a, b,
+            "serialize → deserialize → serialize must be byte-identical"
+        );
         a
     }
 
     #[test]
     fn items_roundtrip_byte_identical() {
         let items = vec![
-            Item::System { text: "you are hotl".into() },
-            Item::User { text: "hi".into(), synthetic: None },
+            Item::System {
+                text: "you are hotl".into(),
+            },
+            Item::User {
+                text: "hi".into(),
+                synthetic: None,
+            },
             Item::User {
                 text: "<project-instructions>...</project-instructions>".into(),
                 synthetic: Some(SyntheticReason::ProjectInstructions),
@@ -253,7 +276,12 @@ mod tests {
             id: new_ulid(),
             parent_id: None,
             ts_ms: 1,
-            payload: EntryPayload::Item { item: Item::User { text: "x".into(), synthetic: None } },
+            payload: EntryPayload::Item {
+                item: Item::User {
+                    text: "x".into(),
+                    synthetic: None,
+                },
+            },
         };
         roundtrip(&e);
         // mutate, re-serialize — still stable
@@ -267,7 +295,8 @@ mod tests {
         assert_eq!(item, Item::Unknown);
         let reason: SyntheticReason = serde_json::from_str(r#""quantum_nudge""#).unwrap();
         assert_eq!(reason, SyntheticReason::Unknown);
-        let payload: EntryPayload = serde_json::from_str(r#"{"kind":"visibility","target":"e1"}"#).unwrap();
+        let payload: EntryPayload =
+            serde_json::from_str(r#"{"kind":"visibility","target":"e1"}"#).unwrap();
         assert_eq!(payload, EntryPayload::Unknown);
         let stop: StopReason = serde_json::from_str(r#""cosmic_ray""#).unwrap();
         assert_eq!(stop, StopReason::Other);

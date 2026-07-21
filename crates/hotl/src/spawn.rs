@@ -34,7 +34,10 @@ impl SpawnTool {
     }
 
     async fn run_impl(&self, input: Value, cancel: CancellationToken) -> ToolOutcome {
-        let mode = input.get("mode").and_then(Value::as_str).unwrap_or("subagent");
+        let mode = input
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("subagent");
         if mode != "subagent" {
             return ToolOutcome::err(
                 "Only `subagent` is supported in M4 (a fresh, isolated child). \
@@ -42,7 +45,9 @@ impl SpawnTool {
             );
         }
         let Some(task) = input.get("task").and_then(Value::as_str) else {
-            return ToolOutcome::err("`task` is required: the self-contained brief for the sub-agent.");
+            return ToolOutcome::err(
+                "`task` is required: the self-contained brief for the sub-agent.",
+            );
         };
         let mut child = match self.builder.build(task) {
             Ok(c) => c,
@@ -119,7 +124,9 @@ impl Tool for SpawnTool {
     fn permission(&self, input: &Value) -> Permission {
         let task = input.get("task").and_then(Value::as_str).unwrap_or("?");
         let short: String = task.chars().take(80).collect();
-        Permission::Ask { summary: format!("spawn sub-agent: {short}") }
+        Permission::Ask {
+            summary: format!("spawn sub-agent: {short}"),
+        }
     }
     /// Children are isolated engines with their own logs; several may run
     /// side by side within one batch (each still gets its own y/n ask).
@@ -162,7 +169,10 @@ mod tests {
                 snapshots: None,
                 hooks: None,
                 initial_items: Vec::new(),
-                config: EngineConfig { max_turns: 4, ..Default::default() },
+                config: EngineConfig {
+                    max_turns: 4,
+                    ..Default::default()
+                },
             }))
         }
     }
@@ -170,7 +180,9 @@ mod tests {
     #[tokio::test]
     async fn subagent_runs_and_returns_enveloped_result() {
         let tool = SpawnTool::new(Arc::new(ScriptedChild));
-        let out = tool.run(json!({"task": "find the answer"}), CancellationToken::new()).await;
+        let out = tool
+            .run(json!({"task": "find the answer"}), CancellationToken::new())
+            .await;
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("the answer is 42"));
         assert!(out.content.contains("trust=\"untrusted\""));
@@ -189,9 +201,16 @@ mod tests {
     #[tokio::test]
     async fn fork_and_teammate_are_reserved_and_task_required() {
         let tool = SpawnTool::new(Arc::new(ScriptedChild));
-        let forked = tool.run(json!({"mode": "fork", "task": "x"}), CancellationToken::new()).await;
+        let forked = tool
+            .run(
+                json!({"mode": "fork", "task": "x"}),
+                CancellationToken::new(),
+            )
+            .await;
         assert!(forked.is_error && forked.content.contains("reserved"));
-        let no_task = tool.run(json!({"mode": "subagent"}), CancellationToken::new()).await;
+        let no_task = tool
+            .run(json!({"mode": "subagent"}), CancellationToken::new())
+            .await;
         assert!(no_task.is_error && no_task.content.contains("`task` is required"));
     }
 }

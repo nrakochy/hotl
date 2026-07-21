@@ -48,7 +48,10 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
     {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("hotl: could not read --json-schema `{}`: {e}", schema_path.display());
+            eprintln!(
+                "hotl: could not read --json-schema `{}`: {e}",
+                schema_path.display()
+            );
             return 2;
         }
     };
@@ -65,7 +68,13 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, scaffold.masker(), scaffold.clock.now_ms()) {
+    let log = match SessionLog::create(
+        &sessions_dir(),
+        &scaffold.model,
+        None,
+        scaffold.masker(),
+        scaffold.clock.now_ms(),
+    ) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl: could not create session log: {e}");
@@ -75,7 +84,14 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
     let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
     items.push(crate::structured::contract_item(&schema));
     let mut handle = spawn_session(scaffold.deps(log, None, items));
-    match crate::structured::run_structured(&mut handle, &schema, prompt, crate::structured::MAX_RETRIES).await {
+    match crate::structured::run_structured(
+        &mut handle,
+        &schema,
+        prompt,
+        crate::structured::MAX_RETRIES,
+    )
+    .await
+    {
         Ok(value) => {
             println!("{value}");
             0
@@ -103,7 +119,10 @@ pub async fn resume_main(args: Vec<String>) -> i32 {
         }
         return 0;
     };
-    let Some((id, _, _)) = sessions.iter().find(|(id, ..)| id.starts_with(prefix.as_str())) else {
+    let Some((id, _, _)) = sessions
+        .iter()
+        .find(|(id, ..)| id.starts_with(prefix.as_str()))
+    else {
         eprintln!("hotl: no session starts with `{prefix}` (try bare `hotl resume` to list)");
         return 1;
     };
@@ -112,7 +131,10 @@ pub async fn resume_main(args: Vec<String>) -> i32 {
             for warning in &replayed.warnings {
                 eprintln!("hotl: WARNING — {warning}");
             }
-            let resumed = Resumed { parent_id: replayed.header.session_id, items: replayed.items };
+            let resumed = Resumed {
+                parent_id: replayed.header.session_id,
+                items: replayed.items,
+            };
             run_session(None, false, Some(resumed)).await
         }
         Err(e) => {
@@ -157,14 +179,24 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
             crate::acp::SessionSpec::Load(sid) => {
                 let replayed = hotl_store::replay_chain(&sessions_dir(), &sid)
                     .map_err(|e| format!("could not load session {sid}: {e}"))?;
-                Some(Resumed { parent_id: replayed.header.session_id, items: replayed.items })
+                Some(Resumed {
+                    parent_id: replayed.header.session_id,
+                    items: replayed.items,
+                })
             }
         };
         let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
-        let log = SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, scaffold.masker(), scaffold.clock.now_ms())
-            .map_err(|e| format!("could not create session log: {e}"))?;
+        let log = SessionLog::create(
+            &sessions_dir(),
+            &scaffold.model,
+            parent_id,
+            scaffold.masker(),
+            scaffold.clock.now_ms(),
+        )
+        .map_err(|e| format!("could not create session log: {e}"))?;
         let session_id = log.session_id.clone();
-        let (snapshots, initial) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+        let (snapshots, initial) =
+            session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
         Ok(spawn_session(scaffold.deps(log, snapshots, initial)))
     });
     Ok((factory, model))
@@ -186,7 +218,13 @@ pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, None, scaffold.masker(), scaffold.clock.now_ms()) {
+    let log = match SessionLog::create(
+        &sessions_dir(),
+        &scaffold.model,
+        None,
+        scaffold.masker(),
+        scaffold.clock.now_ms(),
+    ) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl serve: could not create session log: {e}");
@@ -194,7 +232,8 @@ pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
         }
     };
     let session_id = log.session_id.clone();
-    let (snapshots, initial_items) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
+    let (snapshots, initial_items) =
+        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
     let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
     crate::session_server::serve(id, handle, prompt).await
 }
@@ -267,15 +306,34 @@ async fn scaffold(
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = engine_config(&model, secrets, &cfg);
     let spawn_builder = child_builder(
-        provider.clone(), rules.clone(), clock.clone(), config.clone(),
-        cwd.clone(), cfg.hooks_toml(), system.clone(), model.clone(), sandbox_enforced,
+        provider.clone(),
+        rules.clone(),
+        clock.clone(),
+        config.clone(),
+        cwd.clone(),
+        cfg.hooks_toml(),
+        system.clone(),
+        model.clone(),
+        sandbox_enforced,
         initial_helper_key.clone(),
     );
     let registry = Arc::new(build_registry(&cfg, &config_dir, Some(spawn_builder)));
     let hooks = load_hooks(&cfg);
     Ok(Scaffold {
-        provider, model, clock, config_dir, system, rules, sandbox_enforced,
-        sandbox_status, cwd, config, registry, hooks, cfg, initial_helper_key,
+        provider,
+        model,
+        clock,
+        config_dir,
+        system,
+        rules,
+        sandbox_enforced,
+        sandbox_status,
+        cwd,
+        config,
+        registry,
+        hooks,
+        cfg,
+        initial_helper_key,
     })
 }
 
@@ -347,7 +405,13 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     };
 
     let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
-    let log = match SessionLog::create(&sessions_dir(), &scaffold.model, parent_id, scaffold.masker(), scaffold.clock.now_ms()) {
+    let log = match SessionLog::create(
+        &sessions_dir(),
+        &scaffold.model,
+        parent_id,
+        scaffold.masker(),
+        scaffold.clock.now_ms(),
+    ) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("hotl: could not create session log: {e}");
@@ -358,17 +422,29 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     spawn_secret_audit(log.path().to_path_buf());
     let gc_config_dir = scaffold.config_dir.clone();
     std::thread::spawn(move || crate::gc::auto_gc(&gc_config_dir)); // retention, off the hot path
-    let (snapshots, initial_items) = session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+    let (snapshots, initial_items) =
+        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
     let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
 
-    let mut surface =
-        Surface::new(handle, headless, json_events, ask_timeout_from_env(&secrets, &scaffold.cfg));
+    let mut surface = Surface::new(
+        handle,
+        headless,
+        json_events,
+        ask_timeout_from_env(&secrets, &scaffold.cfg),
+    );
     if let Some(p) = prompt {
-        surface.handle.prompt(crate::setup::expand_file_refs(&p)).await;
+        surface
+            .handle
+            .prompt(crate::setup::expand_file_refs(&p))
+            .await;
         return surface.run_until_idle().await;
     }
     if let Some(r) = &resumed {
-        println!("resumed from session {} ({} items of context)", r.parent_id, r.items.len());
+        println!(
+            "resumed from session {} ({} items of context)",
+            r.parent_id,
+            r.items.len()
+        );
         // #8: continue an interrupted turn (last item is the model's to answer).
         if hotl_engine::needs_continuation(&r.items) {
             println!("(continuing the interrupted turn…)");
@@ -445,8 +521,14 @@ impl HotlChildBuilder {
 
 impl crate::spawn::ChildBuilder for HotlChildBuilder {
     fn build(&self, _brief: &str) -> Result<hotl_engine::SessionHandle, String> {
-        let log = SessionLog::create(&sessions_dir(), &self.model, None, self.masker(), self.clock.now_ms())
-            .map_err(|e| format!("child session log: {e}"))?;
+        let log = SessionLog::create(
+            &sessions_dir(),
+            &self.model,
+            None,
+            self.masker(),
+            self.clock.now_ms(),
+        )
+        .map_err(|e| format!("child session log: {e}"))?;
         let diagnostics = self
             .hooks_toml
             .as_deref()
@@ -505,7 +587,10 @@ fn session_context(
     cwd: &std::path::Path,
     config_dir: &std::path::Path,
     resumed: &Option<Resumed>,
-) -> (Option<Arc<dyn hotl_engine::Snapshotter>>, Vec<hotl_types::Item>) {
+) -> (
+    Option<Arc<dyn hotl_engine::Snapshotter>>,
+    Vec<hotl_types::Item>,
+) {
     let snapshots = shadow_snapshotter(session_id, cwd);
     if snapshots.is_none() {
         eprintln!("hotl: git not found — `hotl undo` snapshots disabled this session");
@@ -539,7 +624,10 @@ fn shadow_snapshotter(
 }
 
 pub(crate) fn shadow_root() -> PathBuf {
-    sessions_dir().parent().map(|p| p.join("shadow")).unwrap_or_else(|| PathBuf::from("shadow"))
+    sessions_dir()
+        .parent()
+        .map(|p| p.join("shadow"))
+        .unwrap_or_else(|| PathBuf::from("shadow"))
 }
 
 /// `hotl undo [--force]`: restore the workspace to the newest session's
@@ -767,7 +855,9 @@ impl Surface {
             EngineEvent::ToolAutoAllowed { name, rule } => {
                 eprintln!("  (auto-allowed {name} by rule: {rule})");
             }
-            EngineEvent::Retrying { attempt, reason } => eprintln!("· retrying ({attempt}): {reason}"),
+            EngineEvent::Retrying { attempt, reason } => {
+                eprintln!("· retrying ({attempt}): {reason}")
+            }
             EngineEvent::FallbackModel { model } => eprintln!("· falling back to {model}"),
             EngineEvent::PromptQueued => eprintln!("(queued — runs after the current turn)"),
             EngineEvent::Compacted { degraded } => {
@@ -777,7 +867,11 @@ impl Surface {
                     eprintln!("(context compacted — earlier history summarized)");
                 }
             }
-            EngineEvent::Ask { summary, protected_why, reply } => {
+            EngineEvent::Ask {
+                summary,
+                protected_why,
+                reply,
+            } => {
                 let answer = self.ask_human(&summary, protected_why.as_deref()).await;
                 let _ = reply.send(answer);
             }
@@ -790,9 +884,13 @@ impl Surface {
         match &outcome {
             Outcome::Done { .. } => {}
             Outcome::Cancelled => eprintln!("\n(interrupted)"),
-            Outcome::TurnLimit => eprintln!("\nhotl: stopped at max_turns — break the task into smaller prompts."),
+            Outcome::TurnLimit => {
+                eprintln!("\nhotl: stopped at max_turns — break the task into smaller prompts.")
+            }
             Outcome::Refused => eprintln!("\nhotl: the model declined this request."),
-            Outcome::DoomLoop { pattern } => eprintln!("\nhotl: stopped — the model kept repeating: {pattern}"),
+            Outcome::DoomLoop { pattern } => {
+                eprintln!("\nhotl: stopped — the model kept repeating: {pattern}")
+            }
             Outcome::ToolFailureBudget { tool } => {
                 eprintln!("\nhotl: stopped — `{tool}` failed too many times in a row.")
             }
@@ -809,14 +907,28 @@ impl Surface {
         let v = match event {
             EngineEvent::TextDelta(t) => serde_json::json!({"type":"text_delta","text":t}),
             EngineEvent::ThinkingDelta(_) => serde_json::json!({"type":"thinking_delta"}),
-            EngineEvent::ToolStart { name, summary } => serde_json::json!({"type":"tool_start","name":name,"summary":summary}),
-            EngineEvent::ToolDone { name, ok } => serde_json::json!({"type":"tool_done","name":name,"ok":ok}),
-            EngineEvent::ToolDenied { name } => serde_json::json!({"type":"tool_denied","name":name}),
-            EngineEvent::ToolAutoAllowed { name, rule } => serde_json::json!({"type":"tool_auto_allowed","name":name,"rule":rule}),
-            EngineEvent::Retrying { attempt, reason } => serde_json::json!({"type":"retrying","attempt":attempt,"reason":reason}),
-            EngineEvent::FallbackModel { model } => serde_json::json!({"type":"fallback_model","model":model}),
+            EngineEvent::ToolStart { name, summary } => {
+                serde_json::json!({"type":"tool_start","name":name,"summary":summary})
+            }
+            EngineEvent::ToolDone { name, ok } => {
+                serde_json::json!({"type":"tool_done","name":name,"ok":ok})
+            }
+            EngineEvent::ToolDenied { name } => {
+                serde_json::json!({"type":"tool_denied","name":name})
+            }
+            EngineEvent::ToolAutoAllowed { name, rule } => {
+                serde_json::json!({"type":"tool_auto_allowed","name":name,"rule":rule})
+            }
+            EngineEvent::Retrying { attempt, reason } => {
+                serde_json::json!({"type":"retrying","attempt":attempt,"reason":reason})
+            }
+            EngineEvent::FallbackModel { model } => {
+                serde_json::json!({"type":"fallback_model","model":model})
+            }
             EngineEvent::PromptQueued => serde_json::json!({"type":"prompt_queued"}),
-            EngineEvent::Compacted { degraded } => serde_json::json!({"type":"compacted","degraded":degraded}),
+            EngineEvent::Compacted { degraded } => {
+                serde_json::json!({"type":"compacted","degraded":degraded})
+            }
             EngineEvent::Ask { summary, reply, .. } => {
                 // JSON mode is headless automation: default-deny, emit the record.
                 let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
@@ -834,7 +946,11 @@ impl Surface {
         println!("{framed}");
     }
 
-    async fn ask_human(&mut self, summary: &str, protected_why: Option<&str>) -> hotl_engine::AskReply {
+    async fn ask_human(
+        &mut self,
+        summary: &str,
+        protected_why: Option<&str>,
+    ) -> hotl_engine::AskReply {
         use hotl_engine::AskReply;
         if self.headless || !std::io::stdin().is_terminal() {
             eprintln!("hotl: denied (headless): {summary}");
@@ -880,7 +996,9 @@ impl Surface {
 /// else (incl. a bare `n` or EOF) is a plain deny.
 fn reply_from_line(line: Option<&str>) -> hotl_engine::AskReply {
     use hotl_engine::AskReply;
-    let Some(t) = line.map(str::trim) else { return AskReply::Deny { message: None } };
+    let Some(t) = line.map(str::trim) else {
+        return AskReply::Deny { message: None };
+    };
     if matches!(t, "y" | "Y" | "yes") {
         return AskReply::Allow;
     }
@@ -894,7 +1012,10 @@ fn reply_from_line(line: Option<&str>) -> hotl_engine::AskReply {
 
 /// The interactive ask timeout from `HOTL_ASK_TIMEOUT` (seconds): unset →
 /// the 300s default; `0` → wait indefinitely (backgrounded/detached sessions).
-fn ask_timeout_from_env(secrets: &dyn SecretStore, cfg: &crate::config::Config) -> Option<std::time::Duration> {
+fn ask_timeout_from_env(
+    secrets: &dyn SecretStore,
+    cfg: &crate::config::Config,
+) -> Option<std::time::Duration> {
     let secs = secrets
         .get("HOTL_ASK_TIMEOUT")
         .and_then(|v| v.parse::<u64>().ok())
@@ -937,7 +1058,11 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         eprintln!("hotl: --json-schema requires -p \"<prompt>\"");
         return Err(2);
     }
-    Ok(Args { prompt, json_events, schema })
+    Ok(Args {
+        prompt,
+        json_events,
+        schema,
+    })
 }
 
 /// Secrets-at-rest audit (M2): warn about earlier logs holding values that
@@ -977,13 +1102,30 @@ fn initial_items(config_dir: &std::path::Path, cwd: &std::path::Path) -> Vec<hot
 /// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
 /// Build the engine config from `config.toml [context]` with env overrides
 /// (env > config.toml > default).
-fn engine_config(model: &str, secrets: &dyn SecretStore, cfg: &crate::config::Config) -> EngineConfig {
-    let mut config = EngineConfig { model: model.to_string(), ..Default::default() };
-    if let Some(window) = secrets.get("HOTL_CONTEXT_WINDOW").and_then(|v| v.parse().ok()).or(cfg.context.window) {
+fn engine_config(
+    model: &str,
+    secrets: &dyn SecretStore,
+    cfg: &crate::config::Config,
+) -> EngineConfig {
+    let mut config = EngineConfig {
+        model: model.to_string(),
+        ..Default::default()
+    };
+    if let Some(window) = secrets
+        .get("HOTL_CONTEXT_WINDOW")
+        .and_then(|v| v.parse().ok())
+        .or(cfg.context.window)
+    {
         config.context_window = window;
     }
-    config.fast_model = secrets.get("HOTL_FAST_MODEL").or_else(|| cfg.provider.fast_model.clone());
-    if let Some(t) = secrets.get("HOTL_EVICT_TOKENS").and_then(|v| v.parse().ok()).or(cfg.context.evict_tokens) {
+    config.fast_model = secrets
+        .get("HOTL_FAST_MODEL")
+        .or_else(|| cfg.provider.fast_model.clone());
+    if let Some(t) = secrets
+        .get("HOTL_EVICT_TOKENS")
+        .and_then(|v| v.parse().ok())
+        .or(cfg.context.evict_tokens)
+    {
         config.evict_threshold_tokens = t;
     }
     config.compaction_reset = match secrets.get("HOTL_COMPACTION_RESET").as_deref() {
@@ -1029,8 +1171,15 @@ fn key_source_for(
     }
 }
 
-type ProviderAndSource = (Arc<dyn hotl_provider::Provider>, Arc<dyn hotl_provider::key::KeySource>);
-type SelectedProvider = (Arc<dyn hotl_provider::Provider>, String, Arc<dyn hotl_provider::key::KeySource>);
+type ProviderAndSource = (
+    Arc<dyn hotl_provider::Provider>,
+    Arc<dyn hotl_provider::key::KeySource>,
+);
+type SelectedProvider = (
+    Arc<dyn hotl_provider::Provider>,
+    String,
+    Arc<dyn hotl_provider::key::KeySource>,
+);
 
 /// Provider/model selection. `HOTL_MODEL` accepts `provider/model`:
 ///   anthropic/claude-…   needs ANTHROPIC_API_KEY (or [provider] api_key_helper)
@@ -1067,7 +1216,10 @@ pub(crate) fn select_provider(
     Ok((provider, model, source))
 }
 
-fn resolve_anthropic(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Result<ProviderAndSource, String> {
+fn resolve_anthropic(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+) -> Result<ProviderAndSource, String> {
     let key = secrets.get("ANTHROPIC_API_KEY");
     let source = key_source_for(cfg, secrets, key.clone());
     if !source.refreshable() && key.is_none() {
@@ -1082,7 +1234,10 @@ fn resolve_anthropic(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> 
     Ok((Arc::new(AnthropicProvider::new(source.clone())), source))
 }
 
-fn resolve_openai(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Result<ProviderAndSource, String> {
+fn resolve_openai(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+) -> Result<ProviderAndSource, String> {
     let base = secrets
         .get("HOTL_OPENAI_BASE_URL")
         .or_else(|| cfg.provider.base_url.clone())
@@ -1090,11 +1245,13 @@ fn resolve_openai(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Res
     let key = secrets.get("OPENAI_API_KEY");
     let source = key_source_for(cfg, secrets, key.clone());
     if !source.refreshable() && key.is_none() && base == hotl_provider_openai::DEFAULT_BASE_URL {
-        return Err("OPENAI_API_KEY is not set (required for api.openai.com; keyless works \
+        return Err(
+            "OPENAI_API_KEY is not set (required for api.openai.com; keyless works \
                      only with HOTL_OPENAI_BASE_URL pointing at a local/compatible endpoint, \
                      e.g. http://localhost:11434/v1 for Ollama), or configure [provider] \
                      api_key_helper."
-            .to_string());
+                .to_string(),
+        );
     }
     // H-09: a bearer key over cleartext http:// to a non-loopback host
     // crosses the network unencrypted. Warn loudly (don't silently send
@@ -1108,12 +1265,20 @@ fn resolve_openai(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Res
              Use https:// or an SSH tunnel."
         );
     }
-    Ok((Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(base, source.clone())), source))
+    Ok((
+        Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(
+            base,
+            source.clone(),
+        )),
+        source,
+    ))
 }
 
 /// A cleartext base URL pointing somewhere other than the local machine.
 fn cleartext_nonloopback(base: &str) -> bool {
-    let Some(rest) = base.strip_prefix("http://") else { return false };
+    let Some(rest) = base.strip_prefix("http://") else {
+        return false;
+    };
     let host = rest.split(['/', ':']).next().unwrap_or("");
     !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") && !host.is_empty()
 }
@@ -1145,7 +1310,12 @@ mod tests {
 
     impl<const N: usize> From<[(&str, &str); N]> for MapSecrets {
         fn from(pairs: [(&str, &str); N]) -> Self {
-            MapSecrets(pairs.into_iter().map(|(k, v)| (k.to_string(), v.to_string())).collect())
+            MapSecrets(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            )
         }
     }
 
@@ -1172,7 +1342,10 @@ mod tests {
             ("HOTL_OPENAI_BASE_URL", "http://localhost:1/v1"),
         ]);
         let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
-        assert!(source.refreshable(), "helper must win over the static env key");
+        assert!(
+            source.refreshable(),
+            "helper must win over the static env key"
+        );
     }
 
     #[test]
@@ -1184,7 +1357,10 @@ mod tests {
             ("HOTL_OPENAI_BASE_URL", "http://localhost:1/v1"),
         ]);
         let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
-        assert!(!source.refreshable(), "empty api_key_helper must not activate the helper");
+        assert!(
+            !source.refreshable(),
+            "empty api_key_helper must not activate the helper"
+        );
     }
 
     #[test]

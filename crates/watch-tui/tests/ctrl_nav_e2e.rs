@@ -6,14 +6,22 @@ use watch_types::{Agent, AgentObservation, Dir, Location, LocationHandle, Source
 
 fn obs(pane: &str) -> AgentObservation {
     AgentObservation {
-        agent: Agent { name: "claude".into(), pid: 1, argv: "claude".into() },
+        agent: Agent {
+            name: "claude".into(),
+            pid: 1,
+            argv: "claude".into(),
+        },
         cwd: format!("/tmp/{pane}"),
         status: Status::Idle,
         status_line: None,
         location: Location {
             group: "g".into(),
             sub_group: None,
-            handle: LocationHandle::Tmux { pane_id: pane.into(), session: "g".into(), window_index: 0 },
+            handle: LocationHandle::Tmux {
+                pane_id: pane.into(),
+                session: "g".into(),
+                window_index: 0,
+            },
         },
         source: Source::Tmux,
     }
@@ -22,11 +30,19 @@ fn obs(pane: &str) -> AgentObservation {
 #[test]
 fn ctrl_k_switches_pane_never_moves_list() {
     let mut pending = None;
-    let msg = decode_key(KeyCode::Char('k'), KeyModifiers::CONTROL, true, &mut pending);
+    let msg = decode_key(
+        KeyCode::Char('k'),
+        KeyModifiers::CONTROL,
+        true,
+        &mut pending,
+    );
     assert_eq!(msg, Msg::CtrlNav(Dir::Up));
 
     let mut s = AppState::new(true, true);
-    update(&mut s, Msg::Scanned(Ok((vec![obs("%1"), obs("%2")], vec![]))));
+    update(
+        &mut s,
+        Msg::Scanned(Ok((vec![obs("%1"), obs("%2")], vec![]))),
+    );
     s.move_bottom(); // cursor = 1, mid/bottom of list
     assert_eq!(update(&mut s, msg), vec![Cmd::SelectPane(Dir::Up)]);
     assert_eq!(s.cursor, 1, "Ctrl-k does not touch the list cursor");
@@ -39,7 +55,10 @@ fn plain_j_moves_list_not_pane() {
     assert_eq!(msg, Msg::Down);
 
     let mut s = AppState::new(true, true);
-    update(&mut s, Msg::Scanned(Ok((vec![obs("%1"), obs("%2")], vec![]))));
+    update(
+        &mut s,
+        Msg::Scanned(Ok((vec![obs("%1"), obs("%2")], vec![]))),
+    );
     assert_eq!(update(&mut s, msg), vec![]);
     assert_eq!(s.cursor, 1);
 }

@@ -88,18 +88,24 @@ impl Rules {
                     // (`git status; curl … | sh`) turns one into arbitrary
                     // execution, so any command carrying one falls back to the ask.
                     if cmd.starts_with(prefix.as_str()) && !has_shell_operator(cmd) {
-                        return Verdict::Auto { rule: format!("bash prefix `{prefix}`") };
+                        return Verdict::Auto {
+                            rule: format!("bash prefix `{prefix}`"),
+                        };
                     }
                 }
                 "write" | "edit" => {
-                    let Some(pp) = &rule.path_prefix else { continue };
+                    let Some(pp) = &rule.path_prefix else {
+                        continue;
+                    };
                     let path = input.get("path").and_then(Value::as_str).unwrap_or("");
                     // Carve-out 4 (H-03): resolve `.`/`..` lexically before the
                     // prefix test. `src/../../etc/x` normalizes to `../etc/x`,
                     // which no `src/`-shaped prefix matches, so traversal out of
                     // the intended scope falls back to the ask instead of Auto.
                     if let Some(resolved) = lexically_contained(path, pp) {
-                        return Verdict::Auto { rule: format!("{tool} path `{pp}` ({resolved})") };
+                        return Verdict::Auto {
+                            rule: format!("{tool} path `{pp}` ({resolved})"),
+                        };
                     }
                 }
                 _ => {}
@@ -112,7 +118,9 @@ impl Rules {
 /// Shell metacharacters that chain, redirect, or substitute — their presence
 /// means the command does more than the matched prefix implies.
 fn has_shell_operator(cmd: &str) -> bool {
-    cmd.contains([';', '|', '&', '<', '>', '`', '\n', '\r', '(', ')', '{', '}', '$'])
+    cmd.contains([
+        ';', '|', '&', '<', '>', '`', '\n', '\r', '(', ')', '{', '}', '$',
+    ])
 }
 
 /// Lexically resolve `.`/`..` (no filesystem touch) and confirm the result is
@@ -176,26 +184,47 @@ path_prefix = "src/"
     fn bash_rule_requires_sandbox() {
         let r = rules();
         let input = json!({"command": "cargo test"});
-        assert!(matches!(r.evaluate("bash", &input, true, false), Verdict::Auto { .. }));
+        assert!(matches!(
+            r.evaluate("bash", &input, true, false),
+            Verdict::Auto { .. }
+        ));
         assert_eq!(r.evaluate("bash", &input, false, false), Verdict::Ask);
         // non-matching prefix asks
-        assert_eq!(r.evaluate("bash", &json!({"command": "rm -rf /"}), true, false), Verdict::Ask);
+        assert_eq!(
+            r.evaluate("bash", &json!({"command": "rm -rf /"}), true, false),
+            Verdict::Ask
+        );
     }
 
     #[test]
     fn protected_paths_never_auto() {
         let r = Rules::from_toml("[[allow]]\ntool = \"write\"\npath_prefix = \"\"\n").unwrap();
         // empty prefix matches everything — but protected still asks
-        assert!(matches!(r.evaluate("write", &json!({"path": "src/a.rs"}), true, false), Verdict::Auto { .. }));
-        assert_eq!(r.evaluate("write", &json!({"path": "Makefile"}), true, true), Verdict::Ask);
+        assert!(matches!(
+            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            Verdict::Auto { .. }
+        ));
+        assert_eq!(
+            r.evaluate("write", &json!({"path": "Makefile"}), true, true),
+            Verdict::Ask
+        );
     }
 
     #[test]
     fn path_rules_and_defaults() {
         let r = rules();
-        assert!(matches!(r.evaluate("write", &json!({"path": "./src/lib.rs"}), false, false), Verdict::Auto { .. }));
-        assert_eq!(r.evaluate("write", &json!({"path": "docs/x.md"}), true, false), Verdict::Ask);
-        assert_eq!(r.evaluate("edit", &json!({"path": "src/lib.rs"}), true, false), Verdict::Ask); // rule is write-only
+        assert!(matches!(
+            r.evaluate("write", &json!({"path": "./src/lib.rs"}), false, false),
+            Verdict::Auto { .. }
+        ));
+        assert_eq!(
+            r.evaluate("write", &json!({"path": "docs/x.md"}), true, false),
+            Verdict::Ask
+        );
+        assert_eq!(
+            r.evaluate("edit", &json!({"path": "src/lib.rs"}), true, false),
+            Verdict::Ask
+        ); // rule is write-only
         assert!(Rules::default().is_empty());
         assert!(Rules::from_toml("allow = 3").is_err());
     }
@@ -203,7 +232,7 @@ path_prefix = "src/"
     #[test]
     fn path_traversal_never_auto_allows() {
         let r = rules(); // write path_prefix = "src/"
-        // `..` escaping the prefix falls back to the ask (H-03).
+                         // `..` escaping the prefix falls back to the ask (H-03).
         for escape in [
             "src/../../etc/cron.d/evil",
             "src/../../../home/user/.ssh/authorized_keys",

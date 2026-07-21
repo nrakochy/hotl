@@ -5,7 +5,13 @@ use watch_types::{AgentObservation, Status, Theme};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Row {
-    Agent { glyph: String, name: String, subtitle: String, status: Status, selected: bool },
+    Agent {
+        glyph: String,
+        name: String,
+        subtitle: String,
+        status: Status,
+        selected: bool,
+    },
     Spacer,
 }
 
@@ -20,7 +26,12 @@ fn session_summary(agents: &[AgentObservation]) -> Option<String> {
 }
 
 fn project_name(p: &str) -> String {
-    p.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(p).to_string()
+    p.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(p)
+        .to_string()
 }
 
 // Working animation: an equalizer-style bar rising and falling.
@@ -45,7 +56,10 @@ pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
         out.push(Row::Agent {
             glyph: glyph_for(o.status, tick),
             name: project_name(&o.cwd),
-            subtitle: o.status_line.clone().unwrap_or_else(|| o.agent.name.clone()),
+            subtitle: o
+                .status_line
+                .clone()
+                .unwrap_or_else(|| o.agent.name.clone()),
             status: o.status,
             selected: idx == cursor,
         });
@@ -61,7 +75,16 @@ fn hex(s: &str, default: Color) -> Color {
     }
 }
 
-struct Palette { active: Color, blocked: Color, idle: Color, ink: Color, muted: Color, faint: Color, accent: Color, band: Color }
+struct Palette {
+    active: Color,
+    blocked: Color,
+    idle: Color,
+    ink: Color,
+    muted: Color,
+    faint: Color,
+    accent: Color,
+    band: Color,
+}
 
 fn palette(theme: &Theme) -> Palette {
     Palette {
@@ -88,12 +111,21 @@ fn status_color(p: &Palette, s: Status) -> Color {
 // Wordmark, plus a session breadcrumb only when spanning >1 session.
 fn title_line(agents: &[AgentObservation], p: &Palette) -> Line<'static> {
     let mut spans = vec![
-        Span::styled(" ◆ ", Style::default().fg(p.accent).add_modifier(Modifier::BOLD)),
-        Span::styled("hotl", Style::default().fg(p.ink).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            " ◆ ",
+            Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "hotl",
+            Style::default().fg(p.ink).add_modifier(Modifier::BOLD),
+        ),
     ];
     if let Some(sess) = session_summary(agents) {
         spans.push(Span::styled("  ·  ", Style::default().fg(p.faint)));
-        spans.push(Span::styled(format!("⧉ {sess}"), Style::default().fg(p.muted)));
+        spans.push(Span::styled(
+            format!("⧉ {sess}"),
+            Style::default().fg(p.muted),
+        ));
     }
     Line::from(spans)
 }
@@ -108,18 +140,20 @@ pub fn view(state: &AppState, theme: &Theme, frame: &mut Frame) {
     ])
     .split(area);
 
-    frame.render_widget(
-        Paragraph::new(title_line(&state.agents, &p)),
-        chunks[0],
-    );
+    frame.render_widget(Paragraph::new(title_line(&state.agents, &p)), chunks[0]);
 
-    let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(p.faint));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(p.faint));
     let inner = block.inner(chunks[1]);
     frame.render_widget(block, chunks[1]);
 
     if state.agents.is_empty() {
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("  no agents found", Style::default().fg(p.muted)))),
+            Paragraph::new(Line::from(Span::styled(
+                "  no agents found",
+                Style::default().fg(p.muted),
+            ))),
             inner,
         );
     } else {
@@ -133,15 +167,22 @@ pub fn view(state: &AppState, theme: &Theme, frame: &mut Frame) {
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled(format!(" {}", state.status), Style::default().fg(p.muted)),
-            Span::styled("   j/k move · enter jump · r refresh · q quit", Style::default().fg(p.faint)),
+            Span::styled(
+                "   j/k move · enter jump · r refresh · q quit",
+                Style::default().fg(p.faint),
+            ),
         ])),
         chunks[2],
     );
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max { return s.to_string(); }
-    if max <= 1 { return "…".into(); }
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".into();
+    }
     let kept: String = s.chars().take(max - 1).collect();
     format!("{kept}…")
 }
@@ -149,9 +190,19 @@ fn truncate(s: &str, max: usize) -> String {
 fn row_line(row: &Row, p: &Palette, width: u16) -> Line<'static> {
     match row {
         Row::Spacer => Line::from(""),
-        Row::Agent { glyph, name, subtitle, status, selected } => {
+        Row::Agent {
+            glyph,
+            name,
+            subtitle,
+            status,
+            selected,
+        } => {
             let gcolor = status_color(p, *status);
-            let base = if *selected { Style::default().bg(p.band) } else { Style::default() };
+            let base = if *selected {
+                Style::default().bg(p.band)
+            } else {
+                Style::default()
+            };
             let head = 1 + 1 + 1 + name.chars().count() + 3;
             let avail = (width as usize).saturating_sub(head);
             let sub = truncate(subtitle, avail);
@@ -174,20 +225,34 @@ mod tests {
 
     fn obs(group: &str, sub: &str, cwd: &str, status: Status) -> AgentObservation {
         AgentObservation {
-            agent: Agent { name: "claude".into(), pid: 1, argv: "claude".into() },
+            agent: Agent {
+                name: "claude".into(),
+                pid: 1,
+                argv: "claude".into(),
+            },
             cwd: cwd.into(),
             status,
             status_line: None,
             location: Location {
                 group: group.into(),
                 sub_group: Some(sub.into()),
-                handle: LocationHandle::Tmux { pane_id: cwd.into(), session: group.into(), window_index: 0 },
+                handle: LocationHandle::Tmux {
+                    pane_id: cwd.into(),
+                    session: group.into(),
+                    window_index: 0,
+                },
             },
             source: Source::Tmux,
         }
     }
 
-    fn obs_sl(group: &str, sub: &str, cwd: &str, status: Status, sl: Option<&str>) -> AgentObservation {
+    fn obs_sl(
+        group: &str,
+        sub: &str,
+        cwd: &str,
+        status: Status,
+        sl: Option<&str>,
+    ) -> AgentObservation {
         let mut o = obs(group, sub, cwd, status);
         o.status_line = sl.map(|s| s.to_string());
         o
@@ -198,7 +263,9 @@ mod tests {
         // Session context moved to the title bar; the list has only agents/spacers.
         let rs = rows(&[obs("base-0", "w (0)", "/tmp/a", Status::Idle)], 0, 0);
         assert!(rs.iter().any(|r| matches!(r, Row::Agent { .. })));
-        assert!(rs.iter().all(|r| matches!(r, Row::Agent { .. } | Row::Spacer)));
+        assert!(rs
+            .iter()
+            .all(|r| matches!(r, Row::Agent { .. } | Row::Spacer)));
     }
 
     #[test]
@@ -236,8 +303,14 @@ mod tests {
         assert!(text.contains("hotl"), "wordmark present: {text}");
         // Counts are noise in the title — they belong in the status bar.
         assert!(!text.contains("agent"), "no agent count in title: {text}");
-        assert!(!text.contains("blocked"), "no blocked count in title: {text}");
-        assert!(!text.contains("session"), "no breadcrumb for one session: {text}");
+        assert!(
+            !text.contains("blocked"),
+            "no blocked count in title: {text}"
+        );
+        assert!(
+            !text.contains("session"),
+            "no breadcrumb for one session: {text}"
+        );
     }
 
     #[test]
@@ -264,14 +337,26 @@ mod tests {
 
     #[test]
     fn only_cursor_agent_selected() {
-        let agents = vec![obs("g", "w (0)", "/tmp/a", Status::Idle), obs("g", "w (0)", "/tmp/b", Status::Idle)];
-        let selected = rows(&agents, 1, 0).into_iter().filter(|r| matches!(r, Row::Agent { selected: true, .. })).count();
+        let agents = vec![
+            obs("g", "w (0)", "/tmp/a", Status::Idle),
+            obs("g", "w (0)", "/tmp/b", Status::Idle),
+        ];
+        let selected = rows(&agents, 1, 0)
+            .into_iter()
+            .filter(|r| matches!(r, Row::Agent { selected: true, .. }))
+            .count();
         assert_eq!(selected, 1);
     }
 
     #[test]
     fn subtitle_is_status_line_when_present() {
-        let a = obs_sl("g", "w (0)", "/tmp/lca", Status::Idle, Some("[I] .../lca [main] ctx:9%"));
+        let a = obs_sl(
+            "g",
+            "w (0)",
+            "/tmp/lca",
+            Status::Idle,
+            Some("[I] .../lca [main] ctx:9%"),
+        );
         let rs = rows(&[a], 0, 0);
         assert!(rs.iter().any(|r| matches!(r,
             Row::Agent { subtitle, .. } if subtitle == "[I] .../lca [main] ctx:9%")));

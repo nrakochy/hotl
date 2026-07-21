@@ -32,7 +32,11 @@ pub struct AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new(key_source: Arc<dyn KeySource>) -> Self {
-        Self { client: reqwest::Client::new(), key_source, api_url: API_URL.to_string() }
+        Self {
+            client: reqwest::Client::new(),
+            key_source,
+            api_url: API_URL.to_string(),
+        }
     }
 
     #[cfg(test)]
@@ -132,7 +136,6 @@ fn build_messages(items: &[Item], cache_static: bool) -> Vec<Value> {
     out
 }
 
-
 /// One send attempt, classified. Keeps the stream generator small while
 /// letting it yield `Retrying` events live (during the backoff, not after).
 enum Attempt {
@@ -143,7 +146,10 @@ enum Attempt {
 
 fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
     match hotl_provider::retry::classify(&err, attempt) {
-        hotl_provider::retry::Decision::Retry { after_secs } => Attempt::Retry { reason, wait_secs: after_secs },
+        hotl_provider::retry::Decision::Retry { after_secs } => Attempt::Retry {
+            reason,
+            wait_secs: after_secs,
+        },
         hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
     }
 }
@@ -162,7 +168,11 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
     if status == 401 || status == 403 {
         return Attempt::Fail(ProviderError::Auth(message));
     }
-    let err = ProviderError::Http { status, message, retry_after };
+    let err = ProviderError::Http {
+        status,
+        message,
+        retry_after,
+    };
     classify_send(err, attempt, format!("HTTP {status}"))
 }
 
@@ -202,14 +212,19 @@ async fn handle_auth_fail(
     match auth_retry.on_auth_error(source.refreshable()) {
         AuthAction::RefreshAndRetry => match source.refresh().await {
             Ok(()) => Ok("auth failed — re-running api_key_helper".into()),
-            Err(ke) => Err(ProviderError::Auth(format!("{msg} (key refresh also failed: {ke})"))),
+            Err(ke) => Err(ProviderError::Auth(format!(
+                "{msg} (key refresh also failed: {ke})"
+            ))),
         },
         AuthAction::Surface => Err(ProviderError::Auth(msg)),
     }
 }
 
 impl Provider for AnthropicProvider {
-    fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let client = self.client.clone();
         let body = Self::build_body(&req);
         let source = self.key_source.clone();
@@ -306,7 +321,9 @@ mod tests {
             *self.0.lock().unwrap() += 1;
             Box::pin(async { Ok(()) })
         }
-        fn refreshable(&self) -> bool { true }
+        fn refreshable(&self) -> bool {
+            true
+        }
     }
 
     const SSE_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
@@ -314,10 +331,7 @@ mod tests {
 
     /// Serve `responses` to consecutive connections; record each request's
     /// `x-api-key` header (lowercased) into `seen`.
-    async fn tcp_double(
-        responses: Vec<&'static str>,
-        seen: Arc<StdMutex<Vec<String>>>,
-    ) -> String {
+    async fn tcp_double(responses: Vec<&'static str>, seen: Arc<StdMutex<Vec<String>>>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}/v1", listener.local_addr().unwrap());
@@ -329,7 +343,9 @@ mod tests {
                 loop {
                     let n = sock.read(&mut buf).await.unwrap();
                     req.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if req.contains("\r\n\r\n") { break; }
+                    if req.contains("\r\n\r\n") {
+                        break;
+                    }
                 }
                 let auth = req
                     .lines()
@@ -349,7 +365,10 @@ mod tests {
             model: "m".into(),
             max_tokens: 16,
             system: "".into(),
-            items: std::sync::Arc::new(vec![Item::User { text: "hi".into(), synthetic: None }]),
+            items: std::sync::Arc::new(vec![Item::User {
+                text: "hi".into(),
+                synthetic: None,
+            }]),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
             thinking: false,
             cache_static: false,
@@ -361,7 +380,8 @@ mod tests {
     async fn auth_401_refreshes_key_once_and_retries() {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let base = tcp_double(vec![AUTH_401, SSE_OK], seen.clone()).await;
-        let p = AnthropicProvider::new(Arc::new(FlippingKey(StdMutex::new(1)))).with_api_url(format!("{base}/messages"));
+        let p = AnthropicProvider::new(Arc::new(FlippingKey(StdMutex::new(1))))
+            .with_api_url(format!("{base}/messages"));
         let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["key-1", "key-2"]);
@@ -384,9 +404,20 @@ mod tests {
             max_tokens: 1024,
             system: "sys".into(),
             items: std::sync::Arc::new(vec![
-                Item::User { text: "instructions".into(), synthetic: None },
-                Item::Assistant { blocks: vec![serde_json::json!({"type":"text","text":"ok"})] },
-                Item::ToolResults { results: vec![ToolResultItem { tool_use_id: "t1".into(), content: "out".into(), is_error: false }] },
+                Item::User {
+                    text: "instructions".into(),
+                    synthetic: None,
+                },
+                Item::Assistant {
+                    blocks: vec![serde_json::json!({"type":"text","text":"ok"})],
+                },
+                Item::ToolResults {
+                    results: vec![ToolResultItem {
+                        tool_use_id: "t1".into(),
+                        content: "out".into(),
+                        is_error: false,
+                    }],
+                },
             ]),
             tools: vec![ToolDef {
                 name: "read".into(),
@@ -407,8 +438,14 @@ mod tests {
         let msgs = body["messages"].as_array().unwrap();
         // 3 items + the ephemeral MOIM block at the end
         assert_eq!(msgs.len(), 4);
-        assert_eq!(msgs[3]["content"][0]["text"], "<turn-context sample=\"1\"/>");
-        assert!(msgs[3]["content"][0].get("cache_control").is_none(), "MOIM is never cached");
+        assert_eq!(
+            msgs[3]["content"][0]["text"],
+            "<turn-context sample=\"1\"/>"
+        );
+        assert!(
+            msgs[3]["content"][0].get("cache_control").is_none(),
+            "MOIM is never cached"
+        );
         // last *item* user-role message (the tool results) carries the marker —
         // the MOIM block after it doesn't shift the cache point
         let last = &msgs[2];

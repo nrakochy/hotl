@@ -51,7 +51,10 @@ fn scripted_factory() -> acp::SessionFactory {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
-            config: EngineConfig { max_turns: 6, ..Default::default() },
+            config: EngineConfig {
+                max_turns: 6,
+                ..Default::default()
+            },
         }))
     })
 }
@@ -91,16 +94,29 @@ async fn next(reader: &mut Reader) -> ServerMsg {
 fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
     match msg {
         ServerMsg::Update(v) => Some(Msg::Update(v)),
-        ServerMsg::PermissionRequest { req_id, summary, protected_why } => {
-            Some(Msg::PermissionRequest { req_id, summary, protected_why })
-        }
+        ServerMsg::PermissionRequest {
+            req_id,
+            summary,
+            protected_why,
+        } => Some(Msg::PermissionRequest {
+            req_id,
+            summary,
+            protected_why,
+        }),
         ServerMsg::Response { id, result } => {
             let pos = prompt_ids.iter().position(|&p| p == id)?;
             prompt_ids.remove(pos);
             let v = result.expect("prompt result");
             Some(Msg::PromptResult {
-                outcome_kind: v.pointer("/outcome/kind").and_then(Value::as_str).unwrap_or("error").to_string(),
-                outcome_text: v.pointer("/outcome/text").and_then(Value::as_str).map(String::from),
+                outcome_kind: v
+                    .pointer("/outcome/kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+                outcome_text: v
+                    .pointer("/outcome/text")
+                    .and_then(Value::as_str)
+                    .map(String::from),
                 usage: v.get("usage").cloned().unwrap_or(Value::Null),
             })
         }
@@ -112,7 +128,11 @@ async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64
     for cmd in cmds {
         match cmd {
             Cmd::SendPrompt(text) => {
-                prompt_ids.push_back(client.request("session/prompt", json!({"text": text})).await);
+                prompt_ids.push_back(
+                    client
+                        .request("session/prompt", json!({"text": text}))
+                        .await,
+                );
             }
             Cmd::SendSteer(text) => {
                 client.request("session/steer", json!({"text": text})).await;
@@ -120,7 +140,11 @@ async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64
             Cmd::Cancel => {
                 client.request("session/cancel", Value::Null).await;
             }
-            Cmd::ReplyPermission { req_id, allow, message } => client.reply_permission(req_id, allow, message).await,
+            Cmd::ReplyPermission {
+                req_id,
+                allow,
+                message,
+            } => client.reply_permission(req_id, allow, message).await,
             Cmd::OpenEditor(_) | Cmd::SetTitle(_) | Cmd::Quit => {}
         }
     }
@@ -128,10 +152,16 @@ async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64
 
 fn draw(state: &State) -> Vec<String> {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-    terminal.draw(|f| view(state, &Theme::default(), f)).unwrap();
+    terminal
+        .draw(|f| view(state, &Theme::default(), f))
+        .unwrap();
     let buffer = terminal.backend().buffer().clone();
     (0..buffer.area.height)
-        .map(|y| (0..buffer.area.width).map(|x| buffer.cell((x, y)).unwrap().symbol()).collect())
+        .map(|y| {
+            (0..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                .collect()
+        })
         .collect()
 }
 
@@ -141,7 +171,12 @@ fn press(state: &mut State, code: KeyCode) -> Vec<Cmd> {
     update(state, Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
 }
 
-async fn type_prompt(state: &mut State, client: &mut Client, prompt_ids: &mut VecDeque<u64>, text: &str) {
+async fn type_prompt(
+    state: &mut State,
+    client: &mut Client,
+    prompt_ids: &mut VecDeque<u64>,
+    text: &str,
+) {
     for c in text.chars() {
         press(state, KeyCode::Char(c));
     }
@@ -156,30 +191,51 @@ async fn prompt_stream_ask_allow_done_golden() {
     let mut prompt_ids = VecDeque::new();
 
     type_prompt(&mut state, &mut client, &mut prompt_ids, "go").await;
-    assert!(draw(&state).iter().any(|r| r.contains("❯ go")), "prompt echoes immediately");
+    assert!(
+        draw(&state).iter().any(|r| r.contains("❯ go")),
+        "prompt echoes immediately"
+    );
     assert!(matches!(state.phase, Phase::Sampling { .. }));
 
     let mut saw_streaming_strip = false;
     loop {
-        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids) else { continue };
+        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids) else {
+            continue;
+        };
         let is_ask = matches!(msg, Msg::PermissionRequest { .. });
         let is_result = matches!(msg, Msg::PromptResult { .. });
         let cmds = update(&mut state, msg);
         exec(cmds, &mut client, &mut prompt_ids).await;
         if is_ask {
             let rows = draw(&state);
-            assert!(rows.iter().any(|r| r.contains("bash")), "modal names the tool");
-            assert!(rows[STRIP].contains("╭─╮╰ ╯ waiting on you"), "halted gap glyph: {}", rows[STRIP]);
+            assert!(
+                rows.iter().any(|r| r.contains("bash")),
+                "modal names the tool"
+            );
+            assert!(
+                rows[STRIP].contains("╭─╮╰ ╯ waiting on you"),
+                "halted gap glyph: {}",
+                rows[STRIP]
+            );
             // Allow it — the real server maps this to AskReply::Allow and the
             // turn continues: tool_done then turn_done arrive below.
             let cmds = press(&mut state, KeyCode::Char('y'));
-            assert!(matches!(cmds[..], [Cmd::ReplyPermission { allow: true, .. }, ..]));
+            assert!(matches!(
+                cmds[..],
+                [Cmd::ReplyPermission { allow: true, .. }, ..]
+            ));
             exec(cmds, &mut client, &mut prompt_ids).await;
         }
-        if matches!(state.phase, Phase::Streaming { chars, .. } if chars > 0) && !saw_streaming_strip {
+        if matches!(state.phase, Phase::Streaming { chars, .. } if chars > 0)
+            && !saw_streaming_strip
+        {
             saw_streaming_strip = true;
             let rows = draw(&state);
-            assert!(rows[STRIP].contains("writing · ~"), "streaming strip approximates tokens: {}", rows[STRIP]);
+            assert!(
+                rows[STRIP].contains("writing · ~"),
+                "streaming strip approximates tokens: {}",
+                rows[STRIP]
+            );
         }
         if is_result {
             break;
@@ -187,12 +243,25 @@ async fn prompt_stream_ask_allow_done_golden() {
     }
 
     assert_eq!(state.phase, Phase::Idle);
-    assert!(saw_streaming_strip, "text deltas streamed before the result");
+    assert!(
+        saw_streaming_strip,
+        "text deltas streamed before the result"
+    );
     let rows = draw(&state);
-    assert!(rows.iter().any(|r| r.contains("✓ bash")), "tool card resolved");
-    assert!(rows.iter().any(|r| r.contains("all done via tui")), "assistant text rendered");
+    assert!(
+        rows.iter().any(|r| r.contains("✓ bash")),
+        "tool card resolved"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("all done via tui")),
+        "assistant text rendered"
+    );
     assert!(state.usage_line.is_some(), "real usage on the result");
-    assert!(rows[STRIP].contains("· ─ ·"), "back to resting: {}", rows[STRIP]);
+    assert!(
+        rows[STRIP].contains("· ─ ·"),
+        "back to resting: {}",
+        rows[STRIP]
+    );
 }
 
 #[tokio::test]
@@ -203,7 +272,9 @@ async fn deny_with_reason_reaches_engine() {
 
     type_prompt(&mut state, &mut client, &mut prompt_ids, "go").await;
     loop {
-        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids) else { continue };
+        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids) else {
+            continue;
+        };
         let is_ask = matches!(msg, Msg::PermissionRequest { .. });
         let is_result = matches!(msg, Msg::PromptResult { .. });
         let cmds = update(&mut state, msg);

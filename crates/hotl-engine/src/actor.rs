@@ -82,10 +82,34 @@ pub(crate) async fn run(
     while let Some(cmd) = cmd_rx.recv().await {
         match cmd {
             SessionCmd::Prompt(text) => {
-                running = admit_prompt(&shared, &mut log, &mut items, &mut queue, running, text, None, &cmd_tx, &events, &current_turn).await;
+                running = admit_prompt(
+                    &shared,
+                    &mut log,
+                    &mut items,
+                    &mut queue,
+                    running,
+                    text,
+                    None,
+                    &cmd_tx,
+                    &events,
+                    &current_turn,
+                )
+                .await;
             }
             SessionCmd::PromptTagged { text, synthetic } => {
-                running = admit_prompt(&shared, &mut log, &mut items, &mut queue, running, text, Some(synthetic), &cmd_tx, &events, &current_turn).await;
+                running = admit_prompt(
+                    &shared,
+                    &mut log,
+                    &mut items,
+                    &mut queue,
+                    running,
+                    text,
+                    Some(synthetic),
+                    &cmd_tx,
+                    &events,
+                    &current_turn,
+                )
+                .await;
             }
             SessionCmd::Continue => {
                 if !running && crate::needs_continuation(&items) {
@@ -100,7 +124,11 @@ pub(crate) async fn run(
             SessionCmd::Propose { entries, reply } => {
                 let _ = reply.send(commit(&shared, &mut log, &mut items, entries));
             }
-            SessionCmd::WriteBlob { tool_use_id, content, reply } => {
+            SessionCmd::WriteBlob {
+                tool_use_id,
+                content,
+                reply,
+            } => {
                 let result = match log.write_blob(&tool_use_id, &content) {
                     Ok(path) => Ok(path.display().to_string()),
                     Err(_) => Err(content), // hand the content back — never lose it
@@ -108,11 +136,22 @@ pub(crate) async fn run(
                 let _ = reply.send(result);
             }
             SessionCmd::TurnFinished { end, usage } => {
-                on_turn_finished(TurnFinishedCtx {
-                    shared: &shared, log: &mut log, items: &mut items, queue: &mut queue, running: &mut running,
-                    carry_usage: &mut carry_usage, compact_streak: &mut compact_streak,
-                    cmd_tx: &cmd_tx, events: &events, current_turn: &current_turn,
-                }, end, usage)
+                on_turn_finished(
+                    TurnFinishedCtx {
+                        shared: &shared,
+                        log: &mut log,
+                        items: &mut items,
+                        queue: &mut queue,
+                        running: &mut running,
+                        carry_usage: &mut carry_usage,
+                        compact_streak: &mut compact_streak,
+                        cmd_tx: &cmd_tx,
+                        events: &events,
+                        current_turn: &current_turn,
+                    },
+                    end,
+                    usage,
+                )
                 .await;
             }
         }
@@ -141,7 +180,17 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
         TurnEnd::Compact { spec } => {
             *ctx.carry_usage += usage;
             usage = TokenUsage::default();
-            try_compact(ctx.shared, ctx.log, ctx.items, ctx.compact_streak, spec, ctx.cmd_tx, ctx.events, ctx.current_turn).await
+            try_compact(
+                ctx.shared,
+                ctx.log,
+                ctx.items,
+                ctx.compact_streak,
+                spec,
+                ctx.cmd_tx,
+                ctx.events,
+                ctx.current_turn,
+            )
+            .await
         }
     };
     if let Some(outcome) = outcome {
@@ -149,7 +198,15 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
         let mut total = usage;
         total += std::mem::take(ctx.carry_usage);
         *ctx.running = end_turn(
-            ctx.shared, ctx.log, ctx.items, ctx.queue, outcome, total, ctx.cmd_tx, ctx.events, ctx.current_turn,
+            ctx.shared,
+            ctx.log,
+            ctx.items,
+            ctx.queue,
+            outcome,
+            total,
+            ctx.cmd_tx,
+            ctx.events,
+            ctx.current_turn,
         )
         .await;
     }
@@ -202,7 +259,19 @@ async fn end_turn(
     annotate(shared, log, &outcome);
     let _ = events.send(EngineEvent::TurnDone { outcome, usage }).await;
     match queue.pop_front() {
-        Some((next, synthetic)) => start_turn(shared, log, items, next, synthetic, cmd_tx, events, current_turn).await,
+        Some((next, synthetic)) => {
+            start_turn(
+                shared,
+                log,
+                items,
+                next,
+                synthetic,
+                cmd_tx,
+                events,
+                current_turn,
+            )
+            .await
+        }
         None => false,
     }
 }
@@ -210,9 +279,18 @@ async fn end_turn(
 /// Durable admission on arrival; projection advances only after the append
 /// (commit-protocol §durability). Linear-log M1 records the steer as a
 /// tagged user item; the `steer_admission` entry kind arrives with M3b's tree.
-fn admit_steer(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>, text: String) {
-    let payload =
-        EntryPayload::Item { item: Item::User { text, synthetic: Some(SyntheticReason::Steer) } };
+fn admit_steer(
+    shared: &SharedDeps,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
+    text: String,
+) {
+    let payload = EntryPayload::Item {
+        item: Item::User {
+            text,
+            synthetic: Some(SyntheticReason::Steer),
+        },
+    };
     if shared.append(log, &payload) {
         if let EntryPayload::Item { item } = payload {
             Arc::make_mut(items).push(item);
@@ -221,7 +299,12 @@ fn admit_steer(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<It
 }
 
 /// Commit a proposal: append each entry durably, then project it.
-fn commit(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>, entries: Vec<EntryPayload>) -> bool {
+fn commit(
+    shared: &SharedDeps,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
+    entries: Vec<EntryPayload>,
+) -> bool {
     for payload in entries {
         if !shared.append(log, &payload) {
             return false;
@@ -278,7 +361,10 @@ async fn compact(
                 if !shared.append(log, &payload) {
                     return Err("session log is sealed".into());
                 }
-                let plan = compaction::Plan { prefix_end: spec.prefix_end, kept_from: spec.kept_from };
+                let plan = compaction::Plan {
+                    prefix_end: spec.prefix_end,
+                    kept_from: spec.kept_from,
+                };
                 *items = Arc::new(compaction::apply(items, &plan, &digest));
                 return Ok(false);
             }
@@ -292,7 +378,10 @@ async fn compact(
     // digest and keep no verbatim tail — the continuation is a fresh slate.
     // In-place mode (default): fold [prefix..kept_from) and keep the tail.
     let plan = if shared.config.compaction_reset {
-        compaction::Plan { prefix_end: plan.prefix_end, kept_from: items.len() }
+        compaction::Plan {
+            prefix_end: plan.prefix_end,
+            kept_from: items.len(),
+        }
     } else {
         plan
     };
@@ -315,8 +404,11 @@ async fn compact(
 }
 
 pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
-    let model =
-        shared.config.fast_model.clone().unwrap_or_else(|| shared.config.model.clone());
+    let model = shared
+        .config
+        .fast_model
+        .clone()
+        .unwrap_or_else(|| shared.config.model.clone());
     let request = SamplingRequest {
         model,
         max_tokens: SUMMARIZE_MAX_TOKENS,
@@ -370,7 +462,17 @@ async fn admit_prompt(
         let _ = events.send(EngineEvent::PromptQueued).await;
         return true;
     }
-    start_turn(shared, log, items, text, synthetic, cmd_tx, events, current_turn).await
+    start_turn(
+        shared,
+        log,
+        items,
+        text,
+        synthetic,
+        cmd_tx,
+        events,
+        current_turn,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -384,11 +486,15 @@ async fn start_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
-    let payload = EntryPayload::Item { item: Item::User { text, synthetic } };
+    let payload = EntryPayload::Item {
+        item: Item::User { text, synthetic },
+    };
     if !shared.append(log, &payload) {
         let _ = events
             .send(EngineEvent::TurnDone {
-                outcome: Outcome::Error { message: "session log is sealed".into() },
+                outcome: Outcome::Error {
+                    message: "session log is sealed".into(),
+                },
                 usage: TokenUsage::default(),
             })
             .await;
@@ -410,6 +516,13 @@ fn spawn_turn(
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) {
     let token = CancellationToken::new();
-    *current_turn.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
-    tokio::spawn(turn::run(shared.clone(), cmd_tx.clone(), events.clone(), token));
+    *current_turn
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
+    tokio::spawn(turn::run(
+        shared.clone(),
+        cmd_tx.clone(),
+        events.clone(),
+        token,
+    ));
 }

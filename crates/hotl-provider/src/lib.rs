@@ -47,12 +47,29 @@ pub struct SamplingRequest {
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StreamEvent {
     Started,
-    BlockStart { index: usize, kind: String },
-    TextDelta { index: usize, text: String },
-    ThinkingDelta { index: usize, text: String },
-    ToolInputDelta { index: usize, json: String },
-    BlockEnd { index: usize },
-    Retrying { attempt: u32, reason: String },
+    BlockStart {
+        index: usize,
+        kind: String,
+    },
+    TextDelta {
+        index: usize,
+        text: String,
+    },
+    ThinkingDelta {
+        index: usize,
+        text: String,
+    },
+    ToolInputDelta {
+        index: usize,
+        json: String,
+    },
+    BlockEnd {
+        index: usize,
+    },
+    Retrying {
+        attempt: u32,
+        reason: String,
+    },
     /// Terminal event: the provider-assembled verbatim assistant blocks
     /// (echo these back on the next request — replay-safe by construction).
     Completed {
@@ -79,7 +96,10 @@ pub enum ProviderError {
 }
 
 pub trait Provider: Send + Sync {
-    fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>>;
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>>;
 }
 
 /// The honest "second impl" (D9): a scripted provider driving the real engine
@@ -92,7 +112,10 @@ pub struct ScriptedProvider {
 
 impl ScriptedProvider {
     pub fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Self {
-        Self { scripts: Mutex::new(scripts.into()), requests: Mutex::new(Vec::new()) }
+        Self {
+            scripts: Mutex::new(scripts.into()),
+            requests: Mutex::new(Vec::new()),
+        }
     }
 
     /// Every captured request. Cheap since a request's history/tools are
@@ -103,7 +126,11 @@ impl ScriptedProvider {
 
     /// The most recent request, if any.
     pub fn last_request(&self) -> Option<SamplingRequest> {
-        self.requests.lock().expect("requests mutex").last().cloned()
+        self.requests
+            .lock()
+            .expect("requests mutex")
+            .last()
+            .cloned()
     }
 
     pub fn request_count(&self) -> usize {
@@ -113,34 +140,58 @@ impl ScriptedProvider {
     /// Append a script after construction (tests that need the harness's
     /// paths before the scripts can be written).
     pub fn push_script(&self, script: Vec<Result<StreamEvent, ProviderError>>) {
-        self.scripts.lock().expect("scripted provider mutex").push_back(script);
+        self.scripts
+            .lock()
+            .expect("scripted provider mutex")
+            .push_back(script);
     }
 
     /// Convenience: a one-sample script that answers with plain text.
     pub fn text_reply(text: &str) -> Vec<Result<StreamEvent, ProviderError>> {
         vec![
             Ok(StreamEvent::Started),
-            Ok(StreamEvent::BlockStart { index: 0, kind: "text".into() }),
-            Ok(StreamEvent::TextDelta { index: 0, text: text.into() }),
+            Ok(StreamEvent::BlockStart {
+                index: 0,
+                kind: "text".into(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: text.into(),
+            }),
             Ok(StreamEvent::BlockEnd { index: 0 }),
             Ok(StreamEvent::Completed {
                 stop: StopReason::EndTurn,
-                usage: TokenUsage { input_tokens: 10, output_tokens: 5, ..Default::default() },
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                    ..Default::default()
+                },
                 blocks: vec![serde_json::json!({"type": "text", "text": text})],
             }),
         ]
     }
 
     /// Convenience: a sample that calls one tool.
-    pub fn tool_call(id: &str, name: &str, input: Value) -> Vec<Result<StreamEvent, ProviderError>> {
+    pub fn tool_call(
+        id: &str,
+        name: &str,
+        input: Value,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
         let block = serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input});
         vec![
             Ok(StreamEvent::Started),
-            Ok(StreamEvent::BlockStart { index: 0, kind: "tool_use".into() }),
+            Ok(StreamEvent::BlockStart {
+                index: 0,
+                kind: "tool_use".into(),
+            }),
             Ok(StreamEvent::BlockEnd { index: 0 }),
             Ok(StreamEvent::Completed {
                 stop: StopReason::ToolUse,
-                usage: TokenUsage { input_tokens: 10, output_tokens: 8, ..Default::default() },
+                usage: TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                    ..Default::default()
+                },
                 blocks: vec![block],
             }),
         ]
@@ -148,7 +199,10 @@ impl ScriptedProvider {
 }
 
 impl Provider for ScriptedProvider {
-    fn stream(&self, req: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         self.requests.lock().expect("requests mutex").push(req);
         let script = self
             .scripts
@@ -156,7 +210,9 @@ impl Provider for ScriptedProvider {
             .expect("scripted provider mutex")
             .pop_front()
             .unwrap_or_else(|| {
-                vec![Err(ProviderError::Transport("scripted provider exhausted".into()))]
+                vec![Err(ProviderError::Transport(
+                    "scripted provider exhausted".into(),
+                ))]
             });
         Box::pin(futures_util::stream::iter(script))
     }
@@ -222,10 +278,16 @@ pub mod retry {
             return Decision::Fatal;
         }
         match err {
-            ProviderError::Http { status, retry_after, .. } if *status == 429 || *status >= 500 => {
-                Decision::Retry { after_secs: retry_after.unwrap_or(1u64 << (attempt - 1)) }
-            }
-            ProviderError::Transport(_) => Decision::Retry { after_secs: 1u64 << (attempt - 1) },
+            ProviderError::Http {
+                status,
+                retry_after,
+                ..
+            } if *status == 429 || *status >= 500 => Decision::Retry {
+                after_secs: retry_after.unwrap_or(1u64 << (attempt - 1)),
+            },
+            ProviderError::Transport(_) => Decision::Retry {
+                after_secs: 1u64 << (attempt - 1),
+            },
             _ => Decision::Fatal,
         }
     }
@@ -245,13 +307,23 @@ pub mod retry {
     /// prose — the RELIABILITY.md rule concerns the latter). A miss is safe:
     /// the pre-sample threshold catches what this doesn't.
     pub fn is_context_overflow(err: &ProviderError) -> bool {
-        let ProviderError::Http { status: 400, message, .. } = err else {
+        let ProviderError::Http {
+            status: 400,
+            message,
+            ..
+        } = err
+        else {
             return false;
         };
         let m = message.to_lowercase();
-        ["too long", "context length", "context window", "tokens exceed"]
-            .iter()
-            .any(|needle| m.contains(needle))
+        [
+            "too long",
+            "context length",
+            "context window",
+            "tokens exceed",
+        ]
+        .iter()
+        .any(|needle| m.contains(needle))
     }
 
     #[cfg(test)]
@@ -262,7 +334,9 @@ pub mod retry {
         fn overflow_detection() {
             let overflow = ProviderError::Http {
                 status: 400,
-                message: r#"{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#.into(),
+                message:
+                    r#"{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#
+                        .into(),
                 retry_after: None,
             };
             assert!(is_context_overflow(&overflow));
@@ -272,13 +346,21 @@ pub mod retry {
                 retry_after: None,
             };
             assert!(is_context_overflow(&oai));
-            let plain_400 = ProviderError::Http { status: 400, message: "bad schema".into(), retry_after: None };
+            let plain_400 = ProviderError::Http {
+                status: 400,
+                message: "bad schema".into(),
+                retry_after: None,
+            };
             assert!(!is_context_overflow(&plain_400));
         }
 
         #[test]
         fn classify_rules() {
-            let overload = ProviderError::Http { status: 529, message: String::new(), retry_after: Some(7) };
+            let overload = ProviderError::Http {
+                status: 529,
+                message: String::new(),
+                retry_after: Some(7),
+            };
             assert_eq!(classify(&overload, 1), Decision::Retry { after_secs: 7 });
             assert_eq!(classify(&overload, MAX_ATTEMPTS), Decision::Fatal);
             let auth = ProviderError::Auth("bad".into());
@@ -287,7 +369,11 @@ pub mod retry {
             let transport = ProviderError::Transport("reset".into());
             assert_eq!(classify(&transport, 2), Decision::Retry { after_secs: 2 });
             assert!(is_availability(&transport));
-            let bad_req = ProviderError::Http { status: 400, message: String::new(), retry_after: None };
+            let bad_req = ProviderError::Http {
+                status: 400,
+                message: String::new(),
+                retry_after: None,
+            };
             assert_eq!(classify(&bad_req, 1), Decision::Fatal);
         }
     }
@@ -436,9 +522,18 @@ pub mod repair {
 
         #[test]
         fn repairs_common_damage_and_rejects_garbage() {
-            assert_eq!(parse_or_repair(r#"{"path": "a.rs"}"#).unwrap()["path"], "a.rs");
-            assert_eq!(parse_or_repair(r#"{"path": "a.rs",}"#).unwrap()["path"], "a.rs");
-            assert_eq!(parse_or_repair(r#"{"items": [1, 2,]}"#).unwrap()["items"][1], 2);
+            assert_eq!(
+                parse_or_repair(r#"{"path": "a.rs"}"#).unwrap()["path"],
+                "a.rs"
+            );
+            assert_eq!(
+                parse_or_repair(r#"{"path": "a.rs",}"#).unwrap()["path"],
+                "a.rs"
+            );
+            assert_eq!(
+                parse_or_repair(r#"{"items": [1, 2,]}"#).unwrap()["items"][1],
+                2
+            );
             // Truncated mid-string (stream cut): closed and parsed.
             let v = parse_or_repair(r#"{"command": "cargo tes"#).unwrap();
             assert_eq!(v["command"], "cargo tes");

@@ -44,7 +44,10 @@ fn file_permission(verb: &str, input: &Value) -> Permission {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
     let summary = format!("{verb} {path}");
     match execute_later_reason(path) {
-        Some(why) => Permission::AskProtected { summary, why: why.into() },
+        Some(why) => Permission::AskProtected {
+            summary,
+            why: why.into(),
+        },
         None => Permission::Ask { summary },
     }
 }
@@ -82,7 +85,11 @@ impl Tool for ReadTool {
 async fn read_impl(input: &Value) -> ToolResult {
     use tokio::io::AsyncBufReadExt;
     let path = str_arg(input, "path")?;
-    let offset = input.get("offset").and_then(Value::as_u64).unwrap_or(1).max(1) as usize;
+    let offset = input
+        .get("offset")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1) as usize;
     let read_err = |e: std::io::Error| {
         ToolOutcome::err(format!(
             "Could not read `{path}`: {e}. Check the path (use `bash` with `ls` to explore) and try again."
@@ -153,7 +160,9 @@ impl Tool for WriteTool {
         file_permission("write", input)
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { with_diagnostics(&self.diag, &input, write_impl(&input).await).await })
+        Box::pin(
+            async move { with_diagnostics(&self.diag, &input, write_impl(&input).await).await },
+        )
     }
 }
 
@@ -163,14 +172,19 @@ async fn write_impl(input: &Value) -> ToolResult {
     if let Some(parent) = std::path::Path::new(path).parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolOutcome::err(format!("Could not create parent directories for `{path}`: {e}."))
+                ToolOutcome::err(format!(
+                    "Could not create parent directories for `{path}`: {e}."
+                ))
             })?;
         }
     }
     tokio::fs::write(path, content)
         .await
         .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
-    Ok(ToolOutcome::ok(format!("Wrote {} bytes to {path}.", content.len())))
+    Ok(ToolOutcome::ok(format!(
+        "Wrote {} bytes to {path}.",
+        content.len()
+    )))
 }
 
 #[derive(Default)]
@@ -231,7 +245,9 @@ async fn edit_impl(input: &Value) -> ToolResult {
         ));
     }
     let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-        ToolOutcome::err(format!("Could not read `{path}`: {e}. Read the file first to confirm the path."))
+        ToolOutcome::err(format!(
+            "Could not read `{path}`: {e}. Read the file first to confirm the path."
+        ))
     })?;
     match crate::matcher::find(&content, old) {
         crate::matcher::Match::None => Err(ToolOutcome::err(format!(
@@ -281,7 +297,9 @@ impl Tool for BashTool {
             Some(net) => format!("{} {net}", sandbox_status().label()),
             None => sandbox_status().label(),
         };
-        Permission::Ask { summary: format!("bash [{label}]: {short}") }
+        Permission::Ask {
+            summary: format!("bash [{label}]: {short}"),
+        }
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move { done(bash_impl(&input, cancel).await) })
@@ -339,7 +357,11 @@ pub(crate) async fn collect_output(
     let stderr = child.stderr.take();
     let (stdout, stderr) = tokio::join!(drain_capped(stdout, cap), drain_capped(stderr, cap));
     let status = child.wait().await?;
-    Ok(std::process::Output { status, stdout, stderr })
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 /// Read a pipe to EOF in 8KB chunks, keeping at most `cap` bytes.
@@ -369,9 +391,17 @@ fn shell_outcome(result: std::io::Result<std::process::Output>) -> ToolOutcome {
     };
     let text = combined_output(&output);
     if output.status.success() {
-        ToolOutcome::ok(if text.is_empty() { "(no output)".to_string() } else { text })
+        ToolOutcome::ok(if text.is_empty() {
+            "(no output)".to_string()
+        } else {
+            text
+        })
     } else {
-        let code = output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+        let code = output
+            .status
+            .code()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "signal".into());
         ToolOutcome::err(format!("Command exited with status {code}.\n{text}"))
     }
 }
@@ -427,14 +457,23 @@ mod tests {
         std::fs::write(&path, "aaa\nbbb\naaa\n").unwrap();
         let p = path.to_str().unwrap();
 
-        let dup = run(&EditTool::default(), json!({"path": p, "old_string": "aaa", "new_string": "ccc"}));
+        let dup = run(
+            &EditTool::default(),
+            json!({"path": p, "old_string": "aaa", "new_string": "ccc"}),
+        );
         assert!(dup.is_error);
         assert!(dup.content.contains("matches 2 places"));
 
-        let missing = run(&EditTool::default(), json!({"path": p, "old_string": "zzz", "new_string": "ccc"}));
+        let missing = run(
+            &EditTool::default(),
+            json!({"path": p, "old_string": "zzz", "new_string": "ccc"}),
+        );
         assert!(missing.is_error && missing.content.contains("not found"));
 
-        let ok = run(&EditTool::default(), json!({"path": p, "old_string": "bbb", "new_string": "BBB"}));
+        let ok = run(
+            &EditTool::default(),
+            json!({"path": p, "old_string": "bbb", "new_string": "BBB"}),
+        );
         assert!(!ok.is_error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaa\nBBB\naaa\n");
     }
@@ -444,7 +483,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a/b/c.txt");
         let p = path.to_str().unwrap();
-        let w = run(&WriteTool::default(), json!({"path": p, "content": "one\ntwo\n"}));
+        let w = run(
+            &WriteTool::default(),
+            json!({"path": p, "content": "one\ntwo\n"}),
+        );
         assert!(!w.is_error, "{}", w.content);
         let r = run(&ReadTool, json!({"path": p}));
         assert!(!r.is_error);

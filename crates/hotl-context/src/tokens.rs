@@ -22,9 +22,7 @@ pub fn estimate_item(item: &Item) -> u64 {
         Item::System { text } | Item::User { text, .. } => estimate_text(text),
         // Serialized length covers thinking/signature payloads too — they all
         // ride back up on the next request.
-        Item::Assistant { blocks } => {
-            blocks.iter().map(|b| estimate_text(&b.to_string())).sum()
-        }
+        Item::Assistant { blocks } => blocks.iter().map(|b| estimate_text(&b.to_string())).sum(),
         Item::ToolResults { results } => {
             results.iter().map(|r| estimate_text(&r.content) + 6).sum()
         }
@@ -49,8 +47,13 @@ mod tests {
         assert!(estimate_text(&text) > actual_ish);
 
         let items = vec![
-            Item::User { text: text.clone(), synthetic: None },
-            Item::Assistant { blocks: vec![serde_json::json!({"type":"text","text":text})] },
+            Item::User {
+                text: text.clone(),
+                synthetic: None,
+            },
+            Item::Assistant {
+                blocks: vec![serde_json::json!({"type":"text","text":text})],
+            },
         ];
         assert!(estimate_items(&items) > 2 * actual_ish);
     }

@@ -4,7 +4,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::prelude::*;
 
 use watch_listener::Listener;
@@ -87,7 +89,9 @@ fn run(
         state.status = warn;
     }
     let mut pending: Option<char> = None;
-    let mut last_tick = Instant::now().checked_sub(tick).unwrap_or_else(Instant::now);
+    let mut last_tick = Instant::now()
+        .checked_sub(tick)
+        .unwrap_or_else(Instant::now);
     let mut last_anim = Instant::now();
 
     loop {
@@ -160,7 +164,9 @@ fn execute(cmd: Cmd, listener: &Listener) -> Option<Msg> {
             let id = match &obs.location.handle {
                 watch_types::LocationHandle::Tmux { pane_id, .. } => pane_id.clone(),
             };
-            Some(Msg::Jumped(listener.focus(&obs).map(|_| id).map_err(|e| e.to_string())))
+            Some(Msg::Jumped(
+                listener.focus(&obs).map(|_| id).map_err(|e| e.to_string()),
+            ))
         }
         Cmd::SelectPane(dir) => match watch_tmux::select_pane(dir) {
             Ok(None) => None,

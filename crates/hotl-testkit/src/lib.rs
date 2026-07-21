@@ -8,7 +8,9 @@
 
 use std::sync::Arc;
 
-use hotl_engine::{spawn_session, AskReply, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
+use hotl_engine::{
+    spawn_session, AskReply, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle,
+};
 use hotl_platform::SystemClock;
 use hotl_provider::{ProviderError, ScriptedProvider, StreamEvent};
 use hotl_store::{Masker, SessionLog};
@@ -60,7 +62,10 @@ impl Harness {
 }
 
 impl Harness {
-    pub fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>, config: EngineConfig) -> Self {
+    pub fn new(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+    ) -> Self {
         Self::with_items(scripts, config, Vec::new())
     }
 
@@ -79,7 +84,13 @@ impl Harness {
         config: EngineConfig,
         hooks: Arc<dyn hotl_engine::hooks::Hooks>,
     ) -> Self {
-        Self::build_with(scripts, config, Vec::new(), Some(hooks), Registry::builtin())
+        Self::build_with(
+            scripts,
+            config,
+            Vec::new(),
+            Some(hooks),
+            Registry::builtin(),
+        )
     }
 
     /// Construct a harness with a custom tool registry (concurrency probes,
@@ -150,10 +161,13 @@ impl Harness {
 
     pub async fn wait_for_outcome(&mut self) -> Outcome {
         loop {
-            let event = tokio::time::timeout(std::time::Duration::from_secs(10), self.handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let event = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.handle.events.recv(),
+            )
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
             self.seen.push(format!("{event:?}"));
             match event {
                 EngineEvent::Ask { reply, .. } => {
@@ -191,7 +205,11 @@ impl Harness {
             .map(|e| {
                 let mut v = serde_json::to_value(e).expect("entry to value");
                 v["id"] = "ID".into();
-                v["parent_id"] = if e.parent_id.is_some() { "PARENT".into() } else { serde_json::Value::Null };
+                v["parent_id"] = if e.parent_id.is_some() {
+                    "PARENT".into()
+                } else {
+                    serde_json::Value::Null
+                };
                 v["ts_ms"] = 0.into();
                 if let Some(h) = v.pointer_mut("/payload/header") {
                     h["session_id"] = "SESSION".into();
@@ -241,7 +259,10 @@ impl Harness {
     pub fn assert_trajectory(&self, expected: &[&str], mode: TrajectoryMatch) {
         let actual: Vec<String> = self.tool_calls().into_iter().map(|(n, _)| n).collect();
         let ok = match mode {
-            TrajectoryMatch::Exact => actual.iter().map(String::as_str).eq(expected.iter().copied()),
+            TrajectoryMatch::Exact => actual
+                .iter()
+                .map(String::as_str)
+                .eq(expected.iter().copied()),
             TrajectoryMatch::Unordered => {
                 let mut a: Vec<&str> = actual.iter().map(String::as_str).collect();
                 let mut e = expected.to_vec();
@@ -251,7 +272,10 @@ impl Harness {
             }
             TrajectoryMatch::Subset => is_subsequence(expected, &actual),
         };
-        assert!(ok, "trajectory {mode:?} failed:\n expected: {expected:?}\n actual:   {actual:?}");
+        assert!(
+            ok,
+            "trajectory {mode:?} failed:\n expected: {expected:?}\n actual:   {actual:?}"
+        );
     }
 }
 
@@ -267,7 +291,9 @@ pub enum TrajectoryMatch {
 }
 
 /// A one-sample script whose assistant turn calls several tools in one batch.
-pub fn tool_batch(calls: &[(&str, &str, serde_json::Value)]) -> Vec<Result<StreamEvent, ProviderError>> {
+pub fn tool_batch(
+    calls: &[(&str, &str, serde_json::Value)],
+) -> Vec<Result<StreamEvent, ProviderError>> {
     let blocks: Vec<serde_json::Value> = calls
         .iter()
         .map(|(id, name, input)| {
@@ -278,7 +304,11 @@ pub fn tool_batch(calls: &[(&str, &str, serde_json::Value)]) -> Vec<Result<Strea
         Ok(StreamEvent::Started),
         Ok(StreamEvent::Completed {
             stop: hotl_types::StopReason::ToolUse,
-            usage: hotl_types::TokenUsage { input_tokens: 10, output_tokens: 8, ..Default::default() },
+            usage: hotl_types::TokenUsage {
+                input_tokens: 10,
+                output_tokens: 8,
+                ..Default::default()
+            },
             blocks,
         }),
     ]
@@ -297,7 +327,10 @@ mod tests {
     use serde_json::json;
 
     fn cfg() -> EngineConfig {
-        EngineConfig { max_turns: 6, ..Default::default() }
+        EngineConfig {
+            max_turns: 6,
+            ..Default::default()
+        }
     }
 
     /// A concurrency probe: each call bumps a shared running-counter and
@@ -375,11 +408,23 @@ mod tests {
             probe_registry(true),
         );
         let outcome = h.prompt_and_wait("probe twice").await;
-        assert_eq!(outcome, Outcome::Done { text: "both ran".into() });
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "both ran".into()
+            }
+        );
         let items = h.items();
-        let Item::ToolResults { results } = &items[2] else { panic!("expected results, got {items:#?}") };
+        let Item::ToolResults { results } = &items[2] else {
+            panic!("expected results, got {items:#?}")
+        };
         // Both calls passed the barrier — they ran concurrently…
-        assert!(results.iter().all(|r| !r.is_error && r.content == "overlapped"), "{results:?}");
+        assert!(
+            results
+                .iter()
+                .all(|r| !r.is_error && r.content == "overlapped"),
+            "{results:?}"
+        );
         // …and the paired results keep assistant source order.
         let ids: Vec<_> = results.iter().map(|r| r.tool_use_id.as_str()).collect();
         assert_eq!(ids, ["t1", "t2"]);
@@ -396,12 +441,21 @@ mod tests {
             probe_registry(false),
         );
         let outcome = h.prompt_and_wait("probe twice").await;
-        assert_eq!(outcome, Outcome::Done { text: "done".into() });
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "done".into()
+            }
+        );
         let items = h.items();
-        let Item::ToolResults { results } = &items[2] else { panic!("expected results, got {items:#?}") };
+        let Item::ToolResults { results } = &items[2] else {
+            panic!("expected results, got {items:#?}")
+        };
         // Neither call may see the other running: both time out at the barrier.
         assert!(
-            results.iter().all(|r| r.is_error && r.content.contains("did not overlap")),
+            results
+                .iter()
+                .all(|r| r.is_error && r.content.contains("did not overlap")),
             "{results:?}"
         );
     }
@@ -419,7 +473,12 @@ mod tests {
             cfg(),
         );
         let outcome = h.prompt_and_wait("what does hello.txt say?").await;
-        assert_eq!(outcome, Outcome::Done { text: "The file says hello.".into() });
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "The file says hello.".into()
+            }
+        );
         assert_eq!(
             h.kinds(),
             ["header", "item", "item", "usage", "item", "item", "usage"]
@@ -443,7 +502,9 @@ mod tests {
         let outcome = h.prompt_and_wait("clean up").await;
         assert!(matches!(outcome, Outcome::Done { .. }));
         let items = h.items();
-        let Item::ToolResults { results } = &items[2] else { panic!("expected results") };
+        let Item::ToolResults { results } = &items[2] else {
+            panic!("expected results")
+        };
         assert!(results[0].is_error && results[0].content.contains("declined"));
         assert!(h.seen.iter().any(|e| e.starts_with("Ask(")));
     }
@@ -454,7 +515,11 @@ mod tests {
         // appears; sample 2 must include the steer in its request items.
         let mut h = Harness::new(
             vec![
-                ScriptedProvider::tool_call("t1", "bash", json!({"command": "sleep 0.2; echo done"})),
+                ScriptedProvider::tool_call(
+                    "t1",
+                    "bash",
+                    json!({"command": "sleep 0.2; echo done"}),
+                ),
                 ScriptedProvider::text_reply("Done, and noted your steer."),
             ],
             cfg(),
@@ -467,7 +532,15 @@ mod tests {
         let steer_items: Vec<_> = h
             .items()
             .into_iter()
-            .filter(|i| matches!(i, Item::User { synthetic: Some(SyntheticReason::Steer), .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Item::User {
+                        synthetic: Some(SyntheticReason::Steer),
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(steer_items.len(), 1);
 
@@ -477,12 +550,21 @@ mod tests {
         assert_eq!(requests.len(), 2);
         let saw_in_first = requests[0].items.iter().any(is_steer);
         let saw_in_second = requests[1].items.iter().any(is_steer);
-        assert!(!saw_in_first, "steer must not appear in the sample that was already running");
+        assert!(
+            !saw_in_first,
+            "steer must not appear in the sample that was already running"
+        );
         assert!(saw_in_second, "steer must be woven into the next sample");
     }
 
     fn is_steer(i: &Item) -> bool {
-        matches!(i, Item::User { synthetic: Some(SyntheticReason::Steer), .. })
+        matches!(
+            i,
+            Item::User {
+                synthetic: Some(SyntheticReason::Steer),
+                ..
+            }
+        )
     }
 
     #[tokio::test]
@@ -499,9 +581,19 @@ mod tests {
         // Queue a second prompt immediately (turn is running).
         h.handle.prompt("second".into()).await;
         let first = h.wait_for_outcome().await;
-        assert_eq!(first, Outcome::Done { text: "first done".into() });
+        assert_eq!(
+            first,
+            Outcome::Done {
+                text: "first done".into()
+            }
+        );
         let second = h.wait_for_outcome().await;
-        assert_eq!(second, Outcome::Done { text: "second done".into() });
+        assert_eq!(
+            second,
+            Outcome::Done {
+                text: "second done".into()
+            }
+        );
         assert!(h.seen.iter().any(|e| e == "PromptQueued"));
     }
 
@@ -510,10 +602,19 @@ mod tests {
         let scripts: Vec<_> = (0..5)
             .map(|_| ScriptedProvider::tool_call("t", "read", json!({"path": "/same"})))
             .collect();
-        let mut h = Harness::new(scripts, EngineConfig { max_turns: 10, ..Default::default() });
+        let mut h = Harness::new(
+            scripts,
+            EngineConfig {
+                max_turns: 10,
+                ..Default::default()
+            },
+        );
         h.ask_reply = AskReply::Deny { message: None };
         let outcome = h.prompt_and_wait("go").await;
-        assert!(matches!(outcome, Outcome::DoomLoop { .. }), "got {outcome:?}");
+        assert!(
+            matches!(outcome, Outcome::DoomLoop { .. }),
+            "got {outcome:?}"
+        );
         assert!(h.entries().iter().any(|e| matches!(
             &e.payload,
             hotl_types::EntryPayload::Cancelled { reason } if reason.contains("doom")
@@ -533,8 +634,16 @@ mod tests {
             },
         );
         let outcome = h.prompt_and_wait("hi").await;
-        assert_eq!(outcome, Outcome::Done { text: "served by fallback".into() });
-        assert!(h.seen.iter().any(|e| e.contains("FallbackModel(backup-model)")));
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "served by fallback".into()
+            }
+        );
+        assert!(h
+            .seen
+            .iter()
+            .any(|e| e.contains("FallbackModel(backup-model)")));
         let reqs = h.provider.requests();
         assert_eq!(reqs[1].model, "backup-model");
     }
@@ -543,7 +652,10 @@ mod tests {
     async fn auth_error_does_not_fall_back() {
         let mut h = Harness::new(
             vec![vec![Err(ProviderError::Auth("bad key".into()))]],
-            EngineConfig { fallback_models: vec!["backup".into()], ..cfg() },
+            EngineConfig {
+                fallback_models: vec!["backup".into()],
+                ..cfg()
+            },
         );
         let outcome = h.prompt_and_wait("hi").await;
         assert!(matches!(outcome, Outcome::Error { .. }));
@@ -554,14 +666,29 @@ mod tests {
     async fn tool_failure_budget_stops_turn() {
         // Distinct paths so the doom detector (identical sigs) stays quiet.
         let scripts: Vec<_> = (0..6)
-            .map(|i| ScriptedProvider::tool_call(&format!("t{i}"), "read", json!({"path": format!("/nope{i}")})))
+            .map(|i| {
+                ScriptedProvider::tool_call(
+                    &format!("t{i}"),
+                    "read",
+                    json!({"path": format!("/nope{i}")}),
+                )
+            })
             .collect();
         let mut h = Harness::new(
             scripts,
-            EngineConfig { max_turns: 10, tool_failure_budget: 3, ..Default::default() },
+            EngineConfig {
+                max_turns: 10,
+                tool_failure_budget: 3,
+                ..Default::default()
+            },
         );
         let outcome = h.prompt_and_wait("read them all").await;
-        assert_eq!(outcome, Outcome::ToolFailureBudget { tool: "read".into() });
+        assert_eq!(
+            outcome,
+            Outcome::ToolFailureBudget {
+                tool: "read".into()
+            }
+        );
         // Feedback element present in the failing results.
         let items = h.items();
         let with_feedback = items.iter().any(|i| matches!(
@@ -577,10 +704,20 @@ mod tests {
                 // Alternate two calls so neither doom (period ≤3 needs 3 repeats
                 // of a block) nor the failure budget trips first… actually use
                 // successful bash echoes: no failures, distinct args.
-                ScriptedProvider::tool_call(&format!("t{i}"), "bash", json!({"command": format!("echo {i}")}))
+                ScriptedProvider::tool_call(
+                    &format!("t{i}"),
+                    "bash",
+                    json!({"command": format!("echo {i}")}),
+                )
             })
             .collect();
-        let mut h = Harness::new(scripts, EngineConfig { max_turns: 3, ..Default::default() });
+        let mut h = Harness::new(
+            scripts,
+            EngineConfig {
+                max_turns: 3,
+                ..Default::default()
+            },
+        );
         let outcome = h.prompt_and_wait("loop").await;
         assert_eq!(outcome, Outcome::TurnLimit);
     }
@@ -588,19 +725,26 @@ mod tests {
     #[tokio::test]
     async fn interrupt_cancels_running_turn() {
         let mut h = Harness::new(
-            vec![ScriptedProvider::tool_call("t1", "bash", json!({"command": "sleep 30"}))],
+            vec![ScriptedProvider::tool_call(
+                "t1",
+                "bash",
+                json!({"command": "sleep 30"}),
+            )],
             cfg(),
         );
         h.handle.prompt("run forever".into()).await;
         // Wait until the tool starts, then interrupt out-of-band.
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(5), h.handle.events.recv())
-                .await
-                .expect("timeout")
-                .expect("closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(5), h.handle.events.recv())
+                    .await
+                    .expect("timeout")
+                    .expect("closed");
             h.seen.push(format!("{ev:?}"));
             match ev {
-                EngineEvent::Ask { reply, .. } => { let _ = reply.send(AskReply::Allow); }
+                EngineEvent::Ask { reply, .. } => {
+                    let _ = reply.send(AskReply::Allow);
+                }
                 EngineEvent::ToolStart { .. } => break,
                 _ => {}
             }
@@ -618,7 +762,10 @@ mod tests {
             h.transcript()
         };
         let (a, b) = (make().await, make().await);
-        assert_eq!(a, b, "normalized transcripts must be byte-identical across runs");
+        assert_eq!(
+            a, b,
+            "normalized transcripts must be byte-identical across runs"
+        );
     }
 
     /// A tool-call sample whose Completed reports a chosen input_tokens —
@@ -643,17 +790,39 @@ mod tests {
         // then a sample that "reports" 750 tokens: the next request estimate
         // crosses 800, so the turn compacts. The plan folds the big early
         // history and keeps the small recent exchange verbatim.
-        let cfg = EngineConfig { context_window: 1000, max_turns: 10, ..Default::default() };
+        let cfg = EngineConfig {
+            context_window: 1000,
+            max_turns: 10,
+            ..Default::default()
+        };
         let scripts = vec![
-            ScriptedProvider::tool_call("t1", "bash", json!({"command": format!("echo {}", "A".repeat(1100))})),
-            tool_call_reporting("t2", "bash", json!({"command": format!("echo {}", "B".repeat(200))}), 750),
+            ScriptedProvider::tool_call(
+                "t1",
+                "bash",
+                json!({"command": format!("echo {}", "A".repeat(1100))}),
+            ),
+            tool_call_reporting(
+                "t2",
+                "bash",
+                json!({"command": format!("echo {}", "B".repeat(200))}),
+                750,
+            ),
             ScriptedProvider::text_reply("GOAL: digest of earlier work"),
             ScriptedProvider::text_reply("finished after compaction"),
         ];
         let mut h = Harness::new(scripts, cfg);
         let outcome = h.prompt_and_wait("summarize both outputs").await;
-        assert_eq!(outcome, Outcome::Done { text: "finished after compaction".into() });
-        assert!(h.seen.iter().any(|e| e == "Compacted(false)"), "events: {:?}", h.seen);
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "finished after compaction".into()
+            }
+        );
+        assert!(
+            h.seen.iter().any(|e| e == "Compacted(false)"),
+            "events: {:?}",
+            h.seen
+        );
 
         // The log records the compaction; the projection was re-pointed.
         assert!(h.kinds().iter().any(|k| k == "compaction"));
@@ -669,7 +838,10 @@ mod tests {
                 if text.contains("GOAL: digest of earlier work")
         ));
         let flat = format!("{:?}", continuation.items);
-        assert!(!flat.contains(&"A".repeat(64)), "folded history must not ride along");
+        assert!(
+            !flat.contains(&"A".repeat(64)),
+            "folded history must not ride along"
+        );
         assert!(flat.contains(&"B".repeat(64)), "the tail stays verbatim");
     }
 
@@ -680,21 +852,38 @@ mod tests {
             tool_call_reporting("t2", "bash", json!({"command": "echo more"}), 900),
             // Both summarize attempts fail: the floor placeholder applies.
             vec![Err(ProviderError::Transport("summarizer down".into()))],
-            vec![Err(ProviderError::Transport("summarizer still down".into()))],
+            vec![Err(ProviderError::Transport(
+                "summarizer still down".into(),
+            ))],
             ScriptedProvider::text_reply("continued on the floor"),
         ];
         let mut h = Harness::new(
             scripts,
-            EngineConfig { context_window: 1000, max_turns: 10, ..Default::default() },
+            EngineConfig {
+                context_window: 1000,
+                max_turns: 10,
+                ..Default::default()
+            },
         );
         // ~1500 estimated tokens of tool results pushes past the 800 trigger.
         let outcome = h.prompt_and_wait(&"x".repeat(1200)).await;
-        assert_eq!(outcome, Outcome::Done { text: "continued on the floor".into() });
-        assert!(h.seen.iter().any(|e| e == "Compacted(true)"), "events: {:?}", h.seen);
-        let degraded = h.entries().iter().any(|e| matches!(
-            &e.payload,
-            hotl_types::EntryPayload::Compaction { degraded: true, .. }
-        ));
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "continued on the floor".into()
+            }
+        );
+        assert!(
+            h.seen.iter().any(|e| e == "Compacted(true)"),
+            "events: {:?}",
+            h.seen
+        );
+        let degraded = h.entries().iter().any(|e| {
+            matches!(
+                &e.payload,
+                hotl_types::EntryPayload::Compaction { degraded: true, .. }
+            )
+        });
         assert!(degraded, "the compaction entry records the floor");
     }
 
@@ -703,9 +892,18 @@ mod tests {
         let mut h = Harness::new(vec![ScriptedProvider::text_reply("hi")], cfg());
         h.prompt_and_wait("hello").await;
         let requests = h.provider.requests();
-        let tc = requests[0].turn_context.as_deref().expect("turn context attached");
-        assert!(tc.contains("sample=\"1\"") && tc.contains("context_used="), "was: {tc}");
-        assert!(!h.transcript().contains("<turn-context"), "MOIM must never persist");
+        let tc = requests[0]
+            .turn_context
+            .as_deref()
+            .expect("turn context attached");
+        assert!(
+            tc.contains("sample=\"1\"") && tc.contains("context_used="),
+            "was: {tc}"
+        );
+        assert!(
+            !h.transcript().contains("<turn-context"),
+            "MOIM must never persist"
+        );
     }
 
     #[tokio::test]
@@ -721,17 +919,28 @@ mod tests {
             "read",
             json!({"path": path.to_str().unwrap()}),
         ));
-        h.provider.push_script(ScriptedProvider::text_reply("read it"));
+        h.provider
+            .push_script(ScriptedProvider::text_reply("read it"));
         let outcome = h.prompt_and_wait("read the page").await;
         assert!(matches!(outcome, Outcome::Done { .. }));
         drop(h.provider.requests());
         let hint_items: Vec<_> = h
             .items()
             .into_iter()
-            .filter(|i| matches!(i, Item::User { synthetic: Some(SyntheticReason::SubdirInstructions), .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Item::User {
+                        synthetic: Some(SyntheticReason::SubdirInstructions),
+                        ..
+                    }
+                )
+            })
             .collect();
         assert_eq!(hint_items.len(), 1, "items: {:#?}", h.items());
-        let Item::User { text, .. } = &hint_items[0] else { unreachable!() };
+        let Item::User { text, .. } = &hint_items[0] else {
+            unreachable!()
+        };
         assert!(text.contains("web subproject rules") && text.contains("trust=\"untrusted\""));
         // The second sample's request saw the hint.
         let requests = h.provider.requests();
@@ -772,22 +981,40 @@ mod tests {
         // A projection ending in a user turn the model never answered (the
         // process died mid-turn). continue_turn re-samples and completes it
         // without a fresh prompt (#8).
-        let seeded = vec![Item::User { text: "half-finished request".into(), synthetic: None }];
+        let seeded = vec![Item::User {
+            text: "half-finished request".into(),
+            synthetic: None,
+        }];
         let mut h = Harness::with_items(
-            vec![ScriptedProvider::text_reply("finished the interrupted turn")],
+            vec![ScriptedProvider::text_reply(
+                "finished the interrupted turn",
+            )],
             cfg(),
             seeded,
         );
         assert!(hotl_engine::needs_continuation(&h.items()) || h.items().is_empty());
         h.handle.continue_turn().await;
         let outcome = h.wait_for_outcome().await;
-        assert_eq!(outcome, Outcome::Done { text: "finished the interrupted turn".into() });
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "finished the interrupted turn".into()
+            }
+        );
         // No new user item was appended — the request the model saw is the
         // seeded one, not a duplicate.
         let user_turns = h.provider.requests()[0]
             .items
             .iter()
-            .filter(|i| matches!(i, Item::User { synthetic: None, .. }))
+            .filter(|i| {
+                matches!(
+                    i,
+                    Item::User {
+                        synthetic: None,
+                        ..
+                    }
+                )
+            })
             .count();
         assert_eq!(user_turns, 1, "continue must not append a second user item");
     }
@@ -796,8 +1023,13 @@ mod tests {
     async fn continue_is_a_noop_on_a_complete_projection() {
         // Last item is an assistant reply → nothing to continue.
         let done = vec![
-            Item::User { text: "q".into(), synthetic: None },
-            Item::Assistant { blocks: vec![json!({"type":"text","text":"a"})] },
+            Item::User {
+                text: "q".into(),
+                synthetic: None,
+            },
+            Item::Assistant {
+                blocks: vec![json!({"type":"text","text":"a"})],
+            },
         ];
         assert!(!hotl_engine::needs_continuation(&done));
     }
@@ -813,24 +1045,44 @@ mod tests {
             ..Default::default()
         };
         let scripts = vec![
-            ScriptedProvider::tool_call("t1", "bash", json!({"command": format!("echo {}", "A".repeat(1100))})),
-            tool_call_reporting("t2", "bash", json!({"command": format!("echo {}", "B".repeat(200))}), 750),
+            ScriptedProvider::tool_call(
+                "t1",
+                "bash",
+                json!({"command": format!("echo {}", "A".repeat(1100))}),
+            ),
+            tool_call_reporting(
+                "t2",
+                "bash",
+                json!({"command": format!("echo {}", "B".repeat(200))}),
+                750,
+            ),
             ScriptedProvider::text_reply("GOAL: digest"),
             ScriptedProvider::text_reply("done after reset compaction"),
         ];
         let mut h = Harness::new(scripts, cfg);
         let outcome = h.prompt_and_wait("do the thing").await;
-        assert_eq!(outcome, Outcome::Done { text: "done after reset compaction".into() });
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "done after reset compaction".into()
+            }
+        );
         assert!(h.seen.iter().any(|e| e.starts_with("Compacted")));
         let continuation = h.provider.last_request().unwrap();
         // The digest is present…
         assert!(continuation.items.iter().any(|i| matches!(
             i,
-            Item::User { synthetic: Some(SyntheticReason::CompactionSummary), .. }
+            Item::User {
+                synthetic: Some(SyntheticReason::CompactionSummary),
+                ..
+            }
         )));
         // …and no ToolResults / Assistant verbatim tail rode along (fresh slate).
         assert!(
-            !continuation.items.iter().any(|i| matches!(i, Item::ToolResults { .. } | Item::Assistant { .. })),
+            !continuation
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::ToolResults { .. } | Item::Assistant { .. })),
             "reset-mode continuation must not carry the verbatim tail: {:?}",
             continuation.items
         );
@@ -840,7 +1092,10 @@ mod tests {
     async fn moim_context_pct_can_be_hidden() {
         let mut h = Harness::new(
             vec![ScriptedProvider::text_reply("hi")],
-            EngineConfig { show_context_pct: false, ..cfg() },
+            EngineConfig {
+                show_context_pct: false,
+                ..cfg()
+            },
         );
         h.prompt_and_wait("hello").await;
         let reqs = h.provider.requests();
@@ -854,7 +1109,9 @@ mod tests {
         use hotl_engine::hooks::{InProcessHooks, PreToolDecision};
         let hooks = Arc::new(InProcessHooks::new().on_pre_tool(|name, input| {
             if name == "bash" && input.get("command").and_then(|c| c.as_str()) == Some("danger") {
-                PreToolDecision::Deny { message: "policy: no danger".into() }
+                PreToolDecision::Deny {
+                    message: "policy: no danger".into(),
+                }
             } else {
                 PreToolDecision::Continue
             }
@@ -873,7 +1130,10 @@ mod tests {
         let blocked = h.items().into_iter().any(|i| matches!(
             i, Item::ToolResults { results } if results.iter().any(|r| r.is_error && r.content.contains("policy: no danger"))
         ));
-        assert!(blocked, "the hook's denial reached the model as a tool result");
+        assert!(
+            blocked,
+            "the hook's denial reached the model as a tool result"
+        );
     }
 
     #[tokio::test]
@@ -882,11 +1142,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("f.txt");
         std::fs::write(&file, "secret content").unwrap();
-        let hooks = Arc::new(
-            InProcessHooks::new().on_post_tool(|name, _result| {
-                (name == "read").then(|| "[redacted by hook]".to_string())
-            }),
-        );
+        let hooks = Arc::new(InProcessHooks::new().on_post_tool(|name, _result| {
+            (name == "read").then(|| "[redacted by hook]".to_string())
+        }));
         let mut h = Harness::with_hooks(
             vec![
                 ScriptedProvider::tool_call("t1", "read", json!({"path": file.to_str().unwrap()})),
@@ -899,7 +1157,10 @@ mod tests {
         let redacted = h.items().into_iter().any(|i| matches!(
             i, Item::ToolResults { results } if results.iter().any(|r| r.content.contains("[redacted by hook]"))
         ));
-        assert!(redacted, "the post-tool hook replaced the result the model saw");
+        assert!(
+            redacted,
+            "the post-tool hook replaced the result the model saw"
+        );
         // The real content never reached the transcript.
         assert!(!h.transcript().contains("secret content"));
     }
@@ -915,14 +1176,20 @@ mod tests {
             ],
             cfg(),
         );
-        h.ask_reply = AskReply::Deny { message: Some("wrong file — use notes.md".into()) };
+        h.ask_reply = AskReply::Deny {
+            message: Some("wrong file — use notes.md".into()),
+        };
         let outcome = h.prompt_and_wait("write it").await;
         assert!(matches!(outcome, Outcome::Done { .. }));
         let items = h.items();
-        let Item::ToolResults { results } = &items[2] else { panic!("expected results") };
+        let Item::ToolResults { results } = &items[2] else {
+            panic!("expected results")
+        };
         assert!(results[0].is_error);
         assert!(
-            results[0].content.contains("declined this tool call: wrong file — use notes.md"),
+            results[0]
+                .content
+                .contains("declined this tool call: wrong file — use notes.md"),
             "the denial reason must reach the model: {}",
             results[0].content
         );
@@ -935,10 +1202,17 @@ mod tests {
         let mut h = Harness::new(
             vec![
                 ScriptedProvider::tool_call("t1", "read", json!({"path": f.to_str().unwrap()})),
-                ScriptedProvider::tool_call("t2", "write", json!({"path": f.to_str().unwrap(), "content": "new"})),
+                ScriptedProvider::tool_call(
+                    "t2",
+                    "write",
+                    json!({"path": f.to_str().unwrap(), "content": "new"}),
+                ),
                 ScriptedProvider::text_reply("did both"),
             ],
-            EngineConfig { max_turns: 6, ..Default::default() },
+            EngineConfig {
+                max_turns: 6,
+                ..Default::default()
+            },
         );
         h.keep_dir(dir);
         h.prompt_and_wait("read then write").await;
@@ -973,19 +1247,28 @@ mod tests {
                 ScriptedProvider::tool_call("t1", "read", json!({"path": big.to_str().unwrap()})),
                 ScriptedProvider::text_reply("read it"),
             ],
-            EngineConfig { evict_threshold_tokens: threshold, max_turns: 6, ..Default::default() },
+            EngineConfig {
+                evict_threshold_tokens: threshold,
+                max_turns: 6,
+                ..Default::default()
+            },
         );
         h.prompt_and_wait("read the big file").await;
         drop(dir);
         let items = h.items();
-        let Item::ToolResults { results } = &items[2] else { panic!("expected results") };
+        let Item::ToolResults { results } = &items[2] else {
+            panic!("expected results")
+        };
         // The blob (when evicted) lives beside the harness log.
         if threshold != 0 {
             let has_blobs = std::fs::read_dir(h.dir())
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .any(|e| e.path().to_string_lossy().contains(".blobs"));
-            assert!(has_blobs, "a .blobs dir should exist beside the log after eviction");
+            assert!(
+                has_blobs,
+                "a .blobs dir should exist beside the log after eviction"
+            );
         }
         results[0].content.clone()
     }
@@ -995,14 +1278,23 @@ mod tests {
         let content = read_big_with_threshold(5_000).await;
         assert!(content.contains("<evicted"), "result should be evicted");
         assert!(content.contains("Read it with the read tool"));
-        assert!(content.len() < 5_000, "in-context result is a preview, not the full 60KB");
+        assert!(
+            content.len() < 5_000,
+            "in-context result is a preview, not the full 60KB"
+        );
     }
 
     #[tokio::test]
     async fn eviction_disabled_at_threshold_zero() {
         let content = read_big_with_threshold(0).await;
-        assert!(!content.contains("<evicted"), "threshold 0 disables eviction");
-        assert!(content.len() > 50_000, "the full result rides in-context when disabled");
+        assert!(
+            !content.contains("<evicted"),
+            "threshold 0 disables eviction"
+        );
+        assert!(
+            content.len() > 50_000,
+            "the full result rides in-context when disabled"
+        );
     }
 
     #[allow(dead_code)]

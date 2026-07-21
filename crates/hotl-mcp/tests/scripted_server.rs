@@ -21,7 +21,9 @@ async fn scripted_server(stream: tokio::io::DuplexStream) {
         let msg: Value = serde_json::from_str(&line).unwrap();
         let id = msg.get("id").cloned().unwrap_or(Value::Null);
         let reply = match msg.get("method").and_then(Value::as_str) {
-            Some("initialize") => json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18"}}),
+            Some("initialize") => {
+                json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18"}})
+            }
             Some("notifications/initialized") => continue,
             Some("tools/list") => {
                 let mut tools = vec![json!({
@@ -53,7 +55,10 @@ async fn scripted_server(stream: tokio::io::DuplexStream) {
                 }});
                 let mut out = response.to_string();
                 out.push('\n');
-                out.push_str(&json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"}).to_string());
+                out.push_str(
+                    &json!({"jsonrpc":"2.0","method":"notifications/tools/list_changed"})
+                        .to_string(),
+                );
                 out.push('\n');
                 write.write_all(out.as_bytes()).await.unwrap();
                 continue;
@@ -120,7 +125,11 @@ async fn first_use_screen_then_trust_then_sanitized_traffic() {
     ));
 
     // 4. A call round-trips and is enveloped with per-tool provenance.
-    let result = run(&tool, json!({"server": "docs", "tool": "echo", "arguments": {"msg": "hi"}})).await;
+    let result = run(
+        &tool,
+        json!({"server": "docs", "tool": "echo", "arguments": {"msg": "hi"}}),
+    )
+    .await;
     assert!(!result.is_error);
     assert!(result.content.contains("echo: hi"));
     assert!(result.content.contains("source=\"mcp:docs/echo\""));

@@ -47,7 +47,10 @@ impl SseAssembler for Assembler {
                 Ok(vec![])
             }
             "error" => {
-                let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("unknown");
+                let msg = v
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
                 Err(ProviderError::Http {
                     status: 200,
                     message: format!("in-stream error: {msg}"),
@@ -69,7 +72,11 @@ impl Assembler {
     fn on_block_start(&mut self, v: &Value) -> StreamEvent {
         let index = index_of(v);
         let block = v.get("content_block").cloned().unwrap_or(Value::Null);
-        let kind = block.get("type").and_then(Value::as_str).unwrap_or("").to_string();
+        let kind = block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         if self.blocks.len() <= index {
             self.blocks.resize(index + 1, Value::Null);
         }
@@ -80,7 +87,13 @@ impl Assembler {
     fn on_block_delta(&mut self, v: &Value) -> Vec<StreamEvent> {
         let index = index_of(v);
         let delta = v.get("delta").cloned().unwrap_or(Value::Null);
-        let text_of = |field: &str| delta.get(field).and_then(Value::as_str).unwrap_or("").to_string();
+        let text_of = |field: &str| {
+            delta
+                .get(field)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
         match delta.get("type").and_then(Value::as_str).unwrap_or("") {
             "text_delta" => {
                 let text = text_of("text");
@@ -136,7 +149,12 @@ impl Assembler {
         self.done = Some(StreamEvent::Completed {
             stop: self.stop.unwrap_or(StopReason::EndTurn),
             usage: self.usage,
-            blocks: self.blocks.iter().filter(|b| !b.is_null()).cloned().collect(),
+            blocks: self
+                .blocks
+                .iter()
+                .filter(|b| !b.is_null())
+                .cloned()
+                .collect(),
         });
     }
 
@@ -152,7 +170,6 @@ impl Assembler {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,18 +181,29 @@ mod tests {
         // A realistic stream, deliberately split mid-line across chunks.
         let wire = concat!(
             "event: message_start\n",
-            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3}}}"#, "\n\n",
+            r#"data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":3}}}"#,
+            "\n\n",
             "event: content_block_start\n",
-            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#, "\n\n",
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#, "\n",
-            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}"#, "\n",
-            r#"data: {"type":"content_block_stop","index":0}"#, "\n",
-            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read","input":{}}}"#, "\n",
-            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#, "\n",
-            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"a.rs\"}"}}"#, "\n",
-            r#"data: {"type":"content_block_stop","index":1}"#, "\n",
-            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#, "\n",
-            r#"data: {"type":"message_stop"}"#, "\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            "\n\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            "\n",
+            r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read","input":{}}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"a.rs\"}"}}"#,
+            "\n",
+            r#"data: {"type":"content_block_stop","index":1}"#,
+            "\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#,
+            "\n",
+            r#"data: {"type":"message_stop"}"#,
+            "\n",
         );
         let bytes = wire.as_bytes();
         let mut events = Vec::new();
@@ -186,7 +214,12 @@ mod tests {
             }
         }
         let done = a.finish().expect("completed");
-        let StreamEvent::Completed { stop, usage, blocks } = done else {
+        let StreamEvent::Completed {
+            stop,
+            usage,
+            blocks,
+        } = done
+        else {
             panic!("wrong terminal event")
         };
         assert_eq!(stop, StopReason::ToolUse);
@@ -197,6 +230,8 @@ mod tests {
         assert_eq!(blocks[0]["text"], "Hello");
         assert_eq!(blocks[1]["input"]["path"], "a.rs");
         // Delta events surfaced for display.
-        assert!(events.iter().any(|e| matches!(e, StreamEvent::TextDelta { .. })));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { .. })));
     }
 }

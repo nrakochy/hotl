@@ -15,7 +15,9 @@ pub fn gc_main(args: &[String]) -> i32 {
 
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
     let policy = RetentionPolicy {
-        max_age: flag_days.or(cfg.retention.max_age_days).map(|d| Duration::from_secs(d * 86_400)),
+        max_age: flag_days
+            .or(cfg.retention.max_age_days)
+            .map(|d| Duration::from_secs(d * 86_400)),
         max_sessions: flag_keep.or(cfg.retention.max_sessions),
     };
 
@@ -54,7 +56,9 @@ pub fn gc_main(args: &[String]) -> i32 {
 /// live server removes its own socket on exit; this catches crashed ones.
 fn sweep_dead_sockets(dry_run: bool) -> usize {
     let run = crate::session_server::run_dir();
-    let Ok(entries) = std::fs::read_dir(&run) else { return 0 };
+    let Ok(entries) = std::fs::read_dir(&run) else {
+        return 0;
+    };
     let mut removed = 0;
     for e in entries.flatten() {
         let p = e.path();
@@ -77,7 +81,10 @@ fn sweep_dead_sockets(dry_run: bool) -> usize {
 pub fn auto_gc(config_dir: &std::path::Path) {
     let cfg = crate::config::Config::load(config_dir);
     let policy = RetentionPolicy {
-        max_age: cfg.retention.max_age_days.map(|d| Duration::from_secs(d * 86_400)),
+        max_age: cfg
+            .retention
+            .max_age_days
+            .map(|d| Duration::from_secs(d * 86_400)),
         max_sessions: cfg.retention.max_sessions,
     };
     if policy.is_noop() {
@@ -95,7 +102,10 @@ fn data_dir() -> std::path::PathBuf {
 }
 
 fn flag_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).map(String::as_str)
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .map(String::as_str)
 }
 
 fn human_bytes(n: u64) -> String {

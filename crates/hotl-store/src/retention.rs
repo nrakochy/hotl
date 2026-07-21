@@ -52,11 +52,16 @@ pub fn gc(data_dir: &Path, policy: &RetentionPolicy, dry_run: bool) -> GcReport 
     let sessions = crate::list_sessions(&sessions_dir);
     let now = SystemTime::now();
 
-    let mut report = GcReport { dry_run, ..Default::default() };
+    let mut report = GcReport {
+        dry_run,
+        ..Default::default()
+    };
     for (idx, (id, log_path, modified)) in sessions.iter().enumerate() {
-        let too_old = policy
-            .max_age
-            .is_some_and(|max| now.duration_since(*modified).map(|age| age > max).unwrap_or(false));
+        let too_old = policy.max_age.is_some_and(|max| {
+            now.duration_since(*modified)
+                .map(|age| age > max)
+                .unwrap_or(false)
+        });
         let over_count = policy.max_sessions.is_some_and(|keep| idx >= keep);
         if !too_old && !over_count {
             continue;
@@ -68,7 +73,10 @@ pub fn gc(data_dir: &Path, policy: &RetentionPolicy, dry_run: bool) -> GcReport 
                 remove(p);
             }
         }
-        report.pruned.push(PrunedSession { id: id.clone(), bytes });
+        report.pruned.push(PrunedSession {
+            id: id.clone(),
+            bytes,
+        });
     }
     report
 }
@@ -84,7 +92,9 @@ fn session_paths(log_path: &Path, shadow_dir: &Path, id: &str) -> Vec<PathBuf> {
 }
 
 fn dir_or_file_size(p: &Path) -> u64 {
-    let Ok(meta) = std::fs::symlink_metadata(p) else { return 0 };
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
     if meta.is_dir() {
         std::fs::read_dir(p)
             .map(|rd| rd.flatten().map(|e| dir_or_file_size(&e.path())).sum())
@@ -95,8 +105,14 @@ fn dir_or_file_size(p: &Path) -> u64 {
 }
 
 fn remove(p: &Path) {
-    let Ok(meta) = std::fs::symlink_metadata(p) else { return };
-    let _ = if meta.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+    let Ok(meta) = std::fs::symlink_metadata(p) else {
+        return;
+    };
+    let _ = if meta.is_dir() {
+        std::fs::remove_dir_all(p)
+    } else {
+        std::fs::remove_file(p)
+    };
 }
 
 #[cfg(test)]
@@ -123,13 +139,18 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::create_dir_all(&shadow).unwrap();
 
-        let ids: Vec<String> = (0..3).map(|_| {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            make_session(&sessions, &shadow)
-        }).collect();
+        let ids: Vec<String> = (0..3)
+            .map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                make_session(&sessions, &shadow)
+            })
+            .collect();
 
         // Keep the newest 1 → the two oldest are pruned.
-        let policy = RetentionPolicy { max_sessions: Some(1), max_age: None };
+        let policy = RetentionPolicy {
+            max_sessions: Some(1),
+            max_age: None,
+        };
         let report = gc(data, &policy, false);
         assert_eq!(report.pruned.len(), 2, "two oldest pruned");
         // The newest survives with its blobs + shadow; the oldest are gone.
@@ -137,8 +158,14 @@ mod tests {
         assert!(sessions.join(format!("{newest}.jsonl")).exists());
         for pruned in &report.pruned {
             assert!(!sessions.join(format!("{}.jsonl", pruned.id)).exists());
-            assert!(!sessions.join(format!("{}.blobs", pruned.id)).exists(), "blob dir pruned");
-            assert!(!shadow.join(format!("{}.git", pruned.id)).exists(), "shadow repo pruned");
+            assert!(
+                !sessions.join(format!("{}.blobs", pruned.id)).exists(),
+                "blob dir pruned"
+            );
+            assert!(
+                !shadow.join(format!("{}.git", pruned.id)).exists(),
+                "shadow repo pruned"
+            );
         }
     }
 
@@ -149,11 +176,17 @@ mod tests {
         std::fs::create_dir_all(data.join("sessions")).unwrap();
         std::fs::create_dir_all(data.join("shadow")).unwrap();
         let id = make_session(&data.join("sessions"), &data.join("shadow"));
-        let policy = RetentionPolicy { max_sessions: Some(0), max_age: None };
+        let policy = RetentionPolicy {
+            max_sessions: Some(0),
+            max_age: None,
+        };
         let report = gc(data, &policy, true);
         assert_eq!(report.pruned.len(), 1);
         assert!(report.dry_run);
-        assert!(data.join(format!("sessions/{id}.jsonl")).exists(), "dry-run kept the file");
+        assert!(
+            data.join(format!("sessions/{id}.jsonl")).exists(),
+            "dry-run kept the file"
+        );
     }
 
     #[test]

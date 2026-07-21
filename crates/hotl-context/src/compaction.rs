@@ -38,7 +38,10 @@ pub fn plan(items: &[Item], tail_budget: u64) -> Option<Plan> {
             break;
         }
     }
-    Some(Plan { prefix_end, kept_from: chosen })
+    Some(Plan {
+        prefix_end,
+        kept_from: chosen,
+    })
 }
 
 /// The new projection: preserved prefix + digest + verbatim tail.
@@ -90,7 +93,11 @@ pub fn summarize_prompt(folded: &[Item]) -> String {
         match item {
             Item::System { .. } | Item::Unknown => {}
             Item::User { text, synthetic } => {
-                let label = if synthetic.is_some() { "user (injected)" } else { "user" };
+                let label = if synthetic.is_some() {
+                    "user (injected)"
+                } else {
+                    "user"
+                };
                 out.push_str(&format!("[{label}] {text}\n"));
             }
             Item::Assistant { blocks } => {
@@ -157,10 +164,15 @@ mod tests {
     use serde_json::json;
 
     fn user(text: &str) -> Item {
-        Item::User { text: text.into(), synthetic: None }
+        Item::User {
+            text: text.into(),
+            synthetic: None,
+        }
     }
     fn assistant(text: &str) -> Item {
-        Item::Assistant { blocks: vec![json!({"type":"text","text":text})] }
+        Item::Assistant {
+            blocks: vec![json!({"type":"text","text":text})],
+        }
     }
     fn results(content: &str) -> Item {
         Item::ToolResults {
@@ -221,11 +233,17 @@ mod tests {
         let applied = apply(&with_history, &p, &digest);
         assert!(matches!(
             applied[0],
-            Item::User { synthetic: Some(SyntheticReason::ProjectInstructions), .. }
+            Item::User {
+                synthetic: Some(SyntheticReason::ProjectInstructions),
+                ..
+            }
         ));
         assert!(matches!(
             applied[1],
-            Item::User { synthetic: Some(SyntheticReason::CompactionSummary), .. }
+            Item::User {
+                synthetic: Some(SyntheticReason::CompactionSummary),
+                ..
+            }
         ));
     }
 

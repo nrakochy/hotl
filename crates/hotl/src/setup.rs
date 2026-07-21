@@ -182,8 +182,14 @@ pub fn is_newer(current: &str, latest: &str) -> bool {
 
 fn parts(v: &str) -> (u64, u64, u64) {
     let v = v.trim_start_matches('v');
-    let mut it = v.split(['.', '-', '+']).map(|p| p.parse::<u64>().unwrap_or(0));
-    (it.next().unwrap_or(0), it.next().unwrap_or(0), it.next().unwrap_or(0))
+    let mut it = v
+        .split(['.', '-', '+'])
+        .map(|p| p.parse::<u64>().unwrap_or(0));
+    (
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+        it.next().unwrap_or(0),
+    )
 }
 
 #[cfg(test)]
@@ -199,10 +205,15 @@ mod tests {
         // Second run without --force keeps the (possibly edited) file.
         std::fs::write(cfg.join("config.toml"), "# edited\n").unwrap();
         setup_main(&cfg, false);
-        assert_eq!(std::fs::read_to_string(cfg.join("config.toml")).unwrap(), "# edited\n");
+        assert_eq!(
+            std::fs::read_to_string(cfg.join("config.toml")).unwrap(),
+            "# edited\n"
+        );
         // --force overwrites.
         setup_main(&cfg, true);
-        assert!(std::fs::read_to_string(cfg.join("config.toml")).unwrap().contains("allow"));
+        assert!(std::fs::read_to_string(cfg.join("config.toml"))
+            .unwrap()
+            .contains("allow"));
     }
 
     #[test]

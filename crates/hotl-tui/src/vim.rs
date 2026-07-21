@@ -107,7 +107,11 @@ impl Editor {
                 self.pending = Pending::default();
                 EditorEvent::None
             }
-            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
                 let (row, col) = self.cursor;
                 let rest = char_split_off(&mut self.lines[row], col);
                 self.lines.insert(row + 1, rest);
@@ -328,11 +332,19 @@ impl Editor {
 
     fn vertical(&mut self, c: char) -> EditorEvent {
         if self.is_empty() {
-            return if c == 'j' { EditorEvent::ScrollDown } else { EditorEvent::ScrollUp };
+            return if c == 'j' {
+                EditorEvent::ScrollDown
+            } else {
+                EditorEvent::ScrollUp
+            };
         }
         let n = self.pending.count.take().unwrap_or(1) as usize;
         let (row, col) = self.cursor;
-        let row = if c == 'j' { (row + n).min(self.lines.len() - 1) } else { row.saturating_sub(n) };
+        let row = if c == 'j' {
+            (row + n).min(self.lines.len() - 1)
+        } else {
+            row.saturating_sub(n)
+        };
         self.cursor = (row, col.min(char_len(&self.lines[row]).saturating_sub(1)));
         EditorEvent::None
     }

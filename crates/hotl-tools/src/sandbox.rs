@@ -95,7 +95,13 @@ pub fn build_command(
     // closed. For Off, no env — the kernel does all the work.
     if let EgressState::Proxy(port) = egress {
         let proxy = format!("http://127.0.0.1:{port}");
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"] {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+        ] {
             cmd.env(key, &proxy);
         }
         for key in ["NO_PROXY", "no_proxy"] {
@@ -215,7 +221,9 @@ fn landlock_command(command: &str, egress: &EgressState) -> tokio::process::Comm
         let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let tmp = canon(std::env::temp_dir());
         let confine_network = matches!(egress, EgressState::Off | EgressState::Proxy(_));
-        let mut attr = Ruleset::default().handle_access(AccessFs::from_all(abi)).ok()?;
+        let mut attr = Ruleset::default()
+            .handle_access(AccessFs::from_all(abi))
+            .ok()?;
         if confine_network {
             // HardRequirement: on a kernel without the net ABI this fails,
             // build_ruleset returns None, and the child refuses to exec
@@ -229,7 +237,10 @@ fn landlock_command(command: &str, egress: &EgressState) -> tokio::process::Comm
         let mut ruleset = attr.create().ok()?;
         // Read + execute everywhere.
         ruleset = ruleset
-            .add_rule(landlock::PathBeneath::new(PathFd::new("/").ok()?, AccessFs::from_read(abi)))
+            .add_rule(landlock::PathBeneath::new(
+                PathFd::new("/").ok()?,
+                AccessFs::from_read(abi),
+            ))
             .ok()?;
         // Full access under cwd, tmp, /dev.
         for p in [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")] {
@@ -293,9 +304,20 @@ mod env_tests {
         let envs: Vec<_> = cmd
             .as_std()
             .get_envs()
-            .map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned())))
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
             .collect();
-        for key in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"] {
+        for key in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+        ] {
             assert!(
                 envs.contains(&(key.to_string(), Some("http://127.0.0.1:9123".to_string()))),
                 "{key} must point at the proxy"
@@ -310,7 +332,11 @@ mod env_tests {
         // Off and Open set nothing (kernel-only / unchanged behavior).
         for egress in [EgressState::Off, EgressState::Open] {
             let cmd = build_command("true", &status, &egress);
-            assert_eq!(cmd.as_std().get_envs().count(), 0, "{egress:?} must not touch env");
+            assert_eq!(
+                cmd.as_std().get_envs().count(),
+                0,
+                "{egress:?} must not touch env"
+            );
         }
     }
 }
@@ -325,7 +351,10 @@ mod tests {
 
     async fn run_with(cmd: &str, egress: &EgressState) -> std::process::Output {
         let status = probe();
-        assert!(matches!(status, SandboxStatus::Enforced("seatbelt")), "no seatbelt on this mac?");
+        assert!(
+            matches!(status, SandboxStatus::Enforced("seatbelt")),
+            "no seatbelt on this mac?"
+        );
         build_command(cmd, &status, egress)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -352,7 +381,10 @@ mod tests {
         // Confined: the same file-write clauses plus network confinement —
         // deny all, re-allow unix-domain sockets and loopback.
         let confined = seatbelt_profile(true);
-        assert!(confined.starts_with(&seatbelt_profile(false)), "file-write clauses unchanged");
+        assert!(
+            confined.starts_with(&seatbelt_profile(false)),
+            "file-write clauses unchanged"
+        );
         assert_eq!(
             confined.strip_prefix(&seatbelt_profile(false)).unwrap(),
             r#"(deny network*)
@@ -381,15 +413,26 @@ mod tests {
         // Outbound non-loopback connect: must not succeed. (On an offline
         // machine it also fails — that is the safe direction to assert.)
         let denied = run_with("nc -z -G 2 1.1.1.1 443", &EgressState::Off).await;
-        assert!(!denied.status.success(), "non-loopback connect must fail under egress off");
+        assert!(
+            !denied.status.success(),
+            "non-loopback connect must fail under egress off"
+        );
     }
 
     #[tokio::test]
     async fn seatbelt_confines_writes() {
         // Write inside cwd: allowed.
-        let inside = format!("touch ./.hotl-sbx-ok-{} && rm ./.hotl-sbx-ok-{}", std::process::id(), std::process::id());
+        let inside = format!(
+            "touch ./.hotl-sbx-ok-{} && rm ./.hotl-sbx-ok-{}",
+            std::process::id(),
+            std::process::id()
+        );
         let ok = run(&inside).await;
-        assert!(ok.status.success(), "cwd write should be allowed: {}", String::from_utf8_lossy(&ok.stderr));
+        assert!(
+            ok.status.success(),
+            "cwd write should be allowed: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
 
         // Write outside (HOME): denied by the floor.
         let home = std::env::var("HOME").expect("HOME");
@@ -400,7 +443,10 @@ mod tests {
         if leaked {
             std::fs::remove_file(&target).ok();
         }
-        assert!(!denied.status.success(), "write outside cwd must fail under the floor");
+        assert!(
+            !denied.status.success(),
+            "write outside cwd must fail under the floor"
+        );
         assert!(!leaked, "file must not exist outside the sandbox");
 
         // Reads outside stay allowed (floor is write-confinement).

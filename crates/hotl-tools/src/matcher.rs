@@ -9,7 +9,11 @@
 
 /// Byte range of the text to replace, or why none was chosen.
 pub enum Match {
-    Unique { start: usize, end: usize, exact: bool },
+    Unique {
+        start: usize,
+        end: usize,
+        exact: bool,
+    },
     None,
     Ambiguous(usize),
 }
@@ -18,7 +22,11 @@ pub fn find(content: &str, old: &str) -> Match {
     match content.match_indices(old).take(2).count() {
         1 => {
             let start = content.find(old).expect("counted above");
-            return Match::Unique { start, end: start + old.len(), exact: true };
+            return Match::Unique {
+                start,
+                end: start + old.len(),
+                exact: true,
+            };
         }
         n if n > 1 => return Match::Ambiguous(content.matches(old).count()),
         _ => {}
@@ -47,7 +55,10 @@ fn find_lines(content: &str, old: &str, normalize: fn(&str) -> String) -> Match 
         return Match::None;
     }
     // Normalize each content line once; windows then compare as slices.
-    let normalized: Vec<String> = content_lines.iter().map(|(text, ..)| normalize(text)).collect();
+    let normalized: Vec<String> = content_lines
+        .iter()
+        .map(|(text, ..)| normalize(text))
+        .collect();
     let mut found: Option<(usize, usize)> = None;
     let mut count = 0usize;
     for window_start in 0..=(content_lines.len() - old_lines.len()) {
@@ -60,7 +71,11 @@ fn find_lines(content: &str, old: &str, normalize: fn(&str) -> String) -> Match 
         }
     }
     match (count, found) {
-        (1, Some((start, end))) => Match::Unique { start, end, exact: false },
+        (1, Some((start, end))) => Match::Unique {
+            start,
+            end,
+            exact: false,
+        },
         (0, _) => Match::None,
         (n, _) => Match::Ambiguous(n),
     }

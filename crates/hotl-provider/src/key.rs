@@ -72,7 +72,10 @@ mod tests {
     use super::*;
 
     fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread().build().unwrap().block_on(f)
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
     }
 
     #[test]

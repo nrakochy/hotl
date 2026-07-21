@@ -75,10 +75,17 @@ impl Shadow {
         if !init.status.success() {
             return None;
         }
-        let shadow = Self { git_dir, work_tree: work_tree.to_path_buf() };
+        let shadow = Self {
+            git_dir,
+            work_tree: work_tree.to_path_buf(),
+        };
         std::fs::write(shadow.git_dir.join("info/exclude"), EXCLUDES).ok()?;
         // Record the work tree so `hotl undo` (a later process) can find it.
-        shadow.git(&["config", "hotl.worktree", &shadow.work_tree.display().to_string()])?;
+        shadow.git(&[
+            "config",
+            "hotl.worktree",
+            &shadow.work_tree.display().to_string(),
+        ])?;
         Some(shadow)
     }
 
@@ -116,19 +123,23 @@ impl Shadow {
             label,
         ])?;
         let out = self.git(&["rev-parse", "HEAD"])?;
-        out.status.success().then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     /// The most recent commit whose label starts with "pre " — the state
     /// before the agent's last mutating batch.
     pub fn latest_pre(&self) -> Option<(String, String)> {
         let out = self.git(&["log", "--format=%H %s"])?;
-        String::from_utf8_lossy(&out.stdout).lines().find_map(|line| {
-            let (hash, subject) = line.split_once(' ')?;
-            subject
-                .starts_with("pre ")
-                .then(|| (hash.to_string(), subject.to_string()))
-        })
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .find_map(|line| {
+                let (hash, subject) = line.split_once(' ')?;
+                subject
+                    .starts_with("pre ")
+                    .then(|| (hash.to_string(), subject.to_string()))
+            })
     }
 
     /// Files that differ between the current tree and `hash` (what a
@@ -144,7 +155,9 @@ impl Shadow {
             .lines()
             .map(String::from)
             .collect();
-        let out = self.git(&["checkout", "-q", hash, "--", "."]).ok_or("git checkout failed")?;
+        let out = self
+            .git(&["checkout", "-q", hash, "--", "."])
+            .ok_or("git checkout failed")?;
         if !out.status.success() {
             return Err(String::from_utf8_lossy(&out.stderr).into_owned());
         }
@@ -201,14 +214,23 @@ mod tests {
         shadow.snapshot("pre batch 1").expect("snapshot");
 
         let listing = std::process::Command::new("git")
-            .arg(format!("--git-dir={}", root.path().join("SEC.git").display()))
+            .arg(format!(
+                "--git-dir={}",
+                root.path().join("SEC.git").display()
+            ))
             .args(["ls-files"])
             .output()
             .unwrap();
         let tracked = String::from_utf8_lossy(&listing.stdout);
-        assert!(tracked.contains("main.rs"), "workspace source should snapshot");
+        assert!(
+            tracked.contains("main.rs"),
+            "workspace source should snapshot"
+        );
         assert!(!tracked.contains(".env"), ".env must be excluded (H-13)");
-        assert!(!tracked.contains("id_rsa"), "private keys must be excluded (H-13)");
+        assert!(
+            !tracked.contains("id_rsa"),
+            "private keys must be excluded (H-13)"
+        );
     }
 
     #[test]
@@ -235,7 +257,10 @@ mod tests {
         let (hash, label) = reopened.latest_pre().expect("pre commit");
         assert_eq!(label, "pre batch 1");
         let touched = reopened.restore(&hash).expect("restore");
-        assert_eq!(std::fs::read_to_string(work.path().join("a.txt")).unwrap(), "v1");
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("a.txt")).unwrap(),
+            "v1"
+        );
         // Created-after files survive (reported, not deleted) — documented.
         assert!(work.path().join("b.txt").exists());
         assert!(touched.iter().any(|f| f == "a.txt"), "touched: {touched:?}");

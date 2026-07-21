@@ -37,7 +37,13 @@ pub fn bg_main(prompt: Option<&str>) -> i32 {
     // Detach: no controlling terminal input, output to a log, own process
     // group so the shell's SIGHUP on exit doesn't reach it.
     cmd.stdin(Stdio::null())
-        .stdout(logfile.as_ref().and_then(|f| f.try_clone().ok()).map(Stdio::from).unwrap_or_else(Stdio::null))
+        .stdout(
+            logfile
+                .as_ref()
+                .and_then(|f| f.try_clone().ok())
+                .map(Stdio::from)
+                .unwrap_or_else(Stdio::null),
+        )
         .stderr(logfile.map(Stdio::from).unwrap_or_else(Stdio::null))
         .process_group(0);
 

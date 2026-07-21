@@ -56,12 +56,20 @@ fn matched_agent_name(command: &str, agent_names: &[String]) -> Option<String> {
     Some(name.clone())
 }
 
-pub fn agent_for(pane_pid: u32, procs: &ProcTable, agent_names: &[String]) -> Option<watch_types::Agent> {
+pub fn agent_for(
+    pane_pid: u32,
+    procs: &ProcTable,
+    agent_names: &[String],
+) -> Option<watch_types::Agent> {
     let mut stack = vec![pane_pid];
     while let Some(pid) = stack.pop() {
         if let Some(cmd) = procs.cmd.get(&pid) {
             if let Some(name) = matched_agent_name(cmd, agent_names) {
-                return Some(watch_types::Agent { name, pid, argv: cmd.clone() });
+                return Some(watch_types::Agent {
+                    name,
+                    pid,
+                    argv: cmd.clone(),
+                });
             }
         }
         if let Some(kids) = procs.children.get(&pid) {
@@ -75,7 +83,9 @@ use std::io;
 use std::process::Command;
 
 pub fn read_proc_table() -> io::Result<ProcTable> {
-    let out = Command::new("ps").args(["-axo", "pid,ppid,state,command"]).output()?;
+    let out = Command::new("ps")
+        .args(["-axo", "pid,ppid,state,command"])
+        .output()?;
     if !out.status.success() {
         return Err(io::Error::other("ps failed"));
     }
@@ -94,13 +104,20 @@ mod tests {
 80031  3244 S    -zsh";
 
     fn names() -> Vec<String> {
-        vec!["claude".to_string(), "codex".to_string(), "hotl".to_string()]
+        vec![
+            "claude".to_string(),
+            "codex".to_string(),
+            "hotl".to_string(),
+        ]
     }
 
     #[test]
     fn parses_ps_rows() {
         let t = parse_ps(PS);
-        assert_eq!(t.cmd.get(&70060).unwrap(), "claude --permission-mode bypassPermissions");
+        assert_eq!(
+            t.cmd.get(&70060).unwrap(),
+            "claude --permission-mode bypassPermissions"
+        );
         assert_eq!(t.children.get(&30578).unwrap(), &vec![70060]);
         assert_eq!(t.children.get(&3244).unwrap().len(), 2);
     }
@@ -130,7 +147,10 @@ mod tests {
     #[test]
     fn matched_agent_name_handles_path_and_login_shell() {
         let n = names();
-        assert_eq!(matched_agent_name("/opt/homebrew/bin/claude --foo", &n).as_deref(), Some("claude"));
+        assert_eq!(
+            matched_agent_name("/opt/homebrew/bin/claude --foo", &n).as_deref(),
+            Some("claude")
+        );
         assert_eq!(matched_agent_name("-zsh", &n), None);
         assert_eq!(matched_agent_name("node server.js", &n), None);
     }
@@ -139,11 +159,23 @@ mod tests {
     fn bare_hotl_is_an_agent() {
         let n = names();
         assert_eq!(matched_agent_name("hotl", &n).as_deref(), Some("hotl"));
-        assert_eq!(matched_agent_name("/usr/local/bin/hotl", &n).as_deref(), Some("hotl"));
-        assert_eq!(matched_agent_name("hotl resume abc123", &n).as_deref(), Some("hotl"));
-        assert_eq!(matched_agent_name("hotl attach bg-12345", &n).as_deref(), Some("hotl"));
+        assert_eq!(
+            matched_agent_name("/usr/local/bin/hotl", &n).as_deref(),
+            Some("hotl")
+        );
+        assert_eq!(
+            matched_agent_name("hotl resume abc123", &n).as_deref(),
+            Some("hotl")
+        );
+        assert_eq!(
+            matched_agent_name("hotl attach bg-12345", &n).as_deref(),
+            Some("hotl")
+        );
         // Flags before a prompt are still the agent (`hotl -p "…"`).
-        assert_eq!(matched_agent_name("hotl -p do the thing", &n).as_deref(), Some("hotl"));
+        assert_eq!(
+            matched_agent_name("hotl -p do the thing", &n).as_deref(),
+            Some("hotl")
+        );
     }
 
     #[test]
@@ -162,7 +194,10 @@ mod tests {
     fn subcommand_filter_only_applies_to_hotl() {
         // Another agent binary with a "watch" argument still matches.
         let n = names();
-        assert_eq!(matched_agent_name("claude watch", &n).as_deref(), Some("claude"));
+        assert_eq!(
+            matched_agent_name("claude watch", &n).as_deref(),
+            Some("claude")
+        );
     }
 
     #[test]

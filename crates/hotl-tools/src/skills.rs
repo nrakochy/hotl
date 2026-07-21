@@ -36,7 +36,9 @@ impl SkillTool {
 }
 
 fn list_skills(dir: &Path) -> Vec<(String, String)> {
-    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
     let mut out: Vec<(String, String)> = entries
         .flatten()
         .filter_map(|e| {
@@ -89,7 +91,8 @@ impl SkillTool {
                 .collect::<Vec<_>>()
                 .join("\n");
             return ToolOutcome::ok(if listing.is_empty() {
-                "No skills saved. The user can add markdown files under the skills config dir.".into()
+                "No skills saved. The user can add markdown files under the skills config dir."
+                    .into()
             } else {
                 listing
             });
@@ -112,7 +115,11 @@ impl SkillTool {
                     list_skills(&self.dir).into_iter().map(|(n, _)| n).collect();
                 ToolOutcome::err(format!(
                     "No skill named `{name}`. Available: {}.",
-                    if known.is_empty() { "(none)".into() } else { known.join(", ") }
+                    if known.is_empty() {
+                        "(none)".into()
+                    } else {
+                        known.join(", ")
+                    }
                 ))
             }
         }
@@ -128,7 +135,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let skills = dir.path().join("skills");
         std::fs::create_dir_all(&skills).unwrap();
-        std::fs::write(skills.join("deploy.md"), "# Deploy checklist\n1. tag\n2. push\n").unwrap();
+        std::fs::write(
+            skills.join("deploy.md"),
+            "# Deploy checklist\n1. tag\n2. push\n",
+        )
+        .unwrap();
 
         assert!(SkillTool::has_skills(dir.path()));
         let tool = SkillTool::new(dir.path());
@@ -139,7 +150,9 @@ mod tests {
 
         let loaded = tool.run_impl(&json!({"name": "deploy"}));
         assert!(!loaded.is_error);
-        assert!(loaded.content.contains("1. tag") && loaded.content.contains("trust=\"untrusted\""));
+        assert!(
+            loaded.content.contains("1. tag") && loaded.content.contains("trust=\"untrusted\"")
+        );
 
         assert!(tool.run_impl(&json!({"name": "../secrets"})).is_error);
         let missing = tool.run_impl(&json!({"name": "nope"}));

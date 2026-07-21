@@ -14,9 +14,14 @@ pub const MAX_RETRIES: u32 = 2;
 /// Strip a ```json … ``` (or bare ``` … ```) fence, returning the inner text.
 pub fn strip_fences(text: &str) -> &str {
     let t = text.trim();
-    let Some(after) = t.strip_prefix("```") else { return t };
+    let Some(after) = t.strip_prefix("```") else {
+        return t;
+    };
     // Drop an optional language tag on the first line.
-    let after = after.split_once('\n').map(|(_, rest)| rest).unwrap_or(after);
+    let after = after
+        .split_once('\n')
+        .map(|(_, rest)| rest)
+        .unwrap_or(after);
     after.strip_suffix("```").unwrap_or(after).trim()
 }
 
@@ -24,8 +29,8 @@ pub fn strip_fences(text: &str) -> &str {
 /// model reads it on retry): parse errors and up to 3 schema violations.
 pub fn validate(schema: &jsonschema::Validator, text: &str) -> Result<Value, String> {
     let inner = strip_fences(text);
-    let value: Value = serde_json::from_str(inner)
-        .map_err(|e| format!("The reply was not valid JSON: {e}"))?;
+    let value: Value =
+        serde_json::from_str(inner).map_err(|e| format!("The reply was not valid JSON: {e}"))?;
     let errors: Vec<String> = schema
         .iter_errors(&value)
         .take(3)
@@ -34,7 +39,10 @@ pub fn validate(schema: &jsonschema::Validator, text: &str) -> Result<Value, Str
     if errors.is_empty() {
         Ok(value)
     } else {
-        Err(format!("The JSON did not match the schema:\n{}", errors.join("\n")))
+        Err(format!(
+            "The JSON did not match the schema:\n{}",
+            errors.join("\n")
+        ))
     }
 }
 
@@ -74,7 +82,11 @@ pub async fn run_structured(
                     )
                     .await;
             }
-            Err(e) => return Err(format!("output did not validate after {max_retries} retries: {e}")),
+            Err(e) => {
+                return Err(format!(
+                    "output did not validate after {max_retries} retries: {e}"
+                ))
+            }
         }
     }
 }
@@ -115,14 +127,19 @@ mod tests {
         let err = validate(&v, r#"{"nome": "x"}"#).unwrap_err();
         assert!(err.contains("name"), "names the violation: {err}");
         assert!(validate(&v, "not json").unwrap_err().contains("JSON"));
-        assert!(validate(&v, "```json\n{\"name\":\"x\"}\n```").is_ok(), "fences stripped");
+        assert!(
+            validate(&v, "```json\n{\"name\":\"x\"}\n```").is_ok(),
+            "fences stripped"
+        );
         assert_eq!(validate(&v, r#"{"name":"ok"}"#).unwrap()["name"], "ok");
     }
 
     #[test]
     fn contract_item_is_tagged() {
         let item = contract_item(&json!({"type":"object"}));
-        let Item::User { text, synthetic } = item else { panic!() };
+        let Item::User { text, synthetic } = item else {
+            panic!()
+        };
         assert_eq!(synthetic, Some(SyntheticReason::SystemReminder));
         assert!(text.contains("output-contract"));
     }
@@ -155,17 +172,25 @@ mod tests {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
-            config: EngineConfig { max_turns: 4, ..Default::default() },
+            config: EngineConfig {
+                max_turns: 4,
+                ..Default::default()
+            },
         });
         let schema = json!({"type":"object","required":["name"]});
-        let out = run_structured(&mut handle, &schema, "give me a name", 2).await.unwrap();
+        let out = run_structured(&mut handle, &schema, "give me a name", 2)
+            .await
+            .unwrap();
         assert_eq!(out["name"], "ok");
         // The retry request carried tagged feedback, not bare user text.
         let second = &provider.requests()[1];
         assert!(
             second.items.iter().any(|i| matches!(
                 i,
-                Item::User { synthetic: Some(SyntheticReason::RetryFeedback), .. }
+                Item::User {
+                    synthetic: Some(SyntheticReason::RetryFeedback),
+                    ..
+                }
             )),
             "the retry must feed back as a tagged RetryFeedback item"
         );

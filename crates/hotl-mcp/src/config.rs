@@ -8,7 +8,6 @@
 //! description = "project documentation search"
 //! ```
 
-
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
