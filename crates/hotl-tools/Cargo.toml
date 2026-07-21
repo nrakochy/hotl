@@ -9,6 +9,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# Compile-time permission enforcement: with this on, mode=auto cannot exist
+# at runtime (Rules::with_mode coerces it to Ask — see rules.rs).
+security-enforced = []
+
 [dependencies]
 hotl-provider = { path = "../hotl-provider", version = "0.1.2" }
 serde = { workspace = true }

@@ -455,7 +455,7 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     if let Some(hint) = crate::setup::first_run_hint(&scaffold.config_dir) {
         eprintln!("hotl: {hint}");
     }
-    print_banner(&scaffold.model, &session_id, &scaffold.sandbox_status);
+    print_banner(&scaffold.model, &session_id, &scaffold.sandbox_status, &scaffold.rules);
     surface.repl().await
 }
 
@@ -688,25 +688,98 @@ fn load_hooks(cfg: &crate::config::Config) -> Option<Arc<dyn hotl_engine::hooks:
         .map(|h| Arc::new(h) as Arc<dyn hotl_engine::hooks::Hooks>)
 }
 
-/// Allow-rules from config.toml `[[allow]]`.
+pub(crate) const ADMIN_RULES_PATH: &str = "/etc/hotl/preapproved.toml";
+
+/// Allow/deny rules from config.toml plus the admin tier, with the resolved
+/// permission mode. Prints its startup warnings — posture never changes
+/// silently.
 fn load_rules(cfg: &crate::config::Config) -> Arc<Rules> {
-    let rules = match cfg.allow_toml() {
+    let admin_path =
+        std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| ADMIN_RULES_PATH.into());
+    let env_mode = std::env::var("HOTL_PERMISSIONS").ok();
+    let (rules, warnings) = load_rules_with(
+        cfg,
+        Some(std::path::Path::new(&admin_path)),
+        env_mode.as_deref(),
+    );
+    for w in warnings {
+        eprintln!("hotl: {w}");
+    }
+    rules
+}
+
+/// The testable core of [`load_rules`]: explicit admin path + env mode, no
+/// process-global reads. Returns the rules and the warnings to print.
+fn load_rules_with(
+    cfg: &crate::config::Config,
+    admin_path: Option<&std::path::Path>,
+    env_mode: Option<&str>,
+) -> (Arc<Rules>, Vec<String>) {
+    let mut warnings = Vec::new();
+    let mut rules = match cfg.allow_toml() {
         Some(t) => Rules::from_toml(&t).unwrap_or_else(|e| {
-            eprintln!("hotl: config.toml [[allow]] ignored: {e}");
+            warnings.push(format!("config.toml [[allow]] ignored: {e}"));
             Rules::default()
         }),
         None => Rules::default(),
     };
-    Arc::new(rules)
+    let (mode, mode_warning) = cfg.permissions.resolve(env_mode);
+    warnings.extend(mode_warning);
+    if hotl_tools::rules::enforced_build() && mode == hotl_tools::rules::PermissionMode::Auto {
+        warnings.push(
+            "permissions.mode=auto requested, but this is a security-enforced build — \
+             per-action asks stay on"
+                .into(),
+        );
+    }
+    rules = rules.with_mode(mode); // enforced builds coerce Auto→Ask inside
+    if let Some(path) = admin_path {
+        match load_admin(path) {
+            Ok(Some(admin)) => rules.merge_admin(admin),
+            Ok(None) => {}
+            Err(why) => warnings.push(format!(
+                "preapproved rules at {} refused: {why}",
+                path.display()
+            )),
+        }
+    }
+    (Arc::new(rules), warnings)
 }
 
-fn print_banner(model: &str, session_id: &str, status: &sandbox::SandboxStatus) {
+/// Read + trust-check the admin file. `Ok(None)` = file absent (normal).
+pub(crate) fn load_admin(
+    path: &std::path::Path,
+) -> Result<Option<hotl_tools::rules::AdminRules>, String> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        return Ok(None);
+    };
+    hotl_tools::rules::admin_file_trusted(meta.uid(), meta.mode())?;
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    hotl_tools::rules::AdminRules::from_toml(&text)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// Startup visibility: auto mode is never silent (design §Config).
+fn permissions_label(rules: &Rules) -> &'static str {
+    if hotl_tools::rules::enforced_build() {
+        "permissions:enforced"
+    } else if rules.mode() == hotl_tools::rules::PermissionMode::Auto {
+        "permissions:auto"
+    } else {
+        "permissions:ask"
+    }
+}
+
+fn print_banner(model: &str, session_id: &str, status: &sandbox::SandboxStatus, rules: &Rules) {
     println!(
-        "hotl · {model} · session {session_id} · {}",
+        "hotl · {model} · session {session_id} · {} · {}",
         match status {
             sandbox::SandboxStatus::Enforced(m) => format!("sandbox:{m}"),
             other => other.label(),
-        }
+        },
+        permissions_label(rules)
     );
     println!("type to prompt · type mid-turn to steer · ctrl-c interrupts · ctrl-d exits");
 }
@@ -1302,6 +1375,35 @@ pub(crate) fn sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_rules_merges_trusted_admin_file_and_reports_untrusted() {
+        let dir = tempfile::tempdir().unwrap();
+        let admin = dir.path().join("preapproved.toml");
+        std::fs::write(&admin, "[[allow]]\ntool = \"bash\"\nprefix = \"git \"\n").unwrap();
+        // World-writable → refused with a warning naming the file.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let (rules, warnings) =
+            load_rules_with(&crate::config::Config::default(), Some(&admin), None);
+        assert!(
+            warnings.iter().any(|w| w.contains("preapproved")),
+            "warnings: {warnings:?}"
+        );
+        // Refused file contributes nothing; mode default auto still applies.
+        assert!(matches!(
+            rules.evaluate("bash", &serde_json::json!({"command": "git status"}), true, false),
+            hotl_tools::rules::Verdict::Auto { rule } if rule == "permissions.mode=auto"
+        ));
+        // Absent file: no warning, auto default.
+        let (_, warnings) =
+            load_rules_with(&crate::config::Config::default(), Some(&dir.path().join("nope.toml")), None);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+        // Explicit ask via the env seam.
+        let (rules, _) =
+            load_rules_with(&crate::config::Config::default(), None, Some("ask"));
+        assert_eq!(rules.mode(), hotl_tools::rules::PermissionMode::Ask);
+    }
 
     /// In-memory `SecretStore` for tests — no real env mutation, no races
     /// between tests running in parallel.

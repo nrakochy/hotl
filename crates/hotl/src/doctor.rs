@@ -51,6 +51,7 @@ pub fn doctor_main() -> i32 {
         provider_check(),
         sandbox_check(),
         config_check(&config_dir),
+        permissions_check(&config_dir),
         rules_check(&config_dir),
         sessions_check(&sessions_dir),
         memory_check(&config_dir),
@@ -197,6 +198,33 @@ fn config_check(config_dir: &Path) -> Check {
             cfg.display()
         ))
     }
+}
+
+fn permissions_check(config_dir: &Path) -> Check {
+    let cfg = crate::config::Config::load(config_dir);
+    let (mode, warning) = cfg
+        .permissions
+        .resolve(std::env::var("HOTL_PERMISSIONS").ok().as_deref());
+    if let Some(w) = warning {
+        return warn(format!("permissions: {w}"));
+    }
+    if hotl_tools::rules::enforced_build() {
+        return ok("permissions: enforced (build) — mode config is ignored".into());
+    }
+    let admin = std::env::var("HOTL_PREAPPROVED")
+        .unwrap_or_else(|_| crate::agent::ADMIN_RULES_PATH.into());
+    let admin_note = match crate::agent::load_admin(Path::new(&admin)) {
+        Ok(Some(_)) => format!(" · admin rules: {admin}"),
+        Ok(None) => String::new(),
+        Err(why) => return warn(format!("permissions: admin file {admin} refused — {why}")),
+    };
+    let mode_word = match mode {
+        hotl_tools::rules::PermissionMode::Auto => "auto",
+        hotl_tools::rules::PermissionMode::Ask => "ask",
+    };
+    ok(format!(
+        "permissions: {mode_word} (protected paths always ask){admin_note}"
+    ))
 }
 
 fn rules_check(config_dir: &Path) -> Check {

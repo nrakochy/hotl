@@ -35,6 +35,11 @@ pub const DEFAULT_CONFIG: &str = "\
 # ask_timeout_secs = 300     # 0 = wait forever for a permission answer
 # sandbox = true             # false disables the bash sandbox floor
 
+[permissions]
+mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.
+                # \"ask\" = approve every mutating/executing call. A
+                # security-enforced build ignores this key entirely.
+
 [network]
 # Egress for bash commands: \"open\" (default), \"off\" (loopback + unix sockets
 # only), or \"allowlist\" (loopback + the hosts below, via a local proxy).

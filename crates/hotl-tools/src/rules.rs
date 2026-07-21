@@ -69,6 +69,12 @@ impl AdminRules {
     }
 }
 
+/// True when compiled with the `security-enforced` feature: the build where
+/// per-action asks cannot be disabled by any config.
+pub fn enforced_build() -> bool {
+    cfg!(feature = "security-enforced")
+}
+
 /// Trust gate for the admin file: root-owned, not group/world-writable.
 /// Pure over (uid, mode) so it is testable without root; the binary feeds
 /// real metadata.
