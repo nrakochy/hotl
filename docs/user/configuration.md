@@ -87,6 +87,19 @@ rs = "cargo check -q --message-format=short"
 | `system-prompt.md` | Replaces the built-in agent instructions (prose). |
 | `memory/MEMORY.md` | Loaded into every session's starting context (capped at 16 KB), enveloped. |
 | `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. |
+
+**Claude Code skills load too.** If you have skills in the Claude format —
+`~/.claude/skills/<name>/SKILL.md`, or plugin skills under
+`~/.claude/plugins/cache/` (highest installed version per plugin) — the
+`skill` tool reads them in place: frontmatter descriptions in the roster, the
+body on demand prefixed with its base directory so `references/` and
+`scripts/` paths resolve (scripts still run through the normal bash gate and
+sandbox). Bare names prefer hotl's own skills, then your Claude skills, then
+plugins; a shadowed plugin skill stays reachable as `plugin:skill`. Opt out
+with:
+
+    [skills]
+    claude = false
 | `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
 
 ### Environment variables
