@@ -20,18 +20,36 @@ hero:
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
 <CardGrid>
-	<Card title="A floor that never turns off" icon="approve-check">
-		Every mutating tool call passes a permission gate, and `bash` runs under a
-		kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines writes
-		to the working directory. Writes to git hooks, shell rc, Makefiles, and
-		agent-instruction files always stop and ask — in every mode.
-		[Permissions & sandbox →](./permissions-and-sandbox/)
-	</Card>
 	<Card title="Nothing is ever lost" icon="document">
 		Sessions are append-only event logs: `hotl resume` continues one,
 		`hotl undo` reverses the agent's file changes via shadow-git snapshots,
 		and context compaction adds a summary on top of history instead of
 		rewriting it. [Overview →](./overview/)
+	</Card>
+	<Card title="Context that stays slim" icon="random">
+		Oversized tool results are evicted to files past a threshold — a preview
+		stays inline, and the agent pages the full result back only when it needs
+		it. Compaction summaries are precomputed in the background from ~60%
+		context-full and fold in at ~80% without pausing the session. The prompt
+		prefix is byte-stable, so provider prompt caches keep hitting — and a
+		per-turn meter shows how full the context actually is.
+		[Configuration →](./configuration/)
+	</Card>
+	<Card title="You own the loop" icon="pen">
+		Steer mid-turn without killing the run — queued steers apply at the next
+		step. Approvals are a vocabulary, not a y/N: allow, allow with an edited
+		input, deny with a message the model actually reads, or answer as the
+		tool yourself. Allow-rules absorb the repetitive asks, so approval
+		fatigue never trains you to say yes.
+		[Permissions & sandbox →](./permissions-and-sandbox/)
+	</Card>
+	<Card title="tmux-native, out of the box" icon="laptop">
+		`hotl watch` in a pane discovers every AI agent in your tmux session,
+		shows live status, pings when one blocks on you, and `enter` jumps focus
+		to it. `Ctrl-h/j/k/l` pane navigation works out of the box and composes
+		with vim-tmux-navigator, and the zsh plugin's OSC-133 marks give watch
+		clean command boundaries in your scrollback.
+		[Shell integration →](./shell/)
 	</Card>
 	<Card title="Any model, one env var" icon="setting">
 		`HOTL_MODEL=provider/model` — Anthropic's Messages API, or any
@@ -39,9 +57,17 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		gateway like LiteLLM. [Gateways & key sources →](./gateway/)
 	</Card>
 	<Card title="Standard protocols at the edges" icon="puzzle">
-		An MCP client brings in external tools; `hotl acp` embeds the agent in any
-		ACP-speaking editor; `hotl watch` supervises every agent in your tmux
-		session. [MCP servers →](./mcp/)
+		An MCP client brings in external tools; `hotl acp` embeds the agent in
+		any ACP-speaking editor — and your Claude Code skills
+		(`~/.claude/skills`, plugins) load in place, no porting.
+		[MCP servers →](./mcp/)
+	</Card>
+	<Card title="A floor that never turns off" icon="approve-check">
+		Every mutating tool call passes a permission gate, and `bash` runs under a
+		kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines writes
+		to the working directory. Writes to git hooks, shell rc, Makefiles, and
+		agent-instruction files always stop and ask — in every mode.
+		[Permissions & sandbox →](./permissions-and-sandbox/)
 	</Card>
 </CardGrid>
 
