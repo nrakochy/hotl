@@ -43,6 +43,43 @@ pub struct Rules {
     deny: Vec<AllowRule>,
     #[serde(skip)]
     mode: PermissionMode,
+    #[serde(skip)]
+    admin_allow: Vec<AllowRule>,
+    #[serde(skip)]
+    admin_deny: Vec<AllowRule>,
+    #[serde(skip)]
+    lock_user_allows: bool,
+}
+
+/// The admin tier: `/etc/hotl/preapproved.toml`. Same rule schema as the
+/// user config plus the lock; trusted only via [`admin_file_trusted`].
+#[derive(Debug, Default, Deserialize)]
+pub struct AdminRules {
+    #[serde(default)]
+    allow: Vec<AllowRule>,
+    #[serde(default)]
+    deny: Vec<AllowRule>,
+    #[serde(default)]
+    pub lock_user_allows: bool,
+}
+
+impl AdminRules {
+    pub fn from_toml(text: &str) -> Result<Self, toml::de::Error> {
+        toml::from_str(text)
+    }
+}
+
+/// Trust gate for the admin file: root-owned, not group/world-writable.
+/// Pure over (uid, mode) so it is testable without root; the binary feeds
+/// real metadata.
+pub fn admin_file_trusted(owner_uid: u32, mode_bits: u32) -> Result<(), String> {
+    if owner_uid != 0 {
+        return Err(format!("not owned by root (uid {owner_uid})"));
+    }
+    if mode_bits & 0o022 != 0 {
+        return Err(format!("group/world-writable (mode {:o})", mode_bits & 0o777));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -87,8 +124,16 @@ impl Rules {
         self.mode
     }
 
-    /// Deny-first evaluation. `protected` is Some when the target is in the
-    /// execute-later class; `sandbox_enforced` reflects the live floor.
+    /// Install the admin tier (trust-checked by the caller).
+    pub fn merge_admin(&mut self, admin: AdminRules) {
+        self.admin_allow = admin.allow;
+        self.admin_deny = admin.deny;
+        self.lock_user_allows = admin.lock_user_allows;
+    }
+
+    /// The full tier pipeline, first match wins: admin deny → user deny →
+    /// protected (always ask) → admin allow → user allow (unless locked) →
+    /// mode=auto → ask. `sandbox_enforced` reflects the live floor.
     pub fn evaluate(
         &self,
         tool: &str,
@@ -96,59 +141,82 @@ impl Rules {
         sandbox_enforced: bool,
         protected: bool,
     ) -> Verdict {
+        if let Some(rule) = match_deny(&self.admin_deny, tool, input) {
+            return Verdict::Deny { rule };
+        }
         if let Some(rule) = match_deny(&self.deny, tool, input) {
             return Verdict::Deny { rule };
         }
         if protected {
-            return Verdict::Ask; // carve-out 1: never auto into execute-later paths
+            return Verdict::Ask; // the floor: never auto into execute-later paths
         }
-        for rule in &self.allow {
-            if rule.tool != tool {
-                continue;
-            }
-            match tool {
-                "bash" => {
-                    if !sandbox_enforced {
-                        continue; // carve-out 2: bash rules need the floor
-                    }
-                    let Some(prefix) = &rule.prefix else { continue };
-                    let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
-                    // Carve-out 3 (H-02): a prefix is a command-family grant, not
-                    // an argument scope. A shell control operator after the prefix
-                    // (`git status; curl … | sh`) turns one into arbitrary
-                    // execution, so any command carrying one falls back to the ask.
-                    if cmd.starts_with(prefix.as_str()) && !has_shell_operator(cmd) {
-                        return Verdict::Auto {
-                            rule: format!("bash prefix `{prefix}`"),
-                        };
-                    }
-                }
-                "write" | "edit" => {
-                    let Some(pp) = &rule.path_prefix else {
-                        continue;
-                    };
-                    let path = input.get("path").and_then(Value::as_str).unwrap_or("");
-                    // Carve-out 4 (H-03): resolve `.`/`..` lexically before the
-                    // prefix test. `src/../../etc/x` normalizes to `../etc/x`,
-                    // which no `src/`-shaped prefix matches, so traversal out of
-                    // the intended scope falls back to the ask instead of Auto.
-                    if let Some(resolved) = lexically_contained(path, pp) {
-                        return Verdict::Auto {
-                            rule: format!("{tool} path `{pp}` ({resolved})"),
-                        };
-                    }
-                }
-                _ => {}
+        if let Some(rule) = match_allow(&self.admin_allow, tool, input, sandbox_enforced) {
+            return Verdict::Auto {
+                rule: format!("admin: {rule}"),
+            };
+        }
+        if !self.lock_user_allows {
+            if let Some(rule) = match_allow(&self.allow, tool, input, sandbox_enforced) {
+                return Verdict::Auto { rule };
             }
         }
         // Lowest-precedence tier: mode=auto is YOLO as a policy point in the
         // same pipeline, not a separate code path. Bash keeps the sandbox
         // gate; the protected carve-out already returned above.
         if self.mode == PermissionMode::Auto && (tool != "bash" || sandbox_enforced) {
-            return Verdict::Auto { rule: "permissions.mode=auto".into() };
+            return Verdict::Auto {
+                rule: "permissions.mode=auto".into(),
+            };
         }
         Verdict::Ask
     }
+}
+
+/// Allow-rule matching with the over-allowing carve-outs (verbatim from the
+/// original single-tier loop): bash needs the sandbox floor and refuses
+/// shell operators after the prefix; paths resolve `..` lexically first.
+fn match_allow(
+    rules: &[AllowRule],
+    tool: &str,
+    input: &Value,
+    sandbox_enforced: bool,
+) -> Option<String> {
+    for rule in rules {
+        if rule.tool != tool {
+            continue;
+        }
+        match tool {
+            "bash" => {
+                if !sandbox_enforced {
+                    continue; // carve-out 2: bash rules need the floor
+                }
+                let Some(prefix) = &rule.prefix else { continue };
+                let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
+                // Carve-out 3 (H-02): a prefix is a command-family grant, not
+                // an argument scope. A shell control operator after the prefix
+                // (`git status; curl … | sh`) turns one into arbitrary
+                // execution, so any command carrying one falls back to the ask.
+                if cmd.starts_with(prefix.as_str()) && !has_shell_operator(cmd) {
+                    return Some(format!("bash prefix `{prefix}`"));
+                }
+            }
+            "write" | "edit" => {
+                let Some(pp) = &rule.path_prefix else {
+                    continue;
+                };
+                let path = input.get("path").and_then(Value::as_str).unwrap_or("");
+                // Carve-out 4 (H-03): resolve `.`/`..` lexically before the
+                // prefix test. `src/../../etc/x` normalizes to `../etc/x`,
+                // which no `src/`-shaped prefix matches, so traversal out of
+                // the intended scope falls back to the ask instead of Auto.
+                if let Some(resolved) = lexically_contained(path, pp) {
+                    return Some(format!("{tool} path `{pp}` ({resolved})"));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Deny matching deliberately over-matches: no sandbox or shell-operator
@@ -290,6 +358,36 @@ path_prefix = "src/"
         ); // rule is write-only
         assert!(Rules::default().is_empty());
         assert!(Rules::from_toml("allow = 3").is_err());
+    }
+
+    #[test]
+    fn admin_tier_grants_denies_and_locks() {
+        let admin = AdminRules::from_toml(
+            "lock_user_allows = true\n\n[[allow]]\ntool = \"bash\"\nprefix = \"git \"\n\n[[deny]]\ntool = \"bash\"\nprefix = \"git push\"\n",
+        )
+        .unwrap();
+        let mut r = Rules::from_toml("[[allow]]\ntool = \"bash\"\nprefix = \"cargo \"\n").unwrap();
+        r.merge_admin(admin);
+        // Admin grant, tagged so the transcript shows who silenced the prompt.
+        assert_eq!(
+            r.evaluate("bash", &json!({"command": "git status"}), true, false),
+            Verdict::Auto { rule: "admin: bash prefix `git `".into() }
+        );
+        // Admin deny outranks the admin grant (deny-first).
+        assert!(matches!(
+            r.evaluate("bash", &json!({"command": "git push origin main"}), true, false),
+            Verdict::Deny { .. }
+        ));
+        // lock_user_allows: the user's cargo rule no longer fires.
+        assert_eq!(r.evaluate("bash", &json!({"command": "cargo test"}), true, false), Verdict::Ask);
+    }
+
+    #[test]
+    fn admin_file_trust_requires_root_and_no_group_world_write() {
+        assert!(admin_file_trusted(0, 0o100644).is_ok());
+        assert!(admin_file_trusted(501, 0o100644).unwrap_err().contains("root"));
+        assert!(admin_file_trusted(0, 0o100664).unwrap_err().contains("writable"));
+        assert!(admin_file_trusted(0, 0o100666).is_err());
     }
 
     #[test]
