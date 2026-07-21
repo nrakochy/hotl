@@ -11,7 +11,8 @@ use std::path::Path;
 /// conveniences only; everything that runs code or writes files is commented
 /// out for the owner to enable deliberately.
 pub const DEFAULT_CONFIG: &str = "\
-# ~/.config/hotl/config.toml — the single hotl config file (see docs/user/).
+# ~/.config/hotl/config.toml — the single hotl config file.
+# Docs: https://nrakochy.github.io/hotl/
 # Every hand-editable setting lives here. Env vars override these (HOTL_MODEL,
 # ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL, HOTL_SANDBOX=off).
 
@@ -21,7 +22,8 @@ pub const DEFAULT_CONFIG: &str = "\
 # base_url = \"http://localhost:11434/v1\"   # e.g. Ollama (openai provider)
 # fast_model = \"...\"                        # cheap model for compaction summaries
 # Run a command to obtain the API key (stdout = key). Beats the static env
-# key when set. For gateways with short-lived keys, see docs/user/gateway.md.
+# key when set. For gateways with short-lived keys, see
+# https://nrakochy.github.io/hotl/gateway/
 # api_key_helper = \"my-mint-key\"
 # api_key_helper_ttl_secs = 300
 

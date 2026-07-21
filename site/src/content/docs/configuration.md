@@ -1,6 +1,8 @@
-# Configuration reference — `hotl` the agent
+---
+title: 'Configuration reference — hotl the agent'
+---
 
-**Mode: reference.** Facts about the command surface, config files, and environment variables of the `hotl` agent, in the system's own structure. It states what each thing is; it does not teach a workflow (see [quickstart.md](quickstart.md)) or argue for a choice (see [permissions-and-sandbox.md](permissions-and-sandbox.md)). All paths are literal; `~` is the invoking user's home. Behavior described is as of the 2026-07-20 source build.
+**Mode: reference.** Facts about the command surface, config files, and environment variables of the `hotl` agent, in the system's own structure. It states what each thing is; it does not teach a workflow (see [quickstart.md](../quickstart/)) or argue for a choice (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). All paths are literal; `~` is the invoking user's home. Behavior described is as of the 2026-07-20 source build.
 
 ## Subcommands
 
@@ -12,14 +14,14 @@
 | `hotl resume` | List recent sessions (id + age), newest first. |
 | `hotl resume <id-prefix>` | Start a new session seeded with an earlier session's full context (replayed from its log and ancestry). |
 | `hotl undo` | Restore workspace files to before the most recent session's last mutating step. Confirm-gated; `--force`/`-f` skips the prompt. |
-| `hotl tui [id-prefix\|--resume]` | Full-screen console: streaming transcript, activity strip, modal asks, vim input. See [tui.md](tui.md). |
-| `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](backgrounding.md). |
+| `hotl tui [id-prefix\|--resume]` | Full-screen console: streaming transcript, activity strip, modal asks, vim input. See [tui.md](../tui/). |
+| `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](../backgrounding/). |
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
 | `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/shadows/blobs per `[retention]`. See [below](#hotl-gc). |
 | `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
 | `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, memory, secrets audit, undo/git. Exit 1 if any check FAILs. |
 | `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
-| `hotl watch` | The tmux dashboard (separate capability; [crates/hotl/README.md](../../crates/hotl/README.md)). |
+| `hotl watch` | The tmux dashboard (separate capability; [crates/hotl/README.md](https://github.com/nrakochy/hotl/blob/master/crates/hotl/README.md)). |
 | `hotl update [ver]` | Print the version + how to update (compares against `ver` if given). |
 | `hotl fleet` | Reserved (orchestrate); not built — exits 2. |
 | `hotl --help` | Usage summary. |
@@ -121,7 +123,7 @@ with:
 
 ### Allow-rules (`[[allow]]`)
 
-Auto-approve tool calls so you aren't prompted for trusted operations. Deliberately config-only — there is no in-REPL "always allow" (that is by design; see [permissions-and-sandbox.md](permissions-and-sandbox.md#why-allow-rules-are-a-file-you-edit)).
+Auto-approve tool calls so you aren't prompted for trusted operations. Deliberately config-only — there is no in-REPL "always allow" (that is by design; see [permissions-and-sandbox.md](../permissions-and-sandbox/#why-allow-rules-are-a-file-you-edit)).
 
 ```toml
 [[allow]]
@@ -137,19 +139,19 @@ Rules that do **not** auto-allow, even with a matching rule (safety carve-outs):
 - A `bash` command containing a shell control operator (`;`, `|`, `&`, `<`, `>`, backtick, `$(`, braces, newline) — it does more than the prefix implies.
 - A `bash` rule at all when the sandbox floor is not enforced, or when a configured `[network]` egress restriction cannot be kernel-enforced on this host.
 - A `write`/`edit` path that resolves outside the prefix after `..` normalization, or is absolute against a relative prefix.
-- Any write to a protected (execute-later) path — always asks. See [permissions-and-sandbox.md](permissions-and-sandbox.md#protected-paths).
+- Any write to a protected (execute-later) path — always asks. See [permissions-and-sandbox.md](../permissions-and-sandbox/#protected-paths).
 
 ### MCP servers (`[[mcp]]`)
 
-Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve its binary (shown with its SHA-256), and a changed binary re-prompts. Server output is sanitized before it reaches the model. Full guide: [mcp.md](mcp.md).
+Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve its binary (shown with its SHA-256), and a changed binary re-prompts. Server output is sanitized before it reaches the model. Full guide: [mcp.md](../mcp/).
 
 ### Post-edit diagnostics (`[diagnostics]`) and hooks (`[[hook]]`)
 
-`[diagnostics]` runs a check command after a successful `edit`/`write` (under the sandbox floor, 30 s timeout). `[[hook]]` intercepts tool calls. Full guide: [hooks.md](hooks.md).
+`[diagnostics]` runs a check command after a successful `edit`/`write` (under the sandbox floor, 30 s timeout). `[[hook]]` intercepts tool calls. Full guide: [hooks.md](../hooks/).
 
 ### Network egress (`[network]`)
 
-Restricts what `bash` commands (and diagnostics/hooks, which run under the same floor) may reach over the network. `egress` is one of `open` (default; unrestricted), `off` (loopback and unix-domain sockets only), or `allowlist` (loopback plus the hosts in `allow`, reached through a local filtering proxy). `allow` entries are hostnames or `*.domain` wildcards — a wildcard matches the apex and any subdomain depth; no ports; matching is case-insensitive; an empty list allows nothing. An unknown `egress` value fails closed to `off` with a startup warning. While a restriction is configured, the bash ask label carries `net:off` / `net:allow(N)` — or `NET:UNENFORCED(reason)` on hosts where the kernel cannot back it (Linux needs kernel ≥ 6.7 for Landlock net; `HOTL_SANDBOX=off` also unenforces it), in which case `bash` allow-rules stop auto-approving. A denied fetch returns `hotl egress: "HOST" is not in [network].allow`. Why and limits: [permissions-and-sandbox.md](permissions-and-sandbox.md#opting-out-of-open-egress).
+Restricts what `bash` commands (and diagnostics/hooks, which run under the same floor) may reach over the network. `egress` is one of `open` (default; unrestricted), `off` (loopback and unix-domain sockets only), or `allowlist` (loopback plus the hosts in `allow`, reached through a local filtering proxy). `allow` entries are hostnames or `*.domain` wildcards — a wildcard matches the apex and any subdomain depth; no ports; matching is case-insensitive; an empty list allows nothing. An unknown `egress` value fails closed to `off` with a startup warning. While a restriction is configured, the bash ask label carries `net:off` / `net:allow(N)` — or `NET:UNENFORCED(reason)` on hosts where the kernel cannot back it (Linux needs kernel ≥ 6.7 for Landlock net; `HOTL_SANDBOX=off` also unenforces it), in which case `bash` allow-rules stop auto-approving. A denied fetch returns `hotl egress: "HOST" is not in [network].allow`. Why and limits: [permissions-and-sandbox.md](../permissions-and-sandbox/#opting-out-of-open-egress).
 
 ### Retention (`[retention]`)
 
@@ -204,4 +206,4 @@ Protected paths outrank admin grants; admin denies outrank everything.
 
 **Engine defaults (not user-configurable via env yet):** max 25 turns per prompt, 32000 max output tokens, adaptive thinking on, static prompt caching on, a tool that fails 5 times consecutively stops the turn.
 
-**See also:** [mcp.md](mcp.md) for connecting MCP tool servers, [hooks.md](hooks.md) for diagnostics and hooks, and [uninstall.md](uninstall.md) for removal.
+**See also:** [mcp.md](../mcp/) for connecting MCP tool servers, [hooks.md](../hooks/) for diagnostics and hooks, and [uninstall.md](../uninstall/) for removal.

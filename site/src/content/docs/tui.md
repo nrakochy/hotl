@@ -1,6 +1,8 @@
-# The console: `hotl tui`
+---
+title: 'The console: hotl tui'
+---
 
-**Mode: how-to.** Drive the agent from a full-screen terminal console — streaming transcript, a loop-motif activity strip, modal permission asks, and a vim-style input editor. Assumes a working agent ([quickstart.md](quickstart.md)).
+**Mode: how-to.** Drive the agent from a full-screen terminal console — streaming transcript, a loop-motif activity strip, modal permission asks, and a vim-style input editor. Assumes a working agent ([quickstart.md](../quickstart/)).
 
 ## Launch
 
@@ -48,7 +50,7 @@ An ask freezes the loop (the gap glyph) and opens a modal with the tool summary 
 
 ## Vim keys
 
-On by default; `vim_mode = false` under `[behavior]` in `config.toml` pins plain insert-mode editing ([configuration.md](configuration.md)).
+On by default; `vim_mode = false` under `[behavior]` in `config.toml` pins plain insert-mode editing ([configuration.md](../configuration/)).
 
 | Keys | Do |
 |---|---|

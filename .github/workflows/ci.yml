@@ -55,6 +55,21 @@ jobs:
           cargo test -p hotl-tools --features security-enforced --locked
           cargo test -p hotl --features security-enforced --locked
 
+  # Docs-site build guard: catches a broken page, link, or config in site/
+  # before release day (docs.yml deploys the site on `release: published`).
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: site/package-lock.json
+      - name: Build docs site
+        run: npm ci && npm run build
+        working-directory: site
+
   # Dependency vulnerability scan. Runs
   # cargo-audit against the committed Cargo.lock. cargo-audit installs from
   # crates.io — the same trust root as the build — so this adds no new

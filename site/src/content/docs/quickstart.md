@@ -1,6 +1,8 @@
-# Quickstart — your first hotl session
+---
+title: 'Quickstart — your first hotl session'
+---
 
-**Mode: tutorial.** This walks you from a fresh checkout to a completed agent task, once, with no forks. Every command is copy-runnable and paired with the output you should see. Why things work the way they do is deliberately deferred — see [permissions-and-sandbox.md](permissions-and-sandbox.md) and [configuration.md](configuration.md) once you've finished.
+**Mode: tutorial.** This walks you from a fresh checkout to a completed agent task, once, with no forks. Every command is copy-runnable and paired with the output you should see. Why things work the way they do is deliberately deferred — see [permissions-and-sandbox.md](../permissions-and-sandbox/) and [configuration.md](../configuration/) once you've finished.
 
 **Preconditions:**
 - macOS or Linux, a terminal, and `git`.
@@ -108,8 +110,8 @@ It asks to confirm, lists `main.rs`, and restores the file to before the edit. `
 Type a request → the agent reads freely → it **asks before changing anything** → you approve per step → every change is snapshotted for `undo`. That approve-each-step rhythm is the core of the tool.
 
 **Next:**
-- Tired of approving trusted commands every time? → allow-rules in [configuration.md](configuration.md#allow-rules-allow).
-- Want to know exactly what the y/N gate and sandbox protect (and what they don't)? → [permissions-and-sandbox.md](permissions-and-sandbox.md).
-- Running it in a script instead of interactively? → headless mode in [configuration.md](configuration.md#headless--p----json).
+- Tired of approving trusted commands every time? → allow-rules in [configuration.md](../configuration/#allow-rules-allow).
+- Want to know exactly what the y/N gate and sandbox protect (and what they don't)? → [permissions-and-sandbox.md](../permissions-and-sandbox/).
+- Running it in a script instead of interactively? → headless mode in [configuration.md](../configuration/#headless--p----json).
 
-**Not covered here:** connecting MCP tool servers and the post-edit hooks feature (see [configuration.md](configuration.md), stubs noted there).
+**Not covered here:** connecting MCP tool servers and the post-edit hooks feature (see [configuration.md](../configuration/), stubs noted there).

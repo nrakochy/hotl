@@ -1,6 +1,8 @@
-# Permissions & the sandbox — what the guardrails do
+---
+title: 'Permissions & the sandbox — what the guardrails do'
+---
 
-**Mode: explanation.** This is the *why* behind hotl's safety model: what the y/N gate, protected paths, allow-rules, and the kernel sandbox actually protect — and, just as important, what they do **not**. Read it away from the keyboard. For exact syntax see [configuration.md](configuration.md); for a first run see [quickstart.md](quickstart.md). Opinions here are marked as such.
+**Mode: explanation.** This is the *why* behind hotl's safety model: what the y/N gate, protected paths, allow-rules, and the kernel sandbox actually protect — and, just as important, what they do **not**. Read it away from the keyboard. For exact syntax see [configuration.md](../configuration/); for a first run see [quickstart.md](../quickstart/). Opinions here are marked as such.
 
 ## The one control that matters: you choose when to approve
 
@@ -56,7 +58,7 @@ allow = ["github.com", "*.crates.io"]
 
 Allowed hosts are reached through a small local proxy, so `cargo fetch` and `git pull` keep working while a `curl` to anywhere else gets a 403 that tells the model exactly which control refused it (`hotl egress: "HOST" is not in [network].allow`). Tools that ignore the proxy environment don't get around anything — they hit the kernel's loopback-only wall and fail. Every bash ask shows the active state: `net:off` or `net:allow(N)`.
 
-Three honest caveats. First, this is **opt-in**: the default stays open because the agent legitimately fetches things, and a silently broken network by default would just teach everyone to turn the feature off. Second, **only HTTP traffic can traverse the proxy** — `git` over an SSH remote (`git@github.com:…`) fails under `off`/`allowlist` no matter what you allow; switch those repos to HTTPS remotes while running restricted. Third, it is **not airtight**: an allowed host is allowed for *everything* (an allowlisted `github.com` can still receive a push of your data), DNS still resolves (macOS resolves names via a local system service; on Linux, Landlock confines TCP only, and needs kernel ≥ 6.7), so a determined DNS-tunnel can still leak — treat egress restriction as a strong brake on casual exfiltration, not a cleanroom. And if the kernel can't enforce the restriction you configured, hotl says so loudly — `NET:UNENFORCED(reason)` in every bash ask — and `bash` allow-rules stop auto-approving, the same fail-closed posture as an unsandboxed host. The full mechanics and limits live in [SECURITY.md](../SECURITY.md).
+Three honest caveats. First, this is **opt-in**: the default stays open because the agent legitimately fetches things, and a silently broken network by default would just teach everyone to turn the feature off. Second, **only HTTP traffic can traverse the proxy** — `git` over an SSH remote (`git@github.com:…`) fails under `off`/`allowlist` no matter what you allow; switch those repos to HTTPS remotes while running restricted. Third, it is **not airtight**: an allowed host is allowed for *everything* (an allowlisted `github.com` can still receive a push of your data), DNS still resolves (macOS resolves names via a local system service; on Linux, Landlock confines TCP only, and needs kernel ≥ 6.7), so a determined DNS-tunnel can still leak — treat egress restriction as a strong brake on casual exfiltration, not a cleanroom. And if the kernel can't enforce the restriction you configured, hotl says so loudly — `NET:UNENFORCED(reason)` in every bash ask — and `bash` allow-rules stop auto-approving, the same fail-closed posture as an unsandboxed host. The full mechanics and limits live in [SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md).
 
 ## Protected paths: some writes are more dangerous than they look
 
@@ -91,4 +93,4 @@ Approval is a judgment call, and judgment is fallible. So hotl photographs your 
 
 The gate is the wall. The sandbox, protected paths, and undo make the wall livable and the mistakes recoverable. None of them replaces you looking at what you approve.
 
-**Source of record:** [docs/SECURITY.md](../SECURITY.md) is the authoritative stance and routing table; this file is its user-facing explanation.
+**Source of record:** [docs/SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md) is the authoritative stance and routing table; this file is its user-facing explanation.

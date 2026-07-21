@@ -1,4 +1,6 @@
-# Run hotl through a gateway — `hotl` the agent
+---
+title: 'Run hotl through a gateway — hotl the agent'
+---
 
 **Mode: how-to.** Point hotl at any OpenAI-compatible gateway (Bifrost,
 LiteLLM, OpenRouter, a corporate proxy) instead of a provider directly, and

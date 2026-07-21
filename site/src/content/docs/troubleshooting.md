@@ -1,4 +1,6 @@
-# Troubleshooting — `hotl` the agent
+---
+title: 'Troubleshooting — hotl the agent'
+---
 
 **Mode: reference (error → cause → fix).** Look up the message you saw. Text in `code` is what hotl prints; find yours by grepping this file for a distinctive phrase. Run `hotl doctor` first for setup problems — it diagnoses most of the table below in one shot.
 
@@ -16,8 +18,8 @@
 
 | Message or symptom | Cause | Fix |
 |---|---|---|
-| The agent's action was `(denied)` and you never saw a prompt | Headless (`-p`) or non-interactive terminal — asks auto-deny. | Run interactively, or add an allow-rule in `config.toml` for the action the run needs. See [configuration.md](configuration.md#allow-rules-allow). |
-| An allow-rule you wrote still prompts | The command has a shell operator, the path escapes the prefix via `..`, the target is a protected path, or (for `bash`) the sandbox isn't enforced. | Expected — these are the carve-outs. See [permissions-and-sandbox.md](permissions-and-sandbox.md). Simplify the command, or approve it by hand. |
+| The agent's action was `(denied)` and you never saw a prompt | Headless (`-p`) or non-interactive terminal — asks auto-deny. | Run interactively, or add an allow-rule in `config.toml` for the action the run needs. See [configuration.md](../configuration/#allow-rules-allow). |
+| An allow-rule you wrote still prompts | The command has a shell operator, the path escapes the prefix via `..`, the target is a protected path, or (for `bash`) the sandbox isn't enforced. | Expected — these are the carve-outs. See [permissions-and-sandbox.md](../permissions-and-sandbox/). Simplify the command, or approve it by hand. |
 | Ask shows `UNSANDBOXED` | No kernel sandbox on this host, or `HOTL_SANDBOX=off`. | On older Linux, none is available; on macOS ensure `/usr/bin/sandbox-exec` exists. `bash` allow-rules are disabled while unsandboxed, by design. |
 | `⚠ PROTECTED PATH —` before an ask | The write targets a write-now/execute-later file (git hook, build.rs, ssh, creds, …). | Intended. Approve only if you meant to write that file; it can run code or grant access later. |
 
