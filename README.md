@@ -11,16 +11,15 @@ you on the loop at every stage:
 
 | Capability | Command | Status |
 |---|---|---|
+| **Execute** | `hotl` | **Shipped** — a personal agent harness (event-log-as-canon, ACP-native): steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
 | **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it |
-| **Execute** | `hotl` | **Building** — a personal agent harness (event-log-as-canon, ACP-native): steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
 | **Orchestrate** | `hotl fleet` | **Future** — drives fleets of agents over the same protocol any editor uses; only its seams exist today |
 
-> **Pre-1.0 — and a breaking change:** bare `hotl` is now the **agent**; the
-> dashboard moved to `hotl watch`. Every mutating or executing tool call asks
-> y/n; a kernel sandbox floor confines `bash` writes. The execute harness is
-> **not yet published** — `cargo install hotl` still installs the older
-> `watch`-only release; run the agent from a source build ([quickstart](https://nrakochy.github.io/hotl/quickstart/))
-> until 0.2.0 ships. Expect breaking changes at every 0.x minor.
+> **Pre-1.0 — and a breaking change at 0.2.0:** bare `hotl` is now the
+> **agent**; the dashboard moved to `hotl watch`. Every mutating or executing
+> tool call passes a permission gate, and a kernel sandbox floor confines
+> `bash` writes. Expect breaking changes at every 0.x minor — see
+> [CHANGELOG.md](CHANGELOG.md).
 
 ## Why hotl
 
@@ -54,21 +53,33 @@ endpoint (OpenAI, Groq, Ollama, a local server — it's just a base URL). MCP
 for tools, ACP for embedding in editors — the same contract the future
 `hotl fleet` orchestrator will speak, so the seams are already in place.
 
+## Install
+
+Prebuilt binary — no toolchain needed (macOS / Linux):
+
+    curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
+
+Or with Rust ≥ 1.82 installed:
+
+    cargo install hotl
+
+## Execute — quick start
+
+Point `HOTL_MODEL` at a model (`provider/model` — `anthropic/…` or `openai/…`, which covers any OpenAI-compatible endpoint incl. local Ollama), then:
+
+    hotl doctor    # provider, sandbox floor, config, sessions — all should read ok
+    hotl           # interactive console TUI
+    hotl -p "fix the typo in main.rs"   # headless one-shot
+
+Full tutorial: [quickstart](https://nrakochy.github.io/hotl/quickstart/).
+
 ## Watch — quick start
 
 **Requirements:** [tmux](https://github.com/tmux/tmux) on your `PATH` (run it from inside a tmux session) and `ps` (standard on macOS/Linux).
 
-Install a prebuilt binary — no toolchain needed:
+From inside tmux, open a pane and run it:
 
-    curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
-
-Or with Rust installed:
-
-    cargo install hotl
-
-Then, from inside tmux, open a pane and run it:
-
-    hotl
+    hotl watch
 
 Keys: `j`/`k` (or ↓/↑) move · `enter` jump to the selected agent · `r` refresh
 · `q` or `Ctrl-c` quit · `Ctrl-h`/`j`/`k`/`l` switch tmux panes.
@@ -81,8 +92,9 @@ Keys: `j`/`k` (or ↓/↑) move · `enter` jump to the selected agent · `r` ref
 
 ## Releasing
 
-Cut a release with the helper script — it bumps the workspace version, commits,
-tags `vX.Y.Z`, and pushes. The tag triggers the crates.io publish and the
+Cut a release with the helper script — it bumps the workspace version (and
+every internal path-dep pin, which publish in lockstep), commits, tags
+`vX.Y.Z`, and pushes. The tag triggers the crates.io publish and the
 prebuilt-binary/installer workflows.
 
     scripts/release.sh patch    # bug fix

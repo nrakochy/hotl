@@ -1,6 +1,7 @@
 [package]
 name = "hotl-provider-openai"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. OpenAI-compatible chat-completions provider (OpenAI, Groq, Ollama, any compatible endpoint)."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

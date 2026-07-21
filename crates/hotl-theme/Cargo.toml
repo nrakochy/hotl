@@ -1,6 +1,7 @@
 [package]
 name = "hotl-theme"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. Shared theme model and terminal palette for hotl surfaces."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

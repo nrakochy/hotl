@@ -1,6 +1,7 @@
 [package]
 name = "hotl-tools"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. L4 tool system: read/edit/write/bash built-ins, permission gate seam, protected execute-later paths."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

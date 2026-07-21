@@ -1,6 +1,7 @@
 [package]
 name = "hotl-testkit"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. Golden-transcript test harness: scripted provider + real engine + normalized persisted transcripts."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

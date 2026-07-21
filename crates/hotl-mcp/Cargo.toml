@@ -1,6 +1,7 @@
 [package]
 name = "hotl-mcp"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. M3a MCP client: stdio JSON-RPC, deferred loading, sanitizer chokepoint, trust store."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

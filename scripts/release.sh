@@ -45,6 +45,14 @@ awk -v v="$new" '
   { print }
 ' Cargo.toml > Cargo.toml.tmp && mv Cargo.toml.tmp Cargo.toml
 
+# Sync every internal path-dep pin (`{ path = "../x", version = "…" }`) to the
+# same version — the workspace publishes in lockstep, and a stale pin makes
+# cargo reject the local crate (or worse, resolve an old one from crates.io).
+for f in crates/*/Cargo.toml; do
+  sed -E 's#(path = "\.\./[^"]+", version = ")[0-9]+\.[0-9]+\.[0-9]+(")#\1'"$new"'\2#g' \
+    "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+done
+
 cargo build --quiet            # sync Cargo.lock to the new version
 git commit -aqm "release: $tag"
 git tag -a "$tag" -m "$tag"

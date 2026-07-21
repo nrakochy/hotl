@@ -1,6 +1,7 @@
 [package]
 name = "hotl-store"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. L5 persistence: append-only JSONL session log with ingestion-time secret masking."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

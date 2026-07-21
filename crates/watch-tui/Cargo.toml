@@ -1,6 +1,7 @@
 [package]
 name = "hotl-watch-tui"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. Elm-style ratatui TUI (state, update, view) for hotl."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

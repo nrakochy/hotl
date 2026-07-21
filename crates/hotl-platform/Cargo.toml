@@ -1,6 +1,7 @@
 [package]
 name = "hotl-platform"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. Platform seams: Clock, SecretStore (native impls; browser impls at the gated milestone)."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

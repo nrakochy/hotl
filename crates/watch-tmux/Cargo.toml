@@ -1,6 +1,7 @@
 [package]
 name = "hotl-watch-tmux"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. tmux/ps shims and agent status detection for hotl."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

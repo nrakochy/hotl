@@ -1,6 +1,7 @@
 [package]
 name = "hotl-provider"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. L2 provider seam: trait, block-structured event enum, scripted test provider."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

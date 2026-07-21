@@ -1,107 +1,106 @@
-# hotl — a human-on-the-loop terminal agent dashboard
+# hotl — human on the loop
 
 [![crates.io](https://img.shields.io/crates/v/hotl.svg)](https://crates.io/crates/hotl)
 
-I was inspired by [herdr](https://herdr.dev/), but I wanted to retain those sweet sweet navigation bindings from [neovim-tmux navigation](https://github.com/alexghergh/nvim-tmux-navigation).
+Running one agent is easy. Running several, all day, is a supervision
+problem: knowing which one is blocked on you, trusting what they're allowed
+to do, and recovering when one goes sideways. hotl is one binary that takes
+that problem in three stages, with you on the loop at every stage:
 
-So, byo-keybindings. Run this tui in a pane of your own. It discovers AI-agent processes across your
-ze multiplexer, shows their live status, gives an (optional) audible ping when an agent is waiting on your input.
+| Capability | Command | Status |
+|---|---|---|
+| **Execute** | `hotl` | **Shipped** — a personal agent harness: steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context, MCP client, ACP server, session resume + `undo`. Any Anthropic or OpenAI-compatible model. |
+| **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it. |
+| **Orchestrate** | `hotl fleet` | **Future** — drives fleets of agents over the same protocol any editor uses; only its seams exist today. |
 
-![recording](../../docs/hotl.mp4)
+**User docs: [nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** ·
+[Architecture](https://github.com/nrakochy/hotl/blob/master/ARCHITECTURE.md) ·
+[Security stance](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md)
 
-## Quick start
+> Pre-1.0: expect breaking changes at every 0.x minor. As of 0.2.0, bare
+> `hotl` is the agent; the dashboard moved to `hotl watch`.
 
-**Requirements:** [tmux](https://github.com/tmux/tmux) on your `PATH` (run `hotl` from inside a tmux session) and `ps` (standard on macOS/Linux).
+## Install
 
-Install a prebuilt binary — no toolchain needed:
-
-**macOS / Linux**
+Prebuilt binary, no toolchain needed (macOS / Linux):
 
     curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
 
-**Windows (PowerShell)**
-
-    powershell -c "irm https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.ps1 | iex"
-
-Or grab a `.tar.xz` / `.zip` for your platform directly from the
+Or grab a `.tar.xz` for your platform from the
 [latest release](https://github.com/nrakochy/hotl/releases/latest).
-
-With Rust installed, you can instead build from crates.io:
+With Rust ≥ 1.82 installed:
 
     cargo install hotl
 
-Then, from inside tmux, open a pane and run it:
+## The agent — `hotl`
 
-    hotl
+Point it at a model (`HOTL_MODEL` is always `provider/model`):
 
-Keys: `j`/`k` (or ↓/↑) move · `enter` jump to the selected agent · `r` refresh
-· `q` or `Ctrl-c` quit · `Ctrl-h`/`j`/`k`/`l` switch tmux panes.
+    # Anthropic:
+    export HOTL_MODEL=anthropic/claude-opus-4-8
+    export ANTHROPIC_API_KEY=sk-ant-…
 
-## Run it locally
+    # — or — any OpenAI-compatible endpoint, hosted or local:
+    export HOTL_MODEL=openai/gpt-5
+    export OPENAI_API_KEY=sk-…
 
-Build the optimized binary:
+    # — or — local Ollama (nothing leaves your machine):
+    export HOTL_MODEL=openai/llama3.1
+    export HOTL_OPENAI_BASE_URL=http://localhost:11434/v1
 
-    cargo build --release
+Check the setup, then run it:
 
-The binary is then at `target/release/hotl`. You have a few ways to run it.
+    hotl doctor    # provider, sandbox floor, config, sessions — all should read ok
+    hotl           # interactive console TUI
+    hotl -p "fix the typo in main.rs"   # headless one-shot
 
-### Option A — run by path (no install)
+**The safety floor never turns off.** `bash` executes under a kernel sandbox
+(Seatbelt on macOS, Landlock on Linux) confining writes to the working
+directory. Writes to execute-later paths — git hooks, shell rc, Makefiles,
+agent-instruction files — always stop and ask, in every mode. By default the
+agent otherwise runs uninterrupted; prefer a y/n prompt on every mutating
+call? Set `[permissions] mode = "ask"`. Need prompting guaranteed? A build
+with `--features security-enforced` cannot disable it by any config. What
+the sandbox does and does not cover is written down honestly in
+[SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md).
 
-From inside a tmux session, open a pane and run the absolute path:
+**Nothing is ever lost.** Every session is an append-only log that nothing
+rewrites. `hotl resume` continues an earlier session, `hotl undo` reverses
+the agent's file changes (git snapshots around every mutating step), and
+context compaction adds a summary on top instead of destroying history.
 
-    ~/sources/hotl/target/release/hotl
+Also aboard: MCP client for external tools, `hotl acp` to embed in
+ACP-speaking editors, `hotl bg` to background a session and re-attach later.
+Full walkthrough: [quickstart](https://nrakochy.github.io/hotl/quickstart/).
 
-### Option B — put it on your PATH
+## The dashboard — `hotl watch`
 
-`cargo install` drops binaries in `~/.cargo/bin`. If that directory is on your
-PATH (this machine's zsh config adds it), install and run by name:
-
-    cargo install --path crates/hotl   # installs to ~/.cargo/bin/hotl
-    hotl
-
-If `~/.cargo/bin` is not on your PATH, either add it, or symlink the built
-binary into a directory that already is:
-
-    ln -sf ~/.cargo/bin/hotl ~/.nix-profile/bin/hotl
-
-## Usage
-
-Inside tmux, create a pane (e.g. `Ctrl-b %` for a vertical split), then run
-`hotl` in it. It lists the AI agents it finds, with each agent's live status,
-and refreshes about once a second.
+Inside tmux, open a pane (e.g. `Ctrl-b %`) and run `hotl watch`. It discovers
+AI-agent processes (default: `claude`, `codex`, `hotl`), lists them with a
+live status glyph — an animated braille snake while working · `!` blocked
+(needs your input) · `√` idle · `·` unknown — refreshing about once a second,
+and plays an audible ping when an agent transitions into blocked.
 
 Keys:
 
-- `j` / `k` (or ↓ / ↑) — move the selection
-- `gg` / `G` — jump to the top / bottom of the list
-- `enter` (or `gd`) — jump focus to the selected agent's pane (`hotl` stays open)
+- `j` / `k` (or ↓ / ↑) — move the selection · `gg` / `G` — top / bottom
+- `enter` (or `gd`) — jump focus to the selected agent's pane
 - `Ctrl-h` / `Ctrl-j` / `Ctrl-k` / `Ctrl-l` — switch to the neighboring tmux pane
-- `r` — refresh now
-- `q` or `Ctrl-c` — quit
+- `r` — refresh now · `q` or `Ctrl-c` — quit
 
-(`Ctrl`/arrow keys work regardless of `vim_mode`; the `j`/`k`/`gg`/`G`/`gd`
-letter bindings require `vim_mode = true`, the default.)
+(`Ctrl`/arrow keys work regardless of `vim_mode`; the letter bindings require
+`vim_mode = true`, the default.)
 
-Detected agents (default): `claude`, `codex`, `hotl` (the bare-`hotl` agent; `hotl watch`, `fleet`, `gc`, `doctor`, and `serve` are skipped so the dashboard never lists itself).
+### tmux + vim-tmux-navigator
 
-Each agent shows a live status glyph: an animated braille snake while working ·
-`!` blocked (needs your input) · `√` idle · `·` unknown. When an agent
-transitions **into** blocked, `hotl` plays an audible ping so you know it's
-waiting on you.
-
-## tmux + vim-tmux-navigator
-
-`hotl watch` handles `Ctrl-h/j/k/l` itself by switching tmux panes, so it works
-out of the box. If you also use
-[vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator), extend
-its `is_vim` check so tmux forwards those keys **into** `hotl watch` (which
-does the pane switch) instead of stepping around it — this keeps movement
-seamless whether the focused pane is Vim, another navigator-aware app, or the
-dashboard. Match the full argv (`ps -o args=`), **not** a bare `hotl` in
-`vim_pattern`: the name check matches every hotl surface, and the execute
-console (bare `hotl`) doesn't handle the chords, so a name match would
-swallow your navigation keys whenever a console pane is focused. Left unmatched, they fall through to tmux's own `select-pane` and
-navigation just works. In `~/.config/tmux/tmux.conf`:
+`hotl watch` handles `Ctrl-h/j/k/l` itself by switching tmux panes, so it
+works out of the box. If you also use
+[vim-tmux-navigator](https://github.com/christoomey/vim-tmux-navigator),
+extend its `is_vim` check so tmux forwards those keys **into** `hotl watch`
+instead of stepping around it. Match the full argv (`ps -o args=`), **not** a
+bare `hotl` in `vim_pattern`: a name match would swallow your navigation keys
+whenever an agent-console pane (bare `hotl`) is focused. In
+`~/.config/tmux/tmux.conf`:
 
     vim_pattern='(\S+/)?g?\.?(view|l?n?vim?x?|fzf)(diff)?(-wrapped)?'
     hotl_watch_pattern='(\S+/)?hotl watch( |$)'
@@ -121,28 +120,32 @@ Reload with `tmux source-file ~/.config/tmux/tmux.conf`.
 Optional `~/.config/hotl/config.toml` (absent → sensible defaults):
 
     [settings]
-    ping_on_blocked = true         # audible ping when an agent needs input
-    poll_interval_ms = 1000        # scan cadence
-    agents = ["claude", "codex", "hotl"]   # process names counted as agents
-    vim_mode = true                # vim list keys (j/k/gg/G/gd); false = arrows only
+    ping_on_blocked = true         # watch: audible ping when an agent needs input
+    poll_interval_ms = 1000        # watch: scan cadence
+    agents = ["claude", "codex", "hotl"]   # watch: process names counted as agents
+    vim_mode = true                # vim keys in both surfaces; false = arrows only
+
+    [permissions]
+    mode = "auto"                  # agent: "ask" = y/n on every mutating call
 
     [settings.theme]
-    preset  = "tokyo-night"        # base palette; omit → default
+    preset  = "tokyo-night"        # themes both the agent console and watch
     blocked = "#ff0000"            # optional: override any slot on top
 
 Built-in presets: `default`, `tokyo-night`, `catppuccin`, `gruvbox`, `nord`,
 `dracula`. Overridable slots: `active`, `blocked`, `idle`, `ink`, `muted`,
 `faint`, `accent`, `band`. An unknown preset name falls back to `default`.
-
-A `[plugins]` section is reserved for future use (parsed but inert).
+Full reference: [configuration](https://nrakochy.github.io/hotl/configuration/).
 
 ## Requirements
 
-- A supported multiplexer on your PATH — today **tmux** (run `hotl` from inside
-  a tmux session)
-- `ps` (standard on macOS/Linux)
+- macOS or Linux; `hotl watch` additionally needs
+  [tmux](https://github.com/tmux/tmux) on your `PATH` (run it from inside a
+  tmux session) and `ps` (standard on both).
+- The workspace's library crates (`hotl-engine`, `hotl-tools`, …) are
+  internal components published in lockstep with this binary — no semver
+  promise attaches to their APIs; pin exact or don't depend.
 
-## Build
+## License
 
-    cargo build --release
-    ./target/release/hotl
+MIT OR Apache-2.0

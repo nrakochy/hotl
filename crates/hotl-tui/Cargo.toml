@@ -1,6 +1,7 @@
 [package]
 name = "hotl-tui"
-description = "Internal component of hotl - no semver promise; pin exact or don't depend. Elm-style ratatui console (state, update, view) for the execute agent."
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. Elm-style ratatui console (state, update, view) for the execute agent. Before 0.2.0 this crate name shipped hotl's watch/dashboard TUI (now hotl-watch-tui)."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

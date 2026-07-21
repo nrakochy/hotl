@@ -1,6 +1,6 @@
 [package]
 name = "hotl"
-description = "A terminal dashboard that discovers AI-agent processes in tmux, shows their live status, and jumps focus to them."
+description = "Human-on-the-loop terminal AI agent: steering TUI + headless mode, gated tools under a kernel sandbox floor, session resume + undo, MCP/ACP, any Anthropic or OpenAI-compatible model — plus `hotl watch`, a tmux dashboard for the agents you already run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,10 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
+documentation = "https://nrakochy.github.io/hotl/"
 readme = "README.md"
-keywords = ["tmux", "tui", "agent", "dashboard", "cli"]
-categories = ["command-line-utilities"]
+keywords = ["agent", "llm", "sandbox", "mcp", "tui"]
+categories = ["command-line-utilities", "development-tools"]
 
 [[bin]]
 name = "hotl"

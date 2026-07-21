@@ -1,6 +1,7 @@
 [package]
 name = "hotl-engine"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. L3 turn engine, M0 slice: sample→tools loop, max_turns, cancellation."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

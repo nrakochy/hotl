@@ -1,6 +1,7 @@
 [package]
 name = "hotl-provider-anthropic"
 description = "Internal component of hotl - no semver promise; pin exact or don't depend. Anthropic Messages API provider: SSE streaming, verbatim block assembly, static cache placement."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

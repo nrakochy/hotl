@@ -1,6 +1,7 @@
 [package]
 name = "hotl-types"
-description = "Internal component of hotl - no semver promise; pin exact or don't depend. L1 canonical conversation types: pure data + serde, no tokio, no I/O."
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. L1 canonical conversation types: pure data + serde, no tokio, no I/O. Before 0.2.0 this crate name shipped hotl's watch/dashboard types (now hotl-watch-types)."
+readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
