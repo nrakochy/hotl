@@ -119,7 +119,14 @@ impl Harness {
         config: EngineConfig,
         rules: Rules,
     ) -> Self {
-        Self::build_full(scripts, config, Vec::new(), None, Registry::builtin(), rules)
+        Self::build_full(
+            scripts,
+            config,
+            Vec::new(),
+            None,
+            Registry::builtin(),
+            rules,
+        )
     }
 
     fn build_with(
@@ -129,7 +136,14 @@ impl Harness {
         hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
         registry: Registry,
     ) -> Self {
-        Self::build_full(scripts, config, initial_items, hooks, registry, Rules::default())
+        Self::build_full(
+            scripts,
+            config,
+            initial_items,
+            hooks,
+            registry,
+            Rules::default(),
+        )
     }
 
     fn build_full(
@@ -489,37 +503,54 @@ mod tests {
     async fn auto_mode_runs_mutating_calls_without_asking() {
         // write (not bash): the harness runs unsandboxed, and auto mode
         // deliberately excludes unsandboxed bash — covered by rules tests.
-        let mut h = Harness::with_rules(
-            vec![
-                ScriptedProvider::tool_call("t1", "write", json!({"path": "notes.txt", "content": "x"})),
-                ScriptedProvider::text_reply("ran silently"),
-            ],
-            cfg(),
-            auto_rules(),
-        );
+        // Scripts are pushed after construction so the write targets the
+        // harness tempdir, never the test process cwd.
+        let mut h = Harness::with_rules(Vec::new(), cfg(), auto_rules());
+        let note = h.dir().join("notes.txt");
+        h.provider.push_script(ScriptedProvider::tool_call(
+            "t1",
+            "write",
+            json!({"path": note.to_str().unwrap(), "content": "x"}),
+        ));
+        h.provider
+            .push_script(ScriptedProvider::text_reply("ran silently"));
         let outcome = h.prompt_and_wait("write the note").await;
-        assert_eq!(outcome, Outcome::Done { text: "ran silently".into() });
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "ran silently".into()
+            }
+        );
         // No ask fired; the transcript shows who silenced it.
-        assert!(!h.seen.iter().any(|e| e.starts_with("Ask(")), "events: {:?}", h.seen);
+        assert!(
+            !h.seen.iter().any(|e| e.starts_with("Ask(")),
+            "events: {:?}",
+            h.seen
+        );
         assert!(
             h.seen.iter().any(|e| e.contains("permissions.mode=auto")),
             "events: {:?}",
             h.seen
         );
         // The undo safety net still brackets the batch.
-        assert_eq!(*h.snapshots.lock().unwrap(), vec!["pre batch 1", "post batch 1"]);
+        assert_eq!(
+            *h.snapshots.lock().unwrap(),
+            vec!["pre batch 1", "post batch 1"]
+        );
     }
 
     #[tokio::test]
     async fn auto_mode_protected_write_still_asks() {
-        let mut h = Harness::with_rules(
-            vec![
-                ScriptedProvider::tool_call("t1", "write", json!({"path": "Makefile", "content": "x"})),
-                ScriptedProvider::text_reply("done"),
-            ],
-            cfg(),
-            auto_rules(),
-        );
+        let mut h = Harness::with_rules(Vec::new(), cfg(), auto_rules());
+        // Protected by file name; inside the harness tempdir so the approved
+        // write never touches the test process cwd.
+        let makefile = h.dir().join("Makefile");
+        h.provider.push_script(ScriptedProvider::tool_call(
+            "t1",
+            "write",
+            json!({"path": makefile.to_str().unwrap(), "content": "x"}),
+        ));
+        h.provider.push_script(ScriptedProvider::text_reply("done"));
         h.prompt_and_wait("write the makefile").await;
         assert!(
             h.seen.iter().any(|e| e.starts_with("Ask(")),
@@ -535,11 +566,17 @@ mod tests {
             .collect();
         let mut h = Harness::with_rules(
             scripts,
-            EngineConfig { max_turns: 10, ..Default::default() },
+            EngineConfig {
+                max_turns: 10,
+                ..Default::default()
+            },
             auto_rules(),
         );
         let outcome = h.prompt_and_wait("go").await;
-        assert!(matches!(outcome, Outcome::DoomLoop { .. }), "got {outcome:?}");
+        assert!(
+            matches!(outcome, Outcome::DoomLoop { .. }),
+            "got {outcome:?}"
+        );
         assert!(
             !h.seen.iter().any(|e| e.starts_with("Ask(")),
             "no human to ask in auto: {:?}",

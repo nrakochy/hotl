@@ -211,8 +211,8 @@ fn permissions_check(config_dir: &Path) -> Check {
     if hotl_tools::rules::enforced_build() {
         return ok("permissions: enforced (build) — mode config is ignored".into());
     }
-    let admin = std::env::var("HOTL_PREAPPROVED")
-        .unwrap_or_else(|_| crate::agent::ADMIN_RULES_PATH.into());
+    let admin =
+        std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| crate::agent::ADMIN_RULES_PATH.into());
     let admin_note = match crate::agent::load_admin(Path::new(&admin)) {
         Ok(Some(_)) => format!(" · admin rules: {admin}"),
         Ok(None) => String::new(),

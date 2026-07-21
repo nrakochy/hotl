@@ -47,6 +47,11 @@ ask_timeout_secs = 300     # 0 = wait forever for a permission answer
 sandbox = true             # false disables the bash sandbox floor
 vim_mode = true            # vim-style keys in the `hotl tui` input editor
 
+[permissions]
+mode = "auto"   # no per-action y/N; protected paths + sandbox still guard.
+                # "ask" = approve every mutating/executing call. A
+                # security-enforced build ignores this key entirely.
+
 [network]
 egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
 allow = ["github.com", "*.crates.io"]   # hosts reachable in allowlist mode
@@ -97,6 +102,7 @@ rs = "cargo check -q --message-format=short"
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_ASK_TIMEOUT` | `[behavior].ask_timeout_secs` | `0` = wait forever (backgrounded sessions). |
+| `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) or `ask`; a typo fails closed to `ask`. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 
@@ -135,6 +141,27 @@ Restricts what `bash` commands (and diagnostics/hooks, which run under the same 
 ### Retention (`[retention]`)
 
 Bounds the growth of the session/shadow/blob stores. `hotl gc` prunes on demand; with a `[retention]` policy set, a prune also runs quietly at startup. See [`hotl gc`](#hotl-gc).
+
+## Admin preapproved rules
+
+`/etc/hotl/preapproved.toml` lets a machine admin pre-approve or refuse tool
+use for every hotl user. Same syntax as your `[[allow]]` rules, plus a lock:
+
+    lock_user_allows = false   # true: your own [[allow]] rules are ignored
+
+    [[allow]]
+    tool = "bash"
+    prefix = "git "
+
+    [[deny]]
+    tool = "bash"
+    prefix = "curl "
+
+hotl trusts the file only when it is owned by root and not group/world-
+writable (`sudo chown root /etc/hotl/preapproved.toml && sudo chmod 644
+/etc/hotl/preapproved.toml`); otherwise it is refused with a startup warning
+and a `hotl doctor` row. Grants show in the transcript tagged `admin:`.
+Protected paths outrank admin grants; admin denies outrank everything.
 
 ## hotl gc
 

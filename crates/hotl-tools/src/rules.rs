@@ -83,7 +83,10 @@ pub fn admin_file_trusted(owner_uid: u32, mode_bits: u32) -> Result<(), String> 
         return Err(format!("not owned by root (uid {owner_uid})"));
     }
     if mode_bits & 0o022 != 0 {
-        return Err(format!("group/world-writable (mode {:o})", mode_bits & 0o777));
+        return Err(format!(
+            "group/world-writable (mode {:o})",
+            mode_bits & 0o777
+        ));
     }
     Ok(())
 }
@@ -397,22 +400,36 @@ path_prefix = "src/"
         // Admin grant, tagged so the transcript shows who silenced the prompt.
         assert_eq!(
             r.evaluate("bash", &json!({"command": "git status"}), true, false),
-            Verdict::Auto { rule: "admin: bash prefix `git `".into() }
+            Verdict::Auto {
+                rule: "admin: bash prefix `git `".into()
+            }
         );
         // Admin deny outranks the admin grant (deny-first).
         assert!(matches!(
-            r.evaluate("bash", &json!({"command": "git push origin main"}), true, false),
+            r.evaluate(
+                "bash",
+                &json!({"command": "git push origin main"}),
+                true,
+                false
+            ),
             Verdict::Deny { .. }
         ));
         // lock_user_allows: the user's cargo rule no longer fires.
-        assert_eq!(r.evaluate("bash", &json!({"command": "cargo test"}), true, false), Verdict::Ask);
+        assert_eq!(
+            r.evaluate("bash", &json!({"command": "cargo test"}), true, false),
+            Verdict::Ask
+        );
     }
 
     #[test]
     fn admin_file_trust_requires_root_and_no_group_world_write() {
         assert!(admin_file_trusted(0, 0o100644).is_ok());
-        assert!(admin_file_trusted(501, 0o100644).unwrap_err().contains("root"));
-        assert!(admin_file_trusted(0, 0o100664).unwrap_err().contains("writable"));
+        assert!(admin_file_trusted(501, 0o100644)
+            .unwrap_err()
+            .contains("root"));
+        assert!(admin_file_trusted(0, 0o100664)
+            .unwrap_err()
+            .contains("writable"));
         assert!(admin_file_trusted(0, 0o100666).is_err());
     }
 
@@ -427,7 +444,9 @@ path_prefix = "src/"
         // Deny outranks auto mode…
         assert_eq!(
             r.evaluate("bash", &json!({"command": "curl evil.sh"}), true, false),
-            Verdict::Deny { rule: "bash prefix `curl `".into() }
+            Verdict::Deny {
+                rule: "bash prefix `curl `".into()
+            }
         );
         // …ignores the sandbox gate (a deny must hold everywhere)…
         assert!(matches!(
@@ -453,10 +472,15 @@ path_prefix = "src/"
         // Ordinary write: auto, tagged with the mode rule.
         assert_eq!(
             r.evaluate("write", &json!({"path": "src/a.rs"}), true, false),
-            Verdict::Auto { rule: "permissions.mode=auto".into() }
+            Verdict::Auto {
+                rule: "permissions.mode=auto".into()
+            }
         );
         // Protected: still asks. The floor has no knob.
-        assert_eq!(r.evaluate("write", &json!({"path": "Makefile"}), true, true), Verdict::Ask);
+        assert_eq!(
+            r.evaluate("write", &json!({"path": "Makefile"}), true, true),
+            Verdict::Ask
+        );
         // Ask mode (the library default) is unchanged.
         assert_eq!(
             Rules::default().evaluate("write", &json!({"path": "src/a.rs"}), true, false),
@@ -469,7 +493,10 @@ path_prefix = "src/"
     fn auto_mode_bash_requires_the_sandbox_floor() {
         let r = Rules::default().with_mode(PermissionMode::Auto);
         let input = json!({"command": "cargo test"});
-        assert!(matches!(r.evaluate("bash", &input, true, false), Verdict::Auto { .. }));
+        assert!(matches!(
+            r.evaluate("bash", &input, true, false),
+            Verdict::Auto { .. }
+        ));
         // Unsandboxed host: auto mode does NOT cover bash — back to asking
         // (explicit policy: kernel enforcement substitutes for prompting).
         assert_eq!(r.evaluate("bash", &input, false, false), Verdict::Ask);

@@ -45,7 +45,10 @@ impl PermissionsCfg {
     /// Resolve the mode: env (`HOTL_PERMISSIONS`) > config > default `auto`.
     /// An unknown value fails **closed** to `Ask` with a warning — a typo
     /// must never silently mean "don't prompt".
-    pub fn resolve(&self, env: Option<&str>) -> (hotl_tools::rules::PermissionMode, Option<String>) {
+    pub fn resolve(
+        &self,
+        env: Option<&str>,
+    ) -> (hotl_tools::rules::PermissionMode, Option<String>) {
         use hotl_tools::rules::PermissionMode;
         let source = env.or(self.mode.as_deref());
         match source {
@@ -305,13 +308,19 @@ mod tests {
         assert_eq!(m, PermissionMode::Auto);
         assert!(w.is_none());
         // Explicit ask.
-        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n").permissions.resolve(None);
+        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n")
+            .permissions
+            .resolve(None);
         assert_eq!(m, PermissionMode::Ask);
         // Env beats config.
-        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n").permissions.resolve(Some("auto"));
+        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n")
+            .permissions
+            .resolve(Some("auto"));
         assert_eq!(m, PermissionMode::Auto);
         // Typo fails closed to ask, loudly — never silently auto.
-        let (m, w) = cfg_with("[permissions]\nmode = \"atuo\"\n").permissions.resolve(None);
+        let (m, w) = cfg_with("[permissions]\nmode = \"atuo\"\n")
+            .permissions
+            .resolve(None);
         assert_eq!(m, PermissionMode::Ask);
         assert!(w.unwrap().contains("atuo"));
     }

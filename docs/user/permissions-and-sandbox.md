@@ -2,11 +2,27 @@
 
 **Mode: explanation.** This is the *why* behind hotl's safety model: what the y/N gate, protected paths, allow-rules, and the kernel sandbox actually protect — and, just as important, what they do **not**. Read it away from the keyboard. For exact syntax see [configuration.md](configuration.md); for a first run see [quickstart.md](quickstart.md). Opinions here are marked as such.
 
-## The one control that matters: you approve each change
+## The one control that matters: you choose when to approve
 
-hotl's load-bearing safety property is simple: **the model can read and think freely, but every action that changes your machine — running a shell command, writing or editing a file — stops and asks you first.** Reads never ask. This is the "human on the loop" the name refers to.
+hotl has two prompt modes. **`auto` (the default): ordinary tool calls run
+without asking.** The floor still holds: `bash` runs inside the kernel
+sandbox, writes to execute-later paths (git hooks, Makefiles, shell rc,
+agent-instruction files, hotl's own config) always stop and ask, deny rules
+refuse outright, every silenced prompt appears in the transcript as an
+auto-allow with its granting rule, and `hotl undo` reverses any change.
+**`ask`: every mutating or executing call asks y/N first** — set
+`[permissions] mode = "ask"` (or `HOTL_PERMISSIONS=ask`) if you want the
+human on every loop. When there's no human — headless `-p`, sub-agents, a
+timed-out interactive prompt — an ask becomes an automatic **no**, in both
+modes.
 
-The gate is *fail-closed*. When there's no human to ask — headless `-p` mode, a non-interactive terminal, or a 300-second timeout on an interactive prompt — the answer is **no**, automatically. hotl will refuse an action before it will perform one you didn't see.
+Admins who need `ask` guaranteed compile with `--features security-enforced`:
+that build ignores the mode key entirely (honestly: it's organizational
+control, not DRM — a user with a toolchain can build a permissive binary).
+Admins can also pre-approve known tools machine-wide in
+`/etc/hotl/preapproved.toml` — same `[[allow]]`/`[[deny]]` syntax as your
+config, plus `lock_user_allows = true` to make theirs the only allow tier.
+hotl refuses that file unless it is root-owned and not group/world-writable.
 
 Everything else below exists to make that gate trustworthy: to keep an approved action from doing more than you thought, and to give you a way back if you approve something you shouldn't have.
 

@@ -455,7 +455,12 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     if let Some(hint) = crate::setup::first_run_hint(&scaffold.config_dir) {
         eprintln!("hotl: {hint}");
     }
-    print_banner(&scaffold.model, &session_id, &scaffold.sandbox_status, &scaffold.rules);
+    print_banner(
+        &scaffold.model,
+        &session_id,
+        &scaffold.sandbox_status,
+        &scaffold.rules,
+    );
     surface.repl().await
 }
 
@@ -694,8 +699,7 @@ pub(crate) const ADMIN_RULES_PATH: &str = "/etc/hotl/preapproved.toml";
 /// permission mode. Prints its startup warnings — posture never changes
 /// silently.
 fn load_rules(cfg: &crate::config::Config) -> Arc<Rules> {
-    let admin_path =
-        std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| ADMIN_RULES_PATH.into());
+    let admin_path = std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| ADMIN_RULES_PATH.into());
     let env_mode = std::env::var("HOTL_PERMISSIONS").ok();
     let (rules, warnings) = load_rules_with(
         cfg,
@@ -1397,12 +1401,14 @@ mod tests {
             hotl_tools::rules::Verdict::Auto { rule } if rule == "permissions.mode=auto"
         ));
         // Absent file: no warning, auto default.
-        let (_, warnings) =
-            load_rules_with(&crate::config::Config::default(), Some(&dir.path().join("nope.toml")), None);
+        let (_, warnings) = load_rules_with(
+            &crate::config::Config::default(),
+            Some(&dir.path().join("nope.toml")),
+            None,
+        );
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         // Explicit ask via the env seam.
-        let (rules, _) =
-            load_rules_with(&crate::config::Config::default(), None, Some("ask"));
+        let (rules, _) = load_rules_with(&crate::config::Config::default(), None, Some("ask"));
         assert_eq!(rules.mode(), hotl_tools::rules::PermissionMode::Ask);
     }
 
