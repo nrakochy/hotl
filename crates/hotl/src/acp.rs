@@ -146,6 +146,16 @@ async fn handle_request(
             pending_prompt.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push_back(id);
             state.handle.prompt(text.to_string()).await;
         }
+        "session/steer" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let Some(text) = msg.pointer("/params/text").and_then(Value::as_str) else {
+                return reply_err(writer, id, "session/steer requires params.text").await;
+            };
+            state.handle.steer(text.to_string()).await;
+            reply_ok(writer, id, json!({"queued": true})).await;
+        }
         "session/cancel" => {
             if let Some(state) = session.as_ref() {
                 state.handle.interrupt();

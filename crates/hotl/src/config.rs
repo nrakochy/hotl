@@ -64,6 +64,9 @@ pub struct BehaviorCfg {
     pub ask_timeout_secs: Option<u64>,
     /// `false` disables the bash sandbox floor.
     pub sandbox: Option<bool>,
+    /// Vim-style keys in the TUI input editor (default on, matching watch).
+    #[allow(dead_code)] // read by `hotl tui` (tui.rs) once the runtime lands
+    pub vim_mode: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -249,6 +252,13 @@ mod tests {
         let (policy, warning) = cfg_with("[network]\negress = \"opne\"\n").network.egress_policy();
         assert_eq!(policy, EgressPolicy::Off);
         assert!(warning.unwrap().contains("opne"));
+    }
+
+    #[test]
+    fn vim_mode_parses_and_defaults() {
+        let cfg = cfg_with("[behavior]\nvim_mode = false\n");
+        assert_eq!(cfg.behavior.vim_mode, Some(false));
+        assert_eq!(cfg_with("").behavior.vim_mode, None);
     }
 
     #[test]

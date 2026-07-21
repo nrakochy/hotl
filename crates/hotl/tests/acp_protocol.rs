@@ -203,6 +203,34 @@ async fn replacing_a_session_clears_parked_state() {
     assert_eq!(result["result"]["outcome"]["text"], "all done via acp");
 }
 
+/// `session/steer` queues mid-turn feedback: acknowledged `{queued:true}`
+/// with a session, an error without one.
+#[tokio::test]
+async fn steer_is_acknowledged_and_reaches_engine() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    // Steering with NO session is an error naming the missing session.
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":1,"method":"session/steer","params":{"text":"go left"}})).await;
+    let err = read_until_id(&mut lines, 1).await;
+    assert!(err["error"]["message"].as_str().unwrap().contains("session"));
+
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":2,"method":"session/new"})).await;
+    read_until_id(&mut lines, 2).await;
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":3,"method":"session/steer","params":{"text":"go left"}})).await;
+    let ack = read_until_id(&mut lines, 3).await;
+    assert_eq!(ack["result"], json!({"queued": true}));
+
+    // Missing params.text is an error too.
+    send(&mut cwrite, json!({"jsonrpc":"2.0","id":4,"method":"session/steer"})).await;
+    let err = read_until_id(&mut lines, 4).await;
+    assert!(err["error"]["message"].as_str().unwrap().contains("text"));
+}
+
 async fn read_until_id(
     lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
     id: u64,
