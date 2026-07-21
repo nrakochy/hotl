@@ -709,6 +709,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
