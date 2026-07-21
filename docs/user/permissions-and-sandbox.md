@@ -42,7 +42,7 @@ Three honest caveats. First, this is **opt-in**: the default stays open because 
 
 Writing a file is usually harmless until *later*. A `.git/hooks/pre-commit`, a `Makefile`, a `build.rs`, your `~/.zshrc`, an `~/.ssh/authorized_keys` — writing these is benign, but the *next* git command, build, shell, or login runs code or grants access you never explicitly approved. This is the "write-now, execute-later" trap.
 
-hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule — it always asks, no matter what your `config.toml's [[allow]]` says. The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), shell startup files, SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
+hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule — it always asks, no matter what your `config.toml's [[allow]]` says. The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), shell startup files, hotl's own config directory (`~/.config/hotl/`, including `config.toml` and its `api_key_helper` command), SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
 
 ## Why allow-rules are a file you edit
 

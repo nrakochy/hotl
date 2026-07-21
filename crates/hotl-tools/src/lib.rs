@@ -137,6 +137,11 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     if file == "settings.json" || p.contains(".hotl/") || p.contains(".claude/") {
         return Some("harness settings/hooks: change how future sessions behave");
     }
+    // hotl's own config: allow rules live here, and [provider] api_key_helper
+    // runs an arbitrary command at next startup, outside the tool sandbox.
+    if p.contains(".config/hotl/") {
+        return Some("hotl config: allow rules and the api-key-helper command run from here");
+    }
     if file.ends_with(".zshrc") || file.ends_with(".bashrc") || file.ends_with(".profile") {
         return Some("shell startup file: runs in every new shell");
     }
@@ -194,6 +199,7 @@ mod tests {
             "etc/systemd/system/x.service",
             "crate/build.rs",
             "tests/conftest.py",
+            "/Users/x/.config/hotl/config.toml",
         ] {
             assert!(execute_later_reason(p).is_some(), "{p} should be protected");
         }

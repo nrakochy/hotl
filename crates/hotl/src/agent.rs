@@ -1002,7 +1002,10 @@ fn key_source_for(
     secrets: &dyn SecretStore,
     fallback_key: Option<String>,
 ) -> Arc<dyn hotl_provider::key::KeySource> {
-    let cmd = secrets.get("HOTL_API_KEY_HELPER").or_else(|| cfg.provider.api_key_helper.clone());
+    let cmd = secrets
+        .get("HOTL_API_KEY_HELPER")
+        .or_else(|| cfg.provider.api_key_helper.clone())
+        .filter(|c| !c.trim().is_empty());
     match cmd {
         Some(cmd) => {
             let ttl = secrets
@@ -1085,8 +1088,10 @@ fn resolve_openai(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Res
     }
     // H-09: a bearer key over cleartext http:// to a non-loopback host
     // crosses the network unencrypted. Warn loudly (don't silently send
-    // it); loopback http is the normal local-endpoint case.
-    if key.is_some() && cleartext_nonloopback(&base) {
+    // it); loopback http is the normal local-endpoint case. A helper-sourced
+    // key (source.refreshable()) is just as real a bearer credential as the
+    // static env key, so it must trip this warning too.
+    if (key.is_some() || source.refreshable()) && cleartext_nonloopback(&base) {
         eprintln!(
             "hotl: WARNING — HOTL_OPENAI_BASE_URL is a non-loopback http:// URL and \
              OPENAI_API_KEY is set; the key will cross the network unencrypted. \
@@ -1158,6 +1163,18 @@ mod tests {
         ]);
         let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
         assert!(source.refreshable(), "helper must win over the static env key");
+    }
+
+    #[test]
+    fn empty_helper_command_falls_back_to_static_key() {
+        let cfg = config_from_toml("[provider]\napi_key_helper = \"\"\n");
+        let secrets = MapSecrets::from([
+            ("OPENAI_API_KEY", "sk-static"),
+            ("HOTL_MODEL", "openai/m"),
+            ("HOTL_OPENAI_BASE_URL", "http://localhost:1/v1"),
+        ]);
+        let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
+        assert!(!source.refreshable(), "empty api_key_helper must not activate the helper");
     }
 
     #[test]
