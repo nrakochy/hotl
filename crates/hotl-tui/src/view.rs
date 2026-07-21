@@ -89,25 +89,58 @@ fn item_lines<'a>(item: &TranscriptItem, p: &Palette) -> Vec<Line<'a>> {
                 ToolStatus::Failed => ("✗", p.blocked),
                 ToolStatus::Denied => ("⛔", p.blocked),
             };
-            let mut tail = format!(" {summary}");
+            let (body, mut details) = split_summary(name, summary);
             if let ToolStatus::AutoAllowed { rule } = status {
-                tail.push_str(&format!(" · auto-allowed: {rule}"));
+                details.push(format!("auto-allowed: {rule}"));
             }
             if !matches!(status, ToolStatus::Denied) {
-                tail.push_str(&format!(" · {}s", ticks / 8));
+                details.push(format!("{}s", ticks / 8));
             }
-            vec![Line::from(vec![
-                Span::styled(format!("[{marker} {name}]"), Style::new().fg(color)),
-                Span::styled(tail, Style::new().fg(p.ink)),
-            ])]
+            let mut spans = vec![
+                Span::styled(format!("  [{marker} {name}]"), Style::new().fg(color)),
+                Span::styled(format!(" {body}"), Style::new().fg(p.ink)),
+            ];
+            if !details.is_empty() {
+                spans.push(Span::styled(
+                    format!(" · {}", details.join(" · ")),
+                    Style::new().fg(p.muted),
+                ));
+            }
+            vec![Line::from(spans)]
         }
         TranscriptItem::Notice { text } => {
             vec![Line::styled(
-                text.clone(),
+                format!("  {text}"),
                 Style::new().fg(p.muted).italic(),
             )]
         }
     }
+}
+
+/// Permission summaries lead with the tool name — "bash [sandboxed:seatbelt]:
+/// cargo test", "write ./x". The card already names the tool in its bracket,
+/// so peel that prefix off and demote a bracket tag to a muted detail.
+fn split_summary(name: &str, summary: &str) -> (String, Vec<String>) {
+    let Some(rest) = summary.strip_prefix(name) else {
+        return (summary.to_string(), Vec::new());
+    };
+    if rest.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    if let Some(body) = rest.strip_prefix(':') {
+        return (body.trim_start().to_string(), Vec::new());
+    }
+    if !rest.starts_with(char::is_whitespace) {
+        return (summary.to_string(), Vec::new()); // name is a mere prefix, not a word
+    }
+    let rest = rest.trim_start();
+    if let Some((tag, body)) = rest
+        .strip_prefix('[')
+        .and_then(|tagged| tagged.split_once("]:"))
+    {
+        return (body.trim_start().to_string(), vec![tag.to_string()]);
+    }
+    (rest.to_string(), Vec::new())
 }
 
 fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
@@ -316,6 +349,58 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("bash] echo hi · 2s")),
             "card elapsed"
+        );
+    }
+
+    #[test]
+    fn split_summary_strips_name_and_lifts_tag() {
+        assert_eq!(
+            split_summary("bash", "bash [sandboxed:seatbelt]: echo hi"),
+            ("echo hi".into(), vec!["sandboxed:seatbelt".to_string()])
+        );
+        assert_eq!(
+            split_summary("write", "write ./x"),
+            ("./x".into(), Vec::new())
+        );
+        assert_eq!(
+            split_summary("bash", "bashful thing"),
+            ("bashful thing".into(), Vec::new()),
+            "name must end at a word boundary"
+        );
+        assert_eq!(
+            split_summary("mcp_ask", "run something: x"),
+            ("run something: x".into(), Vec::new()),
+            "summaries that don't lead with the name pass through"
+        );
+    }
+
+    #[test]
+    fn tool_card_indents_dedupes_name_and_mutes_details() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::Tool {
+            name: "bash".into(),
+            summary: "bash [sandboxed:seatbelt]: echo hi".into(),
+            status: ToolStatus::Done,
+            ticks: 8,
+        });
+        let rows = draw(&s);
+        assert!(
+            rows[0].starts_with("  [✓ bash] echo hi · sandboxed:seatbelt · 1s"),
+            "indented, deduped card: {}",
+            rows[0]
+        );
+        let buf = draw_buffer(&s);
+        let p = Palette::default();
+        let col = |needle: &str| rows[0][..rows[0].find(needle).unwrap()].chars().count() as u16;
+        assert_eq!(
+            buf.cell((col("echo"), 0)).unwrap().style().fg,
+            Some(p.ink),
+            "command body is primary"
+        );
+        assert_eq!(
+            buf.cell((col("sandboxed"), 0)).unwrap().style().fg,
+            Some(p.muted),
+            "detail tail is muted"
         );
     }
 
