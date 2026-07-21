@@ -1,7 +1,7 @@
 //! hotl — one binary, three capabilities (watch · orchestrate · execute).
 //!
 //! Subcommands:
-//!   (none)        the agent REPL (execute — the M0 default flip)
+//!   (none)        the console TUI (execute); also `hotl <id-prefix>` / `hotl --resume`
 //!   -p "prompt"   headless one-shot; asks default-deny; --json for events
 //!   watch         the tmux dashboard (the pre-merge `hotl`)
 //!   fleet         reserved (orchestrate, M4+)
@@ -70,9 +70,12 @@ fn main() {
         }
         Some("doctor") => std::process::exit(doctor::doctor_main()),
         Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
-        Some("resume") => std::process::exit(block_on(agent::resume_main(args[1..].to_vec()))),
+        Some("resume") => {
+            let mut rest = vec!["--resume".to_string()];
+            rest.extend(args[1..].iter().cloned());
+            std::process::exit(block_on(tui::tui_main(rest)));
+        }
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
-        Some("tui") => std::process::exit(block_on(tui::tui_main(args[1..].to_vec()))),
         Some("bg") => std::process::exit(bg::bg_main(bg_prompt(&args))),
         Some("attach") => std::process::exit(block_on(attach::attach_main(
             args.get(1).map(String::as_str),
@@ -100,14 +103,26 @@ fn main() {
             }
         }
         Some("--help") | Some("-h") | Some("help") => print_help(),
-        _ => std::process::exit(block_on(agent::agent_main(args))),
+        _ => {
+            if is_headless(&args) {
+                std::process::exit(block_on(agent::agent_main(args)));
+            }
+            std::process::exit(block_on(tui::tui_main(args)));
+        }
     }
+}
+
+/// Headless flags route to `agent.rs`; everything else in the catch-all is
+/// the TUI's (bare, an id-prefix, or --resume).
+fn is_headless(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| matches!(a.as_str(), "-p" | "--print" | "--json" | "--json-schema"))
 }
 
 fn print_help() {
     println!(
         "hotl — human on the loop\n\n\
-         USAGE:\n  hotl                 agent REPL (execute)\n  \
+         USAGE:\n  hotl [id-prefix]     console TUI (execute); --resume picks a session\n  \
          hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
@@ -116,14 +131,14 @@ fn print_help() {
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
-         hotl resume [id]     continue an earlier session (bare: list recent)\n  \
+         hotl resume [id]     continue an earlier session in the TUI (bare: pick from a list)\n  \
          hotl undo            restore files to before the agent's last change\n  \
          hotl fleet           reserved (orchestrate)\n\n\
          CONFIG: ~/.config/hotl/config.toml (one file: [provider] [context] [behavior]\n  \
          [retention], plus [[allow]] [[mcp]] [[hook]] [diagnostics]). Env vars override\n  \
          (HOTL_MODEL, ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL,\n  \
          HOTL_ASK_TIMEOUT=0, HOTL_SANDBOX=off). Run `hotl setup` to write a starter.\n\n\
-         REPL: type to prompt · type mid-turn to steer · ctrl-c interrupts a turn"
+         TUI: type to prompt · type mid-turn to steer · y/n answers asks · ? help · ctrl-c quits"
     );
 }
 
@@ -184,4 +199,24 @@ fn block_on(f: impl std::future::Future<Output = i32>) -> i32 {
         .build()
         .expect("tokio runtime")
         .block_on(f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_headless;
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn headless_flags_route_to_agent() {
+        assert!(is_headless(&v(&["-p", "hi"])));
+        assert!(is_headless(&v(&["--json", "-p", "hi"])));
+        assert!(is_headless(&v(&["-p", "hi", "--json-schema", "s.json"])));
+    }
+    #[test]
+    fn tui_args_do_not() {
+        assert!(!is_headless(&v(&[])));
+        assert!(!is_headless(&v(&["01ABC"])));
+        assert!(!is_headless(&v(&["--resume"])));
+    }
 }

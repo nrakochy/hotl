@@ -103,47 +103,6 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
     }
 }
 
-/// `hotl resume [id-prefix]`: bare lists recent sessions; with a prefix,
-/// replays that session's lineage into a fresh session's context.
-pub async fn resume_main(args: Vec<String>) -> i32 {
-    let dir = sessions_dir();
-    let sessions = hotl_store::list_sessions(&dir);
-    let Some(prefix) = args.first() else {
-        if sessions.is_empty() {
-            println!("no sessions yet — run `hotl` first");
-        } else {
-            println!("recent sessions (resume with `hotl resume <id-prefix>`):");
-            for (id, _, modified) in sessions.iter().take(10) {
-                println!("  {id}  ({})", age(*modified));
-            }
-        }
-        return 0;
-    };
-    let Some((id, _, _)) = sessions
-        .iter()
-        .find(|(id, ..)| id.starts_with(prefix.as_str()))
-    else {
-        eprintln!("hotl: no session starts with `{prefix}` (try bare `hotl resume` to list)");
-        return 1;
-    };
-    match hotl_store::replay_chain(&dir, id) {
-        Ok(replayed) => {
-            for warning in &replayed.warnings {
-                eprintln!("hotl: WARNING — {warning}");
-            }
-            let resumed = Resumed {
-                parent_id: replayed.header.session_id,
-                items: replayed.items,
-            };
-            run_session(None, false, Some(resumed)).await
-        }
-        Err(e) => {
-            eprintln!("hotl: could not replay session: {e}");
-            1
-        }
-    }
-}
-
 /// `hotl acp`: serve the ACP JSON-RPC protocol over stdio (M4). Wires the
 /// real engine deps into a session factory and hands the streams to the
 /// protocol loop. One connection, one process (process-per-session).
@@ -375,16 +334,6 @@ fn masker_with_helper(initial_helper_key: Option<&str>) -> Masker {
     match initial_helper_key {
         Some(k) => Masker::from_env().with_value("HOTL_API_KEY_HELPER", k),
         None => Masker::from_env(),
-    }
-}
-
-fn age(t: std::time::SystemTime) -> String {
-    let secs = t.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-    match secs {
-        0..=59 => format!("{secs}s ago"),
-        60..=3599 => format!("{}m ago", secs / 60),
-        3600..=86399 => format!("{}h ago", secs / 3600),
-        _ => format!("{}d ago", secs / 86400),
     }
 }
 

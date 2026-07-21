@@ -1,4 +1,4 @@
-//! `hotl tui` — terminal runtime for the execute console. All decisions live
+//! Bare `hotl` — terminal runtime for the execute console. All decisions live
 //! in `hotl-tui` (pure Elm core); this file owns the I/O: raw mode, the event
 //! loop, `$EDITOR` suspension, and the in-process duplex to `acp::serve`. The
 //! TUI is a pure ACP client — it never touches the engine directly.
@@ -28,6 +28,13 @@ type ServerReader = BufReader<ReadHalf<DuplexStream>>;
 type Client = AcpClient<WriteHalf<DuplexStream>>;
 
 pub async fn tui_main(args: Vec<String>) -> i32 {
+    use std::io::IsTerminal;
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        eprintln!(
+            "hotl: the console TUI needs a terminal — use `hotl -p \"prompt\"` for scripted runs"
+        );
+        return 2;
+    }
     let spec = match resolve_spec(&args) {
         Ok(s) => s,
         Err(code) => return code,
@@ -56,7 +63,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut client = AcpClient::new(cwrite);
 
     if let Err(e) = handshake(&mut client, &mut reader, spec).await {
-        eprintln!("hotl tui: {e}");
+        eprintln!("hotl: {e}");
         return 1;
     }
 
@@ -65,7 +72,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut guard = match TerminalGuard::enter() {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("hotl tui: {e}");
+            eprintln!("hotl: {e}");
             return 1;
         }
     };
@@ -84,7 +91,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("hotl tui: {e}");
+            eprintln!("hotl: {e}");
             1
         }
     }
@@ -288,6 +295,16 @@ fn run_external_editor(text: &str) -> Option<String> {
 fn resolve_spec(args: &[String]) -> Result<Option<String>, i32> {
     match args.first().map(String::as_str) {
         None => Ok(None),
+        // The one-time migration hint: `tui` was a subcommand before the
+        // default flip, and would otherwise read as a session-id prefix.
+        Some("tui") => {
+            eprintln!("hotl: the TUI is now just `hotl` (the `tui` subcommand was removed)");
+            Err(2)
+        }
+        Some(flag) if flag.starts_with('-') && flag != "--resume" => {
+            eprintln!("hotl: unknown argument `{flag}` (try --help)");
+            Err(2)
+        }
         Some("--resume") => match args.get(1) {
             Some(p) => by_prefix(p).map(Some),
             None => pick_session().map(Some),
@@ -305,11 +322,11 @@ fn by_prefix(prefix: &str) -> Result<String, i32> {
     match matches.len() {
         1 => Ok(matches[0].0.clone()),
         0 => {
-            eprintln!("hotl tui: no session matches `{prefix}`");
+            eprintln!("hotl: no session matches `{prefix}`");
             Err(2)
         }
         n => {
-            eprintln!("hotl tui: `{prefix}` is ambiguous ({n} sessions)");
+            eprintln!("hotl: `{prefix}` is ambiguous ({n} sessions)");
             Err(2)
         }
     }
@@ -325,7 +342,7 @@ fn newest_first() -> Vec<(String, PathBuf, SystemTime)> {
 fn pick_session() -> Result<String, i32> {
     let sessions = newest_first();
     if sessions.is_empty() {
-        eprintln!("hotl tui: no sessions to resume");
+        eprintln!("hotl: no sessions to resume");
         return Err(2);
     }
     eprintln!("pick a session:");
@@ -340,7 +357,7 @@ fn pick_session() -> Result<String, i32> {
     match line.trim().parse::<usize>() {
         Ok(n) if (1..=sessions.len().min(20)).contains(&n) => Ok(sessions[n - 1].0.clone()),
         _ => {
-            eprintln!("hotl tui: not a valid choice");
+            eprintln!("hotl: not a valid choice");
             Err(2)
         }
     }
@@ -399,5 +416,31 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_spec;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn bare_args_open_a_new_session() {
+        assert_eq!(resolve_spec(&v(&[])), Ok(None));
+    }
+
+    #[test]
+    fn tui_literal_gets_the_migration_hint() {
+        // Pre-flip muscle memory: `hotl tui` must not read as an id prefix.
+        assert_eq!(resolve_spec(&v(&["tui"])), Err(2));
+    }
+
+    #[test]
+    fn unknown_flags_are_rejected_before_session_lookup() {
+        assert_eq!(resolve_spec(&v(&["--json"])), Err(2));
+        assert_eq!(resolve_spec(&v(&["-x"])), Err(2));
     }
 }
