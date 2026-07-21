@@ -31,6 +31,11 @@ jobs:
         with:
           # Empty on workflow_dispatch, which falls back to the default branch.
           ref: ${{ github.event.release.tag_name }}
+      # Creates the Pages site on first run (enablement) — deploy-pages fails
+      # with 404 if the repo has never had Pages configured.
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
       - uses: actions/setup-node@v4
         with:
           node-version: 22
