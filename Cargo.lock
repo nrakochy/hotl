@@ -703,6 +703,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotl-tui"
+version = "0.1.2"
+dependencies = [
+ "crossterm",
+ "ratatui",
+ "serde_json",
+]
+
+[[package]]
 name = "hotl-types"
 version = "0.1.2"
 dependencies = [

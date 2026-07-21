@@ -1,0 +1,17 @@
+[package]
+name = "hotl-tui"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. Elm-style ratatui console (state, update, view) for the execute agent."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["tui", "ratatui", "agent", "console"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+serde_json = { workspace = true }
