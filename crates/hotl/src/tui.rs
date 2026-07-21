@@ -47,6 +47,9 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         .behavior
         .vim_mode
         .unwrap_or(true);
+    if let Some(hint) = crate::setup::first_run_hint(&crate::agent::config_dir()) {
+        eprintln!("hotl: {hint}");
+    }
     // Same [settings.theme] table (and warning behavior) as `hotl watch`;
     // warnings print as plain lines before the alternate screen owns stdout.
     let (watch_cfg, theme_warn) = watch_types::HotlConfig::load_with_warning();

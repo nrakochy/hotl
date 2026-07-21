@@ -99,9 +99,6 @@ pub struct ContextCfg {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct BehaviorCfg {
-    /// Seconds an interactive permission ask waits before default-denying
-    /// (`0` = wait forever).
-    pub ask_timeout_secs: Option<u64>,
     /// `false` disables the bash sandbox floor.
     pub sandbox: Option<bool>,
     /// Vim-style keys in the TUI input editor (default on, matching watch).
@@ -229,7 +226,7 @@ mod tests {
             evict_tokens = 5000
 
             [behavior]
-            ask_timeout_secs = 0
+            vim_mode = false
 
             [retention]
             max_age_days = 30
@@ -254,7 +251,7 @@ mod tests {
         );
         assert_eq!(cfg.provider.model.as_deref(), Some("openai/gpt-5"));
         assert_eq!(cfg.context.window, Some(128_000));
-        assert_eq!(cfg.behavior.ask_timeout_secs, Some(0));
+        assert_eq!(cfg.behavior.vim_mode, Some(false));
         assert_eq!(cfg.retention.max_age_days, Some(30));
         assert_eq!(cfg.retention.max_sessions, Some(100));
         // Domain sections reserialize to their loaders' shapes.

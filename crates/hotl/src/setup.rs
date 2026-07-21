@@ -34,8 +34,8 @@ pub const DEFAULT_CONFIG: &str = "\
 # show_used_pct = true       # show context-fullness in each turn's status
 
 [behavior]
-# ask_timeout_secs = 300     # 0 = wait forever for a permission answer
 # sandbox = true             # false disables the bash sandbox floor
+# vim_mode = true            # vim-style keys in the console's input editor
 
 [permissions]
 mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.

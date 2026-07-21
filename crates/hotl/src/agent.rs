@@ -1,9 +1,9 @@
-//! The execute surface: a steering REPL and `-p` headless.
-//!
-//! The surface is a client of the session actor: it renders events, answers
-//! asks, and turns typed lines into prompts (idle) or steers (mid-turn).
+//! The execute surface, headless: `-p` one-shot and `--json-schema`
+//! structured runs. The interactive console is the TUI (crates/hotl-tui +
+//! tui.rs); this module also hosts the engine scaffolding the TUI, ACP, and
+//! the socket server share (`acp_factory`, config/session paths, providers).
 
-use std::io::{IsTerminal, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -14,9 +14,6 @@ use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, sandbox, Registry};
 use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::mpsc;
-
-const ASK_TIMEOUT_SECS: u64 = 300;
 
 /// Stable schema version of the `-p --json` event stream (MD Tier-1 contract;
 /// bump only on a breaking change to a frame's shape).
@@ -35,7 +32,15 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     };
     match (parsed.schema, parsed.prompt) {
         (Some(schema), Some(prompt)) => structured_main(&prompt, &schema).await,
-        (_, prompt) => run_session(prompt, parsed.json_events, None).await,
+        (None, Some(prompt)) => run_session(prompt, parsed.json_events).await,
+        // Reachable via e.g. `hotl --json` with no -p (main.rs routes any
+        // headless flag here); the interactive console is bare `hotl`.
+        (_, None) => {
+            eprintln!(
+                "hotl: -p \"prompt\" is required headless — the interactive console is bare `hotl` in a terminal"
+            );
+            2
+        }
     }
 }
 
@@ -208,14 +213,10 @@ struct Scaffold {
     system: String,
     rules: Arc<Rules>,
     sandbox_enforced: bool,
-    sandbox_status: sandbox::SandboxStatus,
     cwd: PathBuf,
     config: EngineConfig,
     registry: Arc<Registry>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
-    /// The parsed config.toml, loaded once per process and shared with every
-    /// helper that used to re-read the file.
-    cfg: crate::config::Config,
     /// The api-key-helper's key, acquired once at startup validation below.
     /// `None` for a static key source (nothing to register: it's already a
     /// process env var and `Masker::from_env()` already covers it).
@@ -286,12 +287,10 @@ async fn scaffold(
         system,
         rules,
         sandbox_enforced,
-        sandbox_status,
         cwd,
         config,
         registry,
         hooks,
-        cfg,
         initial_helper_key,
     })
 }
@@ -337,8 +336,7 @@ fn masker_with_helper(initial_helper_key: Option<&str>) -> Masker {
     }
 }
 
-async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<Resumed>) -> i32 {
-    let headless = prompt.is_some();
+async fn run_session(prompt: String, json_events: bool) -> i32 {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -353,11 +351,10 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
         Err(code) => return code,
     };
 
-    let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
     let log = match SessionLog::create(
         &sessions_dir(),
         &scaffold.model,
-        parent_id,
+        None,
         scaffold.masker(),
         scaffold.clock.now_ms(),
     ) {
@@ -372,45 +369,15 @@ async fn run_session(prompt: Option<String>, json_events: bool, resumed: Option<
     let gc_config_dir = scaffold.config_dir.clone();
     std::thread::spawn(move || crate::gc::auto_gc(&gc_config_dir)); // retention, off the hot path
     let (snapshots, initial_items) =
-        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
     let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
 
-    let mut surface = Surface::new(
-        handle,
-        headless,
-        json_events,
-        ask_timeout_from_env(&secrets, &scaffold.cfg),
-    );
-    if let Some(p) = prompt {
-        surface
-            .handle
-            .prompt(crate::setup::expand_file_refs(&p))
-            .await;
-        return surface.run_until_idle().await;
-    }
-    if let Some(r) = &resumed {
-        println!(
-            "resumed from session {} ({} items of context)",
-            r.parent_id,
-            r.items.len()
-        );
-        // #8: continue an interrupted turn (last item is the model's to answer).
-        if hotl_engine::needs_continuation(&r.items) {
-            println!("(continuing the interrupted turn…)");
-            surface.handle.continue_turn().await;
-            surface.turn_running = true;
-        }
-    }
-    if let Some(hint) = crate::setup::first_run_hint(&scaffold.config_dir) {
-        eprintln!("hotl: {hint}");
-    }
-    print_banner(
-        &scaffold.model,
-        &session_id,
-        &scaffold.sandbox_status,
-        &scaffold.rules,
-    );
-    surface.repl().await
+    let mut surface = Surface::new(handle, json_events);
+    surface
+        .handle
+        .prompt(crate::setup::expand_file_refs(&prompt))
+        .await;
+    surface.run_until_idle().await
 }
 
 /// Builtins + the `mcp` meta-tool (M3a) + the `spawn` tool (M4) when a child
@@ -720,114 +687,24 @@ pub(crate) fn load_admin(
         .map_err(|e| e.to_string())
 }
 
-/// Startup visibility: auto mode is never silent (design §Config).
-fn permissions_label(rules: &Rules) -> &'static str {
-    if hotl_tools::rules::enforced_build() {
-        "permissions:enforced"
-    } else if rules.mode() == hotl_tools::rules::PermissionMode::Auto {
-        "permissions:auto"
-    } else {
-        "permissions:ask"
-    }
-}
-
-fn print_banner(model: &str, session_id: &str, status: &sandbox::SandboxStatus, rules: &Rules) {
-    println!(
-        "hotl · {model} · session {session_id} · {} · {}",
-        match status {
-            sandbox::SandboxStatus::Enforced(m) => format!("sandbox:{m}"),
-            other => other.label(),
-        },
-        permissions_label(rules)
-    );
-    println!("type to prompt · type mid-turn to steer · ctrl-c interrupts · ctrl-d exits");
-}
-
 struct Surface {
     handle: SessionHandle,
-    headless: bool,
     json: bool,
-    stdin: mpsc::Receiver<String>,
     turn_running: bool,
     saw_text: bool,
-    /// How long an interactive permission ask waits before default-denying.
-    /// `None` = wait indefinitely (a backgrounded/detached session holds the
-    /// ask until you reattach and answer — `HOTL_ASK_TIMEOUT=0`).
-    ask_timeout: Option<std::time::Duration>,
     /// One SIGINT stream for the surface's lifetime — registered once, not
-    /// per select iteration, and shared with `ask_human` so Ctrl-C during a
-    /// permission ask isn't dropped.
+    /// per select iteration.
     sigint: tokio::signal::unix::Signal,
 }
 
 impl Surface {
-    fn new(
-        handle: SessionHandle,
-        headless: bool,
-        json: bool,
-        ask_timeout: Option<std::time::Duration>,
-    ) -> Self {
-        let (tx, rx) = mpsc::channel(8);
-        if !headless {
-            std::thread::spawn(move || {
-                let stdin = std::io::stdin();
-                let mut line = String::new();
-                loop {
-                    line.clear();
-                    match stdin.read_line(&mut line) {
-                        Ok(0) | Err(_) => break, // EOF
-                        Ok(_) => {
-                            if tx.blocking_send(line.clone()).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-        }
+    fn new(handle: SessionHandle, json: bool) -> Self {
         Self {
             handle,
-            headless,
             json,
-            stdin: rx,
             turn_running: false,
             saw_text: false,
-            ask_timeout,
             sigint: signal(SignalKind::interrupt()).expect("SIGINT handler"),
-        }
-    }
-
-    /// Interactive loop. Lines while idle → prompts; lines mid-turn → steers.
-    async fn repl(&mut self) -> i32 {
-        self.prompt_marker();
-        loop {
-            tokio::select! {
-                maybe_event = self.handle.events.recv() => {
-                    let Some(event) = maybe_event else { return 0 };
-                    self.render(event).await;
-                }
-                maybe_line = self.stdin.recv() => {
-                    let Some(line) = maybe_line else { println!(); return 0 };
-                    let line = line.trim().to_string();
-                    if line.is_empty() { if !self.turn_running { self.prompt_marker(); } continue; }
-                    if !self.turn_running && matches!(line.as_str(), "exit" | "quit") { return 0; }
-                    if self.turn_running {
-                        self.handle.steer(crate::setup::expand_file_refs(&line)).await;
-                        eprintln!("(steered — woven into the agent's next step)");
-                    } else {
-                        self.handle.prompt(crate::setup::expand_file_refs(&line)).await;
-                        self.turn_running = true;
-                    }
-                }
-                _ = self.sigint.recv() => {
-                    if self.turn_running {
-                        self.handle.interrupt();
-                    } else {
-                        println!();
-                        return 0;
-                    }
-                }
-            }
         }
     }
 
@@ -850,12 +727,6 @@ impl Surface {
                 }
                 _ = self.sigint.recv() => self.handle.interrupt(),
             }
-        }
-    }
-
-    fn prompt_marker(&self) {
-        if !self.headless {
-            eprint!("\n❯ ");
         }
     }
 
@@ -899,13 +770,10 @@ impl Surface {
                     eprintln!("(context compacted — earlier history summarized)");
                 }
             }
-            EngineEvent::Ask {
-                summary,
-                protected_why,
-                reply,
-            } => {
-                let answer = self.ask_human(&summary, protected_why.as_deref()).await;
-                let _ = reply.send(answer);
+            EngineEvent::Ask { summary, reply, .. } => {
+                // Headless asks default-deny; the record goes to stderr.
+                eprintln!("hotl: denied (headless): {summary}");
+                let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
             }
             EngineEvent::TurnDone { outcome, usage } => self.render_turn_done(outcome, usage),
         }
@@ -932,7 +800,6 @@ impl Surface {
             "[in {} out {} cache-read {}]",
             usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
         );
-        self.prompt_marker();
     }
 
     fn render_json(&mut self, event: EngineEvent) {
@@ -976,86 +843,6 @@ impl Surface {
         let mut framed = v;
         framed["schema_version"] = serde_json::json!(JSON_STREAM_SCHEMA_VERSION);
         println!("{framed}");
-    }
-
-    async fn ask_human(
-        &mut self,
-        summary: &str,
-        protected_why: Option<&str>,
-    ) -> hotl_engine::AskReply {
-        use hotl_engine::AskReply;
-        if self.headless || !std::io::stdin().is_terminal() {
-            eprintln!("hotl: denied (headless): {summary}");
-            return AskReply::Deny { message: None };
-        }
-        if let Some(why) = protected_why {
-            eprintln!("⚠ PROTECTED PATH — {why}");
-        }
-        // A bare `n` denies; `n <reason>` sends the reason to the model (T1).
-        eprint!("allow {summary}? [y/N — add a reason after 'n' to tell the model why] ");
-        // Ctrl-C while the ask is parked = deny + interrupt (the same
-        // semantics as Ctrl-C mid-turn — without this branch the signal
-        // would be dropped while we await stdin).
-        let Some(timeout) = self.ask_timeout else {
-            return tokio::select! {
-                line = self.stdin.recv() => reply_from_line(line.as_deref()),
-                _ = self.sigint.recv() => {
-                    eprintln!();
-                    self.handle.interrupt();
-                    AskReply::Deny { message: None }
-                }
-            };
-        };
-        tokio::select! {
-            answered = tokio::time::timeout(timeout, self.stdin.recv()) => match answered {
-                Ok(line) => reply_from_line(line.as_deref()),
-                Err(_) => {
-                    eprintln!("(no answer in {}s — denied)", timeout.as_secs());
-                    AskReply::Deny { message: None }
-                }
-            },
-            _ = self.sigint.recv() => {
-                eprintln!();
-                self.handle.interrupt();
-                AskReply::Deny { message: None }
-            }
-        }
-    }
-}
-
-/// Parse a permission answer line into an `AskReply` (T1): `y`/`yes` allows;
-/// `n <reason>` / `no <reason>` denies with the reason for the model; anything
-/// else (incl. a bare `n` or EOF) is a plain deny.
-fn reply_from_line(line: Option<&str>) -> hotl_engine::AskReply {
-    use hotl_engine::AskReply;
-    let Some(t) = line.map(str::trim) else {
-        return AskReply::Deny { message: None };
-    };
-    if matches!(t, "y" | "Y" | "yes") {
-        return AskReply::Allow;
-    }
-    let message = t
-        .strip_prefix("n ")
-        .or_else(|| t.strip_prefix("no "))
-        .map(|m| m.trim().to_string())
-        .filter(|m| !m.is_empty());
-    AskReply::Deny { message }
-}
-
-/// The interactive ask timeout from `HOTL_ASK_TIMEOUT` (seconds): unset →
-/// the 300s default; `0` → wait indefinitely (backgrounded/detached sessions).
-fn ask_timeout_from_env(
-    secrets: &dyn SecretStore,
-    cfg: &crate::config::Config,
-) -> Option<std::time::Duration> {
-    let secs = secrets
-        .get("HOTL_ASK_TIMEOUT")
-        .and_then(|v| v.parse::<u64>().ok())
-        .or(cfg.behavior.ask_timeout_secs);
-    match secs {
-        Some(0) => None,
-        Some(n) => Some(std::time::Duration::from_secs(n)),
-        None => Some(std::time::Duration::from_secs(ASK_TIMEOUT_SECS)),
     }
 }
 

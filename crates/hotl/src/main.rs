@@ -137,7 +137,7 @@ fn print_help() {
          CONFIG: ~/.config/hotl/config.toml (one file: [provider] [context] [behavior]\n  \
          [retention], plus [[allow]] [[mcp]] [[hook]] [diagnostics]). Env vars override\n  \
          (HOTL_MODEL, ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL,\n  \
-         HOTL_ASK_TIMEOUT=0, HOTL_SANDBOX=off). Run `hotl setup` to write a starter.\n\n\
+         HOTL_SANDBOX=off). Run `hotl setup` to write a starter.\n\n\
          TUI: type to prompt · type mid-turn to steer · y/n answers asks · ? help · ctrl-c quits"
     );
 }
