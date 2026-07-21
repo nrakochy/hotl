@@ -689,6 +689,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotl-theme"
+version = "0.1.2"
+dependencies = [
+ "ratatui",
+ "serde",
+]
+
+[[package]]
 name = "hotl-tools"
 version = "0.1.2"
 dependencies = [

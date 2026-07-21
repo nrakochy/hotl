@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/watch-types",
+    "crates/hotl-theme",
     "crates/watch-tmux",
     "crates/watch-listener",
     "crates/watch-tui",
