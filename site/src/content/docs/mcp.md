@@ -1,5 +1,6 @@
 ---
 title: 'Connecting MCP tool servers'
+description: Give the hotl agent extra tools from an MCP server over the stdio transport.
 ---
 
 Give the `hotl` agent extra tools from an MCP server. Assumes you have a working agent (see [quickstart.md](../quickstart/)) and an MCP server program on your machine. For the security model behind the approval prompts, see [permissions-and-sandbox.md](../permissions-and-sandbox/).

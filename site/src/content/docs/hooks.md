@@ -1,5 +1,6 @@
 ---
 title: 'Hooks — running your own checks on tool calls'
+description: "Run your own logic on hotl tool calls: post-edit diagnostics and hooks that block, rewrite, or clean up."
 ---
 
 Make the `hotl` agent run *your* logic when it uses a tool — block a call, rewrite it, or clean up a result. Two mechanisms: post-edit **diagnostics** (run a check after edits) and **hooks** (intercept any tool call). Assumes a working agent ([quickstart.md](../quickstart/)).

@@ -1,0 +1,33 @@
+# hotl
+
+> hotl is a human-on-the-loop terminal AI agent in one binary. Bare `hotl` is the agent (console TUI, or `-p "<prompt>"` headless, `--json` for structured output). `hotl watch` is a tmux dashboard for supervising agent processes. `hotl fleet` is reserved and exits with an error. Version 0.2.0+; pre-1.0, breaking changes at every 0.x minor.
+
+Facts an agent needs before acting:
+
+- Model selection: `HOTL_MODEL=provider/model` env var (or `[provider].model` in config). Providers: `anthropic/…` (Messages API, needs `ANTHROPIC_API_KEY`) and `openai/…` (any OpenAI-compatible endpoint, needs `OPENAI_API_KEY`; override base URL with `HOTL_OPENAI_BASE_URL`).
+- Permission modes: `auto` (default — ordinary tool calls run without prompting) or `ask` (y/N per mutating call). Set via `HOTL_PERMISSIONS=ask` or `[permissions] mode = "ask"`. Unknown values fail closed to `ask`. Writes to git hooks, shell rc, Makefiles, and agent-instruction files always prompt, in every mode.
+- Sandbox: `bash` runs under Seatbelt (macOS) or Landlock (Linux), writes confined to the working directory. `HOTL_SANDBOX=off` disables it loudly. Reads and network egress are open by default; `[network].allow` opts into an HTTP allowlist proxy.
+- State: config in `~/.config/hotl/config.toml`; sessions (append-only JSONL) in `~/.local/share/hotl/sessions`. `hotl resume` continues a session; `hotl undo` reverses the agent's file edits via git snapshots. No daemon, no telemetry.
+- Setup check: `hotl doctor` prints ok/FAIL lines for provider, sandbox, config, sessions. Exit code is nonzero on failure.
+
+## Docs
+
+- [Overview](https://nrakochy.github.io/hotl/overview/): design commitments — session log, permission gate, provider seams, protocols, surfaces
+- [Quickstart](https://nrakochy.github.io/hotl/quickstart/): install through first approved edit and undo, with expected output per step
+- [Configuration](https://nrakochy.github.io/hotl/configuration/): every subcommand, config key, env var, and exit code
+- [Permissions & sandbox](https://nrakochy.github.io/hotl/permissions-and-sandbox/): what the gate and sandbox protect and what they deliberately do not
+- [Troubleshooting](https://nrakochy.github.io/hotl/troubleshooting/): error message → cause → fix table
+- [TUI console](https://nrakochy.github.io/hotl/tui/): interactive console keys and behavior
+- [Shell integration](https://nrakochy.github.io/hotl/shell/): zsh `: ` prefix, `@[path]` file capture, OSC-133 marks
+- [Background sessions](https://nrakochy.github.io/hotl/backgrounding/): `hotl bg` / `hotl attach` detached sessions
+- [MCP servers](https://nrakochy.github.io/hotl/mcp/): connecting stdio MCP tool servers
+- [Hooks & diagnostics](https://nrakochy.github.io/hotl/hooks/): post-edit diagnostics and tool-call hooks
+- [Gateways](https://nrakochy.github.io/hotl/gateway/): OpenAI-compatible gateways and command-sourced API keys
+- [Uninstall](https://nrakochy.github.io/hotl/uninstall/): removal, including data locations
+
+## Source
+
+- [Repository](https://github.com/nrakochy/hotl): Rust workspace; `crates/hotl` is the binary, library crates carry no semver promise
+- [ARCHITECTURE.md](https://github.com/nrakochy/hotl/blob/master/ARCHITECTURE.md): layers and event flow
+- [SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md): the security stance, including what the sandbox does not cover
+- [CHANGELOG.md](https://github.com/nrakochy/hotl/blob/master/CHANGELOG.md): release history; 0.2.0 renamed the dashboard to `hotl watch`

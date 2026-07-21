@@ -1,5 +1,6 @@
 ---
 title: 'Troubleshooting — hotl the agent'
+description: hotl error messages mapped to causes and fixes; run hotl doctor first.
 ---
 
 Look up the message you saw. Text in `code` is what hotl prints; find yours by grepping this file for a distinctive phrase. Run `hotl doctor` first for setup problems — it diagnoses most of the table below in one shot.

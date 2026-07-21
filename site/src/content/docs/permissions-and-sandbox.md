@@ -1,5 +1,6 @@
 ---
 title: 'Permissions & the sandbox — what the guardrails do'
+description: What hotl's permission gate, protected paths, allow-rules, and kernel sandbox actually protect — and what they deliberately do not.
 ---
 
 The *why* behind hotl's safety model: what the y/N gate, protected paths, allow-rules, and the kernel sandbox actually protect — and, just as important, what they do **not**. For exact syntax see [configuration.md](../configuration/); for a first run see [quickstart.md](../quickstart/). Opinions here are marked as such.

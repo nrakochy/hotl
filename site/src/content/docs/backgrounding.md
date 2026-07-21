@@ -1,5 +1,6 @@
 ---
 title: 'Backgrounding a session'
+description: Run a hotl agent detached from your terminal with hotl bg, then reconnect from anywhere with hotl attach.
 ---
 
 Run a `hotl` agent detached from your terminal, then reconnect to it later — without tmux. Assumes a working agent ([quickstart.md](../quickstart/)).

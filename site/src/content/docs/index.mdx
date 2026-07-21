@@ -1,0 +1,51 @@
+---
+title: hotl — human on the loop
+description: A human-on-the-loop terminal AI agent — a permission gate under a kernel sandbox floor, an append-only session log with resume and undo, MCP/ACP, and any Anthropic or OpenAI-compatible model.
+template: splash
+hero:
+  tagline: A terminal AI agent with guardrails you can see, a session log nothing rewrites, and any model you point it at — plus a tmux dashboard for every agent you run.
+  actions:
+    - text: Quickstart
+      link: ./quickstart/
+      icon: right-arrow
+    - text: Overview
+      link: ./overview/
+      variant: minimal
+    - text: GitHub
+      link: https://github.com/nrakochy/hotl
+      icon: external
+      variant: minimal
+---
+
+import { Card, CardGrid } from '@astrojs/starlight/components';
+
+<CardGrid stagger>
+	<Card title="A floor that never turns off" icon="approve-check">
+		Every mutating tool call passes a permission gate, and `bash` runs under a
+		kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines writes
+		to the working directory. Writes to git hooks, shell rc, Makefiles, and
+		agent-instruction files always stop and ask — in every mode.
+		[Permissions & sandbox →](./permissions-and-sandbox/)
+	</Card>
+	<Card title="Nothing is ever lost" icon="document">
+		Sessions are append-only event logs: `hotl resume` continues one,
+		`hotl undo` reverses the agent's file changes via shadow-git snapshots,
+		and context compaction adds a summary on top of history instead of
+		rewriting it. [Overview →](./overview/)
+	</Card>
+	<Card title="Any model, one env var" icon="setting">
+		`HOTL_MODEL=provider/model` — Anthropic's Messages API, or any
+		OpenAI-compatible endpoint: OpenAI, Groq, a local Ollama server, or a
+		gateway like LiteLLM. [Gateways & key sources →](./gateway/)
+	</Card>
+	<Card title="Standard protocols at the edges" icon="puzzle">
+		An MCP client brings in external tools; `hotl acp` embeds the agent in any
+		ACP-speaking editor; `hotl watch` supervises every agent in your tmux
+		session. [MCP servers →](./mcp/)
+	</Card>
+</CardGrid>
+
+<p style="text-align: center; margin-top: 2rem;">
+	Building on top of hotl, or pointing an agent at these docs?
+	<a href="./llms.txt">llms.txt</a> is the machine-readable map.
+</p>

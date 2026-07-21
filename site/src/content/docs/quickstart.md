@@ -1,5 +1,6 @@
 ---
 title: 'Quickstart — your first hotl session'
+description: Install hotl, point it at a model, and complete one approved agent task — then undo it. Every command paired with the output you should see.
 ---
 
 From nothing installed to a completed agent task. Every command is copy-runnable and paired with the output you should see; the why behind things lives in [permissions-and-sandbox.md](../permissions-and-sandbox/) and [configuration.md](../configuration/).
@@ -112,5 +113,6 @@ Type a request → the agent reads freely → it **asks before changing anything
 - Staying in `ask` mode but tired of approving trusted commands every time? → allow-rules in [configuration.md](../configuration/#allow-rules-allow).
 - Want to know exactly what the gate and sandbox protect (and what they don't)? → [permissions-and-sandbox.md](../permissions-and-sandbox/).
 - Running it in a script instead of interactively? → headless mode in [configuration.md](../configuration/#headless--p----json).
+- Want `: fix the tests` straight from your shell prompt? → [shell.md](../shell/).
 
 **Not covered here:** connecting MCP tool servers and the post-edit hooks feature (see [configuration.md](../configuration/), stubs noted there).

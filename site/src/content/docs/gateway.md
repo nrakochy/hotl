@@ -1,5 +1,6 @@
 ---
 title: 'Run hotl through a gateway — hotl the agent'
+description: Point hotl at any OpenAI-compatible gateway and obtain API keys from a command instead of an env var.
 ---
 
 Point hotl at any OpenAI-compatible gateway (Bifrost,

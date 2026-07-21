@@ -1,5 +1,6 @@
 ---
 title: 'The console: hotl'
+description: "Drive the hotl agent from a full-screen terminal console: streaming transcript, activity strip, modal permission asks, vim-style input."
 ---
 
 Drive the agent from a full-screen terminal console — streaming transcript, a loop-motif activity strip, modal permission asks, and a vim-style input editor. Assumes a working agent ([quickstart.md](../quickstart/)).

@@ -1,5 +1,6 @@
 ---
 title: 'Configuration reference — hotl the agent'
+description: Reference for every hotl subcommand, config file key, environment variable, and exit code.
 ---
 
 Reference for the command surface, config files, and environment variables of the `hotl` agent. For a guided first run see [quickstart.md](../quickstart/); for the reasoning behind the safety model see [permissions-and-sandbox.md](../permissions-and-sandbox/). All paths are literal; `~` is the invoking user's home.
