@@ -39,6 +39,8 @@ pub enum PermissionMode {
 pub struct Rules {
     #[serde(default)]
     allow: Vec<AllowRule>,
+    #[serde(skip)]
+    mode: PermissionMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -67,6 +69,18 @@ impl Rules {
 
     pub fn is_empty(&self) -> bool {
         self.allow.is_empty()
+    }
+
+    /// Set the prompt mode (binary-resolved). The `security-enforced` build
+    /// coerces `Auto` to `Ask` here — this builder is the single runtime
+    /// enforcement point.
+    pub fn with_mode(mut self, mode: PermissionMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn mode(&self) -> PermissionMode {
+        self.mode
     }
 
     /// Deny-first evaluation. `protected` is Some when the target is in the
@@ -119,6 +133,12 @@ impl Rules {
                 }
                 _ => {}
             }
+        }
+        // Lowest-precedence tier: mode=auto is YOLO as a policy point in the
+        // same pipeline, not a separate code path. Bash keeps the sandbox
+        // gate; the protected carve-out already returned above.
+        if self.mode == PermissionMode::Auto && (tool != "bash" || sandbox_enforced) {
+            return Verdict::Auto { rule: "permissions.mode=auto".into() };
         }
         Verdict::Ask
     }
@@ -236,6 +256,38 @@ path_prefix = "src/"
         ); // rule is write-only
         assert!(Rules::default().is_empty());
         assert!(Rules::from_toml("allow = 3").is_err());
+    }
+
+    #[test]
+    fn auto_mode_allows_ordinary_calls_but_never_protected() {
+        let r = Rules::default().with_mode(PermissionMode::Auto);
+        // Ordinary write: auto, tagged with the mode rule.
+        assert_eq!(
+            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            Verdict::Auto { rule: "permissions.mode=auto".into() }
+        );
+        // Protected: still asks. The floor has no knob.
+        assert_eq!(r.evaluate("write", &json!({"path": "Makefile"}), true, true), Verdict::Ask);
+        // Ask mode (the library default) is unchanged.
+        assert_eq!(
+            Rules::default().evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn auto_mode_bash_requires_the_sandbox_floor() {
+        let r = Rules::default().with_mode(PermissionMode::Auto);
+        let input = json!({"command": "cargo test"});
+        assert!(matches!(r.evaluate("bash", &input, true, false), Verdict::Auto { .. }));
+        // Unsandboxed host: auto mode does NOT cover bash — back to asking
+        // (explicit policy: kernel enforcement substitutes for prompting).
+        assert_eq!(r.evaluate("bash", &input, false, false), Verdict::Ask);
+        // Non-bash tools don't need the floor.
+        assert!(matches!(
+            r.evaluate("read", &json!({"path": "x"}), false, false),
+            Verdict::Auto { .. }
+        ));
     }
 
     #[test]
