@@ -1,4 +1,6 @@
 # Deploys the Starlight docs site (site/) to GitHub Pages.
+# One-time repo prerequisite: Settings → Pages → Source = "GitHub Actions"
+# (creating the Pages site is admin-only; the workflow token can't do it).
 #
 # Runs when cargo-dist publishes a GitHub Release (see release.yml), building
 # the docs from the released tag, and on any master push that touches site/ —
