@@ -27,28 +27,40 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		rewriting it. [Overview →](./overview/)
 	</Card>
 	<Card title="Context that stays slim" icon="random">
-		Oversized tool results are evicted to files past a threshold — a preview
-		stays inline, and the agent pages the full result back only when it needs
-		it. Compaction summaries are precomputed in the background from ~60%
-		context-full and fold in at ~80% without pausing the session. The prompt
-		prefix is byte-stable, so provider prompt caches keep hitting — and a
-		per-turn meter shows how full the context actually is.
+		The window is spent on your task, not on ceremony:
+
+		- Oversized tool results are evicted to files — a preview stays inline,
+		  the agent pages the rest back on demand
+		- Compaction summaries precompute in the background from ~60% full and
+		  fold in at ~80% without pausing the session
+		- The prompt prefix is byte-stable, so provider caches keep hitting
+		- A per-turn meter shows how full the context actually is
+
 		[Configuration →](./configuration/)
 	</Card>
 	<Card title="You own the loop" icon="pen">
 		Steer mid-turn without killing the run — queued steers apply at the next
-		step. Approvals are a vocabulary, not a y/N: allow, allow with an edited
-		input, deny with a message the model actually reads, or answer as the
-		tool yourself. Allow-rules absorb the repetitive asks, so approval
-		fatigue never trains you to say yes.
+		step. And approvals are a vocabulary, not a y/N:
+
+		- allow, or allow with an edited input
+		- deny with a message the model actually reads
+		- answer as the tool yourself
+		- allow-rules absorb the repetitive asks, so approval fatigue never
+		  trains you to say yes
+
 		[Permissions & sandbox →](./permissions-and-sandbox/)
 	</Card>
 	<Card title="tmux-native, out of the box" icon="laptop">
-		`hotl watch` in a pane discovers every AI agent in your tmux session,
-		shows live status, pings when one blocks on you, and `enter` jumps focus
-		to it. `Ctrl-h/j/k/l` pane navigation works out of the box and composes
-		with vim-tmux-navigator, and the zsh plugin's OSC-133 marks give watch
-		clean command boundaries in your scrollback.
+		`hotl watch` in a pane discovers every AI agent in your tmux session:
+
+		- live status per agent, a ping when one blocks on you, `enter` jumps
+		  focus to its pane
+		- `Ctrl-h/j/k/l` pane navigation composes with vim-tmux-navigator
+		- vim hands welcome: the console's input editor speaks motions,
+		  operators, and counts (`vim_mode`, on by default; `Ctrl-e` opens
+		  `$EDITOR`), and watch's list speaks `j`/`k`/`gg`/`G`
+		- the zsh plugin's OSC-133 marks give watch clean command boundaries
+
 		[Shell integration →](./shell/)
 	</Card>
 	<Card title="Any model, one env var" icon="setting">
@@ -61,6 +73,20 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		any ACP-speaking editor — and your Claude Code skills
 		(`~/.claude/skills`, plugins) load in place, no porting.
 		[MCP servers →](./mcp/)
+	</Card>
+	<Card title="One config file, fail-closed" icon="document">
+		Everything hand-editable lives in a single `config.toml` — no
+		`permissions.toml`/`mcp.toml`/`hooks.toml` sprawl:
+
+		- precedence is always env var > config.toml > default, so CI can
+		  override anything without editing the file
+		- a malformed file is ignored with a warning, never half-applied; a
+		  typo'd permission mode fails closed to `ask`
+		- API keys never live in the file — env vars, or `api_key_helper`
+		  runs a command and uses its output
+		- `hotl setup` writes a commented starter; `hotl doctor` checks the lot
+
+		[Configuration →](./configuration/)
 	</Card>
 	<Card title="A floor that never turns off" icon="approve-check">
 		Every mutating tool call passes a permission gate, and `bash` runs under a
