@@ -19,16 +19,9 @@ pub struct Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme {
-            active: "#f2c14e".into(),
-            blocked: "#e06c6c".into(),
-            idle: "#7ee07e".into(),
-            ink: "#e6e9f0".into(),
-            muted: "#8a92a6".into(),
-            faint: "#596072".into(),
-            accent: "#6c8cff".into(),
-            band: "#2a3350".into(),
-        }
+        // The out-of-the-box palette is tokyo-night; `preset("default")` is
+        // its alias. One source of values — the preset table below.
+        preset("tokyo-night").expect("built-in preset")
     }
 }
 
@@ -234,6 +227,10 @@ mod tests {
         assert_eq!(preset("default"), Some(Theme::default()));
     }
     #[test]
+    fn default_is_tokyo_night() {
+        assert_eq!(Theme::default(), preset("tokyo-night").unwrap());
+    }
+    #[test]
     fn preset_known_returns_palette() {
         let t = preset("tokyo-night").expect("exists");
         assert_eq!(t.blocked, "#f7768e");
@@ -353,8 +350,9 @@ mod palette_tests {
     #[test]
     fn palette_from_theme_converts_hex_to_rgb() {
         let p = Palette::from(&Theme::default());
-        assert_eq!(p.active, Color::Rgb(0xf2, 0xc1, 0x4e));
-        assert_eq!(p.band, Color::Rgb(0x2a, 0x33, 0x50));
+        // tokyo-night, the default palette
+        assert_eq!(p.active, Color::Rgb(0xe0, 0xaf, 0x68));
+        assert_eq!(p.band, Color::Rgb(0x29, 0x2e, 0x42));
     }
 
     #[test]
@@ -364,7 +362,7 @@ mod palette_tests {
             ..Theme::default()
         };
         let p = Palette::from(&t);
-        assert_eq!(p.accent, Color::Rgb(0x6c, 0x8c, 0xff));
+        assert_eq!(p.accent, Color::Rgb(0x7a, 0xa2, 0xf7));
     }
 
     #[test]

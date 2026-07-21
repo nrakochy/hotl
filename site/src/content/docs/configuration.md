@@ -77,7 +77,7 @@ command = "/usr/local/bin/guard"
 rs = "cargo check -q --message-format=short"
 
 [settings.theme]           # palette for the console AND `hotl watch` (see tui.md)
-preset = "nord"            # default | tokyo-night | catppuccin | gruvbox | nord | dracula
+preset = "nord"            # tokyo-night (the default) | catppuccin | gruvbox | nord | dracula
 accent = "#88c0d0"         # optional per-slot #rrggbb overrides: active blocked idle
                            # ink muted faint accent band
 ```

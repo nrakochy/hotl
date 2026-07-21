@@ -23,7 +23,7 @@ The console wears the same palette as `hotl watch`, from the same `[settings.the
 
 ```toml
 [settings.theme]
-preset = "nord"       # default | tokyo-night | catppuccin | gruvbox | nord | dracula
+preset = "nord"       # tokyo-night (the default) | catppuccin | gruvbox | nord | dracula
 accent = "#88c0d0"    # optional per-slot #rrggbb overrides
 ```
 

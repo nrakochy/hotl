@@ -105,7 +105,7 @@ mod tests {
                 "hotl".to_string()
             ]
         );
-        assert_eq!(c.settings.theme.resolve().0.active, "#f2c14e");
+        assert_eq!(c.settings.theme.resolve().0.active, "#e0af68");
     }
 
     #[test]
@@ -128,7 +128,7 @@ mod tests {
         let c = HotlConfig::parse("[settings.theme]\nblocked = \"#ff0000\"\n");
         let (theme, _) = c.settings.theme.resolve();
         assert_eq!(theme.blocked, "#ff0000");
-        assert_eq!(theme.idle, "#7ee07e");
+        assert_eq!(theme.idle, "#9ece6a");
     }
 
     #[test]
