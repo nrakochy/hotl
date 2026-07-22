@@ -92,6 +92,9 @@ pub struct State {
     /// `tool_auto_allowed` arrives before its `tool_start`; the rule parks
     /// here until the card exists.
     pub pending_auto_rule: Option<String>,
+    /// Display name (badge + titles); seeded from the open handshake,
+    /// updated by `/rename`.
+    pub session_name: Option<String>,
 }
 
 impl State {
@@ -107,6 +110,7 @@ impl State {
             help_open: false,
             interrupt_sent: false,
             pending_auto_rule: None,
+            session_name: None,
         }
     }
 
@@ -140,6 +144,8 @@ pub enum Msg {
 pub enum Cmd {
     SendPrompt(String),
     SendSteer(String),
+    /// Send `session/rename` (fire-and-forget; the ack is noise).
+    Rename(String),
     Cancel,
     ReplyPermission {
         req_id: u64,
@@ -151,9 +157,13 @@ pub enum Cmd {
     Quit,
 }
 
-const TITLE_WORKING: &str = "hotl — working";
-const TITLE_WAITING: &str = "hotl — waiting on you";
-const TITLE_IDLE: &str = "hotl";
+/// Terminal-tab title: `hotl` / `hotl · <name>`, plus a state suffix.
+fn title(state: &State, suffix: &str) -> String {
+    match &state.session_name {
+        Some(n) => format!("hotl · {n}{suffix}"),
+        None => format!("hotl{suffix}"),
+    }
+}
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
     match msg {
@@ -170,7 +180,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 input: String::new(),
                 denying: false,
             };
-            vec![Cmd::SetTitle(TITLE_WAITING.into())]
+            vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::PromptResult {
             outcome_kind,
@@ -299,7 +309,7 @@ fn on_prompt_result(
     state.usage_line = Some(format_usage(usage));
     state.phase = Phase::Idle;
     state.interrupt_sent = false;
-    vec![Cmd::SetTitle(TITLE_IDLE.into())]
+    vec![Cmd::SetTitle(title(state, ""))]
 }
 
 fn outcome_notice(kind: &str, text: Option<&str>) -> Option<String> {
@@ -371,19 +381,60 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
 }
 
 fn submit(state: &mut State, text: String) -> Vec<Cmd> {
+    if let Some(rest) = text.trim().strip_prefix('/') {
+        return slash_command(state, rest);
+    }
     if state.phase == Phase::Idle {
         state
             .transcript
             .push(TranscriptItem::User { text: text.clone() });
         state.phase = Phase::Sampling { ticks: 0 };
         state.scroll = Scroll::Follow;
-        vec![Cmd::SendPrompt(text), Cmd::SetTitle(TITLE_WORKING.into())]
+        vec![
+            Cmd::SendPrompt(text),
+            Cmd::SetTitle(title(state, " — working")),
+        ]
     } else {
         state.transcript.push(TranscriptItem::Steer {
             text: text.clone(),
             queued: true,
         });
         vec![Cmd::SendSteer(text)]
+    }
+}
+
+/// The TUI's slash commands. `/rename <name>` for now; anything else is a
+/// transcript notice — slash input never reaches the model.
+fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
+    let (cmd, arg) = rest
+        .split_once(char::is_whitespace)
+        .map(|(c, a)| (c, a.trim()))
+        .unwrap_or((rest.trim(), ""));
+    match cmd {
+        "rename" => {
+            // Same rules as hotl_types::normalize_session_name (this crate
+            // has no hotl-types dep): trimmed, non-empty, ≤ 64 chars.
+            let name = arg.trim();
+            if name.is_empty() || name.chars().count() > 64 {
+                notice(state, "usage: /rename <name> (1–64 chars)".into());
+                return Vec::new();
+            }
+            state.session_name = Some(name.to_string());
+            notice(state, format!("session renamed to {name}"));
+            let suffix = if state.phase == Phase::Idle {
+                ""
+            } else {
+                " — working"
+            };
+            vec![
+                Cmd::Rename(name.to_string()),
+                Cmd::SetTitle(title(state, suffix)),
+            ]
+        }
+        other => {
+            notice(state, format!("unknown command: /{other}"));
+            Vec::new()
+        }
     }
 }
 
@@ -439,7 +490,7 @@ fn resume_after_ask(
             allow,
             message,
         },
-        Cmd::SetTitle(TITLE_WORKING.into()),
+        Cmd::SetTitle(title(state, " — working")),
     ]
 }
 
@@ -764,5 +815,58 @@ mod tests {
         assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Quit]));
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
         assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Cancel]));
+    }
+
+    fn type_and_submit(s: &mut State, text: &str) -> Vec<Cmd> {
+        type_str(s, text);
+        press(s, KeyCode::Enter)
+    }
+
+    #[test]
+    fn slash_rename_sets_name_emits_cmd_and_title_not_a_prompt() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/rename fix-auth");
+        assert_eq!(s.session_name.as_deref(), Some("fix-auth"));
+        assert!(
+            matches!(&cmds[..], [Cmd::Rename(n), Cmd::SetTitle(t)]
+                if n == "fix-auth" && t == "hotl · fix-auth"),
+            "got {cmds:?}"
+        );
+        assert_eq!(s.phase, Phase::Idle, "a slash command never starts a turn");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("fix-auth"))
+        );
+    }
+
+    #[test]
+    fn slash_rename_without_arg_shows_usage() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/rename");
+        assert!(cmds.is_empty());
+        assert_eq!(s.session_name, None);
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("usage"))
+        );
+    }
+
+    #[test]
+    fn unknown_slash_command_never_reaches_the_model() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/frobnicate now");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("/frobnicate"))
+        );
+    }
+
+    #[test]
+    fn named_session_titles_carry_the_name() {
+        let mut s = State::test_default();
+        s.session_name = Some("fix-auth".into());
+        let cmds = type_and_submit(&mut s, "hello");
+        assert!(
+            matches!(&cmds[..], [Cmd::SendPrompt(_), Cmd::SetTitle(t)] if t == "hotl · fix-auth — working"),
+            "got {cmds:?}"
+        );
     }
 }
