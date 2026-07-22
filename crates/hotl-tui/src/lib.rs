@@ -9,3 +9,4 @@ pub mod app;
 pub mod client;
 pub mod view;
 pub mod vim;
+pub mod wrap;

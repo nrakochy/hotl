@@ -11,17 +11,23 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use crate::anim;
 use crate::app::{Phase, Scroll, State, ToolStatus, TranscriptItem};
 use crate::vim::Mode;
+use crate::wrap;
 
 const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
 
+/// How tall the input box may grow before it scrolls instead. Past this the
+/// buffer is long enough that `ctrl-e` is the better tool anyway.
+const INPUT_MAX_ROWS: usize = 10;
+
 pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
+    let area = frame.area();
     let [transcript, strip, input, hint] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
-        Constraint::Length(3),
+        Constraint::Length(input_height(state, area)),
         Constraint::Length(1),
     ])
-    .areas(frame.area());
+    .areas(area);
     render_transcript(state, p, frame, transcript);
     render_strip(state, p, frame, strip);
     render_input(state, p, frame, input);
@@ -35,20 +41,33 @@ pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
 }
 
 fn render_transcript(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
-    let lines: Vec<Line> = state
-        .transcript
-        .iter()
-        .flat_map(|i| item_lines(i, p))
-        .collect();
+    // Wrapping up front (rather than via `Paragraph::wrap`) is what keeps the
+    // scroll arithmetic honest: an item that overflows counts as the several
+    // rows it really occupies, so Follow still lands on the last one.
+    let width = area.width as usize;
+    let rows = |i: &TranscriptItem| -> Vec<Line<'static>> {
+        item_lines(i, p)
+            .iter()
+            .flat_map(|l| wrap::line(l, width))
+            .collect()
+    };
+    let lines: Vec<Line> = state.transcript.iter().flat_map(rows).collect();
     let skip = match state.scroll {
         Scroll::Follow => lines.len().saturating_sub(area.height as usize),
         Scroll::At(item) => state.transcript[..item.min(state.transcript.len())]
             .iter()
-            .map(|i| item_lines(i, p).len())
+            .map(|i| rows(i).len())
             .sum::<usize>()
             .min(lines.len().saturating_sub(1)),
     };
-    frame.render_widget(Paragraph::new(lines).scroll((skip as u16, 0)), area);
+    // Slicing beats `Paragraph::scroll`, whose offset is a u16 a long session
+    // would overflow.
+    let visible: Vec<Line> = lines
+        .into_iter()
+        .skip(skip)
+        .take(area.height as usize)
+        .collect();
+    frame.render_widget(Paragraph::new(visible), area);
 }
 
 fn item_lines<'a>(item: &TranscriptItem, p: &Palette) -> Vec<Line<'a>> {
@@ -179,6 +198,43 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     }
 }
 
+/// Every screen row the buffer occupies, plus where the cursor sits among
+/// them. Each logical line contributes one row per wrap, so a typed-over-the-
+/// edge line continues below instead of running off it, and the cursor rides
+/// along instead of pinning to the right margin.
+fn input_rows(text: &str, cursor: (usize, usize), width: usize) -> (Vec<String>, (usize, usize)) {
+    let mut out: Vec<String> = Vec::new();
+    let mut at = (0, 0);
+    for (r, line) in text.split('\n').enumerate() {
+        let rows = wrap::rows(line, width);
+        let last = rows.len() - 1;
+        for (i, &(a, b)) in rows.iter().enumerate() {
+            // Ranges are contiguous, so exactly one row claims the cursor —
+            // the final row also claims the column just past its end.
+            if r == cursor.0 && cursor.1 >= a && (cursor.1 < b || i == last) {
+                at = (out.len(), wrap::columns(line, a, cursor.1));
+            }
+            out.push(wrap::slice(line, a, b));
+        }
+        // A cursor one past a brim-full row belongs at the start of the next
+        // one, not a column beyond the border.
+        if r == cursor.0 && at.1 >= width {
+            out.push(String::new());
+            at = (out.len() - 1, 0);
+        }
+    }
+    (out, at)
+}
+
+/// The box grows with the wrapped buffer instead of clipping it — bounded so
+/// the transcript keeps its 3-row minimum.
+fn input_height(state: &State, area: Rect) -> u16 {
+    let width = (area.width.saturating_sub(2)).max(1) as usize;
+    let (rows, _) = input_rows(&state.editor.text(), state.editor.cursor(), width);
+    let body = rows.len().clamp(1, INPUT_MAX_ROWS) as u16;
+    (body + 2).min(area.height.saturating_sub(5)).max(3)
+}
+
 fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     let mut block = Block::bordered().border_style(Style::new().fg(p.faint));
     if state.vim_mode {
@@ -189,15 +245,24 @@ fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         block = block.title(Span::styled(mode, Style::new().fg(p.accent).bold()));
     }
     let inner = block.inner(area);
-    let (row, col) = state.editor.cursor();
-    let text = state.editor.text();
-    let line = text.split('\n').nth(row).unwrap_or("").to_string();
     frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(line), inner);
-    if inner.width > 0 {
-        let x = inner.x + (col as u16).min(inner.width - 1);
-        frame.set_cursor_position((x, inner.y));
+    if inner.width == 0 || inner.height == 0 {
+        return;
     }
+    let width = inner.width as usize;
+    let height = inner.height as usize;
+    let (rows, (row, col)) = input_rows(&state.editor.text(), state.editor.cursor(), width);
+    // A buffer taller than the box scrolls to keep the cursor's row in view.
+    let top = row.saturating_sub(height - 1);
+    let lines: Vec<Line> = rows
+        .into_iter()
+        .skip(top)
+        .take(height)
+        .map(Line::raw)
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+    let x = inner.x + (col as u16).min(inner.width - 1);
+    frame.set_cursor_position((x, inner.y + (row - top) as u16));
 }
 
 fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
@@ -241,6 +306,12 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
             Style::new().fg(p.faint),
         ));
     }
+    // A long command — or a long deny reason — grows the card downward rather
+    // than vanishing off its right edge.
+    let lines: Vec<Line> = lines
+        .iter()
+        .flat_map(|l| wrap::line(l, centered(over, 60, 0).width.saturating_sub(2) as usize))
+        .collect();
     let area = centered(over, 60, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
@@ -518,5 +589,151 @@ mod tests {
 
         let rows = draw(&State::new(true, "m".into()));
         assert!(!rows[STRIP].contains('…'));
+    }
+
+    // ---- overflow: wrapping in the transcript, the input, and the modal ----
+
+    /// Cursor position after a draw — the input's whole job is putting it in
+    /// the right place once a line wraps.
+    fn draw_cursor(state: &State) -> (u16, u16) {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| view(state, &Palette::default(), f))
+            .unwrap();
+        let p = terminal.get_cursor_position().unwrap();
+        (p.x, p.y)
+    }
+
+    /// The input box's rows, borders stripped.
+    fn input_body(rows: &[String]) -> Vec<String> {
+        rows.iter()
+            .filter(|r| r.starts_with('\u{2502}'))
+            .map(|r| r.trim_matches('\u{2502}').trim_end().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn input_wraps_an_overlong_line_and_grows_the_box() {
+        let mut s = State::new(true, "m".into());
+        let long = "abcdefghij".repeat(12); // 120 chars into a 78-col box
+        s.editor.set_text(&long);
+        let rows = draw(&s);
+        let body = input_body(&rows);
+        assert_eq!(body.len(), 2, "box grew to two rows: {body:#?}");
+        assert_eq!(body.concat(), long, "every typed char survives the wrap");
+        // The cursor follows onto the second row instead of pinning to the edge.
+        assert_eq!(draw_cursor(&s), (1 + 42, 21), "cursor rides the wrap");
+    }
+
+    #[test]
+    fn input_renders_every_line_of_a_multiline_buffer() {
+        let mut s = State::new(true, "m".into());
+        s.editor.set_text("first line\nsecond line\nthird line");
+        let body = input_body(&draw(&s));
+        assert_eq!(body, ["first line", "second line", "third line"]);
+        assert_eq!(draw_cursor(&s), (1 + 10, 21), "cursor on the last line");
+    }
+
+    #[test]
+    fn a_buffer_taller_than_the_box_scrolls_to_the_cursor() {
+        let mut s = State::new(true, "m".into());
+        let text: Vec<String> = (0..20).map(|i| format!("line{i}")).collect();
+        s.editor.set_text(&text.join("\n"));
+        let rows = draw(&s);
+        let body = input_body(&rows);
+        assert_eq!(body.len(), INPUT_MAX_ROWS, "box stops growing");
+        assert_eq!(
+            body.last().unwrap(),
+            "line19",
+            "the cursor's row stays in view: {body:#?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("? help")),
+            "the hint row is not pushed off screen"
+        );
+    }
+
+    #[test]
+    fn a_huge_buffer_never_starves_the_transcript() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(TranscriptItem::Notice { text: "hi".into() });
+        s.editor.set_text(
+            &(0..100)
+                .map(|i| format!("l{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        let rows = draw(&s);
+        assert!(
+            rows[0].contains("hi"),
+            "transcript keeps its rows: {rows:#?}"
+        );
+    }
+
+    #[test]
+    fn transcript_wraps_long_output_instead_of_clipping_it() {
+        let mut s = State::new(true, "m".into());
+        let text = "word ".repeat(40); // 200 chars
+        s.transcript
+            .push(TranscriptItem::Assistant { text: text.clone() });
+        let rows = draw(&s);
+        let shown: String = rows[..STRIP]
+            .iter()
+            .map(|r| r.trim_end())
+            .collect::<Vec<_>>()
+            .concat();
+        assert_eq!(
+            shown.replace(' ', ""),
+            text.replace(' ', ""),
+            "all 200 chars land on wrapped rows"
+        );
+    }
+
+    #[test]
+    fn follow_scroll_counts_wrapped_rows_so_the_tail_stays_visible() {
+        let mut s = State::new(true, "m".into());
+        for i in 0..10 {
+            s.transcript.push(TranscriptItem::Assistant {
+                text: format!("{i} {}", "x".repeat(200)),
+            });
+        }
+        s.transcript.push(TranscriptItem::Notice {
+            text: "the newest line".into(),
+        });
+        let rows = draw(&s);
+        assert!(
+            rows[STRIP - 1].contains("the newest line"),
+            "Follow lands on the last wrapped row: {:?}",
+            rows[STRIP - 1]
+        );
+    }
+
+    #[test]
+    fn a_long_summary_grows_the_ask_modal_instead_of_overflowing_it() {
+        let mut s = State::new(true, "m".into());
+        let cmd = "cargo test --workspace --all-features -- --nocapture --test-threads 1";
+        s.phase = Phase::WaitingAsk {
+            req_id: 7,
+            summary: format!("run bash: {cmd}"),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+        };
+        let all = draw(&s).join("\n").replace('\n', " ");
+        assert!(
+            all.contains("--test-threads 1"),
+            "the tail of the command is readable: {all}"
+        );
+    }
+
+    #[test]
+    fn wide_glyphs_wrap_on_columns_not_char_counts() {
+        let mut s = State::new(true, "m".into());
+        s.editor.set_text(&"\u{65e5}".repeat(50)); // 50 chars, 100 columns
+        let body = input_body(&draw(&s));
+        assert_eq!(body.len(), 2, "78 columns holds 39 wide glyphs: {body:#?}");
+        // A wide glyph owns two cells, the second rendered as a blank.
+        assert_eq!(body[0].matches('\u{65e5}').count(), 39);
     }
 }
