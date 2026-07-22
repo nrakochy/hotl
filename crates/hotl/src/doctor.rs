@@ -8,6 +8,8 @@ use hotl_platform::{EnvSecrets, SecretStore};
 use hotl_store::Masker;
 use hotl_tools::sandbox;
 
+use crate::agent::AuthMode;
+
 enum Status {
     Ok,
     Warn,
@@ -80,18 +82,28 @@ pub fn doctor_main() -> i32 {
     }
 }
 
-fn source_kind(refreshable: bool) -> &'static str {
-    if refreshable {
-        "helper"
-    } else {
-        "static env key"
+fn source_kind(auth: AuthMode, refreshable: bool) -> &'static str {
+    match auth {
+        AuthMode::Subscription => "subscription — no credential held",
+        AuthMode::ApiKey if refreshable => "helper",
+        AuthMode::ApiKey => "static env key",
     }
 }
 
-fn probe_line(base: &str, result: Result<u16, String>) -> String {
+fn probe_line(base: &str, result: Result<u16, String>, auth: AuthMode) -> String {
     let url = format!("{}/models", base.trim_end_matches('/'));
+    let subscription = auth == AuthMode::Subscription;
     match result {
+        // Nothing was authenticated from hotl's side in subscription mode, so
+        // don't claim a key was accepted.
+        Ok(s) if s < 400 && subscription => format!("gateway: {url} reachable (HTTP {s})"),
         Ok(s) if s < 400 => format!("gateway: {url} reachable (HTTP {s}, key accepted)"),
+        // "check the key source" is wrong guidance when hotl holds no key —
+        // the endpoint failed to authenticate upstream, not hotl.
+        Ok(s) if (s == 401 || s == 403) && subscription => format!(
+            "gateway: {url} reachable but the endpoint is not authenticated (HTTP {s}) — \
+             hotl holds no credential in subscription mode; re-authenticate the endpoint"
+        ),
         Ok(s) if s == 401 || s == 403 => format!(
             "gateway: {url} reachable but rejected the key (HTTP {s}) — check the key source"
         ),
@@ -102,10 +114,11 @@ fn probe_line(base: &str, result: Result<u16, String>) -> String {
 
 fn provider_check() -> Check {
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
+    let auth = crate::agent::auth_mode(&cfg, &EnvSecrets).unwrap_or(AuthMode::ApiKey);
     match crate::agent::select_provider(&cfg, &EnvSecrets) {
         Ok((_, model, source)) => ok(format!(
-            "provider: {model} selected (key source: {})",
-            source_kind(source.refreshable())
+            "provider: {model} selected (auth: {})",
+            source_kind(auth, source.refreshable())
         )),
         Err(msg) => fail(format!("provider: {}", msg.lines().next().unwrap_or(&msg))),
     }
@@ -119,6 +132,11 @@ fn key_helper_check(rt: &tokio::runtime::Runtime) -> Check {
     let Some(_) = helper else {
         return ok("key helper: not configured (static env keys)".into());
     };
+    // Subscription mode never consults a key source, so running the helper
+    // here would report a success that has no bearing on what hotl does.
+    if crate::agent::auth_mode(&cfg, &EnvSecrets) == Ok(AuthMode::Subscription) {
+        return ok("key helper: configured but unused (auth = \"subscription\")".into());
+    }
     let (_, _, source) = match crate::agent::select_provider(&cfg, &EnvSecrets) {
         Ok(t) => t,
         Err(_) => {
@@ -138,21 +156,24 @@ fn key_helper_check(rt: &tokio::runtime::Runtime) -> Check {
 
 fn gateway_check(rt: &tokio::runtime::Runtime) -> Check {
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
-    let base = match EnvSecrets
-        .get("HOTL_OPENAI_BASE_URL")
-        .or_else(|| cfg.provider.base_url.clone())
-    {
-        Some(b) if b != hotl_provider_openai::DEFAULT_BASE_URL => b,
-        _ => return ok("gateway: no custom base_url (direct provider)".into()),
+    // Provider-aware: whichever provider is active, probe the endpoint it
+    // will actually use. `None` means a direct connection to the vendor.
+    let Some(base) = crate::agent::active_endpoint(&cfg, &EnvSecrets) else {
+        return ok("gateway: no custom base_url (direct provider)".into());
     };
-    let key = crate::agent::select_provider(&cfg, &EnvSecrets)
-        .ok()
-        .and_then(|(_, _, s)| rt.block_on(s.get()).ok().flatten());
+    let auth = crate::agent::auth_mode(&cfg, &EnvSecrets).unwrap_or(AuthMode::ApiKey);
+    let key = if auth == AuthMode::Subscription {
+        None
+    } else {
+        crate::agent::select_provider(&cfg, &EnvSecrets)
+            .ok()
+            .and_then(|(_, _, s)| rt.block_on(s.get()).ok().flatten())
+    };
     let result = gateway_probe(rt, &base, key.as_deref());
     match &result {
-        Ok(s) if *s == 401 || *s == 403 => warn(probe_line(&base, result)),
-        Ok(s) if *s < 500 => ok(probe_line(&base, result)),
-        _ => fail(probe_line(&base, result)),
+        Ok(s) if *s == 401 || *s == 403 => warn(probe_line(&base, result, auth)),
+        Ok(s) if *s < 500 => ok(probe_line(&base, result, auth)),
+        _ => fail(probe_line(&base, result, auth)),
     }
 }
 
@@ -294,21 +315,49 @@ mod tests {
 
     #[test]
     fn key_source_line_names_active_source() {
-        assert_eq!(source_kind(true), "helper");
-        assert_eq!(source_kind(false), "static env key");
+        assert_eq!(source_kind(AuthMode::ApiKey, true), "helper");
+        assert_eq!(source_kind(AuthMode::ApiKey, false), "static env key");
+    }
+
+    /// A user in subscription mode must not be told a credential is in play.
+    #[test]
+    fn subscription_source_line_says_no_credential_is_held() {
+        let line = source_kind(AuthMode::Subscription, false);
+        assert!(line.contains("subscription"), "{line}");
+        assert!(!line.contains("key"), "{line}");
     }
 
     #[test]
     fn gateway_probe_line_formats() {
         assert_eq!(
-            probe_line("http://localhost:8080/v1", Ok(200)),
+            probe_line("http://localhost:8080/v1", Ok(200), AuthMode::ApiKey),
             "gateway: http://localhost:8080/v1/models reachable (HTTP 200, key accepted)"
         );
         assert_eq!(
-            probe_line("http://localhost:8080/v1", Ok(401)),
+            probe_line("http://localhost:8080/v1", Ok(401), AuthMode::ApiKey),
             "gateway: http://localhost:8080/v1/models reachable but rejected the key (HTTP 401) — check the key source"
         );
-        assert!(probe_line("http://x/v1", Err("connection refused".into()))
-            .contains("connection refused"));
+        assert!(probe_line(
+            "http://x/v1",
+            Err("connection refused".into()),
+            AuthMode::ApiKey
+        )
+        .contains("connection refused"));
+    }
+
+    /// "check the key source" is actively wrong guidance when hotl holds no
+    /// key — the endpoint is what failed to authenticate, not hotl.
+    #[test]
+    fn subscription_probe_401_does_not_blame_the_key_source() {
+        let line = probe_line("http://127.0.0.1:3456/v1", Ok(401), AuthMode::Subscription);
+        assert!(!line.contains("key source"), "{line}");
+        assert!(line.contains("endpoint"), "{line}");
+    }
+
+    #[test]
+    fn subscription_probe_200_does_not_claim_a_key_was_accepted() {
+        let line = probe_line("http://127.0.0.1:3456/v1", Ok(200), AuthMode::Subscription);
+        assert!(!line.contains("key accepted"), "{line}");
+        assert!(line.contains("reachable"), "{line}");
     }
 }

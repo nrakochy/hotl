@@ -1078,14 +1078,7 @@ pub(crate) fn select_provider(
     secrets: &dyn SecretStore,
 ) -> Result<SelectedProvider, String> {
     // Precedence: env HOTL_MODEL > config.toml [provider].model > default.
-    let raw = secrets
-        .get("HOTL_MODEL")
-        .or_else(|| cfg.provider.model.clone())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
-    let (provider_name, model) = match raw.split_once('/') {
-        Some((p, m)) => (p.to_ascii_lowercase(), m.to_string()),
-        None => ("anthropic".to_string(), raw),
-    };
+    let (provider_name, model) = selected_model(cfg, secrets);
     let auth = auth_mode(cfg, secrets)?;
     let (provider, source) = match provider_name.as_str() {
         "anthropic" => resolve_anthropic(cfg, secrets, auth)?,
@@ -1113,7 +1106,10 @@ pub(crate) enum AuthMode {
     Subscription,
 }
 
-fn auth_mode(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Result<AuthMode, String> {
+pub(crate) fn auth_mode(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+) -> Result<AuthMode, String> {
     let raw = secrets
         .get("HOTL_PROVIDER_AUTH")
         .or_else(|| cfg.provider.auth.clone());
@@ -1134,6 +1130,34 @@ fn anthropic_base_url(cfg: &crate::config::Config, secrets: &dyn SecretStore) ->
     secrets
         .get("HOTL_ANTHROPIC_BASE_URL")
         .or_else(|| cfg.provider.base_url.clone())
+}
+
+/// `(provider_name, model)` from `HOTL_MODEL` / config / default. A bare
+/// model string means Anthropic.
+fn selected_model(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> (String, String) {
+    let raw = secrets
+        .get("HOTL_MODEL")
+        .or_else(|| cfg.provider.model.clone())
+        .unwrap_or_else(|| DEFAULT_MODEL.to_string());
+    match raw.split_once('/') {
+        Some((p, m)) => (p.to_ascii_lowercase(), m.to_string()),
+        None => ("anthropic".to_string(), raw),
+    }
+}
+
+/// The endpoint the active provider will actually use, when it is not the
+/// vendor's own. `None` means a direct connection. `hotl doctor` probes this.
+pub(crate) fn active_endpoint(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+) -> Option<String> {
+    match selected_model(cfg, secrets).0.as_str() {
+        "openai" | "oai" => secrets
+            .get("HOTL_OPENAI_BASE_URL")
+            .or_else(|| cfg.provider.base_url.clone())
+            .filter(|b| b != hotl_provider_openai::DEFAULT_BASE_URL),
+        _ => anthropic_base_url(cfg, secrets),
+    }
 }
 
 fn subscription_needs_base_url(env_var: &str) -> String {
