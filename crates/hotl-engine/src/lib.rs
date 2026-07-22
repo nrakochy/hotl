@@ -202,6 +202,8 @@ pub enum SessionCmd {
     Continue,
     /// Mid-turn guidance: admitted durably now, woven into the next sample.
     Steer(String),
+    /// Set the session's display name (durable: appended to the log).
+    Rename(String),
     /// Turn task → actor: sample-boundary snapshot refresh.
     Snapshot {
         reply: oneshot::Sender<Arc<Vec<Item>>>,
@@ -270,6 +272,10 @@ impl SessionHandle {
     }
     pub async fn steer(&self, text: String) {
         let _ = self.cmd.send(SessionCmd::Steer(text)).await;
+    }
+    /// Name the session durably (a `rename` log entry; last one wins).
+    pub async fn rename(&self, name: String) {
+        let _ = self.cmd.send(SessionCmd::Rename(name)).await;
     }
     /// Continue an interrupted turn on resume (M4/#8).
     pub async fn continue_turn(&self) {

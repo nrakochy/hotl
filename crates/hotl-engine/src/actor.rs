@@ -118,6 +118,9 @@ pub(crate) async fn run(
                 }
             }
             SessionCmd::Steer(text) => admit_steer(&shared, &mut log, &mut items, text),
+            SessionCmd::Rename(name) => {
+                let _ = shared.append(&mut log, &EntryPayload::Rename { name });
+            }
             SessionCmd::Snapshot { reply } => {
                 let _ = reply.send(Arc::clone(&items));
             }
