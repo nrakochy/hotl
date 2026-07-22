@@ -1,16 +1,19 @@
 //! Skills (M3b, Claude roots 2026-07-21): procedures/checklists loaded on
 //! demand by name — the same deferred-loading shape as MCP: the tool
 //! description names what exists; content enters context only when asked
-//! for. Three roots, read in place:
+//! for. Four kinds of root, read in place:
 //!
 //! 1. `~/.config/hotl/skills/*.md` — owner-authored flat files.
-//! 2. `~/.claude/skills/<name>/SKILL.md` — the owner's Claude Code skills.
-//! 3. `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/<name>/SKILL.md`
+//! 2. Registered marketplaces (`[skills.marketplaces]`) — a git checkout or
+//!    local dir, walked up to [`MARKETPLACE_MAX_DEPTH`] levels for `SKILL.md`.
+//! 3. `~/.claude/skills/<name>/SKILL.md` — the owner's Claude Code skills.
+//! 4. `~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/skills/<name>/SKILL.md`
 //!    — plugin skills, highest version per plugin.
 //!
-//! Bare names resolve by precedence hotl > Claude user > plugin; a plugin
-//! skill whose bare name is taken stays addressable as `plugin:skill`
-//! (Claude's own qualified convention). Loaded content is enveloped
+//! Bare names resolve by precedence hotl > marketplaces > Claude user >
+//! plugin; a marketplace or plugin skill is always *also* addressable as
+//! `source:skill` (Claude's own qualified convention), which is the only
+//! form when its bare name is taken. Loaded content is enveloped
 //! untrusted and prefixed with the skill's base directory so relative
 //! `references/` and `scripts/` paths resolve through the ordinary tools —
 //! a skill instructs, it never authorizes.
@@ -27,6 +30,12 @@ const DESC_CAP: usize = 150;
 
 struct SkillEntry {
     name: String,
+    /// `<source>:<skill>` alias — always loadable, even when the bare
+    /// name is also this entry's `name`. `None` for hotl-flat and
+    /// Claude-user skills.
+    qualified: Option<String>,
+    /// Roster label: `hotl`, `<marketplace>`, `claude`, or `claude:<plugin>`.
+    source: String,
     description: String,
     path: PathBuf,
     base_dir: PathBuf,
@@ -38,21 +47,38 @@ pub struct SkillTool {
 }
 
 impl SkillTool {
-    /// Production constructor: the hotl flat dir plus (when `include_claude`)
-    /// the two Claude roots derived from `$HOME`.
-    pub fn new(config_dir: &Path, include_claude: bool) -> Self {
+    /// Production constructor: the hotl flat dir, registered marketplace
+    /// roots, plus (when `include_claude`) the two Claude roots.
+    pub fn new(
+        config_dir: &Path,
+        include_claude: bool,
+        marketplaces: &[(String, PathBuf)],
+    ) -> Self {
         let (user, cache) = claude_roots();
-        Self::with_roots(&config_dir.join("skills"), &user, &cache, include_claude)
+        Self::with_roots(
+            &config_dir.join("skills"),
+            marketplaces,
+            &user,
+            &cache,
+            include_claude,
+        )
     }
 
     /// Explicit-roots constructor (also the test seam).
     pub fn with_roots(
         flat: &Path,
+        marketplaces: &[(String, PathBuf)],
         claude_user: &Path,
         plugin_cache: &Path,
         include_claude: bool,
     ) -> Self {
-        let entries = discover(flat, claude_user, plugin_cache, include_claude);
+        let entries = discover(
+            flat,
+            marketplaces,
+            claude_user,
+            plugin_cache,
+            include_claude,
+        );
         let names = entries
             .iter()
             .map(|e| format!("`{}` ({})", e.name, truncate(&e.description, DESC_CAP)))
@@ -68,9 +94,27 @@ impl SkillTool {
         }
     }
 
-    pub fn has_skills(config_dir: &Path, include_claude: bool) -> bool {
+    pub fn has_skills(
+        config_dir: &Path,
+        include_claude: bool,
+        marketplaces: &[(String, PathBuf)],
+    ) -> bool {
         let (user, cache) = claude_roots();
-        !discover(&config_dir.join("skills"), &user, &cache, include_claude).is_empty()
+        !discover(
+            &config_dir.join("skills"),
+            marketplaces,
+            &user,
+            &cache,
+            include_claude,
+        )
+        .is_empty()
+    }
+
+    /// `(name, source, description)` rows, name-sorted — `hotl skills list`.
+    pub fn roster(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.source.as_str(), e.description.as_str()))
     }
 }
 
@@ -84,42 +128,113 @@ fn claude_roots() -> (PathBuf, PathBuf) {
     )
 }
 
-/// All skills across the three roots, bare names claimed in precedence order
-/// (hotl → Claude user → plugins); a plugin skill whose bare name is taken is
-/// entered under `plugin:skill` instead. Sorted by name.
+/// All skills across the roots, bare names claimed in precedence order
+/// (hotl flat → marketplaces → Claude user → Claude plugins). Marketplace
+/// and plugin skills always keep a `<source>:<skill>` alias. Sorted by name.
 fn discover(
     flat: &Path,
+    marketplaces: &[(String, PathBuf)],
     claude_user: &Path,
     plugin_cache: &Path,
     include_claude: bool,
 ) -> Vec<SkillEntry> {
     let mut entries: Vec<SkillEntry> = Vec::new();
-    let claim = |entries: &mut Vec<SkillEntry>, e: SkillEntry| {
-        if !entries.iter().any(|x| x.name == e.name) {
-            entries.push(e);
-        }
-    };
     for e in list_flat(flat) {
-        claim(&mut entries, e);
+        claim(&mut entries, "hotl", e);
+    }
+    for (mkt, root) in marketplaces {
+        for e in list_marketplace_root(root) {
+            claim_qualified(&mut entries, mkt, mkt, e);
+        }
     }
     if include_claude {
         for e in list_skill_dirs(claude_user) {
-            claim(&mut entries, e);
+            claim(&mut entries, "claude", e);
         }
         for (plugin, e) in list_plugin_skills(plugin_cache) {
-            if entries.iter().any(|x| x.name == e.name) {
-                let qualified = SkillEntry {
-                    name: format!("{plugin}:{}", e.name),
-                    ..e
-                };
-                claim(&mut entries, qualified);
-            } else {
-                entries.push(e);
-            }
+            let label = format!("claude:{plugin}");
+            claim_qualified(&mut entries, &plugin, &label, e);
         }
     }
     entries.sort_by(|a, b| a.name.cmp(&b.name));
     entries
+}
+
+/// Enter a skill under its bare name unless that name is already claimed.
+fn claim(entries: &mut Vec<SkillEntry>, source: &str, mut e: SkillEntry) {
+    if !entries.iter().any(|x| x.name == e.name) {
+        e.source = source.to_string();
+        entries.push(e);
+    }
+}
+
+/// Enter a skill from a qualified source: bare name when free (the
+/// qualified form stays as an alias), the qualified form alone otherwise.
+fn claim_qualified(
+    entries: &mut Vec<SkillEntry>,
+    qualifier: &str,
+    source: &str,
+    mut e: SkillEntry,
+) {
+    let qualified = format!("{qualifier}:{}", e.name);
+    if entries
+        .iter()
+        .any(|x| x.name == qualified || x.qualified.as_deref() == Some(&qualified))
+    {
+        return;
+    }
+    e.source = source.to_string();
+    e.qualified = Some(qualified.clone());
+    if entries.iter().any(|x| x.name == e.name) {
+        e.name = qualified;
+    }
+    entries.push(e);
+}
+
+/// Skill dirs sit at most this many directory levels below a marketplace
+/// root (covers `plugins/<p>/skills/<s>/SKILL.md`).
+const MARKETPLACE_MAX_DEPTH: usize = 4;
+
+/// A marketplace root: flat `.md` files at the top level plus every
+/// `SKILL.md` directory within the bounded walk. Deterministic: sorted
+/// entries, first occurrence of a name wins.
+fn list_marketplace_root(root: &Path) -> Vec<SkillEntry> {
+    let mut out = list_flat(root);
+    walk_skill_dirs(root, MARKETPLACE_MAX_DEPTH, &mut out);
+    out
+}
+
+/// Depth-bounded scan: a dir containing `SKILL.md` is a skill (leaf — no
+/// descent); dot-dirs (`.git`, `.claude-plugin`) are never entered.
+fn walk_skill_dirs(dir: &Path, remaining: usize, out: &mut Vec<SkillEntry>) {
+    if remaining == 0 {
+        return;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut subdirs: Vec<PathBuf> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    subdirs.sort();
+    for sub in subdirs {
+        if sub
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_none_or(|n| n.starts_with('.'))
+        {
+            continue;
+        }
+        if let Some(e) = read_skill_dir(&sub) {
+            if !out.iter().any(|x| x.name == e.name) {
+                out.push(e);
+            }
+            continue;
+        }
+        walk_skill_dirs(&sub, remaining - 1, out);
+    }
 }
 
 /// Root 1: flat owner `.md` files, first non-empty line as the description.
@@ -137,6 +252,8 @@ fn list_flat(dir: &Path) -> Vec<SkillEntry> {
             let text = std::fs::read_to_string(&path).ok()?;
             Some(SkillEntry {
                 name,
+                qualified: None,
+                source: String::new(),
                 description: first_line(&text),
                 base_dir: dir.to_path_buf(),
                 path,
@@ -164,6 +281,8 @@ fn read_skill_dir(base_dir: &Path) -> Option<SkillEntry> {
     let (fm_name, description) = parse_frontmatter(&text);
     Some(SkillEntry {
         name: fm_name.unwrap_or(dir_name),
+        qualified: None,
+        source: String::new(),
         description,
         path,
         base_dir: base_dir.to_path_buf(),
@@ -311,7 +430,11 @@ impl SkillTool {
         if name.contains(['/', '\\']) || name.contains("..") {
             return ToolOutcome::err("Skill names are plain names, not paths.");
         }
-        let Some(entry) = self.entries.iter().find(|e| e.name == name) else {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.name == name || e.qualified.as_deref() == Some(name))
+        else {
             let known: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
             return ToolOutcome::err(format!(
                 "No skill named `{name}`. Available: {}.",
@@ -353,8 +476,8 @@ mod tests {
         )
         .unwrap();
 
-        assert!(SkillTool::has_skills(dir.path(), false));
-        let tool = SkillTool::new(dir.path(), false);
+        assert!(SkillTool::has_skills(dir.path(), false, &[]));
+        let tool = SkillTool::new(dir.path(), false, &[]);
         assert!(tool.description().contains("`deploy` (Deploy checklist)"));
 
         let listing = tool.run_impl(&json!({}));
@@ -416,7 +539,7 @@ mod tests {
             "plugin deploy body",
         );
 
-        let tool = SkillTool::with_roots(&flat, &user, &cache, true);
+        let tool = SkillTool::with_roots(&flat, &[], &user, &cache, true);
         let desc = tool.description();
         assert!(
             desc.contains("`deploy`") && desc.contains("`go-service`"),
@@ -462,11 +585,96 @@ mod tests {
             .run_impl(&json!({"name": "brainstorming"}))
             .content
             .contains("brainstorm body"));
+        assert!(tool
+            .run_impl(&json!({"name": "superpowers:brainstorming"}))
+            .content
+            .contains("brainstorm body"));
 
         // Opt-out: only the flat root remains.
-        let tool = SkillTool::with_roots(&flat, &user, &cache, false);
+        let tool = SkillTool::with_roots(&flat, &[], &user, &cache, false);
         assert!(!tool.description().contains("go-service"));
         assert!(tool.description().contains("`deploy`"));
+    }
+
+    #[test]
+    fn marketplace_roots_discovered_with_precedence_and_qualification() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("skills");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("deploy.md"), "# Deploy checklist\nsteps\n").unwrap();
+
+        let mkt = dir.path().join("acme");
+        // Plugin-repo layout: 4 levels below the root.
+        write_skill(
+            &mkt.join("plugins/p1/skills/release"),
+            "name: release\ndescription: cut a release",
+            "release body",
+        );
+        // Bare-name collision with the hotl flat skill.
+        write_skill(
+            &mkt.join("deploy"),
+            "name: deploy\ndescription: marketplace deploy",
+            "mkt deploy body",
+        );
+        // Flat .md at the marketplace root.
+        std::fs::write(mkt.join("notes.md"), "# Notes skill\nnotes body\n").unwrap();
+        // 5 levels down: beyond the walk cap.
+        write_skill(&mkt.join("a/b/c/d/toodeep"), "description: too deep", "x");
+        // Dot-dirs are never entered.
+        write_skill(&mkt.join(".git/skills/hidden"), "description: hidden", "x");
+
+        let marketplaces = vec![("acme".to_string(), mkt.clone())];
+        let none = dir.path().join("none");
+        let tool = SkillTool::with_roots(&flat, &marketplaces, &none, &none, false);
+
+        let desc = tool.description();
+        assert!(
+            desc.contains("`release`") && desc.contains("`notes`"),
+            "{desc}"
+        );
+        assert!(
+            desc.contains("`acme:deploy`"),
+            "colliding name qualifies: {desc}"
+        );
+        assert!(
+            !desc.contains("toodeep") && !desc.contains("hidden"),
+            "{desc}"
+        );
+
+        // Bare and qualified addressing both load.
+        assert!(tool
+            .run_impl(&json!({"name": "deploy"}))
+            .content
+            .contains("steps"));
+        assert!(tool
+            .run_impl(&json!({"name": "acme:deploy"}))
+            .content
+            .contains("mkt deploy body"));
+        assert!(tool
+            .run_impl(&json!({"name": "release"}))
+            .content
+            .contains("release body"));
+        assert!(tool
+            .run_impl(&json!({"name": "acme:release"}))
+            .content
+            .contains("release body"));
+
+        // Roster rows carry source labels.
+        let rows: Vec<(String, String)> = tool
+            .roster()
+            .map(|(n, s, _)| (n.to_string(), s.to_string()))
+            .collect();
+        assert!(rows.contains(&("deploy".into(), "hotl".into())), "{rows:?}");
+        assert!(
+            rows.contains(&("release".into(), "acme".into())),
+            "{rows:?}"
+        );
+
+        // A registered-but-missing root skips silently.
+        let gone = vec![("ghost".to_string(), dir.path().join("missing"))];
+        let tool = SkillTool::with_roots(&flat, &gone, &none, &none, false);
+        assert!(tool.description().contains("`deploy`"));
+        assert!(!tool.description().contains("ghost"));
     }
 
     #[test]
@@ -502,6 +710,7 @@ mod tests {
         .unwrap();
         let tool = SkillTool::with_roots(
             &dir.path().join("none"),
+            &[],
             &user,
             &dir.path().join("none2"),
             true,

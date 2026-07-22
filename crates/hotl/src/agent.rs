@@ -449,10 +449,11 @@ fn build_registry(
     // Claude Code skills (SKILL.md roots) load alongside hotl's own unless
     // opted out via [skills] claude = false.
     let include_claude = cfg.skills.claude.unwrap_or(true);
-    if hotl_tools::skills::SkillTool::has_skills(config_dir, include_claude) {
+    if hotl_tools::skills::SkillTool::has_skills(config_dir, include_claude, &[]) {
         registry.register(Box::new(hotl_tools::skills::SkillTool::new(
             config_dir,
             include_claude,
+            &[],
         )));
     }
     if let Some(builder) = spawn_builder {
