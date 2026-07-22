@@ -725,7 +725,7 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hotl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -760,7 +760,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-context"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hotl-types",
  "serde_json",
@@ -768,7 +768,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "hotl-context",
@@ -786,7 +786,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "hotl-tools",
@@ -801,11 +801,11 @@ dependencies = [
 
 [[package]]
 name = "hotl-platform"
-version = "0.2.0"
+version = "0.3.0"
 
 [[package]]
 name = "hotl-provider"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "bytes",
@@ -819,7 +819,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-provider-anthropic"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "futures-util",
@@ -832,7 +832,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-provider-openai"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-stream",
  "futures-util",
@@ -845,7 +845,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hotl-types",
  "serde",
@@ -855,7 +855,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-testkit"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "hotl-engine",
@@ -872,7 +872,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-theme"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ratatui",
  "serde",
@@ -880,7 +880,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-tools"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-util",
  "hotl-provider",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "hotl-theme",
@@ -907,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -916,21 +916,21 @@ dependencies = [
 
 [[package]]
 name = "hotl-watch-listener"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hotl-watch-types",
 ]
 
 [[package]]
 name = "hotl-watch-tmux"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hotl-watch-types",
 ]
 
 [[package]]
 name = "hotl-watch-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "crossterm",
  "hotl-theme",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "hotl-watch-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hotl-theme",
  "serde",
