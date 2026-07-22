@@ -51,8 +51,19 @@ impl SseAssembler for Assembler {
                     .pointer("/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("unknown");
+                // Map the wire error type to the status it would have carried
+                // pre-stream, so retry/fallback classification treats an
+                // in-stream overload exactly like an HTTP-level one (a 200
+                // here would make the fallback-model chain unreachable for
+                // the most common availability signal).
+                let status = match v.pointer("/error/type").and_then(Value::as_str) {
+                    Some("overloaded_error") => 529,
+                    Some("rate_limit_error") => 429,
+                    Some("api_error") => 500,
+                    _ => 400,
+                };
                 Err(ProviderError::Http {
-                    status: 200,
+                    status,
                     message: format!("in-stream error: {msg}"),
                     retry_after: None,
                 })
@@ -173,6 +184,31 @@ impl Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn in_stream_errors_carry_availability_statuses() {
+        let cases = [
+            ("overloaded_error", 529),
+            ("rate_limit_error", 429),
+            ("api_error", 500),
+            ("invalid_request_error", 400),
+        ];
+        for (etype, want) in cases {
+            let mut a = Assembler::default();
+            let data =
+                format!(r#"{{"type":"error","error":{{"type":"{etype}","message":"boom"}}}}"#);
+            let Err(ProviderError::Http { status, .. }) = a.handle(&data) else {
+                panic!("expected an Http error for {etype}");
+            };
+            assert_eq!(status, want, "{etype}");
+        }
+        // The overload must classify as availability so fallback models fire.
+        let mut a = Assembler::default();
+        let err = a
+            .handle(r#"{"type":"error","error":{"type":"overloaded_error","message":"o"}}"#)
+            .unwrap_err();
+        assert!(hotl_provider::retry::is_availability(&err));
+    }
 
     #[test]
     fn parses_split_chunks_and_assembles_blocks() {
