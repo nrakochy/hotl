@@ -140,11 +140,15 @@ async fn handle_request(
             };
             match factory(spec) {
                 Ok(handle) => {
-                    // Replacing a session: stop its drain task and drop its
-                    // parked state — a dropped ask sender reads as a deny to
-                    // the old engine, and a stale prompt id must never be
-                    // answered with the new session's first TurnDone.
+                    // Replacing a session: interrupt its in-flight turn (its
+                    // events are about to stop rendering anywhere — it must
+                    // not keep running tools invisibly in the shared cwd),
+                    // stop its drain task, and drop its parked state — a
+                    // dropped ask sender reads as a deny to the old engine,
+                    // and a stale prompt id must never be answered with the
+                    // new session's first TurnDone.
                     if let Some(old) = session.take() {
+                        old.handle.interrupt();
                         old.drain.abort();
                         pending
                             .lock()
@@ -162,6 +166,13 @@ async fn handle_request(
                         pending_prompt.clone(),
                         next_id,
                     );
+                    // Resume auto-continuation (M4/#8): a loaded projection
+                    // that ends mid-turn (user prompt or unanswered tool
+                    // results) picks the work back up; the engine no-ops when
+                    // there is nothing to continue.
+                    if method == "session/load" {
+                        state.handle.continue_turn().await;
+                    }
                     let sid = state.id.clone();
                     *session = Some(state);
                     reply_ok(writer, id, json!({"sessionId": sid})).await;
