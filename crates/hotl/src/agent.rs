@@ -31,8 +31,8 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         Err(code) => return code,
     };
     match (parsed.schema, parsed.prompt) {
-        (Some(schema), Some(prompt)) => structured_main(&prompt, &schema).await,
-        (None, Some(prompt)) => run_session(prompt, parsed.json_events).await,
+        (Some(schema), Some(prompt)) => structured_main(&prompt, &schema, parsed.name).await,
+        (None, Some(prompt)) => run_session(prompt, parsed.json_events, parsed.name).await,
         // Reachable via e.g. `hotl --json` with no -p (main.rs routes any
         // headless flag here); the interactive console is bare `hotl`.
         (_, None) => {
@@ -46,7 +46,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
 
 /// `hotl -p "…" --json-schema <file>` (T2): run one headless turn, validate the
 /// answer against the schema (with bounded retry), print the JSON or exit 1.
-async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
+async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Option<String>) -> i32 {
     let schema: serde_json::Value = match std::fs::read_to_string(schema_path)
         .map_err(|e| e.to_string())
         .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))
@@ -73,7 +73,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let log = match SessionLog::create(
+    let mut log = match SessionLog::create(
         &sessions_dir(),
         &scaffold.model,
         None,
@@ -86,6 +86,12 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path) -> i32 {
             return 1;
         }
     };
+    if let Some(n) = &name {
+        let _ = log.append(
+            &hotl_types::EntryPayload::Rename { name: n.clone() },
+            scaffold.clock.now_ms(),
+        );
+    }
     let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
     items.push(crate::structured::contract_item(&schema));
     let mut handle = spawn_session(scaffold.deps(log, None, items));
@@ -138,21 +144,33 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
     };
     let model = scaffold.model.clone();
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
-        let resumed = match spec {
-            crate::acp::SessionSpec::New { .. } => None,
+        let (resumed, requested) = match spec {
+            crate::acp::SessionSpec::New { name } => (None, name),
             crate::acp::SessionSpec::Load {
-                session_id: sid, ..
+                session_id: sid,
+                name,
             } => {
                 let replayed = hotl_store::replay_chain(&sessions_dir(), &sid)
                     .map_err(|e| format!("could not load session {sid}: {e}"))?;
-                Some(Resumed {
-                    parent_id: replayed.header.session_id,
-                    items: replayed.items,
-                })
+                let hotl_store::Replayed {
+                    header,
+                    items,
+                    name: inherited,
+                    ..
+                } = replayed;
+                // An explicit rename-on-resume beats the inherited name.
+                let name = name.or(inherited);
+                (
+                    Some(Resumed {
+                        parent_id: header.session_id,
+                        items,
+                    }),
+                    name,
+                )
             }
         };
         let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
-        let log = SessionLog::create(
+        let mut log = SessionLog::create(
             &sessions_dir(),
             &scaffold.model,
             parent_id,
@@ -160,12 +178,20 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
             scaffold.clock.now_ms(),
         )
         .map_err(|e| format!("could not create session log: {e}"))?;
+        // Copy-forward: the resumed name lives in this log too, so listing
+        // and name resolution stay a single-file scan.
+        if let Some(n) = &requested {
+            let _ = log.append(
+                &hotl_types::EntryPayload::Rename { name: n.clone() },
+                scaffold.clock.now_ms(),
+            );
+        }
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
         Ok(crate::acp::SessionOpen {
             handle: spawn_session(scaffold.deps(log, snapshots, initial)),
-            name: None,
+            name: requested,
         })
     });
     Ok((factory, model))
@@ -173,7 +199,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
 
 /// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a
 /// unix socket for `hotl attach` (the detached-session server behind `hotl bg`).
-pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
+pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>) -> i32 {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -187,7 +213,7 @@ pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
         Ok(s) => s,
         Err(code) => return code,
     };
-    let log = match SessionLog::create(
+    let mut log = match SessionLog::create(
         &sessions_dir(),
         &scaffold.model,
         None,
@@ -200,6 +226,12 @@ pub async fn serve_main(id: String, prompt: Option<String>) -> i32 {
             return 1;
         }
     };
+    if let Some(n) = &name {
+        let _ = log.append(
+            &hotl_types::EntryPayload::Rename { name: n.clone() },
+            scaffold.clock.now_ms(),
+        );
+    }
     let session_id = log.session_id.clone();
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
@@ -341,7 +373,7 @@ fn masker_with_helper(initial_helper_key: Option<&str>) -> Masker {
     }
 }
 
-async fn run_session(prompt: String, json_events: bool) -> i32 {
+async fn run_session(prompt: String, json_events: bool, name: Option<String>) -> i32 {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -356,7 +388,7 @@ async fn run_session(prompt: String, json_events: bool) -> i32 {
         Err(code) => return code,
     };
 
-    let log = match SessionLog::create(
+    let mut log = match SessionLog::create(
         &sessions_dir(),
         &scaffold.model,
         None,
@@ -369,6 +401,12 @@ async fn run_session(prompt: String, json_events: bool) -> i32 {
             return 1;
         }
     };
+    if let Some(n) = &name {
+        let _ = log.append(
+            &hotl_types::EntryPayload::Rename { name: n.clone() },
+            scaffold.clock.now_ms(),
+        );
+    }
     let session_id = log.session_id.clone();
     spawn_secret_audit(log.path().to_path_buf());
     let gc_config_dir = scaffold.config_dir.clone();
@@ -856,18 +894,33 @@ struct Args {
     prompt: Option<String>,
     json_events: bool,
     schema: Option<PathBuf>,
+    name: Option<String>,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut prompt: Option<String> = None;
     let mut json_events = false;
     let mut schema: Option<PathBuf> = None;
+    let mut name: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-p" | "--print" => prompt = iter.next(),
             "--json" => json_events = true,
             "--json-schema" => schema = iter.next().map(PathBuf::from),
+            "-n" | "--name" => {
+                match iter
+                    .next()
+                    .as_deref()
+                    .and_then(hotl_types::normalize_session_name)
+                {
+                    Some(n) => name = Some(n),
+                    None => {
+                        eprintln!("hotl: -n/--name needs a value of 1–64 chars");
+                        return Err(2);
+                    }
+                }
+            }
             other => {
                 eprintln!("hotl: unknown argument `{other}` (try --help)");
                 return Err(2);
@@ -886,6 +939,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         prompt,
         json_events,
         schema,
+        name,
     })
 }
 
@@ -1247,5 +1301,23 @@ mod tests {
         let err = select_provider(&cfg, &MapSecrets::default()).err().unwrap();
         assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
         assert!(err.contains("api_key_helper"), "{err}");
+    }
+
+    #[test]
+    fn parse_args_accepts_name() {
+        let args: Vec<String> = ["-p", "hi", "-n", "  fix-auth  "]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_args(args).expect("parses");
+        assert_eq!(parsed.name.as_deref(), Some("fix-auth"));
+    }
+
+    #[test]
+    fn parse_args_rejects_bad_names() {
+        for bad in [vec!["-p", "hi", "-n"], vec!["-p", "hi", "-n", "   "]] {
+            let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(parse_args(args).is_err());
+        }
     }
 }

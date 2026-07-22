@@ -16,7 +16,7 @@ pub fn session_id() -> String {
 }
 
 /// `hotl bg [prompt]`: spawn a detached `hotl serve` and report how to attach.
-pub fn bg_main(prompt: Option<&str>) -> i32 {
+pub fn bg_main(prompt: Option<&str>, name: Option<&str>) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -33,6 +33,9 @@ pub fn bg_main(prompt: Option<&str>) -> i32 {
     cmd.arg("serve").arg("--id").arg(&id);
     if let Some(p) = prompt {
         cmd.arg("--prompt").arg(p);
+    }
+    if let Some(n) = name {
+        cmd.arg("--name").arg(n);
     }
     // Detach: no controlling terminal input, output to a log, own process
     // group so the shell's SIGHUP on exit doesn't reach it.

@@ -76,13 +76,13 @@ fn main() {
             std::process::exit(block_on(tui::tui_main(rest)));
         }
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
-        Some("bg") => std::process::exit(bg::bg_main(bg_prompt(&args))),
+        Some("bg") => std::process::exit(bg::bg_main(bg_prompt(&args), bg_name(&args).as_deref())),
         Some("attach") => std::process::exit(block_on(attach::attach_main(
             args.get(1).map(String::as_str),
         ))),
         Some("serve") => {
-            let (id, prompt) = parse_serve_args(&args);
-            std::process::exit(block_on(agent::serve_main(id, prompt)));
+            let (id, prompt, name) = parse_serve_args(&args);
+            std::process::exit(block_on(agent::serve_main(id, prompt, name)));
         }
         Some("setup") => {
             let force = args.iter().any(|a| a == "--force" || a == "-f");
@@ -166,28 +166,54 @@ fn update_main(latest: Option<&str>) -> i32 {
     0
 }
 
-/// The optional opening prompt for `hotl bg` (the first non-flag arg).
+/// The optional opening prompt for `hotl bg`: the first non-flag arg that is
+/// not a flag's value.
 fn bg_prompt(args: &[String]) -> Option<&str> {
-    args.get(1)
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "-n" | "--name" => {
+                it.next(); // skip the flag's value
+            }
+            s if !s.starts_with('-') => return Some(s),
+            _ => {}
+        }
+    }
+    None
 }
 
-/// `--id <id>` and `--prompt <p>` for `hotl serve`; a missing id is generated.
-fn parse_serve_args(args: &[String]) -> (String, Option<String>) {
+/// The `-n`/`--name` value for `hotl bg`, normalized.
+fn bg_name(args: &[String]) -> Option<String> {
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "-n" | "--name") {
+            return it
+                .next()
+                .and_then(|v| hotl_types::normalize_session_name(v));
+        }
+    }
+    None
+}
+
+/// `--id <id>`, `--prompt <p>`, `--name <n>` for `hotl serve`; a missing id
+/// is generated.
+fn parse_serve_args(args: &[String]) -> (String, Option<String>, Option<String>) {
     let mut id = None;
     let mut prompt = None;
+    let mut name = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--id" => id = it.next().cloned(),
             "--prompt" => prompt = it.next().cloned(),
+            "--name" => name = it.next().cloned(),
             _ => {}
         }
     }
     (
         id.unwrap_or_else(|| format!("bg-{}", std::process::id())),
         prompt,
+        name,
     )
 }
 
@@ -218,5 +244,26 @@ mod tests {
         assert!(!is_headless(&v(&[])));
         assert!(!is_headless(&v(&["01ABC"])));
         assert!(!is_headless(&v(&["--resume"])));
+    }
+
+    #[test]
+    fn serve_args_carry_a_name() {
+        let (_, _, name) =
+            super::parse_serve_args(&v(&["serve", "--id", "x", "--name", "fix-auth"]));
+        assert_eq!(name.as_deref(), Some("fix-auth"));
+    }
+
+    #[test]
+    fn name_flag_alone_stays_interactive() {
+        // `-n` names a TUI session; only -p/--json/--json-schema go headless.
+        assert!(!super::is_headless(&v(&["-n", "x"])));
+        assert!(super::is_headless(&v(&["-p", "hi", "-n", "x"])));
+    }
+
+    #[test]
+    fn bg_flags_do_not_eat_the_prompt() {
+        let args = v(&["bg", "-n", "fix-auth", "do the thing"]);
+        assert_eq!(super::bg_name(&args).as_deref(), Some("fix-auth"));
+        assert_eq!(super::bg_prompt(&args), Some("do the thing"));
     }
 }
