@@ -101,23 +101,38 @@ impl ShellHook {
             self.strike();
             return None;
         };
-        if let Some(mut stdin) = child.stdin.take() {
-            use tokio::io::AsyncWriteExt;
-            let _ = stdin.write_all(payload.to_string().as_bytes()).await;
-            let _ = stdin.shutdown().await;
-        }
-        // Read stdout capped rather than wait_with_output: past the cap the
-        // pipe closes, an over-chatty hook dies on SIGPIPE, and it strikes.
+        // Everything that can block on the child — the stdin write included —
+        // runs inside the timeout: a hook that never drains stdin would
+        // otherwise park write_all forever once the payload exceeds the OS
+        // pipe buffer, wedging the turn with the clock never started. The
+        // write and the read overlap so a hook that streams output before
+        // finishing stdin can't deadlock the pair of pipes either.
+        let stdin = child.stdin.take();
         let mut stdout = child.stdout.take();
+        let payload = payload.to_string();
         let out = tokio::time::timeout(std::time::Duration::from_secs(HOOK_TIMEOUT_SECS), async {
-            use tokio::io::AsyncReadExt;
-            let mut buf = Vec::new();
-            if let Some(so) = stdout.as_mut() {
-                let _ = so
-                    .take((HOOK_MAX_OUTPUT + 1) as u64)
-                    .read_to_end(&mut buf)
-                    .await;
-            }
+            let write = async {
+                if let Some(mut stdin) = stdin {
+                    use tokio::io::AsyncWriteExt;
+                    let _ = stdin.write_all(payload.as_bytes()).await;
+                    let _ = stdin.shutdown().await;
+                } // dropped here — the hook sees stdin EOF
+            };
+            // Read stdout capped rather than wait_with_output: past the cap
+            // the pipe closes, an over-chatty hook dies on SIGPIPE, and it
+            // strikes.
+            let read = async {
+                use tokio::io::AsyncReadExt;
+                let mut buf = Vec::new();
+                if let Some(so) = stdout.as_mut() {
+                    let _ = so
+                        .take((HOOK_MAX_OUTPUT + 1) as u64)
+                        .read_to_end(&mut buf)
+                        .await;
+                }
+                buf
+            };
+            let ((), buf) = tokio::join!(write, read);
             drop(stdout);
             (child.wait().await, buf)
         })
