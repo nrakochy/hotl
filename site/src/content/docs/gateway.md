@@ -93,9 +93,13 @@ Leave Bifrost's `MaxRetries` at its default 0: the engine owns recovery.
 ## Endpoints that authenticate for you
 
 Some endpoints hold the credential themselves: a corporate gateway that
-terminates auth at its edge, or a local bridge that authenticates against a
-CLI session you have already logged into. hotl has nothing to send them, and
-requiring a key it will not use is just a wart.
+terminates auth at its edge, an internal proxy fronting Bedrock or Vertex, a
+mesh sidecar that attaches identity in transit. hotl has nothing to send
+them, and requiring a key it will not use is just a wart.
+
+This is for endpoints whose operator has provisioned the credential. It is
+not a way to spend a personal Claude subscription — see
+[below](#can-i-use-my-claude-pro-or-max-subscription).
 
 Set `auth = "subscription"`. hotl then holds no credential at all:
 
@@ -140,6 +144,46 @@ actually answers:
 ok    provider: claude-opus-4-8 selected (auth: subscription — no credential held)
 ok    gateway: http://127.0.0.1:3456/v1/models reachable (HTTP 200)
 ```
+
+## Can I use my Claude Pro or Max subscription?
+
+Short answer: no, and hotl will not help you try. Get an API key from the
+[Claude Console](https://platform.claude.com/) instead:
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-…
+export HOTL_MODEL=anthropic/claude-opus-4-8
+hotl doctor
+```
+
+That is billed per token, separately from a Pro or Max plan.
+
+The longer answer, because the question keeps coming up and the wrong route
+is easy to find. A Claude Pro or Max plan buys usage of Claude Code and
+claude.ai. It is not a developer credential. Anthropic's
+[legal and compliance page](https://code.claude.com/docs/en/legal-and-compliance)
+is explicit:
+
+> OAuth authentication is intended exclusively for purchasers of Claude
+> Free, Pro, Max, Team, and Enterprise subscription plans and is designed to
+> support ordinary use of Claude Code and other native Anthropic
+> applications. […] Anthropic does not permit third-party developers to
+> offer Claude.ai login or to route requests through Free, Pro, or Max plan
+> credentials on behalf of their users.
+
+hotl is a third-party tool. There are bridges that re-serve a logged-in
+Claude Code session over an Anthropic-shaped HTTP endpoint, and pointing
+`auth = "subscription"` at one is technically possible. Don't. Anthropic has
+enforced this — accounts were disrupted in early 2026 — and reserves the
+right to act "without prior notice." The account at risk is yours, and hotl
+cannot shield it. That is why no such bridge is named anywhere in these docs
+or defaults.
+
+If per-token billing is the actual objection, hotl is provider-neutral by
+design and the alternatives are one env var away: a local model through
+[Ollama](https://ollama.com) costs nothing per token, and any
+OpenAI-compatible endpoint works via `openai/…`. See
+[point hotl at the gateway](#point-hotl-at-the-gateway).
 
 ## Troubleshooting
 

@@ -10,6 +10,7 @@ Look up the message you saw. Text in `code` is what hotl prints; find yours by g
 | Message or symptom | Cause | Fix |
 |---|---|---|
 | `ANTHROPIC_API_KEY is not set.` | Provider is anthropic (the default) but no key. | Set `ANTHROPIC_API_KEY`, or switch to another provider: `export HOTL_MODEL=openai/<model>` with `OPENAI_API_KEY`, or `HOTL_OPENAI_BASE_URL` for a local endpoint. |
+| You have a Claude Pro/Max plan and no API key | A subscription covers Claude Code and claude.ai, not third-party tools. | Get a key from the [Claude Console](https://platform.claude.com/) (billed per token), or run a local model. Full answer: [can I use my Claude subscription?](../gateway/#can-i-use-my-claude-pro-or-max-subscription) |
 | `OPENAI_API_KEY is not set (required for api.openai.com; …)` | `openai` provider against the default hosted URL, no key. | Set `OPENAI_API_KEY`, or point `HOTL_OPENAI_BASE_URL` at a local server (e.g. `http://localhost:11434/v1`) to run keyless. |
 | `unknown provider \`X\` in HOTL_MODEL` | `HOTL_MODEL` isn't `anthropic/…` or `openai/…`. | Use `provider/model`. `openai` covers all OpenAI-compatible endpoints. |
 | `doctor` provider line shows `FAIL` | Same as the above three. | Fix the env vars in the shell you'll run `hotl` from, then re-run `hotl doctor`. |

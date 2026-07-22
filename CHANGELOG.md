@@ -10,8 +10,11 @@ semver promise of their own.
 
 - Endpoints that authenticate for you: `[provider] auth = "subscription"`
   (env `HOTL_PROVIDER_AUTH`) runs hotl with no credential of its own, for
-  gateways that terminate auth at the edge and local bridges that
-  authenticate against a CLI session. The setting is provider-neutral —
+  operator-provisioned endpoints — corporate gateways that terminate auth at
+  the edge, internal proxies fronting Bedrock or Vertex. It is not a way to
+  spend a personal Claude subscription, which Anthropic's terms restrict to
+  Claude Code and claude.ai; the gateway guide says so plainly, since the
+  wrong route is easy to find. The setting is provider-neutral —
   identical for `anthropic/…` and `openai/…`. Requires `base_url`, and
   fails at startup without one rather than as a mid-session 401. Any API
   key in the environment is discarded rather than forwarded, so a local
