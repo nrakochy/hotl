@@ -25,6 +25,18 @@ semver promise of their own.
   `hotl doctor`'s gateway check follows the active provider instead of
   only ever probing the OpenAI base URL.
 
+### Fixed
+
+- The TUI wraps long lines instead of clipping them, in both the
+  transcript and the input. A multi-line input buffer showed only the
+  cursor's line, the input box was fixed at three rows, and transcript
+  output was cut at the right edge. The input now grows to ten rows and
+  scrolls to keep the cursor visible.
+
+## [0.3.0] - 2026-07-22
+
+### Added
+
 - Skill marketplaces: register extra skill sources with
   `hotl skills add <name> <git-url|path>` (plus `list` / `update` /
   `remove`) or a `[skills.marketplaces]` map in config.toml. Git sources
@@ -37,6 +49,29 @@ semver promise of their own.
   in the resume picker.
 - `hotl -r [arg]` resume flag (same path as `hotl resume`): bare lists
   sessions; the arg accepts the picker number, an id-prefix, or a name.
+
+### Fixed
+
+- Interrupts are delivered everywhere they can land: during the compaction
+  window (the continuation respawn no longer reuses a token carrying a
+  swallowed cancel) and while a permission ask is pending (cancel waits for
+  the answer instead of ending the turn). The session actor holds a weak
+  sender, so dropping a handle exits the task rather than leaking it — with
+  its log fd and projection — per spawned subagent or replaced ACP session.
+- ACP `session/new` and `session/load` interrupt the replaced session's
+  in-flight turn, which otherwise kept running tools invisibly in the shared
+  working directory. `session/load` auto-continues an interrupted turn again.
+- Shell hooks: the stdin payload write runs inside the hook timeout, so a
+  hook that never drains stdin times out at 10s instead of wedging the turn.
+- Anthropic in-stream SSE errors carry their canonical HTTP statuses
+  (`overloaded` → 529, `rate_limit` → 429, `api_error` → 500), so the
+  fallback chain and retry classifier can see them.
+- MCP `tools/call` gets a 600s leash (protocol chatter stays at 30s), and a
+  timed-out request sends `notifications/cancelled` so the server stops work
+  instead of racing a retry into a duplicate.
+- `hotl serve`: a live socket is never stolen (connect-probe before unlink),
+  the exit guard only removes the socket it bound, a second `hotl attach`
+  takes over cleanly, and accept failures back off instead of busy-spinning.
 
 ## [0.2.0] - 2026-07-21
 
