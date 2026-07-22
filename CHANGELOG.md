@@ -4,6 +4,17 @@ Notable changes to hotl. Pre-1.0, breaking changes land at every 0.x minor;
 the internal library crates version in lockstep with the binary and carry no
 semver promise of their own.
 
+## [Unreleased]
+
+### Added
+
+- Named sessions: start one with `-n/--name` (TUI, `hotl bg`, headless `-p`),
+  rename mid-session with `/rename <name>` — the TUI's first slash command.
+  The name shows as a badge above the input, in the terminal tab title, and
+  in the resume picker.
+- `hotl -r [arg]` resume flag (same path as `hotl resume`): bare lists
+  sessions; the arg accepts the picker number, an id-prefix, or a name.
+
 ## [0.2.0] - 2026-07-21
 
 The execute harness ships: hotl is now a human-on-the-loop terminal AI agent,
