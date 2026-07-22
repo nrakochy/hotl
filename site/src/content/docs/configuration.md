@@ -32,7 +32,8 @@ Everything hand-editable lives in **`~/.config/hotl/config.toml`** (or `$XDG_CON
 ```toml
 [provider]
 model = "openai/gpt-5"                      # provider/model
-base_url = "http://localhost:11434/v1"      # OpenAI-compatible endpoint
+base_url = "http://localhost:11434/v1"      # endpoint for the active provider
+auth = "api_key"                            # or "subscription": hotl holds no credential (requires base_url)
 fast_model = "..."                          # cheap model for compaction summaries
 api_key_helper = "..."                      # command whose trimmed stdout is the API key; beats static key env vars; 5s timeout, 64KB cap
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
@@ -134,6 +135,8 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_MODEL` | `[provider].model` | `provider/model`; `openai/…` covers any OpenAI-compatible endpoint. |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | Provider keys (never put keys in config.toml). |
 | `HOTL_OPENAI_BASE_URL` | `[provider].base_url` | OpenAI-compatible endpoint. A non-loopback `http://` URL with a key set warns (cleartext). |
+| `HOTL_ANTHROPIC_BASE_URL` | `[provider].base_url` | Anthropic-shaped endpoint. Both `https://host/v1` and the bare `https://host` resolve. |
+| `HOTL_PROVIDER_AUTH` | `[provider].auth` | `api_key` (default) or `subscription` — see [endpoints that authenticate for you](../gateway/#endpoints-that-authenticate-for-you). |
 | `HOTL_API_KEY_HELPER` | `[provider].api_key_helper` | Overrides the config.toml key of the same name. |
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. |

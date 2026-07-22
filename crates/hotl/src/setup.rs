@@ -14,12 +14,15 @@ pub const DEFAULT_CONFIG: &str = "\
 # ~/.config/hotl/config.toml — the single hotl config file.
 # Docs: https://nrakochy.github.io/hotl/
 # Every hand-editable setting lives here. Env vars override these (HOTL_MODEL,
-# ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL, HOTL_SANDBOX=off).
+# ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL,
+# HOTL_ANTHROPIC_BASE_URL, HOTL_PROVIDER_AUTH, HOTL_SANDBOX=off).
 
 [provider]
 # provider/model. `openai/…` covers any OpenAI-compatible endpoint.
 # model = \"openai/gpt-5\"
-# base_url = \"http://localhost:11434/v1\"   # e.g. Ollama (openai provider)
+# base_url = \"http://localhost:11434/v1\"   # endpoint for the active provider
+# auth = \"subscription\"                    # endpoint authenticates for you;
+#                                          # hotl holds no key (needs base_url)
 # fast_model = \"...\"                        # cheap model for compaction summaries
 # Run a command to obtain the API key (stdout = key). Beats the static env
 # key when set. For gateways with short-lived keys, see

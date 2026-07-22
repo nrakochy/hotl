@@ -90,6 +90,57 @@ hotl
 
 Leave Bifrost's `MaxRetries` at its default 0: the engine owns recovery.
 
+## Endpoints that authenticate for you
+
+Some endpoints hold the credential themselves: a corporate gateway that
+terminates auth at its edge, or a local bridge that authenticates against a
+CLI session you have already logged into. hotl has nothing to send them, and
+requiring a key it will not use is just a wart.
+
+Set `auth = "subscription"`. hotl then holds no credential at all:
+
+```toml
+[provider]
+model    = "anthropic/claude-opus-4-8"
+base_url = "http://127.0.0.1:3456"
+auth     = "subscription"
+```
+
+The setting is provider-neutral — it reads identically on the other side:
+
+```toml
+[provider]
+model    = "openai/gpt-5"
+base_url = "http://127.0.0.1:4000/v1"
+auth     = "subscription"
+```
+
+Per-shell: `export HOTL_PROVIDER_AUTH=subscription HOTL_ANTHROPIC_BASE_URL=http://127.0.0.1:3456`.
+
+Three things worth knowing:
+
+- **Any key in your environment is discarded, not merely unused.** If
+  `ANTHROPIC_API_KEY` is still exported from earlier work, hotl will not
+  forward it — a local bridge never receives a production credential you
+  did not mean to give it.
+- **`base_url` is required.** Without it hotl would send an empty credential
+  to the vendor's own endpoint, so this fails at startup rather than as a
+  confusing 401 mid-session.
+- **Both URL spellings work.** `http://host:3456` and `http://host:3456/v1`
+  resolve to the same endpoint, since bridges and gateways disagree about
+  which half owns the version prefix.
+
+hotl sends its normal request body and does not negotiate capabilities. If an
+endpoint rejects something it does not support — prompt-cache markers,
+thinking blocks — that surfaces as an ordinary error naming the field, rather
+than being silently worked around. `hotl doctor` reports what the endpoint
+actually answers:
+
+```
+ok    provider: claude-opus-4-8 selected (auth: subscription — no credential held)
+ok    gateway: http://127.0.0.1:3456/v1/models reachable (HTTP 200)
+```
+
 ## Troubleshooting
 
 | Symptom | Meaning | Fix |
@@ -98,3 +149,5 @@ Leave Bifrost's `MaxRetries` at its default 0: the engine owns recovery.
 | `api_key_helper … printed nothing on stdout` | Wrong flag or empty secret | Run the command by hand; it must print only the key. |
 | `gateway: … rejected the key (HTTP 401)` in doctor | Key invalid/expired at the gateway | Mint a new key; check the helper fetches the current one. |
 | Model errors mention an unknown model | Gateway routes by its own names | Use the gateway's model id after `openai/`, e.g. `openai/anthropic/claude-opus-4-8`. |
+| `auth = "subscription" requires base_url` | Nothing to authenticate against | Set `[provider] base_url` to the endpoint, or use `auth = "api_key"`. |
+| `the endpoint is not authenticated (HTTP 401)` in doctor | The endpoint's own credential lapsed | Re-authenticate the endpoint (hotl holds no key to fix). |

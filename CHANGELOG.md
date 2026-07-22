@@ -8,6 +8,20 @@ semver promise of their own.
 
 ### Added
 
+- Endpoints that authenticate for you: `[provider] auth = "subscription"`
+  (env `HOTL_PROVIDER_AUTH`) runs hotl with no credential of its own, for
+  gateways that terminate auth at the edge and local bridges that
+  authenticate against a CLI session. The setting is provider-neutral —
+  identical for `anthropic/…` and `openai/…`. Requires `base_url`, and
+  fails at startup without one rather than as a mid-session 401. Any API
+  key in the environment is discarded rather than forwarded, so a local
+  endpoint never receives a production credential by accident.
+- `[provider] base_url` now applies to the `anthropic` provider too (env
+  `HOTL_ANTHROPIC_BASE_URL`), so any Anthropic-shaped endpoint is
+  reachable. Both `https://host/v1` and the bare `https://host` resolve.
+  `hotl doctor`'s gateway check follows the active provider instead of
+  only ever probing the OpenAI base URL.
+
 - Skill marketplaces: register extra skill sources with
   `hotl skills add <name> <git-url|path>` (plus `list` / `update` /
   `remove`) or a `[skills.marketplaces]` map in config.toml. Git sources
