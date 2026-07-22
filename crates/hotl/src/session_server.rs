@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use hotl_engine::{EngineEvent, SessionHandle};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -69,7 +69,23 @@ pub async fn serve(session_id: String, handle: SessionHandle, prompt: Option<Str
         return 1;
     }
     let sock = dir.join(format!("{session_id}.sock"));
-    let _ = std::fs::remove_file(&sock); // clear a stale socket
+    // A stale socket from a dead server is cleared; a *live* one means this
+    // id collides with a running session (pid reuse, repeated --id) — refuse
+    // rather than silently steal its socket out from under it.
+    if sock.exists() {
+        match std::os::unix::net::UnixStream::connect(&sock) {
+            Ok(_) => {
+                eprintln!(
+                    "hotl serve: session `{session_id}` is already running ({})",
+                    sock.display()
+                );
+                return 1;
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&sock);
+            }
+        }
+    }
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
         Err(e) => {
@@ -77,7 +93,7 @@ pub async fn serve(session_id: String, handle: SessionHandle, prompt: Option<Str
             return 1;
         }
     };
-    let _guard = SockGuard(sock);
+    let _guard = SockGuard::new(sock);
     serve_on(listener, session_id, handle, prompt).await;
     0
 }
@@ -106,69 +122,131 @@ pub async fn serve_on(
     accept_loop(listener, shared).await;
 }
 
-/// Removes the socket file when the server exits.
-struct SockGuard(PathBuf);
-impl Drop for SockGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+/// Removes the socket file when the server exits — but only if the path
+/// still refers to the socket *this* server bound (matched by inode), so a
+/// stale guard can never delete a successor's live socket.
+struct SockGuard {
+    path: PathBuf,
+    ino: Option<u64>,
+}
+
+impl SockGuard {
+    fn new(path: PathBuf) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        let ino = std::fs::symlink_metadata(&path).ok().map(|m| m.ino());
+        Self { path, ino }
     }
 }
 
-async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            continue;
-        };
-        let (read, write) = stream.into_split();
-        *shared.client.lock().await = Some(write);
-        resend_pending(&shared).await;
-        // Handle this client until it disconnects; the session lives on.
-        let stop = handle_client(read, &shared).await;
-        *shared.client.lock().await = None;
-        if stop {
-            break; // client asked to shut the session down
+impl Drop for SockGuard {
+    fn drop(&mut self) {
+        use std::os::unix::fs::MetadataExt;
+        let current = std::fs::symlink_metadata(&self.path).ok().map(|m| m.ino());
+        if self.ino.is_none() || current == self.ino {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
 }
 
-/// Read one client's frames until EOF or a `shutdown`. Returns true to stop
-/// the whole server (shutdown), false to just detach.
-async fn handle_client(read: impl AsyncRead + Unpin, shared: &Arc<Shared>) -> bool {
-    let mut lines = BufReader::new(read).lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        let Ok(msg) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        match msg.get("t").and_then(Value::as_str).unwrap_or("") {
-            "prompt" => shared.handle.prompt(str_field(&msg, "text")).await,
-            "steer" => shared.handle.steer(str_field(&msg, "text")).await,
-            "continue" => shared.handle.continue_turn().await,
-            "cancel" => shared.handle.interrupt(),
-            "ask_reply" => {
-                if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                    if let Some((reply, _)) = shared
-                        .pending
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .remove(&id)
-                    {
-                        let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
-                        let deny_msg = msg.get("message").and_then(Value::as_str).map(String::from);
-                        let ans = if allow {
-                            hotl_engine::AskReply::Allow
-                        } else {
-                            hotl_engine::AskReply::Deny { message: deny_msg }
-                        };
-                        let _ = reply.send(ans);
+/// What one client frame asks of the server.
+enum ClientAction {
+    Continue,
+    Detach,
+    Shutdown,
+}
+
+/// Accepting stays live while a client is attached — a second `hotl attach`
+/// takes over (the previous client is told and dropped) instead of hanging
+/// unread in the listener backlog.
+async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
+    let mut reader: Option<tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>> = None;
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let Ok((stream, _)) = accepted else {
+                    // A persistent accept failure (fd exhaustion) must not
+                    // busy-spin the core; back off briefly and retry.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                };
+                if reader.is_some() {
+                    send(
+                        &shared,
+                        &json!({"t": "detached", "reason": "another client attached"}),
+                    )
+                    .await;
+                }
+                let (read, write) = stream.into_split();
+                *shared.client.lock().await = Some(write);
+                reader = Some(BufReader::new(read).lines());
+                resend_pending(&shared).await;
+            }
+            // Lines::next_line is cancel-safe: a frame half-read when the
+            // accept arm wins stays buffered.
+            line = next_line(&mut reader), if reader.is_some() => {
+                match line {
+                    Some(line) => match handle_frame(&line, &shared).await {
+                        ClientAction::Continue => {}
+                        ClientAction::Detach => {
+                            reader = None;
+                            *shared.client.lock().await = None;
+                        }
+                        ClientAction::Shutdown => break,
+                    },
+                    None => { // EOF or read error = detach
+                        reader = None;
+                        *shared.client.lock().await = None;
                     }
                 }
             }
-            "detach" => return false,
-            "shutdown" => return true,
-            _ => {}
         }
     }
-    false // EOF = detach
+}
+
+async fn next_line(
+    reader: &mut Option<tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>>,
+) -> Option<String> {
+    match reader {
+        Some(lines) => lines.next_line().await.ok().flatten(),
+        // Unreachable behind the select guard; never resolve regardless.
+        None => std::future::pending().await,
+    }
+}
+
+/// Apply one client frame to the session.
+async fn handle_frame(line: &str, shared: &Arc<Shared>) -> ClientAction {
+    let Ok(msg) = serde_json::from_str::<Value>(line) else {
+        return ClientAction::Continue;
+    };
+    match msg.get("t").and_then(Value::as_str).unwrap_or("") {
+        "prompt" => shared.handle.prompt(str_field(&msg, "text")).await,
+        "steer" => shared.handle.steer(str_field(&msg, "text")).await,
+        "continue" => shared.handle.continue_turn().await,
+        "cancel" => shared.handle.interrupt(),
+        "ask_reply" => {
+            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                if let Some((reply, _)) = shared
+                    .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id)
+                {
+                    let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
+                    let deny_msg = msg.get("message").and_then(Value::as_str).map(String::from);
+                    let ans = if allow {
+                        hotl_engine::AskReply::Allow
+                    } else {
+                        hotl_engine::AskReply::Deny { message: deny_msg }
+                    };
+                    let _ = reply.send(ans);
+                }
+            }
+        }
+        "detach" => return ClientAction::Detach,
+        "shutdown" => return ClientAction::Shutdown,
+        _ => {}
+    }
+    ClientAction::Continue
 }
 
 /// Re-issue every parked ask to the newly-attached client (the whole point).
@@ -277,6 +355,7 @@ mod tests {
     use hotl_provider::ScriptedProvider;
     use hotl_store::{Masker, SessionLog};
     use hotl_tools::{rules::Rules, Registry};
+    use tokio::io::AsyncRead;
     use tokio::net::UnixStream;
 
     fn scripted_session() -> SessionHandle {
