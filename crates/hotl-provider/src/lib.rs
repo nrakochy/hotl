@@ -218,6 +218,40 @@ impl Provider for ScriptedProvider {
     }
 }
 
+/// Normalize a configured base URL to one ending in `/v1`.
+///
+/// Two spellings are in the wild and users copy whichever their endpoint's
+/// docs show: hotl's own convention (and the OpenAI provider's) puts the
+/// version in the base, while bridges document the bare origin because
+/// official SDKs append the whole versioned path themselves. Everything that
+/// builds a URL from a configured base goes through here, so the provider and
+/// `hotl doctor` can never disagree about where an endpoint lives.
+pub fn v1_base(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1")
+    }
+}
+
+#[cfg(test)]
+mod base_url_tests {
+    use super::v1_base;
+
+    #[test]
+    fn both_spellings_and_trailing_slashes_resolve_alike() {
+        for input in [
+            "http://127.0.0.1:3456",
+            "http://127.0.0.1:3456/",
+            "http://127.0.0.1:3456/v1",
+            "http://127.0.0.1:3456/v1/",
+        ] {
+            assert_eq!(v1_base(input), "http://127.0.0.1:3456/v1", "input: {input}");
+        }
+    }
+}
+
 /// SSE line parsing shared by HTTP providers: turns raw byte chunks into
 /// complete `data:` payload strings. Chunks can split mid-line (and mid-UTF-8
 /// code point), so bytes are buffered, not lossily decoded per chunk.

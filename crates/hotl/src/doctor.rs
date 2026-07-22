@@ -90,8 +90,14 @@ fn source_kind(auth: AuthMode, refreshable: bool) -> &'static str {
     }
 }
 
+/// Where the capability probe goes. Shares `v1_base` with the providers so a
+/// bare-origin base can't make doctor call a live endpoint unreachable.
+fn models_url(base: &str) -> String {
+    format!("{}/models", hotl_provider::v1_base(base))
+}
+
 fn probe_line(base: &str, result: Result<u16, String>, auth: AuthMode) -> String {
-    let url = format!("{}/models", base.trim_end_matches('/'));
+    let url = models_url(base);
     let subscription = auth == AuthMode::Subscription;
     match result {
         // Nothing was authenticated from hotl's side in subscription mode, so
@@ -185,7 +191,7 @@ fn gateway_probe(
     rt.block_on(async {
         let client = reqwest::Client::new();
         let mut req = client
-            .get(format!("{}/models", base.trim_end_matches('/')))
+            .get(models_url(base))
             .timeout(std::time::Duration::from_secs(5));
         if let Some(k) = key {
             req = req.bearer_auth(k);
@@ -343,6 +349,16 @@ mod tests {
             AuthMode::ApiKey
         )
         .contains("connection refused"));
+    }
+
+    /// The probe must resolve a bare-origin base the same way the provider
+    /// does, or doctor reports a working endpoint as unreachable.
+    #[test]
+    fn probe_normalizes_a_bare_origin_base() {
+        assert_eq!(
+            probe_line("http://127.0.0.1:3456", Ok(200), AuthMode::Subscription),
+            "gateway: http://127.0.0.1:3456/v1/models reachable (HTTP 200)"
+        );
     }
 
     /// "check the key source" is actively wrong guidance when hotl holds no

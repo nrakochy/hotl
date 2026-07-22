@@ -33,20 +33,10 @@ const API_VERSION: &str = "2023-06-01";
 /// strictly better. Nothing else in the design depends on the outcome.
 const SUBSCRIPTION_PLACEHOLDER: &str = "hotl";
 
-/// Resolve a configured base URL to the messages endpoint.
-///
-/// Two spellings are accepted on purpose. hotl's own convention (and the
-/// OpenAI provider's) puts the version in the base — `.../v1`. Local bridges
-/// document the bare origin instead, because official SDKs append the whole
-/// `/v1/messages` path themselves, and users copy that. Guessing wrong is a
-/// confusing 404, so both work.
+/// Resolve a configured base URL to the messages endpoint. Both base
+/// spellings are accepted — see [`hotl_provider::v1_base`].
 pub fn messages_url(base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    if base.ends_with("/v1") {
-        format!("{base}/messages")
-    } else {
-        format!("{base}/v1/messages")
-    }
+    format!("{}/messages", hotl_provider::v1_base(base))
 }
 
 pub struct AnthropicProvider {
