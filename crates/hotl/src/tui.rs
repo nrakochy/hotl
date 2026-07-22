@@ -35,8 +35,8 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         );
         return 2;
     }
-    let spec = match resolve_spec(&args) {
-        Ok(s) => s,
+    let TuiArgs { spec, name } = match parse_tui_args(&args) {
+        Ok(a) => a,
         Err(code) => return code,
     };
     let (factory, model) = match crate::agent::acp_factory().await {
@@ -65,10 +65,13 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut reader = BufReader::new(cread);
     let mut client = AcpClient::new(cwrite);
 
-    if let Err(e) = handshake(&mut client, &mut reader, spec).await {
-        eprintln!("hotl: {e}");
-        return 1;
-    }
+    let session_name = match handshake(&mut client, &mut reader, spec, name).await {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("hotl: {e}");
+            return 1;
+        }
+    };
 
     let suspended = Arc::new(AtomicBool::new(false));
     let keys = spawn_key_reader(suspended.clone());
@@ -79,7 +82,8 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
             return 1;
         }
     };
-    let state = State::new(vim_mode, model);
+    let mut state = State::new(vim_mode, model);
+    state.session_name = session_name;
     let result = run_loop(
         &mut guard,
         &mut client,
@@ -101,24 +105,26 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 }
 
 /// initialize + session/new|load before entering raw mode, so wiring errors
-/// print as plain lines instead of corrupting an alt-screen.
+/// print as plain lines instead of corrupting an alt-screen. Returns the
+/// opened session's display name (server-confirmed).
 async fn handshake(
     client: &mut Client,
     reader: &mut ServerReader,
     spec: Option<String>,
-) -> Result<(), String> {
+    name: Option<String>,
+) -> Result<Option<String>, String> {
     let init = client.request("initialize", Value::Null).await;
     wait_response(reader, init).await?;
     let open = match spec {
-        None => client.request("session/new", Value::Null).await,
+        None => client.request("session/new", json!({"name": name})).await,
         Some(sid) => {
             client
-                .request("session/load", json!({"sessionId": sid}))
+                .request("session/load", json!({"sessionId": sid, "name": name}))
                 .await
         }
     };
-    wait_response(reader, open).await?;
-    Ok(())
+    let v = wait_response(reader, open).await?;
+    Ok(v.get("name").and_then(Value::as_str).map(String::from))
 }
 
 async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, String> {
@@ -175,6 +181,13 @@ async fn run_loop(
                 }
                 Cmd::Cancel => {
                     client.request("session/cancel", Value::Null).await;
+                }
+                Cmd::Rename(name) => {
+                    // Ack is noise (like steer): translate() only surfaces
+                    // prompt-id responses.
+                    client
+                        .request("session/rename", json!({"name": name}))
+                        .await;
                 }
                 Cmd::ReplyPermission {
                     req_id,
@@ -295,24 +308,102 @@ fn run_external_editor(text: &str) -> Option<String> {
     content.filter(|c| c.trim_end() != text.trim_end())
 }
 
-fn resolve_spec(args: &[String]) -> Result<Option<String>, i32> {
-    match args.first().map(String::as_str) {
-        None => Ok(None),
-        // The one-time migration hint: `tui` was a subcommand before the
-        // default flip, and would otherwise read as a session-id prefix.
-        Some("tui") => {
-            eprintln!("hotl: the TUI is now just `hotl` (the `tui` subcommand was removed)");
+#[derive(Debug)]
+pub(crate) struct TuiArgs {
+    pub spec: Option<String>,
+    pub name: Option<String>,
+}
+
+/// The console's argument surface: `[id-prefix]`, `-r/--resume [arg]`,
+/// `-n/--name <name>`. `hotl resume [arg]` arrives here rewritten to
+/// `--resume` by main.rs.
+fn parse_tui_args(args: &[String]) -> Result<TuiArgs, i32> {
+    let mut spec: Option<String> = None;
+    let mut resume_bare = false;
+    let mut name: Option<String> = None;
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            // The one-time migration hint: `tui` was a subcommand before the
+            // default flip, and would otherwise read as a session-id prefix.
+            "tui" => {
+                eprintln!("hotl: the TUI is now just `hotl` (the `tui` subcommand was removed)");
+                return Err(2);
+            }
+            "-r" | "--resume" => match it.peek() {
+                Some(v) if !v.starts_with('-') => {
+                    let arg = it.next().expect("peeked");
+                    spec = Some(resolve_session_arg(arg, &newest_first())?);
+                }
+                _ => resume_bare = true,
+            },
+            "-n" | "--name" => {
+                match it
+                    .next()
+                    .map(String::as_str)
+                    .and_then(hotl_types::normalize_session_name)
+                {
+                    Some(n) => name = Some(n),
+                    None => {
+                        eprintln!("hotl: -n/--name needs a value of 1–64 chars");
+                        return Err(2);
+                    }
+                }
+            }
+            flag if flag.starts_with('-') => {
+                eprintln!("hotl: unknown argument `{flag}` (try --help)");
+                return Err(2);
+            }
+            prefix => spec = Some(by_prefix(prefix)?),
+        }
+    }
+    if resume_bare && spec.is_none() {
+        spec = Some(pick_session()?);
+    }
+    Ok(TuiArgs { spec, name })
+}
+
+/// `-r <arg>` resolution: picker list number → unique id-prefix → unique
+/// exact name. Ambiguity errors; it never falls through past a hit.
+fn resolve_session_arg(
+    arg: &str,
+    sessions: &[(String, PathBuf, SystemTime)],
+) -> Result<String, i32> {
+    if let Ok(n) = arg.parse::<usize>() {
+        if (1..=sessions.len().min(20)).contains(&n) {
+            return Ok(sessions[n - 1].0.clone());
+        }
+    }
+    let by_id: Vec<_> = sessions
+        .iter()
+        .filter(|(id, ..)| id.starts_with(arg))
+        .collect();
+    match by_id.len() {
+        1 => return Ok(by_id[0].0.clone()),
+        0 => {}
+        n => {
+            eprintln!("hotl: `{arg}` is ambiguous ({n} sessions)");
+            return Err(2);
+        }
+    }
+    let by_name: Vec<_> = sessions
+        .iter()
+        .filter(|(_, path, _)| hotl_store::session_name(path).as_deref() == Some(arg))
+        .collect();
+    match by_name.len() {
+        1 => Ok(by_name[0].0.clone()),
+        0 => {
+            eprintln!("hotl: no session matches `{arg}`");
             Err(2)
         }
-        Some(flag) if flag.starts_with('-') && flag != "--resume" => {
-            eprintln!("hotl: unknown argument `{flag}` (try --help)");
+        n => {
+            let ids: Vec<&str> = by_name.iter().map(|(id, ..)| id.as_str()).collect();
+            eprintln!(
+                "hotl: {n} sessions are named `{arg}` — use the id: {}",
+                ids.join(", ")
+            );
             Err(2)
         }
-        Some("--resume") => match args.get(1) {
-            Some(p) => by_prefix(p).map(Some),
-            None => pick_session().map(Some),
-        },
-        Some(prefix) => by_prefix(prefix).map(Some),
     }
 }
 
@@ -349,8 +440,11 @@ fn pick_session() -> Result<String, i32> {
         return Err(2);
     }
     eprintln!("pick a session:");
-    for (i, (id, _, t)) in sessions.iter().enumerate().take(20) {
-        eprintln!("  {}) {id}  {}", i + 1, age(*t));
+    for (i, (id, path, t)) in sessions.iter().enumerate().take(20) {
+        match hotl_store::session_name(path) {
+            Some(name) => eprintln!("  {}) {id}  {name}  {}", i + 1, age(*t)),
+            None => eprintln!("  {}) {id}  {}", i + 1, age(*t)),
+        }
     }
     eprint!("> ");
     let mut line = String::new();
@@ -424,26 +518,112 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_spec;
+    use super::{parse_tui_args, resolve_session_arg};
+    use std::time::SystemTime;
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Synthetic newest-first session list; only the picked id matters.
+    fn sessions(ids: &[&str]) -> Vec<(String, std::path::PathBuf, SystemTime)> {
+        ids.iter()
+            .map(|id| {
+                (
+                    id.to_string(),
+                    std::path::PathBuf::from(format!("/nonexistent/{id}.jsonl")),
+                    SystemTime::now(),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn bare_args_open_a_new_session() {
-        assert_eq!(resolve_spec(&v(&[])), Ok(None));
+    fn bare_args_open_a_new_unnamed_session() {
+        let args = parse_tui_args(&v(&[])).unwrap();
+        assert_eq!(args.spec, None);
+        assert_eq!(args.name, None);
     }
 
     #[test]
     fn tui_literal_gets_the_migration_hint() {
         // Pre-flip muscle memory: `hotl tui` must not read as an id prefix.
-        assert_eq!(resolve_spec(&v(&["tui"])), Err(2));
+        assert_eq!(parse_tui_args(&v(&["tui"])).unwrap_err(), 2);
     }
 
     #[test]
     fn unknown_flags_are_rejected_before_session_lookup() {
-        assert_eq!(resolve_spec(&v(&["--json"])), Err(2));
-        assert_eq!(resolve_spec(&v(&["-x"])), Err(2));
+        assert_eq!(parse_tui_args(&v(&["--json"])).unwrap_err(), 2);
+        assert_eq!(parse_tui_args(&v(&["-x"])).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn name_flag_is_normalized_and_validated() {
+        let args = parse_tui_args(&v(&["-n", "  fix-auth  "])).unwrap();
+        assert_eq!(args.name.as_deref(), Some("fix-auth"));
+        assert_eq!(parse_tui_args(&v(&["-n"])).unwrap_err(), 2);
+        assert_eq!(parse_tui_args(&v(&["--name", "   "])).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn list_number_beats_prefix() {
+        // "2" would also be a valid id-prefix here; the picker number wins.
+        let s = sessions(&["01AAA", "2ZZZZ", "01BBB"]);
+        assert_eq!(resolve_session_arg("2", &s), Ok("2ZZZZ".to_string()));
+    }
+
+    #[test]
+    fn out_of_range_number_falls_through_to_prefix() {
+        let s = sessions(&["01AAA", "01BBB"]);
+        assert_eq!(resolve_session_arg("01A", &s), Ok("01AAA".to_string()));
+        assert_eq!(resolve_session_arg("9", &s).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn ambiguous_prefix_is_an_error() {
+        let s = sessions(&["01AAA", "01ABB"]);
+        assert_eq!(resolve_session_arg("01A", &s).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn unmatched_arg_reports_no_session() {
+        let s = sessions(&["01AAA"]);
+        assert_eq!(resolve_session_arg("zzz", &s).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn name_resolution_reads_the_log() {
+        // Real logs on disk so session_name() finds the rename entry.
+        let dir = tempfile::tempdir().unwrap();
+        let mut named =
+            hotl_store::SessionLog::create(dir.path(), "m", None, hotl_store::Masker::empty(), 1)
+                .unwrap();
+        named
+            .append(
+                &hotl_types::EntryPayload::Rename {
+                    name: "fix-auth".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let plain =
+            hotl_store::SessionLog::create(dir.path(), "m", None, hotl_store::Masker::empty(), 3)
+                .unwrap();
+        let s = vec![
+            (
+                named.session_id.clone(),
+                named.path().to_path_buf(),
+                SystemTime::now(),
+            ),
+            (
+                plain.session_id.clone(),
+                plain.path().to_path_buf(),
+                SystemTime::now(),
+            ),
+        ];
+        assert_eq!(
+            resolve_session_arg("fix-auth", &s),
+            Ok(named.session_id.clone())
+        );
     }
 }

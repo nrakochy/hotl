@@ -1,7 +1,7 @@
 //! hotl — one binary, three capabilities (watch · orchestrate · execute).
 //!
 //! Subcommands:
-//!   (none)        the console TUI (execute); also `hotl <id-prefix>` / `hotl --resume`
+//!   (none)        the console TUI (execute); also `hotl <id-prefix>` / `hotl -r [n|id|name]`
 //!   -p "prompt"   headless one-shot; asks default-deny; --json for events
 //!   watch         the tmux dashboard (the pre-merge `hotl`)
 //!   fleet         reserved (orchestrate, M4+)
@@ -122,7 +122,8 @@ fn is_headless(args: &[String]) -> bool {
 fn print_help() {
     println!(
         "hotl — human on the loop\n\n\
-         USAGE:\n  hotl [id-prefix]     console TUI (execute); --resume picks a session\n  \
+         USAGE:\n  hotl [id-prefix]     console TUI (execute); -n/--name names the session\n  \
+         hotl -r [n|id|name]  resume: bare lists sessions; arg = list number, id-prefix, or name\n  \
          hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
@@ -131,7 +132,7 @@ fn print_help() {
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
-         hotl resume [id]     continue an earlier session in the TUI (bare: pick from a list)\n  \
+         hotl resume [arg]    same as -r\n  \
          hotl undo            restore files to before the agent's last change\n  \
          hotl fleet           reserved (orchestrate)\n\n\
          CONFIG: ~/.config/hotl/config.toml (one file: [provider] [context] [behavior]\n  \
