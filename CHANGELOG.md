@@ -8,6 +8,12 @@ semver promise of their own.
 
 ### Added
 
+- Skill marketplaces: register extra skill sources with
+  `hotl skills add <name> <git-url|path>` (plus `list` / `update` /
+  `remove`) or a `[skills.marketplaces]` map in config.toml. Git sources
+  are cloned under `~/.config/hotl/marketplaces/<name>` and touch the
+  network only on explicit `add`/`update`. Skills resolve bare or as
+  `<marketplace>:<skill>` when a name collides.
 - Named sessions: start one with `-n/--name` (TUI, `hotl bg`, headless `-p`),
   rename mid-session with `/rename <name>` — the TUI's first slash command.
   The name shows as a badge above the input, in the terminal tab title, and

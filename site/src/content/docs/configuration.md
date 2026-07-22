@@ -99,13 +99,33 @@ accent = "#88c0d0"         # optional per-slot #rrggbb overrides: active blocked
 `skill` tool reads them in place: frontmatter descriptions in the roster, the
 body on demand prefixed with its base directory so `references/` and
 `scripts/` paths resolve (scripts still run through the normal bash gate and
-sandbox). Bare names prefer hotl's own skills, then your Claude skills, then
-plugins; a shadowed plugin skill stays reachable as `plugin:skill`. Opt out
-with:
+sandbox). Bare names prefer hotl's own skills, then your marketplaces, then
+your Claude skills, then plugins; a plugin skill is always also reachable as
+`plugin:skill`. Opt out with:
 
     [skills]
     claude = false
 | `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
+
+### Skill marketplaces
+
+Register extra skill sources — any git repo or local directory containing
+`SKILL.md` skills:
+
+```toml
+[skills.marketplaces]
+acme = "https://github.com/acme/skills.git"   # managed checkout
+team = "~/work/team-skills"                   # local, read in place
+```
+
+Git sources are cloned by `hotl skills add acme <url>` (or `hotl skills
+update` for an entry added by hand) into `~/.config/hotl/marketplaces/<name>`
+and refreshed only by `hotl skills update` — never at startup. `hotl skills`
+lists every discovered skill with its source; `hotl skills remove <name>`
+unregisters one. Skills are discovered up to four directory levels below
+the root, so flat (`<skill>/SKILL.md`) and plugin-repo
+(`plugins/<p>/skills/<s>/SKILL.md`) layouts both work. A skill whose bare
+name is taken stays addressable as `<marketplace>:<skill>`.
 
 ### Environment variables
 
