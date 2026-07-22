@@ -36,6 +36,7 @@ crossterm = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+toml_edit = "0.22"
 # Harness deps (execute capability). Why: tokio is the one async runtime the
 # ecosystem is shaped around (rust-specs); reqwest/rustls avoids openssl.
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "io-util", "io-std", "signal", "time", "fs", "sync"] }
