@@ -447,13 +447,18 @@ fn build_registry(
         registry.register(Box::new(hotl_mcp::McpTool::new(servers, trust)));
     }
     // Claude Code skills (SKILL.md roots) load alongside hotl's own unless
-    // opted out via [skills] claude = false.
+    // opted out via [skills] claude = false; [skills.marketplaces] roots
+    // are hotl's own and load regardless.
     let include_claude = cfg.skills.claude.unwrap_or(true);
-    if hotl_tools::skills::SkillTool::has_skills(config_dir, include_claude, &[]) {
+    let (marketplaces, warnings) = cfg.skills.marketplace_roots(config_dir);
+    for w in warnings {
+        eprintln!("hotl: {w}");
+    }
+    if hotl_tools::skills::SkillTool::has_skills(config_dir, include_claude, &marketplaces) {
         registry.register(Box::new(hotl_tools::skills::SkillTool::new(
             config_dir,
             include_claude,
-            &[],
+            &marketplaces,
         )));
     }
     if let Some(builder) = spawn_builder {

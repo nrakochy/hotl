@@ -42,6 +42,61 @@ pub struct SkillsCfg {
     /// `false` stops reading Claude Code skill roots (`~/.claude/skills`,
     /// the plugin cache). Default: read them when present.
     pub claude: Option<bool>,
+    /// `[skills.marketplaces]` — extra skill sources: name → local path
+    /// (read in place) or git URL (managed checkout; `hotl skills add`).
+    #[serde(default)]
+    pub marketplaces: std::collections::BTreeMap<String, String>,
+}
+
+impl SkillsCfg {
+    /// Resolve `[skills.marketplaces]` to discovery roots: a local path is
+    /// read in place (`~` expanded), a git URL maps to its managed checkout
+    /// under `<config_dir>/marketplaces/<name>`. An invalid name is skipped
+    /// with a warning — fail-closed, a bad entry never loads skills.
+    pub fn marketplace_roots(
+        &self,
+        config_dir: &Path,
+    ) -> (Vec<(String, std::path::PathBuf)>, Vec<String>) {
+        let mut roots = Vec::new();
+        let mut warnings = Vec::new();
+        for (name, source) in &self.marketplaces {
+            let Some(name) = hotl_tools::skills::normalize_marketplace_name(name) else {
+                warnings.push(format!(
+                    "[skills.marketplaces] `{name}` is not a valid marketplace name \
+                     (letters, digits, `.`/`_`/`-`, alphanumeric first char, ≤ 64 chars) \
+                     — entry skipped"
+                ));
+                continue;
+            };
+            let dir = if is_git_url(source) {
+                config_dir.join("marketplaces").join(&name)
+            } else {
+                expand_home(source)
+            };
+            roots.push((name, dir));
+        }
+        (roots, warnings)
+    }
+}
+
+/// A git URL as opposed to a local path: a fetch scheme, an scp-style
+/// `git@` prefix, or a trailing `.git`.
+pub fn is_git_url(source: &str) -> bool {
+    source.starts_with("http://")
+        || source.starts_with("https://")
+        || source.starts_with("git@")
+        || source.starts_with("ssh://")
+        || source.ends_with(".git")
+}
+
+/// Expand a leading `~/` against `$HOME`.
+fn expand_home(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -336,6 +391,53 @@ mod tests {
         let cfg = cfg_with("[behavior]\nvim_mode = false\n");
         assert_eq!(cfg.behavior.vim_mode, Some(false));
         assert_eq!(cfg_with("").behavior.vim_mode, None);
+    }
+
+    #[test]
+    fn skills_marketplaces_parse_and_resolve() {
+        let cfg = cfg_with(
+            "[skills.marketplaces]\n\
+             acme = \"https://github.com/acme/skills.git\"\n\
+             team = \"/abs/team-skills\"\n\
+             \"bad:name\" = \"/x\"\n",
+        );
+        let dir = std::path::Path::new("/cfg");
+        let (roots, warnings) = cfg.skills.marketplace_roots(dir);
+        assert_eq!(
+            roots,
+            vec![
+                ("acme".to_string(), dir.join("marketplaces/acme")),
+                (
+                    "team".to_string(),
+                    std::path::PathBuf::from("/abs/team-skills")
+                ),
+            ]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("bad:name"), "{warnings:?}");
+
+        // `~/` expands against HOME; absent section resolves empty.
+        let cfg = cfg_with("[skills.marketplaces]\nhome = \"~/team-skills\"\n");
+        let (roots, _) = cfg.skills.marketplace_roots(dir);
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(roots, vec![("home".to_string(), home.join("team-skills"))]);
+        assert!(cfg_with("").skills.marketplace_roots(dir).0.is_empty());
+    }
+
+    #[test]
+    fn git_url_detection() {
+        for url in [
+            "https://github.com/a/b.git",
+            "http://host/repo",
+            "git@github.com:a/b.git",
+            "ssh://host/repo",
+            "/local/path/origin.git",
+        ] {
+            assert!(is_git_url(url), "{url}");
+        }
+        for path in ["~/skills", "/abs/dir", "relative/dir"] {
+            assert!(!is_git_url(path), "{path}");
+        }
     }
 
     #[test]

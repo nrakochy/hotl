@@ -45,6 +45,9 @@ mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.
 [skills]
 # claude = true   # false stops reading Claude Code skills (~/.claude/skills
                   # and the plugin cache) alongside the hotl skills dir.
+# [skills.marketplaces]       # extra skill sources: name = git URL or local path
+# acme = \"https://github.com/acme/skills.git\"   # managed: hotl skills add/update
+# team = \"~/work/team-skills\"                   # local path: read in place
 
 [network]
 # Egress for bash commands: \"open\" (default), \"off\" (loopback + unix sockets
