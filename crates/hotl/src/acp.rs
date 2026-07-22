@@ -141,10 +141,7 @@ async fn handle_request(
         method @ ("session/new" | "session/load") => {
             let name = match msg.pointer("/params/name") {
                 None | Some(Value::Null) => None,
-                Some(v) => match v
-                    .as_str()
-                    .and_then(hotl_types::normalize_session_name)
-                {
+                Some(v) => match v.as_str().and_then(hotl_types::normalize_session_name) {
                     Some(n) => Some(n),
                     None => {
                         return reply_err(
