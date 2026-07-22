@@ -67,6 +67,41 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 
 		[Shell integration →](./shell/)
 	</Card>
+	<Card title="It's Rust, and it goes brrrr" icon="seti:rust">
+		One static binary — no Node, no Python, no runtime to install — and an
+		async policy strict enough to keep it that way:
+
+		- **Rule 0: async is for waiting, threads are for working.** The tokio
+		  runtime only ever hosts tasks blocked on I/O or doing sub-millisecond
+		  coordination
+		- every entry point builds a `current_thread` runtime — nothing pays for
+		  thread-pool spinup on the cold-start path that `hotl -p` and the zsh
+		  plugin live on
+		- shadow-git snapshots and other hot work leave the runtime via
+		  `spawn_blocking` rather than stalling the event loop
+		- four `unsafe` blocks in the entire workspace, every one a plain libc
+		  syscall for the sandbox or a process-group kill
+
+		[Architecture →](./overview/)
+	</Card>
+	<Card title="Concurrency you can reason about" icon="rocket">
+		One actor per session is the sole committer, so there is exactly one
+		writer and no lock order to get wrong. Around that spine:
+
+		- tool batches chunk themselves — contiguous runs of parallel-safe calls
+		  (reads, isolated sub-agents) overlap under one `join_all`; anything
+		  that mutates runs alone, in source order, bracketed by undo snapshots
+		- results come back paired to their call either way, so parallelism
+		  never reorders the transcript
+		- approvals stay deliberately serial: an ask is a human moment, not a
+		  race
+		- `Ctrl-c` never queues — it trips a cancellation token out-of-band, so
+		  interrupts can't wedge behind a full mailbox
+		- compaction is speculative: the digest fires as a background task at
+		  ~60% context and is usually already done when the fold lands
+
+		[Overview →](./overview/)
+	</Card>
 	<Card title="Any model, one env var" icon="setting">
 		`HOTL_MODEL=provider/model` — Anthropic's Messages API, or any
 		OpenAI-compatible endpoint: OpenAI, Groq, a local Ollama server, or a
@@ -92,11 +127,28 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 
 		[Configuration →](./configuration/)
 	</Card>
-	<Card title="A floor that never turns off" icon="approve-check">
-		Every mutating tool call passes a permission gate, and `bash` runs under a
-		kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines writes
-		to the working directory. Writes to git hooks, shell rc, Makefiles, and
-		agent-instruction files always stop and ask — in every mode.
+	<Card title="Security floor that never turns off" icon="approve-check">
+		Every mutating tool call passes one fixed gate, and what sits under it has
+		no off switch — in any mode:
+
+		- `bash` runs confined by the kernel: Seatbelt on macOS, Landlock on
+		  Linux ≥ 5.13 including WSL2. Writes land in the working directory and
+		  temp, nowhere else
+		- where the floor can't be enforced, hotl degrades **fail-closed** —
+		  every exec is individually human-gated with an `UNSANDBOXED` banner and
+		  bash allow-rules stop applying
+		- protected paths (git hooks, shell rc, Makefiles, `.ssh/`, credential
+		  stores, agent-instruction files) are checked *before* allow rules and
+		  never auto-approve
+		- optional egress restriction is kernel-backed, not proxy-backed: a
+		  client that ignores the proxy hits a loopback-only wall
+		- secrets are masked at log ingestion, and secret-bearing files never
+		  enter the undo snapshot store at all
+		- *forthcoming:* third-party plugins as WASM components under a
+		  wasmtime sandbox (epoch deadlines + fuel) — that lane doesn't ship
+		  until its sandbox and trust screens do
+
+		Stated honestly: this is write-confinement, not exfiltration prevention.
 		[Permissions & sandbox →](./permissions-and-sandbox/)
 	</Card>
 </CardGrid>
