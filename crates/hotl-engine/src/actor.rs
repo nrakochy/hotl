@@ -66,7 +66,7 @@ impl SharedDeps {
 pub(crate) async fn run(
     mut deps: SessionDeps,
     mut cmd_rx: mpsc::Receiver<SessionCmd>,
-    cmd_tx: mpsc::Sender<SessionCmd>,
+    cmd_tx: mpsc::WeakSender<SessionCmd>,
     events: mpsc::Sender<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
 ) {
@@ -167,7 +167,7 @@ struct TurnFinishedCtx<'a> {
     running: &'a mut bool,
     carry_usage: &'a mut TokenUsage,
     compact_streak: &'a mut u32,
-    cmd_tx: &'a mpsc::Sender<SessionCmd>,
+    cmd_tx: &'a mpsc::WeakSender<SessionCmd>,
     events: &'a mpsc::Sender<EngineEvent>,
     current_turn: &'a Arc<Mutex<CancellationToken>>,
 }
@@ -222,20 +222,36 @@ async fn try_compact(
     items: &mut Arc<Vec<Item>>,
     compact_streak: &mut u32,
     spec: Option<crate::SpecDigest>,
-    cmd_tx: &mpsc::Sender<SessionCmd>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> Option<Outcome> {
     *compact_streak += 1;
+    // The token interrupt() cancels right now belongs to the turn that just
+    // ended with `Compact`. Honor it through the whole compaction window —
+    // race the inline summarize against it, and hand the *same* token to the
+    // continuation — so an interrupt anywhere in the window ends the logical
+    // turn instead of being silently swallowed.
+    let cancel = current_turn
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
     let compacted = if *compact_streak > MAX_COMPACT_STREAK {
         Err("context window exhausted — compaction can no longer make room".into())
     } else {
-        compact(shared, log, items, spec).await
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Some(Outcome::Cancelled),
+            compacted = compact(shared, log, items, spec) => compacted,
+        }
     };
     match compacted {
         Ok(degraded) => {
             let _ = events.send(EngineEvent::Compacted { degraded }).await;
-            spawn_turn(shared, cmd_tx, events, current_turn);
+            if cancel.is_cancelled() {
+                return Some(Outcome::Cancelled);
+            }
+            respawn_turn(shared, cmd_tx, events, cancel);
             None // still running: same logical turn continues
         }
         Err(message) => Some(Outcome::Error { message }),
@@ -252,7 +268,7 @@ async fn end_turn(
     queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
     outcome: Outcome,
     usage: TokenUsage,
-    cmd_tx: &mpsc::Sender<SessionCmd>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
@@ -453,7 +469,7 @@ async fn admit_prompt(
     running: bool,
     text: String,
     synthetic: Option<SyntheticReason>,
-    cmd_tx: &mpsc::Sender<SessionCmd>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
@@ -482,7 +498,7 @@ async fn start_turn(
     items: &mut Arc<Vec<Item>>,
     text: String,
     synthetic: Option<SyntheticReason>,
-    cmd_tx: &mpsc::Sender<SessionCmd>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
@@ -507,11 +523,11 @@ async fn start_turn(
     true
 }
 
-/// Spawn a turn task against the current projection. Continuation respawns
-/// after a compaction use this directly — no new user item is appended.
+/// Spawn a fresh turn task against the current projection, installing a new
+/// interrupt token for it.
 fn spawn_turn(
     shared: &Arc<SharedDeps>,
-    cmd_tx: &mpsc::Sender<SessionCmd>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) {
@@ -519,10 +535,22 @@ fn spawn_turn(
     *current_turn
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
-    tokio::spawn(turn::run(
-        shared.clone(),
-        cmd_tx.clone(),
-        events.clone(),
-        token,
-    ));
+    respawn_turn(shared, cmd_tx, events, token);
+}
+
+/// Spawn a turn task under an existing token. Compaction respawns use this
+/// directly (no new user item, same logical turn — the interrupt token
+/// carries over so a cancel during the fold still lands).
+fn respawn_turn(
+    shared: &Arc<SharedDeps>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
+    events: &mpsc::Sender<EngineEvent>,
+    token: CancellationToken,
+) {
+    // The turn task holds a strong sender for its lifetime; a failed upgrade
+    // means the handle is gone and there is nobody left to run for.
+    let Some(cmd_tx) = cmd_tx.upgrade() else {
+        return;
+    };
+    tokio::spawn(turn::run(shared.clone(), cmd_tx, events.clone(), token));
 }

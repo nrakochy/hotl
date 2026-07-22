@@ -728,7 +728,16 @@ impl Turn {
         let reply = if self.events.send(event).await.is_err() {
             AskReply::Deny { message: None }
         } else {
-            rx.await.unwrap_or(AskReply::Deny { message: None })
+            // Race the human's reply against the interrupt token: an ask must
+            // never pin a turn the user has already cancelled (the batch loop
+            // sees the cancellation at the next chunk boundary and ends).
+            tokio::select! {
+                biased;
+                _ = self.cancel.cancelled() => AskReply::Deny {
+                    message: Some("the user interrupted the turn".into()),
+                },
+                reply = rx => reply.unwrap_or(AskReply::Deny { message: None }),
+            }
         };
         let allowed = matches!(
             reply,

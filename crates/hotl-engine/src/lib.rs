@@ -300,10 +300,13 @@ pub fn spawn_session(deps: SessionDeps) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
     let (event_tx, event_rx) = mpsc::channel(256);
     let current_turn = Arc::new(Mutex::new(CancellationToken::new()));
+    // The actor gets only a weak sender: strong senders are the handle and
+    // any in-flight turn task, so dropping the handle lets the command
+    // channel close and the actor task exit instead of leaking.
     tokio::spawn(actor::run(
         deps,
         cmd_rx,
-        cmd_tx.clone(),
+        cmd_tx.downgrade(),
         event_tx,
         current_turn.clone(),
     ));
