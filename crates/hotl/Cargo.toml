@@ -23,24 +23,24 @@ path = "src/main.rs"
 security-enforced = ["hotl-tools/security-enforced"]
 
 [dependencies]
-hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.2.0", features = ["ratatui"] }
-watch_types = { package = "hotl-watch-types", path = "../watch-types", version = "0.2.0" }
-watch_tmux = { package = "hotl-watch-tmux", path = "../watch-tmux", version = "0.2.0" }
-watch_listener = { package = "hotl-watch-listener", path = "../watch-listener", version = "0.2.0" }
-watch_tui = { package = "hotl-watch-tui", path = "../watch-tui", version = "0.2.0" }
+hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.2.1", features = ["ratatui"] }
+watch_types = { package = "hotl-watch-types", path = "../watch-types", version = "0.2.1" }
+watch_tmux = { package = "hotl-watch-tmux", path = "../watch-tmux", version = "0.2.1" }
+watch_listener = { package = "hotl-watch-listener", path = "../watch-listener", version = "0.2.1" }
+watch_tui = { package = "hotl-watch-tui", path = "../watch-tui", version = "0.2.1" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
-hotl-types = { path = "../hotl-types", version = "0.2.0" }
-hotl-platform = { path = "../hotl-platform", version = "0.2.0" }
-hotl-provider = { path = "../hotl-provider", version = "0.2.0" }
-hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.2.0" }
-hotl-provider-openai = { path = "../hotl-provider-openai", version = "0.2.0" }
-hotl-tools = { path = "../hotl-tools", version = "0.2.0" }
-hotl-mcp = { path = "../hotl-mcp", version = "0.2.0" }
-hotl-store = { path = "../hotl-store", version = "0.2.0" }
-hotl-context = { path = "../hotl-context", version = "0.2.0" }
-hotl-engine = { path = "../hotl-engine", version = "0.2.0" }
-hotl-tui = { path = "../hotl-tui", version = "0.2.0" }
+hotl-types = { path = "../hotl-types", version = "0.2.1" }
+hotl-platform = { path = "../hotl-platform", version = "0.2.1" }
+hotl-provider = { path = "../hotl-provider", version = "0.2.1" }
+hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.2.1" }
+hotl-provider-openai = { path = "../hotl-provider-openai", version = "0.2.1" }
+hotl-tools = { path = "../hotl-tools", version = "0.2.1" }
+hotl-mcp = { path = "../hotl-mcp", version = "0.2.1" }
+hotl-store = { path = "../hotl-store", version = "0.2.1" }
+hotl-context = { path = "../hotl-context", version = "0.2.1" }
+hotl-engine = { path = "../hotl-engine", version = "0.2.1" }
+hotl-tui = { path = "../hotl-tui", version = "0.2.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }
