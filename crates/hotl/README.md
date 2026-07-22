@@ -148,4 +148,9 @@ Full reference: [configuration](https://nrakochy.github.io/hotl/configuration/).
 
 ## License
 
-MIT OR Apache-2.0
+hotl is dual-licensed:
+
+1. **Open source:** GNU Affero General Public License v3.0 or later
+   (AGPL-3.0-or-later).
+2. **Commercial:** commercial licenses are available for organizations that
+   cannot comply with AGPL. Contact nick.rakochy@gmail.com for details.
