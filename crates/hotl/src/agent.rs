@@ -1280,12 +1280,43 @@ fn resolve_openai(
 }
 
 /// A cleartext base URL pointing somewhere other than the local machine.
+///
+/// Trims and lowercases first, so this is the single normalization point
+/// shared by both provider paths. Neither `v1_base` nor the OpenAI provider
+/// trims whitespace, and neither cares about scheme case — so a value with a
+/// leading space (realistic from a `.env` or a systemd `EnvironmentFile`) or
+/// an uppercase `HTTP://` used to skip the warning while the request still
+/// went out in the clear.
+///
+/// Fails closed: anything not recognizably `https://` (always exempt) or
+/// `http://` is still handed straight to the HTTP client, so a value we
+/// cannot classify warns rather than silently passing as safe.
 fn cleartext_nonloopback(base: &str) -> bool {
-    let Some(rest) = base.strip_prefix("http://") else {
+    let base = base.trim().to_ascii_lowercase();
+    if base.is_empty() || base.starts_with("https://") {
         return false;
+    }
+    let Some(authority) = base.strip_prefix("http://") else {
+        return true;
     };
-    let host = rest.split(['/', ':']).next().unwrap_or("");
+    let host = host_of(authority);
     !matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") && !host.is_empty()
+}
+
+/// The host out of a URL authority, keeping a bracketed IPv6 literal intact.
+///
+/// Splitting on `:` alone truncates `[::1]:3456` to `[`, which is why the
+/// IPv6 loopback arms above never matched and a local endpoint drew a
+/// network-exposure warning.
+fn host_of(authority: &str) -> &str {
+    let authority = authority.split('/').next().unwrap_or("");
+    if authority.starts_with('[') {
+        return match authority.find(']') {
+            Some(close) => &authority[..=close],
+            None => authority,
+        };
+    }
+    authority.split(':').next().unwrap_or("")
 }
 
 pub(crate) fn config_dir() -> PathBuf {
@@ -1495,6 +1526,46 @@ mod tests {
         ]);
         // Selection must succeed; the env value is what the provider gets.
         assert!(select_provider(&cfg, &secrets).is_ok());
+    }
+
+    /// The predicate behind every cleartext warning. `https://` is always
+    /// exempt; loopback is exempt because nothing leaves the machine.
+    #[test]
+    fn cleartext_exempts_https_and_loopback() {
+        for safe in [
+            "https://gateway.example",
+            "https://gateway.example/v1",
+            "HTTPS://gateway.example",
+            "http://localhost:3456",
+            "http://127.0.0.1:3456/v1",
+            "http://[::1]:3456",
+        ] {
+            assert!(!cleartext_nonloopback(safe), "should not warn: {safe}");
+        }
+    }
+
+    /// Anything hotl cannot classify still gets handed to the HTTP client,
+    /// so "can't tell" must warn rather than pass as safe. Untrimmed input
+    /// is realistic from a `.env` file or a systemd `EnvironmentFile`, and
+    /// an uppercase scheme is a URL the client accepts and we did not.
+    #[test]
+    fn cleartext_fails_closed_on_unclassifiable_input() {
+        for risky in [
+            "http://gateway.example",
+            " http://gateway.example",
+            "\thttp://gateway.example\n",
+            "HTTP://gateway.example",
+            "gateway.example:8080",
+            "ftp://gateway.example",
+        ] {
+            assert!(cleartext_nonloopback(risky), "should warn: {risky}");
+        }
+    }
+
+    /// Trimming must not turn a loopback URL into a warning.
+    #[test]
+    fn cleartext_trims_before_classifying_loopback() {
+        assert!(!cleartext_nonloopback("  http://127.0.0.1:3456  "));
     }
 
     /// api_key mode must keep working exactly as before, including the
