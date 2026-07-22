@@ -143,7 +143,7 @@ async fn handle_request(
                 None | Some(Value::Null) => None,
                 Some(v) => match v
                     .as_str()
-                    .and_then(|s| hotl_types::normalize_session_name(s))
+                    .and_then(hotl_types::normalize_session_name)
                 {
                     Some(n) => Some(n),
                     None => {
@@ -234,7 +234,7 @@ async fn handle_request(
             let Some(name) = msg
                 .pointer("/params/name")
                 .and_then(Value::as_str)
-                .and_then(|s| hotl_types::normalize_session_name(s))
+                .and_then(hotl_types::normalize_session_name)
             else {
                 return reply_err(
                     writer,
