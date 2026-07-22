@@ -151,20 +151,23 @@ fn list_skill_dirs(dir: &Path) -> Vec<SkillEntry> {
         return Vec::new();
     };
     read.flatten()
-        .filter_map(|e| {
-            let base_dir = e.path();
-            let path = base_dir.join("SKILL.md");
-            let text = std::fs::read_to_string(&path).ok()?;
-            let dir_name = base_dir.file_name()?.to_str()?.to_string();
-            let (fm_name, description) = parse_frontmatter(&text);
-            Some(SkillEntry {
-                name: fm_name.unwrap_or(dir_name),
-                description,
-                path,
-                base_dir,
-            })
-        })
+        .filter_map(|e| read_skill_dir(&e.path()))
         .collect()
+}
+
+/// One `<dir>/SKILL.md` skill: frontmatter name, falling back to the
+/// directory name.
+fn read_skill_dir(base_dir: &Path) -> Option<SkillEntry> {
+    let path = base_dir.join("SKILL.md");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let dir_name = base_dir.file_name()?.to_str()?.to_string();
+    let (fm_name, description) = parse_frontmatter(&text);
+    Some(SkillEntry {
+        name: fm_name.unwrap_or(dir_name),
+        description,
+        path,
+        base_dir: base_dir.to_path_buf(),
+    })
 }
 
 /// Root 3: `<marketplace>/<plugin>/<version>/skills/<name>/SKILL.md`,
@@ -237,6 +240,24 @@ fn first_line(text: &str) -> String {
         .find(|l| !l.trim().is_empty())
         .map(|l| l.trim_start_matches(['#', ' ']).to_string())
         .unwrap_or_default()
+}
+
+/// A marketplace name: trimmed, non-empty, ≤ 64 chars, chars in
+/// `[A-Za-z0-9._-]` with an alphanumeric first char. The allowlist bans
+/// the path/qualifier metacharacters (`/ \ .. :`) by construction, so a
+/// validated name is safe as a directory name and a `name:` qualifier.
+pub fn normalize_marketplace_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    let ok_first = name
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric());
+    (ok_first
+        && name.chars().count() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+    .then(|| name.to_string())
 }
 
 /// Char-boundary-safe truncation for roster descriptions.
@@ -446,6 +467,27 @@ mod tests {
         let tool = SkillTool::with_roots(&flat, &user, &cache, false);
         assert!(!tool.description().contains("go-service"));
         assert!(tool.description().contains("`deploy`"));
+    }
+
+    #[test]
+    fn marketplace_names_validate() {
+        assert_eq!(normalize_marketplace_name("  acme  "), Some("acme".into()));
+        assert_eq!(
+            normalize_marketplace_name("Acme-2.plugins_x"),
+            Some("Acme-2.plugins_x".into())
+        );
+        assert_eq!(normalize_marketplace_name(""), None);
+        assert_eq!(normalize_marketplace_name("   "), None);
+        assert_eq!(normalize_marketplace_name("a/b"), None);
+        assert_eq!(normalize_marketplace_name("a:b"), None);
+        assert_eq!(normalize_marketplace_name("a b"), None);
+        assert_eq!(normalize_marketplace_name(".hidden"), None);
+        assert_eq!(normalize_marketplace_name(".."), None);
+        assert_eq!(normalize_marketplace_name(&"x".repeat(65)), None);
+        assert_eq!(
+            normalize_marketplace_name(&"x".repeat(64)),
+            Some("x".repeat(64))
+        );
     }
 
     #[test]
