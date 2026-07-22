@@ -15,6 +15,9 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 use tokio::sync::oneshot;
 
 const REQUEST_TIMEOUT_SECS: u64 = 30;
+/// `tools/call` runs real work (builds, migrations, browser automation) and
+/// gets a far longer leash than the protocol chatter above.
+const TOOL_CALL_TIMEOUT_SECS: u64 = 600;
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Value>>>;
@@ -92,6 +95,16 @@ impl Client {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT_SECS)
+            .await
+    }
+
+    async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_secs: u64,
+    ) -> Result<Value, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -106,10 +119,23 @@ impl Client {
         };
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
-        let reply = tokio::time::timeout(std::time::Duration::from_secs(REQUEST_TIMEOUT_SECS), rx)
+        let reply = match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx)
             .await
-            .map_err(|_| format!("`{method}` timed out after {REQUEST_TIMEOUT_SECS}s"))?
-            .map_err(|_| "server disconnected".to_string())?;
+        {
+            Ok(reply) => reply.map_err(|_| "server disconnected".to_string())?,
+            Err(_) => {
+                // Tell the server to stop the work — without this a timed-out
+                // call keeps running server-side while the model, told it
+                // failed, retries it into a duplicate.
+                let _ = self
+                    .send(&json!({
+                        "jsonrpc": "2.0", "method": "notifications/cancelled",
+                        "params": {"requestId": id, "reason": format!("timed out after {timeout_secs}s")},
+                    }))
+                    .await;
+                return Err(format!("`{method}` timed out after {timeout_secs}s"));
+            }
+        };
         // A reply means the reader already removed the entry.
         guard.disarm();
         if let Some(err) = reply.get("error") {
@@ -166,7 +192,11 @@ impl Client {
     /// Returns (joined text content, is_error).
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<(String, bool), String> {
         let result = self
-            .request("tools/call", json!({"name": name, "arguments": arguments}))
+            .request_with_timeout(
+                "tools/call",
+                json!({"name": name, "arguments": arguments}),
+                TOOL_CALL_TIMEOUT_SECS,
+            )
             .await?;
         let is_error = result
             .get("isError")
