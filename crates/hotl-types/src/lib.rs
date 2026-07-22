@@ -213,12 +213,24 @@ pub enum EntryPayload {
         id: String,
         allowed: bool,
     },
+    /// Sets/overwrites the session's display name. Log-only — not a
+    /// projection item (like `PendingAsk`); the last one wins on replay.
+    Rename {
+        name: String,
+    },
     #[serde(other)]
     Unknown,
 }
 
 pub fn new_ulid() -> String {
     ulid::Ulid::new().to_string()
+}
+
+/// A session display name: trimmed, non-empty, at most 64 chars.
+/// The one validator every entry point (CLI, ACP, TUI) funnels through.
+pub fn normalize_session_name(raw: &str) -> Option<String> {
+    let name = raw.trim();
+    (!name.is_empty() && name.chars().count() <= 64).then(|| name.to_string())
 }
 
 #[cfg(test)]
@@ -313,5 +325,28 @@ mod tests {
         let uses = assistant_tool_uses(&blocks);
         assert_eq!(uses.len(), 1);
         assert_eq!(uses[0].name, "read");
+    }
+
+    #[test]
+    fn rename_entry_roundtrips_with_snake_case_kind() {
+        let json = roundtrip(&EntryPayload::Rename {
+            name: "fix-auth".into(),
+        });
+        assert!(json.contains("\"kind\":\"rename\""), "wire kind: {json}");
+        assert!(json.contains("\"name\":\"fix-auth\""), "wire name: {json}");
+    }
+
+    #[test]
+    fn normalize_session_name_trims_and_bounds() {
+        assert_eq!(
+            normalize_session_name("  fix auth  "),
+            Some("fix auth".into())
+        );
+        assert_eq!(normalize_session_name("   "), None);
+        assert_eq!(normalize_session_name(""), None);
+        let long = "x".repeat(65);
+        assert_eq!(normalize_session_name(&long), None);
+        let max = "é".repeat(64); // chars, not bytes
+        assert_eq!(normalize_session_name(&max), Some(max.clone()));
     }
 }
