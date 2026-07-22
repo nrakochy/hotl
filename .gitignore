@@ -5,3 +5,7 @@
 # published. Held out of this repo and its history on purpose.
 /AGENTS.md
 /specs/
+
+# Local agent scratch: machine-local settings and agent worktrees, the
+# latter carrying their own target/ dirs. Nothing here is shared state.
+/.claude/
