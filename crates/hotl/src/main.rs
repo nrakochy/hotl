@@ -27,6 +27,7 @@ mod keysource;
 mod session_server;
 mod setup;
 mod shell_hooks;
+mod skills_cli;
 mod spawn;
 mod structured;
 mod tui;
@@ -89,6 +90,7 @@ fn main() {
             std::process::exit(setup::setup_main(&agent::config_dir(), force));
         }
         Some("gc") => std::process::exit(gc::gc_main(&args)),
+        Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
         Some("update") => std::process::exit(update_main(args.get(1).map(String::as_str))),
         Some("init") => {
             // Binary-generated shell integration (the `:` prefix).
@@ -132,6 +134,7 @@ fn print_help() {
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
+         hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
          hotl resume [arg]    same as -r\n  \
          hotl undo            restore files to before the agent's last change\n  \
          hotl fleet           reserved (orchestrate)\n\n\
