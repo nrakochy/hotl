@@ -139,8 +139,10 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
     let model = scaffold.model.clone();
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         let resumed = match spec {
-            crate::acp::SessionSpec::New => None,
-            crate::acp::SessionSpec::Load(sid) => {
+            crate::acp::SessionSpec::New { .. } => None,
+            crate::acp::SessionSpec::Load {
+                session_id: sid, ..
+            } => {
                 let replayed = hotl_store::replay_chain(&sessions_dir(), &sid)
                     .map_err(|e| format!("could not load session {sid}: {e}"))?;
                 Some(Resumed {
@@ -161,7 +163,10 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
-        Ok(spawn_session(scaffold.deps(log, snapshots, initial)))
+        Ok(crate::acp::SessionOpen {
+            handle: spawn_session(scaffold.deps(log, snapshots, initial)),
+            name: None,
+        })
     });
     Ok((factory, model))
 }

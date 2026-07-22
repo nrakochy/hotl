@@ -20,7 +20,13 @@ mod acp;
 /// A session whose scripted model calls bash (a gated tool → a permission
 /// ask) then replies with text.
 fn scripted_factory() -> acp::SessionFactory {
-    Box::new(|_spec| {
+    Box::new(|spec| {
+        // Echo the requested name back, as the real factory does — resolving
+        // the open's name is the factory's job, not the protocol layer's.
+        let name = match spec {
+            acp::SessionSpec::New { name } => name,
+            acp::SessionSpec::Load { name, .. } => name,
+        };
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
         let provider = Arc::new(ScriptedProvider::new(vec![
@@ -29,23 +35,26 @@ fn scripted_factory() -> acp::SessionFactory {
         ]));
         // Keep the tempdir alive for the session's lifetime.
         std::mem::forget(dir);
-        Ok(spawn_session(SessionDeps {
-            provider,
-            registry: Arc::new(Registry::builtin()),
-            rules: Arc::new(Rules::default()),
-            sandbox_enforced: false,
-            clock: Arc::new(SystemClock),
-            log,
-            system: "sys".into(),
-            cwd: std::env::temp_dir(),
-            snapshots: None,
-            hooks: None,
-            initial_items: Vec::new(),
-            config: EngineConfig {
-                max_turns: 6,
-                ..Default::default()
-            },
-        }))
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: Vec::new(),
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name,
+        })
     })
 }
 
@@ -158,23 +167,26 @@ async fn overlapping_prompts_resolve_in_order() {
             ScriptedProvider::text_reply("first turn"),
             ScriptedProvider::text_reply("second turn"),
         ]));
-        Ok(spawn_session(SessionDeps {
-            provider,
-            registry: Arc::new(Registry::builtin()),
-            rules: Arc::new(Rules::default()),
-            sandbox_enforced: false,
-            clock: Arc::new(SystemClock),
-            log,
-            system: "sys".into(),
-            cwd: std::env::temp_dir(),
-            snapshots: None,
-            hooks: None,
-            initial_items: Vec::new(),
-            config: EngineConfig {
-                max_turns: 6,
-                ..Default::default()
-            },
-        }))
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: Vec::new(),
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+        })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
@@ -340,6 +352,60 @@ async fn read_until_id(
             return m;
         }
     }
+}
+
+/// session/new carries a name back; session/rename acks and re-renames.
+#[tokio::test]
+async fn named_open_and_rename() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+
+    // rename before a session exists → error.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/rename","params":{"name":"x"}}),
+    )
+    .await;
+    assert!(
+        next(&mut lines).await["error"].is_object(),
+        "no session yet"
+    );
+
+    // open with a name (surrounding whitespace normalizes away).
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{"name":"  fix-auth  "}}),
+    )
+    .await;
+    let open = next(&mut lines).await;
+    assert_eq!(open["result"]["name"], "fix-auth");
+
+    // invalid rename → error; valid rename → ok.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/rename","params":{"name":"   "}}),
+    )
+    .await;
+    assert!(
+        next(&mut lines).await["error"].is_object(),
+        "blank name rejected"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/rename","params":{"name":"better-name"}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["ok"], true);
 }
 
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {

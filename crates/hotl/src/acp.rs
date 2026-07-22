@@ -54,13 +54,25 @@ type PendingPrompt = Arc<std::sync::Mutex<VecDeque<Value>>>;
 
 /// What a client asked the factory to produce.
 pub enum SessionSpec {
-    New,
-    Load(String),
+    New {
+        name: Option<String>,
+    },
+    Load {
+        session_id: String,
+        name: Option<String>,
+    },
+}
+
+/// A session the factory opened: the handle plus its display name (the one
+/// just given, or inherited from the resumed chain).
+pub struct SessionOpen {
+    pub handle: SessionHandle,
+    pub name: Option<String>,
 }
 
 /// Builds a session per the client's request. The real binary wires engine
 /// deps here; tests inject a scripted-provider session.
-pub type SessionFactory = Box<dyn FnMut(SessionSpec) -> Result<SessionHandle, String> + Send>;
+pub type SessionFactory = Box<dyn FnMut(SessionSpec) -> Result<SessionOpen, String> + Send>;
 
 /// Drive the protocol over one connection until the client hangs up.
 pub async fn serve(
@@ -127,19 +139,39 @@ async fn handle_request(
             reply_ok(writer, id, json!({"protocolVersion": PROTOCOL_VERSION, "schemaVersion": UPDATE_SCHEMA_VERSION})).await;
         }
         method @ ("session/new" | "session/load") => {
+            let name = match msg.pointer("/params/name") {
+                None | Some(Value::Null) => None,
+                Some(v) => match v
+                    .as_str()
+                    .and_then(|s| hotl_types::normalize_session_name(s))
+                {
+                    Some(n) => Some(n),
+                    None => {
+                        return reply_err(
+                            writer,
+                            id,
+                            "params.name must be 1–64 chars after trimming",
+                        )
+                        .await
+                    }
+                },
+            };
             let spec = if method == "session/load" {
                 match msg.pointer("/params/sessionId").and_then(Value::as_str) {
-                    Some(sid) => SessionSpec::Load(sid.to_string()),
+                    Some(sid) => SessionSpec::Load {
+                        session_id: sid.to_string(),
+                        name,
+                    },
                     None => {
                         return reply_err(writer, id, "session/load requires params.sessionId")
                             .await
                     }
                 }
             } else {
-                SessionSpec::New
+                SessionSpec::New { name }
             };
             match factory(spec) {
-                Ok(handle) => {
+                Ok(open) => {
                     // Replacing a session: interrupt its in-flight turn (its
                     // events are about to stop rendering anywhere — it must
                     // not keep running tools invisibly in the shared cwd),
@@ -160,7 +192,7 @@ async fn handle_request(
                             .clear();
                     }
                     let state = start_session(
-                        handle,
+                        open.handle,
                         writer.clone(),
                         pending.clone(),
                         pending_prompt.clone(),
@@ -175,7 +207,7 @@ async fn handle_request(
                     }
                     let sid = state.id.clone();
                     *session = Some(state);
-                    reply_ok(writer, id, json!({"sessionId": sid})).await;
+                    reply_ok(writer, id, json!({"sessionId": sid, "name": open.name})).await;
                 }
                 Err(e) => reply_err(writer, id, &e).await,
             }
@@ -194,6 +226,25 @@ async fn handle_request(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push_back(id);
             state.handle.prompt(text.to_string()).await;
+        }
+        "session/rename" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let Some(name) = msg
+                .pointer("/params/name")
+                .and_then(Value::as_str)
+                .and_then(|s| hotl_types::normalize_session_name(s))
+            else {
+                return reply_err(
+                    writer,
+                    id,
+                    "session/rename requires params.name (1–64 chars after trimming)",
+                )
+                .await;
+            };
+            state.handle.rename(name).await;
+            reply_ok(writer, id, json!({"ok": true})).await;
         }
         "session/steer" => {
             let Some(state) = session.as_ref() else {

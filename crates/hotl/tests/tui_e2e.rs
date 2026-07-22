@@ -40,23 +40,26 @@ fn scripted_factory() -> acp::SessionFactory {
         ]));
         // Keep the tempdir alive for the session's lifetime.
         std::mem::forget(dir);
-        Ok(spawn_session(SessionDeps {
-            provider,
-            registry: Arc::new(Registry::builtin()),
-            rules: Arc::new(Rules::default()),
-            sandbox_enforced: false,
-            clock: Arc::new(SystemClock),
-            log,
-            system: "sys".into(),
-            cwd: std::env::temp_dir(),
-            snapshots: None,
-            hooks: None,
-            initial_items: Vec::new(),
-            config: EngineConfig {
-                max_turns: 6,
-                ..Default::default()
-            },
-        }))
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: Vec::new(),
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+        })
     })
 }
 
