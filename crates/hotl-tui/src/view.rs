@@ -151,6 +151,32 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         _ => Style::new().fg(p.ink).bg(p.band),
     };
     frame.render_widget(Paragraph::new(anim::strip_line(state)).style(style), area);
+
+    // Session-name chip, right-aligned on the strip (the Claude-style badge
+    // just above the input). The left side stays reserved for the activity
+    // glyphs; too-narrow terminals drop the chip rather than collide.
+    if let Some(name) = &state.session_name {
+        let avail = area.width.saturating_sub(14) as usize;
+        if avail >= 8 {
+            let mut label: String = name.chars().take(avail - 2).collect();
+            if label.chars().count() < name.chars().count() {
+                label.pop();
+                label.push('…');
+            }
+            let chip = format!(" {label} ");
+            let w = chip.chars().count() as u16;
+            let rect = Rect {
+                x: area.x + area.width - w,
+                y: area.y,
+                width: w,
+                height: 1,
+            };
+            frame.render_widget(
+                Paragraph::new(chip).style(Style::new().fg(p.band).bg(p.accent).bold()),
+                rect,
+            );
+        }
+    }
 }
 
 fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
@@ -463,5 +489,34 @@ mod tests {
             "{}",
             rows[INPUT_TOP]
         );
+    }
+
+    #[test]
+    fn session_name_badge_sits_right_aligned_on_the_strip() {
+        let mut s = State::new(true, "m".into());
+        s.session_name = Some("rust code review".into());
+        let rows = draw(&s);
+        assert!(
+            rows[STRIP].trim_end().ends_with("rust code review"),
+            "badge right-aligned: {:?}",
+            rows[STRIP]
+        );
+        // The resting glyph still renders on the left.
+        assert!(
+            rows[STRIP].contains("· ─ ·"),
+            "strip glyphs: {}",
+            rows[STRIP]
+        );
+    }
+
+    #[test]
+    fn long_names_truncate_with_ellipsis_and_absent_names_render_nothing() {
+        let mut s = State::new(true, "m".into());
+        s.session_name = Some("x".repeat(200));
+        let rows = draw(&s);
+        assert!(rows[STRIP].contains('…'), "truncated: {}", rows[STRIP]);
+
+        let rows = draw(&State::new(true, "m".into()));
+        assert!(!rows[STRIP].contains('…'));
     }
 }
