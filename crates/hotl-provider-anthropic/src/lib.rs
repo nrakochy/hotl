@@ -21,13 +21,39 @@ use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
-const API_URL: &str = "https://api.anthropic.com/v1/messages";
+pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
 const API_VERSION: &str = "2023-06-01";
+
+/// Sent as `x-api-key` in subscription mode. Not a credential and not secret —
+/// it exists only because some bridges validate that the header is *present*.
+///
+/// Still open (no bridge was reachable when this landed): if endpoints accept
+/// the request with no `x-api-key` header at all, drop this and omit the
+/// header — hotl would then transmit nothing resembling a credential, which is
+/// strictly better. Nothing else in the design depends on the outcome.
+const SUBSCRIPTION_PLACEHOLDER: &str = "hotl";
+
+/// Resolve a configured base URL to the messages endpoint.
+///
+/// Two spellings are accepted on purpose. hotl's own convention (and the
+/// OpenAI provider's) puts the version in the base — `.../v1`. Local bridges
+/// document the bare origin instead, because official SDKs append the whole
+/// `/v1/messages` path themselves, and users copy that. Guessing wrong is a
+/// confusing 404, so both work.
+pub fn messages_url(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
+    }
+}
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
     key_source: Arc<dyn KeySource>,
     api_url: String,
+    no_credential: bool,
 }
 
 impl AnthropicProvider {
@@ -35,13 +61,28 @@ impl AnthropicProvider {
         Self {
             client: reqwest::Client::new(),
             key_source,
-            api_url: API_URL.to_string(),
+            api_url: messages_url(DEFAULT_BASE_URL),
+            no_credential: false,
         }
     }
 
-    #[cfg(test)]
-    fn with_api_url(mut self, url: String) -> Self {
-        self.api_url = url;
+    /// Point at an Anthropic-shaped endpoint that is not Anthropic.
+    pub fn with_base_url(mut self, base: &str) -> Self {
+        self.api_url = messages_url(base);
+        self
+    }
+
+    /// Subscription mode: hotl holds no credential; the endpoint
+    /// authenticates upstream on its own.
+    ///
+    /// The `key_source` is never consulted once this is set. That is the
+    /// point, not an optimization: a user switching to a local bridge will
+    /// often still have `ANTHROPIC_API_KEY` exported, and forwarding it would
+    /// hand a production credential to a proxy they never meant to trust with
+    /// one. Suppression lives here as well as in provider selection so no
+    /// wiring mistake upstream can leak the key.
+    pub fn subscription(mut self) -> Self {
+        self.no_credential = true;
         self
     }
 
@@ -229,23 +270,33 @@ impl Provider for AnthropicProvider {
         let body = Self::build_body(&req);
         let source = self.key_source.clone();
         let api_url = self.api_url.clone();
+        let no_credential = self.no_credential;
 
         Box::pin(async_stream::stream! {
             let mut attempt: u32 = 0;
             let mut auth_retry = AuthRetry::default();
             let response = loop {
                 attempt += 1;
-                let key = match source.get().await {
-                    Ok(Some(k)) => k,
-                    Ok(None) => {
-                        yield Err(ProviderError::Auth(
-                            "no Anthropic key: set ANTHROPIC_API_KEY or configure [provider] api_key_helper".into(),
-                        ));
-                        return;
-                    }
-                    Err(e) => {
-                        yield Err(ProviderError::Auth(e.0));
-                        return;
+                // Subscription mode short-circuits before `source.get()` — the
+                // key source is never consulted, so an environment key cannot
+                // reach a bridge even if one is configured.
+                let key = if no_credential {
+                    SUBSCRIPTION_PLACEHOLDER.to_string()
+                } else {
+                    match source.get().await {
+                        Ok(Some(k)) => k,
+                        Ok(None) => {
+                            yield Err(ProviderError::Auth(
+                                "no Anthropic key: set ANTHROPIC_API_KEY, configure [provider] api_key_helper, \
+                                 or point [provider] base_url at an endpoint that authenticates for you and set \
+                                 auth = \"subscription\"".into(),
+                            ));
+                            return;
+                        }
+                        Err(e) => {
+                            yield Err(ProviderError::Auth(e.0));
+                            return;
+                        }
                     }
                 };
                 match send_attempt(&client, &api_url, &key, &body, attempt).await {
@@ -380,11 +431,70 @@ mod tests {
     async fn auth_401_refreshes_key_once_and_retries() {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let base = tcp_double(vec![AUTH_401, SSE_OK], seen.clone()).await;
-        let p = AnthropicProvider::new(Arc::new(FlippingKey(StdMutex::new(1))))
-            .with_api_url(format!("{base}/messages"));
+        let p =
+            AnthropicProvider::new(Arc::new(FlippingKey(StdMutex::new(1)))).with_base_url(&base);
         let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["key-1", "key-2"]);
+    }
+
+    #[test]
+    fn base_url_accepts_bare_origin_and_v1_suffix() {
+        // Bridges document the bare origin; hotl's own convention includes /v1.
+        assert_eq!(
+            messages_url("http://127.0.0.1:3456"),
+            "http://127.0.0.1:3456/v1/messages"
+        );
+        assert_eq!(
+            messages_url("http://127.0.0.1:3456/v1"),
+            "http://127.0.0.1:3456/v1/messages"
+        );
+        // Trailing slashes are noise in either spelling.
+        assert_eq!(
+            messages_url("http://127.0.0.1:3456/"),
+            "http://127.0.0.1:3456/v1/messages"
+        );
+        assert_eq!(
+            messages_url("http://127.0.0.1:3456/v1/"),
+            "http://127.0.0.1:3456/v1/messages"
+        );
+        assert_eq!(
+            messages_url(DEFAULT_BASE_URL),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
+
+    /// The security guard. Do not delete: a user switching to a local bridge
+    /// will often still have ANTHROPIC_API_KEY exported, and forwarding it
+    /// hands a production credential to a proxy they never meant to trust.
+    #[tokio::test]
+    async fn subscription_mode_never_sends_a_real_key() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![SSE_OK], seen.clone()).await;
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some(
+            "sk-ant-real-secret".into(),
+        ))))
+        .with_base_url(&base)
+        .subscription();
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        let sent = seen.lock().unwrap()[0].clone();
+        assert!(
+            !sent.contains("sk-ant") && !sent.contains("real-secret"),
+            "subscription mode leaked the environment key: {sent}"
+        );
+    }
+
+    /// Subscription mode must work with no credential available at all.
+    #[tokio::test]
+    async fn subscription_mode_succeeds_with_a_keyless_source() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![SSE_OK], seen.clone()).await;
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(None)))
+            .with_base_url(&base)
+            .subscription();
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
     }
 
     #[tokio::test]
