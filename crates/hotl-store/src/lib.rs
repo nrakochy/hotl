@@ -280,6 +280,8 @@ impl SessionLog {
 pub struct Replayed {
     pub header: hotl_types::SessionHeader,
     pub items: Vec<hotl_types::Item>,
+    /// The session's display name (last `Rename` in the chain, child wins).
+    pub name: Option<String>,
     /// Integrity warnings (a broken `parent_id` chain — H-12). Empty is clean.
     /// Replay is defensive regardless (indices clamped, unknowns degraded), so
     /// a warning means "this log was edited/corrupted since it was written",
@@ -290,10 +292,12 @@ pub struct Replayed {
 pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
-    let header = apply_log(path, &mut items, &mut warnings)?;
+    let mut name = None;
+    let header = apply_log(path, &mut items, &mut warnings, &mut name)?;
     Ok(Replayed {
         header,
         items,
+        name,
         warnings,
     })
 }
@@ -330,12 +334,15 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let (_, newest_header) = lineage.first().cloned().ok_or("empty lineage")?;
     let mut items = Vec::new();
     let mut warnings = Vec::new();
+    // Parent-first, so a child's rename naturally overwrites the parent's.
+    let mut name = None;
     for (path, _) in lineage.iter().rev() {
-        apply_log(path, &mut items, &mut warnings)?;
+        apply_log(path, &mut items, &mut warnings, &mut name)?;
     }
     Ok(Replayed {
         header: newest_header,
         items,
+        name,
         warnings,
     })
 }
@@ -349,6 +356,7 @@ fn apply_log(
     path: &Path,
     items: &mut Vec<hotl_types::Item>,
     warnings: &mut Vec<String>,
+    name: &mut Option<String>,
 ) -> Result<hotl_types::SessionHeader, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut header = None;
@@ -395,6 +403,8 @@ fn apply_log(
             EntryPayload::AskResolved { id, .. } => {
                 pending_asks.remove(&id);
             }
+            // Log-only, like PendingAsk: names the session, never the projection.
+            EntryPayload::Rename { name: n } => *name = Some(n),
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {
             }
         }
@@ -405,6 +415,28 @@ fn apply_log(
         ));
     }
     header.ok_or_else(|| format!("{}: no header entry", path.display()))
+}
+
+/// The session's display name: the last `rename` entry in its log, if any.
+/// A cheap line-scan (substring pre-filter, then parse) — listing and name
+/// resolution must not pay for a full replay.
+pub fn session_name(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    let mut name = None;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else { break };
+        if !line.contains("\"rename\"") {
+            continue;
+        }
+        if let Ok(Entry {
+            payload: EntryPayload::Rename { name: n },
+            ..
+        }) = serde_json::from_str::<Entry>(&line)
+        {
+            name = Some(n);
+        }
+    }
+    name
 }
 
 /// Session files in `dir`, newest first: (session id, path, modified).
@@ -681,5 +713,92 @@ mod tests {
         assert_eq!(hits.len(), 1, "only the jsonl with the live secret");
         assert!(hits[0].ends_with("old.jsonl"));
         assert!(audit_secrets(dir.path(), &Masker::empty()).is_empty());
+    }
+
+    #[test]
+    fn rename_replays_last_one_wins_and_names_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(
+            &EntryPayload::Rename {
+                name: "first".into(),
+            },
+            2,
+        )
+        .unwrap();
+        log.append(
+            &EntryPayload::Rename {
+                name: "second".into(),
+            },
+            3,
+        )
+        .unwrap();
+
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.name.as_deref(), Some("second"));
+        assert!(replayed.items.is_empty(), "rename is not a projection item");
+        assert_eq!(session_name(&path).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn unnamed_session_has_no_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        assert_eq!(session_name(log.path()), None);
+        assert_eq!(replay(log.path()).unwrap().name, None);
+    }
+
+    #[test]
+    fn chain_inherits_parent_name_and_child_rename_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        parent
+            .append(
+                &EntryPayload::Rename {
+                    name: "from-parent".into(),
+                },
+                2,
+            )
+            .unwrap();
+        let parent_id = parent.session_id.clone();
+
+        // Child with no rename of its own → inherits.
+        let child =
+            SessionLog::create(dir.path(), "m", Some(parent_id.clone()), Masker::empty(), 3)
+                .unwrap();
+        let replayed = replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(replayed.name.as_deref(), Some("from-parent"));
+
+        // Child that renames → overrides.
+        let mut child2 =
+            SessionLog::create(dir.path(), "m", Some(parent_id), Masker::empty(), 4).unwrap();
+        child2
+            .append(
+                &EntryPayload::Rename {
+                    name: "from-child".into(),
+                },
+                5,
+            )
+            .unwrap();
+        let replayed = replay_chain(dir.path(), &child2.session_id).unwrap();
+        assert_eq!(replayed.name.as_deref(), Some("from-child"));
+    }
+
+    #[test]
+    fn session_name_ignores_items_that_mention_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append(
+            &EntryPayload::Item {
+                item: Item::User {
+                    text: "please rename the file".into(),
+                    synthetic: None,
+                },
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(session_name(log.path()), None);
     }
 }
