@@ -1086,9 +1086,10 @@ pub(crate) fn select_provider(
         Some((p, m)) => (p.to_ascii_lowercase(), m.to_string()),
         None => ("anthropic".to_string(), raw),
     };
+    let auth = auth_mode(cfg, secrets)?;
     let (provider, source) = match provider_name.as_str() {
-        "anthropic" => resolve_anthropic(cfg, secrets)?,
-        "openai" | "oai" => resolve_openai(cfg, secrets)?,
+        "anthropic" => resolve_anthropic(cfg, secrets, auth)?,
+        "openai" | "oai" => resolve_openai(cfg, secrets, auth)?,
         other => {
             return Err(format!(
                 "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, \
@@ -1100,32 +1101,134 @@ pub(crate) fn select_provider(
     Ok((provider, model, source))
 }
 
+/// How hotl authenticates to the selected provider. Orthogonal to *which*
+/// provider is selected: both spellings read the same for `anthropic/…` and
+/// `openai/…`, so the concept never names a vendor's plan or a proxy project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthMode {
+    /// hotl holds and transmits a credential. The default; unchanged behavior.
+    ApiKey,
+    /// hotl holds no credential; the endpoint authenticates upstream on its
+    /// own. Requires `base_url`.
+    Subscription,
+}
+
+fn auth_mode(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Result<AuthMode, String> {
+    let raw = secrets
+        .get("HOTL_PROVIDER_AUTH")
+        .or_else(|| cfg.provider.auth.clone());
+    match raw.as_deref() {
+        None | Some("api_key") => Ok(AuthMode::ApiKey),
+        Some("subscription") => Ok(AuthMode::Subscription),
+        Some(other) => Err(format!(
+            "unknown [provider] auth `{other}`. Valid values: \"api_key\" (default — hotl \
+             holds the credential) or \"subscription\" (hotl holds no credential; the \
+             endpoint authenticates upstream, and base_url is required)."
+        )),
+    }
+}
+
+/// The active endpoint, if one is configured. `HOTL_ANTHROPIC_BASE_URL` is the
+/// Anthropic-side twin of the long-standing `HOTL_OPENAI_BASE_URL`.
+fn anthropic_base_url(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Option<String> {
+    secrets
+        .get("HOTL_ANTHROPIC_BASE_URL")
+        .or_else(|| cfg.provider.base_url.clone())
+}
+
+fn subscription_needs_base_url(env_var: &str) -> String {
+    format!(
+        "[provider] auth = \"subscription\" requires base_url — hotl holds no credential in \
+         this mode, so it needs an endpoint that authenticates on its own. Set [provider] \
+         base_url (or {env_var}) to that endpoint, or use auth = \"api_key\"."
+    )
+}
+
+/// Warn when traffic crosses the network in the clear. Which exposure matters
+/// depends on the mode: under `api_key` a bearer credential is at stake, under
+/// `subscription` there is no credential but prompts and session content still
+/// travel unencrypted. One predicate, two messages — loopback http is the
+/// normal local-endpoint case and is never warned on.
+fn warn_cleartext(base: &str, auth: AuthMode, credential_present: bool) {
+    if !cleartext_nonloopback(base) {
+        return;
+    }
+    match auth {
+        AuthMode::Subscription => eprintln!(
+            "hotl: WARNING — [provider] base_url is a non-loopback http:// URL; prompts and \
+             session content will cross the network unencrypted. Use https:// or an SSH tunnel."
+        ),
+        AuthMode::ApiKey if credential_present => eprintln!(
+            "hotl: WARNING — [provider] base_url is a non-loopback http:// URL and an API key \
+             is set; the key will cross the network unencrypted. Use https:// or an SSH tunnel."
+        ),
+        AuthMode::ApiKey => {}
+    }
+}
+
 fn resolve_anthropic(
     cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
+    auth: AuthMode,
 ) -> Result<ProviderAndSource, String> {
+    let base = anthropic_base_url(cfg, secrets);
+    if auth == AuthMode::Subscription {
+        let base = base.ok_or_else(|| subscription_needs_base_url("HOTL_ANTHROPIC_BASE_URL"))?;
+        warn_cleartext(&base, auth, false);
+        // A keyless source, deliberately: selection refuses to hand the
+        // provider a credential, and the provider refuses to consult one.
+        // Either half alone would suffice; both means no wiring mistake in
+        // one layer can leak an environment key to a bridge.
+        let source: Arc<dyn hotl_provider::key::KeySource> =
+            Arc::new(hotl_provider::key::StaticKey(None));
+        let provider = AnthropicProvider::new(source.clone())
+            .with_base_url(&base)
+            .subscription();
+        return Ok((Arc::new(provider), source));
+    }
     let key = secrets.get("ANTHROPIC_API_KEY");
     let source = key_source_for(cfg, secrets, key.clone());
     if !source.refreshable() && key.is_none() {
         return Err(
             "ANTHROPIC_API_KEY is not set and no api_key_helper is configured.\n\
-             Export the key, set [provider] api_key_helper in config.toml, or select \
-             another provider, e.g. HOTL_MODEL=openai/<model> (with OPENAI_API_KEY, or \
-             HOTL_OPENAI_BASE_URL for a local endpoint). `hotl watch` needs no key."
+             Export the key, set [provider] api_key_helper in config.toml, point [provider] \
+             base_url at an endpoint that authenticates for you and set auth = \
+             \"subscription\", or select another provider, e.g. HOTL_MODEL=openai/<model> \
+             (with OPENAI_API_KEY, or HOTL_OPENAI_BASE_URL for a local endpoint). \
+             `hotl watch` needs no key."
                 .to_string(),
         );
     }
-    Ok((Arc::new(AnthropicProvider::new(source.clone())), source))
+    let mut provider = AnthropicProvider::new(source.clone());
+    if let Some(base) = &base {
+        warn_cleartext(base, auth, key.is_some() || source.refreshable());
+        provider = provider.with_base_url(base);
+    }
+    Ok((Arc::new(provider), source))
 }
 
 fn resolve_openai(
     cfg: &crate::config::Config,
     secrets: &dyn SecretStore,
+    auth: AuthMode,
 ) -> Result<ProviderAndSource, String> {
-    let base = secrets
+    let configured = secrets
         .get("HOTL_OPENAI_BASE_URL")
-        .or_else(|| cfg.provider.base_url.clone())
-        .unwrap_or_else(|| hotl_provider_openai::DEFAULT_BASE_URL.to_string());
+        .or_else(|| cfg.provider.base_url.clone());
+    if auth == AuthMode::Subscription {
+        let base = configured.ok_or_else(|| subscription_needs_base_url("HOTL_OPENAI_BASE_URL"))?;
+        warn_cleartext(&base, auth, false);
+        let source: Arc<dyn hotl_provider::key::KeySource> =
+            Arc::new(hotl_provider::key::StaticKey(None));
+        return Ok((
+            Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(
+                base,
+                source.clone(),
+            )),
+            source,
+        ));
+    }
+    let base = configured.unwrap_or_else(|| hotl_provider_openai::DEFAULT_BASE_URL.to_string());
     let key = secrets.get("OPENAI_API_KEY");
     let source = key_source_for(cfg, secrets, key.clone());
     if !source.refreshable() && key.is_none() && base == hotl_provider_openai::DEFAULT_BASE_URL {
@@ -1142,13 +1245,7 @@ fn resolve_openai(
     // it); loopback http is the normal local-endpoint case. A helper-sourced
     // key (source.refreshable()) is just as real a bearer credential as the
     // static env key, so it must trip this warning too.
-    if (key.is_some() || source.refreshable()) && cleartext_nonloopback(&base) {
-        eprintln!(
-            "hotl: WARNING — HOTL_OPENAI_BASE_URL is a non-loopback http:// URL and \
-             OPENAI_API_KEY is set; the key will cross the network unencrypted. \
-             Use https:// or an SSH tunnel."
-        );
-    }
+    warn_cleartext(&base, auth, key.is_some() || source.refreshable());
     Ok((
         Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(
             base,
@@ -1289,6 +1386,103 @@ mod tests {
         ]);
         let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
         assert!(source.refreshable());
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(f)
+    }
+
+    #[test]
+    fn subscription_auth_without_base_url_is_refused() {
+        // Fail closed: otherwise hotl sends a placeholder credential to the
+        // vendor's own endpoint and the user debugs a 401 instead of config.
+        let cfg = config_from_toml("[provider]\nauth = \"subscription\"\n");
+        let secrets = MapSecrets::from([("HOTL_MODEL", "anthropic/m")]);
+        let err = select_provider(&cfg, &secrets).err().unwrap();
+        assert!(err.contains("base_url"), "{err}");
+    }
+
+    #[test]
+    fn subscription_auth_needs_no_key() {
+        let cfg = config_from_toml(
+            "[provider]\nauth = \"subscription\"\nbase_url = \"http://127.0.0.1:3456\"\n",
+        );
+        let secrets = MapSecrets::from([("HOTL_MODEL", "anthropic/m")]);
+        let (_p, m, _s) = select_provider(&cfg, &secrets).unwrap();
+        assert_eq!(m, "m");
+    }
+
+    /// Selection-layer half of the credential suppression. The provider
+    /// refuses to consult the source; selection refuses to hand it one.
+    #[test]
+    fn subscription_auth_discards_an_available_key() {
+        let cfg = config_from_toml(
+            "[provider]\nauth = \"subscription\"\nbase_url = \"http://127.0.0.1:3456\"\n\
+             api_key_helper = \"echo leaked\"\n",
+        );
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "anthropic/m"),
+            ("ANTHROPIC_API_KEY", "sk-ant-real-secret"),
+        ]);
+        let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
+        assert!(
+            !source.refreshable(),
+            "subscription mode must not carry a refreshable key source"
+        );
+        assert_eq!(
+            block_on(source.get()).unwrap(),
+            None,
+            "subscription mode must not carry a key"
+        );
+    }
+
+    #[test]
+    fn subscription_auth_works_for_openai_too() {
+        let cfg = config_from_toml(
+            "[provider]\nauth = \"subscription\"\nbase_url = \"http://127.0.0.1:4000/v1\"\n",
+        );
+        let secrets = MapSecrets::from([("HOTL_MODEL", "openai/m")]);
+        let (_p, _m, source) = select_provider(&cfg, &secrets).unwrap();
+        assert_eq!(block_on(source.get()).unwrap(), None);
+    }
+
+    #[test]
+    fn unknown_auth_mode_names_the_valid_values() {
+        let cfg = config_from_toml("[provider]\nauth = \"oauth\"\n");
+        let secrets = MapSecrets::from([("HOTL_MODEL", "anthropic/m")]);
+        let err = select_provider(&cfg, &secrets).err().unwrap();
+        assert!(
+            err.contains("api_key") && err.contains("subscription"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn anthropic_base_url_env_overrides_config() {
+        let cfg = config_from_toml(
+            "[provider]\nauth = \"subscription\"\nbase_url = \"http://127.0.0.1:1/v1\"\n",
+        );
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "anthropic/m"),
+            ("HOTL_ANTHROPIC_BASE_URL", "http://127.0.0.1:9999"),
+        ]);
+        // Selection must succeed; the env value is what the provider gets.
+        assert!(select_provider(&cfg, &secrets).is_ok());
+    }
+
+    /// api_key mode must keep working exactly as before, including the
+    /// OpenAI provider's existing keyless-on-custom-base allowance.
+    #[test]
+    fn api_key_mode_preserves_openai_keyless_custom_base() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "openai/m"),
+            ("HOTL_OPENAI_BASE_URL", "http://localhost:11434/v1"),
+        ]);
+        assert!(select_provider(&cfg, &secrets).is_ok());
     }
 
     #[test]

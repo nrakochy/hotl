@@ -132,8 +132,16 @@ impl PermissionsCfg {
 pub struct ProviderCfg {
     /// `provider/model`, e.g. `openai/gpt-5` or `anthropic/claude-opus-4-8`.
     pub model: Option<String>,
-    /// OpenAI-compatible base URL (for the `openai` provider).
+    /// Endpoint for the active provider. `openai/…` has always used this;
+    /// `anthropic/…` honors it too, so any Anthropic-shaped endpoint (a local
+    /// bridge, a gateway) is reachable. Only one provider is active at a time,
+    /// so one key serves both.
     pub base_url: Option<String>,
+    /// `"api_key"` (default) | `"subscription"`. Under `subscription` hotl
+    /// holds no credential — the endpoint authenticates upstream on its own —
+    /// and `base_url` is required. Provider-neutral: it reads the same for
+    /// `anthropic/…` and `openai/…`.
+    pub auth: Option<String>,
     /// Cheap model for compaction summaries.
     pub fast_model: Option<String>,
     /// Command whose stdout (trimmed) is the API key. When set, it beats the
