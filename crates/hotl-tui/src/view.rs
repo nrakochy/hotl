@@ -103,7 +103,15 @@ impl Spine {
         let mut spans = Vec::with_capacity(content.spans.len() + 1);
         spans.push(Span::styled(lead, style));
         spans.append(&mut content.spans);
-        Line::from(spans)
+        // Carry the content line's own style through — for lines built with
+        // `Line::styled` (plain ink prose, a bold heading, a band-backed code
+        // line) the color lives at line level, not on the spans, and dropping
+        // it here would render them in the terminal's default style.
+        Line {
+            spans,
+            style: content.style,
+            alignment: content.alignment,
+        }
     }
 }
 
@@ -132,6 +140,88 @@ fn item_visual_lines<'a>(
     out
 }
 
+/// Assistant prose with light, line-level structure so an answer is scannable
+/// on its own, not just at the turn boundary. Deliberately NOT a markdown
+/// engine: each line is classified by how it begins, nothing spans lines
+/// except the fenced-code toggle. Anything unrecognized stays plain ink, so a
+/// stray `#` mid-sentence never turns into a heading.
+fn assistant_lines<'a>(text: &str, p: &Palette) -> Vec<Line<'a>> {
+    let mut out = Vec::new();
+    let mut in_fence = false;
+    for raw in text.split('\n') {
+        let lead = raw.trim_start();
+        // ``` toggles a code fence; the fence line itself renders as a quiet
+        // divider rather than literal backticks shouting on screen.
+        if lead.starts_with("```") {
+            in_fence = !in_fence;
+            out.push(Line::styled(
+                raw.to_string(),
+                Style::new().fg(p.faint).dim(),
+            ));
+            continue;
+        }
+        if in_fence {
+            out.push(code_line(raw, p));
+            continue;
+        }
+        // `#`..`###`-led heading → bold, hashes stripped.
+        if let Some(h) = heading_text(lead) {
+            out.push(Line::styled(h, Style::new().fg(p.ink).bold()));
+            continue;
+        }
+        // `- ` / `* ` bullet → a `•` marker in the accent, indentation kept.
+        if let Some((indent, rest)) = bullet(raw) {
+            out.push(Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled("• ", Style::new().fg(p.accent)),
+                Span::styled(rest.to_string(), Style::new().fg(p.ink)),
+            ]));
+            continue;
+        }
+        // A 4-space indent is markdown's other code form.
+        if raw.starts_with("    ") && !raw.trim().is_empty() {
+            out.push(code_line(raw, p));
+            continue;
+        }
+        out.push(Line::styled(raw.to_string(), Style::new().fg(p.ink)));
+    }
+    out
+}
+
+/// A code line: muted on the band, so it reads as code without a full-width
+/// fill that would fight the gutter and wrapping (the band rides the text).
+fn code_line<'a>(raw: &str, p: &Palette) -> Line<'a> {
+    Line::styled(raw.to_string(), Style::new().fg(p.muted).bg(p.band))
+}
+
+/// The text of a `#`/`##`/`###`(…) heading with the hashes and one space
+/// stripped, or `None` if the line is not a heading. Requires a space (or end)
+/// after the hashes, so `#42` in prose is not mistaken for one.
+fn heading_text(lead: &str) -> Option<String> {
+    let rest = lead.trim_start_matches('#');
+    let hashes = lead.len() - rest.len();
+    if hashes == 0 {
+        return None;
+    }
+    match rest.strip_prefix(' ') {
+        Some(body) => Some(body.to_string()),
+        None if rest.is_empty() => Some(String::new()),
+        None => None, // `#foo` — a hash-word, not a heading
+    }
+}
+
+/// `(leading_indent, item_text)` for a `- ` or `* ` bullet, else `None`.
+fn bullet(raw: &str) -> Option<(&str, &str)> {
+    let indent = &raw[..raw.len() - raw.trim_start().len()];
+    let lead = &raw[indent.len()..];
+    for marker in ["- ", "* "] {
+        if let Some(rest) = lead.strip_prefix(marker) {
+            return Some((indent, rest));
+        }
+    }
+    None
+}
+
 /// The spine and the content spans for one item — the content no longer
 /// carries its own marker prefix; the spine owns that column now.
 fn item_block<'a>(item: &TranscriptItem, p: &Palette) -> (Spine, Vec<Line<'a>>) {
@@ -157,9 +247,7 @@ fn item_block<'a>(item: &TranscriptItem, p: &Palette) -> (Spine, Vec<Line<'a>>) 
                 marker_style: Style::new().fg(p.accent),
                 cont_style: Style::new().fg(p.faint),
             },
-            text.split('\n')
-                .map(|l| Line::styled(l.to_string(), Style::new().fg(p.ink)))
-                .collect(),
+            assistant_lines(text, p),
         ),
         TranscriptItem::Steer { text, queued: true } => (
             Spine {
@@ -836,6 +924,85 @@ mod tests {
         // spine glyph still marks who is speaking.
         assert!(rows[0].starts_with("❯ hi"), "no gutter: {:?}", rows[0]);
         assert!(rows[1].starts_with("● yo"), "back-to-back: {:?}", rows[1]);
+    }
+
+    /// Pull the fg/attrs of the first content cell of a row (past the gutter
+    /// and spine) so prose styling can be asserted, not just the glyphs.
+    fn cell_fg(state: &State, row: u16, col: u16) -> Option<Color> {
+        draw_buffer(state).cell((col, row)).unwrap().style().fg
+    }
+
+    #[test]
+    fn assistant_prose_styles_headings_bullets_and_code() {
+        let mut s = State::new(true, "m".into());
+        s.density = hotl_theme::Density::Compact; // gutter 0 → content at col 2
+        s.transcript.push(TranscriptItem::Assistant {
+            text: "# Setup\n- clone the repo\n```\ncargo build\n```\nplain tail".into(),
+        });
+        let rows = draw(&s);
+        let p = Palette::default();
+
+        // Heading: hashes stripped, bold.
+        assert!(
+            rows[0].starts_with("● Setup"),
+            "heading text: {:?}",
+            rows[0]
+        );
+        assert!(
+            draw_buffer(&s)
+                .cell((2, 0))
+                .unwrap()
+                .style()
+                .add_modifier
+                .contains(Modifier::BOLD),
+            "heading is bold"
+        );
+        // Bullet: • marker in accent, at the content column.
+        assert!(
+            rows[1].contains("• clone the repo"),
+            "bullet: {:?}",
+            rows[1]
+        );
+        assert_eq!(cell_fg(&s, 1, 2), Some(p.accent), "bullet marker is accent");
+        // Fenced code: the code line is muted on the band.
+        let code_row = rows.iter().position(|r| r.contains("cargo build")).unwrap();
+        let col = rows[code_row].find("cargo").unwrap() as u16;
+        let cell = draw_buffer(&s)
+            .cell((col, code_row as u16))
+            .unwrap()
+            .style();
+        assert_eq!(cell.fg, Some(p.muted), "code fg muted");
+        assert_eq!(cell.bg, Some(p.band), "code on the band");
+        // Plain line after the closing fence is back to ink, not on the band
+        // (buffer cells default to Reset bg, so assert it's not the band).
+        let tail = rows.iter().position(|r| r.contains("plain tail")).unwrap();
+        let tcol = rows[tail].find("plain").unwrap() as u16;
+        assert_ne!(
+            draw_buffer(&s)
+                .cell((tcol, tail as u16))
+                .unwrap()
+                .style()
+                .bg,
+            Some(p.band),
+            "fence closed: tail is not code"
+        );
+    }
+
+    #[test]
+    fn a_hash_word_is_not_a_heading_and_an_open_fence_runs_to_the_end() {
+        assert_eq!(heading_text("#42 is a count"), None);
+        assert_eq!(heading_text("## Real"), Some("Real".into()));
+        assert_eq!(heading_text("plain"), None);
+        assert_eq!(bullet("  - nested"), Some(("  ", "nested")));
+        assert_eq!(bullet("not a bullet"), None);
+
+        // An unclosed fence keeps everything after it as code. `code_line`
+        // carries the band at line level, so check there.
+        let p = Palette::default();
+        let lines = assistant_lines("```\nline in code\nstill code", &p);
+        // [fence marker, code, code]
+        assert_eq!(lines[1].style.bg, Some(p.band));
+        assert_eq!(lines[2].style.bg, Some(p.band));
     }
 
     #[test]
