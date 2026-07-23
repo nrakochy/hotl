@@ -163,6 +163,19 @@ pub fn preset(name: &str) -> Option<Theme> {
             accent: "#bd93f9".into(),
             band: "#44475a".into(),
         },
+        // Warm, low-blue palette — paper-white ink on a soft brown band,
+        // amber accent, terracotta "active". Deliberately the antidote to
+        // the cool blue-grey default; opt in with `preset = "warm"`.
+        "warm" => Theme {
+            active: "#c4643c".into(),  // terracotta — a tool working
+            blocked: "#c14a4a".into(), // brick red — blocked/failed
+            idle: "#8a9a5b".into(),    // olive — done/idle
+            ink: "#ece0cc".into(),     // warm paper white — body text
+            muted: "#b39a7d".into(),   // tan — details, notices
+            faint: "#8a7355".into(),   // soft brown — continuation bar
+            accent: "#e0a458".into(),  // amber — the assistant marker, bullets
+            band: "#3a2f28".into(),    // warm dark — strip/code background
+        },
         _ => return None,
     })
 }
@@ -249,9 +262,19 @@ mod tests {
             "gruvbox",
             "nord",
             "dracula",
+            "warm",
         ] {
             assert!(preset(name).is_some(), "missing {name}");
         }
+    }
+    #[test]
+    fn warm_preset_is_low_blue() {
+        // The whole point of "warm" is that its ink and accent are not the
+        // cool blue-grey of the default — guard against a copy-paste that
+        // reintroduces a blue.
+        let w = preset("warm").expect("warm exists");
+        assert_ne!(w.ink, Theme::default().ink);
+        assert_eq!(w.accent, "#e0a458");
     }
     #[test]
     fn resolve_no_preset_is_default() {
