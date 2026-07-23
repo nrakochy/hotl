@@ -1,4 +1,4 @@
-use hotl_theme::ThemeConfig;
+use hotl_theme::{Density, ThemeConfig};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -16,6 +16,10 @@ pub struct Settings {
     pub agents: Vec<String>,
     pub vim_mode: bool,
     pub theme: ThemeConfig,
+    /// Transcript spacing for the execute TUI: `compact` | `comfortable` |
+    /// `spacious`. Kept as the raw string so an unknown value warns rather
+    /// than fails to parse the whole config; resolve via [`Settings::density`].
+    pub density: String,
 }
 
 impl Default for Settings {
@@ -26,6 +30,7 @@ impl Default for Settings {
             agents: vec!["claude".into(), "codex".into(), "hotl".into()],
             vim_mode: true,
             theme: ThemeConfig::default(),
+            density: "comfortable".into(),
         }
     }
 }
@@ -40,6 +45,21 @@ impl Settings {
     /// The configured poll interval, floored at [`MIN_POLL_INTERVAL_MS`].
     pub fn poll_interval_ms_clamped(&self) -> u64 {
         self.poll_interval_ms.max(MIN_POLL_INTERVAL_MS)
+    }
+
+    /// Resolve `density`, warning (and falling back to the default) on an
+    /// unrecognized value — the same contract as an unknown theme preset.
+    pub fn density(&self) -> (Density, Option<String>) {
+        match Density::parse(&self.density) {
+            Some(d) => (d, None),
+            None => (
+                Density::default(),
+                Some(format!(
+                    "unknown density '{}' — using comfortable",
+                    self.density
+                )),
+            ),
+        }
     }
 }
 
@@ -91,6 +111,22 @@ fn dirs_config_path() -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn density_defaults_parses_and_warns() {
+        // Default is comfortable, no warning.
+        let (d, warn) = HotlConfig::parse("").settings.density();
+        assert_eq!(d, Density::Comfortable);
+        assert!(warn.is_none());
+        // A set value resolves silently.
+        let c = HotlConfig::parse("[settings]\ndensity = \"compact\"\n");
+        assert_eq!(c.settings.density(), (Density::Compact, None));
+        // A bad value warns and falls back rather than failing the parse.
+        let c = HotlConfig::parse("[settings]\ndensity = \"huge\"\n");
+        let (d, warn) = c.settings.density();
+        assert_eq!(d, Density::Comfortable);
+        assert!(warn.unwrap().contains("huge"));
+    }
 
     #[test]
     fn defaults_when_empty() {

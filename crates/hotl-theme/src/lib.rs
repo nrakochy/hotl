@@ -41,6 +41,48 @@ pub struct ThemeConfig {
     pub band: Option<String>,
 }
 
+/// Transcript spacing. A terminal can't change point size, so "roomier" is
+/// expressed as vertical space between turns plus a left gutter the role
+/// spine lives in. `Comfortable` is the default; `Compact` is the pre-0.5
+/// edge-to-edge look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Density {
+    Compact,
+    #[default]
+    Comfortable,
+    Spacious,
+}
+
+impl Density {
+    /// Parse a config value. `None` for anything unrecognized, so the caller
+    /// can warn and fall back — the same contract as an unknown theme preset.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "compact" => Some(Density::Compact),
+            "comfortable" => Some(Density::Comfortable),
+            "spacious" => Some(Density::Spacious),
+            _ => None,
+        }
+    }
+
+    /// Blank lines inserted between one turn and the next.
+    pub fn blank_lines(self) -> usize {
+        match self {
+            Density::Compact => 0,
+            Density::Comfortable | Density::Spacious => 1,
+        }
+    }
+
+    /// Left-gutter width in columns — where the role spine is drawn.
+    pub fn gutter(self) -> usize {
+        match self {
+            Density::Compact => 0,
+            Density::Comfortable => 2,
+            Density::Spacious => 4,
+        }
+    }
+}
+
 /// Parse a `#rrggbb` (or `rrggbb`) hex color into its RGB bytes. Returns `None`
 /// for any string that isn't exactly six hex digits — the single source of
 /// truth for what counts as a valid color, shared by config validation and the
@@ -252,6 +294,21 @@ mod tests {
     #[test]
     fn preset_unknown_is_none() {
         assert_eq!(preset("nope"), None);
+    }
+    #[test]
+    fn density_parses_and_maps_to_spacing() {
+        assert_eq!(Density::parse("compact"), Some(Density::Compact));
+        assert_eq!(Density::parse(" Comfortable "), Some(Density::Comfortable));
+        assert_eq!(Density::parse("SPACIOUS"), Some(Density::Spacious));
+        assert_eq!(Density::parse("cozy"), None);
+        assert_eq!(Density::default(), Density::Comfortable);
+        // Compact reproduces today's edge-to-edge, no-blank look.
+        assert_eq!(
+            (Density::Compact.blank_lines(), Density::Compact.gutter()),
+            (0, 0)
+        );
+        assert_eq!(Density::Comfortable.gutter(), 2);
+        assert_eq!(Density::Spacious.gutter(), 4);
     }
     #[test]
     fn all_named_presets_exist() {
