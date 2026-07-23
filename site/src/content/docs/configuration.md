@@ -97,15 +97,51 @@ accent = "#88c0d0"         # optional per-slot #rrggbb overrides: active blocked
 **Claude Code skills load too.** If you have skills in the Claude format —
 `~/.claude/skills/<name>/SKILL.md`, or plugin skills under
 `~/.claude/plugins/cache/` (highest installed version per plugin) — the
-`skill` tool reads them in place: frontmatter descriptions in the roster, the
-body on demand prefixed with its base directory so `references/` and
-`scripts/` paths resolve (scripts still run through the normal bash gate and
-sandbox). Bare names prefer hotl's own skills, then your marketplaces, then
-your Claude skills, then plugins; a plugin skill is always also reachable as
-`plugin:skill`. Opt out with:
+`skill` tool reads them in place: the body loads on demand prefixed with its
+base directory so `references/` and `scripts/` paths resolve (scripts still
+run through the normal bash gate and sandbox). Bare names prefer hotl's own
+skills, then your marketplaces, then your Claude skills, then plugins; a
+plugin skill is always also reachable as `plugin:skill`. Opt out with:
 
     [skills]
     claude = false
+
+#### How the agent finds a skill
+
+Skills stay out of the context until they are used. What the model is shown
+on every request is a grouped index — one line per source, with descriptions
+left out entirely, and any source over 12 skills collapsed to a few names
+plus a count:
+
+    hotl: deploy, release
+    claude: auth, go-service, system-shape, vps-cluster
+    superpowers (28): brainstorming, test-driven-development, writing-plans, +25 more
+
+That index costs roughly 120 tokens instead of the ~1,300 a full roster of
+38 skills would, and it grows per *source* — registering a 300-skill
+marketplace adds one line, not 300 names. From there the agent has three
+moves:
+
+| Call | What it does |
+|---|---|
+| `{"name": "deploy"}` | Loads that skill. The usual call. |
+| `{"query": "review a pull request"}` | Searches every skill's full description — **including collapsed ones** — and returns the best 8. |
+| `{"source": "superpowers"}` | Lists one source in full. |
+
+Calling it with no arguments still lists everything.
+
+A collapsed skill is hidden, not unreachable: search covers the whole roster,
+so `query` finds skills the index never named. `hotl skills` always prints
+every skill with its full description — the human view never collapses.
+
+**Forcing one yourself.** In the console TUI, type `/` and the skill name:
+
+    /brainstorming redesign the skill system
+
+Built-in commands (`/rename`) win the name; anything else is looked up as a
+skill, with the rest of the line passed along as arguments. An unrecognised
+name stays an unknown-command notice and never reaches the model. This is the
+manual override for the times the agent doesn't think to search.
 | `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
 
 ### Skill marketplaces

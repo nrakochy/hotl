@@ -55,6 +55,25 @@ There is **no bell, ever** — salience is visual only. `hotl watch` is the thin
 
 Type and press `Enter` to prompt. **Typing while a turn runs is steering**: submit and it becomes a pinned `⤷` chip — dim while queued, and the engine folds it in at the next step. `Shift`/`Alt`+`Enter` inserts a newline.
 
+## Slash commands
+
+A line starting with `/` is handled locally and never becomes a prompt on its
+own.
+
+| Command | Effect |
+|---|---|
+| `/rename <name>` | Rename the session (1–64 chars); the badge and terminal title follow. |
+| `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments. |
+
+Built-ins are matched first, so a skill named `rename` cannot shadow
+`/rename`. Any other name is looked up in your skill roster — bare
+(`/brainstorming`) or qualified (`/superpowers:brainstorming`). A name that
+matches nothing prints an unknown-command notice and costs you no turn.
+
+`/<skill>` exists because the agent is shown a compact index rather than every
+skill's description ([configuration.md](../configuration/)); when it doesn't
+reach for the skill you had in mind, this is how you hand it over directly.
+
 ## Permission asks
 
 An ask freezes the loop (the gap glyph) and opens a modal with the tool summary — and a loud `⚠` line when a protected path is involved. `y` allows. `n` starts a deny: type an optional reason, `Enter` sends it (the reason goes to the model verbatim; `Esc` backs out of the deny).

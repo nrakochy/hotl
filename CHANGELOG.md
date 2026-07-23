@@ -6,7 +6,33 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **Skills load lazily.** The `skill` tool used to advertise every skill
+  name *and* a 150-character description on every single request — about
+  1,300 tokens for a 38-skill roster, whether or not a skill was ever
+  used, and growing with each one added. The always-sent index is now
+  grouped by source with descriptions dropped, and any source over 12
+  skills collapses to a few names plus a count, so the cost grows per
+  source rather than per skill: registering a 300-skill marketplace adds
+  one line, not 300 names. Roughly 120 tokens in place of 1,300.
+
+  Because collapsed skills are no longer named up front, the tool gained
+  two ways to find them: `{"query": "…"}` ranks every skill — collapsed
+  ones included — against its full description and returns the best
+  matches, and `{"source": "…"}` lists one source outright. Loading by
+  `{"name"}` is unchanged, as is `hotl skills`, which still prints the
+  whole roster with full descriptions.
+
 ### Added
+
+- `/<skill>` in the console TUI loads a skill by name and follows it,
+  with the rest of the line passed as arguments
+  (`/brainstorming redesign the parser`). Built-in commands like `/rename`
+  are matched first; an unrecognised name prints a notice and costs no
+  turn. This is the manual override for a skill the agent doesn't think to
+  search for. ACP `initialize` now returns the skill names so any front
+  end can offer the same thing.
 
 - Endpoints that authenticate for you: `[provider] auth = "subscription"`
   (env `HOTL_PROVIDER_AUTH`) runs hotl with no credential of its own, for
