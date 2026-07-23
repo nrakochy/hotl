@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
-# Cut a release: bump the workspace version, commit, tag, and push.
-# The vX.Y.Z tag triggers the crates.io publish + prebuilt-binary workflows.
+# Cut a release: promote the changelog, bump the workspace version, commit,
+# tag, and push. The vX.Y.Z tag triggers the crates.io publish + prebuilt-
+# binary workflows.
+#
+# The changelog is part of the release, not an afterthought: `## [Unreleased]`
+# becomes `## [X.Y.Z] - <today>` with a fresh empty `[Unreleased]` above it.
+# v0.3.0 shipped without its section and had to be backfilled by hand
+# (c0dd281) — hence the hard check below rather than a reminder in a doc.
 #
 # Usage:
 #   scripts/release.sh patch      # 0.1.0 -> 0.1.1
@@ -36,6 +42,36 @@ if git rev-parse "$tag" >/dev/null 2>&1; then
   exit 1
 fi
 
+# --- changelog checks, before anything is edited --------------------------
+# Everything below this point mutates files, so every reason to refuse has
+# to be established first: a half-bumped tree is worse than no release.
+
+if ! grep -q '^## \[Unreleased\]' CHANGELOG.md; then
+  echo "error: CHANGELOG.md has no '## [Unreleased]' heading to promote." >&2
+  echo "hint: add one above the newest version section." >&2
+  exit 1
+fi
+
+# "Has content" = a non-blank line between [Unreleased] and the next `## [`.
+if ! awk '
+    /^## \[Unreleased\]/ { inside = 1; next }
+    /^## \[/             { inside = 0 }
+    inside && NF         { found = 1 }
+    END                  { exit !found }
+  ' CHANGELOG.md; then
+  echo "error: '## [Unreleased]' is empty — refusing to tag a release with no notes." >&2
+  echo "hint: describe the change under it. For a no-op bump, say so explicitly," >&2
+  echo "      e.g. '- Maintenance release: dependency bumps only.'" >&2
+  exit 1
+fi
+
+# A section for this version must not already exist (re-running after a
+# partial failure, or an entry written by hand).
+if grep -q "^## \[$new\]" CHANGELOG.md; then
+  echo "error: CHANGELOG.md already has a '## [$new]' section." >&2
+  exit 1
+fi
+
 echo "releasing $current -> $new"
 
 # Bump the first bare `version = "..."` line — the [workspace.package] one,
@@ -57,6 +93,20 @@ done
 sed -E 's/(text: crates\.io v)[0-9]+\.[0-9]+\.[0-9]+/\1'"$new"'/' \
   site/src/content/docs/index.mdx > site/src/content/docs/index.mdx.tmp \
   && mv site/src/content/docs/index.mdx.tmp site/src/content/docs/index.mdx
+
+# Promote the changelog: what was unreleased is now this version, and a fresh
+# empty [Unreleased] takes its place. The entries themselves are untouched —
+# they simply end up under a dated heading.
+awk -v v="$new" -v d="$(date +%F)" '
+  !done && /^## \[Unreleased\]/ {
+    print "## [Unreleased]"
+    print ""
+    print "## [" v "] - " d
+    done = 1
+    next
+  }
+  { print }
+' CHANGELOG.md > CHANGELOG.md.tmp && mv CHANGELOG.md.tmp CHANGELOG.md
 
 cargo build --quiet            # sync Cargo.lock to the new version
 git commit -aqm "release: $tag"
