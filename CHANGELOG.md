@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-23
+
 ### Changed
 
 - **Skills load lazily.** The `skill` tool used to advertise every skill
