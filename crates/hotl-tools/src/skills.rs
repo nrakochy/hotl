@@ -28,6 +28,16 @@ use tokio_util::sync::CancellationToken;
 /// Listing truncation: full descriptions load with the body, not the roster.
 const DESC_CAP: usize = 150;
 
+/// A source listing more than this many skills collapses in the tool
+/// description to a sample plus a count, so the always-sent roster costs
+/// one line per *source* rather than one entry per *skill*. Registering a
+/// 300-skill marketplace then adds a line, not 300 names.
+const ROLLUP_THRESHOLD: usize = 12;
+
+/// How many names a collapsed source still shows — enough to convey what
+/// the source is about without listing it.
+const ROLLUP_SAMPLE: usize = 3;
+
 struct SkillEntry {
     name: String,
     /// `<source>:<skill>` alias — always loadable, even when the bare
@@ -84,15 +94,7 @@ impl SkillTool {
         if entries.is_empty() {
             return None;
         }
-        let names = entries
-            .iter()
-            .map(|e| format!("`{}` ({})", e.name, truncate(&e.description, DESC_CAP)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let description = format!(
-            "Load one of the user's saved skills (procedures/checklists): {names}. \
-             Call with {{\"name\"}} to load one; no arguments lists them."
-        );
+        let description = describe(&entries);
         Some(Self {
             entries,
             description,
@@ -104,6 +106,57 @@ impl SkillTool {
         self.entries
             .iter()
             .map(|e| (e.name.as_str(), e.source.as_str(), e.description.as_str()))
+    }
+}
+
+/// The always-sent tool description: one line per source, large sources
+/// collapsed. Descriptions are deliberately absent — `query` searches
+/// them, including inside collapsed sources, so a skill that is not named
+/// here is still reachable.
+fn describe(entries: &[SkillEntry]) -> String {
+    let mut sources: Vec<&str> = Vec::new();
+    for e in entries {
+        if !sources.contains(&e.source.as_str()) {
+            sources.push(&e.source);
+        }
+    }
+    sources.sort_by_key(|s| (source_tier(s), *s));
+    let mut out = String::from(
+        "Load one of the user's saved skills (procedures/checklists). \
+         {\"name\"} loads one and is the usual call; {\"query\"} searches \
+         every skill's full description (including sources collapsed \
+         below); {\"source\"} lists one source; no arguments lists \
+         everything.",
+    );
+    for source in sources {
+        let names: Vec<&str> = entries
+            .iter()
+            .filter(|e| e.source == source)
+            .map(|e| e.name.as_str())
+            .collect();
+        out.push_str("\n  ");
+        if names.len() > ROLLUP_THRESHOLD {
+            out.push_str(&format!(
+                "{source} ({}): {}, +{} more — {{\"source\":\"{source}\"}} lists them",
+                names.len(),
+                names[..ROLLUP_SAMPLE].join(", "),
+                names.len() - ROLLUP_SAMPLE,
+            ));
+        } else {
+            out.push_str(&format!("{source}: {}", names.join(", ")));
+        }
+    }
+    out
+}
+
+/// Listing order mirrors bare-name precedence — hotl, marketplaces,
+/// Claude user, Claude plugins — so the owner's own sources read first.
+fn source_tier(source: &str) -> u8 {
+    match source {
+        "hotl" => 0,
+        "claude" => 2,
+        s if s.starts_with("claude:") => 3,
+        _ => 1,
     }
 }
 
@@ -466,7 +519,11 @@ mod tests {
         .unwrap();
 
         let tool = SkillTool::new(dir.path(), false, &[]).expect("a skill exists");
-        assert!(tool.description().contains("`deploy` (Deploy checklist)"));
+        assert!(tool.description().contains("hotl: deploy"));
+        assert_eq!(
+            tool.roster().collect::<Vec<_>>(),
+            vec![("deploy", "hotl", "Deploy checklist")]
+        );
 
         let listing = tool.run_impl(&json!({}));
         assert!(!listing.is_error && listing.content.contains("deploy — Deploy checklist"));
@@ -480,6 +537,42 @@ mod tests {
         assert!(tool.run_impl(&json!({"name": "../secrets"})).is_error);
         let missing = tool.run_impl(&json!({"name": "nope"}));
         assert!(missing.is_error && missing.content.contains("Available: deploy"));
+    }
+
+    /// The point of the rollup: a big marketplace costs a line, not a name
+    /// per skill, and every collapsed skill stays loadable by name.
+    #[test]
+    fn a_large_source_collapses_to_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mkt = dir.path().join("big");
+        for i in 0..300 {
+            write_skill(
+                &mkt.join(format!("skill-{i:03}")),
+                &format!("name: skill-{i:03}\ndescription: number {i}"),
+                "body",
+            );
+        }
+        let flat = dir.path().join("skills");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("deploy.md"), "# Deploy checklist\nsteps\n").unwrap();
+
+        let none = dir.path().join("none");
+        let tool =
+            SkillTool::with_roots(&flat, &[("big".into(), mkt)], &none, &none, false).unwrap();
+
+        let desc = tool.description();
+        assert_eq!(desc.lines().count(), 3, "header + hotl + big: {desc}");
+        assert!(desc.contains("big (300): skill-000, skill-001, skill-002, +297 more"));
+        assert!(
+            desc.len() < 500,
+            "300 skills must not inflate the roster: {} bytes",
+            desc.len()
+        );
+        // Collapsed but not hidden: unnamed skills still load and search.
+        assert!(tool
+            .run_impl(&json!({"name": "skill-299"}))
+            .content
+            .contains("body"));
     }
 
     #[test]
@@ -537,19 +630,22 @@ mod tests {
 
         let tool = SkillTool::with_roots(&flat, &[], &user, &cache, true).unwrap();
         let desc = tool.description();
+        assert!(desc.contains("hotl: deploy"), "{desc}");
+        assert!(desc.contains("claude: go-service"), "{desc}");
         assert!(
-            desc.contains("`deploy`") && desc.contains("`go-service`"),
-            "{desc}"
-        );
-        assert!(desc.contains("Generate Go services"), "{desc}");
-        assert!(!desc.contains(&long_tail), "roster must truncate: {desc}");
-        assert!(
-            desc.contains("(new)") && !desc.contains("(old)"),
-            "higher version wins: {desc}"
+            !desc.contains("Generate Go services") && !desc.contains(&long_tail),
+            "descriptions never enter the always-sent roster: {desc}"
         );
         assert!(
-            desc.contains("`other:deploy`"),
+            desc.contains("other:deploy"),
             "colliding plugin is qualified: {desc}"
+        );
+        // Version dedup is a roster fact now that descriptions left the
+        // tool description.
+        let descs: Vec<&str> = tool.roster().map(|(_, _, d)| d).collect();
+        assert!(
+            descs.iter().any(|d| d.contains("(new)")) && !descs.iter().any(|d| d.contains("(old)")),
+            "higher version wins: {descs:?}"
         );
 
         // Claude skill loads with the base-dir header inside the envelope.
@@ -589,7 +685,7 @@ mod tests {
         // Opt-out: only the flat root remains.
         let tool = SkillTool::with_roots(&flat, &[], &user, &cache, false).unwrap();
         assert!(!tool.description().contains("go-service"));
-        assert!(tool.description().contains("`deploy`"));
+        assert!(tool.description().contains("hotl: deploy"));
     }
 
     #[test]
@@ -624,12 +720,9 @@ mod tests {
         let tool = SkillTool::with_roots(&flat, &marketplaces, &none, &none, false).unwrap();
 
         let desc = tool.description();
+        assert!(desc.contains("release") && desc.contains("notes"), "{desc}");
         assert!(
-            desc.contains("`release`") && desc.contains("`notes`"),
-            "{desc}"
-        );
-        assert!(
-            desc.contains("`acme:deploy`"),
+            desc.contains("acme:deploy"),
             "colliding name qualifies: {desc}"
         );
         assert!(
@@ -669,7 +762,7 @@ mod tests {
         // A registered-but-missing root skips silently.
         let gone = vec![("ghost".to_string(), dir.path().join("missing"))];
         let tool = SkillTool::with_roots(&flat, &gone, &none, &none, false).unwrap();
-        assert!(tool.description().contains("`deploy`"));
+        assert!(tool.description().contains("hotl: deploy"));
         assert!(!tool.description().contains("ghost"));
     }
 
@@ -712,10 +805,9 @@ mod tests {
             true,
         )
         .unwrap();
-        assert!(
-            tool.description().contains("`odd` (Odd skill)"),
-            "{}",
-            tool.description()
+        assert_eq!(
+            tool.roster().collect::<Vec<_>>(),
+            vec![("odd", "claude", "Odd skill")]
         );
     }
 }
