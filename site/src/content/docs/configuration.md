@@ -78,11 +78,28 @@ command = "/usr/local/bin/guard"
 [diagnostics]              # post-edit checks (see hooks.md)
 rs = "cargo check -q --message-format=short"
 
+[settings]
+density = "comfortable"    # transcript spacing: compact | comfortable | spacious
+
 [settings.theme]           # palette for the console AND `hotl watch` (see tui.md)
-preset = "nord"            # tokyo-night (the default) | catppuccin | gruvbox | nord | dracula
+preset = "warm"            # tokyo-night (the default) | warm | catppuccin | gruvbox | nord | dracula
 accent = "#88c0d0"         # optional per-slot #rrggbb overrides: active blocked idle
                            # ink muted faint accent band
 ```
+
+**`density`** controls how much room the console TUI gives the transcript
+(colors live under `[settings.theme]`; the two are independent):
+
+| Value | Between turns | Left gutter |
+|---|---|---|
+| `compact` | no blank line | none — edge to edge |
+| `comfortable` *(default)* | one blank line | 2 columns |
+| `spacious` | one blank line | 4 columns |
+
+An unrecognized value warns and falls back to `comfortable`. The gutter is
+where the role spine is drawn (see [tui.md](../tui/)). `warm` is a low-blue
+palette — paper-white ink, amber accent, terracotta — for a less clinical
+feel; it's opt-in, the default stays `tokyo-night`.
 
 **Precedence for the scalar settings: environment variable > config.toml > default.** So a `HOTL_MODEL` in the shell overrides `[provider].model`, and CI can override anything without editing the file.
 

@@ -6,6 +6,31 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **The console transcript is easier to read at a glance.** Every turn now
+  carries a fixed marker in the left gutter — `❯` you, `●` the assistant
+  (with a `│` bar down multi-line answers), `✓`/`✗`/`⛔` tools, `⤷` steer,
+  `·` notice — each in its role color, so the shape of the conversation is
+  visible by scanning down. Assistant answers also get light structure:
+  `#` headings bold, `-`/`*` bullets with a `•` marker, and fenced or
+  indented code on a muted band. Tool cards drop the `[name]` brackets; the
+  glyph moved to the gutter and the name keeps its status color.
+- The transcript now defaults to **comfortable** spacing — a blank line
+  between turns and a small left gutter. Set `[settings] density = "compact"`
+  for the previous edge-to-edge look, or `"spacious"` for more.
+
+### Added
+
+- **`[settings] density`** — `compact` | `comfortable` | `spacious`, the
+  console transcript's vertical spacing and gutter width. Unknown values
+  warn and fall back to comfortable.
+- **`warm` theme preset** — a low-blue palette (paper-white ink, amber
+  accent, terracotta) for a less clinical console. Opt in with
+  `[settings.theme] preset = "warm"`; the default stays `tokyo-night`.
+  Note that font size and family are set in your terminal, not hotl — see
+  the docs' "Making it warmer".
+
 ## [0.4.0] - 2026-07-23
 
 ### Changed

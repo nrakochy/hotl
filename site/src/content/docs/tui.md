@@ -24,17 +24,26 @@ The console wears the same palette as `hotl watch`, from the same `[settings.the
 
 ```toml
 [settings.theme]
-preset = "nord"       # tokyo-night (the default) | catppuccin | gruvbox | nord | dracula
+preset = "warm"       # tokyo-night (the default) | warm | catppuccin | gruvbox | nord | dracula
 accent = "#88c0d0"    # optional per-slot #rrggbb overrides
 ```
 
 Eight slots: `active` (working), `blocked` (waiting on you), `idle` (settled), `ink`/`muted`/`faint` (text tiers), `accent`, and `band` (the strip background). An unknown preset or invalid color falls back with a one-line warning — the console always launches.
 
+### Making it warmer
+
+Two knobs, one in each table:
+
+- **`preset = "warm"`** — a deliberately low-blue palette (paper-white ink, amber accent, terracotta) instead of the cool blue-grey default.
+- **`[settings] density = "comfortable"`** (the default) or `"spacious"` — more room between turns and a wider gutter. `"compact"` is the old edge-to-edge look. See [configuration.md](../configuration/).
+
+**Font size and family are your terminal's job, not hotl's** — like `vim` or `htop`, the app draws onto whatever grid the emulator gives it and can't set the point size or typeface. To go bigger or warmer there, change it in your terminal: Ghostty (`font-size`, `font-family` in `~/.config/ghostty/config`), iTerm2 (Preferences → Profiles → Text), Kitty (`font_size`, `font_family` in `kitty.conf`), Alacritty (`font` in `alacritty.toml`). A warm monospace face — Berkeley Mono, Comic Code, IBM Plex Mono — pairs well with the `warm` preset.
+
 ## The screen
 
 Top to bottom:
 
-1. **Transcript** — your prompts (`❯ `), the streaming reply, tool cards `[✓ bash] cargo test · 2s`, and dim notices (retries, fallbacks, compaction). With the input empty, `j`/`k` scroll it; it snaps back to following the bottom on your next prompt.
+1. **Transcript** — every turn carries a marker in the left gutter, so you can see the shape of the conversation by scanning straight down: `❯` your prompts, `●` the assistant (with a `│` bar down a long answer), `✓ ✗ ⛔` tool cards (`✓ bash  cargo test · 2s`), `⤷` steers, `·` dim notices (retries, fallbacks, compaction). Inside an assistant answer, headings, bullets, and code get light styling so a long reply is scannable. With the input empty, `j`/`k` scroll it; it snaps back to following the bottom on your next prompt.
 2. **Activity strip** — one line that tells you what the turn is doing, animated as a loop drawing itself:
 
    | You see | It means |
