@@ -79,6 +79,10 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 
     let suspended = Arc::new(AtomicBool::new(false));
     let keys = spawn_key_reader(suspended.clone());
+    // Armed before the screen is taken: a signal or panic between here and
+    // the guard's `Drop` must not strand the terminal in raw mode.
+    crate::term::restore_on_panic();
+    crate::term::trap_signals();
     let mut guard = match TerminalGuard::enter() {
         Ok(g) => g,
         Err(e) => {
@@ -498,6 +502,7 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
+        crate::term::capture();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(e) = execute!(stdout, EnterAlternateScreen) {
@@ -505,7 +510,10 @@ impl TerminalGuard {
             return Err(e);
         }
         match Terminal::new(CrosstermBackend::new(stdout)) {
-            Ok(terminal) => Ok(TerminalGuard { terminal }),
+            Ok(terminal) => {
+                crate::term::arm();
+                Ok(TerminalGuard { terminal })
+            }
             Err(e) => {
                 let _ = execute!(io::stdout(), LeaveAlternateScreen);
                 let _ = disable_raw_mode();
@@ -518,6 +526,7 @@ impl TerminalGuard {
     fn suspend(&mut self) {
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        crate::term::disarm();
     }
 
     /// …and take it back.
@@ -525,6 +534,7 @@ impl TerminalGuard {
         let _ = enable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
         let _ = self.terminal.clear();
+        crate::term::arm();
     }
 }
 
@@ -533,6 +543,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
+        crate::term::disarm();
     }
 }
 

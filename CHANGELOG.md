@@ -6,6 +6,18 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A signal no longer leaves your terminal wedged.** Both TUIs restored the
+  screen only when their guard dropped, so anything that killed the process
+  outright — a real `SIGINT`, a `SIGTERM`, closing the window (`SIGHUP`) —
+  left the terminal in raw mode inside the alternate screen: no echo, no
+  cursor, the shell prompt drawn invisibly over the dashboard, and a second
+  Ctrl-C needed before the terminal was usable. Ctrl-C normally reaches the
+  console as a key, so this only showed up once something restored sane tty
+  modes underneath it. The restore now also runs from a signal handler and a
+  panic hook, and the process exits `128+signo`.
+
 ## [0.4.1] - 2026-07-23
 
 ### Changed

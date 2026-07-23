@@ -30,6 +30,7 @@ mod shell_hooks;
 mod skills_cli;
 mod spawn;
 mod structured;
+mod term;
 mod tui;
 mod watch;
 

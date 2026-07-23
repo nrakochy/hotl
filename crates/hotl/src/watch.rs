@@ -26,6 +26,7 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
+        crate::term::capture();
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         // If entering the alt screen fails, undo raw mode before propagating.
@@ -41,6 +42,7 @@ impl TerminalGuard {
                 return Err(e);
             }
         };
+        crate::term::arm();
         Ok(TerminalGuard { terminal })
     }
 }
@@ -51,6 +53,7 @@ impl Drop for TerminalGuard {
         let _ = disable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
+        crate::term::disarm();
     }
 }
 
@@ -63,6 +66,9 @@ pub fn watch_main() -> io::Result<()> {
     let (cfg, config_warning) = HotlConfig::load_with_warning();
     let listener = Listener::new(vec![Box::new(TmuxSurface::new(&cfg.settings.agents))]);
 
+    // `catch_unwind` below covers panics; signals skip every destructor, so
+    // they get their own restore.
+    crate::term::trap_signals();
     let mut guard = TerminalGuard::enter()?;
     // Catch a panic in the run loop so the guard's Drop restores the terminal
     // first, then re-raise so the panic message renders on the real screen.

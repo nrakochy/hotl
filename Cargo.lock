@@ -747,6 +747,7 @@ dependencies = [
  "hotl-watch-tui",
  "hotl-watch-types",
  "jsonschema",
+ "libc",
  "ratatui",
  "reqwest",
  "serde",
