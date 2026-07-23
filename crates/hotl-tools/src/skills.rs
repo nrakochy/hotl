@@ -785,11 +785,34 @@ mod tests {
             "300 skills must not inflate the roster: {} bytes",
             desc.len()
         );
-        // Collapsed but not hidden: unnamed skills still load and search.
+        // Collapsed but not hidden. This is the property the whole rollup
+        // rests on, so assert both halves: a skill the description never
+        // named still loads by name *and* is still found by search.
         assert!(tool
             .run_impl(&json!({"name": "skill-299"}))
             .content
             .contains("body"));
+
+        let found = tool.run_impl(&json!({"query": "number 299"}));
+        assert!(!found.is_error, "{}", found.content);
+        assert!(
+            found
+                .content
+                .lines()
+                .next()
+                .unwrap()
+                .starts_with("skill-299"),
+            "search must reach a collapsed skill: {}",
+            found.content
+        );
+        assert!(
+            !tool.description().contains("skill-299"),
+            "and it really was collapsed out of the roster"
+        );
+
+        // Expanding the source lists every collapsed skill.
+        let expanded = tool.run_impl(&json!({"source": "big"}));
+        assert_eq!(expanded.content.lines().count(), 300);
     }
 
     #[test]
