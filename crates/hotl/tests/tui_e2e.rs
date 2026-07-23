@@ -305,10 +305,11 @@ async fn deny_with_reason_reaches_engine() {
 
     assert_eq!(state.phase, Phase::Idle, "the turn ends after the deny");
     let rows = draw(&state);
-    // "⛔" is a width-2 glyph — ratatui pads the following cell, so match the
-    // marker and the card text separately rather than the exact "⛔ bash" run.
+    // The denied card is now spine-marked: a ⛔ glyph in the gutter, the name
+    // no longer bracketed. "⛔" is width-2, so match the marker and the name
+    // separately rather than an exact "⛔ bash" run.
     assert!(
-        rows.iter().any(|r| r.contains('⛔') && r.contains("bash]")),
+        rows.iter().any(|r| r.contains('⛔') && r.contains("bash")),
         "denied tool card renders: {:#?}",
         state.transcript
     );
