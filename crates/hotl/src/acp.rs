@@ -79,6 +79,7 @@ pub async fn serve(
     read: impl AsyncRead + Send + Unpin + 'static,
     write: impl AsyncWrite + Send + Unpin + 'static,
     mut factory: SessionFactory,
+    skills: Vec<String>,
 ) {
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -112,6 +113,7 @@ pub async fn serve(
             &pending,
             &pending_prompt,
             &mut next_id,
+            &skills,
         )
         .await;
     }
@@ -132,11 +134,15 @@ async fn handle_request(
     pending: &Pending,
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
+    skills: &[String],
 ) {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     match msg.get("method").and_then(Value::as_str).unwrap_or("") {
         "initialize" => {
-            reply_ok(writer, id, json!({"protocolVersion": PROTOCOL_VERSION, "schemaVersion": UPDATE_SCHEMA_VERSION})).await;
+            // `skills` lets a front end resolve `/<skill>` itself — the
+            // roster is server-side knowledge, so the client never has to
+            // walk the config dirs to know what a slash could mean.
+            reply_ok(writer, id, json!({"protocolVersion": PROTOCOL_VERSION, "schemaVersion": UPDATE_SCHEMA_VERSION, "skills": skills})).await;
         }
         method @ ("session/new" | "session/load") => {
             let name = match msg.pointer("/params/name") {

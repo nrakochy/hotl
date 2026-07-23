@@ -122,8 +122,22 @@ pub async fn acp_main() -> i32 {
         Ok(pair) => pair,
         Err(code) => return code,
     };
-    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory).await;
+    let skills = skill_names(&config_dir());
+    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory, skills).await;
     0
+}
+
+/// Every loadable skill name (bare, plus each `source:skill` alias) for the
+/// ACP `initialize` result — what a client needs to offer `/<skill>`
+/// dispatch without reaching past the protocol into the engine. Empty when
+/// no skills are configured.
+pub(crate) fn skill_names(config_dir: &std::path::Path) -> Vec<String> {
+    let cfg = crate::config::Config::load(config_dir);
+    let include_claude = cfg.skills.claude.unwrap_or(true);
+    let (marketplaces, _) = cfg.skills.marketplace_roots(config_dir);
+    hotl_tools::skills::SkillTool::new(config_dir, include_claude, &marketplaces)
+        .map(|t| t.names().map(String::from).collect())
+        .unwrap_or_default()
 }
 
 /// The real-engine session factory `hotl acp` and `hotl tui` share, plus the

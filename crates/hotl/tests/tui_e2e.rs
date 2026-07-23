@@ -67,7 +67,7 @@ fn scripted_factory() -> acp::SessionFactory {
 async fn start() -> (Client, Reader) {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut client = AcpClient::new(cwrite);
     let mut reader = BufReader::new(cread);

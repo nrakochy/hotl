@@ -65,11 +65,34 @@ async fn send(w: &mut (impl AsyncWriteExt + Unpin), v: Value) {
     w.flush().await.unwrap();
 }
 
+/// `initialize` advertises the roster so a front end can resolve
+/// `/<skill>` without walking the config dirs itself.
+#[tokio::test]
+async fn initialize_advertises_skill_names() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    let skills = vec!["brainstorming".to_string(), "acme:deploy".to_string()];
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), skills));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let init = next(&mut lines).await;
+    assert_eq!(
+        init["result"]["skills"],
+        json!(["brainstorming", "acme:deploy"])
+    );
+}
+
 #[tokio::test]
 async fn initialize_new_prompt_permission_and_result() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -190,7 +213,7 @@ async fn overlapping_prompts_resolve_in_order() {
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, factory));
+    tokio::spawn(acp::serve(sread, swrite, factory, Vec::new()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -225,7 +248,7 @@ async fn overlapping_prompts_resolve_in_order() {
 async fn replacing_a_session_clears_parked_state() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -301,7 +324,7 @@ async fn replacing_a_session_clears_parked_state() {
 async fn steer_is_acknowledged_and_reaches_engine() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -359,7 +382,7 @@ async fn read_until_id(
 async fn named_open_and_rename() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 

@@ -60,13 +60,14 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
-    tokio::spawn(crate::acp::serve(sread, swrite, factory));
+    let skills = crate::agent::skill_names(&crate::agent::config_dir());
+    tokio::spawn(crate::acp::serve(sread, swrite, factory, skills));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut reader = BufReader::new(cread);
     let mut client = AcpClient::new(cwrite);
 
-    let session_name = match handshake(&mut client, &mut reader, spec, name).await {
-        Ok(n) => n,
+    let (session_name, skills) = match handshake(&mut client, &mut reader, spec, name).await {
+        Ok(pair) => pair,
         Err(e) => {
             eprintln!("hotl: {e}");
             return 1;
@@ -84,6 +85,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     };
     let mut state = State::new(vim_mode, model);
     state.session_name = session_name;
+    state.skills = skills;
     let result = run_loop(
         &mut guard,
         &mut client,
@@ -106,15 +108,26 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 
 /// initialize + session/new|load before entering raw mode, so wiring errors
 /// print as plain lines instead of corrupting an alt-screen. Returns the
-/// opened session's display name (server-confirmed).
+/// opened session's display name (server-confirmed) and the skill names
+/// `initialize` advertised, which is what makes `/<skill>` resolvable.
 async fn handshake(
     client: &mut Client,
     reader: &mut ServerReader,
     spec: Option<String>,
     name: Option<String>,
-) -> Result<Option<String>, String> {
+) -> Result<(Option<String>, Vec<String>), String> {
     let init = client.request("initialize", Value::Null).await;
-    wait_response(reader, init).await?;
+    let hello = wait_response(reader, init).await?;
+    let skills: Vec<String> = hello
+        .get("skills")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
     let open = match spec {
         None => client.request("session/new", json!({"name": name})).await,
         Some(sid) => {
@@ -124,7 +137,10 @@ async fn handshake(
         }
     };
     let v = wait_response(reader, open).await?;
-    Ok(v.get("name").and_then(Value::as_str).map(String::from))
+    Ok((
+        v.get("name").and_then(Value::as_str).map(String::from),
+        skills,
+    ))
 }
 
 async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, String> {

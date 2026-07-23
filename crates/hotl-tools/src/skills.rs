@@ -109,6 +109,16 @@ impl SkillTool {
             .iter()
             .map(|e| (e.name.as_str(), e.source.as_str(), e.description.as_str()))
     }
+
+    /// Every name `{"name"}` accepts: the bare name plus any
+    /// `source:skill` alias. Front ends use this to resolve `/<skill>`.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.entries.iter().flat_map(|e| {
+            // A collided skill has `name == qualified`; do not repeat it.
+            std::iter::once(e.name.as_str())
+                .chain(e.qualified.as_deref().filter(|q| *q != e.name.as_str()))
+        })
+    }
 }
 
 /// The always-sent tool description: one line per source, large sources

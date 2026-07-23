@@ -95,6 +95,10 @@ pub struct State {
     /// Display name (badge + titles); seeded from the open handshake,
     /// updated by `/rename`.
     pub session_name: Option<String>,
+    /// Every loadable skill name, from the `initialize` result. `/<name>`
+    /// resolves against this, so an unknown slash stays an unknown
+    /// command instead of becoming a wasted turn.
+    pub skills: Vec<String>,
 }
 
 impl State {
@@ -111,6 +115,7 @@ impl State {
             interrupt_sent: false,
             pending_auto_rule: None,
             session_name: None,
+            skills: Vec::new(),
         }
     }
 
@@ -403,8 +408,11 @@ fn submit(state: &mut State, text: String) -> Vec<Cmd> {
     }
 }
 
-/// The TUI's slash commands. `/rename <name>` for now; anything else is a
-/// transcript notice — slash input never reaches the model.
+/// The TUI's slash commands. Built-ins resolve first; an unmatched
+/// `/<skill>` asks the model to load that skill, which is the human
+/// override for skills the tool description no longer names. Anything
+/// else is a transcript notice — unresolved slash input never reaches the
+/// model.
 fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
     let (cmd, arg) = rest
         .split_once(char::is_whitespace)
@@ -430,6 +438,15 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
                 Cmd::Rename(name.to_string()),
                 Cmd::SetTitle(title(state, suffix)),
             ]
+        }
+        other if state.skills.iter().any(|s| s == other) => {
+            // Desugars to an ordinary prompt: the model calls the skill
+            // tool, so the TUI never reads skill files itself.
+            let mut text = format!("Load the skill `{other}` and follow it for this task.");
+            if !arg.is_empty() {
+                text.push_str(&format!("\n\nARGUMENTS: {arg}"));
+            }
+            submit(state, text)
         }
         other => {
             notice(state, format!("unknown command: /{other}"));
@@ -856,6 +873,43 @@ mod tests {
         assert!(cmds.is_empty(), "got {cmds:?}");
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("/frobnicate"))
+        );
+    }
+
+    #[test]
+    fn a_known_skill_name_after_slash_prompts_for_that_skill() {
+        let mut s = State::test_default();
+        s.skills = vec!["brainstorming".into(), "superpowers:brainstorming".into()];
+
+        let cmds = type_and_submit(&mut s, "/brainstorming redesign the skill system");
+        let Some(Cmd::SendPrompt(text)) = cmds.first() else {
+            panic!("expected a prompt, got {cmds:?}");
+        };
+        assert!(text.contains("`brainstorming`"), "{text}");
+        assert!(
+            text.contains("ARGUMENTS: redesign the skill system"),
+            "the argument rides along: {text}"
+        );
+        assert_eq!(s.phase, Phase::Sampling { ticks: 0 });
+
+        // Qualified names resolve too, and take no argument fine.
+        let mut s = State::test_default();
+        s.skills = vec!["superpowers:brainstorming".into()];
+        let cmds = type_and_submit(&mut s, "/superpowers:brainstorming");
+        let Some(Cmd::SendPrompt(text)) = cmds.first() else {
+            panic!("expected a prompt, got {cmds:?}");
+        };
+        assert!(!text.contains("ARGUMENTS"), "{text}");
+    }
+
+    #[test]
+    fn a_builtin_wins_over_a_skill_of_the_same_name() {
+        let mut s = State::test_default();
+        s.skills = vec!["rename".into()];
+        let cmds = type_and_submit(&mut s, "/rename fix-auth");
+        assert!(
+            matches!(&cmds[..], [Cmd::Rename(n), _] if n == "fix-auth"),
+            "got {cmds:?}"
         );
     }
 
