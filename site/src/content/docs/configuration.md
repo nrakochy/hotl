@@ -115,10 +115,10 @@ plus a count:
 
     hotl: deploy, release
     claude: auth, go-service, system-shape, vps-cluster
-    superpowers (28): brainstorming, test-driven-development, writing-plans, +25 more
+    claude:superpowers (14): brainstorming, executing-plans, writing-plans, +11 more
 
-That index costs roughly 120 tokens instead of the ~1,300 a full roster of
-38 skills would, and it grows per *source* — registering a 300-skill
+On a 24-skill roster that index measures about 150 tokens where the old full
+roster took 980 — and it grows per *source*, so registering a 300-skill
 marketplace adds one line, not 300 names. From there the agent has three
 moves:
 

@@ -10,12 +10,13 @@ semver promise of their own.
 
 - **Skills load lazily.** The `skill` tool used to advertise every skill
   name *and* a 150-character description on every single request — about
-  1,300 tokens for a 38-skill roster, whether or not a skill was ever
-  used, and growing with each one added. The always-sent index is now
-  grouped by source with descriptions dropped, and any source over 12
-  skills collapses to a few names plus a count, so the cost grows per
-  source rather than per skill: registering a 300-skill marketplace adds
-  one line, not 300 names. Roughly 120 tokens in place of 1,300.
+  980 tokens for a 24-skill roster, whether or not a skill was ever used,
+  and growing with each one added. The always-sent index is now grouped by
+  source with descriptions dropped, and any source over 12 skills
+  collapses to a few names plus a count, so the cost grows per source
+  rather than per skill: registering a 300-skill marketplace adds one
+  line, not 300 names. On that same roster it measures 149 tokens against
+  978 — an 85% cut.
 
   Because collapsed skills are no longer named up front, the tool gained
   two ways to find them: `{"query": "…"}` ranks every skill — collapsed
