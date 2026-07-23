@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-23
+
 ### Changed
 
 - **The console transcript is easier to read at a glance.** Every turn now
