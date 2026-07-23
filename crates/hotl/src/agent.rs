@@ -454,12 +454,10 @@ fn build_registry(
     for w in warnings {
         eprintln!("hotl: {w}");
     }
-    if hotl_tools::skills::SkillTool::has_skills(config_dir, include_claude, &marketplaces) {
-        registry.register(Box::new(hotl_tools::skills::SkillTool::new(
-            config_dir,
-            include_claude,
-            &marketplaces,
-        )));
+    if let Some(skills) =
+        hotl_tools::skills::SkillTool::new(config_dir, include_claude, &marketplaces)
+    {
+        registry.register(Box::new(skills));
     }
     if let Some(builder) = spawn_builder {
         registry.register(Box::new(crate::spawn::SpawnTool::new(builder)));

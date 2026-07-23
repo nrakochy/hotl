@@ -48,12 +48,14 @@ pub struct SkillTool {
 
 impl SkillTool {
     /// Production constructor: the hotl flat dir, registered marketplace
-    /// roots, plus (when `include_claude`) the two Claude roots.
+    /// roots, plus (when `include_claude`) the two Claude roots. `None`
+    /// when nothing was discovered — the caller registers no tool, so the
+    /// roster is walked exactly once per start.
     pub fn new(
         config_dir: &Path,
         include_claude: bool,
         marketplaces: &[(String, PathBuf)],
-    ) -> Self {
+    ) -> Option<Self> {
         let (user, cache) = claude_roots();
         Self::with_roots(
             &config_dir.join("skills"),
@@ -71,7 +73,7 @@ impl SkillTool {
         claude_user: &Path,
         plugin_cache: &Path,
         include_claude: bool,
-    ) -> Self {
+    ) -> Option<Self> {
         let entries = discover(
             flat,
             marketplaces,
@@ -79,6 +81,9 @@ impl SkillTool {
             plugin_cache,
             include_claude,
         );
+        if entries.is_empty() {
+            return None;
+        }
         let names = entries
             .iter()
             .map(|e| format!("`{}` ({})", e.name, truncate(&e.description, DESC_CAP)))
@@ -88,26 +93,10 @@ impl SkillTool {
             "Load one of the user's saved skills (procedures/checklists): {names}. \
              Call with {{\"name\"}} to load one; no arguments lists them."
         );
-        Self {
+        Some(Self {
             entries,
             description,
-        }
-    }
-
-    pub fn has_skills(
-        config_dir: &Path,
-        include_claude: bool,
-        marketplaces: &[(String, PathBuf)],
-    ) -> bool {
-        let (user, cache) = claude_roots();
-        !discover(
-            &config_dir.join("skills"),
-            marketplaces,
-            &user,
-            &cache,
-            include_claude,
-        )
-        .is_empty()
+        })
     }
 
     /// `(name, source, description)` rows, name-sorted — `hotl skills list`.
@@ -476,8 +465,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(SkillTool::has_skills(dir.path(), false, &[]));
-        let tool = SkillTool::new(dir.path(), false, &[]);
+        let tool = SkillTool::new(dir.path(), false, &[]).expect("a skill exists");
         assert!(tool.description().contains("`deploy` (Deploy checklist)"));
 
         let listing = tool.run_impl(&json!({}));
@@ -492,6 +480,14 @@ mod tests {
         assert!(tool.run_impl(&json!({"name": "../secrets"})).is_error);
         let missing = tool.run_impl(&json!({"name": "nope"}));
         assert!(missing.is_error && missing.content.contains("Available: deploy"));
+    }
+
+    #[test]
+    fn empty_roots_build_no_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let none = dir.path().join("none");
+        assert!(SkillTool::with_roots(&none, &[], &none, &none, true).is_none());
+        assert!(SkillTool::new(dir.path(), false, &[]).is_none());
     }
 
     fn write_skill(dir: &Path, frontmatter: &str, body: &str) {
@@ -539,7 +535,7 @@ mod tests {
             "plugin deploy body",
         );
 
-        let tool = SkillTool::with_roots(&flat, &[], &user, &cache, true);
+        let tool = SkillTool::with_roots(&flat, &[], &user, &cache, true).unwrap();
         let desc = tool.description();
         assert!(
             desc.contains("`deploy`") && desc.contains("`go-service`"),
@@ -591,7 +587,7 @@ mod tests {
             .contains("brainstorm body"));
 
         // Opt-out: only the flat root remains.
-        let tool = SkillTool::with_roots(&flat, &[], &user, &cache, false);
+        let tool = SkillTool::with_roots(&flat, &[], &user, &cache, false).unwrap();
         assert!(!tool.description().contains("go-service"));
         assert!(tool.description().contains("`deploy`"));
     }
@@ -625,7 +621,7 @@ mod tests {
 
         let marketplaces = vec![("acme".to_string(), mkt.clone())];
         let none = dir.path().join("none");
-        let tool = SkillTool::with_roots(&flat, &marketplaces, &none, &none, false);
+        let tool = SkillTool::with_roots(&flat, &marketplaces, &none, &none, false).unwrap();
 
         let desc = tool.description();
         assert!(
@@ -672,7 +668,7 @@ mod tests {
 
         // A registered-but-missing root skips silently.
         let gone = vec![("ghost".to_string(), dir.path().join("missing"))];
-        let tool = SkillTool::with_roots(&flat, &gone, &none, &none, false);
+        let tool = SkillTool::with_roots(&flat, &gone, &none, &none, false).unwrap();
         assert!(tool.description().contains("`deploy`"));
         assert!(!tool.description().contains("ghost"));
     }
@@ -714,7 +710,8 @@ mod tests {
             &user,
             &dir.path().join("none2"),
             true,
-        );
+        )
+        .unwrap();
         assert!(
             tool.description().contains("`odd` (Odd skill)"),
             "{}",

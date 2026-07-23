@@ -190,14 +190,16 @@ fn render_list(config_dir: &Path) -> String {
     let include_claude = cfg.skills.claude.unwrap_or(true);
     let (roots, warnings) = cfg.skills.marketplace_roots(config_dir);
     let tool = hotl_tools::skills::SkillTool::new(config_dir, include_claude, &roots);
-    let width = tool
-        .roster()
-        .map(|(n, _, _)| n.chars().count())
-        .max()
-        .unwrap_or(0);
     let mut out = String::new();
-    for (name, source, desc) in tool.roster() {
-        out.push_str(&format!("{name:<width$}  {source:<12}  {}\n", clip(desc)));
+    if let Some(tool) = &tool {
+        let width = tool
+            .roster()
+            .map(|(n, _, _)| n.chars().count())
+            .max()
+            .unwrap_or(0);
+        for (name, source, desc) in tool.roster() {
+            out.push_str(&format!("{name:<width$}  {source:<12}  {}\n", clip(desc)));
+        }
     }
     if out.is_empty() {
         out.push_str("no skills discovered\n");
