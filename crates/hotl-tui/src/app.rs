@@ -99,6 +99,9 @@ pub struct State {
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
     pub skills: Vec<String>,
+    /// Transcript spacing, from `[settings] density`. Drives the blank line
+    /// between turns and the left-gutter width the role spine lives in.
+    pub density: hotl_theme::Density,
 }
 
 impl State {
@@ -116,6 +119,7 @@ impl State {
             pending_auto_rule: None,
             session_name: None,
             skills: Vec::new(),
+            density: hotl_theme::Density::default(),
         }
     }
 

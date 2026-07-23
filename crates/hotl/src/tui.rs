@@ -57,6 +57,10 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         eprintln!("hotl: {w}");
     }
     let palette = Palette::from(&watch_cfg.settings.theme.resolve().0);
+    let (density, density_warn) = watch_cfg.settings.density();
+    if let Some(w) = density_warn {
+        eprintln!("hotl: {w}");
+    }
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
@@ -85,6 +89,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut state = State::new(vim_mode, model);
     state.session_name = session_name;
     state.skills = skills;
+    state.density = density;
     let result = run_loop(
         &mut guard,
         &mut client,

@@ -43,22 +43,31 @@ pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
 fn render_transcript(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // Wrapping up front (rather than via `Paragraph::wrap`) is what keeps the
     // scroll arithmetic honest: an item that overflows counts as the several
-    // rows it really occupies, so Follow still lands on the last one.
+    // rows it really occupies, so Follow still lands on the last one. Building
+    // the whole buffer in a loop (not a flat_map) lets a blank-line separator
+    // sit *between* turns and records where each item starts for At-scroll.
     let width = area.width as usize;
-    let rows = |i: &TranscriptItem| -> Vec<Line<'static>> {
-        item_lines(i, p)
-            .iter()
-            .flat_map(|l| wrap::line(l, width))
-            .collect()
-    };
-    let lines: Vec<Line> = state.transcript.iter().flat_map(rows).collect();
+    let gutter = state.density.gutter();
+    let blanks = state.density.blank_lines();
+    let mut lines: Vec<Line> = Vec::new();
+    let mut item_starts: Vec<usize> = Vec::with_capacity(state.transcript.len());
+    for (i, item) in state.transcript.iter().enumerate() {
+        if i > 0 {
+            for _ in 0..blanks {
+                lines.push(Line::raw(""));
+            }
+        }
+        item_starts.push(lines.len());
+        lines.extend(item_visual_lines(item, p, width, gutter));
+    }
+    let total = lines.len();
     let skip = match state.scroll {
-        Scroll::Follow => lines.len().saturating_sub(area.height as usize),
-        Scroll::At(item) => state.transcript[..item.min(state.transcript.len())]
-            .iter()
-            .map(|i| rows(i).len())
-            .sum::<usize>()
-            .min(lines.len().saturating_sub(1)),
+        Scroll::Follow => total.saturating_sub(area.height as usize),
+        Scroll::At(item) => item_starts
+            .get(item)
+            .copied()
+            .unwrap_or(total)
+            .min(total.saturating_sub(1)),
     };
     // Slicing beats `Paragraph::scroll`, whose offset is a u16 a long session
     // would overflow.
@@ -70,30 +79,112 @@ fn render_transcript(state: &State, p: &Palette, frame: &mut Frame, area: Rect) 
     frame.render_widget(Paragraph::new(visible), area);
 }
 
-fn item_lines<'a>(item: &TranscriptItem, p: &Palette) -> Vec<Line<'a>> {
+/// The left-column signature of one turn: a marker glyph on the first visual
+/// row, a continuation glyph on the rest, each with its own color. This is
+/// what lets the eye track who is speaking by scanning straight down.
+struct Spine {
+    marker: &'static str,
+    cont: &'static str,
+    marker_style: Style,
+    cont_style: Style,
+}
+
+impl Spine {
+    /// Prepend the gutter pad and this row's spine glyph to a content line.
+    /// The glyph occupies one column; a trailing space separates it from the
+    /// text, so content always starts at `gutter + 2`.
+    fn wrap<'a>(&self, mut content: Line<'a>, gutter: usize, first: bool) -> Line<'a> {
+        let (glyph, style) = if first {
+            (self.marker, self.marker_style)
+        } else {
+            (self.cont, self.cont_style)
+        };
+        let lead = format!("{}{glyph} ", " ".repeat(gutter));
+        let mut spans = Vec::with_capacity(content.spans.len() + 1);
+        spans.push(Span::styled(lead, style));
+        spans.append(&mut content.spans);
+        Line::from(spans)
+    }
+}
+
+/// One transcript item as it lands on screen: content wrapped to the width the
+/// gutter+spine leave, each row carrying its spine glyph. Used by both the
+/// render and the scroll math, so they can never disagree on row counts.
+fn item_visual_lines<'a>(
+    item: &TranscriptItem,
+    p: &Palette,
+    width: usize,
+    gutter: usize,
+) -> Vec<Line<'a>> {
+    let (spine, content) = item_block(item, p);
+    // `gutter + 2` = the pad plus the one-column glyph and its trailing space.
+    let inner = width.saturating_sub(gutter + 2).max(1);
+    let mut out = Vec::new();
+    for cl in &content {
+        for wl in wrap::line(cl, inner) {
+            let first = out.is_empty();
+            out.push(spine.wrap(wl, gutter, first));
+        }
+    }
+    if out.is_empty() {
+        out.push(spine.wrap(Line::raw(""), gutter, true));
+    }
+    out
+}
+
+/// The spine and the content spans for one item — the content no longer
+/// carries its own marker prefix; the spine owns that column now.
+fn item_block<'a>(item: &TranscriptItem, p: &Palette) -> (Spine, Vec<Line<'a>>) {
     match item {
-        TranscriptItem::User { text } => text
-            .split('\n')
-            .enumerate()
-            .map(|(i, l)| {
-                let prefix = if i == 0 { "❯ " } else { "  " };
-                Line::styled(format!("{prefix}{l}"), Style::new().fg(p.ink).bold())
-            })
-            .collect(),
-        TranscriptItem::Steer { text, queued: true } => vec![Line::styled(
-            format!("⤷ {text} — steer queued, applies at next step"),
-            Style::new().fg(p.muted),
-        )],
+        TranscriptItem::User { text } => (
+            // You are the anchor: high-contrast caret, no continuation bar.
+            Spine {
+                marker: "❯",
+                cont: " ",
+                marker_style: Style::new().fg(p.ink).bold(),
+                cont_style: Style::new(),
+            },
+            text.split('\n')
+                .map(|l| Line::styled(l.to_string(), Style::new().fg(p.ink).bold()))
+                .collect(),
+        ),
+        TranscriptItem::Assistant { text } => (
+            // The warm dot + a faint bar down the whole answer, so a long
+            // reply reads as one block rather than a wall of flat text.
+            Spine {
+                marker: "●",
+                cont: "│",
+                marker_style: Style::new().fg(p.accent),
+                cont_style: Style::new().fg(p.faint),
+            },
+            text.split('\n')
+                .map(|l| Line::styled(l.to_string(), Style::new().fg(p.ink)))
+                .collect(),
+        ),
+        TranscriptItem::Steer { text, queued: true } => (
+            Spine {
+                marker: "⤷",
+                cont: " ",
+                marker_style: Style::new().fg(p.muted),
+                cont_style: Style::new(),
+            },
+            vec![Line::styled(
+                format!("{text} — steer queued, applies at next step"),
+                Style::new().fg(p.muted),
+            )],
+        ),
         TranscriptItem::Steer {
             text,
             queued: false,
-        } => {
-            vec![Line::styled(format!("⤷ {text}"), Style::new().fg(p.accent))]
-        }
-        TranscriptItem::Assistant { text } => text
-            .split('\n')
-            .map(|l| Line::styled(l.to_string(), Style::new().fg(p.ink)))
-            .collect(),
+        } => (
+            Spine {
+                marker: "⤷",
+                cont: " ",
+                marker_style: Style::new().fg(p.accent),
+                cont_style: Style::new(),
+            },
+            vec![Line::styled(text.to_string(), Style::new().fg(p.accent))],
+        ),
         TranscriptItem::Tool {
             name,
             summary,
@@ -115,24 +206,40 @@ fn item_lines<'a>(item: &TranscriptItem, p: &Palette) -> Vec<Line<'a>> {
             if !matches!(status, ToolStatus::Denied) {
                 details.push(format!("{}s", ticks / 8));
             }
-            let mut spans = vec![
-                Span::styled(format!("  [{marker} {name}]"), Style::new().fg(color)),
-                Span::styled(format!(" {body}"), Style::new().fg(p.ink)),
-            ];
+            // Name in the status color (so it stays identifiable now the
+            // marker moved to the spine), body ink, details muted.
+            let mut spans = vec![Span::styled(name.clone(), Style::new().fg(color))];
+            if !body.is_empty() {
+                spans.push(Span::styled(format!("  {body}"), Style::new().fg(p.ink)));
+            }
             if !details.is_empty() {
                 spans.push(Span::styled(
                     format!(" · {}", details.join(" · ")),
                     Style::new().fg(p.muted),
                 ));
             }
-            vec![Line::from(spans)]
+            (
+                Spine {
+                    marker,
+                    cont: " ",
+                    marker_style: Style::new().fg(color),
+                    cont_style: Style::new(),
+                },
+                vec![Line::from(spans)],
+            )
         }
-        TranscriptItem::Notice { text } => {
+        TranscriptItem::Notice { text } => (
+            Spine {
+                marker: "·",
+                cont: " ",
+                marker_style: Style::new().fg(p.muted),
+                cont_style: Style::new(),
+            },
             vec![Line::styled(
-                format!("  {text}"),
+                text.to_string(),
                 Style::new().fg(p.muted).italic(),
-            )]
-        }
+            )],
+        ),
     }
 }
 
@@ -444,7 +551,7 @@ mod tests {
             rows[STRIP]
         );
         assert!(
-            rows.iter().any(|r| r.contains("bash] echo hi · 2s")),
+            rows.iter().any(|r| r.contains("bash  echo hi · 2s")),
             "card elapsed"
         );
     }
@@ -481,9 +588,11 @@ mod tests {
             ticks: 8,
         });
         let rows = draw(&s);
+        // Comfortable gutter (2) + the ✓ spine glyph; the name is no longer
+        // bracketed, and the duplicate leading "bash" is peeled off the body.
         assert!(
-            rows[0].starts_with("  [✓ bash] echo hi · sandboxed:seatbelt · 1s"),
-            "indented, deduped card: {}",
+            rows[0].starts_with("  ✓ bash  echo hi · sandboxed:seatbelt · 1s"),
+            "spine card: {}",
             rows[0]
         );
         let buf = draw_buffer(&s);
@@ -683,10 +792,66 @@ mod tests {
             .map(|r| r.trim_end())
             .collect::<Vec<_>>()
             .concat();
+        // Strip the spine glyphs (● first row, │ continuation) and spaces —
+        // what remains must be every content char, nothing clipped.
         assert_eq!(
-            shown.replace(' ', ""),
+            shown.replace([' ', '●', '│'], ""),
             text.replace(' ', ""),
             "all 200 chars land on wrapped rows"
+        );
+    }
+
+    #[test]
+    fn assistant_turn_shows_marker_then_continuation_bar() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(TranscriptItem::User { text: "hi".into() });
+        s.transcript.push(TranscriptItem::Assistant {
+            text: "line one\nline two".into(),
+        });
+        let rows = draw(&s);
+        // Comfortable gutter = 2. You get the caret; the assistant gets a dot
+        // on its first line and a bar on the next.
+        assert!(rows[0].starts_with("  ❯ hi"), "user caret: {:?}", rows[0]);
+        // A blank line separates the turns (comfortable = 1).
+        assert_eq!(rows[1].trim(), "", "blank between turns: {:?}", rows[1]);
+        assert!(rows[2].starts_with("  ● line one"), "marker: {:?}", rows[2]);
+        assert!(
+            rows[3].starts_with("  │ line two"),
+            "cont bar: {:?}",
+            rows[3]
+        );
+    }
+
+    #[test]
+    fn compact_density_drops_the_blank_and_the_gutter() {
+        let mut s = State::new(true, "m".into());
+        s.density = hotl_theme::Density::Compact;
+        s.transcript
+            .push(TranscriptItem::User { text: "hi".into() });
+        s.transcript
+            .push(TranscriptItem::Assistant { text: "yo".into() });
+        let rows = draw(&s);
+        // No gutter, no blank line between turns — the dense look, but the
+        // spine glyph still marks who is speaking.
+        assert!(rows[0].starts_with("❯ hi"), "no gutter: {:?}", rows[0]);
+        assert!(rows[1].starts_with("● yo"), "back-to-back: {:?}", rows[1]);
+    }
+
+    #[test]
+    fn follow_scroll_lands_on_the_last_line_with_spacing() {
+        // Enough turns to overflow the 19-row transcript, so Follow has to
+        // account for the blank separators too.
+        let mut s = State::new(true, "m".into());
+        for i in 0..30 {
+            s.transcript.push(TranscriptItem::Assistant {
+                text: format!("answer {i}"),
+            });
+        }
+        let rows = draw(&s);
+        assert!(
+            rows[..STRIP].iter().any(|r| r.contains("answer 29")),
+            "last turn is visible under Follow"
         );
     }
 
