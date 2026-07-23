@@ -25,8 +25,10 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-/// Listing truncation: full descriptions load with the body, not the roster.
-const DESC_CAP: usize = 150;
+/// Bulk-listing truncation. The always-sent roster carries no descriptions
+/// at all now, so this only bounds an explicit list-everything call —
+/// `query` and `source` results return descriptions in full.
+const DESC_CAP: usize = 300;
 
 /// A source listing more than this many skills collapses in the tool
 /// description to a sample plus a count, so the always-sent roster costs
@@ -440,7 +442,11 @@ impl Tool for SkillTool {
     fn schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": {"name": {"type": "string"}},
+            "properties": {
+                "name": {"type": "string"},
+                "query": {"type": "string"},
+                "source": {"type": "string"}
+            },
         })
     }
     fn permission(&self, _input: &Value) -> Permission {
@@ -453,12 +459,34 @@ impl Tool for SkillTool {
 }
 
 impl SkillTool {
+    /// `name` loads and always wins; then `query` searches, `source`
+    /// lists one source, and no argument lists everything.
     fn run_impl(&self, input: &Value) -> ToolOutcome {
-        let Some(name) = input.get("name").and_then(Value::as_str) else {
+        let str_arg = |k: &str| {
+            input
+                .get(k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        let Some(name) = str_arg("name") else {
+            if let Some(query) = str_arg("query") {
+                return self.search(query);
+            }
+            if let Some(source) = str_arg("source") {
+                return self.list_source(source);
+            }
             let listing = self
                 .entries
                 .iter()
-                .map(|e| format!("{} — {}", e.name, truncate(&e.description, DESC_CAP)))
+                .map(|e| {
+                    format!(
+                        "{} ({}) — {}",
+                        e.name,
+                        e.source,
+                        truncate(&e.description, DESC_CAP)
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             return ToolOutcome::ok(if listing.is_empty() {
@@ -501,6 +529,108 @@ impl SkillTool {
             Err(e) => ToolOutcome::err(format!("Skill `{name}` could not be read: {e}.")),
         }
     }
+
+    /// Rank every skill against `query` — including those the grouped tool
+    /// description collapsed, which is what makes collapsing safe.
+    /// Descriptions come back untruncated: few rows, so they are affordable.
+    fn search(&self, query: &str) -> ToolOutcome {
+        let terms = tokens(query);
+        if terms.is_empty() {
+            return ToolOutcome::err(
+                "`query` needs at least one word of three or more characters.",
+            );
+        }
+        let mut ranked: Vec<(usize, &SkillEntry)> = self
+            .entries
+            .iter()
+            .map(|e| (score(e, &terms), e))
+            .filter(|(s, _)| *s > 0)
+            .collect();
+        // Score desc, then name asc — a stable order for identical scores.
+        ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        if ranked.is_empty() {
+            let names: Vec<&str> = self.entries.iter().map(|e| e.name.as_str()).collect();
+            return ToolOutcome::ok(format!(
+                "No skill matched `{query}`. All {} skills: {}.",
+                names.len(),
+                names.join(", ")
+            ));
+        }
+        let shown = ranked.len().min(SEARCH_HITS);
+        let mut out = ranked[..shown]
+            .iter()
+            .map(|(_, e)| format!("{} ({}) — {}", e.name, e.source, e.description))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if ranked.len() > shown {
+            out.push_str(&format!("\n(+{} weaker matches)", ranked.len() - shown));
+        }
+        ToolOutcome::ok(out)
+    }
+
+    /// Every skill of one source, with full descriptions — how a collapsed
+    /// source is expanded.
+    fn list_source(&self, source: &str) -> ToolOutcome {
+        let rows: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.source == source)
+            .map(|e| format!("{} — {}", e.name, e.description))
+            .collect();
+        if rows.is_empty() {
+            let mut known: Vec<&str> = self.entries.iter().map(|e| e.source.as_str()).collect();
+            known.sort_unstable();
+            known.dedup();
+            return ToolOutcome::err(format!(
+                "No skill source named `{source}`. Sources: {}.",
+                known.join(", ")
+            ));
+        }
+        ToolOutcome::ok(rows.join("\n"))
+    }
+}
+
+/// Search result cap — enough to choose from, small enough that full
+/// descriptions stay affordable.
+const SEARCH_HITS: usize = 8;
+
+/// Words too common to discriminate between skills. Verbs stay in: a
+/// query like "review a pull request" leans on `review`.
+const STOPWORDS: &[&str] = &[
+    "the", "and", "for", "with", "that", "this", "from", "into", "are", "was", "were", "its",
+    "you", "your", "our", "their", "have", "has", "had", "not", "but", "all", "any", "can", "will",
+    "would", "should", "could", "when", "what", "which", "who", "how", "why", "some", "then",
+    "than", "there", "here", "about", "also", "just", "only", "more", "most", "such", "been",
+    "being", "does", "did", "doing", "them", "they",
+];
+
+/// Lowercase alphanumeric runs of three or more characters, minus
+/// stopwords — the same treatment for queries and for what they search.
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() >= 3)
+        .map(str::to_lowercase)
+        .filter(|w| !STOPWORDS.contains(&w.as_str()))
+        .collect()
+}
+
+/// One point per distinct query term found anywhere, plus two when the
+/// term is the skill's own name and one for a name-prefix match — so
+/// `code-review` outranks a skill that merely mentions reviewing.
+fn score(entry: &SkillEntry, terms: &[String]) -> usize {
+    let name = tokens(&entry.name);
+    let desc = tokens(&entry.description);
+    let mut total = 0;
+    for term in terms {
+        if name.iter().any(|n| n == term) {
+            total += 3;
+        } else if name.iter().any(|n| n.starts_with(term.as_str())) {
+            total += 2;
+        } else if desc.iter().any(|d| d.starts_with(term.as_str())) {
+            total += 1;
+        }
+    }
+    total
 }
 
 #[cfg(test)]
@@ -526,7 +656,7 @@ mod tests {
         );
 
         let listing = tool.run_impl(&json!({}));
-        assert!(!listing.is_error && listing.content.contains("deploy — Deploy checklist"));
+        assert!(!listing.is_error && listing.content.contains("deploy (hotl) — Deploy checklist"));
 
         let loaded = tool.run_impl(&json!({"name": "deploy"}));
         assert!(!loaded.is_error);
@@ -537,6 +667,83 @@ mod tests {
         assert!(tool.run_impl(&json!({"name": "../secrets"})).is_error);
         let missing = tool.run_impl(&json!({"name": "nope"}));
         assert!(missing.is_error && missing.content.contains("Available: deploy"));
+    }
+
+    /// Search is what makes collapsing safe: a skill the tool description
+    /// never named is still found by what it does.
+    #[test]
+    fn query_ranks_by_name_then_description_and_reaches_collapsed_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("claude-skills");
+        write_skill(
+            &user.join("code-review"),
+            "name: code-review\ndescription: Review a pull request against the house style",
+            "review body",
+        );
+        write_skill(
+            &user.join("go-service"),
+            "name: go-service\ndescription: Generate Go services; mentions review of the config",
+            "go body",
+        );
+        write_skill(
+            &user.join("dataviz"),
+            "name: dataviz\ndescription: Charts, plots and dashboards",
+            "viz body",
+        );
+        let none = dir.path().join("none");
+        let tool = SkillTool::with_roots(&none, &[], &user, &none, true).unwrap();
+
+        // Name match outranks a description mention.
+        let hit = tool.run_impl(&json!({"query": "help me review a pull request"}));
+        assert!(!hit.is_error, "{}", hit.content);
+        let first = hit.content.lines().next().unwrap();
+        assert!(first.starts_with("code-review"), "{}", hit.content);
+        assert!(
+            first.contains("against the house style"),
+            "descriptions come back in full: {first}"
+        );
+        assert!(hit.content.contains("go-service"), "{}", hit.content);
+        assert!(!hit.content.contains("dataviz"), "{}", hit.content);
+
+        // A miss lists everything rather than dead-ending.
+        let miss = tool.run_impl(&json!({"query": "quantum tunnelling"}));
+        assert!(!miss.is_error);
+        assert!(
+            miss.content.contains("No skill matched") && miss.content.contains("code-review"),
+            "{}",
+            miss.content
+        );
+
+        // Stopwords alone are not a query.
+        assert!(tool.run_impl(&json!({"query": "the and for"})).is_error);
+
+        // `name` wins when combined with the others.
+        let both =
+            tool.run_impl(&json!({"name": "dataviz", "query": "review", "source": "claude"}));
+        assert!(both.content.contains("viz body"), "{}", both.content);
+    }
+
+    #[test]
+    fn source_lists_one_source_and_rejects_unknown_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("skills");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("deploy.md"), "# Deploy checklist\nsteps\n").unwrap();
+        let user = dir.path().join("claude-skills");
+        write_skill(
+            &user.join("dataviz"),
+            "name: dataviz\ndescription: Charts and plots",
+            "viz body",
+        );
+        let none = dir.path().join("none");
+        let tool = SkillTool::with_roots(&flat, &[], &user, &none, true).unwrap();
+
+        let listed = tool.run_impl(&json!({"source": "claude"}));
+        assert!(!listed.is_error);
+        assert_eq!(listed.content, "dataviz — Charts and plots");
+
+        let bad = tool.run_impl(&json!({"source": "nope"}));
+        assert!(bad.is_error && bad.content.contains("Sources: claude, hotl"));
     }
 
     /// The point of the rollup: a big marketplace costs a line, not a name
