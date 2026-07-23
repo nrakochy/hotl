@@ -195,7 +195,14 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
-    let message = resp.text().await.unwrap_or_default();
+    // Read the error class before the body consumes the response.
+    let error_type = resp
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let body = resp.text().await.unwrap_or_default();
+    let message = hotl_provider::api_error::detail(error_type.as_deref(), &body);
     if status == 401 || status == 403 {
         return Attempt::Fail(ProviderError::Auth(message));
     }

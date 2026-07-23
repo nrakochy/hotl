@@ -581,6 +581,7 @@ pub mod repair {
     }
 }
 
+pub mod api_error;
 pub mod key;
 
 /// Wire-format folding, implemented per provider: turn one SSE `data:`

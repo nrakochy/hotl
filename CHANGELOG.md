@@ -18,6 +18,11 @@ semver promise of their own.
   still sees them at the same point — the next sample happens after the batch
   closes), a turn that dies mid-batch closes the calls it left open, and
   sessions already written this way are repaired as they resume.
+- **Provider errors read as a sentence instead of a JSON dump.** The full
+  response body used to be printed verbatim; the message is now pulled out of
+  whichever shape the provider uses (`error.message`, `message`, an
+  `x-amzn-errortype` header), rendered as `HTTP 400 ValidationException: …`,
+  and clipped rather than dumped when it runs long.
 - **A signal no longer leaves your terminal wedged.** Both TUIs restored the
   screen only when their guard dropped, so anything that killed the process
   outright — a real `SIGINT`, a `SIGTERM`, closing the window (`SIGHUP`) —
