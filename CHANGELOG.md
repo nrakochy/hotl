@@ -8,6 +8,16 @@ semver promise of their own.
 
 ### Fixed
 
+- **Steering while a tool ran could break the rest of the session.** The steer
+  was appended the moment it arrived, which put it between the assistant turn
+  that called the tools and the results answering them. The provider then saw
+  the results as a turn whose predecessor made no tool calls at all, and
+  rejected every later request — on Bedrock-style endpoints as *"the number of
+  toolResult blocks … exceeds the number of toolUse blocks of previous turn"*.
+  Steers that arrive mid-batch are now held until the results land (the model
+  still sees them at the same point — the next sample happens after the batch
+  closes), a turn that dies mid-batch closes the calls it left open, and
+  sessions already written this way are repaired as they resume.
 - **A signal no longer leaves your terminal wedged.** Both TUIs restored the
   screen only when their guard dropped, so anything that killed the process
   outright — a real `SIGINT`, a `SIGTERM`, closing the window (`SIGHUP`) —

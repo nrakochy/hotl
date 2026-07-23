@@ -28,6 +28,7 @@ pub fn plan(items: &[Item], tail_budget: u64) -> Option<Plan> {
     let prefix_end = preserved_prefix_len(items);
     let boundaries: Vec<usize> = (prefix_end + 1..items.len())
         .filter(|&i| matches!(items[i], Item::User { .. } | Item::Assistant { .. }))
+        .filter(|&i| is_clean_boundary(items, i))
         .collect();
     let latest = *boundaries.last()?;
     let mut chosen = latest;
@@ -51,6 +52,16 @@ pub fn apply(items: &[Item], plan: &Plan, digest: &[Item]) -> Vec<Item> {
     out.extend_from_slice(digest);
     out.extend_from_slice(&items[plan.kept_from..]);
     out
+}
+
+/// A tail may only start where tool results still sit behind the assistant
+/// turn that called them. Starting at a user item that is answered by results
+/// would leave those results with no calls in front of them — the request is
+/// then rejected for having more tool_result blocks than the preceding turn
+/// has tool_use blocks, and the fold makes it permanent.
+fn is_clean_boundary(items: &[Item], i: usize) -> bool {
+    !matches!(items.get(i + 1), Some(Item::ToolResults { .. }))
+        || matches!(items[i], Item::Assistant { .. })
 }
 
 /// Leading System / ProjectInstructions / Memory items never fold — they are
@@ -182,6 +193,27 @@ mod tests {
                 is_error: false,
             }],
         }
+    }
+
+    /// History written before steers were held can hold a user item between an
+    /// assistant turn and its results. Cutting there would strand the results
+    /// permanently, so that boundary is not offered.
+    #[test]
+    fn tail_never_starts_where_it_would_strand_results() {
+        let items = vec![
+            user("start"),
+            assistant("calling"),
+            user("a steer that landed in the gap"),
+            results(&"x".repeat(3000)),
+            assistant("done"),
+        ];
+        let plan = plan(&items, 10).expect("plan");
+        assert_ne!(plan.kept_from, 2, "that cut orphans the results");
+        let tail = &items[plan.kept_from..];
+        assert!(
+            !matches!(tail.first(), Some(Item::ToolResults { .. })),
+            "and the tail itself never opens on results"
+        );
     }
 
     #[test]

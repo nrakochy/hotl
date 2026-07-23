@@ -70,9 +70,15 @@ pub(crate) async fn run(
     events: mpsc::Sender<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
 ) {
-    let mut items: Arc<Vec<Item>> = Arc::new(std::mem::take(&mut deps.initial_items));
+    // Resumed history is repaired on the way in: a log written by a build that
+    // let a steer land mid-batch would otherwise fail every request forever.
+    let mut items: Arc<Vec<Item>> =
+        Arc::new(pair_tool_results(std::mem::take(&mut deps.initial_items)));
     let mut running = false;
     let mut queue: VecDeque<(String, Option<SyntheticReason>)> = VecDeque::new();
+    // Steers that arrived while a tool batch was open, waiting for its results
+    // to close the pairing before they can be appended.
+    let mut held_steers: Vec<String> = Vec::new();
     let (shared, mut log) = SharedDeps::new(deps);
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
@@ -117,7 +123,9 @@ pub(crate) async fn run(
                     running = true;
                 }
             }
-            SessionCmd::Steer(text) => admit_steer(&shared, &mut log, &mut items, text),
+            SessionCmd::Steer(text) => {
+                admit_steer(&shared, &mut log, &mut items, &mut held_steers, text)
+            }
             SessionCmd::Rename(name) => {
                 let _ = shared.append(&mut log, &EntryPayload::Rename { name });
             }
@@ -125,7 +133,10 @@ pub(crate) async fn run(
                 let _ = reply.send(Arc::clone(&items));
             }
             SessionCmd::Propose { entries, reply } => {
-                let _ = reply.send(commit(&shared, &mut log, &mut items, entries));
+                let committed = commit(&shared, &mut log, &mut items, entries);
+                // The results a held steer was waiting on may have just landed.
+                release_steers(&shared, &mut log, &mut items, &mut held_steers);
+                let _ = reply.send(committed);
             }
             SessionCmd::WriteBlob {
                 tool_use_id,
@@ -139,6 +150,11 @@ pub(crate) async fn run(
                 let _ = reply.send(result);
             }
             SessionCmd::TurnFinished { end, usage } => {
+                // The turn is over, so nothing will answer an open batch now.
+                // Close it, then let held steers land before a queued prompt
+                // starts the next turn behind them.
+                close_open_batch(&shared, &mut log, &mut items);
+                release_steers(&shared, &mut log, &mut items, &mut held_steers);
                 on_turn_finished(
                     TurnFinishedCtx {
                         shared: &shared,
@@ -295,10 +311,40 @@ async fn end_turn(
     }
 }
 
+/// Whether the projection is mid-batch: it ends on an assistant turn whose
+/// tool calls have no results yet. Both APIs require those results to be the
+/// very next message, so nothing else may be appended in this window.
+fn awaiting_tool_results(items: &[Item]) -> bool {
+    matches!(
+        items.last(),
+        Some(Item::Assistant { blocks }) if !hotl_types::assistant_tool_uses(blocks).is_empty()
+    )
+}
+
 /// Durable admission on arrival; projection advances only after the append
 /// (commit-protocol §durability). Linear-log M1 records the steer as a
 /// tagged user item; the `steer_admission` entry kind arrives with M3b's tree.
+///
+/// Steering mid-batch is the normal case — the human reacts while a tool runs
+/// — and that is precisely the window where appending would strand the batch's
+/// results away from the calls they answer. Such a steer is held instead and
+/// released once the results land. The model sees it at the same moment either
+/// way: the next sample happens after the batch closes.
 fn admit_steer(
+    shared: &SharedDeps,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
+    held: &mut Vec<String>,
+    text: String,
+) {
+    if awaiting_tool_results(items) {
+        held.push(text);
+        return;
+    }
+    append_steer(shared, log, items, text);
+}
+
+fn append_steer(
     shared: &SharedDeps,
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
@@ -315,6 +361,83 @@ fn admit_steer(
             Arc::make_mut(items).push(item);
         }
     }
+}
+
+/// Append the steers that were waiting on a batch, oldest first, once the
+/// pairing is closed.
+fn release_steers(
+    shared: &SharedDeps,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
+    held: &mut Vec<String>,
+) {
+    if held.is_empty() || awaiting_tool_results(items) {
+        return;
+    }
+    for text in held.drain(..) {
+        append_steer(shared, log, items, text);
+    }
+}
+
+/// Answer a batch nothing will answer any more. A turn that dies before it can
+/// report leaves calls hanging; the next request would be rejected for the
+/// missing results, so the protocol gets completed here instead.
+fn close_open_batch(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>) {
+    let Some(Item::Assistant { blocks }) = items.last() else {
+        return;
+    };
+    let uses = hotl_types::assistant_tool_uses(blocks);
+    if uses.is_empty() {
+        return;
+    }
+    let payload = EntryPayload::Item {
+        item: Item::ToolResults {
+            results: uses
+                .iter()
+                .map(|tu| hotl_types::ToolResultItem {
+                    tool_use_id: tu.id.clone(),
+                    content: "Not executed (the turn ended first).".into(),
+                    is_error: true,
+                })
+                .collect(),
+        },
+    };
+    if shared.append(log, &payload) {
+        if let EntryPayload::Item { item } = payload {
+            Arc::make_mut(items).push(item);
+        }
+    }
+}
+
+/// Restore tool_use/tool_result adjacency in history written before steers
+/// were held. Items that landed in the gap move to just after the results
+/// they interrupted — the order the model would have seen anyway, since the
+/// gap only ever opened while a batch was still running. Nothing is dropped.
+pub(crate) fn pair_tool_results(items: Vec<Item>) -> Vec<Item> {
+    let mut out: Vec<Item> = Vec::with_capacity(items.len());
+    // Items pulled out of an open batch, waiting to go back in behind it.
+    let mut stranded: Vec<Item> = Vec::new();
+    for item in items {
+        if !awaiting_tool_results(&out) && stranded.is_empty() {
+            out.push(item);
+            continue;
+        }
+        match item {
+            Item::ToolResults { .. } => {
+                out.push(item);
+                out.append(&mut stranded);
+            }
+            // Another assistant turn means no results were ever coming; the
+            // gap was not an open batch, so leave the order as it was found.
+            Item::Assistant { .. } => {
+                out.append(&mut stranded);
+                out.push(item);
+            }
+            _ => stranded.push(item),
+        }
+    }
+    out.append(&mut stranded);
+    out
 }
 
 /// Commit a proposal: append each entry durably, then project it.
@@ -556,4 +679,101 @@ fn respawn_turn(
         return;
     };
     tokio::spawn(turn::run(shared.clone(), cmd_tx, events.clone(), token));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{awaiting_tool_results, pair_tool_results};
+    use hotl_types::{Item, SyntheticReason, ToolResultItem};
+    use serde_json::json;
+
+    fn user(text: &str) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: Some(SyntheticReason::Steer),
+        }
+    }
+
+    fn calls(id: &str) -> Item {
+        Item::Assistant {
+            blocks: vec![json!({"type": "tool_use", "id": id, "name": "read", "input": {}})],
+        }
+    }
+
+    fn says(text: &str) -> Item {
+        Item::Assistant {
+            blocks: vec![json!({"type": "text", "text": text})],
+        }
+    }
+
+    fn answers(id: &str) -> Item {
+        Item::ToolResults {
+            results: vec![ToolResultItem {
+                tool_use_id: id.into(),
+                content: "ok".into(),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn only_unanswered_tool_calls_hold_the_batch_open() {
+        assert!(awaiting_tool_results(&[calls("t1")]));
+        assert!(!awaiting_tool_results(&[says("hello")]));
+        assert!(!awaiting_tool_results(&[calls("t1"), answers("t1")]));
+        assert!(!awaiting_tool_results(&[]));
+    }
+
+    #[test]
+    fn a_stranded_steer_moves_behind_the_results_it_interrupted() {
+        let repaired = pair_tool_results(vec![calls("t1"), user("wait"), answers("t1")]);
+        assert_eq!(repaired, vec![calls("t1"), answers("t1"), user("wait")]);
+    }
+
+    #[test]
+    fn several_stranded_items_keep_their_order() {
+        let repaired = pair_tool_results(vec![
+            calls("t1"),
+            user("one"),
+            user("two"),
+            answers("t1"),
+            says("done"),
+        ]);
+        assert_eq!(
+            repaired,
+            vec![
+                calls("t1"),
+                answers("t1"),
+                user("one"),
+                user("two"),
+                says("done"),
+            ]
+        );
+    }
+
+    #[test]
+    fn already_paired_history_is_left_alone() {
+        let good = vec![
+            user("start"),
+            calls("t1"),
+            answers("t1"),
+            user("next"),
+            says("done"),
+        ];
+        assert_eq!(pair_tool_results(good.clone()), good);
+    }
+
+    #[test]
+    fn a_gap_with_no_results_coming_is_not_reordered() {
+        // Nothing answered t1, so there is no batch to move anything behind —
+        // reordering here would only invent a new history.
+        let orphaned = vec![calls("t1"), user("never answered"), says("moved on")];
+        assert_eq!(pair_tool_results(orphaned.clone()), orphaned);
+    }
+
+    #[test]
+    fn a_trailing_gap_survives_repair() {
+        let trailing = vec![calls("t1"), user("last word")];
+        assert_eq!(pair_tool_results(trailing.clone()), trailing);
+    }
 }
