@@ -118,31 +118,18 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
 /// real engine deps into a session factory and hands the streams to the
 /// protocol loop. One connection, one process (process-per-session).
 pub async fn acp_main() -> i32 {
-    let (factory, _model) = match acp_factory().await {
-        Ok(pair) => pair,
+    let (factory, _model, skills) = match acp_factory().await {
+        Ok(triple) => triple,
         Err(code) => return code,
     };
-    let skills = skill_names(&config_dir());
     crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory, skills).await;
     0
 }
 
-/// Every loadable skill name (bare, plus each `source:skill` alias) for the
-/// ACP `initialize` result — what a client needs to offer `/<skill>`
-/// dispatch without reaching past the protocol into the engine. Empty when
-/// no skills are configured.
-pub(crate) fn skill_names(config_dir: &std::path::Path) -> Vec<String> {
-    let cfg = crate::config::Config::load(config_dir);
-    let include_claude = cfg.skills.claude.unwrap_or(true);
-    let (marketplaces, _) = cfg.skills.marketplace_roots(config_dir);
-    hotl_tools::skills::SkillTool::new(config_dir, include_claude, &marketplaces)
-        .map(|t| t.names().map(String::from).collect())
-        .unwrap_or_default()
-}
-
 /// The real-engine session factory `hotl acp` and `hotl tui` share, plus the
 /// resolved model name. Prints its own errors; `Err` carries the exit code.
-pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String), i32> {
+pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String, Vec<String>), i32>
+{
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -157,6 +144,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
         Err(code) => return Err(code),
     };
     let model = scaffold.model.clone();
+    let skill_names = scaffold.skill_names.clone();
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         let (resumed, requested) = match spec {
             crate::acp::SessionSpec::New { name } => (None, name),
@@ -208,7 +196,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String)
             name: requested,
         })
     });
-    Ok((factory, model))
+    Ok((factory, model, skill_names))
 }
 
 /// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a
@@ -267,6 +255,9 @@ struct Scaffold {
     cwd: PathBuf,
     config: EngineConfig,
     registry: Arc<Registry>,
+    /// Loadable skill names, produced by the registry's own discovery walk
+    /// so nothing walks the skill roots a second time.
+    skill_names: Vec<String>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     /// The api-key-helper's key, acquired once at startup validation below.
     /// `None` for a static key source (nothing to register: it's already a
@@ -328,7 +319,8 @@ async fn scaffold(
         sandbox_enforced,
         initial_helper_key.clone(),
     );
-    let registry = Arc::new(build_registry(&cfg, &config_dir, Some(spawn_builder)));
+    let (registry, skill_names) = build_registry(&cfg, &config_dir, Some(spawn_builder));
+    let registry = Arc::new(registry);
     let hooks = load_hooks(&cfg);
     Ok(Scaffold {
         provider,
@@ -341,6 +333,7 @@ async fn scaffold(
         cwd,
         config,
         registry,
+        skill_names,
         hooks,
         initial_helper_key,
     })
@@ -444,7 +437,7 @@ fn build_registry(
     cfg: &crate::config::Config,
     config_dir: &std::path::Path,
     spawn_builder: Option<Arc<dyn crate::spawn::ChildBuilder>>,
-) -> Registry {
+) -> (Registry, Vec<String>) {
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
     let diagnostics = cfg
         .hooks_toml()
@@ -468,15 +461,19 @@ fn build_registry(
     for w in warnings {
         eprintln!("hotl: {w}");
     }
+    // One discovery walk: the names for `/`-dispatch come off the same
+    // tool that goes into the registry, never a second scan of the roots.
+    let mut skill_names = Vec::new();
     if let Some(skills) =
         hotl_tools::skills::SkillTool::new(config_dir, include_claude, &marketplaces)
     {
+        skill_names = skills.names().map(String::from).collect();
         registry.register(Box::new(skills));
     }
     if let Some(builder) = spawn_builder {
         registry.register(Box::new(crate::spawn::SpawnTool::new(builder)));
     }
-    registry
+    (registry, skill_names)
 }
 
 /// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
@@ -1350,6 +1347,29 @@ pub(crate) fn sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/`-dispatch names come out of the registry's own discovery walk.
+    /// If this ever needs a second `SkillTool::new`, the roster is being
+    /// scanned twice per start again.
+    #[test]
+    fn build_registry_yields_the_skill_names_it_discovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join("skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::write(skills.join("deploy.md"), "# Deploy checklist\nsteps\n").unwrap();
+
+        // Pin the Claude roots off: they are real directories on the
+        // developer's machine and would leak into this assertion.
+        let mut cfg = crate::config::Config::default();
+        cfg.skills.claude = Some(false);
+        let (_registry, names) = build_registry(&cfg, dir.path(), None);
+        assert_eq!(names, vec!["deploy".to_string()]);
+
+        // No skills configured → no names, and no tool registered.
+        let empty = tempfile::tempdir().unwrap();
+        let (_registry, names) = build_registry(&cfg, empty.path(), None);
+        assert!(names.is_empty(), "{names:?}");
+    }
 
     #[test]
     #[cfg(not(feature = "security-enforced"))] // asserts the auto default

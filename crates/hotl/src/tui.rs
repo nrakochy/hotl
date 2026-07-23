@@ -39,8 +39,8 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         Ok(a) => a,
         Err(code) => return code,
     };
-    let (factory, model) = match crate::agent::acp_factory().await {
-        Ok(pair) => pair,
+    let (factory, model, skills) = match crate::agent::acp_factory().await {
+        Ok(triple) => triple,
         Err(code) => return code,
     };
     let vim_mode = crate::config::Config::load(&crate::agent::config_dir())
@@ -60,7 +60,6 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
-    let skills = crate::agent::skill_names(&crate::agent::config_dir());
     tokio::spawn(crate::acp::serve(sread, swrite, factory, skills));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut reader = BufReader::new(cread);
