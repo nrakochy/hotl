@@ -301,6 +301,21 @@ pub struct Question {
     pub multi: bool,
 }
 
+/// A human's answer to an `ask_user` question (tier-1 gap #4). Lives here
+/// (not hotl-engine, where the plan first sketched it) so both hotl-tools's
+/// `QuestionSink` and hotl-engine's `EngineEvent::Question` can share one
+/// definition without either crate depending on the other — the same
+/// cycle-avoidance the plan flagged as open, resolved the way `Question`
+/// itself already is. `NoHuman` is the documented default when no reply
+/// arrives (headless, `DontAsk`, a dropped reply channel): the model must
+/// always get an answer, never a hang.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuestionAnswer {
+    Selected(Vec<String>),
+    FreeText(String),
+    NoHuman,
+}
+
 pub fn new_ulid() -> String {
     ulid::Ulid::new().to_string()
 }

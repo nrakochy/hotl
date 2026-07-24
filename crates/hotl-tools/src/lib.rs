@@ -5,6 +5,7 @@
 //! message is a prompt: it tells the model what to do next. Erasure happens
 //! once: tools are `dyn Tool` in the registry.
 
+pub mod ask;
 mod builtins;
 pub mod diagnostics;
 pub(crate) mod matcher;
@@ -14,6 +15,7 @@ pub mod sandbox;
 pub mod skills;
 pub mod todo;
 
+pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use todo::TodoWriteTool;
 
