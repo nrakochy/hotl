@@ -70,6 +70,15 @@ There is **no bell, ever** — salience is visual only. `hotl watch` is the thin
 
 Type and press `Enter` to prompt. **Typing while a turn runs is steering**: submit and it becomes a pinned `⤷` chip — dim while queued, and the engine folds it in at the next step. `Shift`/`Alt`+`Enter` inserts a newline.
 
+## History recall
+
+Your submitted prompts are remembered across sessions (shell-style), stored under `[history]` in `config.toml` ([configuration.md](../configuration/)).
+
+- **`↑` / `↓`** — walk previous prompts. Recall triggers only at the buffer's edge: `↑` from the **first** line steps to an older prompt, `↓` from the **last** line steps to a newer one; anywhere else the arrows just move the cursor between lines. What's on the line when you start walking becomes a **prefix filter** — type `git ` then `↑` and you only cycle prompts that began with `git `. An empty line walks everything. Your in-progress text is saved and comes back when you press `↓` past the newest match; editing a recalled prompt keeps it and drops you out of recall.
+- **`Ctrl-R`** — reverse-incremental search. The input line becomes `(reverse-i-search)'query': match`; each character narrows to the most recent prompt containing it, and pressing `Ctrl-R` again steps to the next older match. `Enter` drops the match into the input to edit or send; `Esc` cancels and restores what you had.
+
+Only prompts that start a turn are saved to disk — steers and `/slash` commands aren't, though the running session still recalls everything you typed. Consecutive duplicates are collapsed, and the file is size-bounded (see `[history]`). Vim `k`/`j` remain pure cursor/scroll motion — recall is on the arrows.
+
 ## Slash commands
 
 A line starting with `/` is handled locally and never becomes a prompt on its
@@ -123,6 +132,7 @@ On by default; `vim_mode = false` under `[behavior]` in `config.toml` pins plain
 | `d c y` + motion | Delete / change / yank; `dd cc yy` for the whole line |
 | `x p u` | Delete char · paste · undo (one level) |
 | `j k` | Scroll the transcript when the input is empty; move lines otherwise |
+| `↑ ↓` | Recall prompt history at the buffer's edges (see [History recall](#history-recall)); `Ctrl-R` searches it |
 | `Enter` | Submit (either mode) |
 
 ## The `$EDITOR` escape hatch

@@ -73,6 +73,12 @@ agents = 4                  # concurrent spawn sub-agent sessions (global, paren
 max_age_days = 30          # prune sessions older than this (hotl gc)
 max_sessions = 200         # keep at most this many
 
+[history]                  # console prompt recall (↑/↓, Ctrl-R) — see tui.md
+enabled = true             # false: recall works in-session, nothing on disk
+max_entries = 1000         # oldest entries trimmed past this
+max_bytes = 2097152        # ...and past this size (2 MiB); the smaller cap wins
+# path = "..."             # default: <xdg-data>/hotl/history.jsonl (~ expanded)
+
 [[allow]]                  # allow-rules (see below)
 tool = "bash"
 prefix = "cargo "
@@ -292,6 +298,10 @@ The shared budget that bounds concurrent external work, one process-wide instanc
 ### Retention (`[retention]`)
 
 Bounds the growth of the session/shadow/blob stores. `hotl gc` prunes on demand; with a `[retention]` policy set, a prune also runs quietly at startup. See [`hotl gc`](#hotl-gc).
+
+### History (`[history]`)
+
+The console's prompt history — recalled with `↑`/`↓` and searched with `Ctrl-R` ([tui.md](../tui/)) — persisted as JSONL at `<xdg-data>/hotl/history.jsonl` (or a `path` you set, `~` expanded). Both caps bound the file: it is trimmed to satisfy `max_entries` **and** `max_bytes` (the smaller wins), oldest first, at startup — so the on-disk file is self-bounding, not just the in-session ring. Only prompts that start a turn are written (not steers or slash-commands); consecutive duplicates are collapsed. `enabled = false` keeps recall working within the running session but reads and writes nothing on disk.
 
 ## Admin preapproved rules
 
