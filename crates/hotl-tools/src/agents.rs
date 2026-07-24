@@ -69,7 +69,9 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
         "general-purpose" => Some(AgentDef {
             name: "general-purpose".into(),
             description: "Full-access sub-agent for open-ended, self-contained subtasks \
-                (research, implement, summarize) — the same tools the parent has, minus `spawn`."
+                (research, implement, summarize) — gets the base `read`/`edit`/`write`/`bash`/\
+                `glob`/`grep` builtins, never the parent's `web_fetch`/`web_search`/MCP/skills/\
+                `recall` extensions."
                 .into(),
             system_prompt: None,
             tools: ToolScope::All,
@@ -120,6 +122,12 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
 /// system prompt body. Returns `None` if there's no frontmatter fence or no
 /// `name:` field — callers scanning a directory fall back to the filename
 /// via [`parse_def_or_named`].
+///
+/// `isolation:` is recognized-but-deferred: a Claude-compat frontmatter field
+/// naming a reserved seam (per-child worktree isolation) hotl hasn't built
+/// yet. It's parsed only so an owner who writes it gets a one-line note
+/// rather than silent no-op — the value itself is never stored on
+/// [`AgentDef`] and has no effect.
 pub fn parse_def(text: &str, source: AgentSource) -> Option<AgentDef> {
     parse_def_or_named(text, source, None)
 }
@@ -151,6 +159,9 @@ pub fn parse_def_or_named(
         .unwrap_or(ToolScope::All);
     let model = get("model:");
     let effort = get("effort:");
+    if let Some(isolation) = get("isolation:") {
+        eprintln!("{}", isolation_note(&name, &isolation));
+    }
     let system_prompt = if body.trim().is_empty() {
         None
     } else {
@@ -165,6 +176,20 @@ pub fn parse_def_or_named(
         effort,
         source,
     })
+}
+
+/// The one-line stderr note for a def that sets `isolation:` — pulled out
+/// as a pure function so the message is unit-testable without capturing
+/// stderr. `isolation` rides along parsed-but-deferred (like `effort`): a
+/// Claude-compat field naming a reserved seam (per-child worktree
+/// isolation) hotl hasn't built, so an owner who writes it gets a signal
+/// instead of a silent no-op.
+fn isolation_note(name: &str, isolation: &str) -> String {
+    format!(
+        "hotl: agent def `{name}` sets `isolation: {isolation}` — per-child workspace isolation \
+         is a reserved/deferred seam and is currently ignored; the child runs in the parent's \
+         workspace like any other."
+    )
 }
 
 /// `all` | `read-only`/`readonly` | a comma list of tool names.
@@ -484,5 +509,25 @@ mod tests {
             ..only_reads
         };
         assert!(!is_read_only(&mixed));
+    }
+
+    #[test]
+    fn parse_def_accepts_isolation_key_as_deferred_and_notes_it() {
+        // `isolation:` (Claude-compat frontmatter for per-child worktree
+        // isolation) must not fail parsing and must not be stored on
+        // `AgentDef` — it's parsed-but-deferred, same class as `effort`.
+        let md = "---\nname: worktreed\nisolation: worktree\n---\nbody";
+        let d = parse_def(md, AgentSource::User).unwrap();
+        assert_eq!(d.name, "worktreed");
+        assert_eq!(d.tools, ToolScope::All);
+
+        // The stderr note fired by that same parse is exercised directly
+        // via the pure message-builder (capturing real stderr would need a
+        // test-only dependency); confirm it names the field, the value, and
+        // that it's currently a no-op.
+        let note = isolation_note("worktreed", "worktree");
+        assert!(note.contains("worktreed"));
+        assert!(note.contains("isolation: worktree"));
+        assert!(note.contains("ignored"));
     }
 }

@@ -19,7 +19,7 @@ Three built-in agent types ship with hotl:
 
 | `agent_type` | Tools | Use for |
 |---|---|---|
-| `general-purpose` *(default)* | Everything the parent has, minus `spawn` | Open-ended subtasks: research, implement, summarize. |
+| `general-purpose` *(default)* | Base builtins only: `read`/`edit`/`write`/`bash`/`glob`/`grep` — never the parent's `web_fetch`/`web_search`/MCP/skills/`recall` | Open-ended subtasks: research, implement, summarize. |
 | `explore` | Read-only (`read`/`glob`/`grep`) | Fast search — locate code, files, answers. Safe to fan out several at once. |
 | `plan` | Read-only | Investigate, then propose a step-by-step plan without touching the workspace. |
 
@@ -46,6 +46,7 @@ Frontmatter fields:
 | `tools` | `all` (default) \| `read-only` \| a comma list of tool names (`read, grep, bash`). |
 | `model` | Override the child's model. Omit to inherit the parent's. |
 | `effort` | Parsed, not yet applied — hotl has no effort ladder today (only a thinking on/off switch). Reserved for a future release. |
+| `isolation` | Parsed-but-deferred (Claude-compat: `isolation: worktree`). Per-child workspace isolation isn't built yet — hotl notes it and ignores it rather than silently no-op-ing. |
 
 The body after the `---` fence is the child's system prompt. Omit it to
 inherit the parent's system prompt unchanged (useful for a def that only
