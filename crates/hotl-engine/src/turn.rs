@@ -785,6 +785,16 @@ impl Turn {
                 protected_why: why.clone(),
             }])
             .await;
+        // Notification (tier-1 gap #7, the `hotl watch`/desktop seam): the
+        // agent is blocked on a human, right before the ask actually
+        // surfaces. Fire-and-forget — never awaited on this hot path.
+        if let Some(hooks) = &self.shared.hooks {
+            crate::hooks::notify(
+                hooks,
+                crate::hooks::NotificationKind::Blocked,
+                summary.clone(),
+            );
+        }
         let (tx, rx) = oneshot::channel();
         let event = EngineEvent::Ask {
             summary,

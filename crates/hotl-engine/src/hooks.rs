@@ -35,6 +35,25 @@ pub async fn call_user_prompt(hooks: &Arc<dyn Hooks>, prompt: &str) -> Option<St
         .flatten()
 }
 
+/// Budget for a background (`on_notification`/`on_session_end`) hook call —
+/// generous (it never blocks anything), but bounded, so a "phone home" hook
+/// can't leak a task forever.
+pub const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// `Notification` (tier-1 gap #7, the `hotl watch`/desktop seam): spawn
+/// `on_notification` **detached**, under its own timeout, and return
+/// immediately — the caller MUST NOT `.await` this. A 2s (or hung) notifier
+/// must never stall the turn or the actor loop that calls it (Concurrency &
+/// parallelism §"Background (fire-and-forget) hooks").
+pub fn notify(hooks: &Arc<dyn Hooks>, kind: NotificationKind, detail: impl Into<String>) {
+    let hooks = Arc::clone(hooks);
+    let detail = detail.into();
+    tokio::spawn(async move {
+        let _ =
+            tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_notification(kind, &detail)).await;
+    });
+}
+
 /// A `PreToolUse` decision (wrap-style intercept). A `Rewrite` re-enters the
 /// normal permission gate with the new input — a hook cannot launder a call
 /// past the y/N ask (SECURITY.md §M5 routing rows).

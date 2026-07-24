@@ -31,6 +31,12 @@ use tokio_util::sync::CancellationToken;
 /// dependency cycle; see `question_sink`'s doc comment.
 pub use hotl_types::QuestionAnswer;
 
+/// Re-exported so `hotl_engine::NotificationKind` names the `Notification`
+/// hook's kind without reaching into the `hooks` module — the type is
+/// defined in `hooks.rs` (next to the trait method it parameterizes), not
+/// here, to keep the event vocabulary and its dispatcher together.
+pub use hooks::NotificationKind;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model: String,

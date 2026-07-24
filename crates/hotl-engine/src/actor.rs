@@ -380,6 +380,15 @@ async fn end_turn(
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
     annotate(shared, log, &outcome);
+    // Notification: the turn completed — fire-and-forget, computed before
+    // `outcome` moves into the event below.
+    if let Some(hooks) = &shared.hooks {
+        crate::hooks::notify(
+            hooks,
+            crate::hooks::NotificationKind::Done,
+            outcome_detail(&outcome),
+        );
+    }
     let _ = events.send(EngineEvent::TurnDone { outcome, usage }).await;
     match queue.pop_front() {
         Some((next, synthetic)) => {
@@ -395,7 +404,28 @@ async fn end_turn(
             )
             .await
         }
-        None => false,
+        None => {
+            // Notification: nothing queued behind it — the session goes
+            // idle awaiting the next prompt.
+            if let Some(hooks) = &shared.hooks {
+                crate::hooks::notify(
+                    hooks,
+                    crate::hooks::NotificationKind::Idle,
+                    "awaiting a prompt",
+                );
+            }
+            false
+        }
+    }
+}
+
+/// A short human-readable rendering of an outcome for `Notification` hooks
+/// (a `hotl watch`/desktop consumer, not a protocol payload — free-form text
+/// is fine).
+fn outcome_detail(outcome: &Outcome) -> String {
+    match outcome {
+        Outcome::Done { text } => text.clone(),
+        other => format!("{other:?}"),
     }
 }
 
