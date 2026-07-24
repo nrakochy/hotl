@@ -107,6 +107,7 @@ fn main() {
             }
         }
         Some("--help") | Some("-h") | Some("help") => print_help(),
+        Some("--version") | Some("-V") | Some("version") => print_version(),
         _ => {
             if is_headless(&args) {
                 std::process::exit(block_on(agent::agent_main(args)));
@@ -139,7 +140,8 @@ fn print_help() {
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
          hotl resume [arg]    same as -r\n  \
          hotl undo            restore files to before the agent's last change\n  \
-         hotl fleet           reserved (orchestrate)\n\n\
+         hotl fleet           reserved (orchestrate)\n  \
+         hotl --version       print the version (-V, or `hotl version`)\n\n\
          CONFIG: ~/.config/hotl/config.toml (one file: [provider] [context] [behavior]\n  \
          [retention], plus [[allow]] [[mcp]] [[hook]] [diagnostics]). Env vars override\n  \
          (HOTL_MODEL, ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL,\n  \
@@ -148,16 +150,30 @@ fn print_help() {
     );
 }
 
-/// `hotl update`: report the current version, compare against `latest` if the
-/// caller supplied one, and point at the update path.
-fn update_main(latest: Option<&str>) -> i32 {
-    let current = env!("CARGO_PKG_VERSION");
+/// The one-line version banner, shared by `--version` and `hotl update` so the
+/// two can never disagree about what this build is.
+fn version_line() -> String {
     let enforced = if hotl_tools::rules::enforced_build() {
         " (security-enforced)"
     } else {
         ""
     };
-    println!("hotl {current}{enforced}");
+    format!("hotl {}{enforced}", env!("CARGO_PKG_VERSION"))
+}
+
+/// `hotl --version`. Exists as a bare flag, not just a side effect of
+/// `hotl update`, because every packaging path expects it: nixpkgs'
+/// `versionCheckHook` greps this output to catch a version bumped without its
+/// source tag, and `--version` is what a user tries first.
+fn print_version() {
+    println!("{}", version_line());
+}
+
+/// `hotl update`: report the current version, compare against `latest` if the
+/// caller supplied one, and point at the update path.
+fn update_main(latest: Option<&str>) -> i32 {
+    let current = env!("CARGO_PKG_VERSION");
+    println!("{}", version_line());
     if let Some(latest) = latest {
         if setup::is_newer(current, latest) {
             println!("a newer version is available: {latest}");
@@ -295,5 +311,28 @@ mod tests {
         let args = v(&["bg", "-n", "fix-auth", "do the thing"]);
         assert_eq!(super::bg_name(&args).as_deref(), Some("fix-auth"));
         assert_eq!(super::bg_prompt(&args), Some("do the thing"));
+    }
+
+    #[test]
+    fn version_line_carries_the_bare_cargo_version() {
+        // nixpkgs' versionCheckHook greps this output for the derivation's
+        // `version` attribute verbatim. A decorated version (a `v` prefix, a
+        // git suffix) would make that hook fail on a correct package.
+        let line = super::version_line();
+        assert!(line.starts_with("hotl "), "unexpected banner: {line}");
+        assert!(
+            line.contains(env!("CARGO_PKG_VERSION")),
+            "{line} must contain {}",
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(!line.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[test]
+    fn version_flags_do_not_go_headless() {
+        // --version must reach the dispatch arm, not fall through to the TUI
+        // (which exits 2 without a terminal) or to agent_main.
+        assert!(!super::is_headless(&v(&["--version"])));
+        assert!(!super::is_headless(&v(&["-V"])));
     }
 }
