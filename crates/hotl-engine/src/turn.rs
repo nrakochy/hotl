@@ -10,8 +10,8 @@ use hotl_provider::{retry, SamplingRequest, StreamEvent, ToolDef};
 use hotl_tools::rules::Verdict;
 use hotl_tools::{Permission, ToolOutcome};
 use hotl_types::{
-    assistant_text, assistant_tool_uses, EntryPayload, Item, StopReason, TokenUsage,
-    ToolResultItem, ToolUse,
+    assistant_text, assistant_tool_uses, EntryPayload, Item, StopReason, SyntheticReason,
+    TokenUsage, ToolResultItem, ToolUse,
 };
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -27,6 +27,18 @@ const COMPACT_TRIGGER: f64 = 0.8;
 /// background so it is (usually) already done when [`COMPACT_TRIGGER`] hits,
 /// and the fold needs no blocking model call.
 const SPECULATE_TRIGGER: f64 = 0.6;
+
+/// Shared per-prompt budget for "intercept the end-turn, inject a reminder,
+/// continue" gates (index E4): the TodoGate is the first of these; a future
+/// Stop-hook veto (plan 7) intercepts the same branch and is meant to draw
+/// from this same counter (see `Turn::turn_extensions`) rather than its own,
+/// so composing gates can't multiply worst-case turn extensions. Capped
+/// above any single gate's own bound — it's the *combined* ceiling.
+const TURN_EXTENSION_MAX: u32 = 3;
+/// The TodoGate's own bound within the shared budget (01 §agent-loop's
+/// `max_fires_per_prompt`). It never blocks in `Auto`/`DontAsk` beyond this
+/// — a gate that can wedge an unattended run is a bug.
+const TODO_GATE_MAX: u32 = 2;
 
 pub(crate) async fn run(
     shared: Arc<SharedDeps>,
@@ -133,6 +145,11 @@ struct Turn {
     /// crosses [`SPECULATE_TRIGGER`], consumed when the turn ends in
     /// `Compact`, aborted otherwise.
     speculation: Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>>,
+    /// Shared per-prompt "reminder and continue" budget (index E4) — see
+    /// [`TURN_EXTENSION_MAX`]. Reset per `drive()` call (one call == one
+    /// turn); the TodoGate is the only consumer today, bounded further by
+    /// [`TODO_GATE_MAX`].
+    turn_extensions: u32,
 }
 
 impl Turn {
@@ -160,6 +177,7 @@ impl Turn {
             injected_hints: HashSet::new(),
             last_snapshot: None,
             speculation: None,
+            turn_extensions: 0,
         }
     }
 
@@ -193,13 +211,53 @@ impl Turn {
                 }
                 StopReason::Refusal => return TurnEnd::Outcome(Outcome::Refused),
                 _ => {
+                    if self.todo_gate_should_fire() {
+                        self.turn_extensions += 1;
+                        self.inject_todo_nudge().await;
+                        continue;
+                    }
                     return TurnEnd::Outcome(Outcome::Done {
                         text: assistant_text(&blocks),
-                    })
+                    });
                 }
             }
         }
         TurnEnd::Outcome(Outcome::TurnLimit)
+    }
+
+    /// The bounded "finish your work" nudge (01 §agent-loop's TodoGate,
+    /// verbatim shape): true only when the model just answered with no tool
+    /// calls, the todo reminder it sampled against still lists open work,
+    /// and both the gate's own bound and the shared per-prompt budget have
+    /// room left. Never true past [`TODO_GATE_MAX`] fires — the gate must
+    /// never wedge an unattended (`Auto`/`DontAsk`) run.
+    fn todo_gate_should_fire(&self) -> bool {
+        // The room left is whichever bound is tighter — today that's always
+        // `TODO_GATE_MAX` (it's the smaller constant), but writing it this
+        // way keeps the check correct if a second gate ever starts drawing
+        // down the same shared `turn_extensions` counter ahead of this one.
+        self.turn_extensions < TODO_GATE_MAX.min(TURN_EXTENSION_MAX)
+            && self
+                .last_snapshot
+                .as_deref()
+                .is_some_and(|s| unfinished_todos(s))
+    }
+
+    /// Commit the nudge as an ordinary `SystemReminder` user item — never the
+    /// `Todos`-tagged reminder itself (the model already saw the list in the
+    /// snapshot it just replied to; this just asks it to act on it).
+    async fn inject_todo_nudge(&mut self) -> bool {
+        self.propose(vec![EntryPayload::Item {
+            item: Item::User {
+                text: "<system-reminder>You still have open items on your todo list. \
+                       Continue working on them, or call todo_write to mark them \
+                       completed or drop them, before ending your turn.\
+                       </system-reminder>"
+                    .into(),
+                synthetic: Some(SyntheticReason::SystemReminder),
+            },
+        }])
+        .await
     }
 
     /// One provider sample against a fresh snapshot; commits the assistant
@@ -793,6 +851,21 @@ fn pair(tu: &ToolUse, message: &str, is_error: bool) -> ToolResultItem {
     }
 }
 
+/// Whether the todo reminder in a snapshot (appended as its last item, only
+/// when the list is non-empty — see `actor::snapshot_with_todos`) lists any
+/// `pending`/`in_progress` work. Reads the render text directly rather than
+/// round-tripping through `Vec<Todo>`: it's exactly what the model just
+/// sampled against, so the gate's read matches what produced the reply.
+fn unfinished_todos(snapshot: &[Item]) -> bool {
+    matches!(
+        snapshot.last(),
+        Some(Item::User {
+            text,
+            synthetic: Some(SyntheticReason::Todos),
+        }) if text.contains("[ ]") || text.contains("[~]")
+    )
+}
+
 fn unknown_tool(defs: &[ToolDef], name: &str) -> ToolOutcome {
     let available: Vec<_> = defs.iter().map(|d| d.name.as_str()).collect();
     ToolOutcome::err(format!(
@@ -879,5 +952,26 @@ mod tests {
         // The ask still shows the human-readable signatures.
         let pattern = detect_doom_loop(&[a(), a(), a()]).unwrap();
         assert_eq!(pattern, "read({\"path\":\"x\"})");
+    }
+
+    fn todos_item(text: &str) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: Some(SyntheticReason::Todos),
+        }
+    }
+
+    #[test]
+    fn unfinished_todos_reads_only_the_tagged_last_item() {
+        assert!(!unfinished_todos(&[]));
+        // Untagged last item (an ordinary reply) never counts, even if it
+        // happens to contain the marker text.
+        assert!(!unfinished_todos(&[Item::User {
+            text: "[ ] not a todo reminder".into(),
+            synthetic: None,
+        }]));
+        assert!(unfinished_todos(&[todos_item("<todos>\n[ ] a\n</todos>")]));
+        assert!(unfinished_todos(&[todos_item("<todos>\n[~] a\n</todos>")]));
+        assert!(!unfinished_todos(&[todos_item("<todos>\n[x] a\n</todos>")]));
     }
 }
