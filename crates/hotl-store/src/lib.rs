@@ -418,6 +418,13 @@ fn apply_log(
             // Log-only, like Rename: sets the session's effective mode, never
             // the projection. Last one wins, exactly like the display name.
             EntryPayload::ModeSet { mode: m } => *mode = Some(m),
+            // Log-only durable snapshot of the todo checklist (tier-1 gap
+            // #3). Not surfaced here: it never rides in the projection, and
+            // wiring a resumed session's *starting* list back into a fresh
+            // actor is deliberately deferred (a follow-up "stale todo on
+            // resume" feature) — this replay path only needs to compile
+            // against the new variant, not restore it.
+            EntryPayload::Todos { .. } => {}
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {
             }
         }

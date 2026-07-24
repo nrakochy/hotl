@@ -31,6 +31,7 @@ pub enum SyntheticReason {
     Moim,
     Memory,
     SubdirInstructions,
+    Todos,
     #[serde(other)]
     Unknown,
 }
@@ -67,6 +68,28 @@ pub struct ToolResultItem {
     pub content: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+}
+
+/// A session checklist item (`todo_write`, M4/tier-1 gap #3). Full-state
+/// replace: the model rewrites the whole list each call, so there is no
+/// separate id/patch shape to reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TodoStatus {
+    Pending,
+    InProgress,
+    Completed,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Todo {
+    pub content: String,
+    pub status: TodoStatus,
+    /// Present-tense form shown while in progress ("wiring the gate"); optional.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_form: Option<String>,
 }
 
 /// A tool invocation extracted from assistant blocks.
@@ -226,6 +249,14 @@ pub enum EntryPayload {
     ModeSet {
         mode: String,
     },
+    /// Durable snapshot of the `todo_write` checklist (M4/tier-1 gap #3).
+    /// Log-only, like `Rename`/`ModeSet` — not a projection item, so it never
+    /// rides in the model transcript; the last one wins on replay. The live
+    /// list itself is ephemeral session context injected as a tagged user
+    /// reminder (`SyntheticReason::Todos`), never committed as an `Item`.
+    Todos {
+        items: Vec<Todo>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -358,6 +389,25 @@ mod tests {
                 mode: "plan".into()
             }
         );
+    }
+
+    #[test]
+    fn todo_types_roundtrip_and_absorb_unknown_status() {
+        let t = Todo {
+            content: "wire the gate".into(),
+            status: TodoStatus::InProgress,
+            active_form: Some("wiring the gate".into()),
+        };
+        let j = serde_json::to_string(&t).unwrap();
+        assert!(j.contains("\"status\":\"in_progress\""));
+        let back: Todo = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, t);
+        let unk: TodoStatus = serde_json::from_str("\"blocked_on_ci\"").unwrap();
+        assert_eq!(unk, TodoStatus::Unknown);
+        let e = EntryPayload::Todos { items: vec![t] };
+        let ej = serde_json::to_string(&e).unwrap();
+        assert!(ej.contains("\"kind\":\"todos\""));
+        assert_eq!(serde_json::from_str::<EntryPayload>(&ej).unwrap(), e);
     }
 
     #[test]
