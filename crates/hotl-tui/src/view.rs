@@ -19,6 +19,10 @@ const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
 /// buffer is long enough that `ctrl-e` is the better tool anyway.
 const INPUT_MAX_ROWS: usize = 10;
 
+/// How many completion rows show at once before the list scrolls. Past this
+/// the human should type another character rather than scroll a menu.
+const COMPLETE_MAX_ROWS: usize = 8;
+
 pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     let area = frame.area();
     let [transcript, strip, input, hint] = Layout::vertical([
@@ -32,6 +36,7 @@ pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     render_strip(state, p, frame, strip);
     render_input(state, p, frame, input);
     render_hint(state, p, frame, hint);
+    render_completion(state, p, frame, transcript);
     if matches!(state.phase, Phase::WaitingAsk { .. }) {
         render_ask(state, p, frame, transcript);
     }
@@ -509,6 +514,11 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
         return;
     }
+    if state.completion.is_some() {
+        let hint = "↑↓ pick · tab complete · enter run · esc dismiss";
+        frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
+        return;
+    }
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
         (Phase::WaitingAsk { .. }, ..) => {
             "y allow · n deny · type a reason after n · ctrl-c cancel"
@@ -644,6 +654,74 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The `/`-command menu: a bordered list pinned to the bottom-left of the
+/// transcript area, so it reads as rising out of the input box rather than
+/// floating like the ask/question modals do.
+fn render_completion(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
+    let Some(c) = &state.completion else {
+        return;
+    };
+    // Scroll so the selection stays visible, the same arithmetic the input
+    // box uses for a buffer taller than its height.
+    let top = c.selected.saturating_sub(COMPLETE_MAX_ROWS - 1);
+    let rows: Vec<&crate::complete::Command> = c
+        .matches
+        .iter()
+        .skip(top)
+        .take(COMPLETE_MAX_ROWS)
+        .filter_map(|&i| state.commands.get(i))
+        .collect();
+    if rows.is_empty() {
+        return;
+    }
+    let name_w = rows
+        .iter()
+        .map(|cmd| cmd.name.chars().count())
+        .max()
+        .unwrap_or(0);
+    let lines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let marker = if top + i == c.selected { "› " } else { "  " };
+            let mut spans = vec![
+                Span::styled(marker, Style::new().fg(p.accent).bold()),
+                Span::styled(format!("/{:<name_w$}", cmd.name), Style::new().fg(p.accent)),
+            ];
+            if !cmd.description.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {}", cmd.description),
+                    Style::new().fg(p.faint),
+                ));
+            }
+            Line::from(spans)
+        })
+        .collect();
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 2;
+    let area = above_input(over, width, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" commands ")
+        .border_style(Style::new().fg(p.faint));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // No wrap: an overlong description clips at the border rather than
+    // pushing the menu taller than the transcript it sits over.
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A rect `width`×`height`, pinned to `over`'s bottom-left corner.
+fn above_input(over: Rect, width: u16, height: u16) -> Rect {
+    let width = width.max(10).min(over.width);
+    let height = height.min(over.height);
+    Rect {
+        x: over.x,
+        y: over.y + over.height - height,
+        width,
+        height,
+    }
 }
 
 /// A rect `pct`% of `over`'s width, `height` tall, centered in it.
@@ -1267,5 +1345,91 @@ mod tests {
         assert_eq!(body.len(), 2, "78 columns holds 39 wide glyphs: {body:#?}");
         // A wide glyph owns two cells, the second rendered as a blank.
         assert_eq!(body[0].matches('\u{65e5}').count(), 39);
+    }
+
+    // ---- the `/`-command completion popup ----
+
+    fn with_popup() -> State {
+        let mut s = State::new(true, "m".into());
+        s.commands.push(crate::complete::Command {
+            name: "review".into(),
+            description: "review a pull request".into(),
+            builtin: false,
+        });
+        s.commands.push(crate::complete::Command {
+            name: "bare".into(),
+            description: String::new(),
+            builtin: false,
+        });
+        for c in "/re".chars() {
+            crate::app::update(
+                &mut s,
+                crate::app::Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn the_completion_popup_sits_above_the_input_with_the_selection_marked() {
+        let s = with_popup();
+        let rows = draw(&s);
+        let popup: Vec<&String> = rows[..INPUT_TOP]
+            .iter()
+            .filter(|r| r.contains("/rename") || r.contains("/review"))
+            .collect();
+        assert_eq!(popup.len(), 2, "both matches render: {rows:#?}");
+        assert!(
+            popup[0].contains("› /rename"),
+            "the first match is marked: {}",
+            popup[0]
+        );
+        assert!(
+            popup[0].contains("name this session"),
+            "descriptions render: {}",
+            popup[0]
+        );
+        // 80×24: transcript is rows 0-18, strip 19, input 20-22. Anchored to
+        // the transcript's bottom, the popup's lower border lands on row 18 —
+        // directly above the strip, not on it.
+        assert!(
+            rows[STRIP - 1].contains("─"),
+            "the popup's bottom border sits on the transcript's last row: {}",
+            rows[STRIP - 1]
+        );
+    }
+
+    #[test]
+    fn a_description_less_command_renders_as_name_only() {
+        let mut s = State::new(true, "m".into());
+        s.commands.push(crate::complete::Command {
+            name: "bare".into(),
+            description: String::new(),
+            builtin: false,
+        });
+        for c in "/bar".chars() {
+            crate::app::update(
+                &mut s,
+                crate::app::Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        let rows = draw(&s);
+        let row = rows[..INPUT_TOP]
+            .iter()
+            .find(|r| r.contains("/bare"))
+            .expect("the match renders");
+        // `Block::bordered` adds no padding, so content butts against the
+        // left border: `│› /bare` and nothing after the name.
+        assert_eq!(row.trim_end().trim_end_matches('│').trim_end(), "│› /bare");
+    }
+
+    #[test]
+    fn the_hint_row_names_the_popup_keys_while_it_is_open() {
+        let rows = draw(&with_popup());
+        assert!(
+            rows[HINT].contains("tab complete") && rows[HINT].contains("esc dismiss"),
+            "hint row: {}",
+            rows[HINT]
+        );
     }
 }
