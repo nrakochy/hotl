@@ -21,7 +21,7 @@ use hotl_tools::{
     rules::{PermissionMode, Rules},
     Registry,
 };
-use hotl_types::{EntryPayload, Item, TokenUsage};
+use hotl_types::{EntryPayload, Item, Todo, TokenUsage};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
@@ -169,6 +169,13 @@ pub enum EngineEvent {
         outcome: Outcome,
         usage: TokenUsage,
     },
+    /// The `todo_write` checklist changed (a full-state replace committed).
+    /// Ephemeral-context companion to the durable `Todos` entry: the surface
+    /// (console strip, `hotl watch`) renders progress from this, never from
+    /// parsing model text.
+    TodosChanged {
+        items: Vec<Todo>,
+    },
 }
 
 impl std::fmt::Debug for EngineEvent {
@@ -186,6 +193,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::Compacted { degraded } => write!(f, "Compacted({degraded})"),
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
+            Self::TodosChanged { items } => write!(f, "TodosChanged(n={})", items.len()),
         }
     }
 }
@@ -210,6 +218,11 @@ pub enum SessionCmd {
     /// Set the session's effective permission mode (durable: appended to the
     /// log as `ModeSet`; takes effect immediately — no `Rules` reallocation).
     SetMode(PermissionMode),
+    /// Full-state replace of the `todo_write` checklist (durable: appended
+    /// to the log as `Todos`, last-wins on replay — same shape as
+    /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
+    /// only ever forwards a validated `Vec<Todo>` here.
+    SetTodos(Vec<Todo>),
     /// Turn task → actor: sample-boundary snapshot refresh.
     Snapshot {
         reply: oneshot::Sender<Arc<Vec<Item>>>,
@@ -289,6 +302,12 @@ impl SessionHandle {
     pub async fn set_mode(&self, mode: PermissionMode) {
         let _ = self.cmd.send(SessionCmd::SetMode(mode)).await;
     }
+    /// Full-state replace of the todo checklist (a durable `todos` log
+    /// entry). Exposed mainly for tests that pre-seed a list; the real
+    /// entry point is the `todo_write` tool's sink.
+    pub async fn set_todos(&self, items: Vec<Todo>) {
+        let _ = self.cmd.send(SessionCmd::SetTodos(items)).await;
+    }
     /// Continue an interrupted turn on resume (M4/#8).
     pub async fn continue_turn(&self) {
         let _ = self.cmd.send(SessionCmd::Continue).await;
@@ -314,8 +333,27 @@ pub fn needs_continuation(items: &[Item]) -> bool {
     )
 }
 
+/// A fresh, not-yet-consumed command channel for a session that doesn't
+/// exist yet. Split out from [`spawn_session`] so a caller can build a tool
+/// (`todo_write`) whose sink already holds a live sender to *this* session's
+/// actor before the actor exists — the registry (and the deps built from
+/// it) has to be assembled before `spawn_session` runs, which is otherwise a
+/// chicken-and-egg with a command channel `spawn_session` creates internally.
+pub fn session_channel() -> (mpsc::Sender<SessionCmd>, mpsc::Receiver<SessionCmd>) {
+    mpsc::channel(64)
+}
+
 pub fn spawn_session(deps: SessionDeps) -> SessionHandle {
-    let (cmd_tx, cmd_rx) = mpsc::channel(64);
+    let (cmd_tx, cmd_rx) = session_channel();
+    spawn_session_with(deps, cmd_tx, cmd_rx)
+}
+
+/// Spawn against a pre-created channel (see [`session_channel`]).
+pub fn spawn_session_with(
+    deps: SessionDeps,
+    cmd_tx: mpsc::Sender<SessionCmd>,
+    cmd_rx: mpsc::Receiver<SessionCmd>,
+) -> SessionHandle {
     let (event_tx, event_rx) = mpsc::channel(256);
     let current_turn = Arc::new(Mutex::new(CancellationToken::new()));
     // The actor gets only a weak sender: strong senders are the handle and

@@ -396,6 +396,7 @@ pub(crate) fn update_payload(event: &EngineEvent) -> Option<Value> {
         EngineEvent::FallbackModel { model } => json!({"type": "fallback_model", "model": model}),
         EngineEvent::PromptQueued => json!({"type": "prompt_queued"}),
         EngineEvent::Compacted { degraded } => json!({"type": "compacted", "degraded": degraded}),
+        EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
         EngineEvent::Ask { .. } | EngineEvent::TurnDone { .. } => return None,
     })
 }

@@ -881,6 +881,13 @@ impl Surface {
                 let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
             }
             EngineEvent::TurnDone { outcome, usage } => self.render_turn_done(outcome, usage),
+            EngineEvent::TodosChanged { items } => {
+                let done = items
+                    .iter()
+                    .filter(|t| t.status == hotl_types::TodoStatus::Completed)
+                    .count();
+                eprintln!("· todos: {done}/{} done", items.len());
+            }
         }
     }
 
@@ -941,6 +948,9 @@ impl Surface {
             EngineEvent::TurnDone { outcome, usage } => {
                 self.turn_running = false;
                 serde_json::json!({"type":"turn_done","outcome":format!("{outcome:?}"),"usage":usage})
+            }
+            EngineEvent::TodosChanged { items } => {
+                serde_json::json!({"type":"todos_changed","items":items})
             }
         };
         // MD contract freeze: every -p/--json frame carries the stable stream

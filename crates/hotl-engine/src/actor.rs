@@ -14,7 +14,7 @@ use hotl_tools::{
     rules::{PermissionMode, Rules},
     Registry,
 };
-use hotl_types::{assistant_text, EntryPayload, Item, SyntheticReason, TokenUsage};
+use hotl_types::{assistant_text, EntryPayload, Item, SyntheticReason, Todo, TokenUsage};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
@@ -128,6 +128,11 @@ pub(crate) async fn run(
         Arc::new(pair_tool_results(std::mem::take(&mut deps.initial_items)));
     let mut running = false;
     let mut queue: VecDeque<(String, Option<SyntheticReason>)> = VecDeque::new();
+    // The `todo_write` checklist (M4/tier-1 gap #3): actor-owned, ephemeral
+    // session context. It never lives in `items` — it's stitched onto the
+    // snapshot answer only, the same "ephemeral, request-only" shape as the
+    // MOIM turn-context block, so it never enters the durable projection.
+    let mut todos: Vec<Todo> = Vec::new();
     // Steers that arrived while a tool batch was open, waiting for its results
     // to close the pairing before they can be appended.
     let mut held_steers: Vec<String> = Vec::new();
@@ -196,8 +201,22 @@ pub(crate) async fn run(
                     },
                 );
             }
+            SessionCmd::SetTodos(new_todos) => {
+                todos = new_todos;
+                let _ = shared.append(
+                    &mut log,
+                    &EntryPayload::Todos {
+                        items: todos.clone(),
+                    },
+                );
+                let _ = events
+                    .send(EngineEvent::TodosChanged {
+                        items: todos.clone(),
+                    })
+                    .await;
+            }
             SessionCmd::Snapshot { reply } => {
-                let _ = reply.send(Arc::clone(&items));
+                let _ = reply.send(snapshot_with_todos(&items, &todos));
             }
             SessionCmd::Propose { entries, reply } => {
                 let committed = commit(&shared, &mut log, &mut items, entries);
@@ -473,6 +492,24 @@ fn close_open_batch(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<V
         if let EntryPayload::Item { item } = payload {
             Arc::make_mut(items).push(item);
         }
+    }
+}
+
+/// The snapshot a turn task samples against: the durable projection, plus
+/// the todo reminder appended as the last item when the list is non-empty.
+/// This is where "ephemeral, request-only" actually happens — the reminder
+/// rides *this* returned `Arc`, never `items` itself, so it can never be
+/// committed, replayed, or double-counted on the next snapshot (each call
+/// starts fresh from the durable `items`). The empty-list path returns the
+/// same `Arc` the caller already holds — no allocation on the common case.
+fn snapshot_with_todos(items: &Arc<Vec<Item>>, todos: &[Todo]) -> Arc<Vec<Item>> {
+    match hotl_tools::todo::render_reminder(todos) {
+        Some(reminder) => {
+            let mut with_reminder = (**items).clone();
+            with_reminder.push(reminder);
+            Arc::new(with_reminder)
+        }
+        None => Arc::clone(items),
     }
 }
 
