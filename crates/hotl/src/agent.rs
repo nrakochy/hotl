@@ -415,7 +415,7 @@ async fn scaffold(
     // two independently-built ones.
     let (registry, skill_names) = build_registry(&cfg, &config_dir, concurrency.clone());
     let registry = Arc::new(registry);
-    let hooks = load_hooks(&cfg);
+    let hooks = load_hooks(&cfg, concurrency.clone());
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
     Ok(Scaffold {
         provider,
@@ -1083,10 +1083,16 @@ pub(crate) fn undo_main(args: Vec<String>) -> i32 {
     }
 }
 
-/// Lane-2 shell hooks from config.toml `[[hook]]`, or None (M5).
-fn load_hooks(cfg: &crate::config::Config) -> Option<Arc<dyn hotl_engine::hooks::Hooks>> {
+/// Lane-2 shell hooks from config.toml `[[hook]]`, or None (M5). Threads in
+/// the process-wide `SessionConcurrency` (the same shared budget `bash`/
+/// `grep` draw from) — every shell hook process acquires a `subproc()`
+/// permit before it spawns.
+fn load_hooks(
+    cfg: &crate::config::Config,
+    concurrency: hotl_tools::concurrency::SessionConcurrency,
+) -> Option<Arc<dyn hotl_engine::hooks::Hooks>> {
     cfg.hooks_toml()
-        .and_then(|t| crate::shell_hooks::load_str(&t))
+        .and_then(|t| crate::shell_hooks::load_str(&t, concurrency))
         .map(|h| Arc::new(h) as Arc<dyn hotl_engine::hooks::Hooks>)
 }
 

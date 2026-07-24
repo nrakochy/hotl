@@ -270,8 +270,10 @@ impl InProcessHooks {
 /// matching hooks were folded, not the order their futures completed —
 /// `join_all` preserves input order regardless of completion order), so a
 /// tie among same-severity decisions always resolves to the
-/// first-registered hook, never a race.
-fn merge_pre_tool(results: Vec<PreToolDecision>) -> PreToolDecision {
+/// first-registered hook, never a race. Exposed (not just used internally by
+/// `InProcessHooks`) so lane 2 (the shell adapter) shares the exact same
+/// merge discipline instead of re-implementing it.
+pub fn merge_pre_tool(results: Vec<PreToolDecision>) -> PreToolDecision {
     if let Some(deny) = results
         .iter()
         .find(|d| matches!(d, PreToolDecision::Deny { .. }))
@@ -285,6 +287,16 @@ fn merge_pre_tool(results: Vec<PreToolDecision>) -> PreToolDecision {
         return rewrite.clone();
     }
     PreToolDecision::Continue
+}
+
+/// Deterministic most-restrictive merge over `Stop` results: any `Block`
+/// wins, first-registered among ties — the same discipline as
+/// [`merge_pre_tool`], exposed for the shell adapter to share.
+pub fn merge_stop(results: Vec<StopDecision>) -> StopDecision {
+    results
+        .into_iter()
+        .find(|d| matches!(d, StopDecision::Block { .. }))
+        .unwrap_or(StopDecision::Allow)
 }
 
 impl Hooks for InProcessHooks {
@@ -337,13 +349,7 @@ impl Hooks for InProcessHooks {
     fn on_stop<'a>(&'a self, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
         Box::pin(async move {
             let futures = self.stop.iter().map(|hook| async move { hook(outcome) });
-            let results = futures_util::future::join_all(futures).await;
-            // Any `Block` wins (most-restrictive-first), registration order
-            // among ties — the same discipline as `merge_pre_tool`.
-            results
-                .into_iter()
-                .find(|d| matches!(d, StopDecision::Block { .. }))
-                .unwrap_or(StopDecision::Allow)
+            merge_stop(futures_util::future::join_all(futures).await)
         })
     }
     fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
@@ -359,7 +365,7 @@ impl Hooks for InProcessHooks {
 /// schema's ~10K-char shape, or `None` if nothing was returned.
 pub const ADDITIONAL_CONTEXT_CAP: usize = 10_000;
 
-pub(crate) fn join_additional_context(parts: impl Iterator<Item = String>) -> Option<String> {
+pub fn join_additional_context(parts: impl Iterator<Item = String>) -> Option<String> {
     let mut combined = String::new();
     for part in parts {
         if part.is_empty() {
