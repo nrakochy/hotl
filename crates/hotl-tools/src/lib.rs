@@ -5,6 +5,7 @@
 //! message is a prompt: it tells the model what to do next. Erasure happens
 //! once: tools are `dyn Tool` in the registry.
 
+pub mod agents;
 pub mod ask;
 mod builtins;
 pub mod concurrency;
@@ -150,6 +151,29 @@ impl Registry {
             .iter()
             .find(|t| t.name() == name)
             .map(|b| b.as_ref())
+    }
+
+    /// A child registry containing only the tools of `self` that satisfy
+    /// `keep`, in the same order — cheap (`Arc`-clone per kept tool, no
+    /// rebuild). `spawn` is defensively excluded regardless of `keep`: the
+    /// depth-1 cap is this method's job to preserve, not each caller's (see
+    /// `hotl_tools::agents::filter_registry`, the only current caller).
+    pub fn filtered(&self, keep: impl Fn(&dyn Tool) -> bool) -> Registry {
+        Registry {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| t.name() != "spawn" && keep(t.as_ref()))
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// Whether every tool in this registry is read-only — used to decide if
+    /// a resolved agent def's filtered child registry can run in parallel
+    /// with a mutating one (the "guard parallel mutating children" hazard).
+    pub fn all_read_only(&self) -> bool {
+        self.tools.iter().all(|t| t.read_only())
     }
 }
 
