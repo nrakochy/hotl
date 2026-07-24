@@ -181,6 +181,19 @@ the root, so flat (`<skill>/SKILL.md`) and plugin-repo
 (`plugins/<p>/skills/<s>/SKILL.md`) layouts both work. A skill whose bare
 name is taken stays addressable as `<marketplace>:<skill>`.
 
+### Built-in tools
+
+| Tool | Effect | Permission |
+|---|---|---|
+| `read` | Read a text file (2000 lines / 200KB per call, `offset` continues a truncated read). | None — read-only |
+| `edit` | Exact string replacement in a file. | Ask (protected paths escalate) |
+| `write` | Write a file, creating parent directories. | Ask (protected paths escalate) |
+| `bash` | Run a shell command under the sandbox floor. | Ask |
+| `glob` | List files under the working directory matching a filename pattern (`*.rs`, `**/*.toml`, or a bare substring); hidden/vendor directories (`.git`, `node_modules`, `target`) are skipped. In-process — no subprocess, so it still works with no `rg` on `PATH` or when the sandbox floor degrades. | None — read-only |
+| `grep` | Search file contents with ripgrep (`pattern` is a regex; optional `path`, `glob` filter, `files_only`). Runs through the same sandboxed command path as `bash`, so content search inherits the kernel write-confinement floor. | None — read-only |
+
+`glob` and `grep` are workspace-scoped: an absolute path or a `..` escape outside the working directory is refused, and both run without a permission ask because that containment is what makes them safe reads. Both are parallel-safe, so a batch of several `glob`/`grep` calls in one turn runs concurrently.
+
 ### Environment variables
 
 | Variable | Overrides | Meaning |

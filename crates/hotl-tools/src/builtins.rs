@@ -303,13 +303,8 @@ async fn edit_impl(input: &Value) -> ToolResult {
     }
 }
 
-// TODO(task 4): drop these allows once `GlobTool` is re-exported from `lib.rs`
-// and registered in `Registry::builtin_with` — until then it's unreachable
-// outside `#[cfg(test)]`.
-#[allow(dead_code)]
 const GLOB_MAX_RESULTS: usize = 1000;
 
-#[allow(dead_code)]
 pub struct GlobTool;
 
 impl Tool for GlobTool {
@@ -343,7 +338,6 @@ impl Tool for GlobTool {
     }
 }
 
-#[allow(dead_code)]
 fn glob_impl(input: &Value) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
     let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
@@ -404,10 +398,6 @@ fn glob_impl(input: &Value) -> ToolResult {
 
 const GREP_MAX_OUTPUT: usize = 50 * 1024;
 
-// TODO(task 4): drop these allows once `GrepTool` is re-exported from
-// `lib.rs` and registered in `Registry::builtin_with` — until then it's
-// unreachable outside `#[cfg(test)]`.
-#[allow(dead_code)]
 pub struct GrepTool;
 
 impl Tool for GrepTool {
@@ -443,7 +433,6 @@ impl Tool for GrepTool {
     }
 }
 
-#[allow(dead_code)]
 async fn grep_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
     let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;

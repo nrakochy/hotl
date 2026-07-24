@@ -13,7 +13,7 @@ pub mod rules;
 pub mod sandbox;
 pub mod skills;
 
-pub use builtins::{BashTool, EditTool, ReadTool, WriteTool};
+pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 
 use futures_util::future::BoxFuture;
 use hotl_provider::ToolDef;
@@ -101,6 +101,8 @@ impl Registry {
                 Box::new(EditTool { diag: diag.clone() }),
                 Box::new(WriteTool { diag }),
                 Box::new(BashTool),
+                Box::new(GlobTool),
+                Box::new(GrepTool),
             ],
         }
     }
@@ -194,6 +196,21 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn builtin_registry_includes_search_tools() {
+        let reg = Registry::builtin();
+        for name in ["read", "edit", "write", "bash", "glob", "grep"] {
+            assert!(reg.get(name).is_some(), "missing built-in `{name}`");
+        }
+        // Search tools are read-only and parallel-safe.
+        assert!(reg.get("glob").unwrap().parallel_safe());
+        assert!(reg.get("grep").unwrap().parallel_safe());
+        assert_eq!(
+            reg.get("glob").unwrap().permission(&serde_json::json!({})),
+            Permission::None
+        );
+    }
 
     #[test]
     fn protected_paths() {
