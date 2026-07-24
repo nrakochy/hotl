@@ -1130,4 +1130,61 @@ mod tests {
             "the client-facing catalog is where the description lives"
         );
     }
+
+    /// Guard the collapsed branch: descriptions must stay out of the rollup
+    /// sample line. This is the higher-risk leak point — the non-collapsed
+    /// path is obvious, but the rollup line is where a future "helpful" edit
+    /// might slip a description in.
+    #[test]
+    fn the_rollup_branch_never_leaks_skill_descriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let mkt = dir.path().join("test-mkt");
+        // Create 15 skills to trigger rollup (ROLLUP_THRESHOLD is 12).
+        let mut sentinels = Vec::new();
+        for i in 0..15 {
+            let sentinel = format!("ROLLUP_SENTINEL_{i}");
+            sentinels.push(sentinel.clone());
+            write_skill(
+                &mkt.join(format!("skill-{i:02}")),
+                &format!("name: skill-{i:02}\ndescription: {sentinel} description for skill {i}"),
+                "body",
+            );
+        }
+        let none = dir.path().join("none");
+        let tool =
+            SkillTool::with_roots(&none, &[("test-mkt".to_string(), mkt)], &none, &none, false)
+                .expect("skills exist");
+
+        let desc = tool.description();
+        // Verify we hit the collapsed branch: description should show rollup format.
+        assert!(
+            desc.contains("test-mkt (15):"),
+            "rollup not triggered: {}",
+            desc
+        );
+
+        // No sentinel from any skill should leak into describe().
+        for sentinel in &sentinels {
+            assert!(
+                !desc.contains(sentinel),
+                "describe() must not carry skill descriptions, even in rollup: found {} in: {}",
+                sentinel,
+                desc
+            );
+        }
+
+        // Positive control: all sentinels are in the catalog.
+        let catalog_content: String = tool
+            .catalog()
+            .map(|(_, d)| d)
+            .collect::<Vec<_>>()
+            .join("\n");
+        for sentinel in &sentinels {
+            assert!(
+                catalog_content.contains(sentinel),
+                "catalog must carry descriptions, but {} missing",
+                sentinel
+            );
+        }
+    }
 }
