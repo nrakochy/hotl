@@ -12,8 +12,12 @@ pub mod net;
 pub mod rules;
 pub mod sandbox;
 pub mod skills;
+pub mod todo;
 
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+pub use todo::TodoWriteTool;
+
+use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use hotl_provider::ToolDef;
@@ -90,8 +94,14 @@ impl PermissionGate for StaticGate {
     }
 }
 
+/// Tools are `Arc<dyn Tool>`, not `Box<dyn Tool>`: a `Registry` is cheap to
+/// `Clone` (an Arc-bump per tool, no re-walk of skill roots or MCP config),
+/// which lets a caller layer one session-specific tool (`todo_write`, wired
+/// to that session's own actor) onto the process-wide shared registry
+/// without rebuilding it or making every tool instance `Clone` itself.
+#[derive(Clone)]
 pub struct Registry {
-    tools: Vec<Box<dyn Tool>>,
+    tools: Vec<Arc<dyn Tool>>,
 }
 
 impl Registry {
@@ -101,22 +111,22 @@ impl Registry {
 
     /// Builtins with post-mutation diagnostics (M3a) shared by edit/write.
     pub fn builtin_with(diag: diagnostics::Diagnostics) -> Self {
-        let diag = std::sync::Arc::new(diag);
+        let diag = Arc::new(diag);
         Self {
             tools: vec![
-                Box::new(ReadTool),
-                Box::new(EditTool { diag: diag.clone() }),
-                Box::new(WriteTool { diag }),
-                Box::new(BashTool),
-                Box::new(GlobTool),
-                Box::new(GrepTool),
+                Arc::new(ReadTool),
+                Arc::new(EditTool { diag: diag.clone() }),
+                Arc::new(WriteTool { diag }),
+                Arc::new(BashTool),
+                Arc::new(GlobTool),
+                Arc::new(GrepTool),
             ],
         }
     }
 
     /// Register an additional tool (MCP meta-tool, skills — M3).
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.push(tool);
+        self.tools.push(Arc::from(tool));
     }
 
     pub fn defs(&self) -> Vec<ToolDef> {

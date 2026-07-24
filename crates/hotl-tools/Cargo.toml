@@ -17,6 +17,7 @@ security-enforced = []
 
 [dependencies]
 hotl-provider = { path = "../hotl-provider", version = "0.4.1" }
+hotl-types = { path = "../hotl-types", version = "0.4.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

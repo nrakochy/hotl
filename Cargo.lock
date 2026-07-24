@@ -902,6 +902,7 @@ version = "0.4.1"
 dependencies = [
  "futures-util",
  "hotl-provider",
+ "hotl-types",
  "landlock",
  "libc",
  "serde",
