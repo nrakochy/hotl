@@ -737,6 +737,7 @@ dependencies = [
  "hotl-provider",
  "hotl-provider-anthropic",
  "hotl-provider-openai",
+ "hotl-retrieval",
  "hotl-store",
  "hotl-theme",
  "hotl-tools",

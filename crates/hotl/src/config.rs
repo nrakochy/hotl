@@ -240,6 +240,13 @@ impl Config {
         toml::to_string(&toml::toml! { server = (servers.clone()) }).ok()
     }
 
+    /// The `[[retrieval]]` backends as a `[[backend]]`-shaped TOML string
+    /// (for `hotl_retrieval::config::RetrievalConfig`), or `None`.
+    pub fn retrieval_toml(&self) -> Option<String> {
+        let backends = self.raw.as_ref()?.get("retrieval")?;
+        toml::to_string(&toml::toml! { backend = (backends.clone()) }).ok()
+    }
+
     /// The `[[hook]]` + `[diagnostics]` as a `hooks.toml`-shaped string, or None.
     pub fn hooks_toml(&self) -> Option<String> {
         let raw = self.raw.as_ref()?;
@@ -325,6 +332,15 @@ mod tests {
         );
         let hooks = cfg.hooks_toml().unwrap();
         assert!(hooks.contains("pre_tool") && hooks.contains("cargo check"));
+    }
+
+    #[test]
+    fn retrieval_section_reserializes_for_the_loader() {
+        let cfg =
+            cfg_with("[[retrieval]]\nname = \"notes\"\nkind = \"mcp\"\ncommand = \"/bin/rag\"\n");
+        let t = cfg.retrieval_toml().unwrap();
+        assert!(t.contains("[[backend]]") && t.contains("notes"));
+        assert!(cfg_with("").retrieval_toml().is_none());
     }
 
     #[test]

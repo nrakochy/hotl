@@ -470,6 +470,22 @@ fn build_registry(
         skill_names = skills.names().map(String::from).collect();
         registry.register(Box::new(skills));
     }
+    // Retrieval backends (`[[retrieval]]`) → the `recall` tool. Absent when
+    // nothing is configured: no ambient context cost when unused.
+    let retrieval = cfg
+        .retrieval_toml()
+        .and_then(|t| toml::from_str::<hotl_retrieval::config::RetrievalConfig>(&t).ok())
+        .map(|c| c.backends)
+        .unwrap_or_default();
+    if !retrieval.is_empty() {
+        let (backends, warnings) = hotl_retrieval::config::build(retrieval, config_dir);
+        for w in warnings {
+            eprintln!("hotl: {w}");
+        }
+        if !backends.is_empty() {
+            registry.register(Box::new(hotl_retrieval::RecallTool::new(backends)));
+        }
+    }
     if let Some(builder) = spawn_builder {
         registry.register(Box::new(crate::spawn::SpawnTool::new(builder)));
     }
