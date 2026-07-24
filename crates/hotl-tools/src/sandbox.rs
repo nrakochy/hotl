@@ -79,7 +79,7 @@ pub fn build_command(
     status: &SandboxStatus,
     egress: &EgressState,
 ) -> tokio::process::Command {
-    let mut cmd = match status {
+    let cmd = match status {
         SandboxStatus::Enforced("seatbelt") => seatbelt_command(command, egress),
         #[cfg(target_os = "linux")]
         SandboxStatus::Enforced("landlock") => landlock_command(command, egress),
@@ -89,10 +89,41 @@ pub fn build_command(
             cmd
         }
     };
-    // Allowlist mode: cooperating clients (curl, git, pip, cargo — anything
-    // honoring the proxy env) route through the filtering proxy on loopback;
-    // non-cooperating clients hit the kernel loopback-only wall and fail
-    // closed. For Off, no env — the kernel does all the work.
+    apply_proxy_env(cmd, egress)
+}
+
+/// Build a direct `program arg...` invocation (no shell) under the active
+/// floor and the resolved egress state — the argv-safe sibling of
+/// `build_command`, for callers (like `grep`) that must never splice a
+/// model-authored value into a shell string. Same sandbox floor, same proxy
+/// env wiring; only the exec shape differs (`program`+`args` vs `sh -c`).
+pub fn build_argv(
+    program: &str,
+    args: &[String],
+    status: &SandboxStatus,
+    egress: &EgressState,
+) -> tokio::process::Command {
+    let cmd = match status {
+        SandboxStatus::Enforced("seatbelt") => seatbelt_argv(program, args, egress),
+        #[cfg(target_os = "linux")]
+        SandboxStatus::Enforced("landlock") => landlock_argv(program, args, egress),
+        _ => {
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.args(args);
+            cmd
+        }
+    };
+    apply_proxy_env(cmd, egress)
+}
+
+/// Allowlist mode: cooperating clients (curl, git, pip, cargo — anything
+/// honoring the proxy env) route through the filtering proxy on loopback;
+/// non-cooperating clients hit the kernel loopback-only wall and fail closed.
+/// For Off/Open, no env — the kernel does all the work (or nothing changes).
+fn apply_proxy_env(
+    mut cmd: tokio::process::Command,
+    egress: &EgressState,
+) -> tokio::process::Command {
     if let EgressState::Proxy(port) = egress {
         let proxy = format!("http://127.0.0.1:{port}");
         for key in [
@@ -141,8 +172,10 @@ fn seatbelt_profile(confine_network: bool) -> String {
     profile
 }
 
+/// The `sandbox-exec` invocation up to (not including) the program to run —
+/// shared by the `sh -c` and direct-argv exec shapes.
 #[cfg(target_os = "macos")]
-fn seatbelt_command(command: &str, egress: &EgressState) -> tokio::process::Command {
+fn seatbelt_base(egress: &EgressState) -> tokio::process::Command {
     let confine_network = matches!(egress, EgressState::Off | EgressState::Proxy(_));
     let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let tmp = canon(std::env::temp_dir());
@@ -152,10 +185,21 @@ fn seatbelt_command(command: &str, egress: &EgressState) -> tokio::process::Comm
         .arg("-D")
         .arg(format!("CWD={}", cwd.display()))
         .arg("-D")
-        .arg(format!("TMP={}", tmp.display()))
-        .arg("sh")
-        .arg("-c")
-        .arg(command);
+        .arg(format!("TMP={}", tmp.display()));
+    cmd
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_command(command: &str, egress: &EgressState) -> tokio::process::Command {
+    let mut cmd = seatbelt_base(egress);
+    cmd.arg("sh").arg("-c").arg(command);
+    cmd
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_argv(program: &str, args: &[String], egress: &EgressState) -> tokio::process::Command {
+    let mut cmd = seatbelt_base(egress);
+    cmd.arg(program).args(args);
     cmd
 }
 
@@ -164,6 +208,14 @@ fn seatbelt_command(command: &str, egress: &EgressState) -> tokio::process::Comm
 fn seatbelt_command(command: &str, _egress: &EgressState) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c").arg(command);
+    cmd
+}
+
+#[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
+fn seatbelt_argv(program: &str, args: &[String], _egress: &EgressState) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
     cmd
 }
 
@@ -194,82 +246,87 @@ pub(crate) fn landlock_net_supported() -> Result<(), String> {
         .clone()
 }
 
+/// Build the fully-populated ruleset **in the parent**: `pre_exec` runs
+/// between fork and exec in a multithreaded process, where allocation
+/// (malloc lock) and other non-async-signal-safe work can deadlock, so
+/// everything that allocates happens here, before the spawn.
+///
+/// The fs part stays best-effort at ABI::V2 as before. The net part
+/// (Off/Proxy egress) is a **hard requirement**: `ConnectTcp` only — zero
+/// allowed ports for Off, exactly the proxy port for Proxy. Two honest Linux
+/// limits, by Landlock's design: net rules are **TCP-only** (UDP — including
+/// DNS and DNS-tunnel exfiltration — is not confined) and **port-scoped, not
+/// address-scoped** (the proxy port number is connectable on any host, and
+/// Off blocks loopback TCP too; unix-domain sockets are untouched either
+/// way). Shared by `landlock_command` and `landlock_argv`.
 #[cfg(target_os = "linux")]
-fn landlock_command(command: &str, egress: &EgressState) -> tokio::process::Command {
-    use std::os::unix::io::{AsRawFd, OwnedFd};
-
+fn build_landlock_ruleset(egress: &EgressState) -> Option<std::os::unix::io::OwnedFd> {
     use landlock::{
         Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathFd, Ruleset,
         RulesetAttr, RulesetCreatedAttr, ABI,
     };
 
-    /// Build the fully-populated ruleset **in the parent**: `pre_exec` runs
-    /// between fork and exec in a multithreaded process, where allocation
-    /// (malloc lock) and other non-async-signal-safe work can deadlock, so
-    /// everything that allocates happens here, before the spawn.
-    ///
-    /// The fs part stays best-effort at ABI::V2 as before. The net part
-    /// (Off/Proxy egress) is a **hard requirement**: `ConnectTcp` only —
-    /// zero allowed ports for Off, exactly the proxy port for Proxy. Two
-    /// honest Linux limits, by Landlock's design: net rules are **TCP-only**
-    /// (UDP — including DNS and DNS-tunnel exfiltration — is not confined)
-    /// and **port-scoped, not address-scoped** (the proxy port number is
-    /// connectable on any host, and Off blocks loopback TCP too; unix-domain
-    /// sockets are untouched either way).
-    fn build_ruleset(egress: &EgressState) -> Option<OwnedFd> {
-        let abi = ABI::V2;
-        let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-        let tmp = canon(std::env::temp_dir());
-        let confine_network = matches!(egress, EgressState::Off | EgressState::Proxy(_));
-        let mut attr = Ruleset::default()
-            .handle_access(AccessFs::from_all(abi))
-            .ok()?;
-        if confine_network {
-            // HardRequirement: on a kernel without the net ABI this fails,
-            // build_ruleset returns None, and the child refuses to exec
-            // (fail-closed) rather than run with open egress.
-            attr = attr
-                .set_compatibility(CompatLevel::HardRequirement)
-                .handle_access(AccessNet::ConnectTcp)
-                .ok()?
-                .set_compatibility(CompatLevel::BestEffort);
-        }
-        let mut ruleset = attr.create().ok()?;
-        // Read + execute everywhere.
-        ruleset = ruleset
-            .add_rule(landlock::PathBeneath::new(
-                PathFd::new("/").ok()?,
-                AccessFs::from_read(abi),
-            ))
-            .ok()?;
-        // Full access under cwd, tmp, /dev.
-        for p in [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")] {
-            if let Ok(fd) = PathFd::new(p) {
-                ruleset = ruleset
-                    .add_rule(landlock::PathBeneath::new(fd, AccessFs::from_all(abi)))
-                    .ok()?;
-            }
-        }
-        // Proxy mode: the single connectable TCP port. Off adds no ports.
-        if let EgressState::Proxy(port) = egress {
+    let abi = ABI::V2;
+    let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let tmp = canon(std::env::temp_dir());
+    let confine_network = matches!(egress, EgressState::Off | EgressState::Proxy(_));
+    let mut attr = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))
+        .ok()?;
+    if confine_network {
+        // HardRequirement: on a kernel without the net ABI this fails,
+        // build_landlock_ruleset returns None, and the child refuses to exec
+        // (fail-closed) rather than run with open egress.
+        attr = attr
+            .set_compatibility(CompatLevel::HardRequirement)
+            .handle_access(AccessNet::ConnectTcp)
+            .ok()?
+            .set_compatibility(CompatLevel::BestEffort);
+    }
+    let mut ruleset = attr.create().ok()?;
+    // Read + execute everywhere.
+    ruleset = ruleset
+        .add_rule(landlock::PathBeneath::new(
+            PathFd::new("/").ok()?,
+            AccessFs::from_read(abi),
+        ))
+        .ok()?;
+    // Full access under cwd, tmp, /dev.
+    for p in [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")] {
+        if let Ok(fd) = PathFd::new(p) {
             ruleset = ruleset
-                .add_rule(
-                    NetPort::new(*port, AccessNet::ConnectTcp)
-                        .set_compatibility(CompatLevel::HardRequirement),
-                )
+                .add_rule(landlock::PathBeneath::new(fd, AccessFs::from_all(abi)))
                 .ok()?;
         }
-        // Extract the ruleset fd; None when the kernel can't enforce it.
-        ruleset.into()
     }
+    // Proxy mode: the single connectable TCP port. Off adds no ports.
+    if let EgressState::Proxy(port) = egress {
+        ruleset = ruleset
+            .add_rule(
+                NetPort::new(*port, AccessNet::ConnectTcp)
+                    .set_compatibility(CompatLevel::HardRequirement),
+            )
+            .ok()?;
+    }
+    // Extract the ruleset fd; None when the kernel can't enforce it.
+    ruleset.into()
+}
 
-    let mut cmd = tokio::process::Command::new("sh");
-    cmd.arg("-c").arg(command);
+/// Wire the Landlock ruleset onto `cmd` via `pre_exec`. Shared tail of
+/// `landlock_command`/`landlock_argv` — only how `cmd` is constructed
+/// (`sh -c` vs direct argv) differs between the two.
+#[cfg(target_os = "linux")]
+fn apply_landlock(
+    mut cmd: tokio::process::Command,
+    egress: &EgressState,
+) -> tokio::process::Command {
+    use std::os::unix::io::{AsRawFd, OwnedFd};
+
     // The OwnedFd is captured by the closure, so it stays open across every
     // spawn of this Command (pre_exec runs after fork, before exec — a
     // parent-owned fd is still open in the child there). Fail-closed: with
     // no usable fd the child refuses to exec rather than run unconfined.
-    let ruleset_fd: Option<OwnedFd> = build_ruleset(egress);
+    let ruleset_fd: Option<OwnedFd> = build_landlock_ruleset(egress);
     let apply = move || {
         // Async-signal-safe only from here: raw syscalls, no allocation.
         let Some(fd) = ruleset_fd.as_ref().map(|f| f.as_raw_fd()) else {
@@ -290,6 +347,20 @@ fn landlock_command(command: &str, egress: &EgressState) -> tokio::process::Comm
         cmd.pre_exec(apply);
     }
     cmd
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_command(command: &str, egress: &EgressState) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new("sh");
+    cmd.arg("-c").arg(command);
+    apply_landlock(cmd, egress)
+}
+
+#[cfg(target_os = "linux")]
+fn landlock_argv(program: &str, args: &[String], egress: &EgressState) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(args);
+    apply_landlock(cmd, egress)
 }
 
 #[cfg(test)]
@@ -338,6 +409,39 @@ mod env_tests {
                 "{egress:?} must not touch env"
             );
         }
+    }
+
+    #[test]
+    fn build_argv_execs_program_and_args_directly_and_still_wires_proxy_env() {
+        // No sandbox floor on this "host": the argv falls through to a plain
+        // `Command::new(program)` — no `sh -c` wrapping, ever.
+        let status = SandboxStatus::Unavailable("test".into());
+        let args = vec!["--line-number".to_string(), "needle".to_string()];
+        let cmd = build_argv("rg", &args, &status, &EgressState::Open);
+        let std_cmd = cmd.as_std();
+        assert_eq!(std_cmd.get_program(), "rg");
+        let got_args: Vec<_> = std_cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(got_args, args);
+
+        // Proxy env wiring is shared with build_command.
+        let proxied = build_argv("rg", &args, &status, &EgressState::Proxy(9123));
+        let envs: Vec<_> = proxied
+            .as_std()
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&(
+            "HTTP_PROXY".to_string(),
+            Some("http://127.0.0.1:9123".to_string())
+        )));
     }
 }
 

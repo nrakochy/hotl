@@ -402,6 +402,123 @@ fn glob_impl(input: &Value) -> ToolResult {
     Ok(ToolOutcome::ok(out))
 }
 
+const GREP_MAX_OUTPUT: usize = 50 * 1024;
+
+// TODO(task 4): drop these allows once `GrepTool` is re-exported from
+// `lib.rs` and registered in `Registry::builtin_with` — until then it's
+// unreachable outside `#[cfg(test)]`.
+#[allow(dead_code)]
+pub struct GrepTool;
+
+impl Tool for GrepTool {
+    fn name(&self) -> &'static str {
+        "grep"
+    }
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+    fn description(&self) -> &str {
+        "Search file contents in the working directory with ripgrep. `pattern` is a regular \
+         expression. Optional `path` (relative), `glob` (e.g. \"*.rs\" to filter files), and \
+         `files_only` (list matching file names only). Output is capped at 50KB; narrow the \
+         pattern or add `glob` if it truncates."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "Regular expression to search for"},
+                "path": {"type": "string", "description": "Directory or file to search (relative to the working directory; defaults to \".\")"},
+                "glob": {"type": "string", "description": "Only search files matching this glob, e.g. \"*.rs\""},
+                "files_only": {"type": "boolean", "description": "List matching file paths instead of matching lines"}
+            },
+            "required": ["pattern"]
+        })
+    }
+    fn permission(&self, _input: &Value) -> Permission {
+        Permission::None
+    }
+    fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move { done(grep_impl(&input, cancel).await) })
+    }
+}
+
+#[allow(dead_code)]
+async fn grep_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
+    let pattern = str_arg(input, "pattern")?;
+    let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
+    // Fixed argv — the model's pattern is a value, never spliced into a shell.
+    let mut args = vec![
+        "--line-number".to_string(),
+        "--no-heading".to_string(),
+        "--color=never".to_string(),
+        "--max-columns=400".to_string(),
+    ];
+    if input
+        .get("files_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        args.push("--files-with-matches".to_string());
+    }
+    if let Some(g) = input.get("glob").and_then(Value::as_str) {
+        args.push("--glob".to_string());
+        args.push(g.to_string());
+    }
+    args.push("--".to_string());
+    args.push(pattern.to_string());
+    args.push(root.to_string_lossy().to_string());
+
+    // Reuse the sandbox command builder so content search inherits the floor,
+    // but exec `rg` directly (no `sh -c`) so the pattern can never be spliced
+    // into a shell string.
+    let egress = crate::net::egress_state().await;
+    let mut cmd = sandbox::build_argv("rg", &args, sandbox_status(), &egress);
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .process_group(0);
+    let child = cmd.spawn().map_err(|e| {
+        ToolOutcome::err(format!(
+            "Could not run ripgrep: {e}. Is `rg` installed? Fall back to `bash` with grep/find."
+        ))
+    })?;
+    let pid = child.id();
+    let wait = collect_output(child, GREP_MAX_OUTPUT + 1024);
+    tokio::pin!(wait);
+    let output = tokio::select! {
+        r = &mut wait => r.map_err(|e| ToolOutcome::err(format!("ripgrep failed: {e}.")))?,
+        _ = cancel.cancelled() => {
+            kill_group(pid);
+            return Err(ToolOutcome::err("Search cancelled by the user."));
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    // rg exit 1 == no matches (success, a prompt); >1 == real error.
+    match output.status.code() {
+        Some(0) => {
+            let mut body = text.to_string();
+            if body.len() > GREP_MAX_OUTPUT {
+                let mut end = GREP_MAX_OUTPUT;
+                while !body.is_char_boundary(end) {
+                    end -= 1;
+                }
+                body.truncate(end);
+                body.push_str("\n[truncated at 50KB: narrow `pattern` or add a `glob` filter]");
+            }
+            Ok(ToolOutcome::ok(body))
+        }
+        Some(1) => Ok(ToolOutcome::ok(format!(
+            "No matches for `{pattern}`. Try a looser pattern or a different `path`/`glob`."
+        ))),
+        _ => Err(ToolOutcome::err(format!(
+            "ripgrep error: {}. Check the pattern (it is a regex).",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
+}
+
 pub struct BashTool;
 
 impl Tool for BashTool {
@@ -630,6 +747,42 @@ mod tests {
         let out = GlobTool
             .run(
                 json!({"pattern": "*.rs", "path": "/etc"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(out.is_error && out.content.contains("outside the working directory"));
+    }
+
+    #[tokio::test]
+    async fn grep_finds_matches_and_reports_no_matches_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.rs"), "fn needle() {}\nother\n").unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+
+        let hit = GrepTool
+            .run(json!({"pattern": "needle"}), CancellationToken::new())
+            .await;
+        let miss = GrepTool
+            .run(json!({"pattern": "zzzzznope"}), CancellationToken::new())
+            .await;
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(
+            !hit.is_error && hit.content.contains("needle"),
+            "{}",
+            hit.content
+        );
+        // A no-match result is success (a prompt), not an error to retry.
+        assert!(!miss.is_error, "no-match must not be an error");
+        assert!(miss.content.to_lowercase().contains("no matches"));
+    }
+
+    #[tokio::test]
+    async fn grep_refuses_out_of_workspace_path() {
+        let out = GrepTool
+            .run(
+                json!({"pattern": "x", "path": "/etc"}),
                 CancellationToken::new(),
             )
             .await;
