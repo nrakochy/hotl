@@ -480,14 +480,17 @@ impl Turn {
         why: Option<String>,
     ) -> AskReply {
         let protected = why.is_some();
-        // TODO(plan mode, task 3): pass the tool's real `read_only()` instead
-        // of `false` once the gate consults it.
+        let read_only = self
+            .shared
+            .registry
+            .get(&tu.name)
+            .is_some_and(|t| t.read_only());
         match self.shared.rules.evaluate(
             &tu.name,
             input,
             self.shared.sandbox_enforced,
             protected,
-            false,
+            read_only,
         ) {
             Verdict::Auto { rule } => {
                 self.emit(EngineEvent::ToolAutoAllowed {
