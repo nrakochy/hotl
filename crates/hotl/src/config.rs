@@ -118,14 +118,16 @@ impl PermissionsCfg {
         use hotl_tools::rules::PermissionMode;
         let source = env.or(self.mode.as_deref());
         match source {
-            None | Some("auto") => (PermissionMode::Auto, None),
-            Some("ask") => (PermissionMode::Ask, None),
-            Some(other) => (
-                PermissionMode::Ask,
-                Some(format!(
-                    "[permissions].mode = \"{other}\" is not a mode (auto | ask) — failing closed to \"ask\""
-                )),
-            ),
+            None => (PermissionMode::Auto, None),
+            Some(s) => match PermissionMode::from_str(s) {
+                Some(m) => (m, None),
+                None => (
+                    PermissionMode::Ask,
+                    Some(format!(
+                        "[permissions].mode = \"{s}\" is not a mode (ask | auto | plan | dontask) — failing closed to \"ask\""
+                    )),
+                ),
+            },
         }
     }
 }
@@ -445,6 +447,22 @@ mod tests {
             .resolve(None);
         assert_eq!(m, PermissionMode::Ask);
         assert!(w.unwrap().contains("atuo"));
+        // plan and dontask parse from config…
+        let (m, w) = cfg_with("[permissions]\nmode = \"plan\"\n")
+            .permissions
+            .resolve(None);
+        assert_eq!(m, PermissionMode::Plan);
+        assert!(w.is_none());
+        let (m, w) = cfg_with("[permissions]\nmode = \"dontask\"\n")
+            .permissions
+            .resolve(None);
+        assert_eq!(m, PermissionMode::DontAsk);
+        assert!(w.is_none());
+        // …and from HOTL_PERMISSIONS.
+        let (m, _) = cfg_with("").permissions.resolve(Some("plan"));
+        assert_eq!(m, PermissionMode::Plan);
+        let (m, _) = cfg_with("").permissions.resolve(Some("dontask"));
+        assert_eq!(m, PermissionMode::DontAsk);
     }
 
     #[test]
