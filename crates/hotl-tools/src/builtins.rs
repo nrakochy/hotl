@@ -341,6 +341,16 @@ impl Tool for GlobTool {
 fn glob_impl(input: &Value) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
     let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
+    glob_walk(&root, pattern)
+}
+
+/// The walk itself, taking an already-resolved root (relative-and-contained
+/// at the call site above; an absolute tempdir path works just as well —
+/// `read_dir`/`strip_prefix` don't care). Split out so tests can drive the
+/// walk directly against a tempdir without touching the process-global
+/// working directory (`std::env::set_current_dir` would race every other
+/// test in this crate that spawns a subprocess relying on ambient cwd).
+fn glob_walk(root: &std::path::Path, pattern: &str) -> ToolResult {
     // "*.rs" / "**/*.rs" -> suffix match on the file name (the substring after
     // the final `*`); a pattern with no `*` -> substring match on the relative
     // path.
@@ -348,7 +358,7 @@ fn glob_impl(input: &Value) -> ToolResult {
         .contains('*')
         .then(|| pattern.rsplit('*').next().unwrap_or(""));
     let mut hits: Vec<String> = Vec::new();
-    let mut stack = vec![root.clone()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -365,7 +375,7 @@ fn glob_impl(input: &Value) -> ToolResult {
                 continue;
             }
             let rel = path
-                .strip_prefix(&root)
+                .strip_prefix(root)
                 .unwrap_or(&path)
                 .to_string_lossy()
                 .to_string();
@@ -436,6 +446,20 @@ impl Tool for GrepTool {
 async fn grep_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
     let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
+    grep_search(pattern, &root, input, cancel).await
+}
+
+/// The ripgrep invocation itself, taking an already-resolved root (relative-
+/// and-contained at the call site above; an absolute tempdir path works just
+/// as well — it's just another argv element to `rg`). Split out for the same
+/// reason as `glob_walk`: tests drive this directly against a tempdir instead
+/// of mutating the process-global working directory.
+async fn grep_search(
+    pattern: &str,
+    root: &std::path::Path,
+    input: &Value,
+    cancel: CancellationToken,
+) -> ToolResult {
     // Fixed argv — the model's pattern is a value, never spliced into a shell.
     let mut args = vec![
         "--line-number".to_string(),
@@ -705,8 +729,14 @@ mod tests {
         assert!(workspace_contained("src/../README.md").is_ok());
     }
 
-    #[tokio::test]
-    async fn glob_matches_by_suffix_and_caps() {
+    #[test]
+    fn glob_matches_by_suffix_and_caps() {
+        // Drives `glob_walk` directly against an absolute tempdir path rather
+        // than `set_current_dir`: the process-global cwd is shared with every
+        // other test in this crate (several spawn subprocesses that rely on
+        // ambient cwd, e.g. `sandbox::tests::seatbelt_confines_writes`), so
+        // flipping it here would race them under the default parallel test
+        // harness.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/a.rs"), "x").unwrap();
@@ -715,12 +745,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".git/config"), "x").unwrap();
 
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
-        let out = GlobTool
-            .run(json!({"pattern": "*.rs"}), CancellationToken::new())
-            .await;
-        std::env::set_current_dir(prev).unwrap();
+        let out = done(glob_walk(dir.path(), "*.rs"));
 
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("src/a.rs") && out.content.contains("src/b.rs"));
@@ -744,18 +769,23 @@ mod tests {
 
     #[tokio::test]
     async fn grep_finds_matches_and_reports_no_matches_cleanly() {
+        // Drives `grep_search` directly against an absolute tempdir path —
+        // same rationale as `glob_matches_by_suffix_and_caps` above: no
+        // `set_current_dir`, no race with the rest of the suite.
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.rs"), "fn needle() {}\nother\n").unwrap();
-        let prev = std::env::current_dir().unwrap();
-        std::env::set_current_dir(dir.path()).unwrap();
 
-        let hit = GrepTool
-            .run(json!({"pattern": "needle"}), CancellationToken::new())
-            .await;
-        let miss = GrepTool
-            .run(json!({"pattern": "zzzzznope"}), CancellationToken::new())
-            .await;
-        std::env::set_current_dir(prev).unwrap();
+        let hit =
+            done(grep_search("needle", dir.path(), &json!({}), CancellationToken::new()).await);
+        let miss = done(
+            grep_search(
+                "zzzzznope",
+                dir.path(),
+                &json!({}),
+                CancellationToken::new(),
+            )
+            .await,
+        );
 
         assert!(
             !hit.is_error && hit.content.contains("needle"),
