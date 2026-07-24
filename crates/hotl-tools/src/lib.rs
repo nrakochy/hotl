@@ -15,10 +15,12 @@ pub mod rules;
 pub mod sandbox;
 pub mod skills;
 pub mod todo;
+pub mod web;
 
 pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use todo::TodoWriteTool;
+pub use web::WebFetchTool;
 
 use std::sync::Arc;
 
