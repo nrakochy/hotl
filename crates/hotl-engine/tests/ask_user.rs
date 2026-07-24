@@ -26,9 +26,12 @@ fn spawn_with_ask_user(
     let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
     let (event_tx, event_rx) = hotl_engine::event_channel();
     let mut registry = Registry::builtin();
+    let notifications = hotl_engine::hooks::NotificationDrain::new();
     registry.register(Box::new(AskUserTool::new(hotl_engine::question_sink(
         cmd_tx.downgrade(),
         event_tx.downgrade(),
+        None,
+        notifications.clone(),
     ))));
     hotl_engine::spawn_session_with_channels(
         SessionDeps {
@@ -50,6 +53,7 @@ fn spawn_with_ask_user(
         cmd_rx,
         event_tx,
         event_rx,
+        notifications,
     )
 }
 

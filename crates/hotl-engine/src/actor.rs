@@ -46,6 +46,11 @@ pub(crate) struct SharedDeps {
     pub config: EngineConfig,
     pub snapshots: Option<Arc<dyn crate::Snapshotter>>,
     pub hooks: Option<Arc<dyn crate::hooks::Hooks>>,
+    /// The session-scoped `notify` drain (Finding 1 fix) — shared with
+    /// whatever built this session's `SessionHandle`, so the CLI's exit-time
+    /// drain call reaches the exact same detached `Notification` hook tasks
+    /// this actor (and any `question_sink`) spawns.
+    pub notifications: crate::hooks::NotificationDrain,
 }
 
 /// `PermissionMode` has no natural discriminant to lean on across an atomic
@@ -70,7 +75,10 @@ fn u8_to_mode(v: u8) -> PermissionMode {
 }
 
 impl SharedDeps {
-    fn new(deps: SessionDeps) -> (Self, SessionLog) {
+    fn new(
+        deps: SessionDeps,
+        notifications: crate::hooks::NotificationDrain,
+    ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
         let shared = Self {
             provider: deps.provider,
@@ -84,6 +92,7 @@ impl SharedDeps {
             config: deps.config,
             snapshots: deps.snapshots,
             hooks: deps.hooks,
+            notifications,
         };
         (shared, deps.log)
     }
@@ -121,6 +130,7 @@ pub(crate) async fn run(
     cmd_tx: mpsc::WeakSender<SessionCmd>,
     events: mpsc::Sender<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
+    notifications: crate::hooks::NotificationDrain,
 ) {
     // Resumed history is repaired on the way in: a log written by a build that
     // let a steer land mid-batch would otherwise fail every request forever.
@@ -138,7 +148,7 @@ pub(crate) async fn run(
     // Steers that arrived while a tool batch was open, waiting for its results
     // to close the pairing before they can be appended.
     let mut held_steers: Vec<String> = Vec::new();
-    let (shared, mut log) = SharedDeps::new(deps);
+    let (shared, mut log) = SharedDeps::new(deps, notifications);
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
@@ -263,11 +273,16 @@ pub(crate) async fn run(
             }
         }
     }
-    // SessionEnd: fire-and-forget, symmetric with `Notification` — the
-    // command channel closed (every `SessionHandle`/turn task dropped its
-    // sender), so this actor is shutting down for good.
+    // SessionEnd (Finding 1 fix): AWAITED, not fire-and-forget — the command
+    // channel closed (every `SessionHandle`/turn task dropped its sender), so
+    // this actor is shutting down for good and nothing needs it responsive
+    // any more. Blocking here (bounded by `call_session_end`'s own timeout)
+    // is what actually guarantees the hook runs to completion: this task is
+    // itself the one `SessionHandle::finish` awaits before the one-shot
+    // CLI's `block_on` drops its runtime, so a detached spawn here would
+    // just move the same race somewhere else.
     if let Some(hooks) = &shared.hooks {
-        crate::hooks::spawn_session_end(hooks);
+        crate::hooks::call_session_end(hooks).await;
     }
 }
 
@@ -391,6 +406,7 @@ async fn end_turn(
     if let Some(hooks) = &shared.hooks {
         crate::hooks::notify(
             hooks,
+            &shared.notifications,
             crate::hooks::NotificationKind::Done,
             outcome_detail(&outcome),
         );
@@ -416,6 +432,7 @@ async fn end_turn(
             if let Some(hooks) = &shared.hooks {
                 crate::hooks::notify(
                     hooks,
+                    &shared.notifications,
                     crate::hooks::NotificationKind::Idle,
                     "awaiting a prompt",
                 );

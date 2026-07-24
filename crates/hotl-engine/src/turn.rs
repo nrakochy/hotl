@@ -833,6 +833,7 @@ impl Turn {
         if let Some(hooks) = &self.shared.hooks {
             crate::hooks::notify(
                 hooks,
+                &self.shared.notifications,
                 crate::hooks::NotificationKind::Blocked,
                 summary.clone(),
             );

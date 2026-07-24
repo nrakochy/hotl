@@ -13,7 +13,7 @@ use hotl_engine::{
 use hotl_platform::SystemClock;
 use hotl_provider::ScriptedProvider;
 use hotl_store::{Masker, SessionLog};
-use hotl_tools::{rules::Rules, Registry};
+use hotl_tools::{rules::Rules, AskUserTool, Registry};
 use serde_json::json;
 use tokio::sync::mpsc;
 
@@ -146,5 +146,103 @@ async fn a_slow_notification_hook_never_stalls_turn_done() {
         start.elapsed() < Duration::from_millis(500),
         "TurnDone must not wait on the notification hook: {:?}",
         start.elapsed()
+    );
+}
+
+/// Finding 2 (IMPORTANT): `Notification::Blocked` must also fire at the
+/// `ask_user` structured-question surface (`hotl_engine::question_sink`),
+/// not just `Turn::ask` (the permission-ask surface) — this is the dominant
+/// "agent needs input" signal, the exact thing `hotl watch` exists to
+/// surface. Wires `question_sink` the same way `ask_user.rs` does (a
+/// pre-split command/event channel, since the sink needs live senders
+/// before the actor exists), but also threads a `hooks` handle and the
+/// session's own `NotificationDrain` through — the two arguments this test
+/// exists to prove actually reach `question_sink` and actually fire.
+#[tokio::test]
+async fn ask_user_question_fires_a_blocked_notification() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = EngineConfig::default();
+    let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call(
+            "t1",
+            "ask_user",
+            json!({
+                "header": "Scope", "prompt": "How far?",
+                "options": [{"label": "MVP"}, {"label": "Full"}]
+            }),
+        ),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let (tx, mut rx) = mpsc::unbounded_channel::<(NotificationKind, String)>();
+    let hooks: Arc<dyn hotl_engine::hooks::Hooks> =
+        Arc::new(InProcessHooks::new().on_notification(move |kind, detail| {
+            let _ = tx.send((kind, detail.to_string()));
+        }));
+
+    let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
+    let (event_tx, event_rx) = hotl_engine::event_channel();
+    let notifications = hotl_engine::hooks::NotificationDrain::new();
+    let mut registry = Registry::builtin();
+    registry.register(Box::new(AskUserTool::new(hotl_engine::question_sink(
+        cmd_tx.downgrade(),
+        event_tx.downgrade(),
+        Some(hooks.clone()),
+        notifications.clone(),
+    ))));
+    let mut handle = hotl_engine::spawn_session_with_channels(
+        SessionDeps {
+            provider,
+            registry: Arc::new(registry),
+            rules: Arc::new(Rules::default()),
+            sandbox_enforced: false,
+            clock: Arc::new(SystemClock),
+            log,
+            system: "sys".into(),
+            cwd: dir.path().to_path_buf(),
+            snapshots: None,
+            hooks: Some(hooks),
+            initial_items: Vec::new(),
+            initial_todos: Vec::new(),
+            config,
+        },
+        cmd_tx,
+        cmd_rx,
+        event_tx,
+        event_rx,
+        notifications,
+    );
+
+    handle.prompt("go".into()).await;
+
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
+        match ev {
+            EngineEvent::Question { reply, .. } => {
+                let _ = reply.send(hotl_types::QuestionAnswer::Selected(vec!["MVP".into()]));
+            }
+            EngineEvent::TurnDone { outcome, .. } => {
+                assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // Fire-and-forget: poll rather than assume it's already landed.
+    let (kind, detail) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+        .await
+        .expect("a Blocked notification must arrive from the ask_user surface")
+        .expect("channel closed early");
+    assert!(
+        matches!(kind, NotificationKind::Blocked),
+        "ask_user surfacing a question must notify Blocked: {kind:?}"
+    );
+    assert_eq!(
+        detail, "Scope",
+        "the detail should be the question's header"
     );
 }

@@ -105,20 +105,27 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     let mut handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration()),
+        scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(log, None, items, None, Vec::new());
             deps.registry = registry;
             deps
         },
     );
-    match crate::structured::run_structured(
+    let result = crate::structured::run_structured(
         &mut handle,
         &schema,
         prompt,
         crate::structured::MAX_RETRIES,
     )
-    .await
-    {
+    .await;
+    // Finding 1 fix: this is a one-shot CLI exit path — drain in-flight
+    // `Notification` hook tasks and await the actor's (now synchronous)
+    // `SessionEnd` hook before `main.rs::block_on` drops its runtime.
+    handle
+        .finish(hotl_engine::hooks::NOTIFICATION_TIMEOUT)
+        .await;
+    match result {
         Ok(value) => {
             println!("{value}");
             0
@@ -239,6 +246,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
         let handle = spawn_session_with_todos(
             (*scaffold.registry).clone(),
             Some(scaffold.spawn_registration()),
+            scaffold.hooks.clone(),
             |registry| {
                 let mut deps =
                     scaffold.deps(log, snapshots, initial, mode_override, inherited_todos);
@@ -295,6 +303,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration()),
+        scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(log, snapshots, initial_items, None, Vec::new());
             deps.registry = registry;
@@ -548,6 +557,7 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration()),
+        scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(log, snapshots, initial_items, None, Vec::new());
             deps.registry = registry;
@@ -560,7 +570,20 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
         .handle
         .prompt(crate::setup::expand_file_refs(&prompt))
         .await;
-    surface.run_until_idle().await
+    let code = surface.run_until_idle().await;
+    // Finding 1 fix: this is a one-shot CLI exit path — `main.rs::block_on`
+    // drops its `current_thread` runtime the instant this function returns,
+    // which used to silently kill any in-flight detached `Notification` hook
+    // task and race `SessionEnd`. `Surface` has no `Drop` impl, so moving
+    // `handle` out (rather than just letting `surface` fall out of scope) is
+    // safe and lets `finish` consume it: drain in-flight notifications, then
+    // await the actor's shutdown (which now runs `SessionEnd` synchronously)
+    // before returning.
+    let Surface { handle, .. } = surface;
+    handle
+        .finish(hotl_engine::hooks::NOTIFICATION_TIMEOUT)
+        .await;
+    code
 }
 
 /// Spawn a session with `todo_write` *and* `ask_user` registered and wired
@@ -604,10 +627,19 @@ struct SpawnRegistration {
 fn spawn_session_with_todos(
     mut registry: Registry,
     spawn: Option<SpawnRegistration>,
+    hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
     let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
     let (event_tx, event_rx) = hotl_engine::event_channel();
+    // Finding 2 fix: `ask_user`'s sink needs the *same* hooks handle and
+    // notification drain the actor below is built with, so a `Blocked`
+    // notification fired from `question_sink` both actually happens (Finding
+    // 1's drain) and reaches the configured hook at all (Finding 2) —
+    // `scaffold()` has already loaded `hooks` by the time any caller reaches
+    // this function, so there's no chicken-and-egg here despite the actor
+    // not existing yet.
+    let notifications = hotl_engine::hooks::NotificationDrain::new();
     let weak = cmd_tx.downgrade();
     registry.register(Box::new(hotl_tools::TodoWriteTool::new(Arc::new(
         move |items| {
@@ -617,7 +649,12 @@ fn spawn_session_with_todos(
         },
     ))));
     registry.register(Box::new(hotl_tools::AskUserTool::new(
-        hotl_engine::question_sink(cmd_tx.downgrade(), event_tx.downgrade()),
+        hotl_engine::question_sink(
+            cmd_tx.downgrade(),
+            event_tx.downgrade(),
+            hooks.clone(),
+            notifications.clone(),
+        ),
     )));
     if let Some(SpawnRegistration {
         builder,
@@ -633,7 +670,14 @@ fn spawn_session_with_todos(
         ));
     }
     let deps = build_deps(Arc::new(registry));
-    hotl_engine::spawn_session_with_channels(deps, cmd_tx, cmd_rx, event_tx, event_rx)
+    hotl_engine::spawn_session_with_channels(
+        deps,
+        cmd_tx,
+        cmd_rx,
+        event_tx,
+        event_rx,
+        notifications,
+    )
 }
 
 /// `fork`'s history seed: asks *this session's own actor* for its current
@@ -871,6 +915,7 @@ impl HotlChildBuilder {
         Ok(spawn_session_with_todos(
             registry,
             None, // children never get their own `spawn` tool — depth-1 is structural
+            None, // children never get hooks either — see `hooks: None` below
             |registry| SessionDeps {
                 provider: self.provider.clone(),
                 registry,
@@ -2133,7 +2178,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -2197,7 +2242,7 @@ mod tests {
         // *before* the assertion below, not merely by the time the test
         // function itself ends).
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -2252,7 +2297,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -2308,7 +2353,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -2617,5 +2662,121 @@ mod tests {
             let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
             assert!(parse_args(args).is_err());
         }
+    }
+
+    /// Finding 1 (CRITICAL) regression. hotl's real `-p` one-shot binary
+    /// drives its whole turn on a single `current_thread` tokio runtime
+    /// (`main.rs::block_on`), which DROPS the instant its driving future —
+    /// `run_session`'s `Surface::run_until_idle()` — resolves. Before the
+    /// fix, `notify`'s detached `tokio::spawn` (awaiting a REAL subprocess:
+    /// a shell `notification` hook) and `spawn_session_end`'s detached spawn
+    /// (a shell `session_end` hook) never got a scheduling turn on that
+    /// runtime: `block_on` returns and drops the runtime the moment
+    /// `run_until_idle` resolves, discarding both mid-flight, silently.
+    ///
+    /// A `#[tokio::test]` can't reproduce this: its own runtime is *also*
+    /// `current_thread`, but every other test in this file (and
+    /// `hooks_notification.rs`) polls `events.recv()`/`rx.recv()` in a loop
+    /// with generous timeouts well past `TurnDone`, which gives the executor
+    /// far more scheduling slack than `run_until_idle` ever spends in
+    /// production — that slack is exactly what let the old detached shape
+    /// limp along in every prior test while still being broken for real
+    /// users (the reviewer's own repro: 20/20 runs of a real subprocess
+    /// spawned inside `current_thread::block_on` never completed).
+    ///
+    /// So this test builds its own fresh `current_thread` runtime by hand —
+    /// the same construction `main.rs::block_on` uses — instead of
+    /// `#[tokio::test]`, and drives the exact sequence `run_session` now
+    /// uses (`Surface::new` → `prompt` → `run_until_idle` →
+    /// `SessionHandle::finish`) against REAL shell hooks (`ShellHooks`,
+    /// lane 2) whose commands write a sentinel file — a side effect only
+    /// observable if the subprocess actually ran to completion. The
+    /// assertions run only AFTER the runtime returned from `block_on` is
+    /// dropped, mirroring the moment `main.rs::block_on` drops its own.
+    ///
+    /// Before the Finding-1 fix (detached `notify`/`spawn_session_end`, no
+    /// drain, no `finish`): both sentinels are reliably missing here. After
+    /// the fix (`notify` tracks its `JoinHandle` in a `NotificationDrain`
+    /// `finish` awaits; `SessionEnd` runs awaited, not detached, at actor
+    /// shutdown, which `finish` also awaits): both sentinels reliably exist.
+    #[test]
+    fn one_shot_exit_path_actually_runs_notification_and_session_end_hooks() {
+        let dir = tempfile::tempdir().unwrap();
+        let notif_sentinel = dir.path().join("notification.done");
+        let end_sentinel = dir.path().join("session_end.done");
+        let toml = format!(
+            "[[hook]]\nevent = \"notification\"\ncommand = \"touch {}\"\n\
+             [[hook]]\nevent = \"session_end\"\ncommand = \"touch {}\"\n",
+            notif_sentinel.display(),
+            end_sentinel.display(),
+        );
+        let hooks: Arc<dyn hotl_engine::hooks::Hooks> =
+            Arc::new(crate::shell_hooks::load_str(&toml, test_concurrency()).unwrap());
+
+        // The exact runtime shape `main.rs::block_on` builds for every
+        // one-shot CLI path — NOT `#[tokio::test]`, whose own generous
+        // polling loops (in every other test in this crate) would mask
+        // exactly the bug this test exists to catch.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let code = runtime.block_on(async {
+            let session_dir = tempfile::tempdir().unwrap();
+            let config = EngineConfig::default();
+            let log =
+                SessionLog::create(session_dir.path(), &config.model, None, Masker::empty(), 0)
+                    .unwrap();
+            let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+                hotl_provider::ScriptedProvider::text_reply("done"),
+            ]));
+            let hooks_for_deps = hooks.clone();
+            let handle = spawn_session_with_todos(
+                Registry::builtin(),
+                None,
+                Some(hooks.clone()),
+                move |registry| SessionDeps {
+                    provider,
+                    registry,
+                    rules: Arc::new(hotl_tools::rules::Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: session_dir.path().to_path_buf(),
+                    snapshots: None,
+                    hooks: Some(hooks_for_deps),
+                    initial_items: Vec::new(),
+                    initial_todos: Vec::new(),
+                    config,
+                },
+            );
+            let mut surface = Surface::new(handle, true);
+            surface.handle.prompt("go".into()).await;
+            let code = surface.run_until_idle().await;
+            // The exact same "exit-time drain" `run_session` performs
+            // before returning to `main.rs::block_on`.
+            let Surface { handle, .. } = surface;
+            handle
+                .finish(hotl_engine::hooks::NOTIFICATION_TIMEOUT)
+                .await;
+            code
+        });
+        // `runtime` is dropped here, at the end of this statement's scope —
+        // the same moment `main.rs::block_on` drops its own runtime in the
+        // real binary. Both hooks' subprocesses must have already run to
+        // completion by now, not merely been spawned.
+        drop(runtime);
+        assert_eq!(code, 0);
+        assert!(
+            notif_sentinel.exists(),
+            "the notification hook's subprocess never completed before the runtime dropped \
+             — Finding 1's detached `notify` task was silently killed mid-flight"
+        );
+        assert!(
+            end_sentinel.exists(),
+            "the session_end hook's subprocess never completed before the runtime dropped \
+             — Finding 1's detached `spawn_session_end` task was silently killed mid-flight"
+        );
     }
 }

@@ -13,6 +13,7 @@ mod turn;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use hotl_platform::Clock;
 use hotl_provider::Provider;
@@ -305,6 +306,16 @@ pub struct SessionHandle {
     cmd: mpsc::Sender<SessionCmd>,
     pub events: mpsc::Receiver<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
+    /// The session-scoped `notify` drain (Finding 1 fix) — the same instance
+    /// the actor (and any `question_sink`) tracks detached `Notification`
+    /// hook tasks in.
+    notifications: hooks::NotificationDrain,
+    /// The actor task itself. Kept (rather than discarded, as before) so a
+    /// one-shot CLI exit path can wait for the actor to fully shut down —
+    /// including its now-synchronous `SessionEnd` hook call (Finding 1) —
+    /// instead of just dropping the handle and hoping the actor gets another
+    /// scheduler turn before the runtime goes away.
+    actor: tokio::task::JoinHandle<()>,
 }
 
 impl SessionHandle {
@@ -348,6 +359,39 @@ impl SessionHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cancel();
+    }
+
+    /// Bounded wait for every detached `Notification` hook task still in
+    /// flight (Finding 1's `notify` fix): the one-shot CLI's `block_on` drops
+    /// its `current_thread` runtime the instant its driving future resolves,
+    /// which would otherwise silently kill a hook task mid-subprocess. A
+    /// one-shot exit path should call this (or, more commonly,
+    /// [`SessionHandle::finish`]) before returning; the long-lived
+    /// TUI/interactive path never needs to — its runtime stays alive on its
+    /// own, so an in-flight notification finishes naturally.
+    pub async fn drain_notifications(&self, grace: Duration) {
+        self.notifications.drain(grace).await;
+    }
+
+    /// The one-shot CLI's exit-time helper (Finding 1, both halves):
+    /// consumes the handle, first draining in-flight `Notification` hook
+    /// tasks (bounded by `grace`), then dropping this handle's strong
+    /// command-channel sender and waiting — again bounded by `grace` — for
+    /// the actor to fully shut down, which now runs its `SessionEnd` hook
+    /// synchronously rather than as a detached task racing this same exit.
+    /// Total worst case is `2 * grace`, never unbounded: a hung hook can
+    /// delay the process's exit, but never wedge it.
+    ///
+    /// Call this (not a bare `drop(handle)`) right before a one-shot CLI
+    /// function returns. The long-lived TUI/interactive/`hotl serve` paths
+    /// must NOT call this — their runtime stays alive on its own, so both
+    /// the notification and session-end hooks get to run naturally without
+    /// this explicit wait.
+    pub async fn finish(self, grace: Duration) {
+        self.notifications.drain(grace).await;
+        let SessionHandle { cmd, actor, .. } = self;
+        drop(cmd);
+        let _ = tokio::time::timeout(grace, actor).await;
     }
 }
 
@@ -394,7 +438,14 @@ pub fn spawn_session_with(
     cmd_rx: mpsc::Receiver<SessionCmd>,
 ) -> SessionHandle {
     let (event_tx, event_rx) = event_channel();
-    spawn_session_with_channels(deps, cmd_tx, cmd_rx, event_tx, event_rx)
+    spawn_session_with_channels(
+        deps,
+        cmd_tx,
+        cmd_rx,
+        event_tx,
+        event_rx,
+        hooks::NotificationDrain::new(),
+    )
 }
 
 /// Spawn against pre-created command *and* event channels (see
@@ -407,22 +458,26 @@ pub fn spawn_session_with_channels(
     cmd_rx: mpsc::Receiver<SessionCmd>,
     event_tx: mpsc::Sender<EngineEvent>,
     event_rx: mpsc::Receiver<EngineEvent>,
+    notifications: hooks::NotificationDrain,
 ) -> SessionHandle {
     let current_turn = Arc::new(Mutex::new(CancellationToken::new()));
     // The actor gets only a weak sender: strong senders are the handle and
     // any in-flight turn task, so dropping the handle lets the command
     // channel close and the actor task exit instead of leaking.
-    tokio::spawn(actor::run(
+    let actor = tokio::spawn(actor::run(
         deps,
         cmd_rx,
         cmd_tx.downgrade(),
         event_tx,
         current_turn.clone(),
+        notifications.clone(),
     ));
     SessionHandle {
         cmd: cmd_tx,
         events: event_rx,
         current_turn,
+        notifications,
+        actor,
     }
 }
 
@@ -447,13 +502,28 @@ pub fn spawn_session_with_channels(
 /// `spawn_session_with_todos` for the sibling fix. An upgrade failure (the
 /// handle/actor already gone) resolves to `NoHuman` — there is nobody left
 /// to answer.
+///
+/// `hooks`/`notifications` (Finding 2 fix): this is the dominant "agent
+/// needs input" surface — the exact signal `hotl watch` exists to catch —
+/// but until now only `Turn::ask` (the permission-ask surface) fired
+/// `Notification::Blocked`. The blocker cited when this was first built
+/// (hooks unavailable at registry-build time) doesn't hold: `scaffold()`
+/// loads hooks and completes before `spawn_session_with_todos`/this sink are
+/// built, so the caller always has a `hooks` handle in scope — it just
+/// wasn't threaded through. `notifications` must be the *same* drain the
+/// session's actor was built with (Finding 1) so the CLI's exit-time drain
+/// call also covers a `Blocked` notification fired from here.
 pub fn question_sink(
     cmd_tx: mpsc::WeakSender<SessionCmd>,
     events_tx: mpsc::WeakSender<EngineEvent>,
+    hooks_handle: Option<Arc<dyn hooks::Hooks>>,
+    notifications: hooks::NotificationDrain,
 ) -> hotl_tools::ask::QuestionSink {
     std::sync::Arc::new(move |question, cancel| {
         let cmd_tx = cmd_tx.clone();
         let events_tx = events_tx.clone();
+        let hooks_handle = hooks_handle.clone();
+        let notifications = notifications.clone();
         Box::pin(async move {
             let id = hotl_types::new_ulid();
             propose_via(
@@ -464,6 +534,17 @@ pub fn question_sink(
                 }],
             )
             .await;
+            // Notification (Finding 2): the agent is blocked on a human at
+            // the ask_user surface, mirroring `Turn::ask` — fire-and-forget,
+            // right before the question actually surfaces.
+            if let Some(h) = &hooks_handle {
+                crate::hooks::notify(
+                    h,
+                    &notifications,
+                    crate::hooks::NotificationKind::Blocked,
+                    question.header.clone(),
+                );
+            }
             let answer = match events_tx.upgrade() {
                 None => hotl_types::QuestionAnswer::NoHuman,
                 Some(events) => {

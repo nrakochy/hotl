@@ -8,11 +8,12 @@
 //! result. Hook-visible payloads are byte-capped (pin #1) so a hook can't be
 //! used to amplify a huge tool result into the process.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use futures_util::future::BoxFuture;
 use serde_json::Value;
+use tokio::task::JoinHandle;
 
 /// Default cap on the bytes of a tool result a hook is shown.
 pub const HOOK_PAYLOAD_CAP: usize = 2048;
@@ -40,18 +41,76 @@ pub async fn call_user_prompt(hooks: &Arc<dyn Hooks>, prompt: &str) -> Option<St
 /// can't leak a task forever.
 pub const NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A session-scoped registry of in-flight detached `notify` task handles
+/// (Finding 1 fix, the Critical review caught in the real CLI): `notify`
+/// pushes the `JoinHandle` it spawns here instead of discarding it, so a
+/// caller that's about to tear down its runtime — the one-shot CLI's
+/// `current_thread` `block_on`, which drops the instant its driving future
+/// resolves — can `drain` them first, under a short bounded grace period.
+/// Without this, a detached `tokio::spawn` awaiting a real subprocess (a
+/// `notification` shell hook) is silently killed mid-flight the moment
+/// `block_on` returns: nothing else is left polling it, unlike the
+/// long-lived TUI/interactive path (or a `#[tokio::test]` that keeps polling
+/// `events.recv()` in a loop) where the runtime stays alive on its own.
+/// Cloning shares the same underlying registry (an `Arc`), so `notify`'s
+/// caller (the actor/turn) and the CLI's exit-time drain call see the same
+/// set of handles.
+#[derive(Clone, Default)]
+pub struct NotificationDrain(Arc<Mutex<Vec<JoinHandle<()>>>>);
+
+impl NotificationDrain {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn track(&self, handle: JoinHandle<()>) {
+        let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // Bound the registry's steady-state size across a long session:
+        // drop handles that already finished rather than let it grow
+        // unbounded (a poisoned lock has no invariants worth protecting —
+        // recover and keep going, same stance `SharedDeps`/`current_turn`
+        // take elsewhere).
+        guard.retain(|h| !h.is_finished());
+        guard.push(handle);
+    }
+
+    /// Await every still-pending handle, bounded by `grace` — never longer.
+    /// A handle that hasn't finished when `grace` elapses is abandoned
+    /// (best-effort, exactly like the per-hook timeout itself): this never
+    /// blocks the caller past `grace`, so a hung notifier can't wedge the
+    /// process's exit either.
+    pub async fn drain(&self, grace: Duration) {
+        let handles: Vec<_> = {
+            let mut guard = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            std::mem::take(&mut *guard)
+        };
+        if handles.is_empty() {
+            return;
+        }
+        let _ = tokio::time::timeout(grace, futures_util::future::join_all(handles)).await;
+    }
+}
+
 /// `Notification` (tier-1 gap #7, the `hotl watch`/desktop seam): spawn
 /// `on_notification` **detached**, under its own timeout, and return
 /// immediately — the caller MUST NOT `.await` this. A 2s (or hung) notifier
 /// must never stall the turn or the actor loop that calls it (Concurrency &
-/// parallelism §"Background (fire-and-forget) hooks").
-pub fn notify(hooks: &Arc<dyn Hooks>, kind: NotificationKind, detail: impl Into<String>) {
+/// parallelism §"Background (fire-and-forget) hooks"). The spawned handle is
+/// tracked in `drain` (Finding 1) so a caller about to tear down its runtime
+/// can wait for it first instead of silently killing it mid-flight.
+pub fn notify(
+    hooks: &Arc<dyn Hooks>,
+    drain: &NotificationDrain,
+    kind: NotificationKind,
+    detail: impl Into<String>,
+) {
     let hooks = Arc::clone(hooks);
     let detail = detail.into();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         let _ =
             tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_notification(kind, &detail)).await;
     });
+    drain.track(handle);
 }
 
 /// Await [`Hooks::on_stop`] under [`HOOK_CALL_TIMEOUT`]; a timeout behaves
@@ -63,13 +122,17 @@ pub async fn call_stop(hooks: &Arc<dyn Hooks>, outcome: &str) -> StopDecision {
         .unwrap_or(StopDecision::Allow)
 }
 
-/// `SessionEnd`: fire-and-forget at actor shutdown, the same detached shape
-/// as [`notify`].
-pub fn spawn_session_end(hooks: &Arc<dyn Hooks>) {
-    let hooks = Arc::clone(hooks);
-    tokio::spawn(async move {
-        let _ = tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_session_end()).await;
-    });
+/// `SessionEnd`: run AWAITED, under its own bounded timeout, at actor
+/// shutdown — NOT detached (Finding 1 fix). By definition nothing needs the
+/// actor responsive once it's already shutting down for good, so blocking
+/// here is correct, and it's the only way to *guarantee* the hook fires: a
+/// detached task here would race the same runtime-drop that silently killed
+/// `notify`'s old detached shape in the one-shot CLI path. The caller
+/// (`actor::run`) is itself a spawned task the CLI now awaits to completion
+/// before returning (`SessionHandle::finish`), so awaiting here — rather
+/// than spawning — is what makes that wait actually cover the hook call.
+pub async fn call_session_end(hooks: &Arc<dyn Hooks>) {
+    let _ = tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_session_end()).await;
 }
 
 /// A `PreToolUse` decision (wrap-style intercept). A `Rewrite` re-enters the

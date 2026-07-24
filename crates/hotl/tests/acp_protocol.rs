@@ -447,8 +447,14 @@ async fn ask_user_round_trip_via_session_request_question() {
         let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
         let (event_tx, event_rx) = hotl_engine::event_channel();
         let mut registry = Registry::builtin();
+        let notifications = hotl_engine::hooks::NotificationDrain::new();
         registry.register(Box::new(hotl_tools::AskUserTool::new(
-            hotl_engine::question_sink(cmd_tx.downgrade(), event_tx.downgrade()),
+            hotl_engine::question_sink(
+                cmd_tx.downgrade(),
+                event_tx.downgrade(),
+                None,
+                notifications.clone(),
+            ),
         )));
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::tool_call(
@@ -485,6 +491,7 @@ async fn ask_user_round_trip_via_session_request_question() {
                 cmd_rx,
                 event_tx,
                 event_rx,
+                notifications,
             ),
             name: None,
         })
