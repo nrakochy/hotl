@@ -23,6 +23,7 @@ mod bg;
 mod config;
 mod doctor;
 mod gc;
+mod history;
 mod keysource;
 mod session_server;
 mod setup;

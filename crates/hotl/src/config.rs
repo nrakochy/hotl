@@ -27,6 +27,8 @@ pub struct Config {
     #[serde(default)]
     pub retention: RetentionCfg,
     #[serde(default)]
+    pub history: HistoryCfg,
+    #[serde(default)]
     pub network: NetworkCfg,
     #[serde(default)]
     pub permissions: PermissionsCfg,
@@ -172,6 +174,41 @@ pub struct BehaviorCfg {
 pub struct RetentionCfg {
     pub max_age_days: Option<u64>,
     pub max_sessions: Option<usize>,
+}
+
+/// `[history]` — the interactive console's prompt history: a size-bounded,
+/// on-disk recall file. Every field is optional; the getters below carry the
+/// product defaults (on, 1000 entries, 2 MiB).
+#[derive(Debug, Default, Deserialize)]
+pub struct HistoryCfg {
+    pub enabled: Option<bool>,
+    pub path: Option<String>,
+    pub max_entries: Option<usize>,
+    pub max_bytes: Option<u64>,
+}
+
+impl HistoryCfg {
+    /// Default on — recall is the expected console behavior.
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    pub fn max_entries(&self) -> usize {
+        self.max_entries.unwrap_or(1000)
+    }
+
+    pub fn max_bytes(&self) -> u64 {
+        self.max_bytes.unwrap_or(2 * 1024 * 1024)
+    }
+
+    /// The resolved history file: a user `path` (with `~/` expanded), else
+    /// `<data_dir>/history.jsonl` (history is state/data, not config).
+    pub fn resolved_path(&self, data_dir: &Path) -> std::path::PathBuf {
+        match &self.path {
+            Some(p) => expand_home(p),
+            None => data_dir.join("history.jsonl"),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -415,6 +452,37 @@ mod tests {
         let cfg = cfg_with("[behavior]\nvim_mode = false\n");
         assert_eq!(cfg.behavior.vim_mode, Some(false));
         assert_eq!(cfg_with("").behavior.vim_mode, None);
+    }
+
+    #[test]
+    fn history_parses_and_falls_back_to_defaults() {
+        // Absent section: the product defaults (on, 1000 entries, 2 MiB).
+        let cfg = cfg_with("");
+        assert!(cfg.history.is_enabled());
+        assert_eq!(cfg.history.max_entries(), 1000);
+        assert_eq!(cfg.history.max_bytes(), 2 * 1024 * 1024);
+
+        // Explicit values override.
+        let cfg = cfg_with(
+            "[history]\nenabled = false\nmax_entries = 5\nmax_bytes = 4096\npath = \"~/h.jsonl\"\n",
+        );
+        assert!(!cfg.history.is_enabled());
+        assert_eq!(cfg.history.max_entries(), 5);
+        assert_eq!(cfg.history.max_bytes(), 4096);
+    }
+
+    #[test]
+    fn history_path_expands_home_and_defaults_under_data_dir() {
+        let data = std::path::Path::new("/data/hotl");
+        // No path → <data-dir>/history.jsonl.
+        assert_eq!(
+            cfg_with("").history.resolved_path(data),
+            data.join("history.jsonl")
+        );
+        // A `~/`-path expands against HOME.
+        let cfg = cfg_with("[history]\npath = \"~/notes/h.jsonl\"\n");
+        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert_eq!(cfg.history.resolved_path(data), home.join("notes/h.jsonl"));
     }
 
     #[test]

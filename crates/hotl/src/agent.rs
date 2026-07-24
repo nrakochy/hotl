@@ -1352,12 +1352,18 @@ pub(crate) fn config_dir() -> PathBuf {
         .join("hotl")
 }
 
-pub(crate) fn sessions_dir() -> PathBuf {
+/// `<xdg-data>/hotl` — the state/data root (sessions, shadows, history),
+/// falling back to `~/.local/share/hotl`.
+pub(crate) fn data_dir() -> PathBuf {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("hotl/sessions")
+        .join("hotl")
+}
+
+pub(crate) fn sessions_dir() -> PathBuf {
+    data_dir().join("sessions")
 }
 
 #[cfg(test)]

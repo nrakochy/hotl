@@ -63,6 +63,13 @@ mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.
 # max_age_days = 30
 # max_sessions = 200
 
+[history]
+# Console prompt recall (Up/Down, Ctrl-R search), persisted across sessions.
+# enabled = true                # false: recall works in-session, nothing on disk
+# path = \"...\"                   # default: <xdg-data>/hotl/history.jsonl (~ expanded)
+# max_entries = 1000            # oldest entries trimmed past this
+# max_bytes = 2097152           # ...and past this size (2 MiB); smaller cap wins
+
 # --- allow-rules: auto-approve trusted tool calls (TRUST GRANTS, not scopes) ---
 # Anything not matched still asks. Protected paths (ssh/creds/build.rs/git hooks)
 # ALWAYS ask, rule or not. Read-only conveniences are safe to auto-allow:
