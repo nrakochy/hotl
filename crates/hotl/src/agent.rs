@@ -225,8 +225,16 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
             .as_deref()
             .and_then(hotl_tools::rules::PermissionMode::from_str);
         if let Some(m) = inherited_mode {
+            // Re-log the *coerced* mode so a `security-enforced` build's log
+            // never claims `auto` while the session actually runs `ask` —
+            // mirroring the runtime `SetMode` path. A recognized mode passes
+            // through `enforced_mode`; an unrecognized (future) mode copies
+            // forward verbatim, since we can't coerce what we can't parse.
+            let logged = mode_override
+                .map(|pm| hotl_tools::rules::enforced_mode(pm).as_str().to_string())
+                .unwrap_or(m);
             let _ = log.append(
-                &hotl_types::EntryPayload::ModeSet { mode: m },
+                &hotl_types::EntryPayload::ModeSet { mode: logged },
                 scaffold.clock.now_ms(),
             );
         }
