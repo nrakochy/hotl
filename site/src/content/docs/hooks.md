@@ -64,7 +64,9 @@ command = "/usr/local/bin/cleanup"
 
 Your command receives the event as JSON on **stdin** and returns a decision as JSON on **stdout**.
 
-**pre_tool** — stdin `{"event":"pre_tool","tool":"bash","input":{...}}`, respond with one of:
+Every stdin envelope carries the event **twice**: hotl's own lowercase `event` (unchanged, so an already-shipped `pre_tool`/`post_tool` hook keeps working), and `hookEventName`, Claude's own camelCase name for the same event (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Notification`, `Stop`, `SessionEnd`) — so a `~/.claude`-style hook script that keys on `hookEventName` (the only key it knows for the brand-new `user_prompt`/`notification`/`stop` events) can read hotl's envelope unmodified.
+
+**pre_tool** — stdin `{"event":"pre_tool","hookEventName":"PreToolUse","tool":"bash","input":{...}}`, respond with one of:
 ```json
 {"decision":"continue"}
 {"decision":"deny","message":"why the model should not do this"}
@@ -72,23 +74,23 @@ Your command receives the event as JSON on **stdin** and returns a decision as J
 ```
 A `deny` becomes an error tool result carrying your message. A `rewrite` swaps the arguments and **re-enters the normal permission gate** — a hook cannot push a call past the y/N ask. With several matching hooks, `deny` beats `rewrite` beats `continue`.
 
-**post_tool** — stdin `{"event":"post_tool","tool":"read","result":"<up to 2KB>"}`, respond with `{"result":"replacement"}` to change what the model sees, or anything else to leave it.
+**post_tool** — stdin `{"event":"post_tool","hookEventName":"PostToolUse","tool":"read","result":"<up to 2KB>"}`, respond with `{"result":"replacement"}` to change what the model sees, or anything else to leave it.
 
-**user_prompt** — stdin `{"event":"user_prompt","prompt":"..."}`, respond with:
+**user_prompt** — stdin `{"event":"user_prompt","hookEventName":"UserPromptSubmit","prompt":"..."}`, respond with:
 ```json
 {"hookSpecificOutput":{"additionalContext":"remember: use pnpm, not npm"}}
 ```
 (the same nested shape Claude Code uses, so an existing `additionalContext` hook script ports unmodified). The text becomes one reminder committed right after the prompt it answers — never a system-prompt edit, so the prefix cache stays stable. Several matching hooks' context is concatenated into that one reminder, in the order they're listed.
 
-**notification** — stdin `{"event":"notification","kind":"blocked"|"idle"|"done","detail":"..."}`. Fire-and-forget: your command's stdout is ignored, and a slow or hung notifier is spawned detached with its own timeout — it can never stall the agent. This is the seam behind `hotl watch`/desktop notifiers.
+**notification** — stdin `{"event":"notification","hookEventName":"Notification","kind":"blocked"|"idle"|"done","detail":"..."}`. Fire-and-forget: your command's stdout is ignored, and a slow or hung notifier is spawned detached with its own timeout — it can never stall the agent. This is the seam behind `hotl watch`/desktop notifiers. `blocked` also fires from the structured `ask_user` question surface, not just the permission ask.
 
-**stop** — stdin `{"event":"stop","outcome":"the model's final reply text"}`, respond with:
+**stop** — stdin `{"event":"stop","hookEventName":"Stop","outcome":"the model's final reply text"}`, respond with:
 ```json
 {"decision":"block","reason":"tests haven't been run yet"}
 ```
 or `{"decision":"allow"}` (the default for anything else). A `block` injects your `reason` as a reminder and lets the model keep going — **bounded**: `stop` shares one small per-prompt budget with hotl's own todo-list nudge, so a hook that always blocks can never wedge a turn forever.
 
-**session_end** — stdin `{"event":"session_end"}`. Fire-and-forget, fired once when the session shuts down.
+**session_end** — stdin `{"event":"session_end","hookEventName":"SessionEnd"}`. Runs to completion at actor shutdown (bounded by its own timeout) rather than fire-and-forget — the process waits for it, so it's guaranteed to actually run before `hotl` exits.
 
 ### Rules hooks live by
 
@@ -98,6 +100,7 @@ or `{"decision":"allow"}` (the default for anything else). A `block` injects you
 - A hook that fails 3 times in a session is **evicted** for that session.
 - A hook can **block** a call, or **add context**, but never **grant** anything: a crashed, malformed, or timed-out hook is a no-op, never an auto-approval.
 - `env` in a `[[hook]]` entry is applied *before* hotl's own identity env (`HOTL_HOOK_EVENT`) — your config can't spoof which event your own script thinks it's answering.
+- `notification` still never blocks the turn, but in one-shot `hotl -p` runs the process waits (briefly, ~10 s) for any still-running `notification` hook before exiting — so a `tmux display-message`/desktop-notifier hook actually fires instead of being silently killed when the process exits right after the turn ends.
 
 ## Which to use
 

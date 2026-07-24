@@ -22,13 +22,17 @@
 //! ```
 //!
 //! Wire protocol (stdin → the hook), unchanged for the original two events:
-//!   {"event":"pre_tool","tool":"bash","input":{...}}
-//!   {"event":"post_tool","tool":"read","result":"<capped>"}
+//!   {"event":"pre_tool","hookEventName":"PreToolUse","tool":"bash","input":{...}}
+//!   {"event":"post_tool","hookEventName":"PostToolUse","tool":"read","result":"<capped>"}
 //! and the new events:
-//!   {"event":"user_prompt","prompt":"..."}
-//!   {"event":"notification","kind":"blocked"|"idle"|"done","detail":"..."}
-//!   {"event":"stop","outcome":"..."}
-//!   {"event":"session_end"}
+//!   {"event":"user_prompt","hookEventName":"UserPromptSubmit","prompt":"..."}
+//!   {"event":"notification","hookEventName":"Notification","kind":"blocked"|"idle"|"done","detail":"..."}
+//!   {"event":"stop","hookEventName":"Stop","outcome":"..."}
+//!   {"event":"session_end","hookEventName":"SessionEnd"}
+//! `hookEventName` carries Claude's own camelCase event-name values (Claude
+//! ecosystem compat) alongside hotl's original lowercase `event` key
+//! (back-compat for already-shipped `pre_tool`/`post_tool` hooks that read
+//! `event`) — every envelope carries both.
 //! Decision (hook stdout → us):
 //!   pre_tool:      {"decision":"continue"}
 //!                | {"decision":"deny","message":"why"}
@@ -82,6 +86,26 @@ struct HookSpec {
 struct HooksFile {
     #[serde(default, rename = "hook")]
     hooks: Vec<HookSpec>,
+}
+
+/// Claude's own camelCase event-name values for the `hookEventName` stdin
+/// key (Finding 3, Claude-ecosystem compat): a real `~/.claude`-style hook
+/// script for the brand-new events (`user_prompt`/`notification`/`stop` —
+/// which have no backward-compat constraint of their own) keys on
+/// `hookEventName`, not hotl's original lowercase `event`, so it can't parse
+/// hotl's envelope without this. `event` is kept in the envelope alongside
+/// it (see `Hooks for ShellHooks` below) so an already-shipped
+/// `pre_tool`/`post_tool` hook reading `event` is unaffected.
+fn claude_event_name(event: &str) -> &'static str {
+    match event {
+        "pre_tool" => "PreToolUse",
+        "post_tool" => "PostToolUse",
+        "user_prompt" => "UserPromptSubmit",
+        "notification" => "Notification",
+        "stop" => "Stop",
+        "session_end" => "SessionEnd",
+        _ => "Unknown",
+    }
 }
 
 /// `"*"`, absent, or empty → every tool; otherwise an exact-name comma list.
@@ -266,7 +290,12 @@ impl ShellHook {
 impl Hooks for ShellHooks {
     fn pre_tool<'a>(&'a self, name: &'a str, input: &'a Value) -> BoxFuture<'a, PreToolDecision> {
         Box::pin(async move {
-            let payload = json!({"event": "pre_tool", "tool": name, "input": input});
+            let payload = json!({
+                "event": "pre_tool",
+                "hookEventName": claude_event_name("pre_tool"),
+                "tool": name,
+                "input": input
+            });
             // Every matching hook runs concurrently (they're subprocess-
             // latency-bound); results are collected and folded in
             // REGISTRATION order (never completion order — `join_all`
@@ -300,7 +329,12 @@ impl Hooks for ShellHooks {
                     continue;
                 }
                 let view = current.as_deref().unwrap_or(capped);
-                let payload = json!({"event": "post_tool", "tool": name, "result": view});
+                let payload = json!({
+                    "event": "post_tool",
+                    "hookEventName": claude_event_name("post_tool"),
+                    "tool": name,
+                    "result": view
+                });
                 if let Some(decision) = hook.invoke(&payload, "post_tool", &self.concurrency).await
                 {
                     if let Some(replacement) = decision.get("result").and_then(Value::as_str) {
@@ -316,7 +350,11 @@ impl Hooks for ShellHooks {
 
     fn on_user_prompt<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
-            let payload = json!({"event": "user_prompt", "prompt": prompt});
+            let payload = json!({
+                "event": "user_prompt",
+                "hookEventName": claude_event_name("user_prompt"),
+                "prompt": prompt
+            });
             let futures = self.prompt.iter().map(|hook| {
                 let payload = payload.clone();
                 async move {
@@ -342,7 +380,12 @@ impl Hooks for ShellHooks {
                 NotificationKind::Idle => "idle",
                 NotificationKind::Done => "done",
             };
-            let payload = json!({"event": "notification", "kind": kind_str, "detail": detail});
+            let payload = json!({
+                "event": "notification",
+                "hookEventName": claude_event_name("notification"),
+                "kind": kind_str,
+                "detail": detail
+            });
             // The caller (`hotl_engine::hooks::notify`) already spawned this
             // whole call detached with its own timeout — awaiting every
             // shell hook here is safe; it never touches the turn's hot path.
@@ -358,7 +401,11 @@ impl Hooks for ShellHooks {
 
     fn on_stop<'a>(&'a self, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
         Box::pin(async move {
-            let payload = json!({"event": "stop", "outcome": outcome});
+            let payload = json!({
+                "event": "stop",
+                "hookEventName": claude_event_name("stop"),
+                "outcome": outcome
+            });
             let futures = self.stop.iter().map(|hook| {
                 let payload = payload.clone();
                 async move {
@@ -374,7 +421,10 @@ impl Hooks for ShellHooks {
 
     fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let payload = json!({"event": "session_end"});
+            let payload = json!({
+                "event": "session_end",
+                "hookEventName": claude_event_name("session_end")
+            });
             let futures = self
                 .session_end
                 .iter()
@@ -559,5 +609,40 @@ env = { HOTL_HOOK_EVENT = "spoofed-should-not-win" }
             .on_notification(NotificationKind::Blocked, "waiting")
             .await;
         hooks.on_session_end().await;
+    }
+
+    /// Finding 3: `user_prompt`/`notification`/`stop` are brand-new events
+    /// with no backward-compat constraint of their own — a real
+    /// `~/.claude`-style hook script for them keys on `hookEventName`
+    /// (Claude's own camelCase values), not hotl's original lowercase
+    /// `event`. Capture the raw stdin envelope exactly as a real script
+    /// would (`cat > file`) and assert both keys are present: `event` for
+    /// already-shipped hotl hooks, `hookEventName` for the Claude ecosystem.
+    #[tokio::test]
+    async fn stdin_envelope_carries_the_claude_compat_hook_event_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let notif_capture = dir.path().join("notification.json");
+        let stop_capture = dir.path().join("stop.json");
+        let toml = format!(
+            "[[hook]]\nevent = \"notification\"\ncommand = \"cat > {}\"\n\
+             [[hook]]\nevent = \"stop\"\ncommand = \"cat > {}; echo '{{}}'\"\n",
+            notif_capture.display(),
+            stop_capture.display(),
+        );
+        let hooks = load_str(&toml, concurrency()).unwrap();
+        hooks
+            .on_notification(NotificationKind::Blocked, "waiting on a human")
+            .await;
+        hooks.on_stop("done").await;
+
+        let notif: Value =
+            serde_json::from_str(&std::fs::read_to_string(&notif_capture).unwrap()).unwrap();
+        assert_eq!(notif["event"], "notification");
+        assert_eq!(notif["hookEventName"], "Notification");
+
+        let stop: Value =
+            serde_json::from_str(&std::fs::read_to_string(&stop_capture).unwrap()).unwrap();
+        assert_eq!(stop["event"], "stop");
+        assert_eq!(stop["hookEventName"], "Stop");
     }
 }
