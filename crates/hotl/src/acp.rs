@@ -105,12 +105,23 @@ pub struct SessionOpen {
 /// deps here; tests inject a scripted-provider session.
 pub type SessionFactory = Box<dyn FnMut(SessionSpec) -> Result<SessionOpen, String> + Send>;
 
+/// One skill as `initialize` advertises it. The description is client-facing
+/// only — front ends render it in the `/` completion menu. It never enters a
+/// prompt: the model's view of the roster is
+/// `hotl_tools::skills::SkillTool`'s tool description, which names skills
+/// without describing them.
+#[derive(Debug, Clone)]
+pub struct SkillInfo {
+    pub name: String,
+    pub description: String,
+}
+
 /// Drive the protocol over one connection until the client hangs up.
 pub async fn serve(
     read: impl AsyncRead + Send + Unpin + 'static,
     write: impl AsyncWrite + Send + Unpin + 'static,
     mut factory: SessionFactory,
-    skills: Vec<String>,
+    skills: Vec<SkillInfo>,
 ) {
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -176,14 +187,20 @@ async fn handle_request(
     pending_questions: &PendingQuestions,
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
-    skills: &[String],
+    skills: &[SkillInfo],
 ) {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     match msg.get("method").and_then(Value::as_str).unwrap_or("") {
         "initialize" => {
-            // `skills` lets a front end resolve `/<skill>` itself — the
-            // roster is server-side knowledge, so the client never has to
-            // walk the config dirs to know what a slash could mean.
+            // `skills` lets a front end resolve `/<skill>` itself and build a
+            // completion menu — the roster is server-side knowledge, so the
+            // client never has to walk the config dirs to know what a slash
+            // could mean. Descriptions ride this response only; they are
+            // never part of any prompt.
+            let skills: Vec<Value> = skills
+                .iter()
+                .map(|s| json!({"name": s.name, "description": s.description}))
+                .collect();
             reply_ok(writer, id, json!({"protocolVersion": PROTOCOL_VERSION, "schemaVersion": UPDATE_SCHEMA_VERSION, "skills": skills})).await;
         }
         method @ ("session/new" | "session/load") => {

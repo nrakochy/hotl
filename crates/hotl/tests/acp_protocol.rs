@@ -69,10 +69,19 @@ async fn send(w: &mut (impl AsyncWriteExt + Unpin), v: Value) {
 /// `initialize` advertises the roster so a front end can resolve
 /// `/<skill>` without walking the config dirs itself.
 #[tokio::test]
-async fn initialize_advertises_skill_names() {
+async fn initialize_advertises_skill_names_and_descriptions() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    let skills = vec!["brainstorming".to_string(), "acme:deploy".to_string()];
+    let skills = vec![
+        acp::SkillInfo {
+            name: "brainstorming".into(),
+            description: "turn an idea into a design".into(),
+        },
+        acp::SkillInfo {
+            name: "acme:deploy".into(),
+            description: String::new(),
+        },
+    ];
     tokio::spawn(acp::serve(sread, swrite, scripted_factory(), skills));
 
     let (cread, mut cwrite) = tokio::io::split(client);
@@ -85,7 +94,10 @@ async fn initialize_advertises_skill_names() {
     let init = next(&mut lines).await;
     assert_eq!(
         init["result"]["skills"],
-        json!(["brainstorming", "acme:deploy"])
+        json!([
+            {"name": "brainstorming", "description": "turn an idea into a design"},
+            {"name": "acme:deploy", "description": ""},
+        ])
     );
 }
 

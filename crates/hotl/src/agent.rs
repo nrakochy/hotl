@@ -151,8 +151,14 @@ pub async fn acp_main() -> i32 {
 
 /// The real-engine session factory `hotl acp` and `hotl tui` share, plus the
 /// resolved model name. Prints its own errors; `Err` carries the exit code.
-pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String, Vec<String>), i32>
-{
+pub(crate) async fn acp_factory() -> Result<
+    (
+        crate::acp::SessionFactory,
+        String,
+        Vec<crate::acp::SkillInfo>,
+    ),
+    i32,
+> {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -167,7 +173,14 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
         Err(code) => return Err(code),
     };
     let model = scaffold.model.clone();
-    let skill_names = scaffold.skill_names.clone();
+    let skills: Vec<crate::acp::SkillInfo> = scaffold
+        .skills
+        .iter()
+        .map(|(name, description)| crate::acp::SkillInfo {
+            name: name.clone(),
+            description: description.clone(),
+        })
+        .collect();
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         let (resumed, requested) = match spec {
             crate::acp::SessionSpec::New { name } => (None, name),
@@ -267,7 +280,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
             name: requested,
         })
     });
-    Ok((factory, model, skill_names))
+    Ok((factory, model, skills))
 }
 
 /// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a
@@ -335,9 +348,9 @@ struct Scaffold {
     cwd: PathBuf,
     config: EngineConfig,
     registry: Arc<Registry>,
-    /// Loadable skill names, produced by the registry's own discovery walk
-    /// so nothing walks the skill roots a second time.
-    skill_names: Vec<String>,
+    /// Loadable skill names with descriptions, produced by the registry's
+    /// own discovery walk so nothing walks the skill roots a second time.
+    skills: Vec<(String, String)>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     /// The api-key-helper's key, acquired once at startup validation below.
     /// `None` for a static key source (nothing to register: it's already a
@@ -430,7 +443,7 @@ async fn scaffold(
     // `build_registry` consumes the original for the web tools, so the
     // `agents` cap and the `requests` cap draw from one shared budget, not
     // two independently-built ones.
-    let (registry, skill_names) = build_registry(&cfg, &config_dir, concurrency.clone());
+    let (registry, skills) = build_registry(&cfg, &config_dir, concurrency.clone());
     let registry = Arc::new(registry);
     let hooks = load_hooks(&cfg, concurrency.clone());
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
@@ -445,7 +458,7 @@ async fn scaffold(
         cwd,
         config,
         registry,
-        skill_names,
+        skills,
         hooks,
         initial_helper_key,
         spawn_builder,
@@ -721,7 +734,7 @@ fn build_registry(
     cfg: &crate::config::Config,
     config_dir: &std::path::Path,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
-) -> (Registry, Vec<String>) {
+) -> (Registry, Vec<(String, String)>) {
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
     let diagnostics = cfg
         .hooks_toml()
@@ -745,13 +758,17 @@ fn build_registry(
     for w in warnings {
         eprintln!("hotl: {w}");
     }
-    // One discovery walk: the names for `/`-dispatch come off the same
-    // tool that goes into the registry, never a second scan of the roots.
-    let mut skill_names = Vec::new();
+    // One discovery walk: the names for `/`-dispatch and their descriptions
+    // come off the same tool that goes into the registry, never a second
+    // scan of the roots.
+    let mut skills_catalog: Vec<(String, String)> = Vec::new();
     if let Some(skills) =
         hotl_tools::skills::SkillTool::new(config_dir, include_claude, &marketplaces)
     {
-        skill_names = skills.names().map(String::from).collect();
+        skills_catalog = skills
+            .catalog()
+            .map(|(n, d)| (n.to_string(), d.to_string()))
+            .collect();
         registry.register(Box::new(skills));
     }
     // Retrieval backends (`[[retrieval]]`) → the `recall` tool. Absent when
@@ -802,7 +819,7 @@ fn build_registry(
             search_concurrency,
         )));
     }
-    (registry, skill_names)
+    (registry, skills_catalog)
 }
 
 /// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
@@ -1978,13 +1995,17 @@ mod tests {
         // developer's machine and would leak into this assertion.
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (_registry, names) = build_registry(&cfg, dir.path(), test_concurrency());
-        assert_eq!(names, vec!["deploy".to_string()]);
+        let (_registry, catalog) = build_registry(&cfg, dir.path(), test_concurrency());
+        assert_eq!(
+            catalog,
+            vec![("deploy".to_string(), "Deploy checklist".to_string())],
+            "the description rides along with the name"
+        );
 
         // No skills configured → no names, and no tool registered.
         let empty = tempfile::tempdir().unwrap();
-        let (_registry, names) = build_registry(&cfg, empty.path(), test_concurrency());
-        assert!(names.is_empty(), "{names:?}");
+        let (_registry, catalog) = build_registry(&cfg, empty.path(), test_concurrency());
+        assert!(catalog.is_empty(), "{catalog:?}");
     }
 
     #[test]

@@ -94,7 +94,18 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     };
     let mut state = State::new(vim_mode, model);
     state.session_name = session_name;
-    state.skills = skills;
+    state.skills = skills.iter().map(|(n, _)| n.clone()).collect();
+    state
+        .commands
+        .extend(
+            skills
+                .into_iter()
+                .map(|(name, description)| hotl_tui::complete::Command {
+                    name,
+                    description,
+                    builtin: false,
+                }),
+        );
     state.density = density;
     state.editor.load_history(history);
     let result = run_loop(
@@ -118,28 +129,45 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     }
 }
 
+/// `initialize`'s skill roster as `(name, description)`. Accepts the object
+/// shape `[{"name":…,"description":…}]` and the legacy bare-string shape
+/// `["name"]`, so a newer TUI against an older engine keeps `/<skill>`
+/// dispatch and simply shows no descriptions.
+fn parse_skills(hello: &Value) -> Vec<(String, String)> {
+    hello
+        .get("skills")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| match v {
+                    Value::String(name) => Some((name.clone(), String::new())),
+                    Value::Object(_) => v.get("name").and_then(Value::as_str).map(|name| {
+                        let description = v
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        (name.to_string(), description.to_string())
+                    }),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// initialize + session/new|load before entering raw mode, so wiring errors
 /// print as plain lines instead of corrupting an alt-screen. Returns the
-/// opened session's display name (server-confirmed) and the skill names
+/// opened session's display name (server-confirmed) and the skills
 /// `initialize` advertised, which is what makes `/<skill>` resolvable.
 async fn handshake(
     client: &mut Client,
     reader: &mut ServerReader,
     spec: Option<String>,
     name: Option<String>,
-) -> Result<(Option<String>, Vec<String>), String> {
+) -> Result<(Option<String>, Vec<(String, String)>), String> {
     let init = client.request("initialize", Value::Null).await;
     let hello = wait_response(reader, init).await?;
-    let skills: Vec<String> = hello
-        .get("skills")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(String::from)
-                .collect()
-        })
-        .unwrap_or_default();
+    let skills = parse_skills(&hello);
     let open = match spec {
         None => client.request("session/new", json!({"name": name})).await,
         Some(sid) => {
@@ -569,7 +597,8 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tui_args, resolve_session_arg};
+    use super::{parse_skills, parse_tui_args, resolve_session_arg};
+    use serde_json::json;
     use std::time::SystemTime;
 
     fn v(args: &[&str]) -> Vec<String> {
@@ -676,5 +705,39 @@ mod tests {
             resolve_session_arg("fix-auth", &s),
             Ok(named.session_id.clone())
         );
+    }
+
+    #[test]
+    fn skills_parse_from_the_object_shape_with_descriptions() {
+        let hello = json!({"skills": [
+            {"name": "review", "description": "review a pull request"},
+            {"name": "bare"},
+        ]});
+        assert_eq!(
+            parse_skills(&hello),
+            vec![
+                ("review".to_string(), "review a pull request".to_string()),
+                ("bare".to_string(), String::new()),
+            ]
+        );
+    }
+
+    /// A newer TUI against an older engine degrades to names-only rather
+    /// than losing `/<skill>` dispatch entirely.
+    #[test]
+    fn skills_still_parse_from_the_legacy_bare_string_shape() {
+        let hello = json!({"skills": ["review", "acme:deploy"]});
+        assert_eq!(
+            parse_skills(&hello),
+            vec![
+                ("review".to_string(), String::new()),
+                ("acme:deploy".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_skills_field_yields_nothing() {
+        assert!(parse_skills(&json!({})).is_empty());
     }
 }
