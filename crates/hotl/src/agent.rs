@@ -573,7 +573,7 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
         },
     );
 
-    let mut surface = Surface::new(handle, json_events);
+    let mut surface = Surface::new(handle, json_events, scaffold.config.max_turns);
     surface
         .handle
         .prompt(crate::setup::expand_file_refs(&prompt))
@@ -1226,18 +1226,22 @@ struct Surface {
     json: bool,
     turn_running: bool,
     saw_text: bool,
+    /// Carried only to name the budget in the `TurnLimit` notice — the stop is
+    /// otherwise unexplained, and the knob that fixes it isn't guessable.
+    max_turns: i64,
     /// One SIGINT stream for the surface's lifetime — registered once, not
     /// per select iteration.
     sigint: tokio::signal::unix::Signal,
 }
 
 impl Surface {
-    fn new(handle: SessionHandle, json: bool) -> Self {
+    fn new(handle: SessionHandle, json: bool, max_turns: i64) -> Self {
         Self {
             handle,
             json,
             turn_running: false,
             saw_text: false,
+            max_turns,
             sigint: signal(SignalKind::interrupt()).expect("SIGINT handler"),
         }
     }
@@ -1335,9 +1339,12 @@ impl Surface {
         match &outcome {
             Outcome::Done { .. } => {}
             Outcome::Cancelled => eprintln!("\n(interrupted)"),
-            Outcome::TurnLimit => {
-                eprintln!("\nhotl: stopped at max_turns — break the task into smaller prompts.")
-            }
+            Outcome::TurnLimit => eprintln!(
+                "\nhotl: stopped after {} model steps (the max_turns cap).\n\
+                 Raise it with `[behavior] max_turns` in config.toml or \
+                 HOTL_MAX_TURNS; `-1` removes the cap entirely.",
+                self.max_turns
+            ),
             Outcome::Refused => eprintln!("\nhotl: the model declined this request."),
             Outcome::DoomLoop { pattern } => {
                 eprintln!("\nhotl: stopped — the model kept repeating: {pattern}")
@@ -1503,8 +1510,8 @@ fn initial_items(config_dir: &std::path::Path, cwd: &std::path::Path) -> Vec<hot
 
 /// Engine knobs from the environment: HOTL_CONTEXT_WINDOW (tokens) and
 /// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
-/// Build the engine config from `config.toml [context]` with env overrides
-/// (env > config.toml > default).
+/// Build the engine config from `config.toml` (`[context]`, plus `[behavior]
+/// max_turns`) with env overrides (env > config.toml > default).
 fn engine_config(
     model: &str,
     secrets: &dyn SecretStore,
@@ -1520,6 +1527,13 @@ fn engine_config(
         .or(cfg.context.window)
     {
         config.context_window = window;
+    }
+    if let Some(turns) = secrets
+        .get("HOTL_MAX_TURNS")
+        .and_then(|v| v.parse().ok())
+        .or(cfg.behavior.max_turns)
+    {
+        config.max_turns = turns;
     }
     config.fast_model = secrets
         .get("HOTL_FAST_MODEL")
@@ -2458,6 +2472,24 @@ mod tests {
     }
 
     #[test]
+    fn max_turns_precedence_env_then_config_then_default() {
+        let cfg = config_from_toml("[behavior]\nmax_turns = 250\n");
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &cfg).max_turns,
+            250
+        );
+        // Env wins, and carries the `-1` = unlimited sentinel intact.
+        let secrets = MapSecrets::from([("HOTL_MAX_TURNS", "-1")]);
+        assert_eq!(engine_config("m", &secrets, &cfg).max_turns, -1);
+        // Absent everywhere: the built-in default, which must be roomy enough
+        // that ordinary agentic work never trips it.
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &config_from_toml("")).max_turns,
+            100
+        );
+    }
+
+    #[test]
     fn helper_beats_static_key_env() {
         let cfg = config_from_toml("[provider]\napi_key_helper = \"echo k\"\n");
         let secrets = MapSecrets::from([
@@ -2759,7 +2791,7 @@ mod tests {
                     config,
                 },
             );
-            let mut surface = Surface::new(handle, true);
+            let mut surface = Surface::new(handle, true, EngineConfig::default().max_turns);
             surface.handle.prompt("go".into()).await;
             let code = surface.run_until_idle().await;
             // The exact same "exit-time drain" `run_session` performs

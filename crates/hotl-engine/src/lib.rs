@@ -42,7 +42,16 @@ pub use hooks::NotificationKind;
 pub struct EngineConfig {
     pub model: String,
     pub max_tokens: u32,
-    pub max_turns: u32,
+    /// Model samples one prompt may spend before the turn is cut short with
+    /// [`Outcome::TurnLimit`]. Every tool round-trip costs one, so this is a
+    /// step budget for the agent loop, not a count of conversational turns.
+    ///
+    /// **Negative = unlimited**: the turn runs until the model stops on its
+    /// own, the context fills, a tool budget trips, or the user cancels. That
+    /// is a deliberate opt-in — the bound is what keeps an unattended
+    /// (`Auto`/`DontAsk`) run from looping on the owner's money, so removing
+    /// it should be a choice, never a default.
+    pub max_turns: i64,
     pub thinking: bool,
     pub cache_static: bool,
     /// Availability-only fallback models (≤3 total — RELIABILITY.md).
@@ -70,7 +79,10 @@ impl Default for EngineConfig {
         Self {
             model: "claude-opus-4-8".into(),
             max_tokens: 32_000,
-            max_turns: 25,
+            // Roomy enough that ordinary agentic work (long edit/test/fix
+            // chains) finishes inside it — the cap is a runaway backstop, not
+            // a work ceiling. Sub-agent call sites set their own, tighter.
+            max_turns: 100,
             thinking: true,
             cache_static: true,
             fallback_models: Vec::new(),

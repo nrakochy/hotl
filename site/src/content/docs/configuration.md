@@ -47,6 +47,9 @@ show_used_pct = true       # show context-fullness in each turn's status
 [behavior]
 sandbox = true             # false disables the bash sandbox floor
 vim_mode = false           # true = vim-style keys in the console's input editor
+max_turns = 100            # model steps one prompt may spend (a tool round-trip
+                           # costs one). -1 = unlimited: run until the model is
+                           # done, the context fills, or you interrupt.
 
 [permissions]
 mode = "auto"   # "auto" | "ask" | "plan" | "dontask"
@@ -238,6 +241,7 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
+| `HOTL_MAX_TURNS` | `[behavior].max_turns` | Model steps per prompt (default 100); `-1` = unlimited. |
 | `HOTL_CONCURRENCY_REQUESTS` | `[concurrency].requests` | Concurrent `web_fetch`/`web_search` HTTP requests (default 4). |
 | `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Concurrent sub-agent (`spawn`) sessions (default 4) — global across the parent and every child. |
 | `HOTL_CONCURRENCY_SUBPROCS` | `[concurrency].subprocs` | Reserved (subprocess batching; no effect yet). |

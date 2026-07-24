@@ -185,6 +185,11 @@ pub struct BehaviorCfg {
     /// Vim-style keys in the console's input editor. Resolve via
     /// [`BehaviorCfg::vim_mode`] — absent means **off**.
     pub vim_mode: Option<bool>,
+    /// Model samples one prompt may spend before the turn is cut short with
+    /// `turn limit reached`. A tool round-trip costs one, so this is the
+    /// agent loop's step budget. `-1` = unlimited (run until the model stops
+    /// on its own). Absent = the engine default.
+    pub max_turns: Option<i64>,
 }
 
 impl BehaviorCfg {
@@ -447,6 +452,21 @@ mod tests {
         );
         let hooks = cfg.hooks_toml().unwrap();
         assert!(hooks.contains("pre_tool") && hooks.contains("cargo check"));
+    }
+
+    #[test]
+    fn behavior_max_turns_parses_including_the_unlimited_sentinel() {
+        assert_eq!(
+            cfg_with("[behavior]\nmax_turns = 250\n").behavior.max_turns,
+            Some(250)
+        );
+        // `-1` is the opt-in "no cap" posture — it must survive parsing as a
+        // negative, not be rejected or clamped.
+        assert_eq!(
+            cfg_with("[behavior]\nmax_turns = -1\n").behavior.max_turns,
+            Some(-1)
+        );
+        assert_eq!(cfg_with("").behavior.max_turns, None);
     }
 
     #[test]

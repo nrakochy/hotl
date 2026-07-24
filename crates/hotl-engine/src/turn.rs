@@ -184,7 +184,14 @@ impl Turn {
     }
 
     async fn drive(&mut self) -> TurnEnd {
-        for _ in 0..self.shared.config.max_turns {
+        // A negative bound is the opt-in "no cap" posture (`EngineConfig::
+        // max_turns`): the loop then only ever leaves through one of the
+        // branches below — done, cancelled, compaction, refusal, tool budget
+        // — so cancellation and the context-full path stay the real floor.
+        let bound = self.shared.config.max_turns;
+        let mut spent: i64 = 0;
+        while bound < 0 || spent < bound {
+            spent += 1;
             let (stop, blocks) = match self.sample().await {
                 SampleEnd::Completed { stop, blocks } => (stop, blocks),
                 SampleEnd::Cancelled => return TurnEnd::Outcome(Outcome::Cancelled),

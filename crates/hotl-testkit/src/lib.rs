@@ -848,6 +848,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negative_max_turns_never_caps() {
+        // 30 tool steps — past the old hard-wired 25 — then a real answer.
+        // A negative `max_turns` is the opt-in "run until the model is done"
+        // posture, so the turn must reach `Done`, never `TurnLimit`.
+        let mut scripts: Vec<_> = (0..30)
+            .map(|i| {
+                ScriptedProvider::tool_call(
+                    &format!("t{i}"),
+                    "bash",
+                    json!({"command": format!("echo {i}")}),
+                )
+            })
+            .collect();
+        scripts.push(ScriptedProvider::text_reply("finished"));
+        let mut h = Harness::new(
+            scripts,
+            EngineConfig {
+                max_turns: -1,
+                ..Default::default()
+            },
+        );
+        let outcome = h.prompt_and_wait("go as long as it takes").await;
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "finished".into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn interrupt_cancels_running_turn() {
         let mut h = Harness::new(
             vec![ScriptedProvider::tool_call(

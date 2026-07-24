@@ -31,7 +31,7 @@ Look up the message you saw. Text in `code` is what hotl prints; find yours by g
 |---|---|---|
 | `stopped — the model kept repeating: …` | Doom-loop guard: the model made the same tool call in a tight cycle. In `ask` mode you declined to continue; in `auto` mode it stops on its own (nobody is watching). | Re-prompt with a more specific instruction; the loop usually means the task was ambiguous. |
 | `stopped — \`TOOL\` failed too many times in a row.` | A tool failed 5 consecutive times (tool-failure budget). | Check the tool's error output in the transcript; the underlying command or path is wrong. |
-| `stopped at max_turns` | The turn hit the 25-step cap. | Break the task into smaller prompts. |
+| `turn limit reached` / `stopped after N model steps` | The turn spent its `max_turns` budget (default 100 model steps; a tool round-trip costs one). | Raise `[behavior] max_turns` in `config.toml` (or `HOTL_MAX_TURNS`). `-1` removes the cap — the turn then ends only when the model is done, the context fills, or you interrupt. |
 | `(context compacted — …)` | Normal: history was summarized to stay within the window. | None. If it happens too early, set `HOTL_CONTEXT_WINDOW` to your model's real window size. |
 | `session log is sealed` / `could not create session log` | The session log couldn't be written (permissions, disk). | Check `~/.local/share/hotl/sessions/` is writable (`hotl doctor` reports this). |
 | `preapproved rules at … refused` | The admin file isn't root-owned, or is group/world-writable. | `sudo chown root /etc/hotl/preapproved.toml && sudo chmod 644 /etc/hotl/preapproved.toml` |

@@ -382,7 +382,9 @@ fn outcome_notice(kind: &str, text: Option<&str>) -> Option<String> {
     Some(match kind {
         "done" => return None,
         "cancelled" => "turn cancelled".into(),
-        "turn_limit" => "turn limit reached".into(),
+        // Name the knob: hitting this looks like an unexplained stop, and the
+        // fix ([behavior] max_turns, or -1 for no cap) is not guessable.
+        "turn_limit" => "turn limit reached — raise [behavior] max_turns (-1 = no cap)".into(),
         "refused" => "provider refused the request".into(),
         other => format!("{other}: {}", text.unwrap_or(""))
             .trim_end_matches([':', ' '])
