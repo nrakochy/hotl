@@ -254,7 +254,7 @@ impl Turn {
         if let Some(pattern) = detect_doom_loop(self.call_sigs.make_contiguous()) {
             // Auto mode has nobody watching: the doom guard is a malfunction
             // brake, not a permission — stop the turn instead of asking.
-            let stop = if self.shared.rules.mode() == hotl_tools::rules::PermissionMode::Auto {
+            let stop = if self.shared.effective_mode() == hotl_tools::rules::PermissionMode::Auto {
                 true
             } else {
                 let cont = self
@@ -486,6 +486,7 @@ impl Turn {
             .get(&tu.name)
             .is_some_and(|t| t.read_only());
         match self.shared.rules.evaluate(
+            self.shared.effective_mode(),
             &tu.name,
             input,
             self.shared.sandbox_enforced,

@@ -23,6 +23,10 @@ pub const JSON_STREAM_SCHEMA_VERSION: u32 = 1;
 pub(crate) struct Resumed {
     pub parent_id: String,
     pub items: Vec<hotl_types::Item>,
+    /// The parent's last `ModeSet`, if any (durable, last-wins — same
+    /// inheritance shape as the display name). `None` = the parent never
+    /// left its startup default, so the resumed session keeps its own.
+    pub mode: Option<String>,
 }
 
 pub async fn agent_main(args: Vec<String>) -> i32 {
@@ -94,7 +98,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     }
     let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
     items.push(crate::structured::contract_item(&schema));
-    let mut handle = spawn_session(scaffold.deps(log, None, items));
+    let mut handle = spawn_session(scaffold.deps(log, None, items, None));
     match crate::structured::run_structured(
         &mut handle,
         &schema,
@@ -158,6 +162,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
                     header,
                     items,
                     name: inherited,
+                    mode,
                     ..
                 } = replayed;
                 // An explicit rename-on-resume beats the inherited name.
@@ -166,6 +171,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
                     Some(Resumed {
                         parent_id: header.session_id,
                         items,
+                        mode,
                     }),
                     name,
                 )
@@ -188,11 +194,26 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
                 scaffold.clock.now_ms(),
             );
         }
+        // Copy-forward the inherited mode too (same reasoning as the name):
+        // this log is now the single-file source of truth for `hotl resume`.
+        // An unrecognized mode string (a future build's mode this binary
+        // doesn't know) copies forward as history but never overrides —
+        // `mode_override` stays `None`, so the session keeps its own default.
+        let inherited_mode = resumed.as_ref().and_then(|r| r.mode.clone());
+        let mode_override = inherited_mode
+            .as_deref()
+            .and_then(hotl_tools::rules::PermissionMode::from_str);
+        if let Some(m) = inherited_mode {
+            let _ = log.append(
+                &hotl_types::EntryPayload::ModeSet { mode: m },
+                scaffold.clock.now_ms(),
+            );
+        }
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
         Ok(crate::acp::SessionOpen {
-            handle: spawn_session(scaffold.deps(log, snapshots, initial)),
+            handle: spawn_session(scaffold.deps(log, snapshots, initial, mode_override)),
             name: requested,
         })
     });
@@ -237,7 +258,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     let session_id = log.session_id.clone();
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
-    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
+    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items, None));
     crate::session_server::serve(id, handle, prompt).await
 }
 
@@ -347,16 +368,26 @@ impl Scaffold {
         masker_with_helper(self.initial_helper_key.as_deref())
     }
 
+    /// `mode_override` seeds a resumed session's *starting* effective mode
+    /// from its own history (the copy-forward `ModeSet`) instead of the
+    /// process-wide startup default — a per-session `Rules` clone, not a
+    /// mutation of the shared one (every other session in this process must
+    /// keep its own default).
     fn deps(
         &self,
         log: SessionLog,
         snapshots: Option<Arc<dyn hotl_engine::Snapshotter>>,
         initial_items: Vec<hotl_types::Item>,
+        mode_override: Option<hotl_tools::rules::PermissionMode>,
     ) -> SessionDeps {
+        let rules = match mode_override {
+            Some(m) => Arc::new((*self.rules).clone().with_mode(m)),
+            None => self.rules.clone(),
+        };
         SessionDeps {
             provider: self.provider.clone(),
             registry: self.registry.clone(),
-            rules: self.rules.clone(),
+            rules,
             sandbox_enforced: self.sandbox_enforced,
             clock: self.clock.clone(),
             log,
@@ -420,7 +451,7 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     std::thread::spawn(move || crate::gc::auto_gc(&gc_config_dir)); // retention, off the hot path
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
-    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items));
+    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items, None));
 
     let mut surface = Surface::new(handle, json_events);
     surface
@@ -1411,6 +1442,7 @@ mod tests {
         // Refused file contributes nothing; mode default auto still applies.
         assert!(matches!(
             rules.evaluate(
+                rules.mode(),
                 "bash",
                 &serde_json::json!({"command": "git status"}),
                 true,

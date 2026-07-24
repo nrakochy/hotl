@@ -282,6 +282,10 @@ pub struct Replayed {
     pub items: Vec<hotl_types::Item>,
     /// The session's display name (last `Rename` in the chain, child wins).
     pub name: Option<String>,
+    /// The session's effective permission mode (last `ModeSet` in the chain,
+    /// child wins) — a raw string, forward-compat; the engine maps it to
+    /// `PermissionMode`. `None` = no mode was ever set (use the process default).
+    pub mode: Option<String>,
     /// Integrity warnings (a broken `parent_id` chain — H-12). Empty is clean.
     /// Replay is defensive regardless (indices clamped, unknowns degraded), so
     /// a warning means "this log was edited/corrupted since it was written",
@@ -293,11 +297,13 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let mut name = None;
-    let header = apply_log(path, &mut items, &mut warnings, &mut name)?;
+    let mut mode = None;
+    let header = apply_log(path, &mut items, &mut warnings, &mut name, &mut mode)?;
     Ok(Replayed {
         header,
         items,
         name,
+        mode,
         warnings,
     })
 }
@@ -334,15 +340,18 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let (_, newest_header) = lineage.first().cloned().ok_or("empty lineage")?;
     let mut items = Vec::new();
     let mut warnings = Vec::new();
-    // Parent-first, so a child's rename naturally overwrites the parent's.
+    // Parent-first, so a child's rename/mode-set naturally overwrites the
+    // parent's.
     let mut name = None;
+    let mut mode = None;
     for (path, _) in lineage.iter().rev() {
-        apply_log(path, &mut items, &mut warnings, &mut name)?;
+        apply_log(path, &mut items, &mut warnings, &mut name, &mut mode)?;
     }
     Ok(Replayed {
         header: newest_header,
         items,
         name,
+        mode,
         warnings,
     })
 }
@@ -357,6 +366,7 @@ fn apply_log(
     items: &mut Vec<hotl_types::Item>,
     warnings: &mut Vec<String>,
     name: &mut Option<String>,
+    mode: &mut Option<String>,
 ) -> Result<hotl_types::SessionHeader, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut header = None;
@@ -405,6 +415,9 @@ fn apply_log(
             }
             // Log-only, like PendingAsk: names the session, never the projection.
             EntryPayload::Rename { name: n } => *name = Some(n),
+            // Log-only, like Rename: sets the session's effective mode, never
+            // the projection. Last one wins, exactly like the display name.
+            EntryPayload::ModeSet { mode: m } => *mode = Some(m),
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {
             }
         }
@@ -739,6 +752,41 @@ mod tests {
         assert_eq!(replayed.name.as_deref(), Some("second"));
         assert!(replayed.items.is_empty(), "rename is not a projection item");
         assert_eq!(session_name(&path).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn mode_set_replays_last_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(
+            &EntryPayload::ModeSet {
+                mode: "plan".into(),
+            },
+            2,
+        )
+        .unwrap();
+        log.append(
+            &EntryPayload::ModeSet {
+                mode: "auto".into(),
+            },
+            3,
+        )
+        .unwrap();
+
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.mode.as_deref(), Some("auto"));
+        assert!(
+            replayed.items.is_empty(),
+            "mode_set is not a projection item"
+        );
+    }
+
+    #[test]
+    fn unset_session_has_no_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        assert_eq!(replay(log.path()).unwrap().mode, None);
     }
 
     #[test]

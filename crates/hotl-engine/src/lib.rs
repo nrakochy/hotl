@@ -17,7 +17,10 @@ use std::sync::{Arc, Mutex};
 use hotl_platform::Clock;
 use hotl_provider::Provider;
 use hotl_store::SessionLog;
-use hotl_tools::{rules::Rules, Registry};
+use hotl_tools::{
+    rules::{PermissionMode, Rules},
+    Registry,
+};
 use hotl_types::{EntryPayload, Item, TokenUsage};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -204,6 +207,9 @@ pub enum SessionCmd {
     Steer(String),
     /// Set the session's display name (durable: appended to the log).
     Rename(String),
+    /// Set the session's effective permission mode (durable: appended to the
+    /// log as `ModeSet`; takes effect immediately — no `Rules` reallocation).
+    SetMode(PermissionMode),
     /// Turn task → actor: sample-boundary snapshot refresh.
     Snapshot {
         reply: oneshot::Sender<Arc<Vec<Item>>>,
@@ -276,6 +282,12 @@ impl SessionHandle {
     /// Name the session durably (a `rename` log entry; last one wins).
     pub async fn rename(&self, name: String) {
         let _ = self.cmd.send(SessionCmd::Rename(name)).await;
+    }
+    /// Set the session's effective permission mode durably (a `mode_set` log
+    /// entry; last one wins). Takes effect immediately: the running actor
+    /// flips an atomic, it never reallocates `Rules`.
+    pub async fn set_mode(&self, mode: PermissionMode) {
+        let _ = self.cmd.send(SessionCmd::SetMode(mode)).await;
     }
     /// Continue an interrupted turn on resume (M4/#8).
     pub async fn continue_turn(&self) {

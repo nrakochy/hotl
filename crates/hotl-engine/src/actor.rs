@@ -2,6 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
@@ -9,7 +10,10 @@ use hotl_context::compaction;
 use hotl_platform::Clock;
 use hotl_provider::{Provider, SamplingRequest, StreamEvent};
 use hotl_store::SessionLog;
-use hotl_tools::{rules::Rules, Registry};
+use hotl_tools::{
+    rules::{PermissionMode, Rules},
+    Registry,
+};
 use hotl_types::{assistant_text, EntryPayload, Item, SyntheticReason, TokenUsage};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -30,6 +34,11 @@ pub(crate) struct SharedDeps {
     pub provider: Arc<dyn Provider>,
     pub registry: Arc<Registry>,
     pub rules: Arc<Rules>,
+    /// The session's *current effective* permission mode — separate from
+    /// `rules.mode()` (the startup default) so `SetMode` can flip it without
+    /// reallocating `Rules` (task 4: mode moves, `Rules` stays a plain
+    /// cheap-to-share value). Seeded from `rules.mode()` at session start.
+    mode: AtomicU8,
     pub sandbox_enforced: bool,
     pub clock: Arc<dyn Clock>,
     pub system: Arc<str>,
@@ -39,12 +48,35 @@ pub(crate) struct SharedDeps {
     pub hooks: Option<Arc<dyn crate::hooks::Hooks>>,
 }
 
+/// `PermissionMode` has no natural discriminant to lean on across an atomic
+/// (and shouldn't grow one just for this) — a tiny, exhaustively-matched
+/// codec keeps the two in lockstep instead.
+fn mode_to_u8(mode: PermissionMode) -> u8 {
+    match mode {
+        PermissionMode::Ask => 0,
+        PermissionMode::Auto => 1,
+        PermissionMode::Plan => 2,
+        PermissionMode::DontAsk => 3,
+    }
+}
+
+fn u8_to_mode(v: u8) -> PermissionMode {
+    match v {
+        1 => PermissionMode::Auto,
+        2 => PermissionMode::Plan,
+        3 => PermissionMode::DontAsk,
+        _ => PermissionMode::Ask,
+    }
+}
+
 impl SharedDeps {
     fn new(deps: SessionDeps) -> (Self, SessionLog) {
+        let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
         let shared = Self {
             provider: deps.provider,
             registry: deps.registry,
             rules: deps.rules,
+            mode,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,
             system: deps.system.into(),
@@ -54,6 +86,16 @@ impl SharedDeps {
             hooks: deps.hooks,
         };
         (shared, deps.log)
+    }
+
+    /// The mode `evaluate` should gate against right now — not necessarily
+    /// `rules.mode()`, which is only ever the startup default.
+    pub(crate) fn effective_mode(&self) -> PermissionMode {
+        u8_to_mode(self.mode.load(Ordering::Relaxed))
+    }
+
+    fn set_mode(&self, mode: PermissionMode) {
+        self.mode.store(mode_to_u8(mode), Ordering::Relaxed);
     }
 
     /// Durable append (flush inside `SessionLog`); false = log sealed.
@@ -128,6 +170,18 @@ pub(crate) async fn run(
             }
             SessionCmd::Rename(name) => {
                 let _ = shared.append(&mut log, &EntryPayload::Rename { name });
+            }
+            SessionCmd::SetMode(mode) => {
+                // Effective immediately: the atomic, not a rebuilt `Rules`,
+                // is what `evaluate` reads. The durable entry is what lets
+                // `hotl resume` restore it, exactly like `Rename`/name.
+                shared.set_mode(mode);
+                let _ = shared.append(
+                    &mut log,
+                    &EntryPayload::ModeSet {
+                        mode: mode.as_str().into(),
+                    },
+                );
             }
             SessionCmd::Snapshot { reply } => {
                 let _ = reply.send(Arc::clone(&items));

@@ -218,6 +218,14 @@ pub enum EntryPayload {
     Rename {
         name: String,
     },
+    /// Sets the session's effective permission mode (plan mode's
+    /// approve-and-continue, `/mode`, `session/set_mode`). Log-only, like
+    /// `Rename` — not a projection item; the last one wins on replay, so
+    /// `hotl resume` restores the mode the session was actually in. A
+    /// string, not the enum, for forward-compat: the engine maps it.
+    ModeSet {
+        mode: String,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -334,6 +342,22 @@ mod tests {
         });
         assert!(json.contains("\"kind\":\"rename\""), "wire kind: {json}");
         assert!(json.contains("\"name\":\"fix-auth\""), "wire name: {json}");
+    }
+
+    #[test]
+    fn mode_set_entry_roundtrips_snake_case() {
+        let j = serde_json::to_string(&EntryPayload::ModeSet {
+            mode: "plan".into(),
+        })
+        .unwrap();
+        assert!(j.contains("\"kind\":\"mode_set\""), "wire kind: {j}");
+        let back: EntryPayload = serde_json::from_str(&j).unwrap();
+        assert_eq!(
+            back,
+            EntryPayload::ModeSet {
+                mode: "plan".into()
+            }
+        );
     }
 
     #[test]
