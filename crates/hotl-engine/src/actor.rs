@@ -734,6 +734,9 @@ async fn start_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
+    // Captured before `text` moves into the committed item — `UserPromptSubmit`
+    // hooks (tier-1 gap #7) see the prompt exactly as submitted.
+    let prompt_for_hooks = text.clone();
     let payload = EntryPayload::Item {
         item: Item::User { text, synthetic },
     };
@@ -750,6 +753,26 @@ async fn start_turn(
     }
     if let EntryPayload::Item { item } = payload {
         Arc::make_mut(items).push(item);
+    }
+    // UserPromptSubmit: a hook's `additionalContext` becomes one tagged
+    // `SystemReminder` user item committed right after the prompt it answers
+    // — never a system-prompt edit (prefix-cache stability), the one
+    // reminder chokepoint every injection site shares. Best-effort: a sealed
+    // log here doesn't fail the turn (the prompt itself already landed).
+    if let Some(hooks) = &shared.hooks {
+        if let Some(context) = crate::hooks::call_user_prompt(hooks, &prompt_for_hooks).await {
+            let reminder = EntryPayload::Item {
+                item: Item::User {
+                    text: format!("<system-reminder>{context}</system-reminder>"),
+                    synthetic: Some(SyntheticReason::SystemReminder),
+                },
+            };
+            if shared.append(log, &reminder) {
+                if let EntryPayload::Item { item } = reminder {
+                    Arc::make_mut(items).push(item);
+                }
+            }
+        }
     }
     spawn_turn(shared, cmd_tx, events, current_turn);
     true

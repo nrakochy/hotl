@@ -8,11 +8,32 @@
 //! result. Hook-visible payloads are byte-capped (pin #1) so a hook can't be
 //! used to amplify a huge tool result into the process.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 
 /// Default cap on the bytes of a tool result a hook is shown.
 pub const HOOK_PAYLOAD_CAP: usize = 2048;
+
+/// Wall-clock budget for a *blocking* hook call (`on_user_prompt`, `on_stop`)
+/// — the turn awaits these because they return context/decisions it needs.
+/// A hook that exceeds this is treated as a no-op (never a grant, never a
+/// block), so a crashed or hung hook can't stall a turn indefinitely. Shell
+/// hooks already bound each subprocess invocation more tightly
+/// (`shell_hooks::HOOK_TIMEOUT_SECS`); this is the outer safety net that
+/// applies to every `Hooks` impl, including a future non-subprocess lane.
+pub const HOOK_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Await [`Hooks::on_user_prompt`] under [`HOOK_CALL_TIMEOUT`]; a timeout
+/// behaves exactly like `None` — no context, never a crash.
+pub async fn call_user_prompt(hooks: &Arc<dyn Hooks>, prompt: &str) -> Option<String> {
+    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.on_user_prompt(prompt))
+        .await
+        .ok()
+        .flatten()
+}
 
 /// A `PreToolUse` decision (wrap-style intercept). A `Rewrite` re-enters the
 /// normal permission gate with the new input — a hook cannot launder a call
