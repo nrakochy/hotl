@@ -34,11 +34,14 @@ async fn egress_off_refuses_web_fetch_and_web_search_without_a_request() {
         out.content
     );
 
-    let search = WebSearchTool::new(SearchBackend {
-        url: "https://search.example/api".into(),
-        api_key: None,
-        result_cap: 8,
-    });
+    let search = WebSearchTool::new(
+        SearchBackend {
+            url: "https://search.example/api".into(),
+            api_key: None,
+            result_cap: 8,
+        },
+        SessionConcurrency::new(ConcurrencyLimits::default()),
+    );
     let out = search
         .run(json!({"query": "rust"}), CancellationToken::new())
         .await;

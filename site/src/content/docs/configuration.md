@@ -232,6 +232,8 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_CONCURRENCY_REQUESTS` | `[concurrency].requests` | Concurrent `web_fetch`/`web_search` HTTP requests (default 4). |
 | `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Reserved (sub-agent fan-out; no effect yet). |
 | `HOTL_CONCURRENCY_SUBPROCS` | `[concurrency].subprocs` | Reserved (subprocess batching; no effect yet). |
+| `HOTL_CONCURRENCY_WORKER_THREADS` | `[concurrency].worker_threads` | Reserved (tokio worker-thread pool; parsed but not yet wired to a runtime — see below). |
+| `HOTL_CONCURRENCY_BLOCKING_THREADS` | `[concurrency].blocking_threads` | Reserved (`spawn_blocking` pool cap; parsed but not yet wired to a runtime — see below). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 
 ### Allow-rules (`[[allow]]`)

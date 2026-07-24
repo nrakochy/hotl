@@ -31,6 +31,103 @@ const MAX_BODY_BYTES: usize = 100 * 1024;
 const HTML_BLOCKING_THRESHOLD: usize = 256 * 1024;
 const MAX_URLS_PER_CALL: usize = 20;
 const USER_AGENT: &str = concat!("hotl-web-fetch/", env!("CARGO_PKG_VERSION"));
+/// Matches reqwest's own default redirect-chain cap (`redirect::Policy`'s
+/// `Default`) — the egress re-check below doesn't relax that limit, it adds
+/// a second one (per-hop host allowlisting) on top of it.
+const MAX_REDIRECTS: usize = 10;
+
+/// A redirect target the egress policy refuses. Carried as the request's
+/// error *source* by reqwest's redirect machinery (its own `Display` for a
+/// redirect failure is just "error following redirect" — the useful, host-
+/// naming reason lives here), so `fetch_err` below can surface it.
+#[derive(Debug)]
+struct EgressDenied(String);
+
+impl std::fmt::Display for EgressDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for EgressDenied {}
+
+/// The redirect policy for both web-tool clients: a bare `.timeout()`/
+/// `.user_agent()` client builder uses reqwest's DEFAULT redirect policy,
+/// which follows up to 10 hops with **no** re-check — so `good.example`
+/// (in `allow`) could 302 to `evil.example` (not in `allow`) and the evil
+/// host's body would reach the model, never having been asked about. The
+/// pre-flight `host_allowed` check in `run_impl`/`WebSearchTool::run_impl`
+/// only covers the *first* hop; this policy is what makes every subsequent
+/// hop fail closed too — same authority (`net::host_allowed`), no second
+/// allowlist.
+fn redirect_policy() -> reqwest::redirect::Policy {
+    redirect_policy_with(net::host_allowed)
+}
+
+/// The `reqwest::redirect::Attempt` this policy sees on every hop is a
+/// crate-private type in reqwest with no public constructor, so the
+/// decision itself lives here as a pure function over plain values —
+/// testable directly, with no `Attempt` to fabricate and no process-wide
+/// state to touch.
+enum RedirectDecision {
+    Follow,
+    Stop,
+    Error(String),
+}
+
+/// `host`: `None` only for a URL with no host (not reachable for the http(s)
+/// URLs `Attempt::url` ever carries; treated as nothing-to-check). `hops`:
+/// the number of redirects already followed in this chain so far.
+fn decide_redirect(
+    host: Option<&str>,
+    hops: usize,
+    checker: &impl Fn(&str) -> HostVerdict,
+) -> RedirectDecision {
+    if hops >= MAX_REDIRECTS {
+        return RedirectDecision::Stop;
+    }
+    let Some(host) = host else {
+        return RedirectDecision::Follow;
+    };
+    match checker(host) {
+        HostVerdict::Denied(reason) => RedirectDecision::Error(format!(
+            "redirected to \"{host}\", which is refused: {reason}"
+        )),
+        HostVerdict::Allowed | HostVerdict::NoPolicy => RedirectDecision::Follow,
+    }
+}
+
+/// The decision logic, parameterized over the host check so it can be unit
+/// tested without touching the process-wide `net::POLICY` `OnceLock` (which
+/// is set-once — a test that installed a policy would leak into every other
+/// test sharing the same test binary). Production always calls this through
+/// `redirect_policy()`, which closes over the real `net::host_allowed`.
+fn redirect_policy_with(
+    checker: impl Fn(&str) -> HostVerdict + Send + Sync + 'static,
+) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        match decide_redirect(attempt.url().host_str(), attempt.previous().len(), &checker) {
+            RedirectDecision::Follow => attempt.follow(),
+            RedirectDecision::Stop => attempt.stop(),
+            RedirectDecision::Error(msg) => attempt.error(EgressDenied(msg)),
+        }
+    })
+}
+
+/// Render a `reqwest::Error` including its full source chain. Needed because
+/// reqwest's own `Display` for a redirect failure is the generic "error
+/// following redirect for url (...)" — the actual reason (an `EgressDenied`
+/// naming the refused host) lives one level down in `source()` and would
+/// otherwise never reach the model.
+fn fetch_err(host: &str, e: &reqwest::Error) -> String {
+    let mut msg = format!("could not reach {host}: {e}");
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(s) = src {
+        msg.push_str(&format!(": {s}"));
+        src = s.source();
+    }
+    msg
+}
 
 /// The untrusted-content envelope (SECURITY.md; mirrors `spawn.rs::envelope`
 /// and `hotl-retrieval::sanitize`'s shape) tagging provenance `web:<source>`.
@@ -186,6 +283,7 @@ impl WebFetchTool {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(FETCH_TIMEOUT)
+            .redirect(redirect_policy())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
@@ -256,7 +354,7 @@ async fn fetch_one(
         .get(url)
         .send()
         .await
-        .map_err(|e| format!("could not reach {host}: {e}"))?;
+        .map_err(|e| fetch_err(host, &e))?;
     let status = resp.status();
     if !status.is_success() {
         return Err(format!("{host} responded {status}"));
@@ -475,16 +573,27 @@ fn format_hits(hits: &[&SearchHit]) -> String {
 pub struct WebSearchTool {
     backend: SearchBackend,
     client: reqwest::Client,
+    concurrency: SessionConcurrency,
 }
 
 impl WebSearchTool {
-    pub fn new(backend: SearchBackend) -> Self {
+    /// `concurrency` is the same process-wide `SessionConcurrency` passed to
+    /// `WebFetchTool::new` (not a second, tool-local budget): the `requests`
+    /// semaphore governs `web_fetch`'s *and* `web_search`'s HTTP calls
+    /// together, matching the index's governance table and the docs' claim
+    /// that `[concurrency].requests` bounds both.
+    pub fn new(backend: SearchBackend, concurrency: SessionConcurrency) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(FETCH_TIMEOUT)
+            .redirect(redirect_policy())
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { backend, client }
+        Self {
+            backend,
+            client,
+            concurrency,
+        }
     }
 
     async fn run_impl(&self, input: Value, _cancel: CancellationToken) -> ToolOutcome {
@@ -508,9 +617,12 @@ impl WebSearchTool {
         if let Some(key) = &self.backend.api_key {
             req = req.bearer_auth(key);
         }
+        // Same `requests` budget `web_fetch` draws from — one shared socket
+        // ceiling across both tools, not a second, ungoverned lane.
+        let _permit = self.concurrency.request().await;
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => return ToolOutcome::err(format!("could not reach {host}: {e}")),
+            Err(e) => return ToolOutcome::err(fetch_err(&host, &e)),
         };
         if !resp.status().is_success() {
             return ToolOutcome::err(format!("{host} responded {}", resp.status()));
@@ -737,7 +849,7 @@ mod tests {
             api_key: None,
             result_cap: 2,
         };
-        let tool = WebSearchTool::new(backend);
+        let tool = WebSearchTool::new(backend, test_concurrency());
         let out = tool
             .run(json!({"query": "rust"}), CancellationToken::new())
             .await;
@@ -756,12 +868,106 @@ mod tests {
 
     #[tokio::test]
     async fn web_search_missing_query_is_an_instruction() {
-        let tool = WebSearchTool::new(SearchBackend {
-            url: "http://127.0.0.1:1/search".into(),
-            api_key: None,
-            result_cap: 8,
-        });
+        let tool = WebSearchTool::new(
+            SearchBackend {
+                url: "http://127.0.0.1:1/search".into(),
+                api_key: None,
+                result_cap: 8,
+            },
+            test_concurrency(),
+        );
         let out = tool.run(json!({}), CancellationToken::new()).await;
         assert!(out.is_error && out.content.contains("`query` is required"));
+    }
+
+    /// Finding 2: `web_search` must draw from the *same* `requests` budget
+    /// `web_fetch` does, not a second ungoverned lane. With the budget
+    /// clamped to 1 and already held, a `web_search` call must queue behind
+    /// the held permit rather than proceeding immediately.
+    #[tokio::test]
+    async fn web_search_acquires_the_shared_requests_permit() {
+        let origin = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut s, _) = origin.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf).await;
+            let body = json!({"results": []}).to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = s.write_all(resp.as_bytes()).await;
+        });
+        let concurrency = SessionConcurrency::new(ConcurrencyLimits {
+            agents: 4,
+            requests: 1,
+            subprocs: 8,
+        });
+        let held = concurrency.request().await; // the only permit, held here
+        let tool = WebSearchTool::new(
+            SearchBackend {
+                url: format!("http://127.0.0.1:{port}/search"),
+                api_key: None,
+                result_cap: 8,
+            },
+            concurrency,
+        );
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(80),
+            tool.run(json!({"query": "rust"}), CancellationToken::new()),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "web_search proceeded without waiting for the shared requests permit"
+        );
+        drop(held);
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tool.run(json!({"query": "rust"}), CancellationToken::new()),
+        )
+        .await
+        .expect("must complete once the permit is free");
+        assert!(!out.is_error, "{}", out.content);
+    }
+
+    /// Finding 1: the redirect decision re-checks *every* hop against the
+    /// egress verdict, not just the first — `Allowed`/`NoPolicy` follow,
+    /// `Denied` fails closed with a reason naming the refused host. Drives
+    /// `decide_redirect` directly (the pure function `redirect_policy_with`
+    /// wraps) with an injected checker — no process-wide state, no
+    /// fabricated `reqwest::redirect::Attempt` (a crate-private type).
+    #[test]
+    fn redirect_decision_denies_only_the_denied_host_and_caps_hops() {
+        let checker = |host: &str| {
+            if host == "evil.example" {
+                HostVerdict::Denied("not in [network] allow".to_string())
+            } else {
+                HostVerdict::Allowed
+            }
+        };
+        match decide_redirect(Some("good.example"), 0, &checker) {
+            RedirectDecision::Follow => {}
+            _ => panic!("an allowed host must follow"),
+        }
+        match decide_redirect(Some("evil.example"), 0, &checker) {
+            RedirectDecision::Error(msg) => {
+                assert!(msg.contains("evil.example"));
+                assert!(msg.contains("not in [network] allow"));
+            }
+            _ => panic!("a denied host must fail closed, not follow or silently stop"),
+        }
+        // The hop cap applies independently of the host verdict — even an
+        // allowed host stops once the chain is long enough.
+        match decide_redirect(Some("good.example"), MAX_REDIRECTS, &checker) {
+            RedirectDecision::Stop => {}
+            _ => panic!("the hop cap must apply even to an allowed host"),
+        }
+    }
+
+    fn test_concurrency() -> SessionConcurrency {
+        SessionConcurrency::new(ConcurrencyLimits::default())
     }
 }

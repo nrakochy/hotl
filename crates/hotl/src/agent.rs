@@ -360,7 +360,9 @@ async fn scaffold(
     // The one process-wide SessionConcurrency (Layer-B budget): built once
     // here and cloned (shared Arc semaphores, not a fresh pool) into the
     // registry — today `web_fetch` is its only consumer.
-    if let Some(warning) = layer_c_warning(&cfg.concurrency) {
+    let (layer_c_worker_threads, layer_c_blocking_threads) =
+        layer_c_resolved(secrets, &cfg.concurrency);
+    if let Some(warning) = layer_c_warning(layer_c_worker_threads, layer_c_blocking_threads) {
         eprintln!("hotl: {warning}");
     }
     let concurrency =
@@ -615,6 +617,10 @@ fn build_registry(
     }
     // `web_fetch` needs no backend — always registered, gated by the human
     // (Permission::Ask) and by the process-wide [network] egress policy.
+    // Cloned (shared `Arc` semaphores, not a fresh budget) before the move
+    // below: `web_search`, registered next, draws from the same `requests`
+    // semaphore, not a second, ungoverned lane.
+    let search_concurrency = concurrency.clone();
     registry.register(Box::new(hotl_tools::web::WebFetchTool::new(concurrency)));
     // `web_search` is backend-pluggable and absent unless `[web] search` is
     // configured — nothing phones home by default (the `recall`/MCP gate).
@@ -636,7 +642,10 @@ fn build_registry(
             api_key,
             result_cap: search.result_cap,
         };
-        registry.register(Box::new(hotl_tools::web::WebSearchTool::new(backend)));
+        registry.register(Box::new(hotl_tools::web::WebSearchTool::new(
+            backend,
+            search_concurrency,
+        )));
     }
     if let Some(builder) = spawn_builder {
         registry.register(Box::new(crate::spawn::SpawnTool::new(builder)));
@@ -1270,15 +1279,46 @@ fn concurrency_limits(
     }
 }
 
+/// `[concurrency].worker_threads`/`.blocking_threads` resolved with the same
+/// env-over-config precedence as `concurrency_limits` (`HOTL_CONCURRENCY_*` >
+/// config.toml), so the index's full five-env-var surface
+/// (`HOTL_CONCURRENCY_{AGENTS,REQUESTS,SUBPROCS,WORKER_THREADS,
+/// BLOCKING_THREADS}`) is complete even though these two are inert today —
+/// an owner setting only the env var (no config.toml entry) must still be
+/// seen by `layer_c_warning` below, not silently ignored. Unlike the Layer-B
+/// limits, `0` is a meaningful explicit value here (the index's documented
+/// `worker_threads = 0` → tokio's `num_cpus` default), so it is never
+/// coerced back to "absent" the way a zero semaphore limit would be.
+fn layer_c_resolved(
+    secrets: &dyn SecretStore,
+    cfg: &crate::config::ConcurrencyCfg,
+) -> (Option<usize>, Option<usize>) {
+    let pick = |env_key: &str, cfg_val: Option<usize>| {
+        secrets
+            .get(env_key)
+            .and_then(|v| v.parse::<usize>().ok())
+            .or(cfg_val)
+    };
+    (
+        pick("HOTL_CONCURRENCY_WORKER_THREADS", cfg.worker_threads),
+        pick("HOTL_CONCURRENCY_BLOCKING_THREADS", cfg.blocking_threads),
+    )
+}
+
 /// `[concurrency].worker_threads`/`.blocking_threads` are parsed (the index
 /// spec's full `[concurrency]` shape) but not yet wired to a runtime
 /// `Builder` — hotl runs every subcommand on a single `current_thread`
 /// runtime today (`main.rs::block_on`), so there is nowhere to attach them.
 /// Rather than silently ignoring a value the owner deliberately set, warn
 /// once at startup so a configured-but-inert knob is visible, not a silent
-/// no-op.
-fn layer_c_warning(cfg: &crate::config::ConcurrencyCfg) -> Option<String> {
-    if cfg.worker_threads.is_none() && cfg.blocking_threads.is_none() {
+/// no-op. Takes the already-resolved (env > config) values — see
+/// `layer_c_resolved` — so an env-only override warns exactly like a
+/// config.toml-only one.
+fn layer_c_warning(
+    worker_threads: Option<usize>,
+    blocking_threads: Option<usize>,
+) -> Option<String> {
+    if worker_threads.is_none() && blocking_threads.is_none() {
         return None;
     }
     Some(
@@ -1636,13 +1676,47 @@ mod tests {
 
     #[test]
     fn layer_c_knobs_warn_when_set_since_the_runtime_is_single_threaded() {
+        let secrets = MapSecrets::default();
         let cfg = config_from_toml("");
-        assert!(layer_c_warning(&cfg.concurrency).is_none());
+        let (wt, bt) = layer_c_resolved(&secrets, &cfg.concurrency);
+        assert!(layer_c_warning(wt, bt).is_none());
+
         let cfg = config_from_toml("[concurrency]\nworker_threads = 4\n");
-        let w = layer_c_warning(&cfg.concurrency).expect("must warn");
+        let (wt, bt) = layer_c_resolved(&secrets, &cfg.concurrency);
+        let w = layer_c_warning(wt, bt).expect("must warn");
         assert!(w.contains("current_thread"));
+
         let cfg = config_from_toml("[concurrency]\nblocking_threads = 32\n");
-        assert!(layer_c_warning(&cfg.concurrency).is_some());
+        let (wt, bt) = layer_c_resolved(&secrets, &cfg.concurrency);
+        assert!(layer_c_warning(wt, bt).is_some());
+    }
+
+    /// Finding 3: the index documents five `HOTL_CONCURRENCY_*` env vars;
+    /// `WORKER_THREADS`/`BLOCKING_THREADS` must resolve with the same
+    /// env-over-config precedence as `AGENTS`/`REQUESTS`/`SUBPROCS` — an
+    /// env-only override (no matching config.toml entry) must still surface
+    /// and still trigger the "configured but inert" warning, and env must
+    /// win over a conflicting config.toml value.
+    #[test]
+    fn layer_c_env_vars_parse_with_env_over_config_precedence() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([("HOTL_CONCURRENCY_WORKER_THREADS", "8")]);
+        let (wt, bt) = layer_c_resolved(&secrets, &cfg.concurrency);
+        assert_eq!(wt, Some(8));
+        assert_eq!(bt, None);
+        assert!(
+            layer_c_warning(wt, bt).is_some(),
+            "an env-only override must still warn, not be silently ignored"
+        );
+
+        let cfg = config_from_toml("[concurrency]\nworker_threads = 2\nblocking_threads = 16\n");
+        let secrets = MapSecrets::from([
+            ("HOTL_CONCURRENCY_WORKER_THREADS", "8"),
+            ("HOTL_CONCURRENCY_BLOCKING_THREADS", "64"),
+        ]);
+        let (wt, bt) = layer_c_resolved(&secrets, &cfg.concurrency);
+        assert_eq!(wt, Some(8), "env must win over config.toml");
+        assert_eq!(bt, Some(64), "env must win over config.toml");
     }
 
     fn test_concurrency() -> hotl_tools::concurrency::SessionConcurrency {
