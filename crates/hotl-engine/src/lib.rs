@@ -25,6 +25,12 @@ use hotl_types::{EntryPayload, Item, Todo, TokenUsage};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+/// Re-exported so `hotl_engine::QuestionAnswer` resolves alongside
+/// `EngineEvent::Question` — the type physically lives in hotl-types (shared
+/// with hotl-tools's `QuestionSink`) to avoid a hotl-tools → hotl-engine
+/// dependency cycle; see `question_sink`'s doc comment.
+pub use hotl_types::QuestionAnswer;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model: String,
@@ -165,6 +171,15 @@ pub enum EngineEvent {
         protected_why: Option<String>,
         reply: oneshot::Sender<AskReply>,
     },
+    /// A structured `ask_user` question (tier-1 gap #4) — NOT a permission
+    /// gate: the reply is a plain-text tool result, never an authorization.
+    /// Committed durably (`PendingQuestion`) before this event is sent; a
+    /// dropped `reply` (headless/no-human) resolves to `QuestionAnswer::NoHuman`.
+    Question {
+        id: String,
+        question: hotl_types::Question,
+        reply: oneshot::Sender<hotl_types::QuestionAnswer>,
+    },
     TurnDone {
         outcome: Outcome,
         usage: TokenUsage,
@@ -192,6 +207,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::PromptQueued => write!(f, "PromptQueued"),
             Self::Compacted { degraded } => write!(f, "Compacted({degraded})"),
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),
+            Self::Question { question, .. } => write!(f, "Question({})", question.header),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
             Self::TodosChanged { items } => write!(f, "TodosChanged(n={})", items.len()),
         }
@@ -350,18 +366,42 @@ pub fn session_channel() -> (mpsc::Sender<SessionCmd>, mpsc::Receiver<SessionCmd
     mpsc::channel(64)
 }
 
+/// A fresh, not-yet-consumed event channel for a session that doesn't exist
+/// yet — the events-side twin of [`session_channel`]. Split out so a caller
+/// can build a tool (`ask_user`) whose sink already holds a live sender to
+/// *this* session's own events stream before the actor exists, the same
+/// chicken-and-egg [`session_channel`] solves for `SessionCmd`.
+pub fn event_channel() -> (mpsc::Sender<EngineEvent>, mpsc::Receiver<EngineEvent>) {
+    mpsc::channel(256)
+}
+
 pub fn spawn_session(deps: SessionDeps) -> SessionHandle {
     let (cmd_tx, cmd_rx) = session_channel();
     spawn_session_with(deps, cmd_tx, cmd_rx)
 }
 
-/// Spawn against a pre-created channel (see [`session_channel`]).
+/// Spawn against a pre-created command channel (see [`session_channel`]);
+/// builds its own event channel.
 pub fn spawn_session_with(
     deps: SessionDeps,
     cmd_tx: mpsc::Sender<SessionCmd>,
     cmd_rx: mpsc::Receiver<SessionCmd>,
 ) -> SessionHandle {
-    let (event_tx, event_rx) = mpsc::channel(256);
+    let (event_tx, event_rx) = event_channel();
+    spawn_session_with_channels(deps, cmd_tx, cmd_rx, event_tx, event_rx)
+}
+
+/// Spawn against pre-created command *and* event channels (see
+/// [`session_channel`]/[`event_channel`]) — what a caller needs when a
+/// session-scoped tool's sink (`ask_user`) must hold live senders to both
+/// before the actor exists.
+pub fn spawn_session_with_channels(
+    deps: SessionDeps,
+    cmd_tx: mpsc::Sender<SessionCmd>,
+    cmd_rx: mpsc::Receiver<SessionCmd>,
+    event_tx: mpsc::Sender<EngineEvent>,
+    event_rx: mpsc::Receiver<EngineEvent>,
+) -> SessionHandle {
     let current_turn = Arc::new(Mutex::new(CancellationToken::new()));
     // The actor gets only a weak sender: strong senders are the handle and
     // any in-flight turn task, so dropping the handle lets the command
@@ -377,5 +417,96 @@ pub fn spawn_session_with(
         cmd: cmd_tx,
         events: event_rx,
         current_turn,
+    }
+}
+
+/// The production [`hotl_tools::ask::QuestionSink`] for `ask_user` (tier-1
+/// gap #4): mirrors `Turn::ask` almost line-for-line, but runs from inside a
+/// tool rather than `Turn` itself, so it reaches the actor through channels
+/// instead of `self.propose`/`self.events` directly. Durably commits
+/// `PendingQuestion` *before* surfacing (so a process that dies mid-question
+/// leaves a dangling record replay can warn about, exactly like
+/// `PendingAsk`), emits [`EngineEvent::Question`] carrying a fresh reply
+/// channel, races the human's reply against the call's own cancellation
+/// token (the same token `Turn::ask` races — an in-flight `ask_user` must
+/// never outlive a turn the user already cancelled), then commits
+/// `QuestionResolved`.
+///
+/// Captures only *weak* senders: this sink ends up owned by the tool
+/// registry, which `SharedDeps` — and so the actor — holds for the whole
+/// session. A strong sender captured here would be exactly the reference
+/// cycle that made an early cut of `TodoWriteTool`'s sink leak the actor
+/// task (`cmd_rx.recv()` never returns `None` while a strong sender lives
+/// inside the very state the actor holds forever); see
+/// `spawn_session_with_todos` for the sibling fix. An upgrade failure (the
+/// handle/actor already gone) resolves to `NoHuman` — there is nobody left
+/// to answer.
+pub fn question_sink(
+    cmd_tx: mpsc::WeakSender<SessionCmd>,
+    events_tx: mpsc::WeakSender<EngineEvent>,
+) -> hotl_tools::ask::QuestionSink {
+    std::sync::Arc::new(move |question, cancel| {
+        let cmd_tx = cmd_tx.clone();
+        let events_tx = events_tx.clone();
+        Box::pin(async move {
+            let id = hotl_types::new_ulid();
+            propose_via(
+                &cmd_tx,
+                vec![EntryPayload::PendingQuestion {
+                    id: id.clone(),
+                    question: question.clone(),
+                }],
+            )
+            .await;
+            let answer = match events_tx.upgrade() {
+                None => hotl_types::QuestionAnswer::NoHuman,
+                Some(events) => {
+                    let (reply_tx, reply_rx) = oneshot::channel();
+                    if events
+                        .send(EngineEvent::Question {
+                            id: id.clone(),
+                            question,
+                            reply: reply_tx,
+                        })
+                        .await
+                        .is_err()
+                    {
+                        hotl_types::QuestionAnswer::NoHuman
+                    } else {
+                        tokio::select! {
+                            biased;
+                            _ = cancel.cancelled() => hotl_types::QuestionAnswer::NoHuman,
+                            reply = reply_rx => reply.unwrap_or(hotl_types::QuestionAnswer::NoHuman),
+                        }
+                    }
+                }
+            };
+            propose_via(
+                &cmd_tx,
+                vec![EntryPayload::QuestionResolved {
+                    id,
+                    answer: hotl_tools::ask::format_answer(&answer),
+                }],
+            )
+            .await;
+            answer
+        })
+    })
+}
+
+/// Durable-append helper for [`question_sink`]: best-effort, like
+/// `Turn::propose` — a sealed/gone log never blocks the question itself.
+async fn propose_via(cmd_tx: &mpsc::WeakSender<SessionCmd>, entries: Vec<EntryPayload>) {
+    let Some(tx) = cmd_tx.upgrade() else { return };
+    let (reply_tx, reply_rx) = oneshot::channel();
+    if tx
+        .send(SessionCmd::Propose {
+            entries,
+            reply: reply_tx,
+        })
+        .await
+        .is_ok()
+    {
+        let _ = reply_rx.await;
     }
 }

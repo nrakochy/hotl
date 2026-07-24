@@ -399,6 +399,9 @@ fn apply_log(
     // mid-ask — surface it on resume (id → summary).
     let mut pending_asks: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    // Same shape, for a dangling `ask_user` question at end-of-log.
+    let mut pending_questions: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (n, line) in BufReader::new(file).lines().enumerate() {
         let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
         let entry: Entry = serde_json::from_str(&line)
@@ -436,6 +439,14 @@ fn apply_log(
             EntryPayload::AskResolved { id, .. } => {
                 pending_asks.remove(&id);
             }
+            // A structured question (tier-1 gap #4) committed before it
+            // surfaces — same dangling-on-resume shape as `PendingAsk`.
+            EntryPayload::PendingQuestion { id, question } => {
+                pending_questions.insert(id, question.header);
+            }
+            EntryPayload::QuestionResolved { id, .. } => {
+                pending_questions.remove(&id);
+            }
             // Log-only, like PendingAsk: names the session, never the projection.
             EntryPayload::Rename { name: n } => *name = Some(n),
             // Log-only, like Rename: sets the session's effective mode, never
@@ -454,6 +465,11 @@ fn apply_log(
     for summary in pending_asks.into_values() {
         warnings.push(format!(
             "an unanswered permission request was pending when the session stopped: {summary}"
+        ));
+    }
+    for header in pending_questions.into_values() {
+        warnings.push(format!(
+            "an unanswered question was pending when the session stopped: {header}"
         ));
     }
     header.ok_or_else(|| format!("{}: no header entry", path.display()))
