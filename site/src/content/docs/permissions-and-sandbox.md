@@ -7,17 +7,42 @@ The *why* behind hotl's safety model: what the y/N gate, protected paths, allow-
 
 ## The one control that matters: you choose when to approve
 
-hotl has two prompt modes. **`auto` (the default): ordinary tool calls run
-without asking.** The floor still holds: `bash` runs inside the kernel
-sandbox, writes to execute-later paths (git hooks, Makefiles, shell rc,
+hotl has four prompt modes, all routed through the same evaluation
+pipeline (deny rules and the protected-path floor apply identically to
+all of them). **`auto` (the default): ordinary tool calls run without
+asking.** The floor still holds: `bash` runs inside the kernel sandbox,
+writes to execute-later paths (git hooks, Makefiles, shell rc,
 agent-instruction files, hotl's own config) always stop and ask, deny rules
 refuse outright, every silenced prompt appears in the transcript as an
 auto-allow with its granting rule, and `hotl undo` reverses any change.
 **`ask`: every mutating or executing call asks y/N first** — set
 `[permissions] mode = "ask"` (or `HOTL_PERMISSIONS=ask`) if you want the
 human on every loop. When there's no human — headless `-p`, sub-agents, a
-timed-out interactive prompt — an ask becomes an automatic **no**, in both
-modes.
+timed-out interactive prompt — an ask becomes an automatic **no**, in every
+mode.
+
+**`plan`: read-only until you approve a plan.** Every tool that isn't
+structurally read-only (`read`, `glob`, `grep`, `recall`) is denied outright
+— the agent can explore and propose, but can't edit, write, run `bash`, or
+otherwise mutate anything, no matter what an `[[allow]]` rule says. Once the
+agent has proposed a plan you're happy with, switch out of plan mode
+(`/plan` again, `/mode auto`, or `session/set_mode` over ACP) and the agent
+continues from where it left off, now able to act. The mode switch is a
+durable log entry, so `hotl resume` restores whichever mode a session was
+last left in. Because plan mode is strictly read-only, it's also a genuinely
+safe unattended posture for read-only analysis: `hotl -p --plan "audit X"`
+can't mutate anything, sandbox or no sandbox.
+
+**`dontask`: never wait for input.** Anything that would normally prompt is
+denied instead of asked — allow-rules and read-only tools still run, but
+nothing pauses for a human who isn't there. This is the right posture for
+`-p`/CI: a script that hits an unapproved action should fail loudly, not
+hang waiting on a prompt nobody will answer.
+
+`plan` and `dontask` are strictly stricter than `ask` — they only ever
+*deny more* than the default pipeline would, never less — so a
+`security-enforced` build (which forces `auto` back to `ask`) leaves them
+alone.
 
 Admins who need `ask` guaranteed compile with `--features security-enforced`:
 that build ignores the mode key entirely (honestly: it's organizational

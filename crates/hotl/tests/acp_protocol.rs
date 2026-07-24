@@ -431,6 +431,61 @@ async fn named_open_and_rename() {
     assert_eq!(next(&mut lines).await["result"]["ok"], true);
 }
 
+/// `session/set_mode` acks and switches the mode; an invalid mode errors
+/// naming the valid ones. Mirrors `named_open_and_rename`.
+#[tokio::test]
+async fn set_mode_acks_and_rejects_unknown_modes() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+
+    // set_mode before a session exists → error.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/set_mode","params":{"mode":"plan"}}),
+    )
+    .await;
+    assert!(
+        next(&mut lines).await["error"].is_object(),
+        "no session yet"
+    );
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+    )
+    .await;
+    next(&mut lines).await;
+
+    // invalid mode → error naming the valid ones.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_mode","params":{"mode":"yolo"}}),
+    )
+    .await;
+    let err = next(&mut lines).await;
+    assert!(err["error"].is_object(), "invalid mode rejected");
+    let message = err["error"]["message"].as_str().unwrap_or("");
+    assert!(message.contains("ask"), "names valid modes: {message}");
+
+    // valid mode → ok.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/set_mode","params":{"mode":"plan"}}),
+    )
+    .await;
+    assert_eq!(next(&mut lines).await["result"]["ok"], true);
+}
+
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {
     let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
         .await

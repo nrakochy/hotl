@@ -49,9 +49,12 @@ sandbox = true             # false disables the bash sandbox floor
 vim_mode = true            # vim-style keys in the console's input editor
 
 [permissions]
-mode = "auto"   # no per-action y/N; protected paths + sandbox still guard.
-                # "ask" = approve every mutating/executing call. A
-                # security-enforced build ignores this key entirely.
+mode = "auto"   # "auto" | "ask" | "plan" | "dontask"
+                # auto: no per-action y/N; protected paths + sandbox still guard.
+                # ask: approve every mutating/executing call.
+                # plan: read-only until you approve a plan (see permissions-and-sandbox.md).
+                # dontask: never wait for input — deny anything not pre-approved (the -p/CI posture).
+                # A security-enforced build ignores this key entirely (ask stays on).
 
 [network]
 egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
@@ -208,7 +211,7 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
-| `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) or `ask`; a typo fails closed to `ask`. |
+| `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 

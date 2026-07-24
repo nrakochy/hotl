@@ -72,7 +72,13 @@ own.
 | Command | Effect |
 |---|---|
 | `/rename <name>` | Rename the session (1–64 chars); the badge and terminal title follow. |
+| `/plan` | Switch to plan mode: read-only until you approve a plan (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). |
+| `/mode <ask\|auto\|plan\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing. |
 | `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments. |
+
+A non-default mode shows as a badge on the strip next to the session name.
+Switching mode never starts a turn — it's session bookkeeping, and it's
+durable (`hotl resume` restores whichever mode you left the session in).
 
 Built-ins are matched first, so a skill named `rename` cannot shadow
 `/rename`. Any other name is looked up in your skill roster — bare

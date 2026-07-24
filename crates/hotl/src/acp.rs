@@ -249,6 +249,25 @@ async fn handle_request(
             state.handle.rename(name).await;
             reply_ok(writer, id, json!({"ok": true})).await;
         }
+        "session/set_mode" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let Some(mode) = msg
+                .pointer("/params/mode")
+                .and_then(Value::as_str)
+                .and_then(hotl_tools::rules::PermissionMode::from_str)
+            else {
+                return reply_err(
+                    writer,
+                    id,
+                    "session/set_mode requires params.mode (ask | auto | plan | dontask)",
+                )
+                .await;
+            };
+            state.handle.set_mode(mode).await;
+            reply_ok(writer, id, json!({"ok": true})).await;
+        }
         "session/steer" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(writer, id, "no session — call session/new first").await;
