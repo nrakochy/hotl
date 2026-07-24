@@ -33,6 +33,37 @@ pub enum PermissionMode {
     #[default]
     Ask,
     Auto,
+    /// Read-only until the human approves a plan: every non-read tool is
+    /// denied. Exiting is a durable `SetMode` the surface issues.
+    Plan,
+    /// Never wait for input: run only pre-approved (allow-rule/read-only)
+    /// calls, deny everything else. The `-p`/CI posture.
+    DontAsk,
+}
+
+impl PermissionMode {
+    // Deliberately not `impl FromStr`: this returns `Option`, not `Result`
+    // (there is no error type worth threading — an unrecognized mode string
+    // is always handled by falling back to `Ask`, one call site at a time).
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "ask" => Some(Self::Ask),
+            "auto" => Some(Self::Auto),
+            "plan" => Some(Self::Plan),
+            "dontask" | "dont_ask" | "dont-ask" => Some(Self::DontAsk),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ask => "ask",
+            Self::Auto => "auto",
+            Self::Plan => "plan",
+            Self::DontAsk => "dontask",
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -127,7 +158,9 @@ impl Rules {
     pub fn with_mode(mut self, mode: PermissionMode) -> Self {
         // The security-enforced build's whole contract is one line: auto
         // cannot exist at runtime. Config, env, and callers all pass
-        // through here.
+        // through here. `Plan` and `DontAsk` are strictly stricter than
+        // `Ask` (they only ever add denials), so they are safe to keep in
+        // this build — only `Auto` (which removes asks) gets coerced.
         #[cfg(feature = "security-enforced")]
         let mode = match mode {
             PermissionMode::Auto => PermissionMode::Ask,
@@ -149,14 +182,23 @@ impl Rules {
     }
 
     /// The full tier pipeline, first match wins: admin deny → user deny →
-    /// protected (always ask) → admin allow → user allow (unless locked) →
-    /// mode=auto → ask. `sandbox_enforced` reflects the live floor.
+    /// protected (always ask) → **plan-mode block** (if the tool isn't
+    /// read-only) → admin allow → user allow (unless locked) →
+    /// mode=auto/dontask → ask. `sandbox_enforced` reflects the live floor.
+    ///
+    /// Placement note: plan's read-only block sits *above* the allow-rule
+    /// tiers, so a deliberate `[[allow]] write` rule can never punch through
+    /// plan mode — plan is a hard read-only stance, not a narrowable one.
+    /// It sits *below* the deny tiers and the protected floor, which are
+    /// stricter still and must always win. `Auto`/`DontAsk` stay below the
+    /// allow tiers so a pre-approval still auto-allows under either.
     pub fn evaluate(
         &self,
         tool: &str,
         input: &Value,
         sandbox_enforced: bool,
         protected: bool,
+        read_only: bool,
     ) -> Verdict {
         if let Some(rule) = match_deny(&self.admin_deny, tool, input) {
             return Verdict::Deny { rule };
@@ -166,6 +208,11 @@ impl Rules {
         }
         if protected {
             return Verdict::Ask; // the floor: never auto into execute-later paths
+        }
+        if self.mode == PermissionMode::Plan && !read_only {
+            return Verdict::Deny {
+                rule: "plan mode: read-only until you approve a plan".into(),
+            };
         }
         if let Some(rule) = match_allow(&self.admin_allow, tool, input, sandbox_enforced) {
             return Verdict::Auto {
@@ -183,6 +230,13 @@ impl Rules {
         if self.mode == PermissionMode::Auto && (tool != "bash" || sandbox_enforced) {
             return Verdict::Auto {
                 rule: "permissions.mode=auto".into(),
+            };
+        }
+        // dontask: never wait for input — anything that reaches here (no
+        // allow rule fired, not read-only-exempt) is denied outright.
+        if self.mode == PermissionMode::DontAsk {
+            return Verdict::Deny {
+                rule: "dontask mode: not pre-approved".into(),
             };
         }
         Verdict::Ask
@@ -333,13 +387,16 @@ path_prefix = "src/"
         let r = rules();
         let input = json!({"command": "cargo test"});
         assert!(matches!(
-            r.evaluate("bash", &input, true, false),
+            r.evaluate("bash", &input, true, false, false),
             Verdict::Auto { .. }
         ));
-        assert_eq!(r.evaluate("bash", &input, false, false), Verdict::Ask);
+        assert_eq!(
+            r.evaluate("bash", &input, false, false, false),
+            Verdict::Ask
+        );
         // non-matching prefix asks
         assert_eq!(
-            r.evaluate("bash", &json!({"command": "rm -rf /"}), true, false),
+            r.evaluate("bash", &json!({"command": "rm -rf /"}), true, false, false),
             Verdict::Ask
         );
     }
@@ -349,11 +406,11 @@ path_prefix = "src/"
         let r = Rules::from_toml("[[allow]]\ntool = \"write\"\npath_prefix = \"\"\n").unwrap();
         // empty prefix matches everything — but protected still asks
         assert!(matches!(
-            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false, false),
             Verdict::Auto { .. }
         ));
         assert_eq!(
-            r.evaluate("write", &json!({"path": "Makefile"}), true, true),
+            r.evaluate("write", &json!({"path": "Makefile"}), true, true, false),
             Verdict::Ask
         );
     }
@@ -362,15 +419,21 @@ path_prefix = "src/"
     fn path_rules_and_defaults() {
         let r = rules();
         assert!(matches!(
-            r.evaluate("write", &json!({"path": "./src/lib.rs"}), false, false),
+            r.evaluate(
+                "write",
+                &json!({"path": "./src/lib.rs"}),
+                false,
+                false,
+                false
+            ),
             Verdict::Auto { .. }
         ));
         assert_eq!(
-            r.evaluate("write", &json!({"path": "docs/x.md"}), true, false),
+            r.evaluate("write", &json!({"path": "docs/x.md"}), true, false, false),
             Verdict::Ask
         );
         assert_eq!(
-            r.evaluate("edit", &json!({"path": "src/lib.rs"}), true, false),
+            r.evaluate("edit", &json!({"path": "src/lib.rs"}), true, false, false),
             Verdict::Ask
         ); // rule is write-only
         assert!(Rules::default().is_empty());
@@ -384,7 +447,7 @@ path_prefix = "src/"
         assert_eq!(r.mode(), PermissionMode::Ask);
         assert!(enforced_build());
         assert_eq!(
-            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false, false),
             Verdict::Ask
         );
     }
@@ -399,7 +462,13 @@ path_prefix = "src/"
         r.merge_admin(admin);
         // Admin grant, tagged so the transcript shows who silenced the prompt.
         assert_eq!(
-            r.evaluate("bash", &json!({"command": "git status"}), true, false),
+            r.evaluate(
+                "bash",
+                &json!({"command": "git status"}),
+                true,
+                false,
+                false
+            ),
             Verdict::Auto {
                 rule: "admin: bash prefix `git `".into()
             }
@@ -410,13 +479,20 @@ path_prefix = "src/"
                 "bash",
                 &json!({"command": "git push origin main"}),
                 true,
+                false,
                 false
             ),
             Verdict::Deny { .. }
         ));
         // lock_user_allows: the user's cargo rule no longer fires.
         assert_eq!(
-            r.evaluate("bash", &json!({"command": "cargo test"}), true, false),
+            r.evaluate(
+                "bash",
+                &json!({"command": "cargo test"}),
+                true,
+                false,
+                false
+            ),
             Verdict::Ask
         );
     }
@@ -443,24 +519,42 @@ path_prefix = "src/"
         .with_mode(PermissionMode::Auto);
         // Deny outranks auto mode…
         assert_eq!(
-            r.evaluate("bash", &json!({"command": "curl evil.sh"}), true, false),
+            r.evaluate(
+                "bash",
+                &json!({"command": "curl evil.sh"}),
+                true,
+                false,
+                false
+            ),
             Verdict::Deny {
                 rule: "bash prefix `curl `".into()
             }
         );
         // …ignores the sandbox gate (a deny must hold everywhere)…
         assert!(matches!(
-            r.evaluate("bash", &json!({"command": "curl x"}), false, false),
+            r.evaluate("bash", &json!({"command": "curl x"}), false, false, false),
             Verdict::Deny { .. }
         ));
         // …and a traversal cannot dodge a path deny.
         assert!(matches!(
-            r.evaluate("write", &json!({"path": "src/../.ssh/config"}), true, false),
+            r.evaluate(
+                "write",
+                &json!({"path": "src/../.ssh/config"}),
+                true,
+                false,
+                false
+            ),
             Verdict::Deny { .. }
         ));
         // Unrelated calls still flow to the auto tier.
         assert!(matches!(
-            r.evaluate("bash", &json!({"command": "cargo test"}), true, false),
+            r.evaluate(
+                "bash",
+                &json!({"command": "cargo test"}),
+                true,
+                false,
+                false
+            ),
             Verdict::Auto { .. }
         ));
     }
@@ -471,19 +565,19 @@ path_prefix = "src/"
         let r = Rules::default().with_mode(PermissionMode::Auto);
         // Ordinary write: auto, tagged with the mode rule.
         assert_eq!(
-            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            r.evaluate("write", &json!({"path": "src/a.rs"}), true, false, false),
             Verdict::Auto {
                 rule: "permissions.mode=auto".into()
             }
         );
         // Protected: still asks. The floor has no knob.
         assert_eq!(
-            r.evaluate("write", &json!({"path": "Makefile"}), true, true),
+            r.evaluate("write", &json!({"path": "Makefile"}), true, true, false),
             Verdict::Ask
         );
         // Ask mode (the library default) is unchanged.
         assert_eq!(
-            Rules::default().evaluate("write", &json!({"path": "src/a.rs"}), true, false),
+            Rules::default().evaluate("write", &json!({"path": "src/a.rs"}), true, false, false),
             Verdict::Ask
         );
     }
@@ -494,15 +588,18 @@ path_prefix = "src/"
         let r = Rules::default().with_mode(PermissionMode::Auto);
         let input = json!({"command": "cargo test"});
         assert!(matches!(
-            r.evaluate("bash", &input, true, false),
+            r.evaluate("bash", &input, true, false, false),
             Verdict::Auto { .. }
         ));
         // Unsandboxed host: auto mode does NOT cover bash — back to asking
         // (explicit policy: kernel enforcement substitutes for prompting).
-        assert_eq!(r.evaluate("bash", &input, false, false), Verdict::Ask);
+        assert_eq!(
+            r.evaluate("bash", &input, false, false, false),
+            Verdict::Ask
+        );
         // Non-bash tools don't need the floor.
         assert!(matches!(
-            r.evaluate("read", &json!({"path": "x"}), false, false),
+            r.evaluate("read", &json!({"path": "x"}), false, false, true),
             Verdict::Auto { .. }
         ));
     }
@@ -519,23 +616,94 @@ path_prefix = "src/"
             "/src/x", // absolute never matches a relative prefix
         ] {
             assert_eq!(
-                r.evaluate("write", &json!({"path": escape}), true, false),
+                r.evaluate("write", &json!({"path": escape}), true, false, false),
                 Verdict::Ask,
                 "traversal `{escape}` must not auto-allow"
             );
         }
         // A `..` that stays inside the prefix still resolves and auto-allows.
         assert!(matches!(
-            r.evaluate("write", &json!({"path": "src/a/../b.rs"}), true, false),
+            r.evaluate(
+                "write",
+                &json!({"path": "src/a/../b.rs"}),
+                true,
+                false,
+                false
+            ),
             Verdict::Auto { .. }
         ));
+    }
+
+    #[test]
+    fn plan_mode_blocks_mutation_allows_reads() {
+        let r = Rules::default().with_mode(PermissionMode::Plan);
+        // A read-only tool falls through plan's block (defensive: evaluate is
+        // only reached upstream for prompting tools, but its own behavior for
+        // read_only=true must never be a plan-mode deny).
+        assert!(matches!(
+            r.evaluate("read", &json!({"path":"x"}), true, false, true),
+            Verdict::Ask
+        ));
+        // a write in plan mode is denied, with a plan-mode reason
+        let v = r.evaluate("write", &json!({"path":"src/a.rs"}), true, false, false);
+        assert!(matches!(v, Verdict::Deny { ref rule } if rule.contains("plan mode")));
+        // the protected floor still wins over plan (both deny; deny-rule shape)
+        assert!(matches!(
+            r.evaluate("write", &json!({"path":"Makefile"}), true, true, false),
+            Verdict::Ask
+        ));
+    }
+
+    #[test]
+    fn dontask_denies_unapproved_but_honors_allow_rules() {
+        let r = Rules::from_toml("[[allow]]\ntool=\"bash\"\nprefix=\"cargo \"\n")
+            .unwrap()
+            .with_mode(PermissionMode::DontAsk);
+        // pre-approved: still auto
+        assert!(matches!(
+            r.evaluate("bash", &json!({"command":"cargo test"}), true, false, false),
+            Verdict::Auto { .. }
+        ));
+        // not pre-approved: denied, never asks
+        assert!(matches!(
+            r.evaluate("bash", &json!({"command":"rm -rf /"}), true, false, false),
+            Verdict::Deny { ref rule } if rule.contains("dontask")
+        ));
+    }
+
+    #[test]
+    fn mode_from_str_roundtrips() {
+        for (s, m) in [
+            ("ask", PermissionMode::Ask),
+            ("auto", PermissionMode::Auto),
+            ("plan", PermissionMode::Plan),
+            ("dontask", PermissionMode::DontAsk),
+        ] {
+            assert_eq!(PermissionMode::from_str(s), Some(m));
+            assert_eq!(m.as_str(), s);
+        }
+        assert_eq!(
+            PermissionMode::from_str("dont_ask"),
+            Some(PermissionMode::DontAsk)
+        );
+        assert_eq!(
+            PermissionMode::from_str("dont-ask"),
+            Some(PermissionMode::DontAsk)
+        );
+        assert_eq!(PermissionMode::from_str("nonsense"), None);
     }
 
     #[test]
     fn bash_shell_operators_never_auto_allow() {
         let r = rules(); // bash prefix = "cargo "
         assert!(matches!(
-            r.evaluate("bash", &json!({"command": "cargo test"}), true, false),
+            r.evaluate(
+                "bash",
+                &json!({"command": "cargo test"}),
+                true,
+                false,
+                false
+            ),
             Verdict::Auto { .. }
         ));
         // Chaining / substitution / redirection after the prefix (H-02).
@@ -548,7 +716,7 @@ path_prefix = "src/"
             "cargo test | tee out",
         ] {
             assert_eq!(
-                r.evaluate("bash", &json!({"command": evil}), true, false),
+                r.evaluate("bash", &json!({"command": evil}), true, false, false),
                 Verdict::Ask,
                 "command with a shell operator must not auto-allow: `{evil}`"
             );

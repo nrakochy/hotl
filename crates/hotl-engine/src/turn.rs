@@ -480,11 +480,15 @@ impl Turn {
         why: Option<String>,
     ) -> AskReply {
         let protected = why.is_some();
-        match self
-            .shared
-            .rules
-            .evaluate(&tu.name, input, self.shared.sandbox_enforced, protected)
-        {
+        // TODO(plan mode, task 3): pass the tool's real `read_only()` instead
+        // of `false` once the gate consults it.
+        match self.shared.rules.evaluate(
+            &tu.name,
+            input,
+            self.shared.sandbox_enforced,
+            protected,
+            false,
+        ) {
             Verdict::Auto { rule } => {
                 self.emit(EngineEvent::ToolAutoAllowed {
                     name: tu.name.clone(),

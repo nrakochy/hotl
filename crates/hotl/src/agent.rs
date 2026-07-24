@@ -1410,7 +1410,13 @@ mod tests {
         );
         // Refused file contributes nothing; mode default auto still applies.
         assert!(matches!(
-            rules.evaluate("bash", &serde_json::json!({"command": "git status"}), true, false),
+            rules.evaluate(
+                "bash",
+                &serde_json::json!({"command": "git status"}),
+                true,
+                false,
+                false
+            ),
             hotl_tools::rules::Verdict::Auto { rule } if rule == "permissions.mode=auto"
         ));
         // Absent file: no warning, auto default.

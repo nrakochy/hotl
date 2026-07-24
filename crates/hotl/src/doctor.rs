@@ -245,10 +245,7 @@ fn permissions_check(config_dir: &Path) -> Check {
         Ok(None) => String::new(),
         Err(why) => return warn(format!("permissions: admin file {admin} refused — {why}")),
     };
-    let mode_word = match mode {
-        hotl_tools::rules::PermissionMode::Auto => "auto",
-        hotl_tools::rules::PermissionMode::Ask => "ask",
-    };
+    let mode_word = mode.as_str();
     ok(format!(
         "permissions: {mode_word} (protected paths always ask){admin_note}"
     ))
