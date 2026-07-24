@@ -249,6 +249,22 @@ pub enum EntryPayload {
     ModeSet {
         mode: String,
     },
+    /// A structured question (`ask_user`, tier-1 gap #4) committed durably
+    /// **before** it surfaces — mirrors `PendingAsk`/`AskResolved` exactly:
+    /// if the process dies before a matching `question_resolved`, replay
+    /// sees a dangling question and resume can re-surface it. Log-only (not
+    /// a projection item).
+    PendingQuestion {
+        id: String,
+        question: Question,
+    },
+    /// Resolution of a `pending_question`: the human's answer (already
+    /// formatted to the plain text the model reads — labels joined for a
+    /// selection, the free-text body, or the no-human guidance).
+    QuestionResolved {
+        id: String,
+        answer: String,
+    },
     /// Durable snapshot of the `todo_write` checklist (M4/tier-1 gap #3).
     /// Log-only, like `Rename`/`ModeSet` — not a projection item, so it never
     /// rides in the model transcript; the last one wins on replay. The live
@@ -259,6 +275,30 @@ pub enum EntryPayload {
     },
     #[serde(other)]
     Unknown,
+}
+
+/// One selectable choice in a structured [`Question`] (`ask_user`, tier-1
+/// gap #4). `description` is an optional one-line elaboration shown under
+/// the label.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuestionOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// A structured multiple-choice question the agent asks the human
+/// (`ask_user`) — a header, a prompt, and 2-4 labelled options (plus an
+/// always-available free-text "other" the surfaces provide, not encoded
+/// here). `multi` reserves multi-select for a future surface; today's
+/// surfaces treat every question as single-select.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Question {
+    pub header: String,
+    pub prompt: String,
+    pub options: Vec<QuestionOption>,
+    #[serde(default)]
+    pub multi: bool,
 }
 
 pub fn new_ulid() -> String {
@@ -319,6 +359,44 @@ mod tests {
         for item in &items {
             roundtrip(item);
         }
+    }
+
+    #[test]
+    fn question_types_and_entries_roundtrip() {
+        let q = Question {
+            header: "Auth".into(),
+            prompt: "Which provider?".into(),
+            options: vec![
+                QuestionOption {
+                    label: "Keycloak".into(),
+                    description: Some("self-hosted".into()),
+                },
+                QuestionOption {
+                    label: "Auth0".into(),
+                    description: None,
+                },
+            ],
+            multi: false,
+        };
+        let pj = serde_json::to_string(&EntryPayload::PendingQuestion {
+            id: "q1".into(),
+            question: q.clone(),
+        })
+        .unwrap();
+        assert!(pj.contains("\"kind\":\"pending_question\""));
+        assert_eq!(
+            serde_json::from_str::<EntryPayload>(&pj).unwrap(),
+            EntryPayload::PendingQuestion {
+                id: "q1".into(),
+                question: q
+            }
+        );
+        let rj = serde_json::to_string(&EntryPayload::QuestionResolved {
+            id: "q1".into(),
+            answer: "Keycloak".into(),
+        })
+        .unwrap();
+        assert!(rj.contains("\"kind\":\"question_resolved\""));
     }
 
     #[test]
