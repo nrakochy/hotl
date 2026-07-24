@@ -59,7 +59,7 @@ Prebuilt binary — no toolchain needed (macOS / Linux):
 
     curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
 
-Or with Rust ≥ 1.82 installed:
+Or with Rust ≥ 1.88 installed:
 
     cargo install hotl
 

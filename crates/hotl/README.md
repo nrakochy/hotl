@@ -28,7 +28,7 @@ Prebuilt binary, no toolchain needed (macOS / Linux):
 
 Or grab a `.tar.xz` for your platform from the
 [latest release](https://github.com/nrakochy/hotl/releases/latest).
-With Rust ≥ 1.82 installed:
+With Rust ≥ 1.88 installed:
 
     cargo install hotl
 

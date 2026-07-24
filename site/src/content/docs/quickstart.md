@@ -19,7 +19,7 @@ Prebuilt, no toolchain needed:
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
 ```
 
-(Or, with a Rust toolchain ≥ 1.82: `cargo install hotl`. Building from a checkout — `cargo build --release -p hotl` — works too; then substitute your `target/release/hotl` path for `hotl` below.)
+(Or, with a Rust toolchain ≥ 1.88: `cargo install hotl`. Building from a checkout — `cargo build --release -p hotl` — works too; then substitute your `target/release/hotl` path for `hotl` below.)
 
 Expected: the installer reports where it put `hotl` (usually `~/.cargo/bin`). Open a fresh shell if needed, then confirm:
 
