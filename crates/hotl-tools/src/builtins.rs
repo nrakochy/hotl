@@ -39,6 +39,43 @@ fn str_arg<'v>(input: &'v Value, key: &str) -> Result<&'v str, ToolOutcome> {
     })
 }
 
+/// Confirm a search root stays inside the working directory. Absolute paths
+/// and `..` escapes are refused: `glob`/`grep` are read-only *and*
+/// workspace-scoped — that containment is what lets them run without an ask.
+/// Pure-lexical (no fs touch), so it can't be defeated by a symlink race.
+// TODO(task 2): drop this allow once `GlobTool`/`GrepTool` consume it.
+#[allow(dead_code)]
+pub(crate) fn workspace_contained(path: &str) -> Result<std::path::PathBuf, ToolOutcome> {
+    let reject = || {
+        ToolOutcome::err(format!(
+            "`{path}` is outside the working directory. `glob`/`grep` only search the \
+             current project; use a relative path inside it."
+        ))
+    };
+    if path.starts_with('/') {
+        return Err(reject());
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for part in path.trim_start_matches("./").split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                if matches!(out.last(), Some(&seg) if seg != "..") {
+                    out.pop();
+                } else {
+                    return Err(reject()); // escapes above the root
+                }
+            }
+            seg => out.push(seg),
+        }
+    }
+    Ok(std::path::PathBuf::from(if out.is_empty() {
+        ".".to_string()
+    } else {
+        out.join("/")
+    }))
+}
+
 /// Permission for a mutating file tool: protected paths escalate.
 fn file_permission(verb: &str, input: &Value) -> Permission {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
@@ -448,6 +485,21 @@ mod tests {
             .build()
             .unwrap()
             .block_on(tool.run(input, CancellationToken::new()))
+    }
+
+    #[test]
+    fn workspace_contained_rejects_escape_and_absolute() {
+        // relative, in-workspace: allowed (returned path is the cleaned relative)
+        assert!(workspace_contained("src").is_ok());
+        assert!(workspace_contained("./src/lib.rs").is_ok());
+        assert!(workspace_contained(".").is_ok());
+        // absolute path: refused (a read tool is not an exfiltration primitive)
+        assert!(workspace_contained("/etc/passwd").is_err());
+        // traversal out of the workspace: refused
+        assert!(workspace_contained("../secrets").is_err());
+        assert!(workspace_contained("src/../../etc").is_err());
+        // a `..` that stays inside is fine
+        assert!(workspace_contained("src/../README.md").is_ok());
     }
 
     #[test]
