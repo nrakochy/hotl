@@ -648,7 +648,12 @@ fn build_registry(
         )));
     }
     if let Some(builder) = spawn_builder {
-        registry.register(Box::new(crate::spawn::SpawnTool::new(builder)));
+        let agents_include_claude = cfg.agents.claude.unwrap_or(true);
+        registry.register(Box::new(crate::spawn::SpawnTool::new(
+            builder,
+            config_dir.to_path_buf(),
+            agents_include_claude,
+        )));
     }
     (registry, skill_names)
 }
@@ -682,7 +687,11 @@ impl HotlChildBuilder {
 }
 
 impl crate::spawn::ChildBuilder for HotlChildBuilder {
-    fn build(&self, _brief: &str) -> Result<hotl_engine::SessionHandle, String> {
+    fn build(
+        &self,
+        _def: &hotl_tools::agents::AgentDef,
+        _brief: &str,
+    ) -> Result<hotl_engine::SessionHandle, String> {
         let log = SessionLog::create(
             &sessions_dir(),
             &self.model,

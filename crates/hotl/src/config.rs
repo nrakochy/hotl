@@ -35,6 +35,8 @@ pub struct Config {
     #[serde(default)]
     pub skills: SkillsCfg,
     #[serde(default)]
+    pub agents: AgentsCfg,
+    #[serde(default)]
     pub concurrency: ConcurrencyCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
@@ -81,6 +83,16 @@ impl SkillsCfg {
         }
         (roots, warnings)
     }
+}
+
+/// `[agents]` — user-defined subagent shapes (tier-1 gap #6). Mirrors
+/// `[skills] claude` exactly: hotl always reads its own `agents/*.md`;
+/// `~/.claude/agents/*.md` loads too unless opted out.
+#[derive(Debug, Default, Deserialize)]
+pub struct AgentsCfg {
+    /// `false` stops reading `~/.claude/agents`. Default: read it when
+    /// present.
+    pub claude: Option<bool>,
 }
 
 /// A git URL as opposed to a local path: a fetch scheme, an scp-style
