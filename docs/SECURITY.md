@@ -94,6 +94,26 @@ Everything that flows into the model's context from a source other than the user
 
 **Trust store — first-use screen.** The first call to a server raises a *protected* ask (never auto-allowable): server name, binary path, SHA-256 of the binary, and what approval means ("this program will run on your machine and its output will enter the model's context"). Approval is recorded in `~/.config/hotl/trust.toml` keyed by server name → binary hash; a changed hash re-raises the screen. An unreadable binary is recorded honestly as having no integrity check; a failed trust-store write keeps the grant in memory only and re-asks next session. Server binaries run **outside** the bash sandbox floor — they are user-installed programs, not model-directed commands; installing one is the trust decision.
 
+## Retrieval (`recall`)
+
+The `recall` tool searches owner-configured knowledge backends (`[[retrieval]]`
+in config.toml). The tool is absent when nothing is configured.
+
+- **Everything a backend returns is untrusted.** Results, and backend errors,
+  pass one sanitizer chokepoint — control/ANSI strip, 50 KB byte cap, defang,
+  then the untrusted-content envelope with `recall:<backend>` provenance —
+  before entering the transcript. Retrieved text may inform the work; it can
+  never authorize tool use or change the rules.
+- **Backends that execute a program inherit the MCP posture.** An MCP-backed
+  backend raises the protected first-use ask carrying the server binary's
+  SHA-256 (recorded to the same `trust.toml`; a grant covers the server
+  whether it is reached via `mcp` or `recall`), then a plain per-call ask.
+  In-process backends with no execution or egress run without asking.
+- **No egress by default.** hotl ships no cloud retrieval backend; a backend
+  reaches the network only if the owner configures one that does.
+- Oversized result sets ride the existing eviction path: blob on disk, head
+  preview + read-back pointer in context.
+
 ## Sub-agents and protocol clients
 
 **`spawn` (sub-agents).** The child has **no human on the loop**, so its permission asks default-deny — it runs only auto-allowed/read-only tools under the parent's sandbox floor and rules. The depth cap is **structural, not a counter**: children are built with a builtins-only tool registry — no `spawn`, no MCP — so a child cannot recurse or reach external servers; the capability simply isn't in its registry. Results return to the parent inside the untrusted envelope. `fork` and `teammate` are reserved topologies.
