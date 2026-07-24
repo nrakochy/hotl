@@ -1,0 +1,36 @@
+name: Update flake.lock
+
+# flake.lock's nixpkgs pin goes stale — a few refreshes a year keeps the
+# toolchain close to what a nixpkgs PR builds against and keeps cache hits from
+# cache.nixos.org warm.
+#
+# Deliberately NOT part of scripts/release.sh: coupling releases to nixpkgs
+# churn would let an unrelated upstream regression block a release. This opens
+# a PR that can sit, be reviewed, or be closed without touching release day.
+
+on:
+  schedule:
+    # Monthly, the first of the month. The pin does not need to be fresh, only
+    # not ancient.
+    - cron: "0 4 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/update-flake-lock@main
+        with:
+          pr-title: "build(nix): update flake.lock"
+          pr-labels: dependencies
+          # A PR opened with the default GITHUB_TOKEN does not trigger
+          # workflows, so ci.yml's `nix` job will not run on it — and that job
+          # is master-only anyway. Verify with `nix flake check` locally, or
+          # let the post-merge master run be the gate.
+          commit-msg: "build(nix): update flake.lock"

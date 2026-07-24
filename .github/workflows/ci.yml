@@ -112,6 +112,31 @@ jobs:
         run: npm ci && npm run build
         working-directory: site
 
+  # Flake evaluation + build gate. `nix flake check` builds checks.package,
+  # which is the package derivation with the test suite re-enabled — so this
+  # leg stays predictive of the nixpkgs build, which keeps tests on.
+  #
+  # Deliberately master-only: it is a full cold Rust build plus the suite on
+  # each leg (nixpkgs delivers the toolchain prebuilt, never our dependency
+  # tree), and it duplicates coverage the jobs above already have on PRs. Its
+  # real job is proving *the flake* still evaluates and builds. Release tags
+  # get their own leg in nix-tag.yml, against the published tag.
+  #
+  # macos-latest is not redundant with ubuntu: darwin has the weaker sandbox
+  # and different PTY semantics, so checkPhase behavior diverges there.
+  nix:
+    if: github.ref == 'refs/heads/master'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: DeterminateSystems/nix-installer-action@main
+      - name: nix flake check
+        run: nix flake check --print-build-logs
+
   # Dependency vulnerability scan. Runs
   # cargo-audit against the committed Cargo.lock. cargo-audit installs from
   # crates.io — the same trust root as the build — so this adds no new

@@ -1,0 +1,49 @@
+name: Nix (published tag)
+
+# Builds the *published tag* from GitHub, not the checkout — that is what a
+# nixpkgs consumer actually fetches, and it is the only way to catch a tag that
+# builds differently from the tree it was cut from.
+#
+# Why this exists: a Nix breakage introduced by a new dependency is otherwise
+# discovered whenever r-ryantm opens a nixpkgs PR, days after the tag is
+# public. This closes that gap to minutes.
+#
+# Scope caveat, stated so it never surprises: this job vendors via
+# importCargoLock (flake.nix), while nixpkgs vendors via fetchCargoVendor. The
+# two backends diverge only on git dependencies, of which this workspace has
+# none — so this catches essentially all real breakage (build and test
+# failures), while cargoHash staleness remains the update bot's job by design.
+#
+# Failure here does not fail the release: crates.io publish and the prebuilt
+# binaries are separate tag consumers (publish.yml / release.yml) and stay off
+# Nix's critical path.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-tag-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        # macos-latest is aarch64 — the platform the flake's first consumer
+        # runs on, and where checkPhase surprises live (weaker sandbox,
+        # different PTY semantics).
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: DeterminateSystems/nix-installer-action@main
+      # The tag's tree already had its suite run by ci.yml's `nix` job on
+      # master, so this builds the package output (tests off) rather than
+      # checks. What it uniquely proves is that the *tag ref* resolves and
+      # builds — the exact fetch a consumer or a nixpkgs maintainer performs.
+      - name: Build the published tag
+        run: nix build github:nrakochy/hotl/${{ github.ref_name }} --print-build-logs
