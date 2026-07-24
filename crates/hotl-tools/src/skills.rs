@@ -119,6 +119,24 @@ impl SkillTool {
                 .chain(e.qualified.as_deref().filter(|q| *q != e.name.as_str()))
         })
     }
+
+    /// `(name, description)` for every name `{"name"}` accepts — the bare
+    /// name plus any `source:skill` alias, each carrying its entry's
+    /// description. Same names and order as [`Self::names`].
+    ///
+    /// Client-facing only: front ends build the `/<skill>` completion menu
+    /// from this. It never enters a prompt — the model sees [`describe`],
+    /// which names skills without describing them.
+    pub fn catalog(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.entries.iter().flat_map(|e| {
+            std::iter::once((e.name.as_str(), e.description.as_str())).chain(
+                e.qualified
+                    .as_deref()
+                    .filter(|q| *q != e.name.as_str())
+                    .map(|q| (q, e.description.as_str())),
+            )
+        })
+    }
 }
 
 /// The always-sent tool description: one line per source, large sources
@@ -1048,6 +1066,68 @@ mod tests {
         assert_eq!(
             tool.roster().collect::<Vec<_>>(),
             vec![("odd", "claude", "Odd skill")]
+        );
+    }
+
+    /// The client-facing catalog pairs every accepted name with its
+    /// description — including the `source:skill` alias, which `names()`
+    /// emits bare.
+    #[test]
+    fn catalog_pairs_every_accepted_name_with_its_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let mkt = dir.path().join("acme");
+        write_skill(
+            &mkt.join("deploy"),
+            "name: deploy\ndescription: tag and push the release",
+            "body",
+        );
+        let none = dir.path().join("none");
+        let tool = SkillTool::with_roots(
+            &none,
+            &[("acme".to_string(), mkt.clone())],
+            &none,
+            &none,
+            false,
+        )
+        .expect("a skill exists");
+
+        assert_eq!(
+            tool.catalog().collect::<Vec<_>>(),
+            vec![
+                ("deploy", "tag and push the release"),
+                ("acme:deploy", "tag and push the release"),
+            ]
+        );
+        // Same names, same order as the roster front ends already resolve.
+        assert_eq!(
+            tool.catalog().map(|(n, _)| n).collect::<Vec<_>>(),
+            tool.names().collect::<Vec<_>>()
+        );
+    }
+
+    /// The load-bearing guard: descriptions are client-facing only. The tool
+    /// description goes into every request forever, so a skill description
+    /// leaking into it is a permanent context tax on every session.
+    #[test]
+    fn the_always_sent_tool_description_never_carries_skill_descriptions() {
+        let dir = tempfile::tempdir().unwrap();
+        let user = dir.path().join("claude-skills");
+        write_skill(
+            &user.join("deploy"),
+            "name: deploy\ndescription: SENTINEL tag and push the release",
+            "body",
+        );
+        let none = dir.path().join("none");
+        let tool = SkillTool::with_roots(&none, &[], &user, &none, true).expect("a skill exists");
+
+        assert!(
+            !tool.description().contains("SENTINEL"),
+            "describe() must name skills, never describe them: {}",
+            tool.description()
+        );
+        assert!(
+            tool.catalog().any(|(_, d)| d.contains("SENTINEL")),
+            "the client-facing catalog is where the description lives"
         );
     }
 }
