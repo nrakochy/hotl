@@ -125,7 +125,7 @@ pub fn label_suffix() -> Option<String> {
 /// which matches the apex (`example.com`) **and** any subdomain depth
 /// (`a.example.com`, `a.b.example.com`). No ports in patterns; a trailing dot
 /// on the host is stripped. An empty pattern list allows nothing.
-fn host_allowed(host: &str, patterns: &[String]) -> bool {
+fn host_matches(host: &str, patterns: &[String]) -> bool {
     let host = host.trim_end_matches('.').to_ascii_lowercase();
     patterns.iter().any(|pattern| {
         let pattern = pattern.to_ascii_lowercase();
@@ -134,6 +134,51 @@ fn host_allowed(host: &str, patterns: &[String]) -> bool {
             None => host == pattern,
         }
     })
+}
+
+/// The verdict for a pre-request egress check (`web_fetch`/`web_search`): can
+/// this host be reached *before* a socket is opened, with no subprocess and
+/// no proxy round-trip — just the same policy bash's proxy consults.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostVerdict {
+    /// The policy explicitly allows this host (allowlist match).
+    Allowed,
+    /// The policy explicitly refuses this host; the reason is prompt-shaped
+    /// (tells the model what to do: add the host, or change the policy).
+    Denied(String),
+    /// No restriction is configured (`Open`) — the caller falls back to the
+    /// ordinary permission ask; this is not itself a grant.
+    NoPolicy,
+}
+
+/// Pure decision function, testable without touching the process-wide
+/// `OnceLock` (which is set-once and installed for real only at startup).
+fn verdict_for(host: &str, policy: &EgressPolicy) -> HostVerdict {
+    match policy {
+        EgressPolicy::Open => HostVerdict::NoPolicy,
+        EgressPolicy::Off => HostVerdict::Denied(format!(
+            "egress is off ([network] egress = \"off\"); \"{host}\" is unreachable — \
+             set egress = \"allowlist\" and add it, or egress = \"open\""
+        )),
+        EgressPolicy::Allowlist(patterns) => {
+            if host_matches(host, patterns) {
+                HostVerdict::Allowed
+            } else {
+                HostVerdict::Denied(format!(
+                    "\"{host}\" is not in [network] allow; add it or use egress = \"open\""
+                ))
+            }
+        }
+    }
+}
+
+/// Pre-request egress check shared by `web_fetch`/`web_search` (and anything
+/// else that wants to know "can I reach this host" before spending a socket
+/// or a subprocess): reads the same process-wide policy bash's proxy
+/// consults, so there is exactly one egress authority, never a second
+/// tool-local allowlist.
+pub fn host_allowed(host: &str) -> HostVerdict {
+    verdict_for(host, policy())
 }
 
 /// Lazily start the proxy (once per process) and return its port; `None` if
@@ -190,7 +235,7 @@ async fn handle_conn(mut client: TcpStream, patterns: &'static [String]) {
         let Some((host, port)) = split_host_port(target, None) else {
             return respond(&mut client, "400 Bad Request", "malformed CONNECT target").await;
         };
-        if !host_allowed(&host, patterns) {
+        if !host_matches(&host, patterns) {
             return deny_host(&mut client, &host).await;
         }
         let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await else {
@@ -212,7 +257,7 @@ async fn handle_conn(mut client: TcpStream, patterns: &'static [String]) {
     let Some((host, port)) = http_target(target, &head) else {
         return respond(&mut client, "400 Bad Request", "no target host in request").await;
     };
-    if !host_allowed(&host, patterns) {
+    if !host_matches(&host, patterns) {
         return deny_host(&mut client, &host).await;
     }
     let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await else {
@@ -303,25 +348,57 @@ mod tests {
     fn host_allowed_matrix() {
         let p = patterns(&["github.com", "*.crates.io"]);
         // Exact.
-        assert!(host_allowed("github.com", &p));
-        assert!(!host_allowed("api.github.com", &p)); // exact is not a wildcard
+        assert!(host_matches("github.com", &p));
+        assert!(!host_matches("api.github.com", &p)); // exact is not a wildcard
                                                       // Wildcard covers the apex and every subdomain depth.
-        assert!(host_allowed("crates.io", &p));
-        assert!(host_allowed("static.crates.io", &p));
-        assert!(host_allowed("a.b.crates.io", &p));
+        assert!(host_matches("crates.io", &p));
+        assert!(host_matches("static.crates.io", &p));
+        assert!(host_matches("a.b.crates.io", &p));
         // Case-insensitive both sides; trailing dot stripped.
-        assert!(host_allowed("GitHub.COM", &p));
-        assert!(host_allowed("github.com.", &p));
-        assert!(host_allowed(
+        assert!(host_matches("GitHub.COM", &p));
+        assert!(host_matches("github.com.", &p));
+        assert!(host_matches(
             "Static.Crates.IO",
             &patterns(&["*.CRATES.io"])
         ));
         // No suffix tricks: evilcrates.io is not *.crates.io.
-        assert!(!host_allowed("evilcrates.io", &p));
-        assert!(!host_allowed("crates.io.evil.example", &p));
+        assert!(!host_matches("evilcrates.io", &p));
+        assert!(!host_matches("crates.io.evil.example", &p));
         // No match, and the empty list allows nothing.
-        assert!(!host_allowed("example.com", &p));
-        assert!(!host_allowed("github.com", &[]));
+        assert!(!host_matches("example.com", &p));
+        assert!(!host_matches("github.com", &[]));
+    }
+
+    /// Task 1: `host_allowed` is the pre-request egress check `web_fetch`/
+    /// `web_search` consult — same policy bash's proxy uses, no subprocess,
+    /// no second allowlist. `Open` (the default) yields `NoPolicy` — the
+    /// caller still asks; `Off` denies every host; `Allowlist` matches like
+    /// the proxy does, with a prompt-shaped reason on denial.
+    #[test]
+    fn host_allowed_reads_the_configured_policy() {
+        let allow = EgressPolicy::Allowlist(patterns(&["github.com", "*.crates.io"]));
+        assert_eq!(verdict_for("github.com", &allow), HostVerdict::Allowed);
+        assert_eq!(verdict_for("api.crates.io", &allow), HostVerdict::Allowed);
+        match verdict_for("evil.com", &allow) {
+            HostVerdict::Denied(reason) => {
+                assert!(reason.contains("evil.com") && reason.contains("[network] allow"));
+            }
+            other => panic!("expected Denied, got {other:?}"),
+        }
+
+        assert_eq!(
+            verdict_for("anything.example", &EgressPolicy::Open),
+            HostVerdict::NoPolicy
+        );
+
+        match verdict_for("anything.example", &EgressPolicy::Off) {
+            HostVerdict::Denied(reason) => assert!(reason.contains("egress is off")),
+            other => panic!("expected Denied, got {other:?}"),
+        }
+
+        // The public entrypoint reads the (unset-in-tests, so default Open)
+        // process-wide policy.
+        assert_eq!(host_allowed("anything.example"), HostVerdict::NoPolicy);
     }
 
     #[test]
