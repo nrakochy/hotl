@@ -1,9 +1,9 @@
 ---
-title: hotl — human on the loop
+title: hotl — human on the loop terminal AI agent
 description: A human-on-the-loop terminal AI agent — a permission gate under a kernel sandbox floor, an append-only session log with resume and undo, MCP/ACP, and any Anthropic or OpenAI-compatible model.
 template: splash
 hero:
-  tagline: A terminal AI agent with guardrails you can see, a session log nothing rewrites, and any model you point it at — plus a tmux dashboard for every agent you run.
+  tagline: It's fast, slim, secure, and extensible — plus a tmux dashboard for every agent you run.
   actions:
     - text: Quickstart
       link: ./quickstart/
@@ -28,17 +28,18 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		Sessions are append-only event logs: `hotl resume` continues one,
 		`hotl undo` reverses the agent's file changes via shadow-git snapshots,
 		and context compaction adds a summary on top of history instead of
-		rewriting it. [Overview →](./overview/)
+		rewriting it — so a failed compaction can't brick a session.
+		[Overview →](./overview/)
 	</Card>
 	<Card title="Context that stays slim" icon="random">
 		The window is spent on your task, not on ceremony:
 
-		- Oversized tool results are evicted to files — a preview stays inline,
+		- oversized tool results are evicted to files — a preview stays inline,
 		  the agent pages the rest back on demand
-		- Compaction summaries precompute in the background from ~60% full and
+		- compaction summaries precompute in the background from ~60% full and
 		  fold in at ~80% without pausing the session
-		- The prompt prefix is byte-stable, so provider caches keep hitting
-		- A per-turn meter shows how full the context actually is
+		- the prompt prefix is byte-stable, so provider caches keep hitting —
+		  and a per-turn meter shows how full the window actually is
 
 		[Configuration →](./configuration/)
 	</Card>
@@ -46,13 +47,16 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		Steer mid-turn without killing the run — queued steers apply at the next
 		step. And approvals are a vocabulary, not a y/N:
 
-		- allow, or allow with an edited input
+		- allow, allow with an edited input, or answer as the tool yourself
 		- deny with a message the model actually reads
-		- answer as the tool yourself
 		- allow-rules absorb the repetitive asks, so approval fatigue never
 		  trains you to say yes
+		- walk away entirely: an ask raised while you're detached from a
+		  `hotl bg` session is *parked*, not denied, and re-presented the moment
+		  you reattach
 
-		[Permissions & sandbox →](./permissions-and-sandbox/)
+		[Permissions →](./permissions-and-sandbox/) ·
+		[Background sessions →](./backgrounding/)
 	</Card>
 	<Card title="tmux-native, out of the box" icon="laptop">
 		`hotl watch` in a pane discovers every AI agent in your tmux session:
@@ -60,71 +64,67 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		- live status per agent, a ping when one blocks on you, `enter` jumps
 		  focus to its pane
 		- `Ctrl-h/j/k/l` pane navigation composes with vim-tmux-navigator
-		- vim hands welcome: the console's input editor speaks motions,
-		  operators, and counts (`vim_mode`, on by default; `Ctrl-e` opens
-		  `$EDITOR`), and watch's list speaks `j`/`k`/`gg`/`G`
-		- the zsh plugin's OSC-133 marks give watch clean command boundaries
+		- watch's list speaks `j`/`k`/`gg`/`G`, and vim hands can switch the
+		  console's input editor to a real modal one — motions, operators,
+		  counts, `Ctrl-e` to `$EDITOR` (`[behavior] vim_mode = true`; off by
+		  default, because a modal editor ambushes everyone else)
 
 		[Shell integration →](./shell/)
 	</Card>
-	<Card title="It's Rust, and it goes brrrr" icon="seti:rust">
+	<Card title="Goes brrrr" icon="seti:rust">
 		One static binary — no Node, no Python, no runtime to install — and an
 		async policy strict enough to keep it that way:
 
 		- **Rule 0: async is for waiting, threads are for working.** The tokio
 		  runtime only ever hosts tasks blocked on I/O or doing sub-millisecond
 		  coordination
+		- fan-out is green threads, not OS threads: parallel reads, or thirty
+		  `spawn`ed sub-agents each with their own context and log, cost a task
+		  apiece — bounded by permits, capped at one level of depth, returning
+		  only their result
 		- every entry point builds a `current_thread` runtime — nothing pays for
 		  thread-pool spinup on the cold-start path that `hotl -p` and the zsh
 		  plugin live on
-		- shadow-git snapshots and other hot work leave the runtime via
-		  `spawn_blocking` rather than stalling the event loop
-		- four `unsafe` blocks in the entire workspace, every one a plain libc
-		  syscall for the sandbox or a process-group kill
+		- work that genuinely blocks — shadow-git snapshots, `glob`'s tree walk
+		  — leaves via `spawn_blocking`, and that pool is yours to size
+		- one actor per session is the sole committer, so there's no lock order
+		  to get wrong: parallel-safe calls overlap, anything that mutates runs
+		  alone in source order, and `Ctrl-c` trips a cancellation token
+		  out-of-band rather than queueing behind a full mailbox
 
-		[Architecture →](./overview/)
+		[Sub-agents →](./agents/) · [Concurrency →](./configuration/)
 	</Card>
-	<Card title="Concurrency you can reason about" icon="rocket">
-		One actor per session is the sole committer, so there is exactly one
-		writer and no lock order to get wrong. Around that spine:
-
-		- tool batches chunk themselves — contiguous runs of parallel-safe calls
-		  (reads, isolated sub-agents) overlap under one `join_all`; anything
-		  that mutates runs alone, in source order, bracketed by undo snapshots
-		- results come back paired to their call either way, so parallelism
-		  never reorders the transcript
-		- approvals stay deliberately serial: an ask is a human moment, not a
-		  race
-		- `Ctrl-c` never queues — it trips a cancellation token out-of-band, so
-		  interrupts can't wedge behind a full mailbox
-		- compaction is speculative: the digest fires as a background task at
-		  ~60% context and is usually already done when the fold lands
-
-		[Overview →](./overview/)
-	</Card>
-	<Card title="Any model, one env var" icon="setting">
+	<Card title="Any model, any protocol" icon="setting">
 		`HOTL_MODEL=provider/model` — Anthropic's Messages API, or any
 		OpenAI-compatible endpoint: OpenAI, Groq, a local Ollama server, or a
-		gateway like LiteLLM. [Gateways & key sources →](./gateway/)
+		gateway like LiteLLM. Keys come from the environment or a command you
+		name, never from the config file. An MCP client brings in external
+		tools, and `hotl acp` embeds the agent in any ACP-speaking editor.
+		[Gateways →](./gateway/) · [MCP →](./mcp/)
 	</Card>
-	<Card title="Standard protocols at the edges" icon="puzzle">
-		An MCP client brings in external tools; `hotl acp` embeds the agent in
-		any ACP-speaking editor — and your Claude Code skills
-		(`~/.claude/skills`, plugins) load in place, no porting.
-		[MCP servers →](./mcp/)
+	<Card title="Extend it without forking it" icon="puzzle">
+		Your own logic at hotl's seams, all from the one config file:
+
+		- skills and sub-agent types you define yourself — tool scope, model,
+		  system prompt. Claude Code's `~/.claude/skills`, `~/.claude/agents`,
+		  and plugins load in place, no porting
+		- six hook events — `pre_tool`, `post_tool`, `user_prompt`,
+		  `notification`, `stop`, `session_end` — to block a call, rewrite its
+		  input, inject context, or ring a bell. A hook can never *grant*:
+		  crashed, malformed, or timed out is a no-op, not an auto-approval
+		- `[diagnostics] rs = "cargo check -q"` puts your compiler's output in
+		  the tool result for the edit that broke it
+		- `recall` plugs in a search backend for corpora that outgrew grep
+
+		[Hooks →](./hooks/) · [Sub-agents →](./agents/)
 	</Card>
-	<Card title="One config file, fail-closed" icon="document">
+	<Card title="One config file, fail-closed" icon="seti:config">
 		Everything hand-editable lives in a single `config.toml` — no
-		`permissions.toml`/`mcp.toml`/`hooks.toml` sprawl:
-
-		- precedence is always env var > config.toml > default, so CI can
-		  override anything without editing the file
-		- a malformed file is ignored with a warning, never half-applied; a
-		  typo'd permission mode fails closed to `ask`
-		- API keys never live in the file — env vars, or `api_key_helper`
-		  runs a command and uses its output
-		- `hotl setup` writes a commented starter; `hotl doctor` checks the lot
-
+		`permissions.toml`/`mcp.toml`/`hooks.toml` sprawl. Precedence is always
+		env var > config.toml > default, so CI can override anything without
+		editing the file; a malformed file is ignored with a warning, never
+		half-applied; a typo'd permission mode fails closed to `ask`.
+		`hotl setup` writes a commented starter, `hotl doctor` checks the lot.
 		[Configuration →](./configuration/)
 	</Card>
 	<Card title="Security floor that never turns off" icon="approve-check">
@@ -144,9 +144,6 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		  client that ignores the proxy hits a loopback-only wall
 		- secrets are masked at log ingestion, and secret-bearing files never
 		  enter the undo snapshot store at all
-		- *forthcoming:* third-party plugins as WASM components under a
-		  wasmtime sandbox (epoch deadlines + fuel) — that lane doesn't ship
-		  until its sandbox and trust screens do
 
 		Stated honestly: this is write-confinement, not exfiltration prevention.
 		[Permissions & sandbox →](./permissions-and-sandbox/)

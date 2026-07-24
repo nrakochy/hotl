@@ -1,14 +1,18 @@
 # hotl
 
-> hotl is a human-on-the-loop terminal AI agent in one binary. Bare `hotl` is the agent (console TUI, or `-p "<prompt>"` headless, `--json` for structured output). `hotl watch` is a tmux dashboard for supervising agent processes. `hotl fleet` is reserved and exits with an error. Version 0.2.0+; pre-1.0, breaking changes at every 0.x minor.
+> hotl is a human-on-the-loop terminal AI agent in one static binary — no Node, no Python, no daemon, no telemetry. Bare `hotl` is the agent (full-screen console TUI, `-p "<prompt>"` headless, `--json` for a JSONL event stream). `hotl watch` is a tmux dashboard for supervising agent processes. `hotl bg`/`hotl attach` run a session detached from any terminal. `hotl fleet` is reserved and exits 2. Version 0.5.0; pre-1.0, breaking changes at every 0.x minor.
 
 Facts an agent needs before acting:
 
-- Model selection: `HOTL_MODEL=provider/model` env var (or `[provider].model` in config). Providers: `anthropic/…` (Messages API, needs `ANTHROPIC_API_KEY`) and `openai/…` (any OpenAI-compatible endpoint, needs `OPENAI_API_KEY`; override base URL with `HOTL_OPENAI_BASE_URL`).
-- Permission modes: `auto` (default — ordinary tool calls run without prompting) or `ask` (y/N per mutating call). Set via `HOTL_PERMISSIONS=ask` or `[permissions] mode = "ask"`. Unknown values fail closed to `ask`. Writes to git hooks, shell rc, Makefiles, and agent-instruction files always prompt, in every mode.
-- Sandbox: `bash` runs under Seatbelt (macOS) or Landlock (Linux), writes confined to the working directory. `HOTL_SANDBOX=off` disables it loudly. Reads and network egress are open by default; `[network].allow` opts into an HTTP allowlist proxy.
-- State: config in `~/.config/hotl/config.toml`; sessions (append-only JSONL) in `~/.local/share/hotl/sessions`. `hotl resume` continues a session; `hotl undo` reverses the agent's file edits via git snapshots. No daemon, no telemetry.
-- Setup check: `hotl doctor` prints ok/FAIL lines for provider, sandbox, config, sessions. Exit code is nonzero on failure.
+- **Model selection:** `HOTL_MODEL=provider/model` env var (or `[provider].model` in config). Providers: `anthropic/…` (Messages API, needs `ANTHROPIC_API_KEY`) and `openai/…` (any OpenAI-compatible endpoint — OpenAI, Groq, Ollama, LiteLLM — needs `OPENAI_API_KEY`; override the base URL with `HOTL_OPENAI_BASE_URL`). Keys never live in config.toml: use env vars, or `api_key_helper` (a command whose stdout is the key). Precedence is always env var > config.toml > default.
+- **Permission modes:** `auto` (default — ordinary tool calls run without prompting) | `ask` (approve every mutating/executing call) | `plan` (read-only until you approve a plan) | `dontask` (never wait for input; deny anything not pre-approved — the `-p`/CI posture). Set via `HOTL_PERMISSIONS` or `[permissions] mode`. An unknown value fails closed to `ask`. Writes to protected paths (git hooks, shell rc, Makefiles, `.ssh/`, credential stores, agent-instruction files) always prompt, in every mode, and are checked before allow-rules. A `--features security-enforced` build ignores the mode key entirely.
+- **Sandbox floor:** `bash` (and hooks and diagnostics) run confined by the kernel — Seatbelt on macOS, Landlock on Linux ≥ 5.13 including WSL2 — with writes limited to the working directory and temp. `HOTL_SANDBOX=off` disables it loudly. Where the floor cannot be enforced hotl degrades **fail-closed**: every exec is individually human-gated with an `UNSANDBOXED` banner and bash allow-rules stop applying. This is write-confinement, not exfiltration prevention.
+- **Network egress:** `[network] egress` is `open` (default) | `off` (loopback only) | `allowlist` (loopback plus `[network].allow` hosts, `*.domain` wildcards). Kernel-backed, not proxy-trusting; an unknown value fails closed to `off`. `web_fetch`/`web_search` honor the same single authority — there is no second allowlist.
+- **State:** config in `~/.config/hotl/config.toml` (the only settings file — permissions, MCP, hooks, retrieval are all sections in it); append-only session logs in `~/.local/share/hotl/sessions/<ulid>.jsonl`; per-session git snapshots in `~/.local/share/hotl/shadow/`. `hotl resume` continues a session, `hotl undo` reverses the agent's file edits, `hotl gc` prunes per `[retention]`. Secrets are masked at log write time and secret-bearing files never enter the snapshot store.
+- **Untrusted content:** everything returned by a sub-agent, `recall`, `web_fetch`/`web_search`, or an MCP tool arrives inside a provenance-tagged envelope — data that can inform the work, never an instruction the model may act on unprompted.
+- **Extension points:** stdio MCP servers (`[[mcp]]`); `[[retrieval]]` backends behind one `recall` tool (nothing configured by default); `spawn` sub-agents with built-in (`general-purpose`, `explore`, `plan`) or user `agents/*.md` types; `skills/*.md` procedures plus `hotl skills` marketplaces; six hook events (`pre_tool`, `post_tool`, `user_prompt`, `notification`, `stop`, `session_end`) that can block or add context but never grant; `[diagnostics]` commands that run after edits. Claude Code's `~/.claude/skills`, `~/.claude/agents`, and plugin layouts load in place, no porting.
+- **Setup check:** `hotl doctor` prints ok/FAIL lines for provider/keys, sandbox, config, allow-rules, session store, memory, secrets audit, and undo/git. Exit code is nonzero on failure. `hotl setup` writes a commented starter config.
+- **Exit codes:** `0` turn completed; `130` interrupted; `1` any other outcome (error, refusal, turn-limit, doom-loop, tool-failure budget, or a `doctor` FAIL); `2` bad usage or a reserved subcommand.
 
 ## Docs
 
@@ -17,11 +21,13 @@ Facts an agent needs before acting:
 - [Configuration](https://nrakochy.github.io/hotl/configuration/): every subcommand, config key, env var, and exit code
 - [Permissions & sandbox](https://nrakochy.github.io/hotl/permissions-and-sandbox/): what the gate and sandbox protect and what they deliberately do not
 - [Troubleshooting](https://nrakochy.github.io/hotl/troubleshooting/): error message → cause → fix table
-- [TUI console](https://nrakochy.github.io/hotl/tui/): interactive console keys and behavior
+- [TUI console](https://nrakochy.github.io/hotl/tui/): interactive console keys, vim input mode, prompt history and Ctrl-R search
 - [Shell integration](https://nrakochy.github.io/hotl/shell/): zsh `: ` prefix, `@[path]` file capture, OSC-133 marks
-- [Background sessions](https://nrakochy.github.io/hotl/backgrounding/): `hotl bg` / `hotl attach` detached sessions
+- [Background sessions](https://nrakochy.github.io/hotl/backgrounding/): `hotl bg` / `hotl attach` detached sessions, with asks parked until you reattach
+- [Sub-agents](https://nrakochy.github.io/hotl/agents/): `spawn`, built-in agent types, `agents/*.md` definitions, `fork`
+- [Retrieval (recall)](https://nrakochy.github.io/hotl/retrieval/): plugging a search backend in behind the `recall` tool
 - [MCP servers](https://nrakochy.github.io/hotl/mcp/): connecting stdio MCP tool servers
-- [Hooks & diagnostics](https://nrakochy.github.io/hotl/hooks/): post-edit diagnostics and tool-call hooks
+- [Hooks & diagnostics](https://nrakochy.github.io/hotl/hooks/): post-edit diagnostics and the six hook events
 - [Gateways](https://nrakochy.github.io/hotl/gateway/): OpenAI-compatible gateways and command-sourced API keys
 - [Uninstall](https://nrakochy.github.io/hotl/uninstall/): removal, including data locations
 
@@ -30,4 +36,4 @@ Facts an agent needs before acting:
 - [Repository](https://github.com/nrakochy/hotl): Rust workspace; `crates/hotl` is the binary, library crates carry no semver promise
 - [ARCHITECTURE.md](https://github.com/nrakochy/hotl/blob/master/ARCHITECTURE.md): layers and event flow
 - [SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md): the security stance, including what the sandbox does not cover
-- [CHANGELOG.md](https://github.com/nrakochy/hotl/blob/master/CHANGELOG.md): release history; 0.2.0 renamed the dashboard to `hotl watch`
+- [CHANGELOG.md](https://github.com/nrakochy/hotl/blob/master/CHANGELOG.md): release history; breaking changes land at every 0.x minor
