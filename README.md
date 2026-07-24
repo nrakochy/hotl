@@ -63,6 +63,22 @@ Or with Rust ≥ 1.88 installed:
 
     cargo install hotl
 
+With Nix (flakes enabled) — run it without installing, or add it to a profile:
+
+    nix run github:nrakochy/hotl
+    nix profile install github:nrakochy/hotl
+
+The flake tracks `master`; your `flake.lock` decides when that moves. As a
+flake input:
+
+    inputs.hotl = {
+      url = "github:nrakochy/hotl";
+      inputs.nixpkgs.follows = "nixpkgs";   # avoids a second nixpkgs, and a second rustc
+    };
+
+Nix builds hotl from source, so the first build compiles the whole dependency
+tree — use the prebuilt binary above if you want it now.
+
 ## Execute — quick start
 
 Point `HOTL_MODEL` at a model (`provider/model` — `anthropic/…` or `openai/…`, which covers any OpenAI-compatible endpoint incl. local Ollama), then:
