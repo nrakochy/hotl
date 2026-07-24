@@ -34,6 +34,8 @@ pub struct Config {
     pub permissions: PermissionsCfg,
     #[serde(default)]
     pub skills: SkillsCfg,
+    #[serde(default)]
+    pub concurrency: ConcurrencyCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
     raw: Option<toml::Value>,
@@ -213,6 +215,38 @@ impl HistoryCfg {
     }
 }
 
+/// `[concurrency]` — the Layer-B resource governors (`hotl_tools::concurrency`
+/// index spec) plus the two Layer-C runtime-pool knobs. `agents`/`requests`/
+/// `subprocs` feed `ConcurrencyLimits` (env `HOTL_CONCURRENCY_*` > this >
+/// the fixed default; `0`/absent falls back to the default, never to zero).
+/// `worker_threads`/`blocking_threads` are parsed for completeness with the
+/// index's documented shape but are not yet wired into a runtime builder:
+/// hotl's binary runs its async work on a single `current_thread` runtime
+/// everywhere (`main.rs::block_on` drives every subcommand including the
+/// TUI and `acp_main`; `doctor.rs` builds its own `current_thread` runtime
+/// too) as a deliberate cold-start choice, so there is no `multi_thread`
+/// `Builder` anywhere to attach `.worker_threads()`/`.max_blocking_threads()`
+/// to yet. Sizing the runtime pools is the
+/// concurrency owner's job per the index's Ownership paragraph; a consuming
+/// plan only creates the semaphore budget and threads it through.
+#[derive(Debug, Default, Deserialize)]
+pub struct ConcurrencyCfg {
+    /// Concurrent sub-agent LLM sessions (unused until a fan-out plan lands).
+    pub agents: Option<usize>,
+    /// Concurrent `web_fetch`/`web_search` HTTP requests — governs
+    /// `web_fetch`'s multi-URL batch today.
+    pub requests: Option<usize>,
+    /// Concurrent `bash`/`grep`/hook child processes (unused until a
+    /// subprocess-fan-out plan lands).
+    pub subprocs: Option<usize>,
+    /// Reserved: tokio worker-thread pool size (`0` = num_cpus). Parsed, not
+    /// yet consumed — see the struct doc.
+    pub worker_threads: Option<usize>,
+    /// Reserved: `spawn_blocking` pool cap. Parsed, not yet consumed — see
+    /// the struct doc.
+    pub blocking_threads: Option<usize>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct NetworkCfg {
     /// `"open"` (default) | `"off"` | `"allowlist"`.
@@ -284,6 +318,17 @@ impl Config {
     pub fn retrieval_toml(&self) -> Option<String> {
         let backends = self.raw.as_ref()?.get("retrieval")?;
         toml::to_string(&toml::toml! { backend = (backends.clone()) }).ok()
+    }
+
+    /// The `[web]` section's *contents* (for `hotl_tools::web::WebConfig`,
+    /// whose `search` field sits at the document's top level — unlike
+    /// `retrieval`/`mcp`, no key rename is needed, so this reserializes the
+    /// inner table directly rather than re-wrapping it under `web`), or
+    /// `None` when absent — `web_fetch` registers regardless (it needs no
+    /// backend); `web_search` simply never gets built.
+    pub fn web_toml(&self) -> Option<String> {
+        let web = self.raw.as_ref()?.get("web")?;
+        toml::to_string(web).ok()
     }
 
     /// The `[[hook]]` + `[diagnostics]` as a `hooks.toml`-shaped string, or None.
@@ -380,6 +425,36 @@ mod tests {
         let t = cfg.retrieval_toml().unwrap();
         assert!(t.contains("[[backend]]") && t.contains("notes"));
         assert!(cfg_with("").retrieval_toml().is_none());
+    }
+
+    #[test]
+    fn concurrency_section_parses_and_defaults_absent() {
+        let cfg = cfg_with(
+            "[concurrency]\nagents = 2\nrequests = 3\nsubprocs = 6\nworker_threads = 4\nblocking_threads = 32\n",
+        );
+        assert_eq!(cfg.concurrency.agents, Some(2));
+        assert_eq!(cfg.concurrency.requests, Some(3));
+        assert_eq!(cfg.concurrency.subprocs, Some(6));
+        assert_eq!(cfg.concurrency.worker_threads, Some(4));
+        assert_eq!(cfg.concurrency.blocking_threads, Some(32));
+        let absent = cfg_with("");
+        assert_eq!(absent.concurrency.agents, None);
+        assert_eq!(absent.concurrency.requests, None);
+        assert_eq!(absent.concurrency.subprocs, None);
+    }
+
+    #[test]
+    fn web_section_passes_through_for_the_search_tool_loader() {
+        let cfg = cfg_with(
+            "[web]\n[web.search]\nurl = \"https://s.example/api\"\napi_key_env = \"SEARCH_KEY\"\n",
+        );
+        let t = cfg.web_toml().unwrap();
+        assert!(t.contains("[search]"), "was: {t}");
+        assert!(t.contains("https://s.example/api"));
+        assert!(t.contains("SEARCH_KEY"));
+        // Absent [web] section: None — web_fetch registers regardless (it
+        // needs no config), web_search simply never gets built.
+        assert!(cfg_with("").web_toml().is_none());
     }
 
     #[test]

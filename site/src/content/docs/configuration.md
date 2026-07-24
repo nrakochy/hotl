@@ -60,6 +60,14 @@ mode = "auto"   # "auto" | "ask" | "plan" | "dontask"
 egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
 allow = ["github.com", "*.crates.io"]   # hosts reachable in allowlist mode
 
+[web.search]                # optional: enables web_search (absent by default)
+url = "https://s.example/api"   # a JSON search API you run/subscribe to
+api_key_env = "SEARCH_KEY"      # name of an env var holding the key (never the key itself)
+result_cap = 8                  # max results per search (default 8)
+
+[concurrency]               # Layer-B budgets; every field optional, safe defaults
+requests = 4                # concurrent web_fetch/web_search HTTP requests
+
 [retention]
 max_age_days = 30          # prune sessions older than this (hotl gc)
 max_sessions = 200         # keep at most this many
@@ -196,6 +204,8 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `grep` | Search file contents with ripgrep (`pattern` is a regex; optional `path`, `glob` filter, `files_only`). Runs through the same sandboxed command path as `bash`, so content search inherits the kernel write-confinement floor. | None — read-only |
 | `todo_write` | Replace the session's task checklist (every call sends the whole list). Keeps the model on-plan on long unattended runs and gives you a glanceable progress signal in the console strip. | None |
 | `ask_user` | Ask you a structured multiple-choice question (a header, a prompt, and 2–4 labelled options, plus free text) when the model hits a genuine ambiguity instead of guessing. | None — see below |
+| `web_fetch` | Fetch one or more URLs (an array — fetched concurrently in one call) and return their text (HTML stripped). Always registered; needs no configuration. | Ask (always, even under an allowlist) |
+| `web_search` | Search via the `[web.search]` backend you configure and get back titles/URLs/snippets; `web_fetch` a result for the full text. Registered **only** when `[web.search]` is set — absent otherwise, so nothing phones home by default. | Ask |
 
 `glob` and `grep` are workspace-scoped: an absolute path or a `..` escape outside the working directory is refused, and both run without a permission ask because that containment is what makes them safe reads. Both are parallel-safe, so a batch of several `glob`/`grep` calls in one turn runs concurrently.
 
@@ -219,6 +229,9 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
+| `HOTL_CONCURRENCY_REQUESTS` | `[concurrency].requests` | Concurrent `web_fetch`/`web_search` HTTP requests (default 4). |
+| `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Reserved (sub-agent fan-out; no effect yet). |
+| `HOTL_CONCURRENCY_SUBPROCS` | `[concurrency].subprocs` | Reserved (subprocess batching; no effect yet). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 
 ### Allow-rules (`[[allow]]`)
@@ -252,6 +265,18 @@ Declare external tool servers. Each is exposed to the model through one `mcp` to
 ### Network egress (`[network]`)
 
 Restricts what `bash` commands (and diagnostics/hooks, which run under the same floor) may reach over the network. `egress` is one of `open` (default; unrestricted), `off` (loopback and unix-domain sockets only), or `allowlist` (loopback plus the hosts in `allow`, reached through a local filtering proxy). `allow` entries are hostnames or `*.domain` wildcards — a wildcard matches the apex and any subdomain depth; no ports; matching is case-insensitive; an empty list allows nothing. An unknown `egress` value fails closed to `off` with a startup warning. While a restriction is configured, the bash ask label carries `net:off` / `net:allow(N)` — or `NET:UNENFORCED(reason)` on hosts where the kernel cannot back it (Linux needs kernel ≥ 6.7 for Landlock net; `HOTL_SANDBOX=off` also unenforces it), in which case `bash` allow-rules stop auto-approving. A denied fetch returns `hotl egress: "HOST" is not in [network].allow`. Why and limits: [permissions-and-sandbox.md](../permissions-and-sandbox/#opting-out-of-open-egress).
+
+### Web tools (`web_fetch` / `web_search`, `[web]`)
+
+`web_fetch` reads one or more URLs as text — pass an array to fetch several pages in one call, concurrently (bounded by `[concurrency].requests`, default 4). It needs no configuration and is always registered. `web_search` is backend-pluggable: hotl ships no built-in search endpoint, so it stays **absent from the registry** until you set `[web.search]` — nothing phones home by default, the same discipline as `recall`/MCP. Point `url` at a JSON search API you run or subscribe to (SearXNG, Brave, Tavily, an internal endpoint); its response is mapped to `{title, url, snippet}` rows, tolerant of a few common field-name shapes. The API key is named by `api_key_env` — an environment variable, never a literal key in config.toml.
+
+Both tools honor the *same* `[network]` egress policy `bash` does — there is exactly one egress authority, never a second allowlist. With `egress = "off"` both refuse every host outright; with `"allowlist"`, a host outside `allow` fails closed with a message telling you to add it. Even when a fetch is allowed, it still asks (network side effects can exfiltrate via the URL itself) — the ask names every host in the batch.
+
+Every byte a fetch or search returns enters the model inside the untrusted-content envelope, tagged with its source (`web:<host>`) — web content is data the model can use to inform its work, never an instruction it can act on unprompted, the same treatment `spawn` and `recall` results get.
+
+### Concurrency (`[concurrency]`)
+
+The shared budget that bounds concurrent external work — today, `requests` caps how many `web_fetch`/`web_search` HTTP calls run at once (a batch of 20 URLs never opens more than `requests` sockets simultaneously). `agents`/`subprocs` are reserved config surface for upcoming sub-agent fan-out and subprocess-batching work; setting them has no effect yet. `worker_threads`/`blocking_threads` are parsed for completeness but not yet wired to a runtime — hotl runs on a single-threaded async runtime today — and setting either logs a startup warning noting they're currently inert.
 
 ### Retention (`[retention]`)
 

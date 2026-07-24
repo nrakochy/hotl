@@ -357,6 +357,14 @@ async fn scaffold(
         && hotl_tools::net::auto_allow_permitted(&sandbox_status);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let config = engine_config(&model, secrets, &cfg);
+    // The one process-wide SessionConcurrency (Layer-B budget): built once
+    // here and cloned (shared Arc semaphores, not a fresh pool) into the
+    // registry — today `web_fetch` is its only consumer.
+    if let Some(warning) = layer_c_warning(&cfg.concurrency) {
+        eprintln!("hotl: {warning}");
+    }
+    let concurrency =
+        hotl_tools::concurrency::SessionConcurrency::new(concurrency_limits(secrets, &cfg));
     let spawn_builder = child_builder(
         provider.clone(),
         rules.clone(),
@@ -369,7 +377,8 @@ async fn scaffold(
         sandbox_enforced,
         initial_helper_key.clone(),
     );
-    let (registry, skill_names) = build_registry(&cfg, &config_dir, Some(spawn_builder));
+    let (registry, skill_names) =
+        build_registry(&cfg, &config_dir, Some(spawn_builder), concurrency);
     let registry = Arc::new(registry);
     let hooks = load_hooks(&cfg);
     Ok(Scaffold {
@@ -548,11 +557,13 @@ fn spawn_session_with_todos(
 
 /// Builtins + the `mcp` meta-tool (M3a) + the `spawn` tool (M4) when a child
 /// builder is supplied. `spawn` is omitted for child sessions, so sub-agents
-/// cannot recurse (structural depth cap).
+/// cannot recurse (structural depth cap). `web_fetch` is always registered;
+/// `web_search` only when `[web] search` is configured (the `recall` gate).
 fn build_registry(
     cfg: &crate::config::Config,
     config_dir: &std::path::Path,
     spawn_builder: Option<Arc<dyn crate::spawn::ChildBuilder>>,
+    concurrency: hotl_tools::concurrency::SessionConcurrency,
 ) -> (Registry, Vec<String>) {
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
     let diagnostics = cfg
@@ -601,6 +612,31 @@ fn build_registry(
         if !backends.is_empty() {
             registry.register(Box::new(hotl_retrieval::RecallTool::new(backends)));
         }
+    }
+    // `web_fetch` needs no backend — always registered, gated by the human
+    // (Permission::Ask) and by the process-wide [network] egress policy.
+    registry.register(Box::new(hotl_tools::web::WebFetchTool::new(concurrency)));
+    // `web_search` is backend-pluggable and absent unless `[web] search` is
+    // configured — nothing phones home by default (the `recall`/MCP gate).
+    let web_search = cfg
+        .web_toml()
+        .and_then(|t| toml::from_str::<hotl_tools::web::WebConfig>(&t).ok())
+        .and_then(|c| c.search);
+    if let Some(search) = web_search {
+        // The API key is a *name of an env var*, not the key itself, and is
+        // never stored in config.toml (the `api_key_helper` rule) — read
+        // once, here, at registration.
+        let api_key = search
+            .api_key_env
+            .as_deref()
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|v| !v.trim().is_empty());
+        let backend = hotl_tools::web::SearchBackend {
+            url: search.url,
+            api_key,
+            result_cap: search.result_cap,
+        };
+        registry.register(Box::new(hotl_tools::web::WebSearchTool::new(backend)));
     }
     if let Some(builder) = spawn_builder {
         registry.register(Box::new(crate::spawn::SpawnTool::new(builder)));
@@ -1199,6 +1235,60 @@ fn engine_config(
     config
 }
 
+/// `[concurrency]` Layer-B budget: precedence is env (`HOTL_CONCURRENCY_*`),
+/// then config.toml, then the fixed, deliberately small default
+/// (`ConcurrencyLimits::default`). `0`/absent on any field falls back to the
+/// default — `SessionConcurrency` clamps to at least 1 besides, so the
+/// budget can never deadlock. Built once in `scaffold()` and cloned (shared
+/// `Arc` semaphores) into every registry that needs it — exactly one
+/// `SessionConcurrency` per process.
+fn concurrency_limits(
+    secrets: &dyn SecretStore,
+    cfg: &crate::config::Config,
+) -> hotl_tools::concurrency::ConcurrencyLimits {
+    let d = hotl_tools::concurrency::ConcurrencyLimits::default();
+    let pick = |env_key: &str, cfg_val: Option<usize>, default: usize| {
+        secrets
+            .get(env_key)
+            .and_then(|v| v.parse::<usize>().ok())
+            .or(cfg_val)
+            .filter(|&n| n > 0)
+            .unwrap_or(default)
+    };
+    hotl_tools::concurrency::ConcurrencyLimits {
+        agents: pick("HOTL_CONCURRENCY_AGENTS", cfg.concurrency.agents, d.agents),
+        requests: pick(
+            "HOTL_CONCURRENCY_REQUESTS",
+            cfg.concurrency.requests,
+            d.requests,
+        ),
+        subprocs: pick(
+            "HOTL_CONCURRENCY_SUBPROCS",
+            cfg.concurrency.subprocs,
+            d.subprocs,
+        ),
+    }
+}
+
+/// `[concurrency].worker_threads`/`.blocking_threads` are parsed (the index
+/// spec's full `[concurrency]` shape) but not yet wired to a runtime
+/// `Builder` — hotl runs every subcommand on a single `current_thread`
+/// runtime today (`main.rs::block_on`), so there is nowhere to attach them.
+/// Rather than silently ignoring a value the owner deliberately set, warn
+/// once at startup so a configured-but-inert knob is visible, not a silent
+/// no-op.
+fn layer_c_warning(cfg: &crate::config::ConcurrencyCfg) -> Option<String> {
+    if cfg.worker_threads.is_none() && cfg.blocking_threads.is_none() {
+        return None;
+    }
+    Some(
+        "[concurrency] worker_threads/blocking_threads are set but not yet wired to a \
+         runtime — hotl runs on a single current_thread runtime today, so these have no \
+         effect yet."
+            .to_string(),
+    )
+}
+
 fn exit_code(outcome: &Outcome) -> i32 {
     match outcome {
         Outcome::Done { .. } => 0,
@@ -1535,13 +1625,51 @@ mod tests {
         // developer's machine and would leak into this assertion.
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (_registry, names) = build_registry(&cfg, dir.path(), None);
+        let (_registry, names) = build_registry(&cfg, dir.path(), None, test_concurrency());
         assert_eq!(names, vec!["deploy".to_string()]);
 
         // No skills configured → no names, and no tool registered.
         let empty = tempfile::tempdir().unwrap();
-        let (_registry, names) = build_registry(&cfg, empty.path(), None);
+        let (_registry, names) = build_registry(&cfg, empty.path(), None, test_concurrency());
         assert!(names.is_empty(), "{names:?}");
+    }
+
+    #[test]
+    fn layer_c_knobs_warn_when_set_since_the_runtime_is_single_threaded() {
+        let cfg = config_from_toml("");
+        assert!(layer_c_warning(&cfg.concurrency).is_none());
+        let cfg = config_from_toml("[concurrency]\nworker_threads = 4\n");
+        let w = layer_c_warning(&cfg.concurrency).expect("must warn");
+        assert!(w.contains("current_thread"));
+        let cfg = config_from_toml("[concurrency]\nblocking_threads = 32\n");
+        assert!(layer_c_warning(&cfg.concurrency).is_some());
+    }
+
+    fn test_concurrency() -> hotl_tools::concurrency::SessionConcurrency {
+        hotl_tools::concurrency::SessionConcurrency::new(
+            hotl_tools::concurrency::ConcurrencyLimits::default(),
+        )
+    }
+
+    /// Mirrors the `recall` gate (`retrieval_backends_gate_the_recall_tool`-
+    /// style test): `web_fetch` needs no configuration and is always
+    /// present; `web_search` is absent until `[web] search` is configured,
+    /// then present — nothing phones home by default.
+    #[test]
+    fn web_fetch_always_present_web_search_gated_on_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.skills.claude = Some(false);
+        let (registry, _) = build_registry(&cfg, dir.path(), None, test_concurrency());
+        assert!(registry.get("web_fetch").is_some());
+        assert!(registry.get("web_search").is_none());
+
+        let cfg = config_from_toml(
+            "[web]\n[web.search]\nurl = \"https://s.example/api\"\napi_key_env = \"SEARCH_KEY\"\n",
+        );
+        let (registry, _) = build_registry(&cfg, dir.path(), None, test_concurrency());
+        assert!(registry.get("web_fetch").is_some());
+        assert!(registry.get("web_search").is_some());
     }
 
     /// `todo_write`, registered by `spawn_session_with_todos` (not

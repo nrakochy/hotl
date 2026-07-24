@@ -20,7 +20,7 @@ pub mod web;
 pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use todo::TodoWriteTool;
-pub use web::WebFetchTool;
+pub use web::{WebFetchTool, WebSearchTool};
 
 use std::sync::Arc;
 
