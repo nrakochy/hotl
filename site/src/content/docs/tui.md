@@ -91,6 +91,11 @@ own.
 | `/mode <ask\|auto\|plan\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing. |
 | `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments. |
 
+Typing `/` opens a menu of every command and skill, filtered as you keep
+typing: `↑` / `↓` pick, `Tab` completes the highlighted name, `Enter` runs
+it, `Esc` dismisses. The descriptions beside each skill come from its
+roster entry — they are drawn for you and are never sent to the model.
+
 A non-default mode shows as a badge on the strip next to the session name.
 Switching mode never starts a turn — it's session bookkeeping, and it's
 durable (`hotl resume` restores whichever mode you left the session in).
@@ -135,6 +140,7 @@ In headless (`-p`) or JSON mode there is no one to ask, so the question resolves
 | `x p u` | Delete char · paste · undo (one level) |
 | `j k` | Scroll the transcript when the input is empty; move lines otherwise |
 | `↑ ↓` | Recall prompt history at the buffer's edges (see [History recall](#history-recall)); `Ctrl-R` searches it |
+| `/` then `↑ ↓` | Pick from the command menu; `Tab` completes, `Enter` runs it, `Esc` dismisses |
 | `Enter` | Submit (either mode) |
 
 ## The `$EDITOR` escape hatch

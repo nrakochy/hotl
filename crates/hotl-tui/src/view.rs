@@ -640,6 +640,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "d c y operators · dd cc yy x p u",
         "j k scroll transcript when input is empty",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
+        "/ opens command completion · ↑↓ pick · tab complete · enter run",
         "ctrl-e or :e open $EDITOR · ctrl-c quit/cancel",
         "any key closes this help",
     ]
@@ -783,6 +784,17 @@ mod tests {
             rows[INPUT_TOP].contains("-- INSERT --"),
             "mode title: {}",
             rows[INPUT_TOP]
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_documents_the_completion_keys() {
+        let mut s = State::new(true, "m".into());
+        s.help_open = true;
+        let rows = draw(&s);
+        assert!(
+            rows.iter().any(|r| r.contains("complete")),
+            "help must name the / completion keys: {rows:#?}"
         );
     }
 

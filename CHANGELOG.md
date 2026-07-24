@@ -6,6 +6,14 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **TUI command completion.** Typing `/` opens a filtering popup of every
+  built-in command and loadable skill: `↑↓` picks, `tab` completes, `enter`
+  runs, `esc` dismisses. `initialize` now advertises skills as
+  `[{name, description}]` (the bare-string form is still accepted); the
+  descriptions are client-facing only and add nothing to the model's context.
+
 ## [0.5.1] - 2026-07-24
 
 ### Changed
