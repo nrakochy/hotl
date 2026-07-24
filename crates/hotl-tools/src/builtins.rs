@@ -96,6 +96,9 @@ impl Tool for ReadTool {
     fn parallel_safe(&self) -> bool {
         true
     }
+    fn read_only(&self) -> bool {
+        true
+    }
     fn description(&self) -> &str {
         "Read a text file from the local filesystem. Returns at most 2000 lines / 200KB per call; use `offset` (1-indexed start line) to continue a truncated read."
     }
@@ -314,6 +317,9 @@ impl Tool for GlobTool {
     fn parallel_safe(&self) -> bool {
         true
     }
+    fn read_only(&self) -> bool {
+        true
+    }
     fn description(&self) -> &str {
         "List files in the working directory matching a filename pattern, newest-first is NOT \
          guaranteed — results are sorted by path. Patterns: `*.rs` (suffix), `**/*.rs` (same, \
@@ -415,6 +421,9 @@ impl Tool for GrepTool {
         "grep"
     }
     fn parallel_safe(&self) -> bool {
+        true
+    }
+    fn read_only(&self) -> bool {
         true
     }
     fn description(&self) -> &str {

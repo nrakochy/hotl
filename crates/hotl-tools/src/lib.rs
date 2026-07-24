@@ -65,6 +65,13 @@ pub trait Tool: Send + Sync {
     fn parallel_safe(&self) -> bool {
         false
     }
+    /// Does this tool only ever read (no filesystem mutation, no execution,
+    /// no network side effects)? Read-only tools run in plan mode; everything
+    /// else is blocked there. Like `parallel_safe`, the default is the safe
+    /// answer (false), and each read tool opts in.
+    fn read_only(&self) -> bool {
+        false
+    }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome>;
 }
 
@@ -220,6 +227,17 @@ mod tests {
         assert!(execute_later_reason(".hotl/settings.json").is_some());
         assert!(execute_later_reason("src/main.rs").is_none());
         assert!(execute_later_reason("docs/notes.md").is_none());
+    }
+
+    #[test]
+    fn read_only_is_true_only_for_pure_reads() {
+        let reg = Registry::builtin();
+        assert!(reg.get("read").unwrap().read_only());
+        assert!(reg.get("glob").unwrap().read_only());
+        assert!(reg.get("grep").unwrap().read_only());
+        assert!(!reg.get("write").unwrap().read_only());
+        assert!(!reg.get("edit").unwrap().read_only());
+        assert!(!reg.get("bash").unwrap().read_only()); // bash can mutate; not read-only
     }
 
     #[test]

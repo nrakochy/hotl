@@ -128,6 +128,9 @@ impl Tool for RecallTool {
     fn description(&self) -> &str {
         &self.description
     }
+    fn read_only(&self) -> bool {
+        true
+    }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
