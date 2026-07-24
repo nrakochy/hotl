@@ -267,6 +267,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
         Msg::EditorDone(content) => {
             if let Some(text) = content {
                 state.editor.set_text(text.trim_end_matches('\n'));
+                refresh(state);
             }
             Vec::new()
         }
@@ -1310,6 +1311,36 @@ mod tests {
         assert!(
             matches!(&cmds[..], [Cmd::SetMode(m)] if m == "auto"),
             "got {cmds:?}"
+        );
+    }
+
+    /// The `$EDITOR` round trip replaces the whole buffer outside the normal
+    /// key path. If the popup from a stale `/re` survives that replacement,
+    /// the next Enter splices against a selection that no longer describes
+    /// what's on screen — silently destroying the user's freehand prompt in
+    /// favor of a bogus `/rename`.
+    #[test]
+    fn editor_done_clears_a_stale_popup_so_enter_submits_the_real_text() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/re");
+        assert!(
+            s.completion.is_some(),
+            "popup open before the editor round trip"
+        );
+        update(&mut s, Msg::EditorDone(Some("explain the bug".into())));
+        assert!(
+            s.completion.is_none(),
+            "the popup must not survive a buffer replaced out from under it"
+        );
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert_eq!(s.editor.text(), "");
+        assert!(
+            matches!(
+                &cmds[..],
+                [Cmd::AppendHistory(h), Cmd::SendPrompt(p), Cmd::SetTitle(_)]
+                    if h == "explain the bug" && p == "explain the bug"
+            ),
+            "the editor's real content must reach the model unchanged, got {cmds:?}"
         );
     }
 
