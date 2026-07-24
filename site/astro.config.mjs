@@ -55,6 +55,7 @@ export default defineConfig({
 					label: 'Extending',
 					items: [
 						{ label: 'MCP servers', slug: 'mcp' },
+						{ label: 'Retrieval (recall)', slug: 'retrieval' },
 						{ label: 'Hooks & diagnostics', slug: 'hooks' },
 						{ label: 'Gateways & key sources', slug: 'gateway' },
 					],

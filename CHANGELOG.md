@@ -6,6 +6,17 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **`recall` — a pluggable retrieval seam.** Configure `[[retrieval]]`
+  backends (any stdio MCP server exposing a search tool) and the model gains
+  one `recall` tool for conceptual search over your notes/docs corpora.
+  Results arrive as provenance-tagged, untrusted-enveloped tool results;
+  first use of a backend raises the same protected trust screen as MCP.
+  Nothing is configured by default, and no built-in backend touches the
+  network. (Design: agentic search stays the default; `recall` is for
+  corpora that outgrow grep.)
+
 ### Fixed
 
 - **Steering while a tool ran could break the rest of the session.** The steer

@@ -776,6 +776,7 @@ dependencies = [
  "hotl-context",
  "hotl-platform",
  "hotl-provider",
+ "hotl-retrieval",
  "hotl-store",
  "hotl-tools",
  "hotl-types",
