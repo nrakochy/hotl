@@ -29,11 +29,13 @@ const COMPACT_TRIGGER: f64 = 0.8;
 const SPECULATE_TRIGGER: f64 = 0.6;
 
 /// Shared per-prompt budget for "intercept the end-turn, inject a reminder,
-/// continue" gates (index E4): the TodoGate is the first of these; a future
-/// Stop-hook veto (plan 7) intercepts the same branch and is meant to draw
-/// from this same counter (see `Turn::turn_extensions`) rather than its own,
-/// so composing gates can't multiply worst-case turn extensions. Capped
-/// above any single gate's own bound — it's the *combined* ceiling.
+/// continue" gates (index E4): the TodoGate and the `Stop` hook veto
+/// (`Turn::consult_stop`) both draw from this same counter (see
+/// `Turn::turn_extensions`) rather than each having its own, so composing
+/// gates can't multiply worst-case turn extensions — a turn is extended at
+/// most `TURN_EXTENSION_MAX` times total, ever, regardless of which gate(s)
+/// fired on any given pass. Capped above any single gate's own bound — it's
+/// the *combined* ceiling.
 const TURN_EXTENSION_MAX: u32 = 3;
 /// The TodoGate's own bound within the shared budget (01 §agent-loop's
 /// `max_fires_per_prompt`). It never blocks in `Auto`/`DontAsk` beyond this
@@ -211,14 +213,23 @@ impl Turn {
                 }
                 StopReason::Refusal => return TurnEnd::Outcome(Outcome::Refused),
                 _ => {
-                    if self.todo_gate_should_fire() {
+                    // Done branch (index E4): the TodoGate and a `Stop` hook
+                    // veto both intercept "the model just stopped" and can
+                    // inject-and-continue — evaluated in FIXED order
+                    // (TodoGate first, the model's own bookkeeping; `on_stop`
+                    // second, owner policy gets the last word) against the
+                    // SAME pre-increment `turn_extensions` snapshot, so
+                    // either (or both) firing in this pass costs exactly one
+                    // unit of the shared combined budget, never one each.
+                    let text = assistant_text(&blocks);
+                    let todo_fires = self.todo_gate_should_fire();
+                    let stop_reason = self.consult_stop(&text).await;
+                    if todo_fires || stop_reason.is_some() {
                         self.turn_extensions += 1;
-                        self.inject_todo_nudge().await;
+                        self.inject_gate_nudge(todo_fires, stop_reason).await;
                         continue;
                     }
-                    return TurnEnd::Outcome(Outcome::Done {
-                        text: assistant_text(&blocks),
-                    });
+                    return TurnEnd::Outcome(Outcome::Done { text });
                 }
             }
         }
@@ -243,17 +254,48 @@ impl Turn {
                 .is_some_and(|s| unfinished_todos(s))
     }
 
-    /// Commit the nudge as an ordinary `SystemReminder` user item — never the
-    /// `Todos`-tagged reminder itself (the model already saw the list in the
-    /// snapshot it just replied to; this just asks it to act on it).
-    async fn inject_todo_nudge(&mut self) -> bool {
+    /// `Stop` hook veto (Task 4, tech-debt #10): consulted only when the
+    /// shared [`TURN_EXTENSION_MAX`] budget still has room and hooks are
+    /// configured — a `Block{reason}` asks the turn to continue;
+    /// `Allow`/no-hooks/no-room all resolve to `None` (never extends). Bounded
+    /// by the SAME counter the TodoGate draws down, so a hook that always
+    /// blocks can compose with the TodoGate without multiplying worst-case
+    /// turn extensions (index E4).
+    async fn consult_stop(&self, outcome_text: &str) -> Option<String> {
+        if self.turn_extensions >= TURN_EXTENSION_MAX {
+            return None;
+        }
+        let hooks = self.shared.hooks.as_ref()?;
+        match crate::hooks::call_stop(hooks, outcome_text).await {
+            crate::hooks::StopDecision::Block { reason } => Some(reason),
+            crate::hooks::StopDecision::Allow => None,
+        }
+    }
+
+    /// Commit the Done-branch gate nudge(s) as ONE tagged `SystemReminder`
+    /// user item (Innovation #7 — one injection per commit point): when both
+    /// the TodoGate and a Stop-hook `Block` land in the same continuation,
+    /// their sections ride inside a single `<system-reminder>`, in fixed
+    /// order (TodoGate section first, Stop section second), never as two
+    /// adjacent items.
+    async fn inject_gate_nudge(&mut self, todo_fires: bool, stop_reason: Option<String>) -> bool {
+        let mut body = String::new();
+        if todo_fires {
+            body.push_str(
+                "You still have open items on your todo list. Continue working on them, \
+                 or call todo_write to mark them completed or drop them, before ending \
+                 your turn.",
+            );
+        }
+        if let Some(reason) = stop_reason {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&reason);
+        }
         self.propose(vec![EntryPayload::Item {
             item: Item::User {
-                text: "<system-reminder>You still have open items on your todo list. \
-                       Continue working on them, or call todo_write to mark them \
-                       completed or drop them, before ending your turn.\
-                       </system-reminder>"
-                    .into(),
+                text: format!("<system-reminder>{body}</system-reminder>"),
                 synthetic: Some(SyntheticReason::SystemReminder),
             },
         }])

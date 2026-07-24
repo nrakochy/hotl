@@ -263,6 +263,12 @@ pub(crate) async fn run(
             }
         }
     }
+    // SessionEnd: fire-and-forget, symmetric with `Notification` — the
+    // command channel closed (every `SessionHandle`/turn task dropped its
+    // sender), so this actor is shutting down for good.
+    if let Some(hooks) = &shared.hooks {
+        crate::hooks::spawn_session_end(hooks);
+    }
 }
 
 /// The mutable session state `on_turn_finished` threads back into the loop.

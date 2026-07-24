@@ -54,6 +54,24 @@ pub fn notify(hooks: &Arc<dyn Hooks>, kind: NotificationKind, detail: impl Into<
     });
 }
 
+/// Await [`Hooks::on_stop`] under [`HOOK_CALL_TIMEOUT`]; a timeout behaves
+/// exactly like `Allow` — a hung hook can never wedge a turn (it's a no-op,
+/// not a block).
+pub async fn call_stop(hooks: &Arc<dyn Hooks>, outcome: &str) -> StopDecision {
+    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.on_stop(outcome))
+        .await
+        .unwrap_or(StopDecision::Allow)
+}
+
+/// `SessionEnd`: fire-and-forget at actor shutdown, the same detached shape
+/// as [`notify`].
+pub fn spawn_session_end(hooks: &Arc<dyn Hooks>) {
+    let hooks = Arc::clone(hooks);
+    tokio::spawn(async move {
+        let _ = tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_session_end()).await;
+    });
+}
+
 /// A `PreToolUse` decision (wrap-style intercept). A `Rewrite` re-enters the
 /// normal permission gate with the new input — a hook cannot launder a call
 /// past the y/N ask (SECURITY.md §M5 routing rows).
