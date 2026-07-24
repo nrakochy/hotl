@@ -43,8 +43,6 @@ fn str_arg<'v>(input: &'v Value, key: &str) -> Result<&'v str, ToolOutcome> {
 /// and `..` escapes are refused: `glob`/`grep` are read-only *and*
 /// workspace-scoped — that containment is what lets them run without an ask.
 /// Pure-lexical (no fs touch), so it can't be defeated by a symlink race.
-// TODO(task 2): drop this allow once `GlobTool`/`GrepTool` consume it.
-#[allow(dead_code)]
 pub(crate) fn workspace_contained(path: &str) -> Result<std::path::PathBuf, ToolOutcome> {
     let reject = || {
         ToolOutcome::err(format!(
@@ -305,6 +303,105 @@ async fn edit_impl(input: &Value) -> ToolResult {
     }
 }
 
+// TODO(task 4): drop these allows once `GlobTool` is re-exported from `lib.rs`
+// and registered in `Registry::builtin_with` — until then it's unreachable
+// outside `#[cfg(test)]`.
+#[allow(dead_code)]
+const GLOB_MAX_RESULTS: usize = 1000;
+
+#[allow(dead_code)]
+pub struct GlobTool;
+
+impl Tool for GlobTool {
+    fn name(&self) -> &'static str {
+        "glob"
+    }
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+    fn description(&self) -> &str {
+        "List files in the working directory matching a filename pattern, newest-first is NOT \
+         guaranteed — results are sorted by path. Patterns: `*.rs` (suffix), `**/*.rs` (same, \
+         recursion is always on), or a bare substring matched against the relative path. Hidden \
+         directories (.git, node_modules) are skipped. Returns at most 1000 paths."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string", "description": "e.g. \"*.rs\", \"**/*.toml\", or a path substring"},
+                "path": {"type": "string", "description": "Directory to search under (relative to the working directory; defaults to \".\")"}
+            },
+            "required": ["pattern"]
+        })
+    }
+    fn permission(&self, _input: &Value) -> Permission {
+        Permission::None
+    }
+    fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move { done(glob_impl(&input)) })
+    }
+}
+
+#[allow(dead_code)]
+fn glob_impl(input: &Value) -> ToolResult {
+    let pattern = str_arg(input, "pattern")?;
+    let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
+    // "*.rs" / "**/*.rs" -> suffix match on the file name (the substring after
+    // the final `*`); a pattern with no `*` -> substring match on the relative
+    // path.
+    let suffix = pattern
+        .contains('*')
+        .then(|| pattern.rsplit('*').next().unwrap_or(""));
+    let mut hits: Vec<String> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue; // skip vcs/vendor/build dirs
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            let matched = match suffix {
+                Some(sfx) => name.ends_with(sfx), // "*.rs" -> ".rs"
+                None => rel.contains(pattern),    // bare substring
+            };
+            if matched {
+                hits.push(rel);
+            }
+        }
+    }
+    hits.sort();
+    let total = hits.len();
+    let mut out = if total == 0 {
+        format!("No files match `{pattern}`. Try a broader pattern, or `grep` to search contents.")
+    } else {
+        let shown = total.min(GLOB_MAX_RESULTS);
+        let mut s = hits[..shown].join("\n");
+        if total > shown {
+            s.push_str(&format!(
+                "\n[truncated: showing {shown} of {total}; narrow the pattern or `path`]"
+            ));
+        }
+        s
+    };
+    out.push('\n');
+    Ok(ToolOutcome::ok(out))
+}
+
 pub struct BashTool;
 
 impl Tool for BashTool {
@@ -500,6 +597,43 @@ mod tests {
         assert!(workspace_contained("src/../../etc").is_err());
         // a `..` that stays inside is fine
         assert!(workspace_contained("src/../README.md").is_ok());
+    }
+
+    #[tokio::test]
+    async fn glob_matches_by_suffix_and_caps() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("src")).unwrap();
+        std::fs::write(dir.path().join("src/a.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("src/b.rs"), "x").unwrap();
+        std::fs::write(dir.path().join("README.md"), "x").unwrap();
+        std::fs::create_dir_all(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".git/config"), "x").unwrap();
+
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let out = GlobTool
+            .run(json!({"pattern": "*.rs"}), CancellationToken::new())
+            .await;
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("src/a.rs") && out.content.contains("src/b.rs"));
+        assert!(!out.content.contains("README.md"), "suffix filter failed");
+        assert!(
+            !out.content.contains(".git/"),
+            "hidden dirs must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_refuses_escape() {
+        let out = GlobTool
+            .run(
+                json!({"pattern": "*.rs", "path": "/etc"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(out.is_error && out.content.contains("outside the working directory"));
     }
 
     #[test]
