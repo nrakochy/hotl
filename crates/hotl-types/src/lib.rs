@@ -280,7 +280,7 @@ pub enum EntryPayload {
 /// One selectable choice in a structured [`Question`] (`ask_user`, tier-1
 /// gap #4). `description` is an optional one-line elaboration shown under
 /// the label.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QuestionOption {
     pub label: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,7 +292,7 @@ pub struct QuestionOption {
 /// always-available free-text "other" the surfaces provide, not encoded
 /// here). `multi` reserves multi-select for a future surface; today's
 /// surfaces treat every question as single-select.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Question {
     pub header: String,
     pub prompt: String,

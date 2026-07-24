@@ -195,10 +195,13 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `glob` | List files under the working directory matching a filename pattern (`*.rs`, `**/*.toml`, or a bare substring); hidden/vendor directories (`.git`, `node_modules`, `target`) are skipped. In-process — no subprocess, so it still works with no `rg` on `PATH` or when the sandbox floor degrades. | None — read-only |
 | `grep` | Search file contents with ripgrep (`pattern` is a regex; optional `path`, `glob` filter, `files_only`). Runs through the same sandboxed command path as `bash`, so content search inherits the kernel write-confinement floor. | None — read-only |
 | `todo_write` | Replace the session's task checklist (every call sends the whole list). Keeps the model on-plan on long unattended runs and gives you a glanceable progress signal in the console strip. | None |
+| `ask_user` | Ask you a structured multiple-choice question (a header, a prompt, and 2–4 labelled options, plus free text) when the model hits a genuine ambiguity instead of guessing. | None — see below |
 
 `glob` and `grep` are workspace-scoped: an absolute path or a `..` escape outside the working directory is refused, and both run without a permission ask because that containment is what makes them safe reads. Both are parallel-safe, so a batch of several `glob`/`grep` calls in one turn runs concurrently.
 
 `todo_write` is session-scoped ephemeral context, not part of the model transcript: the current list rides into every request as a tagged reminder, but it never becomes part of the durable conversation the model reads back verbatim. A text-only reply with `pending`/`in_progress` items still open gets nudged to finish or update the list — bounded to at most two nudges per prompt, so it can never wedge an unattended run. Sub-agents spawned with the `spawn` tool get their own independent list, wired to their own session.
+
+`ask_user`'s permission is `None` for a specific reason, not an oversight: it is **not a permission gate**. It's a plain data-gathering round-trip — the human's answer becomes a text tool result, exactly like a `read` — so it never authorizes any mutating action on its own (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). It runs during plan mode for the same reason `read`/`glob`/`grep` do: asking a clarifying question changes nothing on disk. Headless (`-p`) and JSON-mode runs have no one to ask, so the question always resolves — never hangs — to a documented "no human available" answer the model can act on. See [tui.md](../tui/#questions) for the console picker.
 
 ### Environment variables
 

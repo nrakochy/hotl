@@ -23,6 +23,11 @@ pub const PROTOCOL_VERSION: &str = "0.1";
 
 type Writer = Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>;
 type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AskReply>>>>;
+/// In-flight `session/request_question` round-trips, parallel to `Pending`.
+/// Disjoint ids from `Pending`: both draw from the same per-session `req_id`
+/// counter in `drain_events`, so an id never means two different things.
+type PendingQuestions =
+    Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<hotl_types::QuestionAnswer>>>>;
 
 /// Map an ACP client's permission `result` to an `AskReply` (T1/§2b): a client
 /// may `{"allow":true}`, `{"allow":false,"message":"…"}`, provide edited
@@ -48,6 +53,32 @@ fn ask_reply_from_result(result: Option<&Value>) -> AskReply {
         message: r.get("message").and_then(Value::as_str).map(String::from),
     }
 }
+
+/// Map an ACP client's `session/request_question` `result` to a
+/// `QuestionAnswer`: `{"selected":["label", ...]}` or `{"freeText":"..."}`.
+/// Anything else (including a missing/malformed result, or a client that
+/// hangs up before replying) resolves to `NoHuman` — never a hang, and
+/// never anything that could be mistaken for a permission grant.
+fn question_answer_from_result(result: Option<&Value>) -> hotl_types::QuestionAnswer {
+    let Some(r) = result else {
+        return hotl_types::QuestionAnswer::NoHuman;
+    };
+    if let Some(text) = r.get("freeText").and_then(Value::as_str) {
+        return hotl_types::QuestionAnswer::FreeText(text.to_string());
+    }
+    if let Some(arr) = r.get("selected").and_then(Value::as_array) {
+        let labels: Vec<String> = arr
+            .iter()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect();
+        if !labels.is_empty() {
+            return hotl_types::QuestionAnswer::Selected(labels);
+        }
+    }
+    hotl_types::QuestionAnswer::NoHuman
+}
+
 /// JSON-RPC ids of in-flight prompt requests, answered in order on TurnDone
 /// (the engine queues overlapping prompts and finishes them FIFO).
 type PendingPrompt = Arc<std::sync::Mutex<VecDeque<Value>>>;
@@ -83,6 +114,7 @@ pub async fn serve(
 ) {
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pending_questions: PendingQuestions = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_prompt: PendingPrompt = Arc::new(std::sync::Mutex::new(VecDeque::new()));
     let mut next_id: u64 = 1;
     let mut session: Option<SessionState> = None;
@@ -92,10 +124,18 @@ pub async fn serve(
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue; // unparseable frame, no id to reply to
         };
-        // A client response to one of our permission requests?
+        // A client response to one of our permission requests, or one of our
+        // questions (disjoint id spaces — a hit in one map means a miss in
+        // the other, so trying both is safe and order-independent)?
         if msg.get("method").is_none() {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some(reply) = pending
+                if let Some(reply) = pending_questions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id)
+                {
+                    let _ = reply.send(question_answer_from_result(msg.get("result")));
+                } else if let Some(reply) = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&id)
@@ -111,6 +151,7 @@ pub async fn serve(
             &mut factory,
             &mut session,
             &pending,
+            &pending_questions,
             &pending_prompt,
             &mut next_id,
             &skills,
@@ -132,6 +173,7 @@ async fn handle_request(
     factory: &mut SessionFactory,
     session: &mut Option<SessionState>,
     pending: &Pending,
+    pending_questions: &PendingQuestions,
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
     skills: &[String],
@@ -189,6 +231,10 @@ async fn handle_request(
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .clear();
+                        pending_questions
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .clear();
                         pending_prompt
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -198,6 +244,7 @@ async fn handle_request(
                         open.handle,
                         writer.clone(),
                         pending.clone(),
+                        pending_questions.clone(),
                         pending_prompt.clone(),
                         next_id,
                     );
@@ -288,15 +335,18 @@ async fn handle_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_session(
     mut handle: SessionHandle,
     writer: Writer,
     pending: Pending,
+    pending_questions: PendingQuestions,
     pending_prompt: PendingPrompt,
     next_id: &mut u64,
 ) -> SessionState {
     let id = format!("acp-{}", *next_id);
-    // Permission request ids for this session are disjoint from every other id.
+    // Permission/question request ids for this session are disjoint from
+    // every other id.
     let req_id_seed = *next_id * 1_000_000;
     *next_id += 1;
     let events = std::mem::replace(&mut handle.events, mpsc::channel(1).1);
@@ -305,6 +355,7 @@ fn start_session(
         events,
         writer,
         pending,
+        pending_questions,
         pending_prompt,
         sid,
         req_id_seed,
@@ -313,12 +364,14 @@ fn start_session(
 }
 
 /// Map engine events to `session/update` notifications, turn permission asks
-/// into `session/request_permission` requests, and answer the pending prompt
-/// on TurnDone.
+/// into `session/request_permission` requests, questions into
+/// `session/request_question` requests, and answer the pending prompt on
+/// TurnDone.
 async fn drain_events(
     mut events: mpsc::Receiver<EngineEvent>,
     writer: Writer,
     pending: Pending,
+    pending_questions: PendingQuestions,
     pending_prompt: PendingPrompt,
     session_id: String,
     mut req_id: u64,
@@ -341,10 +394,40 @@ async fn drain_events(
                 }))
                 .await;
             }
+            EngineEvent::Question {
+                question, reply, ..
+            } => {
+                // NOT a permission gate: the reply is plain text the model
+                // reads, never an authorization (SECURITY invariant).
+                req_id += 1;
+                pending_questions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(req_id, reply);
+                send(
+                    &writer,
+                    &json!({
+                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_question",
+                        "params": {
+                            "sessionId": session_id,
+                            "header": question.header,
+                            "prompt": question.prompt,
+                            "options": question.options,
+                            "multi": question.multi,
+                        },
+                    }),
+                )
+                .await;
+            }
             EngineEvent::TurnDone { outcome, usage } => {
-                // A turn that ended without its asks being answered left dead
-                // reply channels behind — drop them so they can't leak.
+                // A turn that ended without its asks/questions being answered
+                // left dead reply channels behind — drop them so they can't
+                // leak.
                 pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|_, tx| !tx.is_closed());
+                pending_questions
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
@@ -397,7 +480,9 @@ pub(crate) fn update_payload(event: &EngineEvent) -> Option<Value> {
         EngineEvent::PromptQueued => json!({"type": "prompt_queued"}),
         EngineEvent::Compacted { degraded } => json!({"type": "compacted", "degraded": degraded}),
         EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
-        EngineEvent::Ask { .. } | EngineEvent::TurnDone { .. } => return None,
+        EngineEvent::Ask { .. } | EngineEvent::Question { .. } | EngineEvent::TurnDone { .. } => {
+            return None
+        }
     })
 }
 

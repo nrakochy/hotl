@@ -35,6 +35,9 @@ pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     if matches!(state.phase, Phase::WaitingAsk { .. }) {
         render_ask(state, p, frame, transcript);
     }
+    if matches!(state.phase, Phase::WaitingQuestion { .. }) {
+        render_question(state, p, frame, transcript);
+    }
     if state.help_open {
         render_help(p, frame, transcript);
     }
@@ -360,7 +363,9 @@ fn split_summary(name: &str, summary: &str) -> (String, Vec<String>) {
 fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // The band background is the watch look; blocked = "waiting on you".
     let style = match state.phase {
-        Phase::WaitingAsk { .. } => Style::new().fg(p.blocked).bg(p.band).bold(),
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
+            Style::new().fg(p.blocked).bg(p.band).bold()
+        }
         Phase::Idle => Style::new().fg(p.muted).bg(p.band),
         _ => Style::new().fg(p.ink).bg(p.band),
     };
@@ -508,6 +513,9 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         (Phase::WaitingAsk { .. }, ..) => {
             "y allow · n deny · type a reason after n · ctrl-c cancel"
         }
+        (Phase::WaitingQuestion { .. }, ..) => {
+            "1-9 pick an option · type for free text · enter submit · esc clear"
+        }
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
     };
@@ -546,6 +554,60 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     }
     // A long command — or a long deny reason — grows the card downward rather
     // than vanishing off its right edge.
+    let lines: Vec<Line> = lines
+        .iter()
+        .flat_map(|l| wrap::line(l, centered(over, 60, 0).width.saturating_sub(2) as usize))
+        .collect();
+    let area = centered(over, 60, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" waiting on you ")
+        .border_style(Style::new().fg(p.blocked));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// `ask_user`'s option-picker modal (tier-1 gap #4) — generalizes
+/// `render_ask`'s y/n card to N labelled options (2-4, per the tool's own
+/// validation) plus free text. Not a permission card: no "waiting on you"
+/// urgency color beyond the shared blocked-phase band the strip already
+/// carries.
+fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
+    let Phase::WaitingQuestion {
+        header,
+        prompt,
+        options,
+        input,
+        ..
+    } = &state.phase
+    else {
+        return;
+    };
+    let mut lines = vec![
+        Line::styled(header.clone(), Style::new().fg(p.ink).bold()),
+        Line::styled(prompt.clone(), Style::new().fg(p.ink)),
+        Line::raw(""),
+    ];
+    for (i, opt) in options.iter().enumerate() {
+        let mut text = format!("{}) {}", i + 1, opt.label);
+        if let Some(desc) = &opt.description {
+            text.push_str(&format!(" — {desc}"));
+        }
+        lines.push(Line::styled(text, Style::new().fg(p.ink)));
+    }
+    lines.push(Line::raw(""));
+    if input.is_empty() {
+        lines.push(Line::styled(
+            "1-9 pick an option, or type free text",
+            Style::new().fg(p.faint),
+        ));
+    } else {
+        lines.push(Line::styled(
+            format!("free text: {input}▏"),
+            Style::new().fg(p.ink),
+        ));
+    }
     let lines: Vec<Line> = lines
         .iter()
         .flat_map(|l| wrap::line(l, centered(over, 60, 0).width.saturating_sub(2) as usize))
@@ -701,6 +763,37 @@ mod tests {
         let all = rows.join("\n");
         assert!(all.contains("run bash: rm -rf ./x"), "summary in modal");
         assert!(all.contains("⚠ protected path"), "loud protected line");
+        assert!(rows[STRIP].contains("waiting on you"), "halted strip");
+    }
+
+    #[test]
+    fn waiting_question_renders_the_modal_with_numbered_options() {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::WaitingQuestion {
+            req_id: 9,
+            header: "Scope".into(),
+            prompt: "How far?".into(),
+            options: vec![
+                hotl_tools::ask::QuestionOption {
+                    label: "MVP".into(),
+                    description: None,
+                },
+                hotl_tools::ask::QuestionOption {
+                    label: "Full".into(),
+                    description: Some("everything".into()),
+                },
+            ],
+            input: String::new(),
+        };
+        let rows = draw(&s);
+        let all = rows.join("\n");
+        assert!(all.contains("Scope"), "header in modal");
+        assert!(all.contains("How far?"), "prompt in modal");
+        assert!(all.contains("1) MVP"), "numbered option: {all}");
+        assert!(
+            all.contains("2) Full — everything"),
+            "description shown: {all}"
+        );
         assert!(rows[STRIP].contains("waiting on you"), "halted strip");
     }
 

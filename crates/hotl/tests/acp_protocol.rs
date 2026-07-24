@@ -433,6 +433,116 @@ async fn named_open_and_rename() {
     assert_eq!(next(&mut lines).await["result"]["ok"], true);
 }
 
+/// `ask_user` round-trips through `session/request_question`: the client
+/// sees the header/prompt/options, answers with a selection, and the tool
+/// result (fed back to the scripted model) carries the selected label. Also
+/// covers the SECURITY invariant end to end: the question never touches
+/// `session/request_permission` — only a plain `session/prompt` result.
+#[tokio::test]
+async fn ask_user_round_trip_via_session_request_question() {
+    let factory: acp::SessionFactory = Box::new(|_spec| {
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        std::mem::forget(dir);
+        let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
+        let (event_tx, event_rx) = hotl_engine::event_channel();
+        let mut registry = Registry::builtin();
+        registry.register(Box::new(hotl_tools::AskUserTool::new(
+            hotl_engine::question_sink(cmd_tx.downgrade(), event_tx.downgrade()),
+        )));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_call(
+                "t1",
+                "ask_user",
+                json!({
+                    "header": "Scope", "prompt": "How far?",
+                    "options": [{"label": "MVP"}, {"label": "Full"}]
+                }),
+            ),
+            ScriptedProvider::text_reply("all done via acp"),
+        ]));
+        Ok(acp::SessionOpen {
+            handle: hotl_engine::spawn_session_with_channels(
+                SessionDeps {
+                    provider,
+                    registry: Arc::new(registry),
+                    rules: Arc::new(Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: std::env::temp_dir(),
+                    snapshots: None,
+                    hooks: None,
+                    initial_items: Vec::new(),
+                    initial_todos: Vec::new(),
+                    config: EngineConfig {
+                        max_turns: 6,
+                        ..Default::default()
+                    },
+                },
+                cmd_tx,
+                cmd_rx,
+                event_tx,
+                event_rx,
+            ),
+            name: None,
+        })
+    });
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory, Vec::new()));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+    )
+    .await;
+    let session_id = read_until_id(&mut lines, 1)
+        .await
+        .pointer("/result/sessionId")
+        .and_then(Value::as_str)
+        .expect("session id")
+        .to_string();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+
+    let result = loop {
+        let msg = next(&mut lines).await;
+        assert_ne!(
+            msg.get("method").and_then(Value::as_str),
+            Some("session/request_permission"),
+            "ask_user must never route through the permission gate: {msg}"
+        );
+        if msg.get("method").and_then(Value::as_str) == Some("session/request_question") {
+            assert_eq!(msg["params"]["sessionId"], session_id);
+            assert_eq!(msg["params"]["header"], "Scope");
+            assert_eq!(msg["params"]["prompt"], "How far?");
+            assert_eq!(
+                msg["params"]["options"],
+                json!([{"label": "MVP"}, {"label": "Full"}])
+            );
+            let rid = msg["id"].clone();
+            send(
+                &mut cwrite,
+                json!({"jsonrpc":"2.0","id":rid,"result":{"selected":["MVP"]}}),
+            )
+            .await;
+        } else if msg.get("id") == Some(&json!(2)) {
+            break msg;
+        }
+    };
+    assert_eq!(result["result"]["outcome"]["kind"], "done");
+    assert_eq!(result["result"]["outcome"]["text"], "all done via acp");
+}
+
 /// `session/set_mode` acks and switches the mode; an invalid mode errors
 /// naming the valid ones. Mirrors `named_open_and_rename`.
 #[tokio::test]

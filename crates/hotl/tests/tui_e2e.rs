@@ -64,11 +64,69 @@ fn scripted_factory() -> acp::SessionFactory {
     })
 }
 
+/// A session whose scripted model asks a structured question (`ask_user`)
+/// then replies with text — the tier-1 gap #4 golden.
+fn scripted_ask_user_factory() -> acp::SessionFactory {
+    Box::new(|_spec| {
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
+        let (event_tx, event_rx) = hotl_engine::event_channel();
+        let mut registry = Registry::builtin();
+        registry.register(Box::new(hotl_tools::AskUserTool::new(
+            hotl_engine::question_sink(cmd_tx.downgrade(), event_tx.downgrade()),
+        )));
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_call(
+                "t1",
+                "ask_user",
+                json!({
+                    "header": "Scope", "prompt": "How far?",
+                    "options": [{"label": "MVP"}, {"label": "Full"}]
+                }),
+            ),
+            ScriptedProvider::text_reply("all done via tui"),
+        ]));
+        std::mem::forget(dir);
+        Ok(acp::SessionOpen {
+            handle: hotl_engine::spawn_session_with_channels(
+                SessionDeps {
+                    provider,
+                    registry: Arc::new(registry),
+                    rules: Arc::new(Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: std::env::temp_dir(),
+                    snapshots: None,
+                    hooks: None,
+                    initial_items: Vec::new(),
+                    initial_todos: Vec::new(),
+                    config: EngineConfig {
+                        max_turns: 6,
+                        ..Default::default()
+                    },
+                },
+                cmd_tx,
+                cmd_rx,
+                event_tx,
+                event_rx,
+            ),
+            name: None,
+        })
+    })
+}
+
 /// Spin up serve + client and complete the pre-TUI handshake.
 async fn start() -> (Client, Reader) {
+    start_with(scripted_factory()).await
+}
+
+async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, factory, Vec::new()));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut client = AcpClient::new(cwrite);
     let mut reader = BufReader::new(cread);
@@ -108,6 +166,9 @@ fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
             summary,
             protected_why,
         }),
+        ServerMsg::QuestionRequest { req_id, question } => {
+            Some(Msg::QuestionRequest { req_id, question })
+        }
         ServerMsg::Response { id, result } => {
             let pos = prompt_ids.iter().position(|&p| p == id)?;
             prompt_ids.remove(pos);
@@ -160,6 +221,11 @@ async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64
                 allow,
                 message,
             } => client.reply_permission(req_id, allow, message).await,
+            Cmd::ReplyQuestion {
+                req_id,
+                selected,
+                free_text,
+            } => client.reply_question(req_id, selected, free_text).await,
             Cmd::OpenEditor(_) | Cmd::SetTitle(_) | Cmd::AppendHistory(_) | Cmd::Quit => {}
         }
     }
@@ -276,6 +342,62 @@ async fn prompt_stream_ask_allow_done_golden() {
         rows[STRIP].contains("· ─ ·"),
         "back to resting: {}",
         rows[STRIP]
+    );
+}
+
+/// `ask_user` end to end through the real TUI stack: the modal shows the
+/// numbered options, a digit picks one, and the model's next turn (fed the
+/// selected label as the tool result) completes normally. Also proves the
+/// SECURITY invariant at the TUI layer: a question never freezes into
+/// `session/request_permission` — only `session/request_question`.
+#[tokio::test]
+async fn ask_user_option_pick_golden() {
+    let (mut client, mut reader) = start_with(scripted_ask_user_factory()).await;
+    let mut state = State::new(true, "m".into());
+    let mut prompt_ids = VecDeque::new();
+
+    type_prompt(&mut state, &mut client, &mut prompt_ids, "go").await;
+
+    loop {
+        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids) else {
+            continue;
+        };
+        assert!(
+            !matches!(msg, Msg::PermissionRequest { .. }),
+            "ask_user must never freeze into a permission ask"
+        );
+        let is_question = matches!(msg, Msg::QuestionRequest { .. });
+        let is_result = matches!(msg, Msg::PromptResult { .. });
+        let cmds = update(&mut state, msg);
+        exec(cmds, &mut client, &mut prompt_ids).await;
+        if is_question {
+            let rows = draw(&state);
+            let all = rows.join("\n");
+            assert!(all.contains("Scope"), "header in modal: {all}");
+            assert!(all.contains("1) MVP"), "numbered option: {all}");
+            assert!(
+                rows[STRIP].contains("waiting on you"),
+                "halted strip: {}",
+                rows[STRIP]
+            );
+            let cmds = press(&mut state, KeyCode::Char('1'));
+            assert!(matches!(
+                &cmds[..],
+                [Cmd::ReplyQuestion { selected, free_text: None, .. }, ..]
+                if selected == &vec!["MVP".to_string()]
+            ));
+            exec(cmds, &mut client, &mut prompt_ids).await;
+        }
+        if is_result {
+            break;
+        }
+    }
+
+    assert_eq!(state.phase, Phase::Idle);
+    let rows = draw(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("all done via tui")),
+        "assistant text rendered after the question resolved"
     );
 }
 

@@ -54,6 +54,10 @@ hotl refuses that file unless it is root-owned and not group/world-writable.
 
 Everything else below exists to make that gate trustworthy: to keep an approved action from doing more than you thought, and to give you a way back if you approve something you shouldn't have.
 
+### `ask_user` is not a permission gate
+
+The `ask_user` tool ([configuration.md](../configuration/#built-in-tools)) puts a structured multiple-choice question to you — a header, a prompt, 2–4 options, plus free text. It looks like another y/N moment but it isn't one: **it never authorizes a tool call.** The answer becomes a plain-text tool result, the same shape a `read` returns, and nothing about that text can grant permission for a later mutating call — a model cannot launder an edit or a shell command through a question. That's also why its own permission is `None` and it runs even in `plan` mode: answering a question changes nothing on disk. Like an ordinary ask, a question with no human to answer it — headless `-p`, JSON mode, a sub-agent — never hangs: it resolves immediately to a documented "no human available" default the model can act on.
+
 ### Approved work runs concurrently where that's safe
 
 Within one model turn the agent often issues several tool calls at once. hotl runs the read-only ones concurrently — a batch of five file reads doesn't queue behind itself — while anything that mutates or executes (`bash`, `write`, `edit`) runs strictly one at a time, in source order, and never overlaps with anything else. Permission asks are unaffected: every approval is still presented to you one at a time, before the calls it gates run. Sub-agents (`spawn`) count as overlap-safe too: each child runs in its own isolated session, so several approved sub-agents work side by side. Concurrency never changes *what* is allowed — only how long the allowed work takes.

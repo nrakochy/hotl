@@ -99,6 +99,14 @@ reach for the skill you had in mind, this is how you hand it over directly.
 
 An ask freezes the loop (the gap glyph) and opens a modal with the tool summary — and a loud `⚠` line when a protected path is involved. `y` allows. `n` starts a deny: type an optional reason, `Enter` sends it (the reason goes to the model verbatim; `Esc` backs out of the deny).
 
+## Questions
+
+The agent can also ask a **structured question** (`ask_user`) — a header, a prompt, and 2–4 numbered options — when it hits a genuine ambiguity instead of guessing. It freezes the loop the same way a permission ask does (same gap glyph, same "waiting on you" strip), but **it is not a permission ask**: answering it never authorizes any tool, it only supplies text the model reads on its next turn.
+
+Press a digit (`1`–`4`) to pick that option — it submits immediately, no confirm step. To answer with something not listed, just start typing: the modal switches to free text, `Enter` submits it, `Esc` clears it back to the picker.
+
+In headless (`-p`) or JSON mode there is no one to ask, so the question resolves immediately to a documented "no human available" answer and the model proceeds on its own judgment — it never hangs a scripted run.
+
 ## Interrupting
 
 - `Esc` (with the input empty) — interrupt the running turn; press again to insist.

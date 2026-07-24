@@ -21,7 +21,7 @@ pub fn loop_glyph(phase: &Phase) -> &'static str {
         Phase::Idle => RESTING,
         Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => draw_then_turn(*ticks),
         Phase::Tool { ticks, .. } => ORBIT[(*ticks % 4) as usize],
-        Phase::WaitingAsk { .. } => GAP,
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => GAP,
         Phase::Compacting { ticks } => COIL[(*ticks % 4) as usize],
     }
 }
@@ -56,7 +56,9 @@ pub fn strip_line(state: &State) -> String {
         Phase::Tool { name, ticks } => {
             format!("{glyph} {name} · {}s · esc to interrupt", secs(*ticks))
         }
-        Phase::WaitingAsk { .. } => format!("{GAP} waiting on you"),
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
+            format!("{GAP} waiting on you")
+        }
         Phase::Compacting { .. } => format!("{glyph} folding history…"),
     };
     match todos_summary(&state.todos) {

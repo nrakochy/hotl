@@ -229,6 +229,11 @@ async fn run_loop(
                     allow,
                     message,
                 } => client.reply_permission(req_id, allow, message).await,
+                Cmd::ReplyQuestion {
+                    req_id,
+                    selected,
+                    free_text,
+                } => client.reply_question(req_id, selected, free_text).await,
                 Cmd::SetTitle(title) => {
                     let _ = execute!(io::stdout(), SetTitle(&title));
                 }
@@ -255,6 +260,9 @@ fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
             summary,
             protected_why,
         }),
+        ServerMsg::QuestionRequest { req_id, question } => {
+            Some(Msg::QuestionRequest { req_id, question })
+        }
         ServerMsg::Response { id, result } => {
             // Only prompt replies become messages; steer/cancel acks are noise.
             let pos = prompt_ids.iter().position(|&p| p == id)?;

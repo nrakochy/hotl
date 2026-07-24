@@ -6,6 +6,7 @@
 //! U+2028 caveat applies to Node's readline splitting on Unicode line
 //! separators, not to byte-linewise framing of serde output.)
 
+use hotl_tools::ask::{Question, QuestionOption};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -19,6 +20,9 @@ pub enum ServerMsg {
         summary: String,
         protected_why: Option<String>,
     },
+    /// A `session/request_question` reverse-request (`ask_user`, tier-1
+    /// gap #4) — NOT a permission gate; answering it never authorizes a tool.
+    QuestionRequest { req_id: u64, question: Question },
     /// A reply to one of our requests (including the prompt result).
     Response {
         id: u64,
@@ -53,6 +57,23 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         if let Some(m) = message {
             result["message"] = json!(m);
         }
+        self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
+            .await;
+    }
+
+    /// Answer a `session/request_question`: exactly one of `selected`
+    /// (labels) or `free_text` is set by the caller (`app::Cmd::ReplyQuestion`
+    /// only ever produces one or the other).
+    pub async fn reply_question(
+        &mut self,
+        req_id: u64,
+        selected: Vec<String>,
+        free_text: Option<String>,
+    ) {
+        let result = match free_text {
+            Some(text) => json!({"freeText": text}),
+            None => json!({"selected": selected}),
+        };
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
             .await;
     }
@@ -97,6 +118,47 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
                 .and_then(Value::as_str)
                 .map(String::from),
         }),
+        Some("session/request_question") => {
+            let options = msg
+                .pointer("/params/options")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|o| QuestionOption {
+                            label: o
+                                .get("label")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            description: o
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .map(String::from),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(ServerMsg::QuestionRequest {
+                req_id: msg.get("id").and_then(Value::as_u64)?,
+                question: Question {
+                    header: msg
+                        .pointer("/params/header")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    prompt: msg
+                        .pointer("/params/prompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                    options,
+                    multi: msg
+                        .pointer("/params/multi")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                },
+            })
+        }
         Some(_) => None,
         None => {
             let id = msg.get("id").and_then(Value::as_u64)?;
@@ -186,6 +248,66 @@ mod tests {
             })
         );
         assert_eq!(read_server_msg(&mut r).await, None, "EOF");
+    }
+
+    #[tokio::test]
+    async fn read_decodes_a_question_request() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let feed = concat!(
+            r#"{"jsonrpc":"2.0","id":9,"method":"session/request_question","params":{"sessionId":"s","header":"Scope","prompt":"How far?","options":[{"label":"MVP"},{"label":"Full","description":"everything"}],"multi":false}}"#,
+            "\n",
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut server, feed.as_bytes())
+            .await
+            .unwrap();
+        drop(server);
+        let mut r = BufReader::new(client);
+        assert_eq!(
+            read_server_msg(&mut r).await,
+            Some(ServerMsg::QuestionRequest {
+                req_id: 9,
+                question: Question {
+                    header: "Scope".into(),
+                    prompt: "How far?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "MVP".into(),
+                            description: None,
+                        },
+                        QuestionOption {
+                            label: "Full".into(),
+                            description: Some("everything".into()),
+                        },
+                    ],
+                    multi: false,
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn reply_question_shape_matches_server_contract() {
+        let (mut read, write) = tokio::io::duplex(4096);
+        let mut client = AcpClient::new(write);
+        client.reply_question(9, vec!["MVP".into()], None).await;
+        client
+            .reply_question(10, Vec::new(), Some("other".into()))
+            .await;
+        drop(client);
+        let mut out = String::new();
+        read.read_to_string(&mut out).await.unwrap();
+        let lines: Vec<Value> = out
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            lines[0],
+            json!({"jsonrpc": "2.0", "id": 9, "result": {"selected": ["MVP"]}})
+        );
+        assert_eq!(
+            lines[1],
+            json!({"jsonrpc": "2.0", "id": 10, "result": {"freeText": "other"}})
+        );
     }
 
     #[tokio::test]

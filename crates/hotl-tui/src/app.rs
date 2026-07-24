@@ -3,6 +3,7 @@
 //! golden-testable.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use hotl_tools::ask::{Question, QuestionOption};
 use serde_json::Value;
 
 use crate::vim::{Editor, EditorEvent};
@@ -29,6 +30,17 @@ pub enum Phase {
         protected_why: Option<String>,
         input: String,
         denying: bool,
+    },
+    /// A structured `ask_user` question (tier-1 gap #4) — NOT a permission
+    /// ask: answering it never authorizes a tool, it only supplies text the
+    /// model reads. `input` is the free-text buffer; once the human starts
+    /// typing, digit keys stop selecting and become ordinary characters.
+    WaitingQuestion {
+        req_id: u64,
+        header: String,
+        prompt: String,
+        options: Vec<QuestionOption>,
+        input: String,
     },
     Compacting {
         ticks: u64,
@@ -147,6 +159,10 @@ pub enum Msg {
         summary: String,
         protected_why: Option<String>,
     },
+    QuestionRequest {
+        req_id: u64,
+        question: Question,
+    },
     PromptResult {
         outcome_kind: String,
         outcome_text: Option<String>,
@@ -173,6 +189,14 @@ pub enum Cmd {
         req_id: u64,
         allow: bool,
         message: Option<String>,
+    },
+    /// Answer a `session/request_question`. Exactly one of `selected`
+    /// (a single label — v1 is single-select even when `multi` was set) or
+    /// `free_text` is populated.
+    ReplyQuestion {
+        req_id: u64,
+        selected: Vec<String>,
+        free_text: Option<String>,
     },
     OpenEditor(String),
     SetTitle(String),
@@ -204,6 +228,16 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 protected_why,
                 input: String::new(),
                 denying: false,
+            };
+            vec![Cmd::SetTitle(title(state, " — waiting on you"))]
+        }
+        Msg::QuestionRequest { req_id, question } => {
+            state.phase = Phase::WaitingQuestion {
+                req_id,
+                header: question.header,
+                prompt: question.prompt,
+                options: question.options,
+                input: String::new(),
             };
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
@@ -374,6 +408,9 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     }
     if matches!(state.phase, Phase::WaitingAsk { .. }) {
         return on_ask_key(state, key);
+    }
+    if matches!(state.phase, Phase::WaitingQuestion { .. }) {
+        return on_question_key(state, key);
     }
     if key.code == KeyCode::Esc && state.phase != Phase::Idle && state.editor.is_empty() {
         if !state.interrupt_sent {
@@ -551,6 +588,69 @@ fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     }
 }
 
+/// `ask_user`'s modal (tier-1 gap #4): number keys 1-N pick an option
+/// instantly (submits right away — no confirm step, matching `on_ask_key`'s
+/// `y`); any other printable character starts free text instead (typing
+/// commits to free text — once `input` is non-empty, digits are just more
+/// text, never a late option pick). Esc while typing free text backs out to
+/// the picker rather than submitting a partial answer.
+fn on_question_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
+    let Phase::WaitingQuestion {
+        req_id,
+        options,
+        input,
+        ..
+    } = &mut state.phase
+    else {
+        return Vec::new();
+    };
+    let req_id = *req_id;
+    if !input.is_empty() {
+        match key.code {
+            KeyCode::Char(c) => input.push(c),
+            KeyCode::Backspace => {
+                input.pop();
+            }
+            KeyCode::Esc => input.clear(),
+            KeyCode::Enter => {
+                let text = input.clone();
+                return resume_after_question(state, req_id, Vec::new(), Some(text));
+            }
+            _ => {}
+        }
+        return Vec::new();
+    }
+    match key.code {
+        KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
+            let idx = c as usize - '1' as usize;
+            if let Some(opt) = options.get(idx) {
+                let label = opt.label.clone();
+                return resume_after_question(state, req_id, vec![label], None);
+            }
+        }
+        KeyCode::Char(c) => input.push(c),
+        _ => {}
+    }
+    Vec::new()
+}
+
+fn resume_after_question(
+    state: &mut State,
+    req_id: u64,
+    selected: Vec<String>,
+    free_text: Option<String>,
+) -> Vec<Cmd> {
+    state.phase = Phase::Sampling { ticks: 0 };
+    vec![
+        Cmd::ReplyQuestion {
+            req_id,
+            selected,
+            free_text,
+        },
+        Cmd::SetTitle(title(state, " — working")),
+    ]
+}
+
 fn resume_after_ask(
     state: &mut State,
     req_id: u64,
@@ -591,7 +691,7 @@ fn on_tick(state: &mut State) {
                 }
             }
         }
-        Phase::Idle | Phase::WaitingAsk { .. } => {}
+        Phase::Idle | Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {}
     }
 }
 
@@ -823,6 +923,93 @@ mod tests {
             if m == "wrong dir")
         );
         assert!(!matches!(s.phase, Phase::WaitingAsk { .. }));
+    }
+
+    fn question(s: &mut State) {
+        update(
+            s,
+            Msg::QuestionRequest {
+                req_id: 9,
+                question: Question {
+                    header: "Scope".into(),
+                    prompt: "How far?".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "MVP".into(),
+                            description: None,
+                        },
+                        QuestionOption {
+                            label: "Full".into(),
+                            description: Some("everything".into()),
+                        },
+                    ],
+                    multi: false,
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn question_request_freezes_into_waiting_question_with_the_options() {
+        let mut s = State::test_default();
+        s.phase = Phase::Idle;
+        question(&mut s);
+        assert!(matches!(
+            &s.phase,
+            Phase::WaitingQuestion { req_id: 9, header, options, .. }
+            if header == "Scope" && options.len() == 2
+        ));
+        update(&mut s, Msg::Tick);
+        assert!(
+            matches!(s.phase, Phase::WaitingQuestion { .. }),
+            "the loop halts on a question exactly like a permission ask"
+        );
+    }
+
+    #[test]
+    fn selecting_option_index_by_digit_emits_the_answer_with_that_label() {
+        let mut s = State::test_default();
+        question(&mut s);
+        let cmds = press(&mut s, KeyCode::Char('2'));
+        assert!(matches!(
+            &cmds[..],
+            [Cmd::ReplyQuestion { req_id: 9, selected, free_text: None }, ..]
+            if selected == &vec!["Full".to_string()]
+        ));
+        assert!(!matches!(s.phase, Phase::WaitingQuestion { .. }));
+    }
+
+    #[test]
+    fn typing_instead_of_a_digit_switches_to_free_text_and_enter_submits_it() {
+        let mut s = State::test_default();
+        question(&mut s);
+        type_str(&mut s, "neither, do it differently");
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(matches!(
+            &cmds[..],
+            [Cmd::ReplyQuestion { req_id: 9, selected, free_text: Some(t) }, ..]
+            if selected.is_empty() && t == "neither, do it differently"
+        ));
+        assert!(!matches!(s.phase, Phase::WaitingQuestion { .. }));
+    }
+
+    #[test]
+    fn a_digit_out_of_range_is_a_no_op_and_a_digit_after_typing_is_just_text() {
+        let mut s = State::test_default();
+        question(&mut s);
+        // Only 2 options: '9' is out of range and does not submit.
+        let cmds = press(&mut s, KeyCode::Char('9'));
+        assert!(cmds.is_empty());
+        assert!(matches!(s.phase, Phase::WaitingQuestion { .. }));
+
+        // Once free text has started, a digit is just another character.
+        type_str(&mut s, "opt");
+        press(&mut s, KeyCode::Char('2'));
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(matches!(
+            &cmds[..],
+            [Cmd::ReplyQuestion { free_text: Some(t), .. }, ..] if t == "opt2"
+        ));
     }
 
     #[test]

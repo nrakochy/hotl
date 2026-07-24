@@ -499,35 +499,38 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     surface.run_until_idle().await
 }
 
-/// Spawn a session with `todo_write` registered and wired to *its own*
-/// actor. The tool's sink needs a live sender before the actor exists (the
-/// registry is part of `SessionDeps`, which has to be built before
-/// `spawn_session` runs), so the channel is split via
-/// `hotl_engine::session_channel`/`spawn_session_with` — the same "reach the
-/// actor through an mpsc `SessionCmd` sender" shape `spawn`'s child wiring
-/// uses, but pointed at this session rather than a new child. Every session
-/// (top-level and child) gets its own list: each call here builds a fresh
-/// registry clone (cheap — `Registry` is Arc-backed) with a sink bound to
-/// that particular session, so a child's `todo_write` can never write into
-/// its parent's list or vice versa.
+/// Spawn a session with `todo_write` *and* `ask_user` registered and wired
+/// to *its own* actor. Both tools' sinks need a live sender before the actor
+/// exists (the registry is part of `SessionDeps`, which has to be built
+/// before `spawn_session` runs), so the command *and* event channels are
+/// split via `hotl_engine::session_channel`/`event_channel` +
+/// `spawn_session_with_channels` — the same "reach the actor through an mpsc
+/// sender" shape `spawn`'s child wiring uses, but pointed at this session
+/// rather than a new child. Every session (top-level and child) gets its own
+/// checklist and its own question round-trip: each call here builds a fresh
+/// registry clone (cheap — `Registry` is Arc-backed) with sinks bound to
+/// that particular session, so a child's `todo_write`/`ask_user` can never
+/// reach into its parent's session or vice versa.
 ///
-/// The sink captures a *weak* sender (`cmd_tx.downgrade()`), upgraded on
-/// each send, mirroring the actor's own weak-sender pattern
-/// (`hotl_engine::spawn_session_with`: "the actor gets only a weak sender").
-/// The registry this sink lives in becomes `SharedDeps.registry`, which the
-/// actor holds for the whole of `run()` — a *strong* clone here would be a
-/// reference cycle (the actor holding, via its own registry, a strong
-/// sender to the very channel it's waiting to see close) and the actor task
-/// would never exit: `cmd_rx.recv()` only returns `None` once every strong
-/// sender (the handle, and any in-flight turn task) is gone, and this sink
-/// would count as one, forever. An upgrade failure (the handle already
-/// dropped, so the channel is closing) just drops the send — nothing is
-/// listening for it any more anyway.
+/// Both sinks capture *weak* senders (`.downgrade()`), upgraded on each use,
+/// mirroring the actor's own weak-sender pattern
+/// (`hotl_engine::spawn_session_with_channels`: "the actor gets only a weak
+/// sender"). The registry these sinks live in becomes `SharedDeps.registry`,
+/// which the actor holds for the whole of `run()` — a *strong* clone here
+/// would be a reference cycle (the actor holding, via its own registry, a
+/// strong sender to the very channel it's waiting to see close) and the
+/// actor task would never exit: `cmd_rx.recv()` only returns `None` once
+/// every strong sender (the handle, and any in-flight turn task) is gone,
+/// and a captured strong sink sender would count as one, forever — this is
+/// exactly the leak an early cut of `todo_write`'s sink had. An upgrade
+/// failure (the handle already dropped, so the channel is closing) just
+/// drops the send/resolves to `NoHuman` — nobody is listening any more.
 fn spawn_session_with_todos(
     mut registry: Registry,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
     let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
+    let (event_tx, event_rx) = hotl_engine::event_channel();
     let weak = cmd_tx.downgrade();
     registry.register(Box::new(hotl_tools::TodoWriteTool::new(Arc::new(
         move |items| {
@@ -536,8 +539,11 @@ fn spawn_session_with_todos(
             }
         },
     ))));
+    registry.register(Box::new(hotl_tools::AskUserTool::new(
+        hotl_engine::question_sink(cmd_tx.downgrade(), event_tx.downgrade()),
+    )));
     let deps = build_deps(Arc::new(registry));
-    hotl_engine::spawn_session_with(deps, cmd_tx, cmd_rx)
+    hotl_engine::spawn_session_with_channels(deps, cmd_tx, cmd_rx, event_tx, event_rx)
 }
 
 /// Builtins + the `mcp` meta-tool (M3a) + the `spawn` tool (M4) when a child
@@ -960,6 +966,16 @@ impl Surface {
                 eprintln!("hotl: denied (headless): {summary}");
                 let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
             }
+            EngineEvent::Question {
+                question, reply, ..
+            } => {
+                // Headless has no human to ask: resolve to the documented
+                // no-human default so the model proceeds instead of hanging
+                // (SECURITY/never-hang invariant — never a permission grant
+                // either way, this is a data-gathering round-trip only).
+                eprintln!("hotl: no human available (headless): {}", question.header);
+                let _ = reply.send(hotl_engine::QuestionAnswer::NoHuman);
+            }
             EngineEvent::TurnDone { outcome, usage } => self.render_turn_done(outcome, usage),
             EngineEvent::TodosChanged { items } => {
                 let done = items
@@ -1024,6 +1040,20 @@ impl Surface {
                 // JSON mode is headless automation: default-deny, emit the record.
                 let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
                 serde_json::json!({"type":"ask_denied","summary":summary})
+            }
+            EngineEvent::Question {
+                question, reply, ..
+            } => {
+                // JSON mode is headless automation too: no human to ask, so
+                // resolve to the documented no-human default (never a hang,
+                // never a permission grant) and emit the record.
+                let _ = reply.send(hotl_engine::QuestionAnswer::NoHuman);
+                serde_json::json!({
+                    "type": "question_no_human",
+                    "header": question.header,
+                    "prompt": question.prompt,
+                    "options": question.options,
+                })
             }
             EngineEvent::TurnDone { outcome, usage } => {
                 self.turn_running = false;
@@ -1626,6 +1656,109 @@ mod tests {
             drained.is_ok(),
             "actor task never exited after the handle was dropped — leaked \
              (reference cycle via a strong todo_write sink sender)"
+        );
+    }
+
+    /// `ask_user`, registered by `spawn_session_with_todos` alongside
+    /// `todo_write`, reaches this same session's own actor: the sink's
+    /// `EngineEvent::Question` shows up on *this* handle's `events`, and the
+    /// answer sent back becomes the tool's result.
+    #[tokio::test]
+    async fn ask_user_reaches_its_own_sessions_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig::default();
+        let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).unwrap();
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::tool_call(
+                "t1",
+                "ask_user",
+                serde_json::json!({
+                    "header": "Scope", "prompt": "How far?",
+                    "options": [{"label": "MVP"}, {"label": "Full"}]
+                }),
+            ),
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        let mut handle = spawn_session_with_todos(Registry::builtin(), |registry| SessionDeps {
+            provider,
+            registry,
+            rules: Arc::new(hotl_tools::rules::Rules::default()),
+            sandbox_enforced: false,
+            clock: Arc::new(SystemClock),
+            log,
+            system: "sys".into(),
+            cwd: dir.path().to_path_buf(),
+            snapshots: None,
+            hooks: None,
+            initial_items: Vec::new(),
+            initial_todos: Vec::new(),
+            config,
+        });
+        handle.prompt("go".into()).await;
+
+        let mut answered = false;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if let EngineEvent::Question { reply, .. } = ev {
+                answered = true;
+                let _ = reply.send(hotl_types::QuestionAnswer::Selected(vec!["MVP".into()]));
+                continue;
+            }
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                break;
+            }
+        }
+        assert!(
+            answered,
+            "ask_user should have reached this session's own actor"
+        );
+    }
+
+    /// Regression for the reference-cycle leak (same shape as
+    /// `dropping_the_handle_lets_a_todo_wired_actor_exit`, extended to cover
+    /// `ask_user`'s sink too): before the fix, a sink capturing a *strong*
+    /// `EngineEvent`/`SessionCmd` sender inside the registry the actor holds
+    /// for `run()`'s whole lifetime would keep `cmd_rx.recv()` from ever
+    /// seeing the strong-sender count reach zero, leaking the actor task.
+    /// `question_sink` holds only weak senders — dropping the handle (the
+    /// last strong sender, since no turn is in flight) must let the actor
+    /// exit.
+    #[tokio::test]
+    async fn dropping_the_handle_lets_an_ask_user_wired_actor_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig::default();
+        let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).unwrap();
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        let SessionHandle { mut events, .. } =
+            spawn_session_with_todos(Registry::builtin(), |registry| SessionDeps {
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                snapshots: None,
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                config,
+            });
+
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while events.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "actor task never exited after the handle was dropped — leaked \
+             (reference cycle via a strong ask_user sink sender)"
         );
     }
 
