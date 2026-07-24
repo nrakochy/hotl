@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-24
+
 ### Added
 
 - **`recall` — a pluggable retrieval seam.** Configure `[[retrieval]]`

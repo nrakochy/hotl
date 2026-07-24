@@ -11,12 +11,12 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-hotl-types = { path = "../hotl-types", version = "0.4.1" }
-hotl-platform = { path = "../hotl-platform", version = "0.4.1" }
-hotl-provider = { path = "../hotl-provider", version = "0.4.1" }
-hotl-context = { path = "../hotl-context", version = "0.4.1" }
-hotl-tools = { path = "../hotl-tools", version = "0.4.1" }
-hotl-store = { path = "../hotl-store", version = "0.4.1" }
+hotl-types = { path = "../hotl-types", version = "0.5.0" }
+hotl-platform = { path = "../hotl-platform", version = "0.5.0" }
+hotl-provider = { path = "../hotl-provider", version = "0.5.0" }
+hotl-context = { path = "../hotl-context", version = "0.5.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.5.0" }
+hotl-store = { path = "../hotl-store", version = "0.5.0" }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
@@ -24,7 +24,7 @@ tokio-util = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-hotl-retrieval = { path = "../hotl-retrieval", version = "0.4.1" }
+hotl-retrieval = { path = "../hotl-retrieval", version = "0.5.0" }
 tempfile = { workspace = true }
 # test-util: paused-clock tests measure summarize/sample overlap deterministically.
 tokio = { workspace = true, features = ["test-util"] }

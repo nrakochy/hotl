@@ -11,8 +11,8 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-hotl-types = { path = "../hotl-types", version = "0.4.1" }
-hotl-provider = { path = "../hotl-provider", version = "0.4.1" }
+hotl-types = { path = "../hotl-types", version = "0.5.0" }
+hotl-provider = { path = "../hotl-provider", version = "0.5.0" }
 serde_json = { workspace = true }
 reqwest = { workspace = true }
 futures-util = { workspace = true }
