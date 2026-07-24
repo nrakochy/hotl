@@ -231,19 +231,22 @@ impl HistoryCfg {
 /// index spec) plus the two Layer-C runtime-pool knobs. `agents`/`requests`/
 /// `subprocs` feed `ConcurrencyLimits` (env `HOTL_CONCURRENCY_*` > this >
 /// the fixed default; `0`/absent falls back to the default, never to zero).
-/// `worker_threads`/`blocking_threads` are parsed for completeness with the
-/// index's documented shape but are not yet wired into a runtime builder:
-/// hotl's binary runs its async work on a single `current_thread` runtime
-/// everywhere (`main.rs::block_on` drives every subcommand including the
-/// TUI and `acp_main`; `doctor.rs` builds its own `current_thread` runtime
-/// too) as a deliberate cold-start choice, so there is no `multi_thread`
-/// `Builder` anywhere to attach `.worker_threads()`/`.max_blocking_threads()`
-/// to yet. Sizing the runtime pools is the
-/// concurrency owner's job per the index's Ownership paragraph; a consuming
-/// plan only creates the semaphore budget and threads it through.
+///
+/// Of the two Layer-C knobs, only `blocking_threads` is actually wired:
+/// `main.rs::block_on` calls `.max_blocking_threads()` on hotl's existing
+/// `current_thread` runtime builder — a call valid on any runtime flavor —
+/// sizing the pool `glob`'s `spawn_blocking` tree walk (the sole real
+/// blocking-pool user) draws from. `worker_threads` stays deliberately
+/// inert: it only applies to a `multi_thread` runtime, and hotl runs a
+/// single `current_thread` runtime everywhere (`main.rs::block_on` drives
+/// every subcommand including the TUI and `acp_main`; `doctor.rs` builds its
+/// own `current_thread` runtime too) by design — switching flavors to honor
+/// it risks breaking `!Send` futures across the TUI/actor code, which is out
+/// of scope here. `agent::layer_c_warning` surfaces that inertness at
+/// startup so a configured `worker_threads` is visible, not a silent no-op.
 #[derive(Debug, Default, Deserialize)]
 pub struct ConcurrencyCfg {
-    /// Concurrent sub-agent LLM sessions (unused until a fan-out plan lands).
+    /// Concurrent sub-agent LLM sessions — governs `spawn`'s fan-out.
     pub agents: Option<usize>,
     /// Concurrent `web_fetch`/`web_search` HTTP requests — governs
     /// `web_fetch`'s multi-URL batch today.
@@ -251,11 +254,12 @@ pub struct ConcurrencyCfg {
     /// Concurrent `bash`/`grep`/hook child processes (unused until a
     /// subprocess-fan-out plan lands).
     pub subprocs: Option<usize>,
-    /// Reserved: tokio worker-thread pool size (`0` = num_cpus). Parsed, not
-    /// yet consumed — see the struct doc.
+    /// Reserved: tokio worker-thread pool size (`0` = num_cpus). Parsed, but
+    /// deliberately inert — see the struct doc.
     pub worker_threads: Option<usize>,
-    /// Reserved: `spawn_blocking` pool cap. Parsed, not yet consumed — see
-    /// the struct doc.
+    /// `spawn_blocking` pool cap (index default 16; tokio's own default is
+    /// 512 if unset). Wired: `main.rs::block_on` applies it to the
+    /// `current_thread` runtime's blocking pool.
     pub blocking_threads: Option<usize>,
 }
 

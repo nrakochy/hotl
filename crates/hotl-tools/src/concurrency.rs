@@ -14,11 +14,13 @@
 //! semaphores, not a fresh independent budget — into every registry/builder
 //! that needs it, so parent + every child draw from one shared pool.
 //!
-//! This module is owned here (built ahead of the subagent plan that
-//! ordinarily introduces it) so `web_fetch`'s concurrent multi-URL fetch has
-//! somewhere real to acquire a `request()` permit; `agent()`/`subproc()` are
-//! unused today and wait for the plans that fan out sub-agents and
-//! subprocesses to draw on them.
+//! This module was originally built ahead of the subagent plan that
+//! ordinarily introduces it, so `web_fetch`'s concurrent multi-URL fetch had
+//! somewhere real to acquire a `request()` permit. `agent()` is now consumed
+//! by `spawn` (`hotl::spawn::SpawnTool`, held for a child's whole lifetime,
+//! acquired right before `ChildBuilder::build`/`build_fork`) — the runaway
+//! sub-agent-spawn guard. `subproc()` is still unused, waiting for a
+//! subprocess-fan-out plan to draw on it.
 
 use std::sync::Arc;
 

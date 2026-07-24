@@ -224,13 +224,37 @@ fn parse_serve_args(args: &[String]) -> (String, Option<String>, Option<String>)
 }
 
 /// One-shot CLI paths run current_thread per the async policy (no pool
-/// spinup on the cold-start path).
+/// spinup on the cold-start path). `[concurrency].blocking_threads` sizes
+/// the *blocking* pool (`.max_blocking_threads`) on this same
+/// `current_thread` builder — that call is valid on any runtime flavor
+/// (unlike `.worker_threads()`, which only applies to `multi_thread` and
+/// stays deliberately inert; see `agent::layer_c_warning`) and is the one
+/// Layer-C lever that actually matters here: it bounds `glob`'s
+/// `spawn_blocking` tree walk, the sole real blocking-pool user in hotl
+/// today. Read once, synchronously, before the runtime exists — config
+/// loading itself needs no async.
 fn block_on(f: impl std::future::Future<Output = i32>) -> i32 {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-        .block_on(f)
+    let mut builder = tokio::runtime::Builder::new_current_thread();
+    builder.enable_all();
+    if let Some(n) = resolve_blocking_threads() {
+        builder.max_blocking_threads(n);
+    }
+    builder.build().expect("tokio runtime").block_on(f)
+}
+
+/// `[concurrency].blocking_threads` (env `HOTL_CONCURRENCY_BLOCKING_THREADS`
+/// wins over config.toml), reusing the exact same env-over-config precedence
+/// `agent::layer_c_resolved` already implements. `None` = the owner never
+/// set it — leave tokio's own default (512) alone. `Some(0)` (an explicit,
+/// degenerate override) is clamped to 1: a 0-thread blocking pool would hang
+/// every `spawn_blocking` caller forever, which is worse than ignoring a
+/// nonsensical value — the same "never deadlock the budget" stance
+/// `SessionConcurrency` takes for its own zero-limit case.
+fn resolve_blocking_threads() -> Option<usize> {
+    let secrets = hotl_platform::EnvSecrets;
+    let cfg = crate::config::Config::load(&agent::config_dir());
+    let (_worker_threads, blocking_threads) = agent::layer_c_resolved(&secrets, &cfg.concurrency);
+    blocking_threads.map(|n| n.max(1))
 }
 
 #[cfg(test)]
