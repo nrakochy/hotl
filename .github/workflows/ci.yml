@@ -71,6 +71,32 @@ jobs:
           cargo test -p hotl-tools --features security-enforced --locked
           cargo test -p hotl --features security-enforced --locked
 
+  # MSRV floor gate. `rust-version` in Cargo.toml was declared but unverified —
+  # every other job is @stable, so nothing caught the floor drifting upward.
+  # This matters beyond tidiness: if MSRV climbs past what a nixpkgs stable
+  # release ships, hotl gets dropped from that channel.
+  #
+  # The toolchain is derived from Cargo.toml rather than hardcoded, for the
+  # same reason flake.nix derives the version — a literal here would be one
+  # more thing release-time edits must remember.
+  #
+  # `--locked` also catches a Cargo.lock drifted from Cargo.toml, which would
+  # break the nix build: buildRustPackage vendors strictly from the lockfile.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        run: echo "v=$(grep -m1 '^rust-version = ' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.v }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+      - name: Check at the declared MSRV
+        run: cargo check --workspace --locked --all-targets
+
   # Docs-site build guard: catches a broken page, link, or config in site/
   # before release day (docs.yml deploys the site on `release: published`).
   docs:
