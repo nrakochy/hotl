@@ -286,6 +286,10 @@ pub struct Replayed {
     /// child wins) — a raw string, forward-compat; the engine maps it to
     /// `PermissionMode`. `None` = no mode was ever set (use the process default).
     pub mode: Option<String>,
+    /// The session's todo checklist (last `Todos` entry in the chain, child
+    /// wins) — same last-wins, log-only shape as `mode`/`name`. Empty = no
+    /// list was ever set (a resumed session starts with none, same as fresh).
+    pub todos: Vec<hotl_types::Todo>,
     /// Integrity warnings (a broken `parent_id` chain — H-12). Empty is clean.
     /// Replay is defensive regardless (indices clamped, unknowns degraded), so
     /// a warning means "this log was edited/corrupted since it was written",
@@ -298,12 +302,21 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut warnings = Vec::new();
     let mut name = None;
     let mut mode = None;
-    let header = apply_log(path, &mut items, &mut warnings, &mut name, &mut mode)?;
+    let mut todos = Vec::new();
+    let header = apply_log(
+        path,
+        &mut items,
+        &mut warnings,
+        &mut name,
+        &mut mode,
+        &mut todos,
+    )?;
     Ok(Replayed {
         header,
         items,
         name,
         mode,
+        todos,
         warnings,
     })
 }
@@ -340,18 +353,27 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let (_, newest_header) = lineage.first().cloned().ok_or("empty lineage")?;
     let mut items = Vec::new();
     let mut warnings = Vec::new();
-    // Parent-first, so a child's rename/mode-set naturally overwrites the
-    // parent's.
+    // Parent-first, so a child's rename/mode-set/todos naturally overwrites
+    // the parent's.
     let mut name = None;
     let mut mode = None;
+    let mut todos = Vec::new();
     for (path, _) in lineage.iter().rev() {
-        apply_log(path, &mut items, &mut warnings, &mut name, &mut mode)?;
+        apply_log(
+            path,
+            &mut items,
+            &mut warnings,
+            &mut name,
+            &mut mode,
+            &mut todos,
+        )?;
     }
     Ok(Replayed {
         header: newest_header,
         items,
         name,
         mode,
+        todos,
         warnings,
     })
 }
@@ -367,6 +389,7 @@ fn apply_log(
     warnings: &mut Vec<String>,
     name: &mut Option<String>,
     mode: &mut Option<String>,
+    todos: &mut Vec<hotl_types::Todo>,
 ) -> Result<hotl_types::SessionHeader, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut header = None;
@@ -419,12 +442,11 @@ fn apply_log(
             // the projection. Last one wins, exactly like the display name.
             EntryPayload::ModeSet { mode: m } => *mode = Some(m),
             // Log-only durable snapshot of the todo checklist (tier-1 gap
-            // #3). Not surfaced here: it never rides in the projection, and
-            // wiring a resumed session's *starting* list back into a fresh
-            // actor is deliberately deferred (a follow-up "stale todo on
-            // resume" feature) — this replay path only needs to compile
-            // against the new variant, not restore it.
-            EntryPayload::Todos { .. } => {}
+            // #3), exactly like `Rename`/`ModeSet`: never rides the
+            // projection, last one wins. The resumed actor's *starting* list
+            // is seeded from this (see `SessionDeps::initial_todos`), not
+            // replayed into `items`.
+            EntryPayload::Todos { items: list } => *todos = list,
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {
             }
         }
@@ -483,7 +505,7 @@ pub fn list_sessions(dir: &Path) -> Vec<(String, PathBuf, std::time::SystemTime)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hotl_types::Item;
+    use hotl_types::{Item, Todo, TodoStatus};
 
     #[test]
     fn log_appends_chain_and_masks_secrets() {
@@ -787,6 +809,54 @@ mod tests {
             replayed.items.is_empty(),
             "mode_set is not a projection item"
         );
+    }
+
+    #[test]
+    fn todos_replay_last_one_wins_and_never_enter_the_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(
+            &EntryPayload::Todos {
+                items: vec![Todo {
+                    content: "first".into(),
+                    status: TodoStatus::Pending,
+                    active_form: None,
+                }],
+            },
+            2,
+        )
+        .unwrap();
+        let second = vec![
+            Todo {
+                content: "second".into(),
+                status: TodoStatus::InProgress,
+                active_form: None,
+            },
+            Todo {
+                content: "third".into(),
+                status: TodoStatus::Pending,
+                active_form: None,
+            },
+        ];
+        log.append(
+            &EntryPayload::Todos {
+                items: second.clone(),
+            },
+            3,
+        )
+        .unwrap();
+
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.todos, second);
+        assert!(replayed.items.is_empty(), "todos is not a projection item");
+    }
+
+    #[test]
+    fn unset_session_has_no_todos() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        assert_eq!(replay(log.path()).unwrap().todos, Vec::<Todo>::new());
     }
 
     #[test]

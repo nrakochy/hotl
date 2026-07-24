@@ -34,6 +34,7 @@ async fn set_mode_appends_a_durable_entry() {
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
 
@@ -89,6 +90,7 @@ async fn set_mode_takes_effect_on_the_running_session() {
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
 
@@ -155,6 +157,7 @@ async fn set_mode_auto_stays_auto_on_a_normal_build() {
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
 

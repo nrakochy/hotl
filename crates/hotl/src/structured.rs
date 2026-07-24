@@ -172,6 +172,7 @@ mod tests {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
+            initial_todos: Vec::new(),
             config: EngineConfig {
                 max_turns: 4,
                 ..Default::default()

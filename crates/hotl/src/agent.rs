@@ -27,6 +27,10 @@ pub(crate) struct Resumed {
     /// inheritance shape as the display name). `None` = the parent never
     /// left its startup default, so the resumed session keeps its own.
     pub mode: Option<String>,
+    /// The parent's last `Todos` snapshot, if any (durable, last-wins —
+    /// same inheritance shape as `mode`/`name`). Empty = the parent never
+    /// had a list, so the resumed session starts with none, same as fresh.
+    pub todos: Vec<hotl_types::Todo>,
 }
 
 pub async fn agent_main(args: Vec<String>) -> i32 {
@@ -99,7 +103,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
     items.push(crate::structured::contract_item(&schema));
     let mut handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
-        let mut deps = scaffold.deps(log, None, items, None);
+        let mut deps = scaffold.deps(log, None, items, None, Vec::new());
         deps.registry = registry;
         deps
     });
@@ -167,6 +171,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
                     items,
                     name: inherited,
                     mode,
+                    todos,
                     ..
                 } = replayed;
                 // An explicit rename-on-resume beats the inherited name.
@@ -176,6 +181,7 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
                         parent_id: header.session_id,
                         items,
                         mode,
+                        todos,
                     }),
                     name,
                 )
@@ -213,11 +219,21 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
                 scaffold.clock.now_ms(),
             );
         }
+        // Unlike name/mode, the inherited todos are *not* copy-forwarded
+        // into this log: `hotl_store::replay`/`session_name` never need a
+        // single-file todos scan the way listing needs the name, and
+        // re-appending here would durably log a second `Todos` entry this
+        // session never actually wrote (`SetTodos` was never called). The
+        // list instead seeds the actor's starting state directly below.
+        let inherited_todos = resumed
+            .as_ref()
+            .map(|r| r.todos.clone())
+            .unwrap_or_default();
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
         let handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
-            let mut deps = scaffold.deps(log, snapshots, initial, mode_override);
+            let mut deps = scaffold.deps(log, snapshots, initial, mode_override, inherited_todos);
             deps.registry = registry;
             deps
         });
@@ -268,7 +284,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
     let handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
-        let mut deps = scaffold.deps(log, snapshots, initial_items, None);
+        let mut deps = scaffold.deps(log, snapshots, initial_items, None, Vec::new());
         deps.registry = registry;
         deps
     });
@@ -385,13 +401,17 @@ impl Scaffold {
     /// from its own history (the copy-forward `ModeSet`) instead of the
     /// process-wide startup default — a per-session `Rules` clone, not a
     /// mutation of the shared one (every other session in this process must
-    /// keep its own default).
+    /// keep its own default). `initial_todos` is the same idea for the todo
+    /// checklist (the replayed `Todos` entry) — threaded straight to the
+    /// actor's starting `todos`, not re-logged (see
+    /// `SessionDeps::initial_todos`).
     fn deps(
         &self,
         log: SessionLog,
         snapshots: Option<Arc<dyn hotl_engine::Snapshotter>>,
         initial_items: Vec<hotl_types::Item>,
         mode_override: Option<hotl_tools::rules::PermissionMode>,
+        initial_todos: Vec<hotl_types::Todo>,
     ) -> SessionDeps {
         let rules = match mode_override {
             Some(m) => Arc::new((*self.rules).clone().with_mode(m)),
@@ -409,6 +429,7 @@ impl Scaffold {
             snapshots,
             hooks: self.hooks.clone(),
             initial_items,
+            initial_todos,
             config: self.config.clone(),
         }
     }
@@ -465,7 +486,7 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
     let handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
-        let mut deps = scaffold.deps(log, snapshots, initial_items, None);
+        let mut deps = scaffold.deps(log, snapshots, initial_items, None, Vec::new());
         deps.registry = registry;
         deps
     });
@@ -489,15 +510,30 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
 /// registry clone (cheap — `Registry` is Arc-backed) with a sink bound to
 /// that particular session, so a child's `todo_write` can never write into
 /// its parent's list or vice versa.
+///
+/// The sink captures a *weak* sender (`cmd_tx.downgrade()`), upgraded on
+/// each send, mirroring the actor's own weak-sender pattern
+/// (`hotl_engine::spawn_session_with`: "the actor gets only a weak sender").
+/// The registry this sink lives in becomes `SharedDeps.registry`, which the
+/// actor holds for the whole of `run()` — a *strong* clone here would be a
+/// reference cycle (the actor holding, via its own registry, a strong
+/// sender to the very channel it's waiting to see close) and the actor task
+/// would never exit: `cmd_rx.recv()` only returns `None` once every strong
+/// sender (the handle, and any in-flight turn task) is gone, and this sink
+/// would count as one, forever. An upgrade failure (the handle already
+/// dropped, so the channel is closing) just drops the send — nothing is
+/// listening for it any more anyway.
 fn spawn_session_with_todos(
     mut registry: Registry,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
     let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
-    let tx = cmd_tx.clone();
+    let weak = cmd_tx.downgrade();
     registry.register(Box::new(hotl_tools::TodoWriteTool::new(Arc::new(
         move |items| {
-            let _ = tx.try_send(hotl_engine::SessionCmd::SetTodos(items));
+            if let Some(tx) = weak.upgrade() {
+                let _ = tx.try_send(hotl_engine::SessionCmd::SetTodos(items));
+            }
         },
     ))));
     let deps = build_deps(Arc::new(registry));
@@ -622,6 +658,7 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
+            initial_todos: Vec::new(),
             config: self.config.clone(),
         }))
     }
@@ -1506,6 +1543,7 @@ mod tests {
             snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
+            initial_todos: Vec::new(),
             config,
         });
         handle.prompt("go".into()).await;
@@ -1526,6 +1564,69 @@ mod tests {
         let items = seen.expect("todo_write should have reached this session's own actor");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].content, "wire it up");
+    }
+
+    /// Regression for the reference-cycle leak: before the fix, the
+    /// `todo_write` sink held a *strong* `SessionCmd` sender clone inside
+    /// the registry the actor holds for `run()`'s whole lifetime, so
+    /// `cmd_rx.recv()` never saw the strong-sender count reach zero and the
+    /// actor task ran forever — leaking the actor, its session-log file
+    /// handle, and its projection memory for every session that ever
+    /// closed. The sink now holds a weak sender (upgraded on send), same as
+    /// the actor's own `cmd_tx`, so dropping the handle (the last strong
+    /// sender, since no turn is in flight) must let the actor exit — which
+    /// is only observable, from outside the engine crate, as its `events`
+    /// sender clone dropping and closing the channel.
+    #[tokio::test]
+    async fn dropping_the_handle_lets_a_todo_wired_actor_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig::default();
+        let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).unwrap();
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        // Destructure the constructor's return value directly (never bind it
+        // to a `handle` local first): only then does the unbound part of the
+        // pattern — the strong `cmd` sender and the interrupt token,
+        // `SessionHandle`'s other, private, fields; `..` needs no visibility
+        // into them — drop *at this statement*, rather than lingering as an
+        // anonymous temporary until the end of the function's scope (which
+        // would defeat the point — the actor must be observed to exit
+        // *before* the assertion below, not merely by the time the test
+        // function itself ends).
+        let SessionHandle { mut events, .. } =
+            spawn_session_with_todos(Registry::builtin(), |registry| SessionDeps {
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                snapshots: None,
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                config,
+            });
+
+        // With no turn ever started, the only strong `SessionCmd` sender was
+        // the handle's own — dropping it should let `cmd_rx.recv()` return
+        // `None` right away, the actor loop exit, and its `events` sender
+        // clone (the last one, since no turn task ever ran) drop with it,
+        // closing this channel. Before the fix this hung until the timeout:
+        // the todo_write sink's strong sender clone, reachable through the
+        // actor's own registry, kept the count above zero forever.
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while events.recv().await.is_some() {}
+        })
+        .await;
+        assert!(
+            drained.is_ok(),
+            "actor task never exited after the handle was dropped — leaked \
+             (reference cycle via a strong todo_write sink sender)"
+        );
     }
 
     #[test]

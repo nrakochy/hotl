@@ -36,6 +36,7 @@ fn session(provider: Arc<dyn Provider>, initial_items: Vec<Item>) -> Session {
         snapshots: None,
         hooks: None,
         initial_items,
+        initial_todos: Vec::new(),
         config,
     });
     Session { handle, _dir: dir }

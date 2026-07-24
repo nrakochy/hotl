@@ -72,6 +72,7 @@ fn session(provider: Arc<dyn Provider>, config: EngineConfig) -> Session {
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
     Session {

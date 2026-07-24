@@ -132,7 +132,9 @@ pub(crate) async fn run(
     // session context. It never lives in `items` — it's stitched onto the
     // snapshot answer only, the same "ephemeral, request-only" shape as the
     // MOIM turn-context block, so it never enters the durable projection.
-    let mut todos: Vec<Todo> = Vec::new();
+    // A resumed session seeds this from its replayed `Todos` entry
+    // (`SessionDeps::initial_todos`); a fresh session starts empty.
+    let mut todos: Vec<Todo> = std::mem::take(&mut deps.initial_todos);
     // Steers that arrived while a tool batch was open, waiting for its results
     // to close the pairing before they can be appended.
     let mut held_steers: Vec<String> = Vec::new();

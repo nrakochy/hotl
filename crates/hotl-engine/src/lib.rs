@@ -269,6 +269,13 @@ pub struct SessionDeps {
     /// Extension hooks (M5); None = no hooks.
     pub hooks: Option<Arc<dyn hooks::Hooks>>,
     pub initial_items: Vec<Item>,
+    /// The todo checklist a resumed session starts with (the replayed
+    /// session's last durable `Todos` entry — see `hotl_store::Replayed`).
+    /// Empty for a fresh session. Seeds the actor's live `todos`, not
+    /// `initial_items`: it never rode the projection, so it must not
+    /// re-enter through it, and seeding here (vs. a post-spawn `SetTodos`)
+    /// means resume never appends a duplicate `Todos` log entry.
+    pub initial_todos: Vec<Todo>,
     pub config: EngineConfig,
 }
 

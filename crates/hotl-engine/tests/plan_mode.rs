@@ -55,6 +55,7 @@ async fn plan_mode_denies_write_tool_result() {
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
     let mut s = Session { handle, dir };
@@ -167,6 +168,7 @@ async fn plan_mode_does_not_block_a_read_only_tool_that_still_asks() {
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
     let mut s = Session { handle, dir };

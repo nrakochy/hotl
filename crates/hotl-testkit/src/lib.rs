@@ -172,6 +172,7 @@ impl Harness {
             snapshots: Some(Arc::new(RecordingSnapshotter(snapshots.clone()))),
             hooks,
             initial_items,
+            initial_todos: Vec::new(),
             config,
         };
         let handle = spawn_session(deps);

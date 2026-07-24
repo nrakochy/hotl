@@ -42,6 +42,7 @@ async fn set_todos_appends_a_durable_entry_and_emits_todos_changed() {
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
 
@@ -101,6 +102,7 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
         snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
+        initial_todos: Vec::new(),
         config,
     });
 
@@ -141,5 +143,103 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
             }
         )),
         "the todo reminder must never land in the durable projection"
+    );
+}
+
+/// Task 3 Step 1(c): a resumed actor's live todos come back from the
+/// replayed log — mirrors the `Rename`/`ModeSet` resume-inheritance shape.
+/// This drives `SessionDeps::initial_todos` (the seeding mechanism) the same
+/// way `hotl`'s `session/load` resume path does: replay the parent log, then
+/// hand the replayed `todos` to a fresh actor's starting state — never a
+/// post-spawn `SetTodos` call, so resume never appends a second `Todos`
+/// entry to the log.
+#[tokio::test]
+async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = EngineConfig::default();
+
+    // The "parent" session: durably records a todo list, same as a real
+    // `todo_write` call would via `SetTodos`.
+    let mut parent_log =
+        SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
+    let parent_path = parent_log.path().to_path_buf();
+    let restored = vec![todo("finish the gate", TodoStatus::InProgress)];
+    parent_log
+        .append(
+            &EntryPayload::Todos {
+                items: restored.clone(),
+            },
+            1,
+        )
+        .expect("append todos");
+    drop(parent_log);
+
+    let replayed = hotl_store::replay(&parent_path).expect("replay");
+    assert_eq!(
+        replayed.todos, restored,
+        "sanity: the fixture actually replays"
+    );
+
+    // The "resumed" session: a fresh log/actor seeded from the replayed
+    // todos — no `set_todos()` call on this handle at all.
+    let child_log =
+        SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
+    let child_log_path = child_log.path().to_path_buf();
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "ok",
+    )]));
+    let mut handle = spawn_session(SessionDeps {
+        provider: provider.clone(),
+        registry: Arc::new(Registry::builtin()),
+        rules: Arc::new(Rules::default()),
+        sandbox_enforced: false,
+        clock: Arc::new(SystemClock),
+        log: child_log,
+        system: "sys".into(),
+        cwd: dir.path().to_path_buf(),
+        snapshots: None,
+        hooks: None,
+        initial_items: Vec::new(),
+        initial_todos: replayed.todos,
+        config,
+    });
+
+    handle.prompt("go".into()).await;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
+        if matches!(ev, EngineEvent::TurnDone { .. }) {
+            break;
+        }
+    }
+
+    // The seeded list reached `turn.rs`'s reminder injection, same as a live
+    // `set_todos()` would — proving the actor's *starting* state carried it.
+    let request = provider.last_request().expect("one request");
+    let last = request.items.last().expect("non-empty snapshot");
+    match last {
+        Item::User { text, synthetic } => {
+            assert_eq!(*synthetic, Some(SyntheticReason::Todos));
+            assert!(text.contains("[~] finish the gate"), "text: {text}");
+        }
+        other => panic!("expected the todo reminder last, got {other:?}"),
+    }
+
+    // Seeding must not re-log: the resumed session's own log carries no
+    // `Todos` entry of its own (it never called `SetTodos`).
+    let logged: Vec<Vec<Todo>> = std::fs::read_to_string(&child_log_path)
+        .expect("read log")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
+        .filter_map(|e| match e.payload {
+            EntryPayload::Todos { items } => Some(items),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        logged.is_empty(),
+        "seeding initial_todos must not append a duplicate durable Todos entry: {logged:?}"
     );
 }

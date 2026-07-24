@@ -53,6 +53,7 @@ fn scripted_factory() -> acp::SessionFactory {
                 snapshots: None,
                 hooks: None,
                 initial_items: Vec::new(),
+                initial_todos: Vec::new(),
                 config: EngineConfig {
                     max_turns: 6,
                     ..Default::default()
