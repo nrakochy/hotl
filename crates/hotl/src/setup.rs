@@ -38,7 +38,7 @@ pub const DEFAULT_CONFIG: &str = "\
 
 [behavior]
 # sandbox = true             # false disables the bash sandbox floor
-# vim_mode = true            # vim-style keys in the console's input editor
+# vim_mode = false           # true = vim-style keys in the console's input editor
 
 [permissions]
 mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.

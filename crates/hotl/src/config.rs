@@ -182,8 +182,23 @@ pub struct ContextCfg {
 pub struct BehaviorCfg {
     /// `false` disables the bash sandbox floor.
     pub sandbox: Option<bool>,
-    /// Vim-style keys in the TUI input editor (default on, matching watch).
+    /// Vim-style keys in the console's input editor. Resolve via
+    /// [`BehaviorCfg::vim_mode`] — absent means **off**.
     pub vim_mode: Option<bool>,
+}
+
+impl BehaviorCfg {
+    /// Default **off**: a modal editor is a trap for anyone who doesn't
+    /// already have the muscle memory — one stray `Esc` and typing stops
+    /// inserting. Vim users opt in with `[behavior] vim_mode = true`.
+    ///
+    /// This is deliberately the opposite of `hotl watch`'s `[settings]
+    /// vim_mode`, which stays on: there the letter keys are *additive* over a
+    /// read-only list (arrows, `enter`, `q`, and `r` work either way), so
+    /// leaving them on strands nobody.
+    pub fn vim_mode(&self) -> bool {
+        self.vim_mode.unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -561,6 +576,19 @@ mod tests {
         let cfg = cfg_with("[behavior]\nvim_mode = false\n");
         assert_eq!(cfg.behavior.vim_mode, Some(false));
         assert_eq!(cfg_with("").behavior.vim_mode, None);
+    }
+
+    #[test]
+    fn vim_mode_resolves_off_unless_opted_in() {
+        // Absent section, and an explicit `false`: plain insert-mode editing.
+        assert!(!cfg_with("").behavior.vim_mode());
+        assert!(!cfg_with("[behavior]\nvim_mode = false\n")
+            .behavior
+            .vim_mode());
+        // Only an explicit `true` turns the modal editor on.
+        assert!(cfg_with("[behavior]\nvim_mode = true\n")
+            .behavior
+            .vim_mode());
     }
 
     #[test]

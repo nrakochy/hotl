@@ -46,7 +46,7 @@ show_used_pct = true       # show context-fullness in each turn's status
 
 [behavior]
 sandbox = true             # false disables the bash sandbox floor
-vim_mode = true            # vim-style keys in the console's input editor
+vim_mode = false           # true = vim-style keys in the console's input editor
 
 [permissions]
 mode = "auto"   # "auto" | "ask" | "plan" | "dontask"

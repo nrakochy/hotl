@@ -89,7 +89,8 @@ Keys:
 - `r` — refresh now · `q` or `Ctrl-c` — quit
 
 (`Ctrl`/arrow keys work regardless of `vim_mode`; the letter bindings require
-`vim_mode = true`, the default.)
+`[settings] vim_mode = true`, the default for `watch`. The agent console's
+input editor is a separate key, `[behavior] vim_mode`, which defaults **off**.)
 
 ### tmux + vim-tmux-navigator
 
@@ -123,7 +124,10 @@ Optional `~/.config/hotl/config.toml` (absent → sensible defaults):
     ping_on_blocked = true         # watch: audible ping when an agent needs input
     poll_interval_ms = 1000        # watch: scan cadence
     agents = ["claude", "codex", "hotl"]   # watch: process names counted as agents
-    vim_mode = true                # vim keys in both surfaces; false = arrows only
+    vim_mode = true                # watch: vim letter keys; false = arrows only
+
+    [behavior]
+    vim_mode = false               # agent console: true = modal vim input editor
 
     [permissions]
     mode = "auto"                  # agent: "ask" = y/n on every mutating call

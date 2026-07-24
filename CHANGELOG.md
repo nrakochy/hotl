@@ -6,6 +6,18 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **The console's vim input editor is now opt-in.** `[behavior] vim_mode`
+  defaults to `false`: the input is a plain insert-mode field, and `Esc` on an
+  empty input keeps its "interrupt the turn" meaning. A modal editor ambushes
+  anyone without the muscle memory — one stray `Esc` and typing stops
+  inserting — so it now waits to be asked for. Set `[behavior] vim_mode = true`
+  to get motions, operators, counts, and `Ctrl-e`/`:e` back. `hotl watch`'s
+  separate `[settings] vim_mode` is unaffected and stays **on**: there the
+  letter keys are additive over a read-only list, and arrows, `enter`, `q`, and
+  `r` work either way.
+
 ## [0.5.0] - 2026-07-24
 
 ### Added

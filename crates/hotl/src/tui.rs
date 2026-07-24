@@ -44,7 +44,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         Err(code) => return code,
     };
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
-    let vim_mode = cfg.behavior.vim_mode.unwrap_or(true);
+    let vim_mode = cfg.behavior.vim_mode();
     // Prompt-history tail, loaded (and startup-compacted) before the screen is
     // taken; the store is handed to the loop to append each submitted prompt.
     let (history_store, history) =

@@ -123,7 +123,9 @@ In headless (`-p`) or JSON mode there is no one to ask, so the question resolves
 
 ## Vim keys
 
-On by default; `vim_mode = false` under `[behavior]` in `config.toml` pins plain insert-mode editing ([configuration.md](../configuration/)).
+**Off by default** — the input editor is a plain insert-mode field unless you ask for more. Opt in with `vim_mode = true` under `[behavior]` in `config.toml` ([configuration.md](../configuration/)). Note that turning it on gives `Esc` its Normal-mode meaning, so interrupting a turn from an empty input moves to `Ctrl-C`.
+
+(`hotl watch`'s own `[settings] vim_mode` is a separate key and stays **on**: there the vim letters are additive over a read-only list, and arrows/`enter`/`q`/`r` work either way.)
 
 | Keys | Do |
 |---|---|
