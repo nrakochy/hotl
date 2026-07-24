@@ -106,6 +106,9 @@ pub struct State {
     /// Transcript spacing, from `[settings] density`. Drives the blank line
     /// between turns and the left-gutter width the role spine lives in.
     pub density: hotl_theme::Density,
+    /// The `todo_write` checklist, from `todos_changed` updates. Empty means
+    /// either no list yet or the model cleared it — both render as nothing.
+    pub todos: Vec<hotl_tools::todo::Todo>,
 }
 
 impl State {
@@ -125,6 +128,7 @@ impl State {
             mode: "ask".into(),
             skills: Vec::new(),
             density: hotl_theme::Density::default(),
+            todos: Vec::new(),
         }
     }
 
@@ -269,6 +273,13 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             enter_streaming(state);
         }
         "tool_auto_allowed" => state.pending_auto_rule = Some(text_of("rule")),
+        "todos_changed" => {
+            state.todos = v
+                .get("items")
+                .cloned()
+                .and_then(|items| serde_json::from_value(items).ok())
+                .unwrap_or_default();
+        }
         "retrying" => {
             let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
             notice(
@@ -693,6 +704,27 @@ mod tests {
             cmds[..],
             [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(_)]
         ));
+    }
+
+    #[test]
+    fn todos_changed_populates_state() {
+        let mut s = State::test_default();
+        assert!(s.todos.is_empty());
+        upd(
+            &mut s,
+            json!({"type":"todos_changed","items":[
+                {"content":"wire the gate","status":"in_progress"},
+                {"content":"write docs","status":"pending"}
+            ]}),
+        );
+        assert_eq!(s.todos.len(), 2);
+        assert_eq!(s.todos[0].content, "wire the gate");
+        assert_eq!(s.todos[0].status, hotl_tools::todo::TodoStatus::InProgress);
+
+        // A later `todos_changed` fully replaces the list (including down
+        // to empty — the model clearing it is a real, renderable state).
+        upd(&mut s, json!({"type":"todos_changed","items":[]}));
+        assert!(s.todos.is_empty());
     }
 
     #[test]

@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use hotl_context::{load_memory, load_system_prompt, project_instructions};
-use hotl_engine::{spawn_session, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
+use hotl_engine::{EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
 use hotl_platform::{Clock, EnvSecrets, SecretStore, SystemClock};
 use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
 use hotl_store::{Masker, SessionLog};
@@ -98,7 +98,11 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     }
     let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
     items.push(crate::structured::contract_item(&schema));
-    let mut handle = spawn_session(scaffold.deps(log, None, items, None));
+    let mut handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
+        let mut deps = scaffold.deps(log, None, items, None);
+        deps.registry = registry;
+        deps
+    });
     match crate::structured::run_structured(
         &mut handle,
         &schema,
@@ -212,8 +216,13 @@ pub(crate) async fn acp_factory() -> Result<(crate::acp::SessionFactory, String,
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+        let handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
+            let mut deps = scaffold.deps(log, snapshots, initial, mode_override);
+            deps.registry = registry;
+            deps
+        });
         Ok(crate::acp::SessionOpen {
-            handle: spawn_session(scaffold.deps(log, snapshots, initial, mode_override)),
+            handle,
             name: requested,
         })
     });
@@ -258,7 +267,11 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     let session_id = log.session_id.clone();
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
-    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items, None));
+    let handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
+        let mut deps = scaffold.deps(log, snapshots, initial_items, None);
+        deps.registry = registry;
+        deps
+    });
     crate::session_server::serve(id, handle, prompt).await
 }
 
@@ -451,7 +464,11 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     std::thread::spawn(move || crate::gc::auto_gc(&gc_config_dir)); // retention, off the hot path
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
-    let handle = spawn_session(scaffold.deps(log, snapshots, initial_items, None));
+    let handle = spawn_session_with_todos((*scaffold.registry).clone(), |registry| {
+        let mut deps = scaffold.deps(log, snapshots, initial_items, None);
+        deps.registry = registry;
+        deps
+    });
 
     let mut surface = Surface::new(handle, json_events);
     surface
@@ -459,6 +476,32 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
         .prompt(crate::setup::expand_file_refs(&prompt))
         .await;
     surface.run_until_idle().await
+}
+
+/// Spawn a session with `todo_write` registered and wired to *its own*
+/// actor. The tool's sink needs a live sender before the actor exists (the
+/// registry is part of `SessionDeps`, which has to be built before
+/// `spawn_session` runs), so the channel is split via
+/// `hotl_engine::session_channel`/`spawn_session_with` — the same "reach the
+/// actor through an mpsc `SessionCmd` sender" shape `spawn`'s child wiring
+/// uses, but pointed at this session rather than a new child. Every session
+/// (top-level and child) gets its own list: each call here builds a fresh
+/// registry clone (cheap — `Registry` is Arc-backed) with a sink bound to
+/// that particular session, so a child's `todo_write` can never write into
+/// its parent's list or vice versa.
+fn spawn_session_with_todos(
+    mut registry: Registry,
+    build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
+) -> SessionHandle {
+    let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
+    let tx = cmd_tx.clone();
+    registry.register(Box::new(hotl_tools::TodoWriteTool::new(Arc::new(
+        move |items| {
+            let _ = tx.try_send(hotl_engine::SessionCmd::SetTodos(items));
+        },
+    ))));
+    let deps = build_deps(Arc::new(registry));
+    hotl_engine::spawn_session_with(deps, cmd_tx, cmd_rx)
 }
 
 /// Builtins + the `mcp` meta-tool (M3a) + the `spawn` tool (M4) when a child
@@ -567,9 +610,9 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
             .map(hotl_tools::diagnostics::Diagnostics::from_toml)
             .unwrap_or_default();
         let registry = Registry::builtin_with(diagnostics);
-        Ok(spawn_session(SessionDeps {
+        Ok(spawn_session_with_todos(registry, |registry| SessionDeps {
             provider: self.provider.clone(),
-            registry: Arc::new(registry),
+            registry,
             rules: self.rules.clone(),
             sandbox_enforced: self.sandbox_enforced,
             clock: self.clock.clone(),
@@ -1432,6 +1475,57 @@ mod tests {
         let empty = tempfile::tempdir().unwrap();
         let (_registry, names) = build_registry(&cfg, empty.path(), None);
         assert!(names.is_empty(), "{names:?}");
+    }
+
+    /// `todo_write`, registered by `spawn_session_with_todos` (not
+    /// `build_registry` — it needs a sink wired to *this* session's own
+    /// actor), actually reaches that same session's `SetTodos` handling —
+    /// not a no-op, not another session's actor.
+    #[tokio::test]
+    async fn todo_write_reaches_its_own_sessions_actor() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig::default();
+        let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).unwrap();
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::tool_call(
+                "t1",
+                "todo_write",
+                serde_json::json!({"todos": [{"content": "wire it up", "status": "in_progress"}]}),
+            ),
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        let mut handle = spawn_session_with_todos(Registry::builtin(), |registry| SessionDeps {
+            provider,
+            registry,
+            rules: Arc::new(hotl_tools::rules::Rules::default()),
+            sandbox_enforced: false,
+            clock: Arc::new(SystemClock),
+            log,
+            system: "sys".into(),
+            cwd: dir.path().to_path_buf(),
+            snapshots: None,
+            hooks: None,
+            initial_items: Vec::new(),
+            config,
+        });
+        handle.prompt("go".into()).await;
+
+        let mut seen = None;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if let EngineEvent::TodosChanged { items } = &ev {
+                seen = Some(items.clone());
+            }
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                break;
+            }
+        }
+        let items = seen.expect("todo_write should have reached this session's own actor");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].content, "wire it up");
     }
 
     #[test]

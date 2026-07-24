@@ -664,6 +664,30 @@ mod tests {
     }
 
     #[test]
+    fn strip_renders_todo_progress_and_the_active_items_text() {
+        let mut s = State::new(true, "m".into());
+        s.todos = vec![
+            hotl_tools::todo::Todo {
+                content: "done thing".into(),
+                status: hotl_tools::todo::TodoStatus::Completed,
+                active_form: None,
+            },
+            hotl_tools::todo::Todo {
+                content: "wire the gate".into(),
+                status: hotl_tools::todo::TodoStatus::InProgress,
+                active_form: Some("wiring the gate".into()),
+            },
+        ];
+        let rows = draw(&s);
+        assert!(rows[STRIP].contains("1/2"), "progress: {}", rows[STRIP]);
+        assert!(
+            rows[STRIP].contains("wiring the gate"),
+            "active item text: {}",
+            rows[STRIP]
+        );
+    }
+
+    #[test]
     fn waiting_ask_renders_modal_with_summary_and_protected_why() {
         let mut s = State::new(true, "m".into());
         s.phase = Phase::WaitingAsk {

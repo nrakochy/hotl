@@ -194,8 +194,11 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `bash` | Run a shell command under the sandbox floor. | Ask |
 | `glob` | List files under the working directory matching a filename pattern (`*.rs`, `**/*.toml`, or a bare substring); hidden/vendor directories (`.git`, `node_modules`, `target`) are skipped. In-process — no subprocess, so it still works with no `rg` on `PATH` or when the sandbox floor degrades. | None — read-only |
 | `grep` | Search file contents with ripgrep (`pattern` is a regex; optional `path`, `glob` filter, `files_only`). Runs through the same sandboxed command path as `bash`, so content search inherits the kernel write-confinement floor. | None — read-only |
+| `todo_write` | Replace the session's task checklist (every call sends the whole list). Keeps the model on-plan on long unattended runs and gives you a glanceable progress signal in the console strip. | None |
 
 `glob` and `grep` are workspace-scoped: an absolute path or a `..` escape outside the working directory is refused, and both run without a permission ask because that containment is what makes them safe reads. Both are parallel-safe, so a batch of several `glob`/`grep` calls in one turn runs concurrently.
+
+`todo_write` is session-scoped ephemeral context, not part of the model transcript: the current list rides into every request as a tagged reminder, but it never becomes part of the durable conversation the model reads back verbatim. A text-only reply with `pending`/`in_progress` items still open gets nudged to finish or update the list — bounded to at most two nudges per prompt, so it can never wedge an unattended run. Sub-agents spawned with the `spawn` tool get their own independent list, wired to their own session.
 
 ### Environment variables
 

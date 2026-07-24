@@ -38,7 +38,7 @@ fn draw_then_turn(ticks: u64) -> &'static str {
 pub fn strip_line(state: &State) -> String {
     let glyph = loop_glyph(&state.phase);
     let secs = |ticks: u64| ticks / 8;
-    match &state.phase {
+    let base = match &state.phase {
         Phase::Idle => match &state.usage_line {
             Some(usage) => format!("{RESTING} · {usage}"),
             None => RESTING.to_string(),
@@ -58,12 +58,78 @@ pub fn strip_line(state: &State) -> String {
         }
         Phase::WaitingAsk { .. } => format!("{GAP} waiting on you"),
         Phase::Compacting { .. } => format!("{glyph} folding history…"),
+    };
+    match todos_summary(&state.todos) {
+        Some(summary) => format!("{base} · {summary}"),
+        None => base,
+    }
+}
+
+/// The todo checklist's compact strip suffix: `"2/5 todos"`, or — while
+/// exactly one item is `in_progress` — `"2/5 · wiring the gate"` (its
+/// `active_form`, falling back to `content`). `None` when the list is empty:
+/// nothing rides the strip until there's something to show progress on.
+fn todos_summary(todos: &[hotl_tools::todo::Todo]) -> Option<String> {
+    if todos.is_empty() {
+        return None;
+    }
+    use hotl_tools::todo::TodoStatus;
+    let done = todos
+        .iter()
+        .filter(|t| t.status == TodoStatus::Completed)
+        .count();
+    let total = todos.len();
+    match todos.iter().find(|t| t.status == TodoStatus::InProgress) {
+        Some(t) => Some(format!(
+            "{done}/{total} {}",
+            t.active_form.as_deref().unwrap_or(&t.content)
+        )),
+        None => Some(format!("{done}/{total} todos")),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hotl_tools::todo::{Todo, TodoStatus};
+
+    fn todo(content: &str, status: TodoStatus, active_form: Option<&str>) -> Todo {
+        Todo {
+            content: content.into(),
+            status,
+            active_form: active_form.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn strip_line_carries_progress_and_the_active_items_text() {
+        let mut s = State::test_default();
+        assert_eq!(strip_line(&s), RESTING, "no todos: unchanged strip");
+
+        s.todos = vec![
+            todo("done thing", TodoStatus::Completed, None),
+            todo(
+                "wire the gate",
+                TodoStatus::InProgress,
+                Some("wiring the gate"),
+            ),
+            todo("write docs", TodoStatus::Pending, None),
+        ];
+        let line = strip_line(&s);
+        assert!(line.contains("1/3"), "progress count: {line}");
+        assert!(line.contains("wiring the gate"), "active item text: {line}");
+
+        // No item in progress: falls back to a bare count, no item text.
+        s.todos = vec![
+            todo("done thing", TodoStatus::Completed, None),
+            todo("write docs", TodoStatus::Pending, None),
+        ];
+        assert_eq!(strip_line(&s), format!("{RESTING} · 1/2 todos"));
+
+        // Cleared list: strip goes back to exactly the no-todos baseline.
+        s.todos.clear();
+        assert_eq!(strip_line(&s), RESTING);
+    }
 
     #[test]
     fn sampling_draws_then_turns() {

@@ -55,6 +55,12 @@ Top to bottom:
    | **the loop halted with a gap** · "waiting on you" | a permission ask — the gap is you; nothing moves until you answer |
    | the loop coiling up · "folding history…" | context compaction |
 
+   When the model has an active `todo_write` checklist, the strip also
+   carries a compact `done/total` count — and, while one item is
+   `in_progress`, that item's own label (e.g. `2/5 wiring the gate`) — so you
+   can see plan progress at a glance without opening the transcript. An
+   empty or never-started list shows nothing extra.
+
 3. **Input** — bordered editor, title shows `-- INSERT --` / `-- NORMAL --`.
 4. **Hint row** — the keys that matter right now.
 
