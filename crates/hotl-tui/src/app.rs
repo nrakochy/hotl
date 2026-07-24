@@ -6,6 +6,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hotl_tools::ask::{Question, QuestionOption};
 use serde_json::Value;
 
+use crate::complete::{self, Completion};
 use crate::vim::{Editor, EditorEvent};
 
 /// What the agent is doing right now. `ticks` count time *in this phase*
@@ -121,6 +122,15 @@ pub struct State {
     /// The `todo_write` checklist, from `todos_changed` updates. Empty means
     /// either no list yet or the model cleared it — both render as nothing.
     pub todos: Vec<hotl_tools::todo::Todo>,
+    /// Every completable `/` command: the built-ins, plus one row per skill
+    /// name the handshake advertised. Built once at startup.
+    pub commands: Vec<complete::Command>,
+    /// The open completion popup, or `None`. Derived from the editor buffer
+    /// after every keystroke — never a mode that can outlive what is typed.
+    pub completion: Option<Completion>,
+    /// Esc closed the popup; suppresses it until the buffer stops being a
+    /// `/` command, so the next fresh slash opens it again.
+    pub dismissed: bool,
 }
 
 impl State {
@@ -141,6 +151,9 @@ impl State {
             skills: Vec::new(),
             density: hotl_theme::Density::default(),
             todos: Vec::new(),
+            commands: complete::builtins(),
+            completion: None,
+            dismissed: false,
         }
     }
 
@@ -397,6 +410,41 @@ fn format_usage(usage: &Value) -> String {
     format!("{} in · {} out tok", n("input_tokens"), n("output_tokens"))
 }
 
+/// Recompute the popup from the editor buffer. Called after every key that
+/// reaches the editor and after a splice, so the popup is always a function
+/// of what is actually typed. A buffer that is no longer a `/` command
+/// re-arms `dismissed` — that is the only thing that clears it.
+fn refresh(state: &mut State) {
+    let text = state.editor.text();
+    if !text.starts_with('/') {
+        state.dismissed = false;
+    }
+    state.completion = complete::recompute(
+        &state.commands,
+        &text,
+        state.editor.cursor(),
+        state.dismissed,
+    );
+}
+
+/// Splice the highlighted command into the buffer. The spliced text carries a
+/// trailing space, so `refresh` closes the popup on the way out.
+fn accept_selected(state: &mut State) {
+    let Some(idx) = state
+        .completion
+        .as_ref()
+        .and_then(|c| c.matches.get(c.selected).copied())
+    else {
+        return;
+    };
+    let Some(name) = state.commands.get(idx).map(|c| c.name.clone()) else {
+        return;
+    };
+    let text = complete::accept(&state.editor.text(), state.editor.cursor(), &name);
+    state.editor.set_text(&text);
+    refresh(state);
+}
+
 fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     if state.help_open {
         state.help_open = false;
@@ -425,7 +473,40 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         state.help_open = true;
         return Vec::new();
     }
-    match state.editor.handle(key) {
+    // The popup owns these four keys while it is open. Esc is layered — it
+    // dismisses here and only reaches the editor's Insert→Normal transition
+    // on a second press. Enter splices and then falls through, so submitting
+    // takes its ordinary path.
+    if let Some(c) = &state.completion {
+        match key.code {
+            KeyCode::Up | KeyCode::Down => {
+                let last = c.matches.len().saturating_sub(1);
+                let next = if key.code == KeyCode::Up {
+                    c.selected.saturating_sub(1)
+                } else {
+                    (c.selected + 1).min(last)
+                };
+                if let Some(c) = &mut state.completion {
+                    c.selected = next;
+                }
+                return Vec::new();
+            }
+            KeyCode::Esc => {
+                state.dismissed = true;
+                state.completion = None;
+                return Vec::new();
+            }
+            KeyCode::Tab => {
+                accept_selected(state);
+                return Vec::new();
+            }
+            KeyCode::Enter => accept_selected(state),
+            _ => {}
+        }
+    }
+    let event = state.editor.handle(key);
+    refresh(state);
+    match event {
         EditorEvent::Submit(text) if text.trim().is_empty() => Vec::new(),
         EditorEvent::Submit(text) => {
             let cmds = submit(state, text.clone());
@@ -1111,6 +1192,125 @@ mod tests {
         assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Quit]));
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
         assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Cancel]));
+    }
+
+    fn with_skills(names: &[(&str, &str)]) -> State {
+        let mut s = State::test_default();
+        for (name, description) in names {
+            s.commands.push(crate::complete::Command {
+                name: (*name).into(),
+                description: (*description).into(),
+                builtin: false,
+            });
+            s.skills.push((*name).into());
+        }
+        s
+    }
+
+    fn selected(s: &State) -> String {
+        let c = s.completion.as_ref().expect("popup open");
+        s.commands[c.matches[c.selected]].name.clone()
+    }
+
+    #[test]
+    fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/");
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(4));
+        type_str(&mut s, "re");
+        assert_eq!(selected(&s), "rename");
+        // `rename` and `review` prefix-match; `plan` and `mode` contain no "re".
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(2));
+    }
+
+    #[test]
+    fn arrows_move_the_selection_and_saturate_at_both_ends() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/re");
+        press(&mut s, KeyCode::Down);
+        assert_eq!(selected(&s), "review");
+        assert_eq!(
+            s.editor.text(),
+            "/re",
+            "the popup owns the arrows while open — no history recall, no buffer change"
+        );
+        press(&mut s, KeyCode::Up);
+        press(&mut s, KeyCode::Up);
+        assert_eq!(selected(&s), "rename", "up saturates at the top");
+        for _ in 0..10 {
+            press(&mut s, KeyCode::Down);
+        }
+        assert_eq!(selected(&s), "review", "down saturates at the bottom");
+    }
+
+    #[test]
+    fn tab_completes_the_selection_without_starting_a_turn() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/re");
+        let cmds = press(&mut s, KeyCode::Tab);
+        assert!(cmds.is_empty(), "tab is not a submit: {cmds:?}");
+        assert_eq!(s.editor.text(), "/rename ");
+        assert!(
+            s.completion.is_none(),
+            "the trailing space closes the popup"
+        );
+        assert_eq!(s.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn enter_runs_the_highlighted_command_not_the_literal_text() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/pl");
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(
+            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "plan"),
+            "got {cmds:?}"
+        );
+        assert!(
+            !matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("unknown")),
+            "the partial word must never reach slash_command"
+        );
+    }
+
+    #[test]
+    fn esc_dismisses_and_stays_dismissed_until_the_slash_is_gone() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/re");
+        press(&mut s, KeyCode::Esc);
+        assert!(s.completion.is_none());
+        type_str(&mut s, "n");
+        assert!(s.completion.is_none(), "still dismissed while typing");
+
+        // Clearing the buffer past the slash re-arms it.
+        for _ in 0.."/ren".chars().count() {
+            press(&mut s, KeyCode::Backspace);
+        }
+        type_str(&mut s, "/re");
+        assert!(s.completion.is_some(), "a fresh slash opens it again");
+    }
+
+    /// Esc is layered: it belongs to the popup first, and only reaches the
+    /// editor's Insert→Normal transition once the popup is gone.
+    #[test]
+    fn the_first_esc_dismisses_the_popup_and_the_second_reaches_normal_mode() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/re");
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.editor.mode(), crate::vim::Mode::Insert);
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.editor.mode(), crate::vim::Mode::Normal);
+    }
+
+    #[test]
+    fn an_argument_closes_the_popup_before_submit() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/mode ");
+        assert!(s.completion.is_none());
+        let cmds = type_and_submit(&mut s, "auto");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "auto"),
+            "got {cmds:?}"
+        );
     }
 
     fn type_and_submit(s: &mut State, text: &str) -> Vec<Cmd> {
