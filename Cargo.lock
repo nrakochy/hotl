@@ -845,6 +845,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotl-retrieval"
+version = "0.4.1"
+dependencies = [
+ "futures-util",
+ "hotl-mcp",
+ "hotl-tools",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "toml",
+]
+
+[[package]]
 name = "hotl-store"
 version = "0.4.1"
 dependencies = [

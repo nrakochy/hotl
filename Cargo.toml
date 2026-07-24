@@ -13,6 +13,7 @@ members = [
     "crates/hotl-provider-openai",
     "crates/hotl-tools",
     "crates/hotl-mcp",
+    "crates/hotl-retrieval",
     "crates/hotl-store",
     "crates/hotl-context",
     "crates/hotl-tui",
