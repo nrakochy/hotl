@@ -7,6 +7,7 @@
 
 pub mod ask;
 mod builtins;
+pub mod concurrency;
 pub mod diagnostics;
 pub(crate) mod matcher;
 pub mod net;
