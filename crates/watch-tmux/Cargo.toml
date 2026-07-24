@@ -17,4 +17,4 @@ name = "watch_tmux"
 path = "src/lib.rs"
 
 [dependencies]
-watch_types = { package = "hotl-watch-types", path = "../watch-types", version = "0.5.0" }
+watch_types = { package = "hotl-watch-types", path = "../watch-types", version = "0.5.1" }

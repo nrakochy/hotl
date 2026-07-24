@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-24
+
 ### Changed
 
 - **The console's vim input editor is now opt-in.** `[behavior] vim_mode`
