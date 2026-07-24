@@ -18,6 +18,18 @@ semver promise of their own.
   letter keys are additive over a read-only list, and arrows, `enter`, `q`, and
   `r` work either way.
 
+### Fixed
+
+- **`hotl watch` never pinged for hotl's own console.** The detector knew only
+  the plain-CLI ask (`allow …? [y/N]`), so a console TUI sitting on a
+  permission card — or an `ask_user` question — read as *unknown* rather than
+  *blocked*: no ping, no color, nothing to jump to. The one agent watch should
+  know best was the one it couldn't see. It now reads the phase the console
+  already publishes in its terminal title (`— waiting on you` / `— working`),
+  which tmux records per pane, with the card's own hint row as a backstop. The
+  title is what survives a long session, where the card sits too far up the
+  screen for the captured tail to reach.
+
 ## [0.5.0] - 2026-07-24
 
 ### Added
