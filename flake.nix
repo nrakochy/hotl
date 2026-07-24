@@ -118,6 +118,8 @@
               "diagnostics::tests::reports_failures_and_stays_silent_when_clean"
               "sandbox::tests::seatbelt_confines_writes"
               "sandbox::tests::seatbelt_egress_off_confines_to_loopback"
+              # hotl-testkit
+              "tests::negative_max_turns_never_caps"
             ]
           );
 
