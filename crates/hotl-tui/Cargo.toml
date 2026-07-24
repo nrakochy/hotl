@@ -14,6 +14,7 @@ categories = ["command-line-utilities"]
 
 [dependencies]
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.4.1", features = ["ratatui"] }
+hotl-tools = { path = "../hotl-tools", version = "0.4.1" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 serde_json = { workspace = true }

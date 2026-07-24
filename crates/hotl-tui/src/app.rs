@@ -472,12 +472,18 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
         }
         "plan" => set_mode(state, "plan"),
         "mode" => {
-            let name = arg.trim();
-            if !["ask", "auto", "plan", "dontask"].contains(&name) {
+            // Delegate to `PermissionMode::from_str` — the same parser ACP's
+            // `session/set_mode` uses — so the TUI and the wire protocol
+            // share one source of truth on what a valid mode name is
+            // (including the `dont_ask`/`dont-ask` aliases a hand-rolled
+            // list here previously rejected). The canonical `as_str()` form
+            // is what gets stored/sent, so the badge and the wire payload
+            // never disagree with what the alias actually meant.
+            let Some(mode) = hotl_tools::rules::PermissionMode::from_str(arg.trim()) else {
                 notice(state, "usage: /mode <ask|auto|plan|dontask>".into());
                 return Vec::new();
-            }
-            set_mode(state, name)
+            };
+            set_mode(state, mode.as_str())
         }
         other if state.skills.iter().any(|s| s == other) => {
             // Desugars to an ordinary prompt: the model calls the skill
@@ -940,6 +946,23 @@ mod tests {
         );
         assert_eq!(s.mode, "dontask");
         assert_eq!(s.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn slash_mode_accepts_dont_ask_alias_via_shared_parser() {
+        // Finding 2 (Plan 2 review, MINOR): the old hardcoded
+        // ["ask","auto","plan","dontask"] list rejected the `dont_ask`
+        // alias that `PermissionMode::from_str` (and ACP) accept. Now that
+        // `/mode` delegates to that parser, the alias must work, and the
+        // canonical `as_str()` form ("dontask") is what gets sent/stored —
+        // not the raw alias the user typed.
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/mode dont_ask");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "dontask"),
+            "got {cmds:?}"
+        );
+        assert_eq!(s.mode, "dontask");
     }
 
     #[test]

@@ -918,6 +918,7 @@ version = "0.4.1"
 dependencies = [
  "crossterm",
  "hotl-theme",
+ "hotl-tools",
  "ratatui",
  "serde_json",
  "tokio",

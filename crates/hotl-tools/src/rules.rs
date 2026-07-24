@@ -106,6 +106,28 @@ pub fn enforced_build() -> bool {
     cfg!(feature = "security-enforced")
 }
 
+/// The security-enforced build's one contract: `Auto` cannot exist at
+/// runtime. `Plan` and `DontAsk` are strictly stricter than `Ask` (they only
+/// ever add denials), so they pass through unchanged — only `Auto` (which
+/// removes asks) gets coerced to `Ask`.
+///
+/// This must be applied at **every** mode-mutation entry point, not just
+/// startup: [`Rules::with_mode`] calls it for the config/env/CLI startup
+/// path, and `hotl-engine`'s `SharedDeps::set_mode` (the runtime
+/// `SessionCmd::SetMode` handler, reachable from ACP `session/set_mode` and
+/// the TUI `/mode` command) calls it before storing into its atomic — a
+/// mid-session mode flip is just as much a mutation as the startup default
+/// and must not bypass the guarantee.
+pub fn enforced_mode(mode: PermissionMode) -> PermissionMode {
+    #[cfg(feature = "security-enforced")]
+    {
+        if mode == PermissionMode::Auto {
+            return PermissionMode::Ask;
+        }
+    }
+    mode
+}
+
 /// Trust gate for the admin file: root-owned, not group/world-writable.
 /// Pure over (uid, mode) so it is testable without root; the binary feeds
 /// real metadata.
@@ -152,21 +174,12 @@ impl Rules {
         self.allow.is_empty()
     }
 
-    /// Set the prompt mode (binary-resolved). The `security-enforced` build
-    /// coerces `Auto` to `Ask` here — this builder is the single runtime
-    /// enforcement point.
+    /// Set the prompt mode (binary-resolved). Coerces through
+    /// [`enforced_mode`] — see that function for the `security-enforced`
+    /// contract this builder shares with every other mode-mutation entry
+    /// point.
     pub fn with_mode(mut self, mode: PermissionMode) -> Self {
-        // The security-enforced build's whole contract is one line: auto
-        // cannot exist at runtime. Config, env, and callers all pass
-        // through here. `Plan` and `DontAsk` are strictly stricter than
-        // `Ask` (they only ever add denials), so they are safe to keep in
-        // this build — only `Auto` (which removes asks) gets coerced.
-        #[cfg(feature = "security-enforced")]
-        let mode = match mode {
-            PermissionMode::Auto => PermissionMode::Ask,
-            other => other,
-        };
-        self.mode = mode;
+        self.mode = enforced_mode(mode);
         self
     }
 
@@ -184,7 +197,8 @@ impl Rules {
     /// The full tier pipeline, first match wins: admin deny → user deny →
     /// protected (always ask) → **plan-mode block** (if the tool isn't
     /// read-only) → admin allow → user allow (unless locked) →
-    /// mode=auto/dontask → ask. `sandbox_enforced` reflects the live floor.
+    /// mode=auto → **dontask deny** (if the tool isn't read-only) → ask.
+    /// `sandbox_enforced` reflects the live floor.
     ///
     /// Placement note: plan's read-only block sits *above* the allow-rule
     /// tiers, so a deliberate `[[allow]] write` rule can never punch through
@@ -192,6 +206,9 @@ impl Rules {
     /// It sits *below* the deny tiers and the protected floor, which are
     /// stricter still and must always win. `Auto`/`DontAsk` stay below the
     /// allow tiers so a pre-approval still auto-allows under either.
+    /// `DontAsk` carries the same read-only carve-out as `Plan`: a
+    /// structurally-read-only tool that still reaches `evaluate` falls
+    /// through to `Ask` under dontask instead of being denied.
     /// `mode` is the session's *current effective* mode — not necessarily
     /// `self.mode()` (the startup default `with_mode` set). Runtime mode
     /// changes (`SetMode`) live outside `Rules` (an `AtomicU8` the caller
@@ -239,8 +256,13 @@ impl Rules {
             };
         }
         // dontask: never wait for input — anything that reaches here (no
-        // allow rule fired, not read-only-exempt) is denied outright.
-        if mode == PermissionMode::DontAsk {
+        // allow rule fired) and isn't read-only is denied outright. A
+        // structurally-read-only tool (most never reach `evaluate` at all —
+        // they're `Permission::None` — but a trusted MCP backend that still
+        // prompts can) falls through to `Ask` instead, matching the docs:
+        // read-only tools still run under dontask, same carve-out plan mode
+        // already gets above.
+        if mode == PermissionMode::DontAsk && !read_only {
             return Verdict::Deny {
                 rule: "dontask mode: not pre-approved".into(),
             };
@@ -499,6 +521,32 @@ path_prefix = "src/"
             ),
             Verdict::Ask
         );
+    }
+
+    // Finding 1 (Plan 2 review, CRITICAL): `with_mode` was the only place
+    // the security-enforced Auto→Ask coercion applied. The runtime
+    // `SetMode` path (`hotl-engine`'s `SharedDeps::set_mode`, reachable via
+    // ACP `session/set_mode` and the TUI `/mode` command) stored the
+    // caller-supplied mode raw, so a client could flip an enforced session
+    // to `Auto` mid-session and defeat the whole build's guarantee.
+    // `enforced_mode` is now the single coercion helper both paths call —
+    // these tests pin its contract directly, independent of `Rules`.
+    #[test]
+    #[cfg(feature = "security-enforced")]
+    fn enforced_mode_coerces_auto_to_ask() {
+        assert_eq!(enforced_mode(PermissionMode::Auto), PermissionMode::Ask);
+        assert_eq!(enforced_mode(PermissionMode::Ask), PermissionMode::Ask);
+        assert_eq!(enforced_mode(PermissionMode::Plan), PermissionMode::Plan);
+        assert_eq!(
+            enforced_mode(PermissionMode::DontAsk),
+            PermissionMode::DontAsk
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn enforced_mode_is_a_no_op_on_a_normal_build() {
+        assert_eq!(enforced_mode(PermissionMode::Auto), PermissionMode::Auto);
     }
 
     #[test]
@@ -776,9 +824,25 @@ path_prefix = "src/"
             ),
             Verdict::Auto { .. }
         ));
-        // not pre-approved: denied, never asks
+        // not pre-approved and mutating: denied, never asks
         assert!(matches!(
-            r.evaluate(r.mode(), "bash", &json!({"command":"rm -rf /"}), true, false, false),            Verdict::Deny { ref rule } if rule.contains("dontask")
+            r.evaluate(r.mode(), "bash", &json!({"command":"rm -rf /"}), true, false, false),
+            Verdict::Deny { ref rule } if rule.contains("dontask")
+        ));
+        // not pre-approved but read-only (e.g. a trusted MCP recall backend
+        // that still prompts): falls through instead of being denied — the
+        // docs promise read-only tools still run under dontask, same
+        // carve-out plan mode already gets.
+        assert!(matches!(
+            r.evaluate(
+                r.mode(),
+                "recall",
+                &json!({"query": "x"}),
+                true,
+                false,
+                true
+            ),
+            Verdict::Ask
         ));
     }
 

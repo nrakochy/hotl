@@ -94,8 +94,18 @@ impl SharedDeps {
         u8_to_mode(self.mode.load(Ordering::Relaxed))
     }
 
-    fn set_mode(&self, mode: PermissionMode) {
+    /// Runtime mode-mutation entry point (`SessionCmd::SetMode`, reachable
+    /// via ACP `session/set_mode` and the TUI `/mode` command). Routes
+    /// through [`hotl_tools::rules::enforced_mode`] — the same coercion
+    /// `Rules::with_mode` applies at startup — so a `security-enforced`
+    /// build can't be flipped to `Auto` mid-session by a client request.
+    /// Returns the mode actually stored (post-coercion) so the caller logs
+    /// the durable `ModeSet` entry with what really took effect, not the
+    /// raw request.
+    fn set_mode(&self, mode: PermissionMode) -> PermissionMode {
+        let mode = hotl_tools::rules::enforced_mode(mode);
         self.mode.store(mode_to_u8(mode), Ordering::Relaxed);
+        mode
     }
 
     /// Durable append (flush inside `SessionLog`); false = log sealed.
@@ -174,8 +184,11 @@ pub(crate) async fn run(
             SessionCmd::SetMode(mode) => {
                 // Effective immediately: the atomic, not a rebuilt `Rules`,
                 // is what `evaluate` reads. The durable entry is what lets
-                // `hotl resume` restore it, exactly like `Rename`/name.
-                shared.set_mode(mode);
+                // `hotl resume` restore it, exactly like `Rename`/name — it
+                // records the post-coercion mode, so a security-enforced
+                // build's log never claims `auto` while it actually ran
+                // `ask`.
+                let mode = shared.set_mode(mode);
                 let _ = shared.append(
                     &mut log,
                     &EntryPayload::ModeSet {
