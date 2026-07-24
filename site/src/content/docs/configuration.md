@@ -67,6 +67,7 @@ result_cap = 8                  # max results per search (default 8)
 
 [concurrency]               # Layer-B budgets; every field optional, safe defaults
 requests = 4                # concurrent web_fetch/web_search HTTP requests
+agents = 4                  # concurrent spawn sub-agent sessions (global, parent + children)
 
 [retention]
 max_age_days = 30          # prune sessions older than this (hotl gc)
@@ -121,6 +122,7 @@ feel; it's opt-in, the default stays `tokyo-night`.
 | `system-prompt.md` | Replaces the built-in agent instructions (prose). |
 | `memory/MEMORY.md` | Loaded into every session's starting context (capped at 16 KB), enveloped. |
 | `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. |
+| `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort` frontmatter, body = system prompt. See [agents.md](../agents/). |
 
 **Claude Code skills load too.** If you have skills in the Claude format —
 `~/.claude/skills/<name>/SKILL.md`, or plugin skills under
@@ -206,6 +208,7 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `ask_user` | Ask you a structured multiple-choice question (a header, a prompt, and 2–4 labelled options, plus free text) when the model hits a genuine ambiguity instead of guessing. | None — see below |
 | `web_fetch` | Fetch one or more URLs (an array — fetched concurrently in one call) and return their text (HTML stripped). Always registered; needs no configuration. | Ask (always, even under an allowlist) |
 | `web_search` | Search via the `[web.search]` backend you configure and get back titles/URLs/snippets; `web_fetch` a result for the full text. Registered **only** when `[web.search]` is set — absent otherwise, so nothing phones home by default. | Ask |
+| `spawn` | Delegate a self-contained subtask to a fresh, isolated sub-agent (`agent_type`: `general-purpose`, `explore`, `plan`, or your own `agents/*.md` def); `fork: true` seeds it with your own current context instead. See [agents.md](../agents/). | Ask |
 
 `glob` and `grep` are workspace-scoped: an absolute path or a `..` escape outside the working directory is refused, and both run without a permission ask because that containment is what makes them safe reads. Both are parallel-safe, so a batch of several `glob`/`grep` calls in one turn runs concurrently.
 
@@ -230,10 +233,10 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
 | `HOTL_CONCURRENCY_REQUESTS` | `[concurrency].requests` | Concurrent `web_fetch`/`web_search` HTTP requests (default 4). |
-| `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Reserved (sub-agent fan-out; no effect yet). |
+| `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Concurrent sub-agent (`spawn`) sessions (default 4) — global across the parent and every child. |
 | `HOTL_CONCURRENCY_SUBPROCS` | `[concurrency].subprocs` | Reserved (subprocess batching; no effect yet). |
-| `HOTL_CONCURRENCY_WORKER_THREADS` | `[concurrency].worker_threads` | Reserved (tokio worker-thread pool; parsed but not yet wired to a runtime — see below). |
-| `HOTL_CONCURRENCY_BLOCKING_THREADS` | `[concurrency].blocking_threads` | Reserved (`spawn_blocking` pool cap; parsed but not yet wired to a runtime — see below). |
+| `HOTL_CONCURRENCY_WORKER_THREADS` | `[concurrency].worker_threads` | Reserved (tokio worker-thread pool; parsed but deliberately not wired — see below). |
+| `HOTL_CONCURRENCY_BLOCKING_THREADS` | `[concurrency].blocking_threads` | `spawn_blocking` pool cap (bounds `glob`'s tree walk; default 16). |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 
 ### Allow-rules (`[[allow]]`)
@@ -278,7 +281,13 @@ Every byte a fetch or search returns enters the model inside the untrusted-conte
 
 ### Concurrency (`[concurrency]`)
 
-The shared budget that bounds concurrent external work — today, `requests` caps how many `web_fetch`/`web_search` HTTP calls run at once (a batch of 20 URLs never opens more than `requests` sockets simultaneously). `agents`/`subprocs` are reserved config surface for upcoming sub-agent fan-out and subprocess-batching work; setting them has no effect yet. `worker_threads`/`blocking_threads` are parsed for completeness but not yet wired to a runtime — hotl runs on a single-threaded async runtime today — and setting either logs a startup warning noting they're currently inert.
+The shared budget that bounds concurrent external work, one process-wide instance shared by the parent session and every sub-agent it spawns:
+
+- `requests` caps how many `web_fetch`/`web_search` HTTP calls run at once (a batch of 20 URLs never opens more than `requests` sockets simultaneously; default 4).
+- `agents` caps how many `spawn` children run their expensive step (the LLM call) at once — a model that issues 30 `spawn` calls in one batch still only runs `agents` at a time; the rest queue rather than stampeding the provider (default 4). See [agents.md](../agents/).
+- `subprocs` is reserved config surface for upcoming subprocess-batching work; setting it has no effect yet.
+- `blocking_threads` caps the tokio blocking-thread pool (default 16) — the pool `glob`'s tree walk uses; tokio's own unconfigured default is 512.
+- `worker_threads` is parsed for completeness but stays deliberately inert: it only applies to a multi-threaded async runtime, and hotl runs a single-threaded (`current_thread`) runtime everywhere by design (switching would risk breaking `!Send` futures in the TUI/actor code). Setting it logs a startup warning noting it has no effect.
 
 ### Retention (`[retention]`)
 
