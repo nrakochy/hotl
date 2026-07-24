@@ -149,6 +149,11 @@ async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64
                     .request("session/rename", json!({"name": name}))
                     .await;
             }
+            Cmd::SetMode(mode) => {
+                client
+                    .request("session/set_mode", json!({"mode": mode}))
+                    .await;
+            }
             Cmd::ReplyPermission {
                 req_id,
                 allow,

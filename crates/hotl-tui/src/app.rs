@@ -95,6 +95,10 @@ pub struct State {
     /// Display name (badge + titles); seeded from the open handshake,
     /// updated by `/rename`.
     pub session_name: Option<String>,
+    /// Effective permission mode (`ask` | `auto` | `plan` | `dontask`);
+    /// updated optimistically by `/plan` and `/mode`. Defaults to `ask` —
+    /// the library default — until the engine says otherwise.
+    pub mode: String,
     /// Every loadable skill name, from the `initialize` result. `/<name>`
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
@@ -118,6 +122,7 @@ impl State {
             interrupt_sent: false,
             pending_auto_rule: None,
             session_name: None,
+            mode: "ask".into(),
             skills: Vec::new(),
             density: hotl_theme::Density::default(),
         }
@@ -155,6 +160,10 @@ pub enum Cmd {
     SendSteer(String),
     /// Send `session/rename` (fire-and-forget; the ack is noise).
     Rename(String),
+    /// Send `session/set_mode` (fire-and-forget; the ack is noise). Payload
+    /// is the mode name (`"ask" | "auto" | "plan" | "dontask"`) — already
+    /// validated by `slash_command` before this is emitted.
+    SetMode(String),
     Cancel,
     ReplyPermission {
         req_id: u64,
@@ -461,6 +470,15 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
                 Cmd::SetTitle(title(state, suffix)),
             ]
         }
+        "plan" => set_mode(state, "plan"),
+        "mode" => {
+            let name = arg.trim();
+            if !["ask", "auto", "plan", "dontask"].contains(&name) {
+                notice(state, "usage: /mode <ask|auto|plan|dontask>".into());
+                return Vec::new();
+            }
+            set_mode(state, name)
+        }
         other if state.skills.iter().any(|s| s == other) => {
             // Desugars to an ordinary prompt: the model calls the skill
             // tool, so the TUI never reads skill files itself.
@@ -608,6 +626,15 @@ fn mark_last_tool(state: &mut State, name: &str, status: ToolStatus) {
 
 fn notice(state: &mut State, text: String) {
     state.transcript.push(TranscriptItem::Notice { text });
+}
+
+/// `/plan` and `/mode <name>` share this: optimistic local update (the badge
+/// flips immediately) plus the durable `SetMode` the surface issues. Never
+/// starts a turn — a mode switch is session bookkeeping, not a prompt.
+fn set_mode(state: &mut State, mode: &str) -> Vec<Cmd> {
+    state.mode = mode.to_string();
+    notice(state, format!("permission mode set to {mode}"));
+    vec![Cmd::SetMode(mode.to_string())]
 }
 
 #[cfg(test)]
@@ -886,6 +913,41 @@ mod tests {
         let cmds = type_and_submit(&mut s, "/rename");
         assert!(cmds.is_empty());
         assert_eq!(s.session_name, None);
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("usage"))
+        );
+    }
+
+    #[test]
+    fn slash_plan_sets_mode_and_does_not_start_a_turn() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/plan");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "plan"),
+            "got {cmds:?}"
+        );
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.mode, "plan");
+    }
+
+    #[test]
+    fn slash_mode_sets_the_named_mode() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/mode dontask");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "dontask"),
+            "got {cmds:?}"
+        );
+        assert_eq!(s.mode, "dontask");
+        assert_eq!(s.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn slash_mode_unknown_shows_usage_and_never_reaches_model() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/mode wat");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert_eq!(s.phase, Phase::Idle);
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("usage"))
         );

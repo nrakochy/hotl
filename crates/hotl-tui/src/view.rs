@@ -391,6 +391,35 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
             );
         }
     }
+
+    // Mode badge, just left of the name chip. `ask` is the default
+    // posture — it stays silent; every other mode (plan's read-only stance
+    // most of all) is worth a standing reminder while it's active.
+    if state.mode != "ask" {
+        let chip = format!(" {} ", state.mode);
+        let w = chip.chars().count() as u16;
+        if w <= area.width {
+            let name_w = state
+                .session_name
+                .as_ref()
+                .map(|n| (n.chars().count() as u16 + 2).min(area.width.saturating_sub(14).max(2)))
+                .unwrap_or(0);
+            if w + name_w <= area.width {
+                let style = if state.mode == "plan" {
+                    Style::new().fg(p.band).bg(p.accent).bold()
+                } else {
+                    Style::new().fg(p.muted).bg(p.band)
+                };
+                let rect = Rect {
+                    x: area.x + area.width - name_w - w,
+                    y: area.y,
+                    width: w,
+                    height: 1,
+                };
+                frame.render_widget(Paragraph::new(chip).style(style), rect);
+            }
+        }
+    }
 }
 
 /// Every screen row the buffer occupies, plus where the cursor sits among
@@ -805,6 +834,28 @@ mod tests {
         assert!(
             rows[STRIP].contains("· ─ ·"),
             "strip glyphs: {}",
+            rows[STRIP]
+        );
+    }
+
+    #[test]
+    fn plan_mode_badge_renders_and_ask_mode_stays_silent() {
+        let mut s = State::new(true, "m".into());
+        s.mode = "plan".into();
+        let rows = draw(&s);
+        assert!(
+            rows[STRIP].to_lowercase().contains("plan"),
+            "plan badge: {:?}",
+            rows[STRIP]
+        );
+
+        // ask is the default posture — no need to shout about it.
+        let s = State::new(true, "m".into());
+        assert_eq!(s.mode, "ask");
+        let rows = draw(&s);
+        assert!(
+            !rows[STRIP].to_lowercase().contains("ask"),
+            "ask should not badge: {:?}",
             rows[STRIP]
         );
     }

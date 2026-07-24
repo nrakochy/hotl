@@ -218,6 +218,12 @@ async fn run_loop(
                         .request("session/rename", json!({"name": name}))
                         .await;
                 }
+                Cmd::SetMode(mode) => {
+                    // Ack is noise, same as rename/steer.
+                    client
+                        .request("session/set_mode", json!({"mode": mode}))
+                        .await;
+                }
                 Cmd::ReplyPermission {
                     req_id,
                     allow,
