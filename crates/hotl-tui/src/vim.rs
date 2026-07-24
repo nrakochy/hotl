@@ -36,6 +36,16 @@ struct Pending {
     colon: Option<String>,
 }
 
+/// `Ctrl-R` reverse-incremental search sub-state. The buffer is left untouched
+/// while searching (the view renders `(reverse-i-search)'query': match`); the
+/// match commits to the buffer only on `Enter`, and `Esc` restores `origin`.
+#[derive(Debug)]
+struct Search {
+    query: String,
+    origin: String,
+    match_idx: Option<usize>,
+}
+
 #[derive(Debug)]
 pub struct Editor {
     lines: Vec<String>,
@@ -45,6 +55,16 @@ pub struct Editor {
     pending: Pending,
     yank: String,
     undo: Option<(Vec<String>, (usize, usize))>,
+    /// Submitted prompts, oldest→newest: loaded at startup, appended on submit.
+    history: Vec<String>,
+    /// Recall cursor into the prefix-filtered view (`None` = editing, not recalling).
+    nav: Option<usize>,
+    /// The in-progress buffer, saved when recall begins and restored past the newest.
+    draft: Option<String>,
+    /// Prefix filter captured when recall began (empty = walk all).
+    prefix: String,
+    /// `Ctrl-R` reverse-i-search state, when active.
+    search: Option<Search>,
 }
 
 impl Editor {
@@ -58,15 +78,47 @@ impl Editor {
             pending: Pending::default(),
             yank: String::new(),
             undo: None,
+            history: Vec::new(),
+            nav: None,
+            draft: None,
+            prefix: String::new(),
+            search: None,
         }
+    }
+
+    /// Seed the in-memory recall ring (the persisted tail, oldest→newest).
+    pub fn load_history(&mut self, history: Vec<String>) {
+        self.history = history;
+    }
+
+    /// The active `Ctrl-R` search as `(query, matched_entry)` for rendering,
+    /// or `None` when not searching. The match is empty when nothing matches.
+    pub fn search_prompt(&self) -> Option<(String, String)> {
+        self.search.as_ref().map(|s| {
+            let matched = s
+                .match_idx
+                .and_then(|i| self.history.get(i))
+                .cloned()
+                .unwrap_or_default();
+            (s.query.clone(), matched)
+        })
     }
 
     pub fn handle(&mut self, key: KeyEvent) -> EditorEvent {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if key.code == KeyCode::Char('e') {
-                return EditorEvent::OpenExternal(self.text());
+            match key.code {
+                KeyCode::Char('e') => return EditorEvent::OpenExternal(self.text()),
+                KeyCode::Char('r') => {
+                    self.search_step();
+                    return EditorEvent::None;
+                }
+                _ => return EditorEvent::None,
             }
-            return EditorEvent::None;
+        }
+        // A live reverse-i-search swallows ordinary keys (query edits, accept,
+        // cancel) until it resolves.
+        if self.search.is_some() {
+            return self.handle_search(key);
         }
         match self.mode {
             Mode::Insert => self.handle_insert(key),
@@ -105,6 +157,7 @@ impl Editor {
                 self.mode = Mode::Normal;
                 self.cursor.1 = self.cursor.1.saturating_sub(1);
                 self.pending = Pending::default();
+                self.end_recall();
                 EditorEvent::None
             }
             KeyCode::Enter
@@ -112,6 +165,7 @@ impl Editor {
                     .modifiers
                     .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
             {
+                self.end_recall();
                 let (row, col) = self.cursor;
                 let rest = char_split_off(&mut self.lines[row], col);
                 self.lines.insert(row + 1, rest);
@@ -119,13 +173,33 @@ impl Editor {
                 EditorEvent::None
             }
             KeyCode::Enter => self.submit(),
+            // Up/Down recall history at the buffer's edges, else move the
+            // cursor between lines (readline-style boundary rule).
+            KeyCode::Up => {
+                if self.cursor.0 == 0 {
+                    self.recall_prev();
+                } else {
+                    self.move_cursor_row(self.cursor.0 - 1);
+                }
+                EditorEvent::None
+            }
+            KeyCode::Down => {
+                if self.cursor.0 + 1 >= self.lines.len() {
+                    self.recall_next();
+                } else {
+                    self.move_cursor_row(self.cursor.0 + 1);
+                }
+                EditorEvent::None
+            }
             KeyCode::Char(c) => {
+                self.end_recall();
                 let (row, col) = self.cursor;
                 char_insert(&mut self.lines[row], col, c);
                 self.cursor.1 += 1;
                 EditorEvent::None
             }
             KeyCode::Backspace => {
+                self.end_recall();
                 let (row, col) = self.cursor;
                 if col > 0 {
                     char_remove(&mut self.lines[row], col - 1);
@@ -141,13 +215,158 @@ impl Editor {
         }
     }
 
+    /// Move the cursor to `row`, clamping the column to that line's length
+    /// (Insert mode allows the cursor one past the last char).
+    fn move_cursor_row(&mut self, row: usize) {
+        let row = row.min(self.lines.len() - 1);
+        let col = self.cursor.1.min(char_len(&self.lines[row]));
+        self.cursor = (row, col);
+    }
+
+    /// History indices whose entry begins with `prefix` (oldest→newest order).
+    fn matching(&self, prefix: &str) -> Vec<usize> {
+        self.history
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.starts_with(prefix))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Up: recall the previous (older) matching entry. Begins recall (saving
+    /// the draft and capturing the buffer as the prefix) on the first step.
+    fn recall_prev(&mut self) {
+        let prefix = if self.nav.is_some() {
+            self.prefix.clone()
+        } else {
+            self.text()
+        };
+        let matches = self.matching(&prefix);
+        if matches.is_empty() {
+            return;
+        }
+        let pos = match self.nav {
+            None => {
+                self.draft = Some(self.text());
+                self.prefix = prefix;
+                matches.len() - 1
+            }
+            Some(p) => p.saturating_sub(1),
+        };
+        self.nav = Some(pos);
+        let text = self.history[matches[pos]].clone();
+        self.set_text(&text);
+    }
+
+    /// Down: recall the next (newer) matching entry, or restore the saved
+    /// draft when stepping past the newest match. No-op when not recalling.
+    fn recall_next(&mut self) {
+        let Some(p) = self.nav else {
+            return;
+        };
+        let prefix = self.prefix.clone();
+        let matches = self.matching(&prefix);
+        if p + 1 >= matches.len() {
+            let draft = self.draft.take().unwrap_or_default();
+            self.nav = None;
+            self.set_text(&draft);
+        } else {
+            self.nav = Some(p + 1);
+            let text = self.history[matches[p + 1]].clone();
+            self.set_text(&text);
+        }
+    }
+
+    /// Leave recall, keeping whatever is in the buffer (an edit "adopts" the
+    /// recalled text as the new draft). Idempotent when not recalling.
+    fn end_recall(&mut self) {
+        self.nav = None;
+        self.draft = None;
+        self.prefix.clear();
+    }
+
+    /// `Ctrl-R`: open reverse-i-search, or step to the next older match when
+    /// it is already open.
+    fn search_step(&mut self) {
+        match self.search.as_ref() {
+            None => {
+                self.search = Some(Search {
+                    query: String::new(),
+                    origin: self.text(),
+                    match_idx: None,
+                });
+            }
+            Some(s) => {
+                let query = s.query.clone();
+                let before = s.match_idx.unwrap_or(self.history.len());
+                if let Some(idx) = self.find_match(&query, before) {
+                    self.search.as_mut().expect("searching").match_idx = Some(idx);
+                }
+            }
+        }
+    }
+
+    /// The newest history index below `before` whose entry contains `query`.
+    fn find_match(&self, query: &str, before: usize) -> Option<usize> {
+        (0..before.min(self.history.len()))
+            .rev()
+            .find(|&i| self.history[i].contains(query))
+    }
+
+    fn handle_search(&mut self, key: KeyEvent) -> EditorEvent {
+        match key.code {
+            KeyCode::Char(c) => self.search_query(Some(c)),
+            KeyCode::Backspace => self.search_query(None),
+            KeyCode::Enter => {
+                if let Some(Search {
+                    match_idx: Some(i), ..
+                }) = self.search.take()
+                {
+                    let text = self.history[i].clone();
+                    self.set_text(&text);
+                }
+            }
+            KeyCode::Esc => {
+                if let Some(s) = self.search.take() {
+                    self.set_text(&s.origin);
+                }
+            }
+            _ => {}
+        }
+        EditorEvent::None
+    }
+
+    /// Extend (`Some`) or shrink (`None`) the query, then re-match from the
+    /// most recent entry.
+    fn search_query(&mut self, ch: Option<char>) {
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        match ch {
+            Some(c) => s.query.push(c),
+            None => {
+                s.query.pop();
+            }
+        }
+        let query = s.query.clone();
+        let idx = self.find_match(&query, self.history.len());
+        self.search.as_mut().expect("searching").match_idx = idx;
+    }
+
     fn submit(&mut self) -> EditorEvent {
         let text = self.text();
+        // Ring the prompt for recall, suppressing a consecutive duplicate.
+        if !text.trim().is_empty() && self.history.last().map(String::as_str) != Some(text.as_str())
+        {
+            self.history.push(text.clone());
+        }
         self.lines = vec![String::new()];
         self.cursor = (0, 0);
         self.mode = Mode::Insert;
         self.pending = Pending::default();
         self.undo = None;
+        self.end_recall();
+        self.search = None;
         EditorEvent::Submit(text)
     }
 
@@ -462,7 +681,10 @@ mod tests {
                     "esc" => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
                     "cr" => KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
                     "bs" => KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+                    "up" => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+                    "down" => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
                     "c-e" => KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                    "c-r" => KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
                     other => panic!("unknown key token <{other}>"),
                 }
             } else {
@@ -598,5 +820,149 @@ mod tests {
         let evs = keys(&mut e, "<esc>ihello<cr>");
         assert_eq!(evs.last(), Some(&EditorEvent::Submit("hello".into())));
         assert!(e.is_empty());
+    }
+
+    // ---- prompt history: recall + reverse-i-search (Insert mode) ----
+
+    /// A fresh Insert-mode editor with a seeded history ring.
+    fn ed_hist(entries: &[&str]) -> Editor {
+        let mut e = Editor::new(true);
+        e.load_history(entries.iter().map(|s| s.to_string()).collect());
+        e
+    }
+
+    #[test]
+    fn up_walks_history_newest_first_and_does_not_wrap() {
+        let mut e = ed_hist(&["first", "second", "third"]);
+        keys(&mut e, "<up>");
+        assert_eq!(e.text(), "third");
+        keys(&mut e, "<up>");
+        assert_eq!(e.text(), "second");
+        keys(&mut e, "<up>");
+        assert_eq!(e.text(), "first");
+        keys(&mut e, "<up>"); // oldest reached — stays put, no wrap
+        assert_eq!(e.text(), "first");
+    }
+
+    #[test]
+    fn prefix_captured_at_nav_start_filters_the_walk_and_down_restores_the_draft() {
+        let mut e = ed_hist(&["apple", "banana", "avocado"]);
+        keys(&mut e, "a"); // draft "a" becomes the prefix filter
+        keys(&mut e, "<up>"); // newest entry starting with "a"
+        assert_eq!(e.text(), "avocado");
+        keys(&mut e, "<up>"); // older "a" match — "banana" is skipped
+        assert_eq!(e.text(), "apple");
+        keys(&mut e, "<down>");
+        assert_eq!(e.text(), "avocado");
+        keys(&mut e, "<down>"); // past the newest match → the saved draft returns
+        assert_eq!(e.text(), "a");
+    }
+
+    #[test]
+    fn empty_prefix_walks_every_entry() {
+        let mut e = ed_hist(&["one", "two"]);
+        keys(&mut e, "<up>");
+        assert_eq!(e.text(), "two");
+        keys(&mut e, "<up>");
+        assert_eq!(e.text(), "one");
+    }
+
+    #[test]
+    fn up_down_move_the_cursor_off_the_boundary_lines_without_recall() {
+        let mut e = ed_hist(&["recalled"]);
+        e.set_text("l1\nl2\nl3"); // cursor on the last line
+        keys(&mut e, "<up>"); // not first line → cursor moves up, buffer intact
+        assert_eq!(e.cursor().0, 1);
+        assert_eq!(e.text(), "l1\nl2\nl3");
+        keys(&mut e, "<up>");
+        assert_eq!(e.cursor().0, 0);
+        assert_eq!(e.text(), "l1\nl2\nl3");
+        keys(&mut e, "<down>"); // not last line → cursor moves down, no recall
+        assert_eq!(e.cursor().0, 1);
+        assert_eq!(e.text(), "l1\nl2\nl3");
+    }
+
+    #[test]
+    fn up_on_the_first_line_recalls_even_with_a_multiline_buffer() {
+        let mut e = ed_hist(&["l1\nl2 recalled"]);
+        e.set_text("l1\nl2"); // 2-line buffer, cursor on the last line
+        keys(&mut e, "<up>"); // cursor to the first line
+        assert_eq!(e.cursor().0, 0);
+        keys(&mut e, "<up>"); // on the first line now → recall (prefix "l1\nl2")
+        assert_eq!(e.text(), "l1\nl2 recalled");
+    }
+
+    #[test]
+    fn submit_rings_the_prompt_with_consecutive_dedup() {
+        let mut e = Editor::new(true);
+        keys(&mut e, "hello<cr>");
+        keys(&mut e, "hello<cr>"); // identical to the previous — not re-ringed
+        keys(&mut e, "world<cr>");
+        keys(&mut e, "<up>");
+        assert_eq!(e.text(), "world");
+        keys(&mut e, "<up>");
+        assert_eq!(e.text(), "hello");
+        keys(&mut e, "<up>"); // only two distinct entries exist
+        assert_eq!(e.text(), "hello");
+    }
+
+    #[test]
+    fn typing_during_recall_exits_recall_and_keeps_the_recalled_text() {
+        let mut e = ed_hist(&["alpha", "beta"]);
+        keys(&mut e, "<up>"); // "beta"
+        keys(&mut e, "!"); // an edit ends recall, keeping "beta!" as the draft
+        assert_eq!(e.text(), "beta!");
+        keys(&mut e, "<down>"); // no active recall → nothing to step to
+        assert_eq!(e.text(), "beta!");
+        keys(&mut e, "<up>"); // fresh nav, prefix "beta!" matches nothing
+        assert_eq!(e.text(), "beta!");
+    }
+
+    #[test]
+    fn ctrl_r_reverse_search_matches_steps_older_and_accepts_into_the_buffer() {
+        let mut e = ed_hist(&["deploy staging", "run tests", "deploy prod"]);
+        keys(&mut e, "<c-r>");
+        keys(&mut e, "deploy"); // most-recent entry containing "deploy"
+        assert_eq!(
+            e.search_prompt(),
+            Some(("deploy".into(), "deploy prod".into()))
+        );
+        keys(&mut e, "<c-r>"); // step to the next older match
+        assert_eq!(
+            e.search_prompt(),
+            Some(("deploy".into(), "deploy staging".into()))
+        );
+        keys(&mut e, "<cr>"); // accept into the buffer, exit search
+        assert_eq!(e.search_prompt(), None);
+        assert_eq!(e.text(), "deploy staging");
+    }
+
+    #[test]
+    fn ctrl_r_esc_cancels_and_restores_the_original_buffer() {
+        let mut e = ed_hist(&["find me"]);
+        keys(&mut e, "draft");
+        keys(&mut e, "<c-r>");
+        keys(&mut e, "find");
+        assert_eq!(e.search_prompt(), Some(("find".into(), "find me".into())));
+        keys(&mut e, "<esc>"); // cancel search
+        assert_eq!(e.search_prompt(), None);
+        assert_eq!(e.text(), "draft");
+    }
+
+    #[test]
+    fn ctrl_r_backspace_shrinks_the_query_and_rematches() {
+        let mut e = ed_hist(&["cargo build", "cargo test"]);
+        keys(&mut e, "<c-r>");
+        keys(&mut e, "build");
+        assert_eq!(
+            e.search_prompt(),
+            Some(("build".into(), "cargo build".into()))
+        );
+        keys(&mut e, "<bs><bs><bs><bs><bs>"); // erase "build" → query "cargo"
+        assert_eq!(
+            e.search_prompt(),
+            Some(("".into(), "cargo test".into())),
+            "empty query matches the most recent entry"
+        );
     }
 }

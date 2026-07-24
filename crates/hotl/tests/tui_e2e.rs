@@ -154,7 +154,7 @@ async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64
                 allow,
                 message,
             } => client.reply_permission(req_id, allow, message).await,
-            Cmd::OpenEditor(_) | Cmd::SetTitle(_) | Cmd::Quit => {}
+            Cmd::OpenEditor(_) | Cmd::SetTitle(_) | Cmd::AppendHistory(_) | Cmd::Quit => {}
         }
     }
 }

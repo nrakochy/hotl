@@ -163,6 +163,9 @@ pub enum Cmd {
     },
     OpenEditor(String),
     SetTitle(String),
+    /// Append a submitted prompt to the on-disk history file (the runtime
+    /// owns the file; the core just names what to persist).
+    AppendHistory(String),
     Quit,
 }
 
@@ -365,7 +368,22 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     }
     match state.editor.handle(key) {
         EditorEvent::Submit(text) if text.trim().is_empty() => Vec::new(),
-        EditorEvent::Submit(text) => submit(state, text),
+        EditorEvent::Submit(text) => {
+            let cmds = submit(state, text.clone());
+            // Persist only prompt-starting submissions (they emit SendPrompt),
+            // and only when the literal text wasn't a slash command — a skill
+            // invocation desugars to a prompt but shouldn't leave its `/name`
+            // (or the expanded template) on disk. In-session recall still walks
+            // everything via the editor's own ring.
+            let starts_turn = cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_)));
+            if starts_turn && !text.trim_start().starts_with('/') {
+                let mut out = vec![Cmd::AppendHistory(text)];
+                out.extend(cmds);
+                out
+            } else {
+                cmds
+            }
+        }
         EditorEvent::OpenExternal(text) => vec![Cmd::OpenEditor(text)],
         EditorEvent::ScrollUp => {
             let cur = match state.scroll {
@@ -638,7 +656,10 @@ mod tests {
             matches!(s.transcript.last(), Some(TranscriptItem::User { text }) if text == "hello")
         );
         assert!(matches!(s.phase, Phase::Sampling { .. }));
-        assert!(matches!(cmds[..], [Cmd::SendPrompt(_), Cmd::SetTitle(_)]));
+        assert!(matches!(
+            cmds[..],
+            [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(_)]
+        ));
     }
 
     #[test]
@@ -918,12 +939,46 @@ mod tests {
     }
 
     #[test]
+    fn a_prompt_turn_persists_to_history_the_literal_text() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "fix the bug");
+        assert!(
+            cmds.iter()
+                .any(|c| matches!(c, Cmd::AppendHistory(t) if t == "fix the bug")),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn slash_commands_and_steers_do_not_persist_to_disk_history() {
+        // A slash command never starts a turn → nothing to persist.
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/rename foo");
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::AppendHistory(_))));
+
+        // A skill invocation desugars to a prompt, but the *literal* was a
+        // slash command — it is not written to the on-disk history either.
+        let mut s = State::test_default();
+        s.skills = vec!["brainstorming".into()];
+        let cmds = type_and_submit(&mut s, "/brainstorming redesign");
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_))));
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::AppendHistory(_))));
+
+        // A steer (typed mid-turn) uses SendSteer, not SendPrompt → not persisted.
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        let cmds = type_and_submit(&mut s, "wait, use X");
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SendSteer(_))));
+        assert!(!cmds.iter().any(|c| matches!(c, Cmd::AppendHistory(_))));
+    }
+
+    #[test]
     fn named_session_titles_carry_the_name() {
         let mut s = State::test_default();
         s.session_name = Some("fix-auth".into());
         let cmds = type_and_submit(&mut s, "hello");
         assert!(
-            matches!(&cmds[..], [Cmd::SendPrompt(_), Cmd::SetTitle(t)] if t == "hotl · fix-auth — working"),
+            matches!(&cmds[..], [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(t)] if t == "hotl · fix-auth — working"),
             "got {cmds:?}"
         );
     }

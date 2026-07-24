@@ -43,10 +43,12 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         Ok(triple) => triple,
         Err(code) => return code,
     };
-    let vim_mode = crate::config::Config::load(&crate::agent::config_dir())
-        .behavior
-        .vim_mode
-        .unwrap_or(true);
+    let cfg = crate::config::Config::load(&crate::agent::config_dir());
+    let vim_mode = cfg.behavior.vim_mode.unwrap_or(true);
+    // Prompt-history tail, loaded (and startup-compacted) before the screen is
+    // taken; the store is handed to the loop to append each submitted prompt.
+    let (history_store, history) =
+        crate::history::History::load(&cfg.history, &crate::agent::data_dir());
     if let Some(hint) = crate::setup::first_run_hint(&crate::agent::config_dir()) {
         eprintln!("hotl: {hint}");
     }
@@ -94,6 +96,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     state.session_name = session_name;
     state.skills = skills;
     state.density = density;
+    state.editor.load_history(history);
     let result = run_loop(
         &mut guard,
         &mut client,
@@ -102,6 +105,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         &suspended,
         state,
         palette,
+        history_store,
     )
     .await;
     drop(guard);
@@ -170,6 +174,7 @@ async fn run_loop(
     suspended: &AtomicBool,
     mut state: State,
     palette: Palette,
+    mut history: crate::history::History,
 ) -> io::Result<i32> {
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     // 8 ticks/sec, armed only while a turn runs — idle schedules no wakeups.
@@ -221,6 +226,7 @@ async fn run_loop(
                 Cmd::SetTitle(title) => {
                     let _ = execute!(io::stdout(), SetTitle(&title));
                 }
+                Cmd::AppendHistory(text) => history.append(&text),
                 Cmd::OpenEditor(text) => {
                     let content = suspended_editor(guard, suspended, &text);
                     queue.extend(update(&mut state, Msg::EditorDone(content)));

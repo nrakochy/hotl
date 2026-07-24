@@ -444,6 +444,15 @@ fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     if inner.width == 0 || inner.height == 0 {
         return;
     }
+    // A live reverse-i-search replaces the buffer view with its prompt line;
+    // the cursor rides just after the query.
+    if let Some((query, matched)) = state.editor.search_prompt() {
+        let head = format!("(reverse-i-search)'{query}': ");
+        frame.render_widget(Paragraph::new(format!("{head}{matched}")), inner);
+        let col = (head.chars().count() as u16).min(inner.width.saturating_sub(1));
+        frame.set_cursor_position((inner.x + col, inner.y));
+        return;
+    }
     let width = inner.width as usize;
     let height = inner.height as usize;
     let (rows, (row, col)) = input_rows(&state.editor.text(), state.editor.cursor(), width);
@@ -461,12 +470,17 @@ fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
 }
 
 fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
+    if state.editor.search_prompt().is_some() {
+        let hint = "type to search · ctrl-r older · enter accept · esc cancel";
+        frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
+        return;
+    }
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
         (Phase::WaitingAsk { .. }, ..) => {
             "y allow · n deny · type a reason after n · ctrl-c cancel"
         }
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
-        _ => "ctrl-e editor · esc interrupt · ? help",
+        _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
     };
     frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
 }
@@ -524,6 +538,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "i a I A o O insert · h l 0 $ w b e motions (+counts)",
         "d c y operators · dd cc yy x p u",
         "j k scroll transcript when input is empty",
+        "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "ctrl-e or :e open $EDITOR · ctrl-c quit/cancel",
         "any key closes this help",
     ]
@@ -600,6 +615,23 @@ mod tests {
             "mode title: {}",
             rows[INPUT_TOP]
         );
+    }
+
+    #[test]
+    fn reverse_i_search_prompt_takes_over_the_input_area() {
+        let mut s = State::new(true, "m".into());
+        s.editor
+            .load_history(vec!["deploy staging".into(), "deploy prod".into()]);
+        s.editor
+            .handle(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        for c in "deploy".chars() {
+            s.editor
+                .handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let all = draw(&s).join("\n");
+        assert!(all.contains("reverse-i-search"), "search prompt: {all}");
+        assert!(all.contains("'deploy'"), "query echoed: {all}");
+        assert!(all.contains("deploy prod"), "newest match shown: {all}");
     }
 
     #[test]
