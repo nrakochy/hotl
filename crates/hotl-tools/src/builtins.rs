@@ -4,7 +4,7 @@
 use std::sync::OnceLock;
 
 use crate::sandbox::{self, SandboxStatus};
-use crate::{execute_later_reason, Permission, Tool, ToolOutcome};
+use crate::{execute_later_reason, fsguard, Permission, Tool, ToolOutcome};
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -39,39 +39,28 @@ fn str_arg<'v>(input: &'v Value, key: &str) -> Result<&'v str, ToolOutcome> {
     })
 }
 
-/// Confirm a search root stays inside the working directory. Absolute paths
-/// and `..` escapes are refused: `glob`/`grep` are read-only *and*
-/// workspace-scoped — that containment is what lets them run without an ask.
-/// Pure-lexical (no fs touch), so it can't be defeated by a symlink race.
-pub(crate) fn workspace_contained(path: &str) -> Result<std::path::PathBuf, ToolOutcome> {
-    let reject = || {
-        ToolOutcome::err(format!(
-            "`{path}` is outside the working directory. `glob`/`grep` only search the \
-             current project; use a relative path inside it."
-        ))
-    };
-    if path.starts_with('/') {
-        return Err(reject());
-    }
-    let mut out: Vec<&str> = Vec::new();
-    for part in path.trim_start_matches("./").split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                if matches!(out.last(), Some(&seg) if seg != "..") {
-                    out.pop();
-                } else {
-                    return Err(reject()); // escapes above the root
-                }
-            }
-            seg => out.push(seg),
+/// Resolve a search tool's `path` argument into a walk root.
+///
+/// INVARIANT: containment is decided on the fd, not the name. The lexical
+/// `classify` only picks the error message; `resolve_beneath` is the boundary
+/// and refuses a search root reached through a symlink. Enforced by
+/// `glob_refuses_a_symlinked_search_root` and
+/// `grep_refuses_a_symlinked_path_argument`.
+fn guarded_search_root(
+    tool: &str,
+    root: &std::path::Path,
+    given: &str,
+) -> Result<std::path::PathBuf, ToolOutcome> {
+    let rel = match fsguard::classify(root, given) {
+        fsguard::Placement::Inside(rel) => rel,
+        fsguard::Placement::Outside(_) => {
+            return Err(ToolOutcome::err(format!(
+                "`{given}` is outside the working directory. `{tool}` only searches the current \
+                 project; use `read` with an absolute path (it will ask) for anything else."
+            )))
         }
-    }
-    Ok(std::path::PathBuf::from(if out.is_empty() {
-        ".".to_string()
-    } else {
-        out.join("/")
-    }))
+    };
+    fsguard::resolve_beneath(root, &rel).map_err(|e| ToolOutcome::err(e.prompt(tool, given)))
 }
 
 /// Permission for a mutating file tool: protected paths escalate.
@@ -346,7 +335,8 @@ impl Tool for GlobTool {
 
 fn glob_impl(input: &Value) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
-    let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
+    let given = input.get("path").and_then(Value::as_str).unwrap_or(".");
+    let root = guarded_search_root("glob", fsguard::workspace_root(), given)?;
     glob_walk(&root, pattern)
 }
 
@@ -454,7 +444,8 @@ impl Tool for GrepTool {
 
 async fn grep_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
-    let root = workspace_contained(input.get("path").and_then(Value::as_str).unwrap_or("."))?;
+    let given = input.get("path").and_then(Value::as_str).unwrap_or(".");
+    let root = guarded_search_root("grep", fsguard::workspace_root(), given)?;
     grep_search(pattern, &root, input, cancel).await
 }
 
@@ -721,21 +712,6 @@ mod tests {
             .build()
             .unwrap()
             .block_on(tool.run(input, CancellationToken::new()))
-    }
-
-    #[test]
-    fn workspace_contained_rejects_escape_and_absolute() {
-        // relative, in-workspace: allowed (returned path is the cleaned relative)
-        assert!(workspace_contained("src").is_ok());
-        assert!(workspace_contained("./src/lib.rs").is_ok());
-        assert!(workspace_contained(".").is_ok());
-        // absolute path: refused (a read tool is not an exfiltration primitive)
-        assert!(workspace_contained("/etc/passwd").is_err());
-        // traversal out of the workspace: refused
-        assert!(workspace_contained("../secrets").is_err());
-        assert!(workspace_contained("src/../../etc").is_err());
-        // a `..` that stays inside is fine
-        assert!(workspace_contained("src/../README.md").is_ok());
     }
 
     #[test]
