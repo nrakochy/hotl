@@ -548,6 +548,44 @@ mod tests {
         assert_eq!(attempts, vec![1]);
     }
 
+    /// End-to-end retry: 429 → backoff → success, over a real socket.
+    /// `retry-after: 0` keeps it instant; the policy itself is unit-tested.
+    #[tokio::test]
+    async fn a_429_is_retried_over_a_real_socket() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![RETRY_429, SSE_OK], seen.clone()).await;
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some("k".into()))))
+            .with_base_url(&base);
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2, "the request was not retried");
+        let retrying = events
+            .iter()
+            .filter(|e| matches!(e, Ok(StreamEvent::Retrying { .. })))
+            .count();
+        assert_eq!(retrying, 1, "the user must be told a retry happened");
+        assert!(matches!(
+            events.last(),
+            Some(Ok(StreamEvent::Completed { .. }))
+        ));
+    }
+
+    /// A 400 is terminal — no blind retry, and the message reaches the user.
+    #[tokio::test]
+    async fn a_400_is_not_retried() {
+        const BAD_REQUEST: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: text/plain\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad request";
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![BAD_REQUEST], seen.clone()).await;
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some("k".into()))))
+            .with_base_url(&base);
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(matches!(
+            events.last(),
+            Some(Err(ProviderError::Http { status: 400, .. }))
+        ));
+        assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
     #[test]
     fn base_url_accepts_bare_origin_and_v1_suffix() {
         // Bridges document the bare origin; hotl's own convention includes /v1.

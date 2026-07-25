@@ -899,6 +899,68 @@ mod tests {
         assert!(!bodies[1].contains("max_completion_tokens"));
     }
 
+    /// The success path over HTTP: the event sequence a consumer actually
+    /// sees, including the `BlockEnd` that T3-14 was missing.
+    #[tokio::test]
+    async fn a_successful_stream_yields_the_full_event_sequence() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![SSE_OK], seen.clone()).await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        let oks: Vec<_> = events.into_iter().map(|e| e.expect("no error")).collect();
+        assert!(matches!(oks[0], StreamEvent::Started));
+        assert!(oks
+            .iter()
+            .any(|e| matches!(e, StreamEvent::BlockStart { index: 0, .. })));
+        assert!(oks
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "hi")));
+        assert!(
+            oks.iter()
+                .any(|e| matches!(e, StreamEvent::BlockEnd { index: 0 })),
+            "T3-14: every dialect closes its blocks"
+        );
+        let Some(StreamEvent::Completed {
+            stop,
+            usage,
+            blocks,
+        }) = oks.last()
+        else {
+            panic!("no terminal event: {oks:?}")
+        };
+        assert_eq!(*stop, StopReason::EndTurn);
+        assert_eq!(usage.input_tokens, 1);
+        assert_eq!(blocks[0]["text"], "hi");
+    }
+
+    /// The OpenAI twin of the retry test.
+    #[tokio::test]
+    async fn a_429_is_retried_over_a_real_socket() {
+        const RETRY_429: &str = "HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/plain\r\nretry-after: 0\r\ncontent-length: 5\r\nconnection: close\r\n\r\nslow!";
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![RETRY_429, SSE_OK], seen.clone()).await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    /// The unterminated-final-line case at the HTTP layer (Task 3): a server
+    /// that closes the socket right after its last `data:` line still
+    /// produces a complete response.
+    #[tokio::test]
+    async fn a_stream_ending_without_a_trailing_newline_still_completes() {
+        const SSE_NO_TRAILING_NEWLINE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}";
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![SSE_NO_TRAILING_NEWLINE], seen.clone()).await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Completed { .. }))),
+            "the terminal event was dropped with the unterminated line: {events:?}"
+        );
+    }
+
     /// The explicit opt-in skips the probe entirely.
     #[test]
     fn legacy_max_tokens_uses_the_old_spelling_from_the_start() {
