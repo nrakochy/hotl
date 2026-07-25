@@ -62,6 +62,7 @@ pub struct OpenAiCompatProvider {
     key_source: Arc<dyn KeySource>,
     headers_timeout: std::time::Duration,
     stream_idle_timeout: std::time::Duration,
+    legacy_max_tokens: bool,
 }
 
 impl OpenAiCompatProvider {
@@ -72,6 +73,7 @@ impl OpenAiCompatProvider {
             key_source,
             headers_timeout: hotl_provider::timeouts::HEADERS,
             stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
+            legacy_max_tokens: false,
         }
     }
 
@@ -89,7 +91,24 @@ impl OpenAiCompatProvider {
         self
     }
 
+    /// Send `max_tokens` instead of `max_completion_tokens` from the first
+    /// request, for an endpoint already known to be old.
+    pub fn legacy_max_tokens(mut self) -> Self {
+        self.legacy_max_tokens = true;
+        self
+    }
+
+    /// The default spelling. `stream()` calls [`Self::body_for`] directly
+    /// because it may re-render the body mid-loop after the legacy probe.
+    #[cfg(test)]
     fn build_body(req: &SamplingRequest) -> Value {
+        Self::body_for(req, false)
+    }
+
+    /// `legacy` sends the pre-2024 `max_tokens` spelling. Older
+    /// OpenAI-compatible servers (llama.cpp, older vLLM/Ollama) reject
+    /// `max_completion_tokens` with a 400, and this crate advertises them.
+    fn body_for(req: &SamplingRequest, legacy: bool) -> Value {
         let mut messages = Vec::new();
         if !req.system.is_empty() {
             messages.push(json!({"role": "system", "content": req.system.as_ref()}));
@@ -102,11 +121,15 @@ impl OpenAiCompatProvider {
         }
         let mut body = json!({
             "model": req.model,
-            "max_completion_tokens": req.max_tokens,
             "stream": true,
             "stream_options": {"include_usage": true},
             "messages": messages,
         });
+        if legacy {
+            body["max_tokens"] = json!(req.max_tokens);
+        } else {
+            body["max_completion_tokens"] = json!(req.max_tokens);
+        }
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools.iter().map(tool_json).collect::<Vec<_>>());
         }
@@ -114,6 +137,18 @@ impl OpenAiCompatProvider {
         // models decide depth server-side here, and caching is implicit.
         body
     }
+}
+
+/// A 400/422 naming `max_completion_tokens` — the one wire error that means
+/// "this server predates the parameter", not "your request is wrong".
+/// Deliberately narrow: it matches on *structured API error text*, which is
+/// the carve-out RELIABILITY.md allows (the rule is about model prose).
+fn rejects_max_completion_tokens(err: &ProviderError) -> bool {
+    matches!(
+        err,
+        ProviderError::Http { status, message, .. }
+            if (*status == 400 || *status == 422) && message.contains("max_completion_tokens")
+    )
 }
 
 fn tool_json(t: &ToolDef) -> Value {
@@ -401,10 +436,11 @@ impl Provider for OpenAiCompatProvider {
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let client = self.client.clone();
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let body = Self::build_body(&req);
         let source = self.key_source.clone();
         let headers_timeout = self.headers_timeout;
         let stream_idle_timeout = self.stream_idle_timeout;
+        let mut legacy = self.legacy_max_tokens;
+        let mut body = Self::body_for(&req, legacy);
 
         Box::pin(async_stream::stream! {
             // INVARIANT (T2-16): `attempt` counts network/HTTP attempts only.
@@ -468,6 +504,16 @@ impl Provider for OpenAiCompatProvider {
                                 return;
                             }
                         }
+                    }
+                    Attempt::Fail(e) if !legacy && rejects_max_completion_tokens(&e) => {
+                        // A capability probe, not a failure: no retry slot.
+                        legacy = true;
+                        body = Self::body_for(&req, true);
+                        yield Ok(StreamEvent::Retrying {
+                            attempt,
+                            reason: "endpoint predates max_completion_tokens — \
+                                     retrying with max_tokens".into(),
+                        });
                     }
                     Attempt::Fail(e) => {
                         yield Err(e);
@@ -787,6 +833,78 @@ mod tests {
             }
         });
         base
+    }
+
+    /// Sibling of [`tcp_double`] that records each request's **body** rather
+    /// than its `authorization` header: read to the header break, take
+    /// `content-length`, then read exactly that many more bytes.
+    async fn tcp_double_bodies(
+        responses: Vec<&'static str>,
+        seen: Arc<StdMutex<Vec<String>>>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut req = Vec::new();
+                let head_end = loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&req[..head_end]).to_string();
+                let len: usize = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split_once(':'))
+                    .and_then(|(_, v)| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while req.len() < head_end + len {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req[head_end..]).to_string());
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.shutdown().await.ok();
+            }
+        });
+        base
+    }
+
+    const UNKNOWN_PARAM_400: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 85\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"Unrecognized request argument supplied: max_completion_tokens\"}}";
+
+    /// An endpoint that predates `max_completion_tokens` gets the old spelling on
+    /// a second try, rather than a dead end — the crate doc advertises Ollama.
+    #[tokio::test]
+    async fn an_older_endpoint_falls_back_to_max_tokens() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double_bodies(vec![UNKNOWN_PARAM_400, SSE_OK], seen.clone()).await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        let bodies = seen.lock().unwrap().clone();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0].contains("max_completion_tokens"));
+        assert!(bodies[1].contains("\"max_tokens\""));
+        assert!(!bodies[1].contains("max_completion_tokens"));
+    }
+
+    /// The explicit opt-in skips the probe entirely.
+    #[test]
+    fn legacy_max_tokens_uses_the_old_spelling_from_the_start() {
+        let body = OpenAiCompatProvider::body_for(&sampling_req(), true);
+        assert_eq!(body["max_tokens"], 16);
+        assert!(body.get("max_completion_tokens").is_none());
     }
 
     fn sampling_req() -> SamplingRequest {
