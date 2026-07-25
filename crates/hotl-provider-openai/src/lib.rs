@@ -29,6 +29,15 @@ use serde_json::{json, Value};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
+/// Marks a failed tool result in the chat-completions dialect.
+///
+/// Anthropic carries this structurally (`"is_error": true`); this wire has no
+/// equivalent field on a `role: "tool"` message, so the signal is in-band or
+/// it is lost. Without it the model cannot tell a failure from a success and
+/// the errors-are-prompts loop silently stops working (T3-13). Do not remove
+/// as cosmetic.
+const TOOL_ERROR_PREFIX: &str = "[tool_error] ";
+
 /// The one client constructor. A default `reqwest` client has no connect
 /// timeout, no read timeout, and no keepalive; T1-4 traces a wedged session
 /// straight back to it.
@@ -148,10 +157,15 @@ fn convert_item(item: &Item, out: &mut Vec<Value>) {
         }
         Item::ToolResults { results } => {
             for r in results {
+                let content = if r.is_error && !r.content.starts_with(TOOL_ERROR_PREFIX) {
+                    format!("{TOOL_ERROR_PREFIX}{}", r.content)
+                } else {
+                    r.content.clone()
+                };
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": r.tool_use_id,
-                    "content": r.content,
+                    "content": content,
                 }));
             }
         }
@@ -491,6 +505,48 @@ mod tests {
         assert!(
             !src.contains(concat!("mod ", "responses")),
             "responses.rs is dead code — delete it or wire it to a real endpoint"
+        );
+    }
+
+    /// INVARIANT (T3-13): a failed tool is legible as failed in both dialects.
+    /// The chat-completions wire has no `is_error` field on a role:"tool"
+    /// message, so the marker is in-band — but it must be there.
+    #[test]
+    fn tool_result_errors_are_legible_in_the_openai_dialect() {
+        let req = SamplingRequest {
+            model: "m".into(),
+            max_tokens: 16,
+            system: "".into(),
+            items: std::sync::Arc::new(vec![Item::ToolResults {
+                results: vec![
+                    ToolResultItem {
+                        tool_use_id: "ok".into(),
+                        content: "all good".into(),
+                        is_error: false,
+                    },
+                    ToolResultItem {
+                        tool_use_id: "bad".into(),
+                        content: "No such file: a.rs. Check the path with `glob`.".into(),
+                        is_error: true,
+                    },
+                ],
+            }]),
+            tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
+            thinking: false,
+            cache_static: false,
+            turn_context: None,
+        };
+        let body = OpenAiCompatProvider::build_body(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(
+            msgs[0]["content"], "all good",
+            "success must not be decorated"
+        );
+        let failed = msgs[1]["content"].as_str().unwrap();
+        assert!(failed.starts_with(TOOL_ERROR_PREFIX), "{failed}");
+        assert!(
+            failed.contains("Check the path"),
+            "the prompt content must survive: {failed}"
         );
     }
 
