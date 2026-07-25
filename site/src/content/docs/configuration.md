@@ -39,7 +39,7 @@ api_key_helper = "..."                      # command whose trimmed stdout is th
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
 
 [context]
-window = 200000            # your model's context size in tokens
+window = 200000            # usually unnecessary — looked up per model; see below
 evict_tokens = 20000       # offload tool results larger than this (0 disables)
 compaction_reset = false   # fresh-slate compaction instead of in-place
 show_used_pct = true       # show context-fullness in each turn's status
@@ -236,7 +236,7 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_PROVIDER_AUTH` | `[provider].auth` | `api_key` (default) or `subscription` — see [endpoints that authenticate for you](../gateway/#endpoints-that-authenticate-for-you). |
 | `HOTL_API_KEY_HELPER` | `[provider].api_key_helper` | Overrides the config.toml key of the same name. |
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |
-| `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. |
+| `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. Leave unset to get the [per-model window](#context-window-context-window). |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
@@ -288,6 +288,20 @@ Restricts what `bash` commands (and diagnostics/hooks, which run under the same 
 Both tools honor the *same* `[network]` egress policy `bash` does — there is exactly one egress authority, never a second allowlist. With `egress = "off"` both refuse every host outright; with `"allowlist"`, a host outside `allow` fails closed with a message telling you to add it. Even when a fetch is allowed, it still asks (network side effects can exfiltrate via the URL itself) — the ask names every host in the batch.
 
 Every byte a fetch or search returns enters the model inside the untrusted-content envelope, tagged with its source (`web:<host>`) — web content is data the model can use to inform its work, never an instruction it can act on unprompted, the same treatment `spawn` and `recall` results get.
+
+### Context window (`[context] window`)
+
+`[context] window` sets the token budget compaction triggers against (at 80%). **Leave it unset unless you need to override it** — hotl looks the window up per model, so the Claude Opus family gets its 1M window and Haiku 4.5 gets its 200K, without you telling it. A model hotl doesn't recognize (any local or gateway model) falls back to 200,000 and prints a warning naming this setting.
+
+Precedence, highest first: `HOTL_CONTEXT_WINDOW` → `[context] window` → the model's known window → 200,000.
+
+```toml
+[context]
+window = 8192   # only needed for a model hotl doesn't recognize, or a
+                # gateway that trims the window below the model's own
+```
+
+Setting this too high overflows the model mid-turn; too low burns a summarize call and discards context you were still paying to keep.
 
 ### Concurrency (`[concurrency]`)
 
