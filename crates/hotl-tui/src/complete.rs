@@ -67,8 +67,13 @@ pub fn word(buffer: &str, cursor: (usize, usize)) -> Option<String> {
 }
 
 /// Match quality, sortable ascending: prefix hits before substring hits,
-/// built-ins before skills, shorter names before longer. `None` = no match.
-fn rank(cmd: &Command, needle: &str) -> Option<(u8, bool, usize)> {
+/// then shorter names before longer, then built-ins before skills as the
+/// final tiebreak. Length must outrank built-in status — otherwise a skill
+/// whose name is a strict prefix of a longer builtin (a skill named `mod`
+/// against the builtin `mode`) would be unreachable via Enter, since the
+/// builtin would always outrank it despite matching a longer needle.
+/// `None` = no match.
+fn rank(cmd: &Command, needle: &str) -> Option<(u8, usize, bool)> {
     let name = cmd.name.to_lowercase();
     let tier = if name.starts_with(needle) {
         0
@@ -77,7 +82,7 @@ fn rank(cmd: &Command, needle: &str) -> Option<(u8, bool, usize)> {
     } else {
         return None;
     };
-    Some((tier, !cmd.builtin, name.chars().count()))
+    Some((tier, name.chars().count(), !cmd.builtin))
 }
 
 /// The popup for this buffer, or `None` when there is nothing to show.
@@ -92,12 +97,12 @@ pub fn recompute(
         return None;
     }
     let needle = word(buffer, cursor)?.to_lowercase();
-    let mut scored: Vec<((u8, bool, usize, String), usize)> = commands
+    let mut scored: Vec<((u8, usize, bool, String), usize)> = commands
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
             rank(c, &needle)
-                .map(|(tier, skill, len)| ((tier, skill, len, c.name.to_lowercase()), i))
+                .map(|(tier, len, skill)| ((tier, len, skill, c.name.to_lowercase()), i))
         })
         .collect();
     if scored.is_empty() {
@@ -203,6 +208,28 @@ mod tests {
             "`rag-recall` contains `re` (at \"rag-\"[re]\"call\") and must sort below the prefix hits; \
              `mode` has no `r` at all and must not appear"
         );
+    }
+
+    /// Regression: a skill whose name is a strict prefix of a longer builtin
+    /// must still rank first, so Enter loads the skill rather than running
+    /// the builtin's usage message. Before `rank` ordered length ahead of
+    /// built-in status, `mode` (a builtin) always outranked a shorter skill
+    /// named `mod`, making that skill unreachable via Enter.
+    #[test]
+    fn a_skill_that_is_a_strict_prefix_of_a_builtin_still_ranks_first() {
+        let mut cmds = table();
+        cmds.push(Command {
+            name: "mod".into(),
+            description: "a skill, not the builtin".into(),
+            builtin: false,
+        });
+        let c = recompute(&cmds, "/mod", (0, 4), false).expect("open");
+        assert_eq!(
+            names(&cmds, &c),
+            vec!["mod", "mode"],
+            "the shorter skill name must sort ahead of the longer builtin"
+        );
+        assert_eq!(c.selected, 0);
     }
 
     #[test]
