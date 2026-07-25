@@ -8,9 +8,9 @@
 pub mod retention;
 pub mod shadow;
 
-use std::fs::{File, OpenOptions};
+use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -224,12 +224,19 @@ impl SessionLog {
         masker: Masker,
         now_ms: u64,
     ) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        // INVARIANT: the session log, its blobs, and both containing directories
+        // are owner-only — the transcript is the most sensitive artifact hotl
+        // writes (the whole conversation, every tool result, every file read).
+        // Enforced by `log_and_dirs_are_owner_only`.
+        // Note: `mode` applies to directories this call *creates*; a pre-existing
+        // `sessions/` keeps whatever mode it already had.
+        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
         let session_id = new_ulid();
         let path = dir.join(format!("{session_id}.jsonl"));
         let file = OpenOptions::new()
             .create_new(true)
             .append(true)
+            .mode(0o600)
             .open(&path)?;
         let offset = file.metadata()?.len();
         let (tx, rx) = mpsc::channel::<WriterCmd>();
@@ -284,7 +291,7 @@ impl SessionLog {
             .and_then(|s| s.to_str())
             .unwrap_or("session");
         let dir = self.path.with_file_name(format!("{stem}.blobs"));
-        std::fs::create_dir_all(&dir)?;
+        DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         // Tool-use ids are provider-generated tokens; keep the filename safe.
         let safe: String = tool_use_id
             .chars()
@@ -1461,6 +1468,33 @@ mod tests {
             "a sealed log must not leave a broken chain: {:?}",
             replayed.warnings
         );
+    }
+
+    #[test]
+    fn log_and_dirs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        let log = SessionLog::create(&sessions, "m", None, Masker::empty(), 1).unwrap();
+        let blob = log.write_blob("toolu_1", "body").unwrap();
+
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(log.path()),
+            0o600,
+            "the transcript must not be world-readable"
+        );
+        assert_eq!(
+            mode(&sessions),
+            0o700,
+            "the sessions dir must not be world-listable"
+        );
+        assert_eq!(
+            mode(&blob),
+            0o600,
+            "blobs were already 0600 — keep them that way"
+        );
+        assert_eq!(mode(blob.parent().unwrap()), 0o700, "the .blobs dir too");
     }
 
     #[test]
