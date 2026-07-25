@@ -8,6 +8,60 @@ semver promise of their own.
 
 ### Fixed
 
+- **`sandboxed:` in an ask now means the sandbox was proven on this host**, not
+  that the mechanism exists on disk. `probe()` used to answer "enforced" the
+  moment it saw `/usr/bin/sandbox-exec`, and that one boolean is the sole gate
+  on `bash` allow-rules auto-approving without a human — so a profile that
+  failed to apply meant silent auto-approval of *unconfined* shell commands. It
+  now spawns a real sandboxed child that tries to write outside the
+  confinement, and reports `Enforced` only if that write fails and leaves
+  nothing behind. One spawn per process, bounded at 2s, and a host that cannot
+  demonstrate confinement degrades to the loud `UNSANDBOXED` posture instead of
+  claiming one. If neither `/var/tmp` nor `$HOME` is writable, set
+  `HOTL_SANDBOX_PROBE_DIR` to somewhere outside the working directory and
+  outside `TMPDIR`.
+- **Linux: `truncate(2)` by path escaped the floor on every kernel.** The
+  Landlock ruleset was pinned to ABI v2, and Landlock only restricts rights it
+  is asked to *handle* — so `LANDLOCK_ACCESS_FS_TRUNCATE` (ABI v3, Linux 6.2)
+  was never requested and an approved command could zero any file on the host.
+  The handled set is now v3. Note this is not reachable via `truncate -s 0` or
+  `> file`, which open the file for writing first and were already denied; it
+  took a raw `truncate(2)`, which is why it survived.
+- **Provider credentials no longer reach child processes.** `bash`, `grep`'s
+  `rg`, diagnostics and owner shell hooks inherited the full environment, so
+  `ANTHROPIC_API_KEY` was one `env` away from any auto-approved command. The
+  scrub is deliberately narrow — provider keys only — because the obvious
+  broad heuristic would also strip `GITHUB_TOKEN` / `CARGO_REGISTRY_TOKEN` /
+  `NPM_TOKEN` and silently break `gh`, `cargo publish` and `npm publish`.
+- **`web_fetch` shows you the whole URL.** The ask read `web_fetch:
+  pastebin.com` while its own code comment noted that a fetch exfiltrates via
+  the URL itself — so the one thing you needed to see (`?d=<your ssh key>`) was
+  the one thing hidden. The ask now carries the full URL, elided only with an
+  explicit remaining-character count.
+- **`web_fetch` no longer follows a redirect off the public web into your
+  private network**, and refuses cloud instance-metadata addresses
+  (`169.254.169.254` and friends) on every hop including the first. An allowed
+  public host could previously 302 into the metadata service and hand instance
+  credentials to the model, having been approved as `web_fetch: example.com`.
+  A chain that *starts* private still works — "fetch my dev server" is a real
+  workflow, and you saw and approved that target.
+- **A failed HTTP client build is reported instead of silently downgraded.**
+  `web_fetch`/`web_search` fell back to a bare client with **no redirect policy
+  and no timeout**, quietly deleting the per-hop egress re-check and letting a
+  hung origin hold a request permit forever. A panicked fetch task is also no
+  longer reported as "cancelled".
+- **The egress proxy is bounded, capped and authenticated.** An unfinished
+  request head pinned a task and a socket for the life of the process (now a
+  10s timeout), accepts were unbounded (now 64 live connections, then 503), the
+  loopback proxy was unauthenticated so any local process could spend your
+  allowlist, and a request carrying two `Host:` headers had the policy check
+  one value while the upstream honored the other — that is refused now, not
+  resolved first-wins.
+- **Post-edit diagnostics output is defanged.** A compiler error quoting a file
+  the model just wrote could carry a forged `</diagnostics>` and reclaim the
+  surrounding context. Every other untrusted path in the workspace already did
+  this; diagnostics was the one that did not.
+
 - **The transcript scrolls without vim mode.** `PageUp`/`PageDown`,
   `Ctrl-Home`/`Ctrl-End`, and the mouse wheel now scroll; previously scroll
   was reachable only from vim Normal mode, which `[behavior] vim_mode`
@@ -33,6 +87,44 @@ semver promise of their own.
 
 ### Changed
 
+Four hardening changes below can break a workflow that used to work. Each has
+a named opt-out, and every opt-out is **labeled in the ask** — there is no
+silent way to run with the denial lifted.
+
+- **Linux kernels 5.13–6.1 lose `bash` auto-allow by default.** Those kernels
+  have Landlock but not the truncate right (see above), so the floor is
+  genuinely partial and hotl no longer certifies it. RHEL 9 (5.14) and Ubuntu
+  22.04 (5.15) are the common cases. `HOTL_SANDBOX=best-effort` accepts the
+  partial floor and labels every ask `sandboxed:landlock(partial)`; upgrading
+  the kernel is the other answer.
+- **macOS: the container-daemon socket class is denied.** `docker.sock`,
+  `podman.sock`, `containerd`, `crio` — a unix-socket connect is a *network*
+  operation, not a file write, so the write floor never covered it, and the
+  Docker API is a complete escape (mount the host root, write anywhere). It
+  survived `egress = "off"` too. `HOTL_UNIX_SOCKETS=open` restores
+  docker-in-the-loop workflows and marks every ask `unix:open`.
+  `ssh-agent`/`gpg-agent` stay reachable, so `git push` over SSH is unaffected.
+  **On Linux this is not enforceable at all** — Landlock has no rule covering
+  `connect(2)` to a pathname socket at any ABI — and hotl makes no claim there.
+- **macOS: Apple Events from a confined command are denied.** `osascript -e
+  'tell application "Terminal" to do script …'` runs its payload in a process
+  that is *not* a descendant of the sandbox. Plain AppleScript still works;
+  only the cross-application event send is refused.
+  `HOTL_MACOS_AUTOMATION=allow` restores Apple-Event-driven Xcode/Simulator/
+  Instruments flows and marks every ask `automation:allow`.
+- **`HTTP_PROXY` under `egress = "allowlist"` now carries a credential**
+  (`http://hotl:<token>@127.0.0.1:<port>`). curl, git-over-HTTP, pip and cargo
+  all forward it as `Proxy-Authorization` and are unaffected — verified end to
+  end. A client that honors the proxy host but drops proxy credentials gets a
+  `407`; `HOTL_PROXY_AUTH=off` restores the previous behavior. The token is
+  explicitly *not* cryptographic: it separates local processes for one session
+  and is visible to anything running as you, which is exactly the boundary it
+  does not claim to defend.
+
+- **A `web_fetch` at a private, loopback, or cloud-metadata address is now a
+  *protected* ask** — the same escalation `write`/`edit` give an execute-later
+  path, so it prompts in every mode including the default `auto`. Public hosts
+  are an ordinary ask, unchanged.
 - **`-p --json` schema version 2.** `turn_done.outcome` is now the tagged
   object `{"kind": …}` instead of a Rust `Debug` string, and
   `thinking_delta` carries `text`. Consumers pinned to v1 must update. The

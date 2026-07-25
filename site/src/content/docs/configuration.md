@@ -250,7 +250,14 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
-| `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. |
+| `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. `best-effort` accepts a *partial* Linux floor on kernels 5.13–6.1 (no truncate right); every ask is then labeled `sandboxed:landlock(partial)`. Unset is the hardened default. |
+| `HOTL_SANDBOX_PROBE_DIR` | — | Where the startup smoke test writes its probe file. Must be writable, outside the working directory, and outside `TMPDIR`. Only needed on hosts where neither `/var/tmp` nor `$HOME` qualifies — otherwise the sandbox reports itself unavailable rather than unproven. |
+| `HOTL_UNIX_SOCKETS` | — | `open` lifts the macOS deny on the container/orchestrator daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) for docker-in-the-loop workflows. Marks every ask `unix:open`. No effect on Linux, where the deny is not expressible. |
+| `HOTL_MACOS_AUTOMATION` | — | `allow` lifts the macOS Apple Events deny, for Xcode/Simulator/Instruments flows driven by AppleScript. Marks every ask `automation:allow`. |
+| `HOTL_SCRUB_ENV` | — | Comma-separated extra variable names to strip from every child process's environment, on top of the provider keys stripped by default. |
+| `HOTL_SCRUB_ENV_STRICT` | — | `1` also strips every variable whose name contains `KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`PASSWD`/`CREDENTIAL`/`AUTH` with a value of 8+ characters. Stricter, but it will break `gh`, `cargo publish` and `npm publish`, which need their tokens. |
+| `HOTL_WEB_ALLOW_METADATA` | — | `1` permits `web_fetch` to reach cloud instance-metadata addresses (`169.254.169.254`, `169.254.170.2`, `fd00:ec2::254`), which are otherwise refused on every redirect hop including the first. Nothing legitimate needs this. |
+| `HOTL_PROXY_AUTH` | — | `off` drops the `Proxy-Authorization` requirement on the local egress proxy, for a client that honors `HTTP_PROXY` but discards its credentials. Without it, any local process could spend your allowlist. |
 | `HOTL_MAX_TURNS` | `[behavior].max_turns` | Model steps per prompt (default 100); `-1` = unlimited. |
 | `HOTL_CONCURRENCY_REQUESTS` | `[concurrency].requests` | Concurrent `web_fetch`/`web_search` HTTP requests (default 4). |
 | `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Concurrent sub-agent (`spawn`) sessions (default 4) — global across the parent and every child. |

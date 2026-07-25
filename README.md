@@ -34,7 +34,7 @@ much you're asked: `auto` (default — ordinary calls run without prompting),
 approve a plan), and `dontask` (never wait for input; deny anything not
 pre-approved — the `-p`/CI posture). An unrecognized mode fails closed to
 `ask`. Underneath, regardless of mode: `bash` (and hooks, and diagnostics)
-runs confined by the kernel — Seatbelt on macOS, Landlock on Linux ≥ 5.13
+runs confined by the kernel — Seatbelt on macOS, Landlock on Linux ≥ 6.2
 including WSL2 — with writes limited to the working directory and temp;
 writes to execute-later and credential paths (git hooks, shell rc, Makefiles,
 `.ssh/`, credential stores, agent-instruction files) always prompt, and are

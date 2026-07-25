@@ -76,6 +76,26 @@ The sandbox stops the agent **tampering with your filesystem outside the project
 
 On hosts with no sandbox mechanism (older Linux kernels, or `HOTL_SANDBOX=off`), the floor is simply absent — every `bash` ask is marked `UNSANDBOXED`, and allow-rules for `bash` stop working. The gate still holds; the confinement doesn't.
 
+### `sandboxed:` means it was proven, not that it was configured
+
+At startup hotl spawns one throwaway sandboxed process that tries to write a file outside the confinement, and only reports the floor as enforced if that write **fails**. Until this check existed, "enforced" meant "the sandbox binary is on disk" — and since that single answer is what lets `bash` allow-rules auto-approve without asking you, a profile that failed to apply for any reason meant *unconfined* commands being auto-approved silently. Now a host that can't demonstrate confinement degrades loudly instead of claiming it.
+
+It costs one process spawn per session, capped at two seconds. The probe file is uniquely named and deleted on every path, including the one where it leaks. If neither `/var/tmp` nor `$HOME` is writable, point `HOTL_SANDBOX_PROBE_DIR` at somewhere that is — outside your working directory and outside `TMPDIR`, or it proves nothing.
+
+### What each platform can and can't confine
+
+The floor is real on both platforms, but they are not equivalent, and the differences are worth knowing before you rely on one:
+
+- **Linux needs kernel ≥ 6.2** for the full floor. Below that (RHEL 9's 5.14, Ubuntu 22.04's 5.15) Landlock exists but lacks the *truncate* right, so an approved command can still zero a file anywhere on the host. hotl refuses to certify that as enforced: those kernels lose `bash` auto-allow unless you set `HOTL_SANDBOX=best-effort`, which accepts the partial floor and labels every ask `sandboxed:landlock(partial)`. Landlock's network confinement separately needs ≥ 6.7.
+- **Unix-domain sockets are a network operation, not a file write**, so the write floor never covered them. On macOS the container-daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) is denied by default — reaching the Docker API is a complete escape, since it can mount the host root — and `HOTL_UNIX_SOCKETS=open` opts back in, marked `unix:open` in every ask. `ssh-agent`/`gpg-agent` stay reachable so `git push` over SSH keeps working. **On Linux none of this is enforceable**: Landlock has no rule covering a connect to a pathname socket at any ABI. If a writable daemon socket is a privilege boundary you depend on, don't run `mode = "auto"` on that host.
+- **macOS also denies Apple Events** from a confined command, because `osascript -e 'tell application "Terminal" to do script …'` runs its payload in a process that isn't a descendant of the sandbox — an escape that never touches disk. Plain AppleScript still runs; only the cross-application send is refused. `HOTL_MACOS_AUTOMATION=allow` restores Xcode/Simulator flows that drive tools this way, marked `automation:allow`.
+
+### Your provider key doesn't reach the commands you approve
+
+Child processes used to inherit hotl's whole environment, so `ANTHROPIC_API_KEY` was one `env` away from any auto-approved `bash` call. Provider credentials are now stripped from every child — `bash`, `grep`'s ripgrep, post-edit diagnostics, and your shell hooks alike.
+
+The scrub is deliberately narrow. The tempting rule — strip anything named like a secret — would also take `GITHUB_TOKEN`, `CARGO_REGISTRY_TOKEN` and `NPM_TOKEN`, breaking `gh`, `cargo publish` and `npm publish` in ways that look like unrelated bugs. Add names with `HOTL_SCRUB_ENV=A,B,C`, or take the broad rule knowingly with `HOTL_SCRUB_ENV_STRICT=1`.
+
 ## Opting out of open egress
 
 `[network].egress` in `config.toml` closes the door the previous section describes as open. Set it to `"off"` and an approved command can reach only your own machine — loopback and unix-domain sockets; the kernel refuses everything else. Set it to `"allowlist"` and you add a short list of hosts the agent may fetch from:
@@ -89,6 +109,21 @@ allow = ["github.com", "*.crates.io"]
 Allowed hosts are reached through a small local proxy, so `cargo fetch` and `git pull` keep working while a `curl` to anywhere else gets a 403 that tells the model exactly which control refused it (`hotl egress: "HOST" is not in [network].allow`). Tools that ignore the proxy environment don't get around anything — they hit the kernel's loopback-only wall and fail. Every bash ask shows the active state: `net:off` or `net:allow(N)`.
 
 Three honest caveats. First, this is **opt-in**: the default stays open because the agent legitimately fetches things, and a silently broken network by default would just teach everyone to turn the feature off. Second, **only HTTP traffic can traverse the proxy** — `git` over an SSH remote (`git@github.com:…`) fails under `off`/`allowlist` no matter what you allow; switch those repos to HTTPS remotes while running restricted. Third, it is **not airtight**: an allowed host is allowed for *everything* (an allowlisted `github.com` can still receive a push of your data), DNS still resolves (macOS resolves names via a local system service; on Linux, Landlock confines TCP only, and needs kernel ≥ 6.7), so a determined DNS-tunnel can still leak — treat egress restriction as a strong brake on casual exfiltration, not a cleanroom. And if the kernel can't enforce the restriction you configured, hotl says so loudly — `NET:UNENFORCED(reason)` in every bash ask — and `bash` allow-rules stop auto-approving, the same fail-closed posture as an unsandboxed host. The full mechanics and limits live in [SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md).
+
+Two smaller things about the proxy. It is **bounded**: a client that opens a connection and never finishes its request gets ten seconds, and there is a ceiling of 64 live connections before it starts answering `503` — an unfinished request used to pin a socket for the life of the process. And it is **authenticated**: the proxy URL hotl hands your commands carries a per-session credential (`http://hotl:<token>@127.0.0.1:<port>`), so another process on the same machine can't quietly spend your allowlist. curl, git-over-HTTP, pip and cargo all forward it and are unaffected; a client that honors the proxy host but discards credentials gets a `407`, and `HOTL_PROXY_AUTH=off` is the escape hatch. The token isn't cryptographic and doesn't pretend to be — it rides your commands' environment, so it separates *processes*, not *users*.
+
+## What `web_fetch` shows you, and where it refuses to go
+
+`web_fetch` always asks, and the ask now carries the **whole URL** — path, query and all. It used to show only the host, which hid precisely the thing worth seeing: a fetch exfiltrates through the URL itself, so `web_fetch: pastebin.com` and `web_fetch: pastebin.com/p?d=<your ssh key>` looked identical at the moment you approved one. Long URLs are elided in the middle with an explicit count of what was cut, never trimmed silently.
+
+Two targets get stricter treatment:
+
+- **Cloud instance-metadata addresses** (`169.254.169.254` and its siblings) are refused outright, on the first hop and on every redirect hop. On a cloud VM that endpoint hands out instance credentials to anything that asks, and nothing legitimate needs an agent to read it. `HOTL_WEB_ALLOW_METADATA=1` exists if you genuinely do.
+- **A redirect from the public web into your private network is refused.** You approved hop one; hop two into `10.0.0.5` or `127.0.0.1` is a target you never saw. An allowed public host could otherwise 302 into an internal service and return its response into the model's context. A chain that *starts* private is fine — "fetch `http://localhost:3000` and tell me what's wrong" is a real workflow, and that target was on screen when you approved it.
+
+Fetching a private or loopback address directly still works, but it is a **protected** ask: it prompts in every mode, including the default `auto`, the same way a write to an execute-later path does.
+
+One honest limit: the classification reads literal addresses. A *hostname* that resolves into private space on a redirect hop isn't caught, because the decision has to be made without doing a DNS lookup.
 
 ## The workspace boundary: the file tools stay in the project
 
