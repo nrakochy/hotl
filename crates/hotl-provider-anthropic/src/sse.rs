@@ -118,21 +118,29 @@ impl Assembler {
         match delta.get("type").and_then(Value::as_str).unwrap_or("") {
             "text_delta" => {
                 let text = text_of("text");
-                self.append_str(index, "text", &text);
+                self.append_str(index, "text", &text)?;
                 Ok(vec![StreamEvent::TextDelta { index, text }])
             }
             "thinking_delta" => {
                 let text = text_of("thinking");
-                self.append_str(index, "thinking", &text);
+                self.append_str(index, "thinking", &text)?;
                 Ok(vec![StreamEvent::ThinkingDelta { index, text }])
             }
             "input_json_delta" => {
+                // `partial_json` is a HashMap and would accept any index, so
+                // placement is checked explicitly to keep the same guarantee.
+                if index >= self.blocks.len() {
+                    return Err(ProviderError::Parse(format!(
+                        "tool input delta for block {index} arrived before its \
+                         content_block_start; the stream is malformed"
+                    )));
+                }
                 let json = text_of("partial_json");
                 self.partial_json.entry(index).or_default().push_str(&json);
                 Ok(vec![StreamEvent::ToolInputDelta { index, json }])
             }
             "signature_delta" => {
-                self.append_str(index, "signature", &text_of("signature"));
+                self.append_str(index, "signature", &text_of("signature"))?;
                 Ok(vec![])
             }
             // Unknown delta kinds: skipped, not fatal (forward compat).
@@ -149,9 +157,13 @@ impl Assembler {
                 let input = hotl_provider::repair::parse_or_repair(&partial).ok_or_else(|| {
                     ProviderError::Parse(format!("tool input didn't parse at block {index}"))
                 })?;
-                if let Some(b) = self.blocks.get_mut(index) {
-                    b["input"] = input;
-                }
+                let block = self.blocks.get_mut(index).ok_or_else(|| {
+                    ProviderError::Parse(format!(
+                        "tool input for block {index} arrived with no content_block_start; \
+                         the stream is malformed"
+                    ))
+                })?;
+                block["input"] = input;
             }
         }
         Ok(StreamEvent::BlockEnd { index })
@@ -179,15 +191,23 @@ impl Assembler {
         });
     }
 
-    fn append_str(&mut self, index: usize, field: &str, s: &str) {
-        if let Some(b) = self.blocks.get_mut(index) {
-            match b.get_mut(field) {
-                Some(Value::String(existing)) => existing.push_str(s),
-                _ => {
-                    b[field] = Value::String(s.to_string());
-                }
+    /// INVARIANT (T2-11): text that reaches the UI also reaches the final
+    /// block list — an unplaceable delta is an error, never a silent drop.
+    /// Enforced by `a_delta_before_its_block_start_is_a_parse_error`.
+    fn append_str(&mut self, index: usize, field: &str, s: &str) -> Result<(), ProviderError> {
+        let block = self.blocks.get_mut(index).ok_or_else(|| {
+            ProviderError::Parse(format!(
+                "delta for block {index} arrived before its content_block_start; \
+                 the stream is malformed"
+            ))
+        })?;
+        match block.get_mut(field) {
+            Some(Value::String(existing)) => existing.push_str(s),
+            _ => {
+                block[field] = Value::String(s.to_string());
             }
         }
+        Ok(())
     }
 }
 
@@ -217,6 +237,65 @@ mod tests {
             r#"{{"type":"content_block_start","index":{idx},"content_block":{{"type":"text","text":""}}}}"#
         );
         assert!(a.handle(&data).is_ok());
+    }
+
+    /// INVARIANT (T2-11): a delta the assembler cannot place in a block is a
+    /// parse error. It must never be emitted to the UI and then dropped from
+    /// history — the user would read text the model never sees again.
+    #[test]
+    fn a_delta_before_its_block_start_is_a_parse_error() {
+        let mut a = Assembler::default();
+        let data = r#"{"type":"content_block_delta","index":0,
+                       "delta":{"type":"text_delta","text":"orphan"}}"#;
+        match a.handle(data) {
+            Err(ProviderError::Parse(m)) => assert!(m.contains("block 0"), "{m}"),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    /// Same for an index inside the cap but past the blocks actually opened.
+    #[test]
+    fn an_out_of_range_delta_is_a_parse_error() {
+        let mut a = Assembler::default();
+        a.handle(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+        )
+        .unwrap();
+        let data = r#"{"type":"content_block_delta","index":5,
+                       "delta":{"type":"text_delta","text":"x"}}"#;
+        assert!(matches!(a.handle(data), Err(ProviderError::Parse(_))));
+    }
+
+    /// The expensive variant: repair succeeds, the block is missing, and today
+    /// `BlockEnd` returns Ok — so the tool call ships with `input: {}`.
+    #[test]
+    fn healed_tool_input_with_no_block_is_a_parse_error_not_an_empty_call() {
+        let mut a = Assembler::default();
+        // No content_block_start for index 3; only a partial_json delta would
+        // normally precede the stop, so drive the partial buffer directly.
+        let delta = r#"{"type":"content_block_delta","index":3,
+                        "delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#;
+        // The delta itself is already unplaceable, and that is the first error.
+        assert!(matches!(a.handle(delta), Err(ProviderError::Parse(_))));
+    }
+
+    /// A block that *was* opened still seals normally — the loud path must not
+    /// break the happy path.
+    #[test]
+    fn an_opened_tool_block_still_seals_its_healed_input() {
+        let mut a = Assembler::default();
+        a.handle(r#"{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t","name":"read","input":{}}}"#).unwrap();
+        // Cut mid-string, the shape `repair::parse_or_repair` heals (a comma
+        // left dangling at the cut point is a separate, still-unhealed case —
+        // see this plan's decision log).
+        a.handle(r#"{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\": \"a.rs"}}"#).unwrap();
+        a.handle(r#"{"type":"content_block_stop","index":0}"#)
+            .unwrap();
+        a.handle(r#"{"type":"message_stop"}"#).unwrap();
+        let StreamEvent::Completed { blocks, .. } = a.finish().unwrap() else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(blocks[0]["input"]["path"], "a.rs", "repair must still land");
     }
 
     #[test]
