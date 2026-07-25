@@ -125,8 +125,11 @@ impl SkillTool {
     /// description. Same names and order as [`Self::names`].
     ///
     /// Client-facing only: front ends build the `/<skill>` completion menu
-    /// from this. It never enters a prompt — the model sees [`describe`],
-    /// which names skills without describing them.
+    /// from this. Content still enters context only when asked for: the
+    /// always-sent tool description ([`describe`]) omits every description
+    /// listed here — the model sees them only by calling the skill tool
+    /// itself (a bare call, `{"query": …}`, or `{"source": …}` all return
+    /// them, same as they always have).
     pub fn catalog(&self) -> impl Iterator<Item = (&str, &str)> {
         self.entries.iter().flat_map(|e| {
             std::iter::once((e.name.as_str(), e.description.as_str())).chain(

@@ -106,10 +106,10 @@ pub struct SessionOpen {
 pub type SessionFactory = Box<dyn FnMut(SessionSpec) -> Result<SessionOpen, String> + Send>;
 
 /// One skill as `initialize` advertises it. The description is client-facing
-/// only — front ends render it in the `/` completion menu. It never enters a
-/// prompt: the model's view of the roster is
-/// `hotl_tools::skills::SkillTool`'s tool description, which names skills
-/// without describing them.
+/// only — front ends render it in the `/` completion menu. Content still
+/// enters context only when asked for: the always-sent tool description
+/// (`hotl_tools::skills::SkillTool`'s `describe`) omits it — the model sees
+/// it only when it calls the skill tool itself.
 #[derive(Debug, Clone)]
 pub struct SkillInfo {
     pub name: String,

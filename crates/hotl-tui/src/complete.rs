@@ -9,7 +9,9 @@
 pub struct Command {
     /// Without the leading `/` — `"rename"`, `"superpowers:brainstorming"`.
     pub name: String,
-    /// Client-facing only; empty renders as name-only. Never sent to the model.
+    /// Client-facing only; empty renders as name-only. Content enters
+    /// context only when asked for: the always-sent tool description omits
+    /// it — the model sees it only by calling the skill tool itself.
     pub description: String,
     /// Built-ins sort above skills at equal match quality.
     pub builtin: bool,
