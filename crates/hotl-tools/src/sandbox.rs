@@ -294,7 +294,7 @@ pub fn build_command(
             cmd
         }
     };
-    apply_proxy_env(cmd, egress)
+    apply_child_env(cmd, egress)
 }
 
 /// Build a direct `program arg...` invocation (no shell) under the active
@@ -320,6 +320,81 @@ pub fn build_argv(
             cmd
         }
     };
+    apply_child_env(cmd, egress)
+}
+
+/// Credentials the *harness* holds. A child process — a model-authored bash
+/// command, `rg`, a diagnostic, an owner hook — has no legitimate need for
+/// any of them, and an auto-approved `bash` can otherwise read them with
+/// `env`. Deliberately narrow: the Masker's KEY/TOKEN/SECRET heuristic
+/// (hotl-store/src/lib.rs) would also strip GITHUB_TOKEN /
+/// CARGO_REGISTRY_TOKEN / NPM_TOKEN and silently break `gh`, `cargo publish`
+/// and `npm publish`. `HOTL_SCRUB_ENV_STRICT=1` opts into that heuristic.
+const PROVIDER_CREDENTIAL_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_ADMIN_KEY",
+    "OPENAI_API_KEY",
+    "HOTL_API_KEY_HELPER",
+    "HOTL_SCRUB_ENV",
+    "HOTL_SCRUB_ENV_STRICT",
+];
+
+/// Same markers as `hotl_store::Masker` — duplicated rather than depended on
+/// (hotl-tools does not link hotl-store). R7 owns consolidating the sanitizer
+/// copies; this list joins that queue.
+const SECRET_NAME_MARKERS: [&str; 7] = [
+    "KEY",
+    "TOKEN",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AUTH",
+];
+
+fn names_to_scrub(extra: Option<&str>, strict: bool) -> Vec<String> {
+    let mut names: Vec<String> = PROVIDER_CREDENTIAL_VARS
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    if let Some(extra) = extra {
+        names.extend(
+            extra
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+        );
+    }
+    if strict {
+        for (name, value) in std::env::vars() {
+            let upper = name.to_uppercase();
+            if value.len() >= 8 && SECRET_NAME_MARKERS.iter().any(|m| upper.contains(m)) {
+                names.push(name);
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// The one place a child's environment is shaped. Both `build_command` and
+/// `build_argv` end here, so there is no second spawn path to forget.
+///
+/// INVARIANT: no provider credential is present in any child's environment.
+/// Enforced by `provider_credentials_never_reach_the_child`.
+fn apply_child_env(
+    mut cmd: tokio::process::Command,
+    egress: &EgressState,
+) -> tokio::process::Command {
+    for name in names_to_scrub(
+        std::env::var("HOTL_SCRUB_ENV").ok().as_deref(),
+        std::env::var("HOTL_SCRUB_ENV_STRICT").is_ok_and(|v| v == "1"),
+    ) {
+        cmd.env_remove(name);
+    }
     apply_proxy_env(cmd, egress)
 }
 
@@ -617,15 +692,80 @@ mod env_tests {
                 "{key} must exempt loopback"
             );
         }
-        // Off and Open set nothing (kernel-only / unchanged behavior).
+        // Off and Open *set* nothing (kernel-only / unchanged behavior). The
+        // environment is not untouched, though: `apply_child_env` removes the
+        // provider credentials on every path — pinned by
+        // `provider_credentials_never_reach_the_child` below.
         for egress in [EgressState::Off, EgressState::Open] {
             let cmd = build_command("true", &status, &egress);
-            assert_eq!(
-                cmd.as_std().get_envs().count(),
-                0,
-                "{egress:?} must not touch env"
+            assert!(
+                cmd.as_std().get_envs().all(|(_, v)| v.is_none()),
+                "{egress:?} must only remove variables, never set one"
             );
         }
+    }
+
+    #[test]
+    fn provider_credentials_never_reach_the_child() {
+        let status = SandboxStatus::Unavailable("test".into());
+        for egress in [
+            EgressState::Open,
+            EgressState::Off,
+            EgressState::Proxy(9123),
+        ] {
+            let cmd = build_command("true", &status, &egress);
+            let envs: Vec<(String, Option<String>)> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            for name in [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "OPENAI_API_KEY",
+                "HOTL_API_KEY_HELPER",
+            ] {
+                assert!(
+                    envs.contains(&(name.to_string(), None)),
+                    "{name} must be removed from the child env under {egress:?}"
+                );
+            }
+            // A credential a child legitimately needs is left alone by default.
+            assert!(
+                !envs.iter().any(|(k, _)| k == "GITHUB_TOKEN"),
+                "the default scrub must not strip GITHUB_TOKEN (gh/git would break)"
+            );
+        }
+        // The same chokepoint covers the argv shape.
+        let argv = build_argv("rg", &["--files".to_string()], &status, &EgressState::Open);
+        assert!(argv
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == "ANTHROPIC_API_KEY" && v.is_none()));
+    }
+
+    #[test]
+    fn strict_mode_extends_the_scrub_and_explicit_names_add_to_it() {
+        assert!(names_to_scrub(Some("MY_THING,OTHER"), false)
+            .iter()
+            .any(|n| n == "MY_THING"));
+        assert!(names_to_scrub(None, false)
+            .iter()
+            .any(|n| n == "ANTHROPIC_API_KEY"));
+        // Strict adds every secret-named var *present in this process*.
+        std::env::set_var("HOTL_TEST_SCRUB_TOKEN", "abcdefghij");
+        assert!(names_to_scrub(None, true)
+            .iter()
+            .any(|n| n == "HOTL_TEST_SCRUB_TOKEN"));
+        assert!(!names_to_scrub(None, false)
+            .iter()
+            .any(|n| n == "HOTL_TEST_SCRUB_TOKEN"));
+        std::env::remove_var("HOTL_TEST_SCRUB_TOKEN");
     }
 
     #[test]
