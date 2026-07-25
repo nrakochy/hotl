@@ -168,6 +168,11 @@ pub(crate) async fn run(
     // Steers that arrived while a tool batch was open, waiting for its results
     // to close the pairing before they can be appended.
     let mut held_steers: Vec<String> = Vec::new();
+    // True between granting a snapshot and the assistant item for that sample
+    // committing: the window where an appended steer would land AHEAD of the
+    // reply that could not possibly have seen it (T3-3). The tool-phase half of
+    // the same hold is `awaiting_tool_results`.
+    let mut sampling = false;
     let (shared, mut log) = SharedDeps::new(deps, notifications);
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
@@ -213,7 +218,15 @@ pub(crate) async fn run(
                 }
             }
             SessionCmd::Steer(text) => {
-                admit_steer(&shared, &mut log, &mut items, &mut held_steers, text).await
+                admit_steer(
+                    &shared,
+                    &mut log,
+                    &mut items,
+                    &mut held_steers,
+                    sampling,
+                    text,
+                )
+                .await
             }
             SessionCmd::Rename(name) => {
                 let _ = shared
@@ -254,12 +267,27 @@ pub(crate) async fn run(
                     .await;
             }
             SessionCmd::Snapshot { reply } => {
+                // A request is about to be built from this projection.
+                sampling = true;
                 let _ = reply.send(snapshot_with_todos(&items, &todos));
             }
             SessionCmd::Propose { entries, reply } => {
+                // Computed before `entries` moves into `commit`.
+                let closes_sample = entries.iter().any(|e| {
+                    matches!(
+                        e,
+                        EntryPayload::Item {
+                            item: Item::Assistant { .. }
+                        }
+                    )
+                });
                 let committed = commit(&shared, &mut log, &mut items, entries).await;
-                // The results a held steer was waiting on may have just landed.
-                release_steers(&shared, &mut log, &mut items, &mut held_steers).await;
+                if closes_sample {
+                    sampling = false;
+                }
+                // The reply (or the results) a held steer was waiting on may
+                // have just landed.
+                release_steers(&shared, &mut log, &mut items, &mut held_steers, sampling).await;
                 let _ = reply.send(committed);
             }
             SessionCmd::WriteBlob {
@@ -277,8 +305,10 @@ pub(crate) async fn run(
                 // The turn is over, so nothing will answer an open batch now.
                 // Close it, then let held steers land before a queued prompt
                 // starts the next turn behind them.
+                // A turn that died mid-sample must not strand its steers.
+                sampling = false;
                 close_open_batch(&shared, &mut log, &mut items).await;
-                release_steers(&shared, &mut log, &mut items, &mut held_steers).await;
+                release_steers(&shared, &mut log, &mut items, &mut held_steers, sampling).await;
                 on_turn_finished(
                     TurnFinishedCtx {
                         shared: &shared,
@@ -506,14 +536,21 @@ fn awaiting_tool_results(items: &[Item]) -> bool {
 /// results away from the calls they answer. Such a steer is held instead and
 /// released once the results land. The model sees it at the same moment either
 /// way: the next sample happens after the batch closes.
+///
+/// `sampling` is the same hold one step earlier: a steer that arrives while a
+/// request is in flight would otherwise commit *ahead* of the assistant item
+/// that request is about to produce.
+/// INVARIANT: a steer never precedes an assistant item that could not have seen
+/// it. Enforced by `a_mid_stream_steer_commits_after_the_reply_it_did_not_see`.
 async fn admit_steer(
     shared: &SharedDeps,
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
     held: &mut Vec<String>,
+    sampling: bool,
     text: String,
 ) {
-    if awaiting_tool_results(items) {
+    if sampling || awaiting_tool_results(items) {
         held.push(text);
         return;
     }
@@ -539,15 +576,16 @@ async fn append_steer(
     }
 }
 
-/// Append the steers that were waiting on a batch, oldest first, once the
-/// pairing is closed.
+/// Append the steers that were waiting on a sample or a batch, oldest first,
+/// once the reply has landed and the pairing is closed.
 async fn release_steers(
     shared: &SharedDeps,
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
     held: &mut Vec<String>,
+    sampling: bool,
 ) {
-    if held.is_empty() || awaiting_tool_results(items) {
+    if sampling || held.is_empty() || awaiting_tool_results(items) {
         return;
     }
     for text in held.drain(..) {
