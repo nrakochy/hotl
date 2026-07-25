@@ -12,6 +12,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 
 use hotl_types::{new_ulid, Entry, EntryPayload, SessionHeader, FORMAT_VERSION};
 use serde::Serialize;
@@ -161,11 +163,55 @@ fn log_contains_secret(path: &Path, masker: &Masker) -> bool {
     false
 }
 
+/// How durable an append must be before the writer acks it
+/// (commit-protocol.md §Durability ordering, step 3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AckTier {
+    /// `sync_data()` completes before the ack. The only tier canon may use.
+    Durable,
+    /// The bytes reached the kernel; ack without fsync. Survives a process
+    /// crash, not a power loss.
+    FlushAndAck,
+    /// Ack on enqueue, before the bytes are written. UI telemetry ONLY —
+    /// never canon.
+    Buffered,
+}
+
+/// What the writer acks with: the log byte offset just past the entry
+/// ("Writer fsyncs, acks with the byte offset").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ack {
+    pub offset: u64,
+}
+
+/// One-shot fault injection at the writer, so the crash cases in
+/// commit-protocol.md's test matrix are deterministic instead of aspirational.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WriteFault {
+    None,
+    FailBeforeWrite,
+    TearThenFail,
+    DropAckBeforeFsync,
+}
+
+/// Handle in front of the session's writer thread. The handle mints ids,
+/// chains `parent_id`, serializes and masks; the writer owns the `File` and
+/// is the only thing that touches it.
+///
+/// INVARIANT: an ack means the bytes are on disk past `sync_data()`.
+/// Enforced by `durable_append_fsyncs_before_it_acks`.
 pub struct SessionLog {
-    file: File,
+    tx: mpsc::Sender<WriterCmd>,
+    writer: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
     masker: Masker,
     last_id: Option<String>,
+    /// `Some(reason)` = log-sealed: read-only, every further append is a
+    /// terminal error (commit-protocol.md §Durability ordering).
+    sealed: Arc<Mutex<Option<String>>>,
+    fsyncs: Arc<AtomicU64>,
+    fault: Arc<AtomicU8>,
     pub session_id: String,
 }
 
@@ -185,11 +231,27 @@ impl SessionLog {
             .create_new(true)
             .append(true)
             .open(&path)?;
+        let offset = file.metadata()?.len();
+        let (tx, rx) = mpsc::channel::<WriterCmd>();
+        let sealed = Arc::new(Mutex::new(None));
+        let fsyncs = Arc::new(AtomicU64::new(0));
+        let fault = Arc::new(AtomicU8::new(0));
+        let writer = std::thread::Builder::new()
+            .name(format!("hotl-log-{session_id}"))
+            .spawn({
+                let (sealed, fsyncs, fault) =
+                    (Arc::clone(&sealed), Arc::clone(&fsyncs), Arc::clone(&fault));
+                move || writer_loop(file, offset, rx, sealed, fsyncs, fault)
+            })?;
         let mut log = Self {
-            file,
+            tx,
+            writer: Some(writer),
             path,
             masker,
             last_id: None,
+            sealed,
+            fsyncs,
+            fault,
             session_id: session_id.clone(),
         };
         log.append(
@@ -244,9 +306,14 @@ impl SessionLog {
         Ok(path)
     }
 
-    /// Append one entry (chained via parent_id), masked, flushed. Takes the
-    /// payload by reference — the entry only ever needs a serialized view.
-    pub fn append(&mut self, payload: &EntryPayload, now_ms: u64) -> std::io::Result<String> {
+    /// Build the masked, newline-terminated line for `payload` and mint its id.
+    /// The chain lives here (single sender, FIFO channel), so the writer never
+    /// needs to know about ids.
+    fn build_line(
+        &mut self,
+        payload: &EntryPayload,
+        now_ms: u64,
+    ) -> std::io::Result<(String, Vec<u8>)> {
         /// Borrowed mirror of [`Entry`]: identical field names and order, so
         /// the wire format is byte-for-byte what `Entry` would serialize.
         #[derive(Serialize)]
@@ -265,13 +332,267 @@ impl SessionLog {
         };
         let line = serde_json::to_string(&entry)
             .map_err(|e| std::io::Error::other(format!("serialize entry: {e}")))?;
-        let masked = self.masker.apply(&line);
-        self.file.write_all(masked.as_bytes())?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
+        let mut bytes = self.masker.apply(&line).into_bytes();
+        bytes.push(b'\n');
+        Ok((id, bytes))
+    }
+
+    /// Append one entry (chained via parent_id), masked, durable. Blocking,
+    /// for the bootstrap callers that run before the actor exists
+    /// (`hotl/src/agent.rs`). Same `Durable` tier as the actor's path; it
+    /// blocks this thread on the writer's ack instead of awaiting it. Takes
+    /// the payload by reference — the entry only ever needs a serialized view.
+    pub fn append(&mut self, payload: &EntryPayload, now_ms: u64) -> std::io::Result<String> {
+        if let Some(reason) = self.seal_reason() {
+            return Err(sealed_error(&reason));
+        }
+        let (id, bytes) = self.build_line(payload, now_ms)?;
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(WriterCmd::Append {
+                line: bytes,
+                tier: AckTier::Durable,
+                ack: AckSink::Blocking(tx),
+            })
+            .map_err(|_| self.writer_gone())?;
+        rx.recv().map_err(|_| self.writer_gone())??;
         self.last_id = Some(id.clone());
         Ok(id)
     }
+
+    /// The actor's path: "Actor forwards to the writer at an acking tier …
+    /// Writer fsyncs, acks with the byte offset" (commit-protocol.md).
+    /// The caller advances its projection only after this resolves `Ok`.
+    pub async fn append_acked(
+        &mut self,
+        payload: &EntryPayload,
+        now_ms: u64,
+    ) -> std::io::Result<Ack> {
+        self.append_tiered(payload, now_ms, AckTier::Durable).await
+    }
+
+    pub async fn append_tiered(
+        &mut self,
+        payload: &EntryPayload,
+        now_ms: u64,
+        tier: AckTier,
+    ) -> std::io::Result<Ack> {
+        if let Some(reason) = self.seal_reason() {
+            return Err(sealed_error(&reason));
+        }
+        let (id, bytes) = self.build_line(payload, now_ms)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriterCmd::Append {
+                line: bytes,
+                tier,
+                ack: AckSink::Async(tx),
+            })
+            .map_err(|_| self.writer_gone())?;
+        let ack = rx.await.map_err(|_| self.writer_gone())??;
+        // Only a committed entry advances the chain: a sealed log must not
+        // leave `last_id` pointing at a line that was truncated away.
+        self.last_id = Some(id);
+        Ok(ack)
+    }
+
+    /// The writer thread is gone (it panicked, or it died mid-commit). Same
+    /// terminal shape as any other seal, so callers have one failure mode.
+    fn writer_gone(&self) -> std::io::Error {
+        let reason = "the log writer stopped before the entry was committed";
+        *self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason.to_string());
+        sealed_error(reason)
+    }
+
+    pub fn is_sealed(&self) -> bool {
+        self.seal_reason().is_some()
+    }
+
+    pub fn seal_reason(&self) -> Option<String> {
+        self.sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// How many `sync_data()` calls the writer has completed. Test
+    /// observability: T1-1 existed partly because nothing could assert an
+    /// fsync had happened.
+    pub fn fsync_count(&self) -> u64 {
+        self.fsyncs.load(Ordering::SeqCst)
+    }
+
+    #[doc(hidden)]
+    pub fn inject_fault(&self, fault: WriteFault) {
+        self.fault.store(fault_to_u8(fault), Ordering::SeqCst);
+    }
+}
+
+impl Drop for SessionLog {
+    fn drop(&mut self) {
+        // Close the channel first, then join: the writer's `recv` returns and
+        // the loop exits, so this never blocks on an idle writer.
+        let (tx, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.tx, tx));
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+    }
+}
+
+/// Where an ack goes back to. Two shapes because the log has two callers:
+/// the async actor (`append_acked`) and the synchronous bootstrap path in
+/// `hotl/src/agent.rs` (`append`), which runs before any actor exists.
+enum AckSink<T> {
+    Async(tokio::sync::oneshot::Sender<std::io::Result<T>>),
+    Blocking(mpsc::SyncSender<std::io::Result<T>>),
+}
+
+impl<T> AckSink<T> {
+    fn send(self, value: std::io::Result<T>) {
+        match self {
+            AckSink::Async(tx) => {
+                let _ = tx.send(value);
+            }
+            AckSink::Blocking(tx) => {
+                let _ = tx.send(value);
+            }
+        }
+    }
+}
+
+enum WriterCmd {
+    Append {
+        line: Vec<u8>,
+        tier: AckTier,
+        ack: AckSink<Ack>,
+    },
+}
+
+fn fault_to_u8(f: WriteFault) -> u8 {
+    match f {
+        WriteFault::None => 0,
+        WriteFault::FailBeforeWrite => 1,
+        WriteFault::TearThenFail => 2,
+        WriteFault::DropAckBeforeFsync => 3,
+    }
+}
+
+/// One-shot: reading a fault clears it, so a test can seal a log and then keep
+/// asserting on the sealed state without re-arming.
+fn take_fault(fault: &AtomicU8) -> WriteFault {
+    match fault.swap(0, Ordering::SeqCst) {
+        1 => WriteFault::FailBeforeWrite,
+        2 => WriteFault::TearThenFail,
+        3 => WriteFault::DropAckBeforeFsync,
+        _ => WriteFault::None,
+    }
+}
+
+fn sealed_error(reason: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "session log is sealed: {reason}. Everything committed before the failure is \
+         intact on disk and replays normally; this session accepts no further writes. \
+         Free space (or fix the disk) and start a new session with `hotl -r <id>` to \
+         continue from this log."
+    ))
+}
+
+/// The one thread that touches the log file. Blocking by construction: this is
+/// where the fsync stall lives, off the async runtime (T1-3).
+fn writer_loop(
+    mut file: File,
+    mut offset: u64,
+    rx: mpsc::Receiver<WriterCmd>,
+    sealed: Arc<Mutex<Option<String>>>,
+    fsyncs: Arc<AtomicU64>,
+    fault: Arc<AtomicU8>,
+) {
+    let seal_now = |reason: String| {
+        *sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    };
+    let is_sealed = || {
+        sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    };
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            WriterCmd::Append { line, tier, ack } => {
+                if let Some(reason) = is_sealed() {
+                    ack.send(Err(sealed_error(&reason)));
+                    continue;
+                }
+                if tier == AckTier::Buffered {
+                    // Telemetry: ack on enqueue, write on a best-effort basis.
+                    // NEVER canon — nothing in the engine reaches this arm.
+                    ack.send(Ok(Ack {
+                        offset: offset + line.len() as u64,
+                    }));
+                    if file.write_all(&line).is_ok() {
+                        offset += line.len() as u64;
+                    }
+                    continue;
+                }
+                match take_fault(&fault) {
+                    WriteFault::FailBeforeWrite => {
+                        seal_and_truncate(&mut file, offset, &seal_now, "no space left on device");
+                        ack.send(Err(sealed_error("no space left on device")));
+                        continue;
+                    }
+                    WriteFault::TearThenFail => {
+                        let half = line.len() / 2;
+                        let _ = file.write_all(&line[..half]); // the torn line
+                        seal_and_truncate(&mut file, offset, &seal_now, "no space left on device");
+                        ack.send(Err(sealed_error("no space left on device")));
+                        continue;
+                    }
+                    WriteFault::DropAckBeforeFsync => {
+                        // "Kill -9 between writer receive and fsync": the bytes
+                        // may or may not have reached the platter, and the ack
+                        // never comes. Dropping `ack` here is the whole point.
+                        let _ = file.write_all(&line);
+                        drop(ack);
+                        return; // the writer is gone, exactly as after SIGKILL
+                    }
+                    WriteFault::None => {}
+                }
+                let result = file.write_all(&line).and_then(|()| {
+                    if tier == AckTier::Durable {
+                        file.sync_data()?; // T1-1: the actual fix
+                        fsyncs.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Ok(())
+                });
+                match result {
+                    Ok(()) => {
+                        offset += line.len() as u64;
+                        ack.send(Ok(Ack { offset }));
+                    }
+                    Err(e) => {
+                        let reason = e.to_string();
+                        seal_and_truncate(&mut file, offset, &seal_now, &reason);
+                        ack.send(Err(sealed_error(&reason)));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Roll the file back to the last acked offset and seal. This is what makes a
+/// torn trailing line impossible to observe (T1-2b): the half-written bytes are
+/// gone before the next reader can ever see them.
+fn seal_and_truncate(file: &mut File, good_offset: u64, seal_now: &impl Fn(String), reason: &str) {
+    let _ = file.set_len(good_offset);
+    let _ = file.sync_data();
+    seal_now(reason.to_string());
 }
 
 /// Reconstruct the projection from a session log (M3b): items append,
@@ -924,6 +1245,116 @@ mod tests {
             .unwrap();
         let replayed = replay_chain(dir.path(), &child2.session_id).unwrap();
         assert_eq!(replayed.name.as_deref(), Some("from-child"));
+    }
+
+    #[tokio::test]
+    async fn durable_append_fsyncs_before_it_acks() {
+        let dir = tempfile::tempdir().unwrap();
+        // `create` writes the header through the same path: 1 fsync already.
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        assert_eq!(
+            log.fsync_count(),
+            1,
+            "the header must be durable before create returns"
+        );
+
+        let ack = log
+            .append_acked(&EntryPayload::Rename { name: "one".into() }, 2)
+            .await
+            .expect("append");
+        assert_eq!(
+            log.fsync_count(),
+            2,
+            "every Durable append fsyncs exactly once"
+        );
+
+        // "acks with the byte offset": the ack names the end of the file on disk.
+        let on_disk = std::fs::metadata(log.path()).unwrap().len();
+        assert_eq!(
+            ack.offset, on_disk,
+            "ack offset must be the post-write file length"
+        );
+        // ...and the bytes are already readable, i.e. the ack came after the write.
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(content.lines().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn buffered_tier_does_not_fsync_and_is_never_the_canon_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let before = log.fsync_count();
+
+        log.append_tiered(
+            &EntryPayload::Rename {
+                name: "tele".into(),
+            },
+            2,
+            AckTier::Buffered,
+        )
+        .await
+        .expect("buffered append");
+        assert_eq!(
+            log.fsync_count(),
+            before,
+            "Buffered must not fsync — it is telemetry"
+        );
+
+        // The canon entry points are Durable, so a caller cannot reach Buffered by
+        // accident: it takes naming the tier.
+        log.append_acked(
+            &EntryPayload::Rename {
+                name: "canon".into(),
+            },
+            3,
+        )
+        .await
+        .expect("append");
+        assert_eq!(log.fsync_count(), before + 1, "append_acked is Durable");
+        let mut sync_log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 4).unwrap();
+        let before = sync_log.fsync_count();
+        sync_log
+            .append(
+                &EntryPayload::Rename {
+                    name: "canon".into(),
+                },
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            before + 1,
+            sync_log.fsync_count(),
+            "the blocking append is Durable too"
+        );
+    }
+
+    #[tokio::test]
+    async fn appends_keep_channel_order_under_interleaving() {
+        // The writer is one thread behind one FIFO channel, so N appends land in
+        // send order with no external sequencing — the property that lets the
+        // actor stay the sole committer without a lock.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        for i in 0..64u32 {
+            log.append_acked(
+                &EntryPayload::Rename {
+                    name: format!("n{i}"),
+                },
+                i as u64,
+            )
+            .await
+            .unwrap();
+        }
+        let names: Vec<String> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Entry>(l).ok())
+            .filter_map(|e| match e.payload {
+                EntryPayload::Rename { name } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, (0..64).map(|i| format!("n{i}")).collect::<Vec<_>>());
     }
 
     #[test]

@@ -14,6 +14,10 @@ homepage.workspace = true
 hotl-types = { path = "../hotl-types", version = "0.5.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# The session log's writer runs on its own blocking thread; the actor awaits
+# its ack (commit-protocol.md §Durability ordering). `sync` is the only
+# feature this crate uses.
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
