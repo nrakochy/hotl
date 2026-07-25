@@ -14,18 +14,115 @@ use std::time::Duration;
 use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 /// Default cap on the bytes of a tool result a hook is shown.
 pub const HOOK_PAYLOAD_CAP: usize = 2048;
 
-/// Wall-clock budget for a *blocking* hook call (`on_user_prompt`, `on_stop`)
-/// — the turn awaits these because they return context/decisions it needs.
-/// A hook that exceeds this is treated as a no-op (never a grant, never a
-/// block), so a crashed or hung hook can't stall a turn indefinitely. Shell
-/// hooks already bound each subprocess invocation more tightly
-/// (`shell_hooks::HOOK_TIMEOUT_SECS`); this is the outer safety net that
-/// applies to every `Hooks` impl, including a future non-subprocess lane.
+/// Appended to a field [`cap_tool_input`] clipped, so a hook can tell a capped
+/// view from a genuinely short value. Fixed text, never interpolated: a hook
+/// that echoes the view back must produce bytes [`restore_capped`] recognizes.
+pub const CAP_MARK: &str = "\n<capped — the tool receives the full value>";
+
+/// Wall-clock budget for a *blocking* hook call — the engine awaits these
+/// because they return context or decisions it needs. A hook that exceeds it is
+/// treated as a no-op (never a grant, never a block), so a crashed or hung hook
+/// can't stall a turn indefinitely. Shell hooks bound each subprocess more
+/// tightly (`shell_hooks::HOOK_TIMEOUT_SECS`); this is the outer net.
+///
+/// INVARIANT: every `Hooks` event the engine awaits is bounded by this AND
+/// raced against the turn's cancellation token — including `pre_tool` and
+/// `post_tool`, which reach the engine only through [`call_pre_tool`] /
+/// [`call_post_tool`]. Enforced by
+/// `a_hung_pre_tool_hook_times_out_instead_of_wedging_the_turn`,
+/// `a_cancelled_turn_does_not_wait_out_a_hook_timeout`, and
+/// `an_interrupt_lands_while_a_pre_tool_hook_hangs`.
 pub const HOOK_CALL_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `PreToolUse` under the timeout and the turn's cancel token. Both fall back
+/// to `Continue`: a no-op is not a grant — the call still faces the full
+/// permission gate (deny rules, protected paths, the human).
+pub async fn call_pre_tool(
+    hooks: &Arc<dyn Hooks>,
+    name: &str,
+    input: &Value,
+    cancel: &CancellationToken,
+) -> PreToolDecision {
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => PreToolDecision::Continue,
+        decision = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.pre_tool(name, input)) => {
+            decision.unwrap_or(PreToolDecision::Continue)
+        }
+    }
+}
+
+/// `PostToolUse` under the timeout and the cancel token, with the payload cap
+/// applied HERE (pin #1) rather than trusted to each impl. Both fallbacks are
+/// `None`: on a timeout or an interrupt the model sees the tool's real output,
+/// never a half-applied proposal.
+pub async fn call_post_tool(
+    hooks: &Arc<dyn Hooks>,
+    name: &str,
+    result: &str,
+    cancel: &CancellationToken,
+) -> Option<String> {
+    let capped = cap_payload(result);
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => None,
+        replacement = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.post_tool(name, capped)) => {
+            replacement.ok().flatten()
+        }
+    }
+}
+
+/// The capped rendering of one field, or `None` when it already fits.
+fn capped_view(s: &str) -> Option<String> {
+    (s.len() > HOOK_PAYLOAD_CAP).then(|| format!("{}{CAP_MARK}", cap_payload(s)))
+}
+
+/// The capped hook *view* of a tool input: every top-level string field over
+/// [`HOOK_PAYLOAD_CAP`] is clipped and marked. Nested values are left alone —
+/// tool inputs are flat by convention, and a hook that needs more should read
+/// the file itself.
+pub fn cap_tool_input(input: &Value) -> Value {
+    let Some(fields) = input.as_object() else {
+        return input.clone();
+    };
+    let mut out = serde_json::Map::with_capacity(fields.len());
+    for (key, value) in fields {
+        let capped = value.as_str().and_then(capped_view);
+        out.insert(
+            key.clone(),
+            capped.map_or_else(|| value.clone(), Value::String),
+        );
+    }
+    Value::Object(out)
+}
+
+/// Undo [`cap_tool_input`] for every field the hook handed back byte-identical
+/// to the capped form, so capping can never truncate what actually executes. A
+/// field the hook genuinely rewrote does not match the capped form, so it is
+/// left exactly as the hook wrote it.
+/// INVARIANT: the executed input differs from the model's only where a hook
+/// deliberately rewrote it. Enforced by
+/// `capping_a_tool_input_is_reversible_when_the_hook_echoes_it_back`,
+/// `a_deliberate_rewrite_of_a_capped_field_still_wins`, and
+/// `the_hook_sees_a_capped_input_but_the_tool_gets_the_full_one`.
+pub fn restore_capped(original: &Value, mut rewritten: Value) -> Value {
+    if let (Some(fields), Some(out)) = (original.as_object(), rewritten.as_object_mut()) {
+        for (key, value) in fields {
+            let Some(capped) = value.as_str().and_then(capped_view) else {
+                continue;
+            };
+            if out.get(key).and_then(Value::as_str) == Some(capped.as_str()) {
+                out.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    rewritten
+}
 
 /// Await [`Hooks::on_user_prompt`] under [`HOOK_CALL_TIMEOUT`]; a timeout
 /// behaves exactly like `None` — no context, never a crash.
@@ -463,6 +560,108 @@ fn cap_str(s: &str, max: usize) -> &str {
 mod tests {
     use super::*;
     use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    struct HangingHooks;
+
+    impl Hooks for HangingHooks {
+        fn pre_tool<'a>(&'a self, _n: &'a str, _i: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+            Box::pin(std::future::pending())
+        }
+        fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// T2-12. The paused clock is legal here: these drive the call wrappers
+    /// alone, with no actor and therefore no writer-thread ack for the clock to
+    /// auto-advance past (0011's standing constraint).
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_pre_tool_hook_times_out_instead_of_wedging_the_turn() {
+        let hooks: Arc<dyn Hooks> = Arc::new(HangingHooks);
+        let cancel = CancellationToken::new();
+        assert_eq!(
+            call_pre_tool(&hooks, "bash", &json!({}), &cancel).await,
+            PreToolDecision::Continue,
+            "a hung pre_tool degrades to a no-op — never a grant, never a block"
+        );
+        assert_eq!(
+            call_post_tool(&hooks, "bash", "the real output", &cancel).await,
+            None,
+            "a hung post_tool leaves the tool's real output in place"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_turn_does_not_wait_out_a_hook_timeout() {
+        let hooks: Arc<dyn Hooks> = Arc::new(HangingHooks);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let start = tokio::time::Instant::now();
+        assert_eq!(
+            call_pre_tool(&hooks, "bash", &json!({}), &cancel).await,
+            PreToolDecision::Continue
+        );
+        assert_eq!(call_post_tool(&hooks, "bash", "out", &cancel).await, None);
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "an interrupt must not wait out HOOK_CALL_TIMEOUT"
+        );
+    }
+
+    /// T2-12b, the subtle half: capping is a *view*. A hook that hands the view
+    /// straight back must not silently truncate what actually executes.
+    #[test]
+    fn capping_a_tool_input_is_reversible_when_the_hook_echoes_it_back() {
+        let body = "z".repeat(HOOK_PAYLOAD_CAP * 2);
+        let input = json!({"path": "notes.txt", "content": body});
+        let view = cap_tool_input(&input);
+        let seen = view["content"].as_str().expect("string field");
+        assert!(
+            seen.len() <= HOOK_PAYLOAD_CAP + CAP_MARK.len(),
+            "the hook saw {} bytes",
+            seen.len()
+        );
+        assert_eq!(
+            view["path"],
+            json!("notes.txt"),
+            "fields under the cap pass through untouched"
+        );
+        let restored = restore_capped(&input, view);
+        assert_eq!(restored, input, "capping must be observationally inert");
+    }
+
+    #[test]
+    fn a_deliberate_rewrite_of_a_capped_field_still_wins() {
+        let body = "z".repeat(HOOK_PAYLOAD_CAP * 2);
+        let input = json!({"path": "notes.txt", "content": body});
+        let mut view = cap_tool_input(&input);
+        view["content"] = json!("redacted by policy");
+        let restored = restore_capped(&input, view);
+        assert_eq!(
+            restored["content"],
+            json!("redacted by policy"),
+            "restoration must never undo a hook's real rewrite"
+        );
+        assert_eq!(restored["path"], json!("notes.txt"));
+    }
+
+    #[test]
+    fn capping_leaves_non_object_inputs_and_nested_values_alone() {
+        let nested = json!({"outer": {"inner": "z".repeat(HOOK_PAYLOAD_CAP * 2)}});
+        assert_eq!(
+            cap_tool_input(&nested),
+            nested,
+            "nested values are not capped"
+        );
+        let scalar = json!("just a string");
+        assert_eq!(cap_tool_input(&scalar), scalar);
+        assert_eq!(
+            restore_capped(&scalar, json!("rewritten")),
+            json!("rewritten")
+        );
+    }
 
     #[tokio::test]
     async fn pre_hook_denies_rewrites_or_continues() {

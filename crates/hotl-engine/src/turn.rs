@@ -572,7 +572,8 @@ impl Turn {
         // PreToolUse: a wrap-style intercept may block or rewrite the call.
         let mut input = tu.input.clone();
         if let Some(hooks) = &self.shared.hooks {
-            match hooks.pre_tool(&tu.name, &input).await {
+            let view = crate::hooks::cap_tool_input(&input);
+            match crate::hooks::call_pre_tool(hooks, &tu.name, &view, &self.cancel).await {
                 crate::hooks::PreToolDecision::Continue => {}
                 crate::hooks::PreToolDecision::Deny { message } => {
                     self.emit(EngineEvent::ToolDenied {
@@ -583,7 +584,14 @@ impl Turn {
                         "A hook blocked this tool call: {message}"
                     )));
                 }
-                crate::hooks::PreToolDecision::Rewrite { input: rewritten } => input = rewritten,
+                crate::hooks::PreToolDecision::Rewrite { input: rewritten } => {
+                    input = crate::hooks::restore_capped(&input, rewritten)
+                }
+            }
+            // The hook may have been abandoned by an interrupt rather than
+            // answered; a cancelled turn executes nothing further.
+            if self.cancel.is_cancelled() {
+                return Gate::Resolved(ToolOutcome::err("Not executed (turn stopped)."));
             }
         }
         let (summary, why) = match tool.permission(&input) {
@@ -647,7 +655,10 @@ impl Turn {
         // PostToolUse: a node-style proposal may replace a successful result.
         if !outcome.is_error {
             if let Some(hooks) = &self.shared.hooks {
-                if let Some(replacement) = hooks.post_tool(&tu.name, &outcome.content).await {
+                if let Some(replacement) =
+                    crate::hooks::call_post_tool(hooks, &tu.name, &outcome.content, &self.cancel)
+                        .await
+                {
                     outcome.content = replacement;
                 }
             }
