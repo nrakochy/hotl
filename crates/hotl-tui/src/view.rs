@@ -514,11 +514,10 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
         return;
     }
-    if state.completion.is_some() {
-        let hint = "↑↓ pick · tab complete · enter run · esc dismiss";
-        frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
-        return;
-    }
+    // The phase arms below take priority over the popup: a permission ask
+    // or structured question owns the keyboard even if a popup was left
+    // open from mid-typing (see `app::modal_active`), and the phase hint is
+    // what actually applies to the keys that work right now.
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
         (Phase::WaitingAsk { .. }, ..) => {
             "y allow · n deny · type a reason after n · ctrl-c cancel"
@@ -526,6 +525,7 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         (Phase::WaitingQuestion { .. }, ..) => {
             "1-9 pick an option · type for free text · enter submit · esc clear"
         }
+        _ if state.completion.is_some() => "↑↓ pick · tab complete · enter run · esc dismiss",
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
     };
@@ -661,6 +661,16 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
 /// transcript area, so it reads as rising out of the input box rather than
 /// floating like the ask/question modals do.
 fn render_completion(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
+    // A permission ask / structured question owns the screen; never draw
+    // the menu underneath its "waiting on you" card even if `state.completion`
+    // were somehow left populated (belt-and-braces alongside the clear in
+    // `app::update`).
+    if matches!(
+        state.phase,
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. }
+    ) {
+        return;
+    }
     let Some(c) = &state.completion else {
         return;
     };
@@ -1408,6 +1418,33 @@ mod tests {
             rows[STRIP - 1].contains("─"),
             "the popup's bottom border sits on the transcript's last row: {}",
             rows[STRIP - 1]
+        );
+    }
+
+    /// Finding 1 (blocking): a stale popup must never outrank a permission
+    /// ask. This drives `state.completion` directly (rather than through
+    /// `app::update`, which already clears it) so the check is independent
+    /// of that other guard — the render layer must hold the line on its own.
+    #[test]
+    fn a_permission_ask_hides_a_stale_popup_and_wins_the_hint_row() {
+        let mut s = with_popup();
+        assert!(s.completion.is_some(), "popup open before the ask arrives");
+        s.phase = Phase::WaitingAsk {
+            req_id: 7,
+            summary: "run bash: rm -rf ./x".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+        };
+        let rows = draw(&s);
+        assert!(
+            rows[HINT].contains("y allow · n deny"),
+            "the ask's hint must win over the popup's: {}",
+            rows[HINT]
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("commands")),
+            "no popup chrome may render over the ask: {rows:#?}"
         );
     }
 

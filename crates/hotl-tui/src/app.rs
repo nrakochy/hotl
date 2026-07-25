@@ -242,6 +242,10 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 input: String::new(),
                 denying: false,
             };
+            // The ask owns the keyboard and the screen now; a popup left
+            // open from mid-typing would steal the first Esc and draw a
+            // stale "commands" menu under the "waiting on you" card.
+            state.completion = None;
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::QuestionRequest { req_id, question } => {
@@ -252,6 +256,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 options: question.options,
                 input: String::new(),
             };
+            state.completion = None;
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::PromptResult {
@@ -411,11 +416,30 @@ fn format_usage(usage: &Value) -> String {
     format!("{} in · {} out tok", n("input_tokens"), n("output_tokens"))
 }
 
+/// True while something else must own the keyboard and the screen: a live
+/// reverse-i-search (the input box is showing its prompt, not the buffer),
+/// or a permission ask / structured question (`on_ask_key` / `on_question_key`
+/// intercept every key before it ever reaches here). The popup must not be
+/// shown, and must not intercept keys, in either case.
+fn modal_active(state: &State) -> bool {
+    state.editor.search_prompt().is_some()
+        || matches!(
+            state.phase,
+            Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. }
+        )
+}
+
 /// Recompute the popup from the editor buffer. Called after every key that
 /// reaches the editor and after a splice, so the popup is always a function
 /// of what is actually typed. A buffer that is no longer a `/` command
-/// re-arms `dismissed` — that is the only thing that clears it.
+/// re-arms `dismissed` — that is the only thing that clears it. While
+/// something else owns the keyboard (`modal_active`) the popup stays closed
+/// regardless of what the buffer says.
 fn refresh(state: &mut State) {
+    if modal_active(state) {
+        state.completion = None;
+        return;
+    }
     let text = state.editor.text();
     if !text.starts_with('/') {
         state.dismissed = false;
@@ -1300,6 +1324,46 @@ mod tests {
         assert_eq!(s.editor.mode(), crate::vim::Mode::Insert);
         press(&mut s, KeyCode::Esc);
         assert_eq!(s.editor.mode(), crate::vim::Mode::Normal);
+    }
+
+    /// Finding 1 (blocking): reverse-i-search must own the keyboard the
+    /// instant it starts. Before the fix, `state.completion` survived the
+    /// `Ctrl-R` that started the search, so the popup's own Esc handler
+    /// swallowed the first Esc — the search only ended on the second one.
+    #[test]
+    fn ctrl_r_closes_a_stale_popup_and_the_first_esc_ends_the_search() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/re");
+        assert!(s.completion.is_some(), "popup open before ctrl-r");
+        ctrl(&mut s, 'r');
+        assert!(
+            s.editor.search_prompt().is_some(),
+            "ctrl-r must still start the search"
+        );
+        assert!(
+            s.completion.is_none(),
+            "the search owns the input area now — the popup must not survive it"
+        );
+        press(&mut s, KeyCode::Esc);
+        assert!(
+            s.editor.search_prompt().is_none(),
+            "one esc must end the search outright, not get swallowed by a stale popup"
+        );
+    }
+
+    /// A permission ask arriving mid-typing (the popup was open on a partial
+    /// `/` word) must close the popup immediately — the ask owns the
+    /// keyboard, and a stale menu must not linger over its card.
+    #[test]
+    fn a_permission_ask_mid_typing_closes_the_open_popup() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/re");
+        assert!(s.completion.is_some(), "popup open before the ask arrives");
+        ask(&mut s);
+        assert!(
+            s.completion.is_none(),
+            "the ask must close a popup left open from mid-typing"
+        );
     }
 
     #[test]
