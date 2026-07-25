@@ -210,8 +210,58 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     if p.contains(".config/hotl/") {
         return Some("hotl config: allow rules and the api-key-helper command run from here");
     }
-    if file.ends_with(".zshrc") || file.ends_with(".bashrc") || file.ends_with(".profile") {
+    // Shell startup. `".bash_profile".ends_with(".profile")` is false — its
+    // last eight bytes are `_profile` — so this family needs explicit entries,
+    // not a suffix test. That single mismatch is what left everything but
+    // `.profile` itself uncovered.
+    // INVARIANT: every file the login/interactive shell sources is here.
+    // Enforced by `shell_startup_family_is_covered_not_just_dot_profile`.
+    if matches!(
+        file,
+        ".profile"
+            | ".bash_profile"
+            | ".bash_login"
+            | ".bash_logout"
+            | ".bashrc"
+            | ".zshrc"
+            | ".zshenv"
+            | ".zprofile"
+            | ".zlogin"
+    ) {
         return Some("shell startup file: runs in every new shell");
+    }
+    // Toolchain entrypoints: each runs a command on the *next ordinary
+    // invocation* of a tool the user already trusts.
+    // INVARIANT: writing any of these is write-now/execute-later, so it takes
+    // the escalated ask. Enforced by
+    // `execute_later_covers_the_toolchain_entrypoints`.
+    if p.contains(".cargo/config") {
+        return Some("cargo config: build.rustc-wrapper and target runners execute on next build");
+    }
+    if file == ".envrc" {
+        return Some("direnv script: runs when your shell enters this directory");
+    }
+    if file == "package.json" {
+        return Some("npm scripts: postinstall/prepare run on your next npm install");
+    }
+    if file == "setup.py" {
+        return Some("python build script: executed by pip/setuptools on next install");
+    }
+    if file == ".pre-commit-config.yaml" || file == ".pre-commit-config.yml" {
+        return Some("pre-commit hooks: run on your next commit");
+    }
+    if matches!(
+        file,
+        "docker-compose.yml" | "docker-compose.yaml" | "compose.yml" | "compose.yaml"
+    ) {
+        return Some("compose file: defines commands and mounts for your next `up`");
+    }
+    if file == "tasks.json" || file == "launch.json" {
+        return Some("editor task/launch config: runs commands from your editor");
+    }
+    // CI runs it on push, on infrastructure holding real credentials.
+    if p.contains(".github/workflows/") {
+        return Some("CI workflow: runs on your next push, with the repo's secrets");
     }
     // SSH: authorized_keys grants login; config can rewrite where ssh connects.
     if p.contains(".ssh/") {
@@ -278,6 +328,90 @@ mod tests {
         assert!(!reg.get("write").unwrap().read_only());
         assert!(!reg.get("edit").unwrap().read_only());
         assert!(!reg.get("bash").unwrap().read_only()); // bash can mutate; not read-only
+    }
+
+    #[test]
+    fn shell_startup_family_is_covered_not_just_dot_profile() {
+        // ".bash_profile".ends_with(".profile") is FALSE — its last eight bytes
+        // are `_profile` — which is the reason this family slipped through.
+        for f in [
+            ".profile",
+            ".bash_profile",
+            ".bash_login",
+            ".bash_logout",
+            ".zshrc",
+            ".zshenv",
+            ".zprofile",
+            ".zlogin",
+            ".bashrc",
+        ] {
+            assert!(
+                execute_later_reason(f).is_some(),
+                "{f} runs in every new shell"
+            );
+            assert!(
+                execute_later_reason(&format!("/Users/you/{f}")).is_some(),
+                "absolute {f}"
+            );
+            assert!(
+                execute_later_reason(&format!("./{f}")).is_some(),
+                "dot-relative {f}"
+            );
+        }
+    }
+
+    #[test]
+    fn execute_later_covers_the_toolchain_entrypoints() {
+        for p in [
+            ".cargo/config.toml",
+            "/Users/you/.cargo/config",
+            ".envrc",
+            "package.json",
+            "app/package.json",
+            ".pre-commit-config.yaml",
+            "docker-compose.yml",
+            "compose.yaml",
+            ".vscode/tasks.json",
+            ".vscode/launch.json",
+            "setup.py",
+            ".github/workflows/ci.yml",
+            "Makefile",
+            "build.rs",
+        ] {
+            assert!(
+                execute_later_reason(p).is_some(),
+                "{p} executes on next use"
+            );
+        }
+        // Ordinary source and docs stay unescalated — the list must not become
+        // an ask-storm.
+        for p in [
+            "src/lib.rs",
+            "README.md",
+            "docs/notes.md",
+            "tests/api.rs",
+            "package-lock.json",
+            "Cargo.lock",
+        ] {
+            assert!(execute_later_reason(p).is_none(), "{p} must not escalate");
+        }
+    }
+
+    #[test]
+    fn every_hardcoded_entry_also_matches_as_an_absolute_path() {
+        // The blind spot the old tests shared with the implementation: they
+        // restated its own relative-looking strings, so neither noticed that a
+        // model naming the same file absolutely would slip past.
+        for p in [
+            "/home/u/.git/hooks/pre-commit",
+            "/srv/app/build.rs",
+            "/home/u/AGENTS.md",
+            "/home/u/.hotl/settings.json",
+            "/home/u/.ssh/config",
+            "/home/u/.aws/credentials",
+        ] {
+            assert!(execute_later_reason(p).is_some(), "{p}");
+        }
     }
 
     #[test]
