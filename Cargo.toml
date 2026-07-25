@@ -53,6 +53,11 @@ async-stream = "0.3"
 jsonschema = { version = "0.26", default-features = false }
 libc = "0.2"
 sha2 = "0.10"
+# Ripgrep's own traversal + glob crates. `ignore` defaults to
+# follow_links(false) — the cheapest containment layer — and is gitignore-aware;
+# `globset` is a real glob matcher (`*` vs `**`, classes, alternates).
+ignore = "0.4"
+globset = "0.4"
 
 [profile.release]
 strip = true

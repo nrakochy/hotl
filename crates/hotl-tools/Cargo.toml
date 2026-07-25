@@ -26,6 +26,8 @@ tokio = { workspace = true, features = ["net"] }
 tokio-util = { workspace = true }
 libc = { workspace = true }
 reqwest = { workspace = true }
+ignore = { workspace = true }
+globset = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

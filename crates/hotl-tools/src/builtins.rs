@@ -50,6 +50,7 @@ fn guarded_search_root(
     tool: &str,
     root: &std::path::Path,
     given: &str,
+    dir_only: bool,
 ) -> Result<std::path::PathBuf, ToolOutcome> {
     let rel = match fsguard::classify(root, given) {
         fsguard::Placement::Inside(rel) => rel,
@@ -60,6 +61,19 @@ fn guarded_search_root(
             )))
         }
     };
+    // `glob` walks its root, so the root has to be a directory; `grep` is
+    // happy with a single file.
+    if dir_only {
+        fsguard::open_dir_beneath(root, &rel).map_err(|e| match e {
+            fsguard::GuardError::Io(ref io) if io.raw_os_error() == Some(libc::ENOTDIR) => {
+                ToolOutcome::err(format!(
+                    "`{given}` is not a directory. `{tool}` lists files *under* a directory — \
+                     pass the containing directory, or use `grep` to search one file."
+                ))
+            }
+            other => ToolOutcome::err(other.prompt(tool, given)),
+        })?;
+    }
     fsguard::resolve_beneath(root, &rel).map_err(|e| ToolOutcome::err(e.prompt(tool, given)))
 }
 
@@ -433,6 +447,9 @@ fn write_guarded(
 }
 
 const GLOB_MAX_RESULTS: usize = 1000;
+const GLOB_MAX_DEPTH: usize = 64;
+const GLOB_MAX_ENTRIES: usize = 200_000;
+const GLOB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub struct GlobTool;
 
@@ -447,17 +464,19 @@ impl Tool for GlobTool {
         true
     }
     fn description(&self) -> &str {
-        "List files in the working directory matching a filename pattern, newest-first is NOT \
-         guaranteed — results are sorted by path. Patterns: `*.rs` (suffix), `**/*.rs` (same, \
-         recursion is always on), or a bare substring matched against the relative path. Hidden \
-         directories (.git, node_modules) are skipped. Returns at most 1000 paths."
+        "List files under the working directory matching a glob. Real glob syntax: `*` (does not \
+         cross `/`), `**` (recurses), `?`, `[a-z]`, `{a,b}`. A pattern with no `/` matches the \
+         file name at any depth (`*.rs`). Results are newest-first by default (`sort`: \"mtime\" \
+         | \"path\"), capped at 1000. Respects .gitignore; `.git` is never walked; symlinks are \
+         never followed."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "e.g. \"*.rs\", \"**/*.toml\", or a path substring"},
-                "path": {"type": "string", "description": "Directory to search under (relative to the working directory; defaults to \".\")"}
+                "pattern": {"type": "string", "description": "Glob, e.g. \"*.rs\", \"src/**/*.rs\", \"src/*/mod.rs\", \"**/*.{ts,tsx}\""},
+                "path": {"type": "string", "description": "Directory to search under (relative to the working directory; defaults to \".\")"},
+                "sort": {"type": "string", "enum": ["mtime", "path"], "description": "Result order; defaults to \"mtime\" (newest first)"}
             },
             "required": ["pattern"]
         })
@@ -465,69 +484,122 @@ impl Tool for GlobTool {
     fn permission(&self, _input: &Value) -> Permission {
         Permission::None
     }
-    fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(glob_impl(&input)) })
+    fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(
+            async move { done(glob_run_input(fsguard::workspace_root(), &input, cancel).await) },
+        )
     }
 }
 
-fn glob_impl(input: &Value) -> ToolResult {
-    let pattern = str_arg(input, "pattern")?;
-    let given = input.get("path").and_then(Value::as_str).unwrap_or(".");
-    let root = guarded_search_root("glob", fsguard::workspace_root(), given)?;
-    glob_walk(&root, pattern)
-}
+/// `root`-parameterized so tests drive the walk against a tempdir without
+/// touching the process-global cwd (`std::env::set_current_dir` would race
+/// every other test in this crate that spawns a subprocess relying on ambient
+/// cwd).
+async fn glob_run_input(
+    root: &std::path::Path,
+    input: &Value,
+    cancel: CancellationToken,
+) -> ToolResult {
+    let pattern = str_arg(input, "pattern")?.to_string();
+    let base = input.get("path").and_then(Value::as_str).unwrap_or(".");
+    let sort_mtime = input.get("sort").and_then(Value::as_str) != Some("path");
+    // The search root goes through the guard: `path: "link"` cannot start the
+    // walk outside the tree. After this, the resolved path IS the real path
+    // (no component was a link), so handing it to `ignore` is safe.
+    let dir = guarded_search_root("glob", root, base, true)?;
 
-/// The walk itself, taking an already-resolved root (relative-and-contained
-/// at the call site above; an absolute tempdir path works just as well —
-/// `read_dir`/`strip_prefix` don't care). Split out so tests can drive the
-/// walk directly against a tempdir without touching the process-global
-/// working directory (`std::env::set_current_dir` would race every other
-/// test in this crate that spawns a subprocess relying on ambient cwd).
-fn glob_walk(root: &std::path::Path, pattern: &str) -> ToolResult {
-    // "*.rs" / "**/*.rs" -> suffix match on the file name (the substring after
-    // the final `*`); a pattern with no `*` -> substring match on the relative
-    // path.
-    let suffix = pattern
-        .contains('*')
-        .then(|| pattern.rsplit('*').next().unwrap_or(""));
-    let mut hits: Vec<String> = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') || name == "node_modules" || name == "target" {
-                continue; // skip vcs/vendor/build dirs
+    let matcher = globset::GlobBuilder::new(&pattern)
+        // `*` stops at `/` only for patterns that speak in paths; a bare
+        // `*.rs` is matched against the file name, where there is no `/`.
+        .literal_separator(pattern.contains('/'))
+        .build()
+        .map_err(|e| {
+            ToolOutcome::err(format!(
+                "`{pattern}` is not a valid glob: {e}. Try `*.rs`, `src/**/*.rs`, or `src/*/mod.rs`."
+            ))
+        })?
+        .compile_matcher();
+    let name_only = !pattern.contains('/');
+
+    // INVARIANT: the walk runs on the blocking pool, never on a tokio worker —
+    // a large or hostile tree must not stall the runtime. Enforced by
+    // `glob_terminates_on_a_symlink_loop_and_never_leaves_the_tree`.
+    let walk_root = dir.clone();
+    let c = cancel.clone();
+    let handle = tokio::task::spawn_blocking(move || -> Result<(Vec<GlobHit>, bool), ()> {
+        let deadline = std::time::Instant::now() + GLOB_DEADLINE;
+        let mut hits: Vec<GlobHit> = Vec::new();
+        let mut seen = 0usize;
+        let mut bounded = false;
+        let walker = ignore::WalkBuilder::new(&walk_root)
+            .follow_links(false) // containment layer 1 — and `ignore`'s default
+            .max_depth(Some(GLOB_MAX_DEPTH))
+            .hidden(false) // `.github/workflows/*.yml` must be reachable
+            .filter_entry(|e| e.file_name() != ".git")
+            .build();
+        for entry in walker {
+            seen += 1;
+            // `spawn_blocking` tasks cannot be aborted from outside, so the
+            // token is polled *here*; the caller's `select!` only stops
+            // waiting. Both halves are needed.
+            if c.is_cancelled() {
+                return Err(());
             }
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
+            if seen > GLOB_MAX_ENTRIES || std::time::Instant::now() > deadline {
+                bounded = true;
+                break; // report what we have with a truncation hint
+            }
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .to_string();
-            let matched = match suffix {
-                Some(sfx) => name.ends_with(sfx), // "*.rs" -> ".rs"
-                None => rel.contains(pattern),    // bare substring
+            let rel = entry
+                .path()
+                .strip_prefix(&walk_root)
+                .unwrap_or(entry.path())
+                .to_path_buf();
+            let subject: &std::ffi::OsStr = if name_only {
+                entry.file_name()
+            } else {
+                rel.as_os_str()
             };
-            if matched {
-                hits.push(rel);
+            if matcher.is_match(std::path::Path::new(subject)) {
+                let mtime = entry
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                hits.push(GlobHit { rel, mtime });
             }
         }
+        Ok((hits, bounded))
+    });
+
+    let cancelled = || ToolOutcome::err("Search cancelled by the user.");
+    let (mut hits, bounded) = tokio::select! {
+        joined = handle => joined
+            .map_err(|e| ToolOutcome::err(format!(
+                "The file walk failed: {e}. Try a narrower `path`."
+            )))?
+            .map_err(|()| cancelled())?,
+        () = cancel.cancelled() => return Err(cancelled()),
+    };
+    if sort_mtime {
+        hits.sort_by(|a, b| b.mtime.cmp(&a.mtime).then_with(|| a.rel.cmp(&b.rel)));
+    } else {
+        hits.sort_by(|a, b| a.rel.cmp(&b.rel));
     }
-    hits.sort();
+
     let total = hits.len();
     let mut out = if total == 0 {
         format!("No files match `{pattern}`. Try a broader pattern, or `grep` to search contents.")
     } else {
         let shown = total.min(GLOB_MAX_RESULTS);
-        let mut s = hits[..shown].join("\n");
+        let mut s = hits[..shown]
+            .iter()
+            .map(|h| h.rel.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
         if total > shown {
             s.push_str(&format!(
                 "\n[truncated: showing {shown} of {total}; narrow the pattern or `path`]"
@@ -535,8 +607,18 @@ fn glob_walk(root: &std::path::Path, pattern: &str) -> ToolResult {
         }
         s
     };
+    if bounded {
+        out.push_str(
+            "\n[the walk hit its entry/time bound before finishing; narrow `path` to see the rest]",
+        );
+    }
     out.push('\n');
     Ok(ToolOutcome::ok(out))
+}
+
+struct GlobHit {
+    rel: std::path::PathBuf,
+    mtime: std::time::SystemTime,
 }
 
 const GREP_MAX_OUTPUT: usize = 50 * 1024;
@@ -582,7 +664,7 @@ impl Tool for GrepTool {
 async fn grep_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
     let given = input.get("path").and_then(Value::as_str).unwrap_or(".");
-    let root = guarded_search_root("grep", fsguard::workspace_root(), given)?;
+    let root = guarded_search_root("grep", fsguard::workspace_root(), given, false)?;
     grep_search(pattern, &root, input, cancel).await
 }
 
@@ -1014,14 +1096,22 @@ mod tests {
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
-    #[test]
-    fn glob_matches_by_suffix_and_caps() {
-        // Drives `glob_walk` directly against an absolute tempdir path rather
-        // than `set_current_dir`: the process-global cwd is shared with every
-        // other test in this crate (several spawn subprocesses that rely on
-        // ambient cwd, e.g. `sandbox::tests::seatbelt_confines_writes`), so
-        // flipping it here would race them under the default parallel test
-        // harness.
+    /// Drives the walk against an absolute tempdir path rather than
+    /// `set_current_dir`: the process-global cwd is shared with every other
+    /// test in this crate (several spawn subprocesses that rely on ambient
+    /// cwd, e.g. `sandbox::tests::seatbelt_confines_writes`), so flipping it
+    /// here would race them under the default parallel test harness.
+    async fn glob_run(
+        root: &std::path::Path,
+        pattern: &str,
+        base: &str,
+        cancel: CancellationToken,
+    ) -> ToolResult {
+        glob_run_input(root, &json!({"pattern": pattern, "path": base}), cancel).await
+    }
+
+    #[tokio::test]
+    async fn glob_matches_by_suffix_and_caps() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("src")).unwrap();
         std::fs::write(dir.path().join("src/a.rs"), "x").unwrap();
@@ -1030,14 +1120,147 @@ mod tests {
         std::fs::create_dir_all(dir.path().join(".git")).unwrap();
         std::fs::write(dir.path().join(".git/config"), "x").unwrap();
 
-        let out = done(glob_walk(dir.path(), "*.rs"));
+        let out = done(glob_run(dir.path(), "*.rs", ".", CancellationToken::new()).await);
 
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("src/a.rs") && out.content.contains("src/b.rs"));
         assert!(!out.content.contains("README.md"), "suffix filter failed");
+        assert!(!out.content.contains(".git/"), "`.git` is never walked");
+    }
+
+    #[tokio::test]
+    async fn glob_handles_real_glob_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for p in [
+            "src/a/mod.rs",
+            "src/b/mod.rs",
+            "src/top.rs",
+            "docs/x.md",
+            ".github/workflows/ci.yml",
+        ] {
+            let f = root.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, "x").unwrap();
+        }
+
+        // T2-10b: this silently matched NOTHING before — `src/*/mod.rs` became
+        // the suffix `/mod.rs`, and a bare file name never contains `/`.
+        let m = done(glob_run(root, "src/*/mod.rs", ".", CancellationToken::new()).await);
         assert!(
-            !out.content.contains(".git/"),
-            "hidden dirs must be skipped"
+            m.content.contains("src/a/mod.rs") && m.content.contains("src/b/mod.rs"),
+            "{}",
+            m.content
+        );
+        assert!(!m.content.contains("src/top.rs"), "`*` must not cross `/`");
+        // `**` recurses; `src/` is honored (it was ignored before).
+        let r = done(glob_run(root, "src/**/*.rs", ".", CancellationToken::new()).await);
+        assert!(
+            r.content.contains("src/a/mod.rs") && r.content.contains("src/top.rs"),
+            "{}",
+            r.content
+        );
+        assert!(!r.content.contains("docs/"), "{}", r.content);
+        // A bare pattern with no `/` matches the file name at any depth.
+        let md = done(glob_run(root, "*.md", ".", CancellationToken::new()).await);
+        assert!(md.content.contains("docs/x.md"), "{}", md.content);
+        // Hidden directories are reachable — this was structurally impossible.
+        let ci = done(
+            glob_run(
+                root,
+                ".github/workflows/*.yml",
+                ".",
+                CancellationToken::new(),
+            )
+            .await,
+        );
+        assert!(ci.content.contains("ci.yml"), "{}", ci.content);
+        // A malformed pattern is a prompt, not a panic.
+        let bad = done(glob_run(root, "src/[", ".", CancellationToken::new()).await);
+        assert!(
+            bad.is_error && bad.content.contains("not a valid glob"),
+            "{}",
+            bad.content
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_terminates_on_a_symlink_loop_and_never_leaves_the_tree() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::os::unix::fs::symlink(&root, root.join("src/loop")).unwrap(); // self-loop
+        std::os::unix::fs::symlink(&home, root.join("escape")).unwrap(); // escape
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            glob_run(&root, "**/*", ".", CancellationToken::new()),
+        )
+        .await
+        .expect("symlink loop must not hang the walk");
+        let out = done(out);
+        assert!(
+            !out.content.contains("id_rsa"),
+            "walked out through a symlink"
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_refuses_a_symlinked_search_root() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::os::unix::fs::symlink(&home, root.join("link")).unwrap();
+        let out = done(glob_run(&root, "*", "link", CancellationToken::new()).await);
+        assert!(
+            out.is_error && out.content.contains("symlink"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_honors_cancellation() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let (_o, root, _h) = fsguard::tests::fixture();
+        let out = done(glob_run(&root, "**/*", ".", cancel).await);
+        assert!(
+            out.is_error && out.content.to_lowercase().contains("cancel"),
+            "{}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn glob_sorts_newest_first_by_default() {
+        // Claude Code's Glob orders by mtime; exploration wants recent files.
+        // Names are chosen so path order and mtime order disagree.
+        let (_o, root, _h) = fsguard::tests::fixture();
+        for (name, secs) in [("a_old.rs", 1_000_000u64), ("b_new.rs", 2_000_000)] {
+            let p = root.join(name);
+            std::fs::write(&p, "x").unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(t))
+                .unwrap();
+        }
+        let by_mtime = done(glob_run(&root, "*.rs", ".", CancellationToken::new()).await);
+        assert!(
+            by_mtime.content.find("b_new.rs") < by_mtime.content.find("a_old.rs"),
+            "newest first: {}",
+            by_mtime.content
+        );
+        let by_path = done(
+            glob_run_input(
+                &root,
+                &json!({"pattern": "*.rs", "sort": "path"}),
+                CancellationToken::new(),
+            )
+            .await,
+        );
+        assert!(
+            by_path.content.find("a_old.rs") < by_path.content.find("b_new.rs"),
+            "`sort: path` must be lexicographic: {}",
+            by_path.content
         );
     }
 

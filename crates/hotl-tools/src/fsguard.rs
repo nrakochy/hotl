@@ -150,10 +150,9 @@ pub(crate) fn open_beneath(root: &Path, rel: &Path) -> Result<File, GuardError> 
     Ok(file)
 }
 
-/// Same, for a directory (`O_DIRECTORY`).
-// Wired into `glob`'s search root by R5 task 4, which is where a walk root
-// genuinely has to be a directory.
-#[cfg_attr(not(test), allow(dead_code))]
+/// Same, for a directory (`O_DIRECTORY`). `glob` uses this on its search root:
+/// a walk root that is not a directory is a mistake worth naming, and one
+/// reached through a symlink is an escape.
 pub(crate) fn open_dir_beneath(root: &Path, rel: &Path) -> Result<File, GuardError> {
     open_leaf(root, rel, OPEN_RD | libc::O_DIRECTORY)
 }
