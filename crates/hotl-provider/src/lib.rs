@@ -954,6 +954,7 @@ pub mod repair {
 }
 
 pub mod api_error;
+pub mod catalog;
 pub mod key;
 
 /// Highest block index any assembler will materialize. Wire indices are
