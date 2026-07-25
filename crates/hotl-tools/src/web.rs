@@ -69,17 +69,32 @@ fn redirect_policy() -> reqwest::redirect::Policy {
 /// decision itself lives here as a pure function over plain values —
 /// testable directly, with no `Attempt` to fabricate and no process-wide
 /// state to touch.
+#[derive(Debug)]
 enum RedirectDecision {
     Follow,
     Stop,
     Error(String),
 }
 
+/// Is this host a cloud instance-metadata address the operator has not
+/// explicitly unblocked? Nothing on the public web legitimately redirects
+/// here, and a fetch returns instance credentials.
+fn metadata_refused(host: &str) -> bool {
+    matches!(address_class(host), AddressClass::Metadata)
+        && !std::env::var("HOTL_WEB_ALLOW_METADATA").is_ok_and(|v| v == "1")
+}
+
 /// `host`: `None` only for a URL with no host (not reachable for the http(s)
-/// URLs `Attempt::url` ever carries; treated as nothing-to-check). `hops`:
+/// URLs `Attempt::url` ever carries; treated as nothing-to-check).
+/// `previous`: the hosts already visited in this chain, oldest first. `hops`:
 /// the number of redirects already followed in this chain so far.
+///
+/// INVARIANT: a chain that begins on a public host never ends on a private,
+/// loopback, or metadata address; a metadata address is refused on every hop.
+/// Enforced by `redirect_refuses_the_public_to_private_transition_and_metadata_always`.
 fn decide_redirect(
     host: Option<&str>,
+    previous: &[&str],
     hops: usize,
     checker: &impl Fn(&str) -> HostVerdict,
 ) -> RedirectDecision {
@@ -89,6 +104,26 @@ fn decide_redirect(
     let Some(host) = host else {
         return RedirectDecision::Follow;
     };
+    let class = address_class(host);
+    if metadata_refused(host) {
+        return RedirectDecision::Error(format!(
+            "refused: \"{host}\" is a cloud instance-metadata address; a fetch there would \
+             return instance credentials. Nothing on the public web needs to redirect here."
+        ));
+    }
+    // The human approved hop 0. A redirect out of the public internet into the
+    // private network is a target they never saw (T3-11). A chain that started
+    // private stays allowed — that one *was* approved, and escalated.
+    let started_public = previous
+        .first()
+        .is_none_or(|h| matches!(address_class(h), AddressClass::Public));
+    if started_public && !matches!(class, AddressClass::Public) && !previous.is_empty() {
+        return RedirectDecision::Error(format!(
+            "refused: redirected from the public web to \"{host}\", a private-network \
+             address. Fetch the internal URL directly if that is what you meant — it will \
+             be shown in the approval prompt."
+        ));
+    }
     match checker(host) {
         HostVerdict::Denied(reason) => RedirectDecision::Error(format!(
             "redirected to \"{host}\", which is refused: {reason}"
@@ -106,7 +141,17 @@ fn redirect_policy_with(
     checker: impl Fn(&str) -> HostVerdict + Send + Sync + 'static,
 ) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
-        match decide_redirect(attempt.url().host_str(), attempt.previous().len(), &checker) {
+        let previous: Vec<&str> = attempt
+            .previous()
+            .iter()
+            .filter_map(|u| u.host_str())
+            .collect();
+        match decide_redirect(
+            attempt.url().host_str(),
+            &previous,
+            attempt.previous().len(),
+            &checker,
+        ) {
             RedirectDecision::Follow => attempt.follow(),
             RedirectDecision::Stop => attempt.stop(),
             RedirectDecision::Error(msg) => attempt.error(EgressDenied(msg)),
@@ -370,6 +415,15 @@ impl WebFetchTool {
                 results[idx] = Some(Err(format!("`{raw}` is not a valid http(s) URL.")));
                 continue;
             };
+            // Hop 0 gets the same metadata guard the redirect policy applies
+            // to every later hop, so the address never opens a socket.
+            if metadata_refused(&host) {
+                results[idx] = Some(Err(format!(
+                    "refused: \"{host}\" is a cloud instance-metadata address; a fetch there \
+                     would return instance credentials."
+                )));
+                continue;
+            }
             if let HostVerdict::Denied(reason) = net::host_allowed(&host) {
                 results[idx] = Some(Err(format!("refused: {reason}")));
                 continue;
@@ -1129,11 +1183,11 @@ mod tests {
                 HostVerdict::Allowed
             }
         };
-        match decide_redirect(Some("good.example"), 0, &checker) {
+        match decide_redirect(Some("good.example"), &[], 0, &checker) {
             RedirectDecision::Follow => {}
             _ => panic!("an allowed host must follow"),
         }
-        match decide_redirect(Some("evil.example"), 0, &checker) {
+        match decide_redirect(Some("evil.example"), &[], 0, &checker) {
             RedirectDecision::Error(msg) => {
                 assert!(msg.contains("evil.example"));
                 assert!(msg.contains("not in [network] allow"));
@@ -1142,10 +1196,51 @@ mod tests {
         }
         // The hop cap applies independently of the host verdict — even an
         // allowed host stops once the chain is long enough.
-        match decide_redirect(Some("good.example"), MAX_REDIRECTS, &checker) {
+        match decide_redirect(Some("good.example"), &[], MAX_REDIRECTS, &checker) {
             RedirectDecision::Stop => {}
             _ => panic!("the hop cap must apply even to an allowed host"),
         }
+    }
+
+    #[test]
+    fn redirect_refuses_the_public_to_private_transition_and_metadata_always() {
+        let allow_all = |_: &str| HostVerdict::NoPolicy; // the *default* policy
+                                                         // 1. Public → private is the transition nobody approved.
+        match decide_redirect(Some("10.0.0.5"), &["example.com"], 1, &allow_all) {
+            RedirectDecision::Error(m) => {
+                assert!(m.contains("private") && m.contains("10.0.0.5"))
+            }
+            other => panic!("public→private must fail closed, got {other:?}"),
+        }
+        // 2. A chain that started private may stay private (dev-server workflow).
+        match decide_redirect(Some("127.0.0.1"), &["127.0.0.1"], 1, &allow_all) {
+            RedirectDecision::Follow => {}
+            other => panic!("private→private must still follow, got {other:?}"),
+        }
+        // 3. Metadata is refused even as the very first hop's target.
+        for host in ["169.254.169.254", "169.254.170.2"] {
+            match decide_redirect(Some(host), &[], 0, &allow_all) {
+                RedirectDecision::Error(m) => assert!(m.contains("metadata")),
+                other => panic!("{host} must always be refused, got {other:?}"),
+            }
+        }
+        // 4. The egress verdict still wins where it applies, and the hop cap
+        //    still applies.
+        let deny_evil = |h: &str| {
+            if h == "evil.example" {
+                HostVerdict::Denied("not in [network] allow".into())
+            } else {
+                HostVerdict::Allowed
+            }
+        };
+        assert!(matches!(
+            decide_redirect(Some("evil.example"), &["ok.example"], 1, &deny_evil),
+            RedirectDecision::Error(_)
+        ));
+        assert!(matches!(
+            decide_redirect(Some("good.example"), &[], MAX_REDIRECTS, &deny_evil),
+            RedirectDecision::Stop
+        ));
     }
 
     fn test_concurrency() -> SessionConcurrency {

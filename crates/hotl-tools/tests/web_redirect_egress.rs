@@ -108,3 +108,41 @@ async fn redirect_between_two_allowed_hosts_still_succeeds() {
     );
     assert!(out.content.contains(target_body), "{}", out.content);
 }
+
+/// T3-11b: a cloud instance-metadata address is refused on *every* hop, and
+/// the refusal names that guard specifically — not merely the allowlist, which
+/// would also have denied it here. The distinction is the point: the metadata
+/// guard must hold even under `egress = "open"`, where the allowlist says
+/// nothing at all.
+#[tokio::test]
+async fn a_redirect_into_cloud_metadata_is_refused_by_name() {
+    net::init(EgressPolicy::Allowlist(vec!["127.0.0.1".to_string()]));
+
+    let origin_port = respond_with(
+        "HTTP/1.1 302 Found\r\nlocation: http://169.254.169.254/latest/meta-data/iam/\r\ncontent-length: 0\r\n\r\n"
+            .to_string(),
+    )
+    .await;
+
+    let tool = WebFetchTool::new(test_concurrency());
+    let url = format!("http://127.0.0.1:{origin_port}/");
+    let out = tool
+        .run(json!({"urls": [url]}), CancellationToken::new())
+        .await;
+
+    assert!(
+        out.is_error,
+        "a redirect into the metadata address must fail closed: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("metadata"),
+        "the refusal must name the metadata guard, not just the allowlist: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("169.254.169.254"),
+        "the refusal must name the address: {}",
+        out.content
+    );
+}
