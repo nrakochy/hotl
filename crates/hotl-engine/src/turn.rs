@@ -506,9 +506,17 @@ impl Turn {
             self.call_sigs.pop_front();
         }
         if let Some(pattern) = detect_doom_loop(self.call_sigs.make_contiguous()) {
-            // Auto mode has nobody watching: the doom guard is a malfunction
-            // brake, not a permission — stop the turn instead of asking.
-            let stop = if self.shared.effective_mode() == hotl_tools::rules::PermissionMode::Auto {
+            // Auto and DontAsk are the unattended postures: nobody is watching,
+            // and the doom guard is a malfunction brake, not a permission —
+            // stop the turn instead of asking a question no one will answer.
+            // INVARIANT: an unattended mode never emits an unanswerable Ask.
+            // Enforced by `dont_ask_mode_hard_stops_on_a_doom_loop`.
+            let unattended = matches!(
+                self.shared.effective_mode(),
+                hotl_tools::rules::PermissionMode::Auto
+                    | hotl_tools::rules::PermissionMode::DontAsk
+            );
+            let stop = if unattended {
                 true
             } else {
                 let cont = self
@@ -1220,7 +1228,11 @@ fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
         }
         let tail = &sigs[sigs.len() - need..];
         let block = &tail[..period];
-        let same = |a: &CallSig, b: &CallSig| a.hash == b.hash;
+        // Hash first (cheap), then the display string it already carries: a
+        // 64-bit collision must not terminate a turn that was working (T3-8).
+        // INVARIANT: only genuinely identical calls count as a repetition.
+        // Enforced by `a_hash_collision_alone_is_not_a_doom_loop`.
+        let same = |a: &CallSig, b: &CallSig| a.hash == b.hash && a.display == b.display;
         if tail
             .chunks(period)
             .all(|c| c.iter().zip(block).all(|(a, b)| same(a, b)))
@@ -1330,6 +1342,18 @@ mod tests {
             .expect("a finished digest must reach the fold");
         assert_eq!(got.text, "DIGEST");
         assert_eq!((got.prefix_end, got.kept_from), (1, 4));
+    }
+
+    /// T3-8: `CallSig` already carries the exact display string, so a 64-bit
+    /// `DefaultHasher` collision must not terminate a turn that was working.
+    #[test]
+    fn a_hash_collision_alone_is_not_a_doom_loop() {
+        let collide = |display: &str| CallSig {
+            hash: 7,
+            display: display.into(),
+        };
+        assert!(detect_doom_loop(&[collide("a"), collide("b"), collide("c")]).is_none());
+        assert!(detect_doom_loop(&[collide("a"), collide("a"), collide("a")]).is_some());
     }
 
     fn todos_item(text: &str) -> Item {

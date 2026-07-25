@@ -145,6 +145,55 @@ async fn a_read_only_batch_takes_no_shadow_snapshot() {
     );
 }
 
+/// T3-9: `DontAsk` is an unattended posture. The doom guard is a malfunction
+/// brake, not a permission — it must stop the turn, never emit an `Ask` that
+/// nobody is there to answer.
+#[tokio::test]
+async fn dont_ask_mode_hard_stops_on_a_doom_loop() {
+    // The same call three times over: `CallSig` ignores the tool_use id, so
+    // these are one repeating signature and the detector's period-1 rule fires.
+    let repeat = |i: usize| {
+        ScriptedProvider::tool_call(&format!("t{i}"), "bash", json!({"command": "echo same"}))
+    };
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        repeat(0),
+        repeat(1),
+        repeat(2),
+        ScriptedProvider::text_reply("must never be reached"),
+    ]));
+    let mut s = session(
+        provider,
+        None,
+        EngineConfig {
+            max_turns: 20,
+            ..Default::default()
+        },
+    );
+    s.handle
+        .set_mode(hotl_tools::rules::PermissionMode::DontAsk)
+        .await;
+
+    s.handle.prompt("loop forever".into()).await;
+    let mut saw_ask = false;
+    let outcome = loop {
+        match next_event(&mut s).await {
+            // Deliberately unanswered: nobody is watching in an unattended
+            // posture, which is the whole point.
+            EngineEvent::Ask { .. } => saw_ask = true,
+            EngineEvent::TurnDone { outcome, .. } => break outcome,
+            _ => {}
+        }
+    };
+    assert!(
+        matches!(outcome, Outcome::DoomLoop { .. }),
+        "expected a hard stop, got {outcome:?}"
+    );
+    assert!(
+        !saw_ask,
+        "an unattended mode must never emit an Ask nobody can answer"
+    );
+}
+
 /// The control: a mutating batch still brackets itself with the pre/post pair.
 #[tokio::test]
 async fn a_mutating_batch_still_takes_the_pre_and_post_snapshots() {
