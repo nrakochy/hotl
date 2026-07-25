@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::Client;
 use crate::config::ServerConfig;
-use crate::sanitize::{self, sanitize};
+use crate::sanitize::{self, wrap_budgeted, Budget, MCP_TRAILER};
 use crate::trust::{binary_hash, TrustStore};
 
 /// Cap chosen to fit any real MCP tool name with headroom while bounding what
@@ -69,6 +69,10 @@ pub struct McpTool {
     hashes: Mutex<HashMap<String, String>>,
     connector: Connector,
     description: String,
+    /// Cumulative external-content budget for this tool instance (one
+    /// session). A single result is capped at `MAX_RESULT_BYTES`; a thousand
+    /// results were not (S-4).
+    budget: Budget,
 }
 
 impl McpTool {
@@ -109,11 +113,23 @@ impl McpTool {
             hashes: Mutex::new(HashMap::new()),
             connector,
             description,
+            budget: Budget::default(),
         }
     }
 
     fn server(&self, name: &str) -> Option<&ServerConfig> {
         self.servers.iter().find(|s| s.name == name)
+    }
+
+    /// The untrusted envelope for everything a server returns — results,
+    /// listings, errors alike. One chokepoint, shared with `recall`.
+    fn envelope(&self, server: &str, tool: &str, text: &str) -> String {
+        wrap_budgeted(
+            &format!("mcp:{server}/{tool}"),
+            MCP_TRAILER,
+            text,
+            &self.budget,
+        )
     }
 
     /// Cached binary hash for a server (computed once per session). The hash
@@ -175,7 +191,7 @@ impl McpTool {
         };
         let client = match self.ensure_client(cfg).await {
             Ok(c) => c,
-            Err(e) => return ToolOutcome::err(sanitize(server_name, "connect", &e)),
+            Err(e) => return ToolOutcome::err(self.envelope(server_name, "connect", &e)),
         };
         match input.get("tool").and_then(Value::as_str) {
             None => self.list(server_name, &client).await,
@@ -191,10 +207,10 @@ impl McpTool {
                 let arguments = input.get("arguments").cloned().unwrap_or(json!({}));
                 match client.call_tool(tool, arguments).await {
                     Ok((text, is_error)) => ToolOutcome {
-                        content: sanitize(server_name, tool, &text),
+                        content: self.envelope(server_name, tool, &text),
                         is_error,
                     },
-                    Err(e) => ToolOutcome::err(sanitize(server_name, tool, &e)),
+                    Err(e) => ToolOutcome::err(self.envelope(server_name, tool, &e)),
                 }
             }
         }
@@ -213,9 +229,9 @@ impl McpTool {
                 if tools.is_empty() {
                     out = "(this server exposes no tools)".into();
                 }
-                ToolOutcome::ok(sanitize(server, "tools/list", &out))
+                ToolOutcome::ok(self.envelope(server, "tools/list", &out))
             }
-            Err(e) => ToolOutcome::err(sanitize(server, "tools/list", &e)),
+            Err(e) => ToolOutcome::err(self.envelope(server, "tools/list", &e)),
         }
     }
 }

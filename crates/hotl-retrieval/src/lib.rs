@@ -4,15 +4,18 @@
 //! backends. hotl ships no vector DB — backends are owner-configured (MCP
 //! servers in P1; a local lexical index arrives in P2). Everything a backend
 //! returns passes one sanitizer chokepoint (untrusted envelope with
-//! `recall:<backend>` provenance) before entering the transcript.
+//! `recall:<backend>` provenance) before entering the transcript — literally
+//! one: [`hotl_mcp::sanitize`], shared rather than copied.
 
 pub mod config;
 pub mod mcp;
-mod sanitize;
 pub mod testing;
 mod tool;
 
-pub use sanitize::MAX_RESULT_BYTES;
+/// The one hardened sanitizer lives in `hotl-mcp` (which this crate already
+/// depends on); the byte-identical copy this crate used to carry was S-6 in
+/// the 2026-07-25 evaluation. Re-exported so the path callers use is unchanged.
+pub use hotl_mcp::sanitize::MAX_RESULT_BYTES;
 pub use tool::RecallTool;
 
 use futures_util::future::BoxFuture;
