@@ -100,6 +100,33 @@ pub enum Scroll {
     At(usize),
 }
 
+/// Running totals across every turn in this session. Per-turn usage is
+/// overwritten by design (the strip shows one line); these are what a human
+/// actually budgets against.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct SessionUsage {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    /// Accumulated only across turns that reported a price. `None` means no
+    /// turn ever did — the UI must then show nothing rather than `$0.00`.
+    pub cost_usd: Option<f64>,
+}
+
+impl SessionUsage {
+    /// Fold one turn's usage payload in. Absent keys count as zero, which is
+    /// what `TokenUsage`'s own `#[serde(default)]` fields already mean.
+    pub fn add(&mut self, usage: &Value) {
+        let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        self.input += n("input_tokens");
+        self.output += n("output_tokens");
+        self.cache_read += n("cache_read_input_tokens");
+        if let Some(c) = usage.get("cost_usd").and_then(Value::as_f64) {
+            *self.cost_usd.get_or_insert(0.0) += c;
+        }
+    }
+}
+
 /// The library's context window, used until the handshake reports the real
 /// one (`initialize`'s `contextWindow`). Only a fallback: an older server
 /// that does not report it still leaves the client rendering something
@@ -116,6 +143,8 @@ pub struct State {
     pub model: String,
     /// Set on the prompt result (real usage; streaming shows `chars/4`).
     pub usage_line: Option<String>,
+    /// Running totals across every turn, the basis of `usage_line`.
+    pub session_usage: SessionUsage,
     pub help_open: bool,
     /// First Esc sent a cancel; suppresses duplicate notices until the result.
     pub interrupt_sent: bool,
@@ -169,6 +198,7 @@ impl State {
             vim_mode,
             model,
             usage_line: None,
+            session_usage: SessionUsage::default(),
             help_open: false,
             interrupt_sent: false,
             pending_auto_rule: None,
@@ -461,7 +491,8 @@ fn on_prompt_result(
     if let Some(n) = outcome_notice(kind, text.as_deref()) {
         notice(state, n);
     }
-    state.usage_line = Some(format_usage(usage));
+    state.session_usage.add(usage);
+    state.usage_line = Some(format_usage(state, usage));
     state.phase = Phase::Idle;
     state.interrupt_sent = false;
     vec![Cmd::SetTitle(title(state, ""))]
@@ -481,9 +512,47 @@ fn outcome_notice(kind: &str, text: Option<&str>) -> Option<String> {
     })
 }
 
-fn format_usage(usage: &Value) -> String {
+/// Compact token count: verbatim below 1000, else one decimal with a `k`/`M`
+/// suffix. The strip has one line to spend, so `12.0k` beats `12000`.
+fn tok(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
+/// The strip's usage line: session totals, this turn's context fullness, and
+/// cost when — and only when — the payload reported one.
+///
+/// Per-turn input/output is overwritten by design (the strip shows one line);
+/// the *totals* are what a human actually budgets against. The context gauge
+/// reads the latest turn, because that is what the next turn will carry.
+///
+/// INVARIANT: no cost segment is rendered unless the turn result carried
+/// `cost_usd` — the UI never estimates prices. R4 owns the catalog that
+/// populates it (see the plan's RQ table). Enforced by
+/// `cost_is_shown_only_when_the_payload_carries_it`.
+fn format_usage(state: &State, usage: &Value) -> String {
     let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
-    format!("{} in · {} out tok", n("input_tokens"), n("output_tokens"))
+    let u = &state.session_usage;
+    let mut parts = vec![
+        format!("{} in", tok(u.input)),
+        format!("{} out", tok(u.output)),
+    ];
+    if u.cache_read > 0 {
+        parts.push(format!("{} cached", tok(u.cache_read)));
+    }
+    // What the *next* turn starts from: everything resident in this turn's
+    // context, not the session's running total.
+    let live = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+    if let Some(pct) = (live * 100).checked_div(state.context_window) {
+        parts.push(format!("{}% ctx", pct.min(100)));
+    }
+    if let Some(cost) = u.cost_usd {
+        parts.push(format!("${cost:.2}"));
+    }
+    parts.join(" · ")
 }
 
 /// True while something else must own the keyboard and the screen: a live
@@ -1000,6 +1069,68 @@ mod tests {
         );
     }
 
+    fn on_result(s: &mut State, kind: &str, text: Option<String>, usage: &Value) -> Vec<Cmd> {
+        update(
+            s,
+            Msg::PromptResult {
+                outcome_kind: kind.into(),
+                outcome_text: text,
+                usage: usage.clone(),
+            },
+        )
+    }
+
+    #[test]
+    fn the_usage_line_shows_cache_reads_and_session_totals() {
+        let mut s = State::test_default();
+        s.context_window = 200_000;
+        let usage = |i, o, c| {
+            json!({
+                "input_tokens": i, "output_tokens": o,
+                "cache_read_input_tokens": c, "cache_creation_input_tokens": 0
+            })
+        };
+        on_result(&mut s, "done", None, &usage(1_000, 500, 4_000));
+        on_result(&mut s, "done", None, &usage(2_000, 500, 8_000));
+
+        let line = s.usage_line.clone().unwrap();
+        assert!(line.contains("3.0k in"), "session totals: {line}");
+        assert!(line.contains("1.0k out"), "{line}");
+        assert!(
+            line.contains("12.0k cached"),
+            "cache reads must show: {line}"
+        );
+        // (2_000 + 8_000) / 200_000 of the window is live in the latest turn.
+        assert!(line.contains("5% ctx"), "context gauge: {line}");
+    }
+
+    #[test]
+    fn cost_is_shown_only_when_the_payload_carries_it() {
+        let mut s = State::test_default();
+        on_result(&mut s, "done", None, &json!({"input_tokens": 10}));
+        assert!(
+            !s.usage_line.as_ref().unwrap().contains('$'),
+            "no invented prices"
+        );
+
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({"input_tokens": 10, "cost_usd": 0.0123}),
+        );
+        assert!(s.usage_line.as_ref().unwrap().contains("$0.01"));
+    }
+
+    #[test]
+    fn the_context_gauge_is_omitted_without_a_window() {
+        let mut s = State::test_default();
+        s.context_window = 0;
+        on_result(&mut s, "done", None, &json!({"input_tokens": 10}));
+        let line = s.usage_line.clone().unwrap();
+        assert!(!line.contains("ctx"), "no window, no gauge: {line}");
+    }
+
     #[test]
     fn thinking_deltas_accumulate_into_one_item() {
         let mut s = State::test_default();
@@ -1383,7 +1514,9 @@ mod tests {
             },
         );
         assert_eq!(s.phase, Phase::Idle);
-        assert_eq!(s.usage_line.as_deref(), Some("120 in · 45 out tok"));
+        // Session totals plus the context gauge; no cache segment (this turn
+        // read none) and no cost (the payload carried none).
+        assert_eq!(s.usage_line.as_deref(), Some("120 in · 45 out · 0% ctx"));
         assert!(matches!(&cmds[..], [Cmd::SetTitle(t)] if t == "hotl"));
     }
 
