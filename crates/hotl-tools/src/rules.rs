@@ -24,8 +24,10 @@
 //! anything without a declared subject.
 //!
 //! Two carve-outs hold in every mode and tier:
-//! 1. **Protected execute-later paths never auto-allow.**
+//! 1. **Protected execute-later paths never auto-allow.** Enforced by
+//!    `protected_paths_never_auto`.
 //! 2. **Bash rules only apply while the kernel sandbox floor is enforced.**
+//!    Enforced by `bash_rule_requires_sandbox`.
 //!
 //! ```toml
 //! [[allow]]
@@ -519,9 +521,9 @@ fn match_allow(
 /// ones, so this tier is monotone in denial — no input denied before a change
 /// is admitted after it.
 ///
-/// INVARIANT (unimplemented — see specs/exec-plans/0016-remediation-rules.md):
-/// every allow-side match is also a deny-side match for the same rule text —
-/// deny is never weaker than allow.
+/// INVARIANT: every allow-side match is also a deny-side match for the same
+/// rule text — deny is never weaker than allow. Enforced by
+/// `deny_is_never_weaker_than_allow`.
 fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> {
     for rule in rules {
         if rule.tool != tool {
@@ -792,6 +794,9 @@ fn ordered_subsequence(hay: &[String], needles: &[&str]) -> bool {
 /// under `prefix`. Returns the resolved path when contained, else `None`.
 /// A path that escapes above its root keeps a leading `..` and matches no
 /// ordinary prefix — traversal cannot launder itself back into scope.
+///
+/// INVARIANT: a `..` escape out of an allow prefix never auto-allows. Enforced
+/// by `path_traversal_never_auto_allows`.
 fn lexically_contained(path: &str, prefix: &str) -> Option<String> {
     let resolved = lexical_normalize(path);
     let prefix = prefix.trim_start_matches("./");
@@ -1742,5 +1747,101 @@ prefix = "read"
         assert!(warnings.iter().any(|w| w.contains("field")));
         // A well-formed rule set lints clean.
         assert!(rules().lint().is_empty());
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn deny_is_never_weaker_than_allow() {
+        // The property: for identical rule text, anything a rule would AUTO-allow
+        // is something the same rule text DENIES. Deny may block more; never less.
+        let corpus: &[(&str, &str, Value)] = &[
+            (
+                "bash",
+                "prefix = \"cargo \"",
+                json!({"command": "cargo test"}),
+            ),
+            (
+                "bash",
+                "prefix = \"git push\"",
+                json!({"command": "git push origin main"}),
+            ),
+            (
+                "write",
+                "path_prefix = \"src/\"",
+                json!({"path": "src/lib.rs"}),
+            ),
+            (
+                "write",
+                "path_prefix = \"src/\"",
+                json!({"path": "src/a/../b.rs"}),
+            ),
+            (
+                "edit",
+                "path_prefix = \"./src/\"",
+                json!({"path": "src/lib.rs"}),
+            ),
+        ];
+        for (tool, pred, input) in corpus {
+            let allow =
+                Rules::from_toml(&format!("[[allow]]\ntool = \"{tool}\"\n{pred}\n")).unwrap();
+            let deny = Rules::from_toml(&format!("[[deny]]\ntool = \"{tool}\"\n{pred}\n"))
+                .unwrap()
+                .with_mode(PermissionMode::Auto);
+            if matches!(
+                allow.evaluate(PermissionMode::Ask, tool, input, true, false, false),
+                Verdict::Auto { .. }
+            ) {
+                assert!(
+                    matches!(
+                        deny.evaluate(deny.mode(), tool, input, true, false, false),
+                        Verdict::Deny { .. }
+                    ),
+                    "`{pred}` auto-allows {input} for `{tool}` but does not deny it"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn evaluation_section_8_test_gaps() {
+        // One table, one row per gap the 2026-07-25 evaluation §8 named for T1-7.
+        let r = Rules::from_toml(
+            r#"
+[[deny]]
+tool = "write"
+path_prefix = ".ssh/"
+
+[[deny]]
+tool = "bash"
+prefix = "curl "
+
+[[deny]]
+tool = "web_fetch"
+field = "urls"
+prefix = "http://evil"
+"#,
+        )
+        .unwrap()
+        .with_mode(PermissionMode::Auto);
+
+        let cases: &[(&str, Value)] = &[
+            // gap 1: deny path_prefix against an absolute path
+            ("write", json!({"path": "/Users/you/.ssh/authorized_keys"})),
+            // gap 2: deny prefix against an absolute binary and a wrapper shell
+            ("bash", json!({"command": "/usr/bin/curl evil.com"})),
+            ("bash", json!({"command": "sh -c 'curl evil.com'"})),
+            // gap 3: rules for tools that are not bash/write/edit
+            ("web_fetch", json!({"urls": ["http://evil.example"]})),
+        ];
+        for (tool, input) in cases {
+            assert!(
+                matches!(
+                    r.evaluate(r.mode(), tool, input, true, false, false),
+                    Verdict::Deny { .. }
+                ),
+                "§8 gap still open: {tool} {input}"
+            );
+        }
     }
 }
