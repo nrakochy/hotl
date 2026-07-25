@@ -907,7 +907,11 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command (`sh -c`). Default timeout 120s (`timeout_ms` overrides, max 600s); the whole process group is killed on timeout or cancel. Output is stdout+stderr combined, truncated at 50KB."
+        "Run a shell command (`sh -c`). Default timeout 120s (`timeout_ms` overrides, max 600s); \
+         the whole process group is killed on timeout or cancel. stdout and stderr share one pipe, \
+         so output arrives in the order the command actually wrote it (as a terminal shows it) and \
+         the two are not distinguishable. Truncated at 50KB. A failure ends with a structured \
+         trailer: `[exit N]` or `[killed by SIGNAME]`."
     }
     fn schema(&self) -> Value {
         json!({
@@ -948,16 +952,24 @@ async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
 
     let egress = crate::net::egress_state().await;
     let mut cmd = sandbox::build_command(command, sandbox_status(), &egress);
+    let (child_out, child_err, pipe) = merged_pipe()
+        .map_err(|e| ToolOutcome::err(format!("Could not create the output pipe: {e}.")))?;
     cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(child_out)
+        .stderr(child_err)
         .kill_on_drop(true)
         .process_group(0);
     let child = cmd
         .spawn()
         .map_err(|e| ToolOutcome::err(format!("Could not start shell: {e}.")))?;
+    // `Command::spawn` takes `&mut self`, so `cmd` still owns the `Stdio`
+    // values — i.e. the parent's own copies of the write ends. Until they are
+    // dropped there is a writer left on the pipe and the drain below never
+    // sees EOF. `Stdio::piped()` hides this because std keeps the parent end
+    // on the `Child`; handing in our own fds makes it ours to release.
+    drop(cmd);
     let pid = child.id();
-    let wait = collect_output(child, BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK);
+    let wait = collect_merged(child, pipe, BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK);
     tokio::pin!(wait);
 
     tokio::select! {
@@ -974,6 +986,85 @@ async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
             Err(ToolOutcome::err("Command cancelled by the user."))
         }
     }
+}
+
+/// One pipe, handed to the child as both stdout and stderr.
+///
+/// INVARIANT: the child's stdout and stderr land in a single pipe in the order
+/// the child wrote them, exactly as a terminal shows them. Two pipes read
+/// separately and concatenated structurally cannot do this — the causal order
+/// is destroyed before anyone sees it. The cost is that the two streams are no
+/// longer distinguishable; that is the right trade, because causal order is
+/// what the model reasons about. Enforced by
+/// `bash_preserves_stdout_stderr_interleaving`.
+fn merged_pipe() -> std::io::Result<(
+    std::process::Stdio,
+    std::process::Stdio,
+    tokio::net::unix::pipe::Receiver,
+)> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let mut fds = [0 as libc::c_int; 2];
+    // SAFETY: `fds` is a live two-element array, which is what pipe(2) writes.
+    // `pipe2(O_CLOEXEC)` is Linux-only but closes the inherit race outright;
+    // elsewhere the fcntls below run immediately after, leaving only the
+    // window std itself has on those platforms.
+    #[cfg(target_os = "linux")]
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    #[cfg(not(target_os = "linux"))]
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: both fds are freshly created and owned by nothing else.
+    let (read_end, write_end) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    // BOTH ends need CLOEXEC, and the write end is the subtle one: any *other*
+    // process this program spawns concurrently would otherwise inherit a copy
+    // and hold the pipe open, so this drain would not see EOF until that
+    // unrelated process exited. The read end matters for the same reason, one
+    // level closer. `dup2` onto fd 1/2 clears CLOEXEC on the copies the child
+    // actually gets, so setting it here costs the child nothing.
+    set_cloexec(&read_end)?;
+    set_cloexec(&write_end)?;
+    // `try_clone` dups with CLOEXEC already set.
+    let write_end2 = write_end.try_clone()?;
+    // Sets O_NONBLOCK itself; must be called inside the runtime.
+    let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(read_end)?;
+    Ok((
+        std::process::Stdio::from(write_end),
+        std::process::Stdio::from(write_end2),
+        rx,
+    ))
+}
+
+fn set_cloexec(fd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: plain fcntl(2) on a fd we own.
+    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: same fd, adding one flag.
+    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Drain the merged pipe to EOF (capped at `cap` bytes), then reap the child.
+/// Draining first is what keeps a chatty command from blocking on a full pipe
+/// while we wait for it to exit.
+///
+/// Additive beside `collect_output`, whose signature is shared with the
+/// diagnostics runner and is deliberately left alone.
+async fn collect_merged(
+    mut child: tokio::process::Child,
+    pipe: tokio::net::unix::pipe::Receiver,
+    cap: usize,
+) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
+    let bytes = drain_capped(Some(pipe), cap).await;
+    let status = child.wait().await?;
+    Ok((status, bytes))
 }
 
 /// Incrementally read the child's stdout/stderr (capped at `cap` bytes each)
@@ -1016,37 +1107,57 @@ async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>, cap: u
     buf
 }
 
-fn shell_outcome(result: std::io::Result<std::process::Output>) -> ToolOutcome {
-    let output = match result {
+fn shell_outcome(result: std::io::Result<(std::process::ExitStatus, Vec<u8>)>) -> ToolOutcome {
+    let (status, bytes) = match result {
         Ok(o) => o,
         Err(e) => return ToolOutcome::err(format!("Failed waiting on command: {e}.")),
     };
-    let text = combined_output(&output);
-    if output.status.success() {
-        ToolOutcome::ok(if text.is_empty() {
+    let text = clip_output(&bytes);
+    if status.success() {
+        return ToolOutcome::ok(if text.is_empty() {
             "(no output)".to_string()
         } else {
             text
-        })
-    } else {
-        let code = output
-            .status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".into());
-        ToolOutcome::err(format!("Command exited with status {code}.\n{text}"))
+        });
+    }
+    // A structured trailer so the model can branch on *why* it failed without
+    // parsing the prose. (A typed field on `ToolOutcome` would be better still,
+    // but that type crosses into the engine and the surface — tracker #17's
+    // neighbour, deferred with the same reasoning.)
+    use std::os::unix::process::ExitStatusExt;
+    let (label, trailer) = match (status.code(), status.signal()) {
+        (Some(code), _) => (format!("status {code}"), format!("[exit {code}]")),
+        (None, Some(sig)) => (
+            format!("signal {}", signal_name(sig)),
+            format!("[killed by {}]", signal_name(sig)),
+        ),
+        (None, None) => (
+            "an unknown status".to_string(),
+            "[exit unknown]".to_string(),
+        ),
+    };
+    ToolOutcome::err(format!("Command exited with {label}.\n{text}\n{trailer}"))
+}
+
+fn signal_name(sig: i32) -> String {
+    match sig {
+        libc::SIGHUP => "SIGHUP".into(),
+        libc::SIGINT => "SIGINT".into(),
+        libc::SIGQUIT => "SIGQUIT".into(),
+        libc::SIGILL => "SIGILL".into(),
+        libc::SIGABRT => "SIGABRT".into(),
+        libc::SIGFPE => "SIGFPE".into(),
+        libc::SIGKILL => "SIGKILL".into(),
+        libc::SIGSEGV => "SIGSEGV".into(),
+        libc::SIGPIPE => "SIGPIPE".into(),
+        libc::SIGALRM => "SIGALRM".into(),
+        libc::SIGTERM => "SIGTERM".into(),
+        other => format!("signal {other}"),
     }
 }
 
-fn combined_output(output: &std::process::Output) -> String {
-    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        text.push_str(&stderr);
-    }
+fn clip_output(bytes: &[u8]) -> String {
+    let mut text = String::from_utf8_lossy(bytes).into_owned();
     if text.len() > BASH_MAX_OUTPUT {
         let mut end = BASH_MAX_OUTPUT;
         while !text.is_char_boundary(end) {
@@ -1060,6 +1171,17 @@ fn combined_output(output: &std::process::Output) -> String {
 
 /// Kill the child's whole process group (spawned with process_group(0),
 /// so its pgid == its pid). Shared with the diagnostics runner (H-11).
+///
+/// INVARIANT: this is only ever called while the `Child` is still owned and
+/// un-reaped by the pending `collect_merged`/`collect_output` future (the
+/// `tokio::select!` timeout and cancel arms in `bash_impl` and `grep_search`),
+/// so the pid is either live or a zombie — reserved either way, and never
+/// reusable by another process. Killing after the child had been waited on
+/// would be a pid-reuse bug: the number could by then name someone else's
+/// process, and the negation would name someone else's *group*. That is why
+/// the kill happens before the wait future is dropped, not after. Its
+/// observable half — the whole group really dies — is enforced by
+/// `timeout_kills_the_whole_process_group`.
 pub(crate) fn kill_group(pid: Option<u32>) {
     if let Some(pid) = pid {
         // SAFETY: plain syscall; negative pid targets the process group.
@@ -1663,6 +1785,62 @@ mod tests {
         assert!(!EditTool::default().parallel_safe());
         assert!(!WriteTool::default().parallel_safe());
         assert!(!BashTool.parallel_safe());
+    }
+
+    #[test]
+    fn bash_preserves_stdout_stderr_interleaving() {
+        // Two pipes concatenated structurally cannot do this: the model would
+        // see all of stdout, then all of stderr, and reason about a sequence
+        // that never happened.
+        let out = run(
+            &BashTool,
+            json!({"command": "printf 'one\\n'; printf 'two\\n' >&2; printf 'three\\n'"}),
+        );
+        assert!(!out.is_error, "{}", out.content);
+        let (a, b, c) = (
+            out.content.find("one").unwrap(),
+            out.content.find("two").unwrap(),
+            out.content.find("three").unwrap(),
+        );
+        assert!(a < b && b < c, "interleaving lost: {}", out.content);
+    }
+
+    #[test]
+    fn bash_reports_the_exit_status_structurally() {
+        let f = run(&BashTool, json!({"command": "exit 3"}));
+        assert!(
+            f.is_error && f.content.contains("status 3"),
+            "{}",
+            f.content
+        );
+        assert!(f.content.contains("[exit 3]"), "{}", f.content);
+        let k = run(&BashTool, json!({"command": "kill -TERM $$"}));
+        assert!(k.is_error && k.content.contains("signal"), "{}", k.content);
+        assert!(k.content.contains("[killed by SIGTERM]"), "{}", k.content);
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_group() {
+        // `kill_group` targets -pid, so it reaches the child's own children.
+        // The invariant it depends on is that the kill lands while the `Child`
+        // is still owned and un-reaped, so the pid is still reserved and can
+        // never name somebody else's process.
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("still-alive");
+        let cmd = format!("(sleep 1; touch {}) & sleep 5", marker.to_str().unwrap());
+        let t = run(&BashTool, json!({"command": cmd, "timeout_ms": 300}));
+        assert!(
+            t.is_error && t.content.contains("timed out"),
+            "{}",
+            t.content
+        );
+        // Outlive the background sleep: if the group kill had missed it, the
+        // marker would appear after the tool call already returned.
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        assert!(
+            !marker.exists(),
+            "a grandchild survived the process-group kill"
+        );
     }
 
     #[test]
