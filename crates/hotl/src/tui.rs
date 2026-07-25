@@ -10,7 +10,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
+    KeyEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
@@ -212,8 +215,7 @@ async fn run_loop(
         guard.terminal.draw(|f| view(&state, &palette, f))?;
         let msg = tokio::select! {
             ev = keys.recv() => match ev {
-                Some(Event::Key(k)) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),
-                Some(_) => None, // resize etc: redraw happens on loop
+                Some(ev) => terminal_msg(ev), // `None` = redraw-only (resize, mouse motion)
                 None => return Ok(1),
             },
             sm = read_server_msg(reader) => match sm {
@@ -273,6 +275,33 @@ async fn run_loop(
                 Cmd::Quit => return Ok(0),
             }
         }
+    }
+}
+
+/// Transcript items per wheel notch — a third of a page (`scroll::PAGE`).
+const WHEEL_LINES: usize = 3;
+
+/// One terminal event → an Elm message, or `None` for events the loop only
+/// needs as a redraw trigger (resize, focus, mouse motion, key release). Pure,
+/// so the select arm's mapping is unit-testable.
+///
+/// The `None` for non-wheel mouse kinds is load-bearing rather than defensive:
+/// it drops motion and click noise before any `Msg` exists, so a mouse drag
+/// cannot drive a redraw storm through the loop.
+fn terminal_msg(ev: Event) -> Option<Msg> {
+    use crossterm::event::MouseEventKind;
+    match ev {
+        Event::Key(k) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),
+        Event::Mouse(m) => match m.kind {
+            MouseEventKind::ScrollUp => {
+                Some(Msg::Scroll(hotl_tui::scroll::Intent::Up(WHEEL_LINES)))
+            }
+            MouseEventKind::ScrollDown => {
+                Some(Msg::Scroll(hotl_tui::scroll::Intent::Down(WHEEL_LINES)))
+            }
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -543,9 +572,13 @@ fn age(t: SystemTime) -> String {
 }
 
 /// Owns raw mode + alt screen, restoring on drop (mirrors watch.rs) — an
-/// early error, normal exit, or panic all leave the shell usable.
+/// early error, normal exit, or panic all leave the shell usable. Every mode
+/// it enables is also in `term::RESTORE`, which is what the signal path writes.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// Mouse capture is on. Recorded so `suspend`/`resume`/`Drop` stay
+    /// symmetric with whatever `enter` decided.
+    mouse: bool,
 }
 
 impl TerminalGuard {
@@ -557,22 +590,41 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(e);
         }
+        // Mouse capture makes the wheel scroll the transcript, at the cost of
+        // the terminal's own drag-select (hold Shift on most emulators, or set
+        // HOTL_MOUSE=0). Opt-out is env-only until R4 adds `[behavior] mouse`
+        // — see specs/exec-plans/active/0020-remediation-surface.md RQ-1.
+        let mouse = std::env::var("HOTL_MOUSE").as_deref() != Ok("0");
+        if mouse {
+            let _ = execute!(stdout, EnableMouseCapture);
+        }
+        let _ = execute!(stdout, EnableBracketedPaste);
         match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => {
                 crate::term::arm();
-                Ok(TerminalGuard { terminal })
+                Ok(TerminalGuard { terminal, mouse })
             }
             Err(e) => {
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
+                let _ = execute!(
+                    io::stdout(),
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
                 let _ = disable_raw_mode();
                 Err(e)
             }
         }
     }
 
-    /// Hand the real screen to `$EDITOR`…
+    /// Hand the real screen to `$EDITOR`… (mouse reporting and bracketed paste
+    /// go with it — `$EDITOR` sets its own).
     fn suspend(&mut self) {
         let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
+        if self.mouse {
+            let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
+        }
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         crate::term::disarm();
     }
@@ -581,6 +633,10 @@ impl TerminalGuard {
     fn resume(&mut self) {
         let _ = enable_raw_mode();
         let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        if self.mouse {
+            let _ = execute!(self.terminal.backend_mut(), EnableMouseCapture);
+        }
+        let _ = execute!(self.terminal.backend_mut(), EnableBracketedPaste);
         let _ = self.terminal.clear();
         crate::term::arm();
     }
@@ -589,6 +645,10 @@ impl TerminalGuard {
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
+        if self.mouse {
+            let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
+        }
         let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
         crate::term::disarm();
@@ -597,9 +657,34 @@ impl Drop for TerminalGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_skills, parse_tui_args, resolve_session_arg};
+    use super::{parse_skills, parse_tui_args, resolve_session_arg, terminal_msg, WHEEL_LINES};
+    use crossterm::event::{Event, KeyModifiers};
+    use hotl_tui::app::Msg;
     use serde_json::json;
     use std::time::SystemTime;
+
+    #[test]
+    fn wheel_events_become_scroll_messages() {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        let ev = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        assert_eq!(
+            terminal_msg(ev(MouseEventKind::ScrollUp)),
+            Some(Msg::Scroll(hotl_tui::scroll::Intent::Up(WHEEL_LINES)))
+        );
+        assert_eq!(
+            terminal_msg(ev(MouseEventKind::ScrollDown)),
+            Some(Msg::Scroll(hotl_tui::scroll::Intent::Down(WHEEL_LINES)))
+        );
+        // Motion and clicks are noise — they must not wake the update loop.
+        assert_eq!(terminal_msg(ev(MouseEventKind::Moved)), None);
+    }
 
     fn v(args: &[&str]) -> Vec<String> {
         args.iter().map(|s| s.to_string()).collect()

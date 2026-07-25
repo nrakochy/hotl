@@ -23,8 +23,15 @@
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
-/// Leave the alternate screen, then show the cursor.
-const RESTORE: &[u8] = b"\x1b[?1049l\x1b[?25h";
+/// Disable mouse reporting (button, any-motion, SGR encoding) and bracketed
+/// paste, leave the alternate screen, then show the cursor — in that order, so
+/// nothing we turned on outlives the process. A shell that inherits mouse
+/// reporting emits escape sequences on every mouse move, which is strictly
+/// worse than the raw-mode wedge this module exists to prevent.
+/// INVARIANT: undoes every mode `TerminalGuard::enter` sets. Enforced by
+/// `restore_bytes_disable_mouse_and_bracketed_paste`.
+const RESTORE: &[u8] =
+    b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h";
 
 /// The signals that kill a foreground TUI outright. SIGQUIT is left alone:
 /// it is the deliberate "core-dump this" escape hatch.
@@ -137,6 +144,27 @@ mod tests {
             !restore(),
             "a guard that restored itself leaves nothing behind"
         );
+    }
+
+    /// The signal-path restore must undo everything a guard turns on, not just
+    /// the alternate screen — a killed TUI that leaves mouse reporting or
+    /// bracketed paste enabled poisons the user's shell worse than raw mode
+    /// does.
+    #[test]
+    fn restore_bytes_disable_mouse_and_bracketed_paste() {
+        let s = std::str::from_utf8(RESTORE).unwrap();
+        assert!(s.contains("\x1b[?1049l"), "leave alternate screen");
+        assert!(s.contains("\x1b[?25h"), "show cursor");
+        assert!(s.contains("\x1b[?1006l"), "disable SGR mouse encoding");
+        assert!(
+            s.contains("\x1b[?1003l"),
+            "disable any-motion mouse tracking"
+        );
+        assert!(
+            s.contains("\x1b[?1000l"),
+            "disable button-event mouse tracking"
+        );
+        assert!(s.contains("\x1b[?2004l"), "disable bracketed paste");
     }
 
     #[test]

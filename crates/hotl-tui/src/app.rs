@@ -163,7 +163,7 @@ impl State {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum Msg {
     /// The `update` object from a `session/update` notification.
     Update(Value),
