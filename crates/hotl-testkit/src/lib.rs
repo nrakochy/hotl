@@ -504,14 +504,23 @@ mod tests {
     async fn auto_mode_runs_mutating_calls_without_asking() {
         // write (not bash): the harness runs unsandboxed, and auto mode
         // deliberately excludes unsandboxed bash — covered by rules tests.
-        // Scripts are pushed after construction so the write targets the
-        // harness tempdir, never the test process cwd.
+        //
+        // The target must be *inside* the working directory: a write outside
+        // it is a protected ask that deliberately outranks `mode=auto` (the
+        // sandbox write-confinement floor does not cover it), and this test is
+        // about the auto tier silencing an *ordinary* call. A scratch dir
+        // created inside the process cwd is both in-tree and self-cleaning, so
+        // the write still never leaves a stray file behind.
         let mut h = Harness::with_rules(Vec::new(), cfg(), auto_rules());
-        let note = h.dir().join("notes.txt");
+        let scratch = tempfile::TempDir::new_in(".").expect("scratch dir");
+        let note = format!(
+            "{}/notes.txt",
+            scratch.path().file_name().unwrap().to_str().unwrap()
+        );
         h.provider.push_script(ScriptedProvider::tool_call(
             "t1",
             "write",
-            json!({"path": note.to_str().unwrap(), "content": "x"}),
+            json!({"path": note, "content": "x"}),
         ));
         h.provider
             .push_script(ScriptedProvider::text_reply("ran silently"));
@@ -528,6 +537,7 @@ mod tests {
             "events: {:?}",
             h.seen
         );
+        assert!(scratch.path().join("notes.txt").exists(), "write ran");
         assert!(
             h.seen.iter().any(|e| e.contains("permissions.mode=auto")),
             "events: {:?}",

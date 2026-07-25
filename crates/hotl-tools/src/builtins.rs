@@ -64,15 +64,37 @@ fn guarded_search_root(
 }
 
 /// Permission for a mutating file tool: protected paths escalate.
+///
+/// INVARIANT: the execute-later classification runs on the *resolved* target
+/// as well as the literal path, so an innocent-looking name that is a symlink
+/// to `~/.zshrc` still gets the escalated ask — a symlink cannot launder a
+/// protected write into an ordinary one. Enforced by
+/// `file_permission_classifies_the_resolved_target`.
 fn file_permission(verb: &str, input: &Value) -> Permission {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
     let summary = format!("{verb} {path}");
-    match execute_later_reason(path) {
-        Some(why) => Permission::AskProtected {
+    let resolved = std::fs::canonicalize(path).ok();
+    let reason = execute_later_reason(path).or_else(|| {
+        resolved
+            .as_deref()
+            .and_then(|r| execute_later_reason(&r.to_string_lossy()))
+    });
+    let outside = matches!(
+        fsguard::classify(fsguard::workspace_root(), path),
+        fsguard::Placement::Outside(_)
+    );
+    match (reason, outside) {
+        (Some(why), _) => Permission::AskProtected {
             summary,
             why: why.into(),
         },
-        None => Permission::Ask { summary },
+        (None, true) => Permission::AskProtected {
+            summary,
+            why: "outside the working directory: not covered by the sandbox write-confinement \
+                  floor"
+                .into(),
+        },
+        (None, false) => Permission::Ask { summary },
     }
 }
 
@@ -238,27 +260,46 @@ impl Tool for WriteTool {
         file_permission("write", input)
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(
-            async move { with_diagnostics(&self.diag, &input, write_impl(&input).await).await },
-        )
+        Box::pin(async move {
+            let root = fsguard::workspace_root();
+            with_diagnostics(&self.diag, &input, write_in(root, &input).await).await
+        })
     }
 }
 
-async fn write_impl(input: &Value) -> ToolResult {
+/// INVARIANT: a write inside the workspace goes through the guarded create,
+/// so no component of the path — including the final one — is ever a symlink
+/// that would redirect the bytes somewhere else. A path outside the workspace
+/// was approved explicitly by the human, who saw the resolved target in the
+/// ask, so it is written plainly. Enforced by
+/// `write_through_a_symlink_does_not_touch_the_target`.
+async fn write_in(root: &std::path::Path, input: &Value) -> ToolResult {
     let path = str_arg(input, "path")?;
     let content = str_arg(input, "content")?;
-    if let Some(parent) = std::path::Path::new(path).parent() {
-        if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                ToolOutcome::err(format!(
-                    "Could not create parent directories for `{path}`: {e}."
-                ))
-            })?;
+    match fsguard::classify(root, path) {
+        fsguard::Placement::Inside(rel) => {
+            use std::io::Write;
+            let mut f = fsguard::create_beneath(root, &rel, true)
+                .map_err(|e| ToolOutcome::err(e.prompt("write", path)))?;
+            f.write_all(content.as_bytes())
+                .and_then(|()| f.sync_all())
+                .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
+        }
+        fsguard::Placement::Outside(_) => {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        ToolOutcome::err(format!(
+                            "Could not create parent directories for `{path}`: {e}."
+                        ))
+                    })?;
+                }
+            }
+            tokio::fs::write(path, content)
+                .await
+                .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
         }
     }
-    tokio::fs::write(path, content)
-        .await
-        .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
     Ok(ToolOutcome::ok(format!(
         "Wrote {} bytes to {path}.",
         content.len()
@@ -292,7 +333,10 @@ impl Tool for EditTool {
         file_permission("edit", input)
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { with_diagnostics(&self.diag, &input, edit_impl(&input).await).await })
+        Box::pin(async move {
+            let root = fsguard::workspace_root();
+            with_diagnostics(&self.diag, &input, edit_in(root, &input).await).await
+        })
     }
 }
 
@@ -313,7 +357,11 @@ async fn with_diagnostics(
     outcome
 }
 
-async fn edit_impl(input: &Value) -> ToolResult {
+/// INVARIANT: both halves of an edit — the read that finds the match and the
+/// write that applies it — go through the guard, so an in-workspace name that
+/// is a symlink out of the tree is refused rather than silently rewriting the
+/// link's target. Enforced by `edit_through_a_symlink_does_not_touch_the_target`.
+async fn edit_in(root: &std::path::Path, input: &Value) -> ToolResult {
     let path = str_arg(input, "path")?;
     let old = str_arg(input, "old_string")?;
     let new = str_arg(input, "new_string")?;
@@ -322,11 +370,8 @@ async fn edit_impl(input: &Value) -> ToolResult {
             "`old_string` is empty. Use `write` to create a file, or provide the exact text to replace.",
         ));
     }
-    let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-        ToolOutcome::err(format!(
-            "Could not read `{path}`: {e}. Read the file first to confirm the path."
-        ))
-    })?;
+    let placement = fsguard::classify(root, path);
+    let content = read_guarded_to_string(root, &placement, path)?;
     match crate::matcher::find(&content, old) {
         crate::matcher::Match::None => Err(ToolOutcome::err(format!(
             "`old_string` was not found in `{path}` (even with whitespace-tolerant matching). \
@@ -337,12 +382,53 @@ async fn edit_impl(input: &Value) -> ToolResult {
         ))),
         crate::matcher::Match::Unique { start, end, exact } => {
             let updated = format!("{}{new}{}", &content[..start], &content[end..]);
-            tokio::fs::write(path, updated)
-                .await
-                .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
+            write_guarded(root, &placement, path, updated.as_bytes())?;
             let note = if exact { "" } else { " (whitespace-tolerant match)" };
             Ok(ToolOutcome::ok(format!("Edited {path}.{note}")))
         }
+    }
+}
+
+/// Read a file for editing through whichever door its `Placement` opened:
+/// the fd descent inside the workspace, a plain open outside it (which the
+/// human approved by path).
+fn read_guarded_to_string(
+    root: &std::path::Path,
+    placement: &fsguard::Placement,
+    path: &str,
+) -> Result<String, ToolOutcome> {
+    let not_read = |e: std::io::Error| {
+        ToolOutcome::err(format!(
+            "Could not read `{path}`: {e}. Read the file first to confirm the path."
+        ))
+    };
+    match placement {
+        fsguard::Placement::Inside(rel) => {
+            use std::io::Read;
+            let mut f = fsguard::open_beneath(root, rel)
+                .map_err(|e| ToolOutcome::err(e.prompt("edit", path)))?;
+            let mut s = String::new();
+            f.read_to_string(&mut s).map_err(not_read)?;
+            Ok(s)
+        }
+        fsguard::Placement::Outside(_) => std::fs::read_to_string(path).map_err(not_read),
+    }
+}
+
+/// The write-back half of `read_guarded_to_string`. Inside the workspace this
+/// is the atomic replace (temp sibling, fsync, `renameat`, parent fsync);
+/// outside it, a plain whole-file write.
+fn write_guarded(
+    root: &std::path::Path,
+    placement: &fsguard::Placement,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), ToolOutcome> {
+    match placement {
+        fsguard::Placement::Inside(rel) => fsguard::replace_beneath(root, rel, bytes)
+            .map_err(|e| ToolOutcome::err(e.prompt("edit", path))),
+        fsguard::Placement::Outside(_) => std::fs::write(path, bytes)
+            .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}."))),
     }
 }
 
@@ -826,6 +912,106 @@ mod tests {
         );
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[tokio::test]
+    async fn write_through_a_symlink_does_not_touch_the_target() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        let target = home.join(".zshrc");
+        std::fs::write(&target, "# original\n").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::os::unix::fs::symlink(&target, root.join("docs/notes.md")).unwrap();
+
+        let out = done(write_in(&root, &json!({"path": "docs/notes.md", "content": "evil"})).await);
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "# original\n");
+        assert!(out.content.contains("symlink"), "{}", out.content);
+    }
+
+    #[test]
+    fn file_permission_classifies_the_resolved_target() {
+        // The laundering case: an innocent name pointing at a protected file must
+        // get the escalated ask, not the ordinary one.
+        let (_o, root, home) = fsguard::tests::fixture();
+        let rc = home.join(".zshrc");
+        std::fs::write(&rc, "").unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::os::unix::fs::symlink(&rc, root.join("docs/notes.md")).unwrap();
+        let p = root.join("docs/notes.md");
+        match file_permission("write", &json!({"path": p.to_str().unwrap()})) {
+            Permission::AskProtected { why, .. } => {
+                assert!(why.contains("shell startup file"), "{why}")
+            }
+            other => panic!("symlink to .zshrc must escalate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_creates_parents_but_never_through_a_link() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::os::unix::fs::symlink(&home, root.join("out")).unwrap();
+        let out = done(write_in(&root, &json!({"path": "out/a/b.txt", "content": "x"})).await);
+        assert!(out.is_error, "{}", out.content);
+        assert!(!home.join("a/b.txt").exists(), "created through the link");
+        // The ordinary case still works.
+        let ok = done(write_in(&root, &json!({"path": "a/b/c.txt", "content": "x"})).await);
+        assert!(!ok.is_error, "{}", ok.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("a/b/c.txt")).unwrap(),
+            "x"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_through_a_symlink_does_not_touch_the_target() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        let target = home.join(".zshrc");
+        std::fs::write(&target, "export PATH=/usr/bin\n").unwrap();
+        std::os::unix::fs::symlink(&target, root.join("notes.md")).unwrap();
+        let out = done(
+            edit_in(
+                &root,
+                &json!({"path": "notes.md", "old_string": "/usr/bin", "new_string": "/evil"}),
+            )
+            .await,
+        );
+        assert!(out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "export PATH=/usr/bin\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_inside_the_tree_still_works_and_keeps_the_mode() {
+        let (_o, root, _home) = fsguard::tests::fixture();
+        let script = root.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = done(
+            edit_in(
+                &root,
+                &json!({"path": "run.sh", "old_string": "echo old", "new_string": "echo new"}),
+            )
+            .await,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            "#!/bin/sh\necho new\n"
+        );
+        // An atomic replace must not silently drop the executable bit.
+        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755, "mode {mode:o}");
+        // ...and it must leave no temp sibling behind.
+        let leftovers: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".hotl-tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]

@@ -181,6 +181,251 @@ pub(crate) fn resolve_beneath(root: &Path, rel: &Path) -> Result<PathBuf, GuardE
     Ok(joined)
 }
 
+/// Create (or truncate) `rel` beneath `root`. The parent is reached by the
+/// same `O_NOFOLLOW` descent; the leaf is created with `O_NOFOLLOW` so an
+/// existing symlink there fails with `ELOOP` instead of writing its target.
+///
+/// INVARIANT: a write never follows a symlink, at any component, including
+/// the final one. Enforced by
+/// `write_through_a_symlink_does_not_touch_the_target` and
+/// `write_creates_parents_but_never_through_a_link`.
+pub(crate) fn create_beneath(root: &Path, rel: &Path, mkparents: bool) -> Result<File, GuardError> {
+    let (dir, leaf) = split_parent(root, rel, mkparents)?;
+    openat_leaf(
+        &dir,
+        &leaf,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0o644,
+    )
+}
+
+/// Atomically replace `rel`'s contents: write a sibling temp file, `fsync`
+/// it, `renameat` over the target, then `fsync` the parent directory.
+///
+/// INVARIANT: a crash mid-write leaves either the old file or the new one,
+/// never a truncated one, and the target's mode survives the swap. Enforced by
+/// `replace_is_atomic_and_durable` and
+/// `edit_inside_the_tree_still_works_and_keeps_the_mode`.
+pub(crate) fn replace_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> Result<(), GuardError> {
+    use std::io::Write;
+    let (dir, leaf) = split_parent(root, rel, false)?;
+    let tmp = std::ffi::OsString::from(format!(
+        ".hotl-tmp-{}-{}",
+        std::process::id(),
+        next_tmp_seq()
+    ));
+    let mut f = openat_leaf(
+        &dir,
+        &tmp,
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        0o644,
+    )?;
+    // Carry the target's mode across, or an atomic replace would silently
+    // drop the executable bit off every script it edits.
+    let staged = (|| {
+        if let Some(mode) = mode_at(&dir, &leaf) {
+            fchmod(&f, mode)?;
+        }
+        f.write_all(bytes)?;
+        f.sync_all()
+    })();
+    if let Err(e) = staged {
+        unlinkat(&dir, &tmp);
+        return Err(GuardError::Io(e));
+    }
+    drop(f);
+    if let Err(e) = renameat(&dir, &tmp, &dir, &leaf) {
+        unlinkat(&dir, &tmp);
+        return Err(GuardError::Io(e));
+    }
+    // Durability of the *name*: without this the rename can be lost even
+    // though the data was synced.
+    dir.sync_all().map_err(GuardError::Io)
+}
+
+/// Descend to `rel`'s parent and hand back `(parent dir fd, leaf name)`.
+/// Missing intermediates are created with `mkdirat` when `mkparents`, and
+/// every one that already exists is re-opened `O_NOFOLLOW|O_DIRECTORY`, so a
+/// symlinked intermediate is refused rather than descended through.
+fn split_parent(
+    root: &Path,
+    rel: &Path,
+    mkparents: bool,
+) -> Result<(File, std::ffi::OsString), GuardError> {
+    let comps: Vec<&OsStr> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::CurDir => None,
+            Component::Normal(s) => Some(Ok(s)),
+            _ => Some(Err(())),
+        })
+        .collect::<Result<Vec<_>, ()>>()
+        .map_err(|_| GuardError::Escape {
+            at: rel.to_path_buf(),
+        })?;
+    // A bare `.` names the root directory, which is not a file to write.
+    let Some((leaf, parents)) = comps.split_last() else {
+        return Err(GuardError::Escape {
+            at: rel.to_path_buf(),
+        });
+    };
+    let mut dir = open_root(root)?;
+    let mut walked = PathBuf::new();
+    for comp in parents {
+        walked.push(comp);
+        dir = open_or_make_dir(&dir, comp, mkparents, &walked)?;
+    }
+    Ok((dir, (*leaf).to_os_string()))
+}
+
+fn open_or_make_dir(
+    dir: &File,
+    comp: &OsStr,
+    mkparents: bool,
+    walked: &Path,
+) -> Result<File, GuardError> {
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY;
+    let c = CString::new(comp.as_bytes()).map_err(|_| GuardError::Escape {
+        at: walked.to_path_buf(),
+    })?;
+    // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+    if fd >= 0 {
+        // SAFETY: freshly opened fd, owned by nothing else.
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    let err = std::io::Error::last_os_error();
+    if mkparents && err.raw_os_error() == Some(libc::ENOENT) {
+        // SAFETY: plain mkdirat(2) on a fd we own.
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EEXIST) {
+                return Err(GuardError::Io(e));
+            }
+        }
+        // SAFETY: same, re-opening what we just created.
+        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
+        if fd >= 0 {
+            // SAFETY: freshly opened fd, owned by nothing else.
+            return Ok(unsafe { File::from_raw_fd(fd) });
+        }
+        return Err(GuardError::Io(std::io::Error::last_os_error()));
+    }
+    // Same classification as `descend`: a link is an escape, anything else is
+    // an ordinary I/O error.
+    Err(
+        if matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
+            && is_symlink_at(dir, comp)
+        {
+            GuardError::Escape {
+                at: walked.to_path_buf(),
+            }
+        } else {
+            GuardError::Io(err)
+        },
+    )
+}
+
+fn openat_leaf(
+    dir: &File,
+    leaf: &OsStr,
+    flags: libc::c_int,
+    mode: libc::mode_t,
+) -> Result<File, GuardError> {
+    let c = CString::new(leaf.as_bytes()).map_err(|_| GuardError::Escape {
+        at: PathBuf::from(leaf),
+    })?;
+    // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated;
+    // `openat` is variadic and takes the mode as its third argument when
+    // `O_CREAT` is set.
+    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode as libc::c_uint) };
+    if fd >= 0 {
+        // SAFETY: freshly opened fd, owned by nothing else.
+        return Ok(unsafe { File::from_raw_fd(fd) });
+    }
+    let err = std::io::Error::last_os_error();
+    Err(
+        if matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
+            && is_symlink_at(dir, leaf)
+        {
+            GuardError::Escape {
+                at: PathBuf::from(leaf),
+            }
+        } else {
+            GuardError::Io(err)
+        },
+    )
+}
+
+/// The permission bits of `name` in `dir`, or `None` if it does not exist
+/// (or is not a regular file — a mode is only meaningful to carry across for
+/// one that is).
+fn mode_at(dir: &File, name: &OsStr) -> Option<libc::mode_t> {
+    let c = CString::new(name.as_bytes()).ok()?;
+    // SAFETY: `stat` is a plain repr(C) struct; all-zero is a valid instance.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated.
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            c.as_ptr(),
+            &mut st,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+        return None;
+    }
+    Some(st.st_mode & 0o7777)
+}
+
+fn fchmod(f: &File, mode: libc::mode_t) -> std::io::Result<()> {
+    // SAFETY: plain fchmod(2) on a fd we own.
+    if unsafe { libc::fchmod(f.as_raw_fd(), mode) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn unlinkat(dir: &File, name: &OsStr) {
+    let Ok(c) = CString::new(name.as_bytes()) else {
+        return;
+    };
+    // SAFETY: plain unlinkat(2) on a fd we own. Best-effort cleanup of our
+    // own temp file; a failure here has nothing to report.
+    unsafe {
+        libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0);
+    }
+}
+
+fn renameat(olddir: &File, oldname: &OsStr, newdir: &File, newname: &OsStr) -> std::io::Result<()> {
+    let old = CString::new(oldname.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let new = CString::new(newname.as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    // SAFETY: both fds are open directories we own; both names are
+    // NUL-terminated.
+    if unsafe {
+        libc::renameat(
+            olddir.as_raw_fd(),
+            old.as_ptr(),
+            newdir.as_raw_fd(),
+            new.as_ptr(),
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Per-process counter so two concurrent replaces cannot pick the same temp
+/// name (the pid alone is not enough).
+fn next_tmp_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// `root.join(rel)` with the lone `.` collapsed, so a caller handing the
 /// result to an external walker gets `root` rather than `root/.`.
 pub(crate) fn join_beneath(root: &Path, rel: &Path) -> PathBuf {
