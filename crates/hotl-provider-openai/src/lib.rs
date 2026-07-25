@@ -5,6 +5,10 @@
 //! no key needed). The base URL is configurable; auth is optional for
 //! non-default bases.
 //!
+//! **Chat Completions only.** The Responses API is a separate dialect; it is
+//! not implemented here (an assembler with no HTTP client behind it was
+//! deleted in R3 — see `specs/exec-plans/tech-debt-tracker.md`).
+//!
 //! Cross-provider translation (`transform_messages`) lives
 //! in this crate's converters, where the corpus says it belongs:
 //! - canonical assistant blocks are Anthropic-shaped; text and tool_use map
@@ -13,8 +17,6 @@
 //! - tool results become one `role:"tool"` message per result;
 //! - responses map back to canonical blocks (tool_calls → `tool_use` blocks),
 //!   so a session can cross dialects mid-conversation in either direction.
-
-pub mod responses;
 
 use std::sync::Arc;
 
@@ -389,6 +391,20 @@ impl Provider for OpenAiCompatProvider {
 mod tests {
     use super::*;
     use hotl_types::ToolResultItem;
+
+    /// R3/T1: the Responses-API assembler was deleted (dead code, and its two
+    /// tests read as dialect coverage that did not exist). If this crate grows a
+    /// Responses dialect again, it arrives with an HTTP client and an
+    /// HTTP-level test, not an assembler nothing constructs.
+    #[test]
+    fn only_the_chat_completions_dialect_is_compiled_in() {
+        let src = include_str!("lib.rs");
+        // Split so this test's own source is not a match for itself.
+        assert!(
+            !src.contains(concat!("mod ", "responses")),
+            "responses.rs is dead code — delete it or wire it to a real endpoint"
+        );
+    }
 
     #[test]
     fn body_shape_drops_thinking_and_splits_tool_results() {
