@@ -260,6 +260,19 @@ impl SseAssembler for Assembler {
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             self.finish = Some(map_finish(reason));
+            // INVARIANT (T3-14): close every block that opened. The
+            // chat-completions wire has no per-block terminator, so
+            // `finish_reason` is the point at which the block set is final —
+            // emitted in the same order `finish()` assembles them. Enforced by
+            // `every_block_start_has_a_matching_block_end`.
+            if !self.got_final {
+                if self.text_started {
+                    out.push(StreamEvent::BlockEnd { index: 0 });
+                }
+                for idx in 0..self.tools.len() {
+                    out.push(StreamEvent::BlockEnd { index: idx + 1 });
+                }
+            }
             self.got_final = true;
         }
         Ok(out)
@@ -557,6 +570,72 @@ mod tests {
         let data = r#"{"choices":[{"delta":{"tool_calls":[
             {"index":4000000000,"id":"c","function":{"name":"read","arguments":""}}]}}]}"#;
         assert!(matches!(a.handle(data), Err(ProviderError::Parse(_))));
+    }
+
+    /// INVARIANT (T3-14): every block the assembler opens is closed, in every
+    /// dialect. `BlockEnd` is the contract's flush signal; a consumer must not
+    /// have to know which provider is behind it.
+    #[test]
+    fn every_block_start_has_a_matching_block_end() {
+        let chunks = [
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c0","function":{"name":"read","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c1","function":{"name":"glob","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ];
+        let mut a = Assembler::default();
+        let mut events = Vec::new();
+        for c in chunks {
+            events.extend(a.handle(c).unwrap());
+        }
+        let starts: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::BlockStart { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<usize> = events
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::BlockEnd { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![0, 1, 2]);
+        assert_eq!(ends, vec![0, 1, 2], "every opened block must be closed");
+        // And every BlockEnd follows its BlockStart.
+        for i in &starts {
+            let s = events
+                .iter()
+                .position(|e| matches!(e, StreamEvent::BlockStart { index, .. } if index == i))
+                .unwrap();
+            let e = events
+                .iter()
+                .position(|e| matches!(e, StreamEvent::BlockEnd { index } if index == i))
+                .unwrap();
+            assert!(s < e, "BlockEnd {i} preceded its BlockStart");
+        }
+    }
+
+    /// A text-only response closes block 0 and nothing else.
+    #[test]
+    fn a_text_only_response_closes_exactly_one_block() {
+        let mut a = Assembler::default();
+        let mut events = a
+            .handle(r#"{"choices":[{"delta":{"content":"hi"}}]}"#)
+            .unwrap();
+        events.extend(
+            a.handle(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
+                .unwrap(),
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| matches!(e, StreamEvent::BlockEnd { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]
