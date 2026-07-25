@@ -42,7 +42,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         Ok(a) => a,
         Err(code) => return code,
     };
-    let (factory, model, skills) = match crate::agent::acp_factory().await {
+    let (factory, model, info) = match crate::agent::acp_factory().await {
         Ok(triple) => triple,
         Err(code) => return code,
     };
@@ -69,7 +69,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
-    tokio::spawn(crate::acp::serve(sread, swrite, factory, skills));
+    tokio::spawn(crate::acp::serve(sread, swrite, factory, info));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut reader = BufReader::new(cread);
     let mut client = AcpClient::new(cwrite);

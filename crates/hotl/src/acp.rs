@@ -99,6 +99,11 @@ pub enum SessionSpec {
 pub struct SessionOpen {
     pub handle: SessionHandle,
     pub name: Option<String>,
+    /// This session's effective permission mode at open (inherited-and-coerced
+    /// on resume, else the configured default).
+    /// INVARIANT: equals what the engine's `Rules` will actually enforce.
+    /// Enforced by `tests/acp_protocol.rs::the_session_reports_its_effective_mode`.
+    pub mode: String,
 }
 
 /// Builds a session per the client's request. The real binary wires engine
@@ -116,12 +121,25 @@ pub struct SkillInfo {
     pub description: String,
 }
 
+/// What `serve` advertises to a client before any session exists. Bundled
+/// rather than passed positionally: `serve` is already at the argument count
+/// where this workspace reaches for `#[allow(clippy::too_many_arguments)]`.
+#[derive(Debug, Clone)]
+pub struct ServerInfo {
+    pub skills: Vec<SkillInfo>,
+    /// The configured permission mode a new session starts in, already run
+    /// through `enforced_mode`. Clients render it; they never infer it.
+    pub default_mode: String,
+    /// Model context window in tokens — what a UI's fullness gauge divides by.
+    pub context_window: u64,
+}
+
 /// Drive the protocol over one connection until the client hangs up.
 pub async fn serve(
     read: impl AsyncRead + Send + Unpin + 'static,
     write: impl AsyncWrite + Send + Unpin + 'static,
     mut factory: SessionFactory,
-    skills: Vec<SkillInfo>,
+    info: ServerInfo,
 ) {
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -165,7 +183,7 @@ pub async fn serve(
             &pending_questions,
             &pending_prompt,
             &mut next_id,
-            &skills,
+            &info,
         )
         .await;
     }
@@ -187,7 +205,7 @@ async fn handle_request(
     pending_questions: &PendingQuestions,
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
-    skills: &[SkillInfo],
+    info: &ServerInfo,
 ) {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     match msg.get("method").and_then(Value::as_str).unwrap_or("") {
@@ -197,11 +215,26 @@ async fn handle_request(
             // client never has to walk the config dirs to know what a slash
             // could mean. Descriptions ride this response only; they are
             // never part of any prompt.
-            let skills: Vec<Value> = skills
+            let skills: Vec<Value> = info
+                .skills
                 .iter()
                 .map(|s| json!({"name": s.name, "description": s.description}))
                 .collect();
-            reply_ok(writer, id, json!({"protocolVersion": PROTOCOL_VERSION, "schemaVersion": UPDATE_SCHEMA_VERSION, "skills": skills})).await;
+            // `defaultMode` and `contextWindow` are server-side truth a client
+            // renders rather than guesses: the badge used to read "ask" while
+            // the shipped default ran "auto" (evaluation §5.7).
+            reply_ok(
+                writer,
+                id,
+                json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "schemaVersion": UPDATE_SCHEMA_VERSION,
+                    "skills": skills,
+                    "defaultMode": info.default_mode,
+                    "contextWindow": info.context_window,
+                }),
+            )
+            .await;
         }
         method @ ("session/new" | "session/load") => {
             let name = match msg.pointer("/params/name") {
@@ -234,6 +267,8 @@ async fn handle_request(
             };
             match factory(spec) {
                 Ok(open) => {
+                    // Captured before `open.handle` moves into `start_session`.
+                    let mode = open.mode;
                     // Replacing a session: interrupt its in-flight turn (its
                     // events are about to stop rendering anywhere — it must
                     // not keep running tools invisibly in the shared cwd),
@@ -274,7 +309,16 @@ async fn handle_request(
                     }
                     let sid = state.id.clone();
                     *session = Some(state);
-                    reply_ok(writer, id, json!({"sessionId": sid, "name": open.name})).await;
+                    // The session's own effective mode rides the open result:
+                    // a client's handshake runs before it takes the screen and
+                    // wants the seed synchronously, rather than waiting for a
+                    // notification that only fires on a *change*.
+                    reply_ok(
+                        writer,
+                        id,
+                        json!({"sessionId": sid, "name": open.name, "mode": mode}),
+                    )
+                    .await;
                 }
                 Err(e) => reply_err(writer, id, &e).await,
             }
@@ -329,8 +373,23 @@ async fn handle_request(
                 )
                 .await;
             };
+            // The *effective* mode, post-coercion: a `security-enforced` build
+            // forces Auto→Ask inside `Rules::with_mode`, so acking the
+            // requested mode would leave a client's badge reading `auto` for a
+            // session actually running `ask` — the §5.7 lie in reverse.
+            let effective = hotl_tools::rules::enforced_mode(mode);
             state.handle.set_mode(mode).await;
-            reply_ok(writer, id, json!({"ok": true})).await;
+            let session_id = state.id.clone();
+            reply_ok(writer, id, json!({"ok": true, "mode": effective.as_str()})).await;
+            // Broadcast, not just ack: a mode changed by *any* client (or by
+            // resume inheritance) has to reach every attached surface, and
+            // `session/update` needs no id-plumbing in a client's loop.
+            notify(
+                writer,
+                &session_id,
+                json!({"type": "mode_changed", "mode": effective.as_str()}),
+            )
+            .await;
         }
         "session/steer" => {
             let Some(state) = session.as_ref() else {

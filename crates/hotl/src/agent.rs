@@ -141,24 +141,19 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
 /// real engine deps into a session factory and hands the streams to the
 /// protocol loop. One connection, one process (process-per-session).
 pub async fn acp_main() -> i32 {
-    let (factory, _model, skills) = match acp_factory().await {
+    let (factory, _model, info) = match acp_factory().await {
         Ok(triple) => triple,
         Err(code) => return code,
     };
-    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory, skills).await;
+    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory, info).await;
     0
 }
 
 /// The real-engine session factory `hotl acp` and `hotl tui` share, plus the
-/// resolved model name. Prints its own errors; `Err` carries the exit code.
-pub(crate) async fn acp_factory() -> Result<
-    (
-        crate::acp::SessionFactory,
-        String,
-        Vec<crate::acp::SkillInfo>,
-    ),
-    i32,
-> {
+/// resolved model name and what `initialize` advertises. Prints its own
+/// errors; `Err` carries the exit code.
+pub(crate) async fn acp_factory(
+) -> Result<(crate::acp::SessionFactory, String, crate::acp::ServerInfo), i32> {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -181,6 +176,14 @@ pub(crate) async fn acp_factory() -> Result<
             description: description.clone(),
         })
         .collect();
+    // What a new session starts in, already coerced by `load_rules`
+    // (`with_mode` runs `enforced_mode`), plus the window a context gauge
+    // divides by. Advertised at `initialize` so no client has to guess either.
+    let info = crate::acp::ServerInfo {
+        skills,
+        default_mode: scaffold.rules.mode().as_str().to_string(),
+        context_window: scaffold.config.context_window,
+    };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         let (resumed, requested) = match spec {
             crate::acp::SessionSpec::New { name } => (None, name),
@@ -261,6 +264,15 @@ pub(crate) async fn acp_factory() -> Result<
             .as_ref()
             .map(|r| r.todos.clone())
             .unwrap_or_default();
+        // The effective mode this session will actually run under: the
+        // inherited-and-coerced override, else the configured default. The
+        // same value `deps()` hands the actor — computed once, reported once,
+        // never inferred by a client.
+        let mode = mode_override
+            .map(hotl_tools::rules::enforced_mode)
+            .unwrap_or_else(|| scaffold.rules.mode())
+            .as_str()
+            .to_string();
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
@@ -278,9 +290,10 @@ pub(crate) async fn acp_factory() -> Result<
         Ok(crate::acp::SessionOpen {
             handle,
             name: requested,
+            mode,
         })
     });
-    Ok((factory, model, skills))
+    Ok((factory, model, info))
 }
 
 /// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a

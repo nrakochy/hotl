@@ -20,7 +20,20 @@ mod acp;
 /// A session whose scripted model calls bash (a gated tool → a permission
 /// ask) then replies with text.
 fn scripted_factory() -> acp::SessionFactory {
-    Box::new(|spec| {
+    scripted_factory_with_mode("ask")
+}
+
+/// What `serve` advertises when a test does not care about the values.
+fn server_info() -> acp::ServerInfo {
+    acp::ServerInfo {
+        skills: Vec::new(),
+        default_mode: "ask".into(),
+        context_window: 200_000,
+    }
+}
+
+fn scripted_factory_with_mode(mode: &'static str) -> acp::SessionFactory {
+    Box::new(move |spec| {
         // Echo the requested name back, as the real factory does — resolving
         // the open's name is the factory's job, not the protocol layer's.
         let name = match spec {
@@ -55,6 +68,7 @@ fn scripted_factory() -> acp::SessionFactory {
                 },
             }),
             name,
+            mode: mode.to_string(),
         })
     })
 }
@@ -82,7 +96,15 @@ async fn initialize_advertises_skill_names_and_descriptions() {
             description: String::new(),
         },
     ];
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), skills));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        acp::ServerInfo {
+            skills,
+            ..server_info()
+        },
+    ));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -105,7 +127,7 @@ async fn initialize_advertises_skill_names_and_descriptions() {
 async fn initialize_new_prompt_permission_and_result() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -223,11 +245,12 @@ async fn overlapping_prompts_resolve_in_order() {
                 },
             }),
             name: None,
+            mode: "ask".into(),
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, factory, Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -262,7 +285,7 @@ async fn overlapping_prompts_resolve_in_order() {
 async fn replacing_a_session_clears_parked_state() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -338,7 +361,7 @@ async fn replacing_a_session_clears_parked_state() {
 async fn steer_is_acknowledged_and_reaches_engine() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -396,7 +419,7 @@ async fn read_until_id(
 async fn named_open_and_rename() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
@@ -506,11 +529,12 @@ async fn ask_user_round_trip_via_session_request_question() {
                 notifications,
             ),
             name: None,
+            mode: "ask".into(),
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, factory, Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info()));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -568,7 +592,7 @@ async fn ask_user_round_trip_via_session_request_question() {
 async fn set_mode_acks_and_rejects_unknown_modes() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), Vec::new()));
+    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
@@ -615,6 +639,70 @@ async fn set_mode_acks_and_rejects_unknown_modes() {
     )
     .await;
     assert_eq!(next(&mut lines).await["result"]["ok"], true);
+}
+
+/// The permission mode is server-side truth. A client that renders a badge
+/// must never have to guess it — the evaluation's §5.7 bug was a UI that
+/// showed "ask" while the session ran "auto".
+#[tokio::test]
+async fn the_session_reports_its_effective_mode() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory_with_mode("auto"),
+        acp::ServerInfo {
+            skills: Vec::new(),
+            default_mode: "auto".into(),
+            context_window: 1_000_000,
+        },
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let hello = read_until_id(&mut lines, 1).await;
+    assert_eq!(hello["result"]["defaultMode"], "auto");
+    assert_eq!(hello["result"]["contextWindow"], 1_000_000);
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    assert_eq!(
+        opened["result"]["mode"], "auto",
+        "session/new must report the mode"
+    );
+
+    // A mode change is broadcast, not just acked — any attached surface updates.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"mode":"plan"}}),
+    )
+    .await;
+    let mut saw_notification = false;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "mode_changed" {
+            assert_eq!(m["params"]["update"]["mode"], "plan");
+            saw_notification = true;
+            break;
+        }
+        if m["id"] == json!(3) {
+            assert_eq!(
+                m["result"]["mode"], "plan",
+                "the ack carries the effective mode"
+            );
+        }
+    }
+    assert!(saw_notification, "set_mode must broadcast mode_changed");
 }
 
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {

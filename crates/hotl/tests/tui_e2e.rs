@@ -60,6 +60,7 @@ fn scripted_factory() -> acp::SessionFactory {
                 },
             }),
             name: None,
+            mode: "ask".into(),
         })
     })
 }
@@ -121,6 +122,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
                 notifications,
             ),
             name: None,
+            mode: "ask".into(),
         })
     })
 }
@@ -133,7 +135,16 @@ async fn start() -> (Client, Reader) {
 async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
-    tokio::spawn(acp::serve(sread, swrite, factory, Vec::new()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        factory,
+        acp::ServerInfo {
+            skills: Vec::new(),
+            default_mode: "ask".into(),
+            context_window: 200_000,
+        },
+    ));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut client = AcpClient::new(cwrite);
     let mut reader = BufReader::new(cread);
