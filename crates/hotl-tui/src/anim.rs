@@ -14,7 +14,6 @@ pub const TURNING: [&str; 4] = ["╭─╮╰─╯", "╭╮ ╰╯─", "─�
 pub const ORBIT: [&str; 4] = ["●─╮╰─╯", "╭●╮╰─╯", "╭─●╰─╯", "╭─╮╰●╯"];
 /// WaitingAsk: halted, the gap is you.
 pub const GAP: &str = "╭─╮╰ ╯";
-pub const COIL: [&str; 4] = ["◜◝◟◞", "◜◝", "◜", "·"];
 
 pub fn loop_glyph(phase: &Phase) -> &'static str {
     match phase {
@@ -22,7 +21,6 @@ pub fn loop_glyph(phase: &Phase) -> &'static str {
         Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => draw_then_turn(*ticks),
         Phase::Tool { ticks, .. } => ORBIT[(*ticks % 4) as usize],
         Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => GAP,
-        Phase::Compacting { ticks } => COIL[(*ticks % 4) as usize],
     }
 }
 
@@ -59,7 +57,6 @@ pub fn strip_line(state: &State) -> String {
         Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
             format!("{GAP} waiting on you")
         }
-        Phase::Compacting { .. } => format!("{glyph} folding history…"),
     };
     match todos_summary(&state.todos) {
         Some(summary) => format!("{base} · {summary}"),
@@ -188,7 +185,5 @@ mod tests {
             diff: Vec::new(),
         };
         assert_eq!(strip_line(&s), "╭─╮╰ ╯ waiting on you");
-        s.phase = Phase::Compacting { ticks: 1 };
-        assert_eq!(strip_line(&s), "◜◝ folding history…");
     }
 }

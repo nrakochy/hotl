@@ -47,9 +47,6 @@ pub enum Phase {
         options: Vec<QuestionOption>,
         input: String,
     },
-    Compacting {
-        ticks: u64,
-    },
 }
 
 /// One row of a proposed change, as it arrives on the wire. The generator
@@ -503,9 +500,6 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     "history folded".into()
                 },
             );
-            if matches!(state.phase, Phase::Compacting { .. }) {
-                state.phase = Phase::Sampling { ticks: 0 };
-            }
         }
         // `turn_done` rides in the prompt result; thinking stays in Sampling.
         _ => {}
@@ -1028,9 +1022,7 @@ fn resume_after_ask(
 
 fn on_tick(state: &mut State) {
     match &mut state.phase {
-        Phase::Sampling { ticks }
-        | Phase::Streaming { ticks, .. }
-        | Phase::Compacting { ticks } => *ticks += 1,
+        Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => *ticks += 1,
         Phase::Tool { ticks, .. } => {
             *ticks += 1;
             // The running card's elapsed stays in lock-step with the strip's.
@@ -1616,15 +1608,30 @@ mod tests {
         assert!(matches!(&cmds[..], [Cmd::SetTitle(t)] if t == "hotl"));
     }
 
+    /// Dead animation state: the compacting phase was defined, ticked,
+    /// exited, and animated, but never assigned outside tests (evaluation §7)
+    /// — the engine emits only `Compacted { degraded }`, a *completion*
+    /// signal. It is gone until the engine emits a compaction-*start* event
+    /// (this plan's RQ-3); the frames are preserved in the plan's Task 12 so
+    /// restoring it is a copy-paste.
+    #[test]
+    fn no_unreachable_phase_variants() {
+        let src = include_str!("app.rs");
+        // Split so this assertion is not its own counter-example.
+        let needle = concat!("Compact", "ing");
+        assert!(
+            !src.contains(needle),
+            "a phase nothing assigns must not ship — see RQ-3"
+        );
+    }
+
     #[test]
     fn compacted_and_retrying_become_notices() {
         let mut s = State::test_default();
-        s.phase = Phase::Compacting { ticks: 3 };
         upd(&mut s, json!({"type":"compacted","degraded":false}));
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("folded"))
         );
-        assert!(!matches!(s.phase, Phase::Compacting { .. }));
         upd(
             &mut s,
             json!({"type":"retrying","attempt":2,"reason":"overloaded"}),
