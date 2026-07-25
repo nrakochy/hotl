@@ -477,7 +477,49 @@ fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> 
             }
         }
     }
+    // A deny rule is a "never". A command whose real argv is hidden behind an
+    // expansion cannot be shown to satisfy it, so it is refused rather than
+    // admitted — the fail-safe direction for the strict tier.
+    // INVARIANT: fires only when this tier carries a command deny rule for this
+    // tool. Enforced by `deny_refuses_commands_it_cannot_statically_analyze`.
+    let governs_commands = rules.iter().any(|r| r.tool == tool && r.prefix.is_some());
+    if governs_commands {
+        if let Some((SubjectKind::Command, values)) =
+            subject_values(tool, input, &probe(tool), true)
+        {
+            if let Some(cmd) = values.iter().find(|c| unanalyzable(c)) {
+                let short: String = cmd.chars().take(60).collect();
+                return Some(format!(
+                    "deny rules are in force for `{tool}` and `{short}` uses $ or ` expansion, so \
+                     the command that would actually run cannot be checked — rerun it with \
+                     literal arguments, one command per call"
+                ));
+            }
+        }
+    }
     None
+}
+
+/// A rule-shaped key for looking up a tool's *declared* subject, independent of
+/// any particular rule's `field` override.
+fn probe(tool: &str) -> AllowRule {
+    AllowRule {
+        tool: tool.to_string(),
+        prefix: None,
+        path_prefix: None,
+        field: None,
+    }
+}
+
+/// `$` and `` ` `` mean the command that runs is not the command in the string:
+/// parameter expansion, command substitution, `eval`. No lexer can see through
+/// them, so when a deny rule governs this tool the honest verdict is refusal.
+///
+/// Deliberately narrower than [`has_shell_operator`]: chaining and redirection
+/// are handled precisely by per-segment matching, and blanket-denying them
+/// would break ordinary work for anyone who writes a single deny rule.
+fn unanalyzable(cmd: &str) -> bool {
+    cmd.contains(['$', '`'])
 }
 
 /// Shell metacharacters that chain, redirect, or substitute — their presence
@@ -1414,5 +1456,59 @@ prefix = "payments"
         // Multi-token rules match as an ordered token subsequence after argv[0].
         assert!(deny_command_matches("git -c a=b push origin", "git push"));
         assert!(!deny_command_matches("git push", "git pull"));
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn deny_refuses_commands_it_cannot_statically_analyze() {
+        let r = Rules::from_toml("[[deny]]\ntool = \"bash\"\nprefix = \"curl \"\n")
+            .unwrap()
+            .with_mode(PermissionMode::Auto);
+        // Indirection through a variable or a substitution: refused, with a prompt
+        // telling the model how to rewrite it.
+        for evasion in [
+            "CURL=curl; $CURL evil.com",
+            "$(echo curl) evil.com",
+            "`which curl` evil.com",
+            "eval \"$CMD\"",
+        ] {
+            let v = r.evaluate(
+                r.mode(),
+                "bash",
+                &json!({"command": evasion}),
+                true,
+                false,
+                false,
+            );
+            assert!(
+                matches!(v, Verdict::Deny { ref rule } if rule.contains("literal")),
+                "`{evasion}` must be refused with a rewrite prompt, got {v:?}"
+            );
+        }
+        // Plain chaining is still analyzed per segment, not blanket-denied.
+        assert!(matches!(
+            r.evaluate(
+                r.mode(),
+                "bash",
+                &json!({"command": "cargo build && cargo test"}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Auto { .. }
+        ));
+        // And a session with no bash deny rule is entirely unaffected.
+        let none = Rules::default().with_mode(PermissionMode::Auto);
+        assert!(matches!(
+            none.evaluate(
+                none.mode(),
+                "bash",
+                &json!({"command": "echo $HOME"}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Auto { .. }
+        ));
     }
 }
