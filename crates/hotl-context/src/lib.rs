@@ -8,6 +8,8 @@
 pub mod compaction;
 pub mod tokens;
 
+pub use tokens::TokenProfile;
+
 use hotl_types::{Item, SyntheticReason};
 use std::path::{Path, PathBuf};
 

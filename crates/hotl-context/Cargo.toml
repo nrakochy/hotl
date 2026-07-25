@@ -12,6 +12,4 @@ homepage.workspace = true
 
 [dependencies]
 hotl-types = { path = "../hotl-types", version = "0.5.1" }
-
-[dev-dependencies]
 serde_json = { workspace = true }
