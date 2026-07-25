@@ -586,9 +586,13 @@ fn writer_loop(
     }
 }
 
-/// Roll the file back to the last acked offset and seal. This is what makes a
-/// torn trailing line impossible to observe (T1-2b): the half-written bytes are
-/// gone before the next reader can ever see them.
+/// Roll the file back to the last acked offset and seal.
+///
+/// INVARIANT: a failed write is never observable as a torn trailing line — the
+/// file is rolled back to the last acked offset before the error is returned,
+/// so the half-written bytes are gone before the next reader can ever see them
+/// (T1-2b). Enforced by `disk_full_seals_the_log_and_leaves_no_torn_entry` and
+/// `a_sealed_log_never_advances_the_parent_chain`.
 fn seal_and_truncate(file: &mut File, good_offset: u64, seal_now: &impl Fn(String), reason: &str) {
     let _ = file.set_len(good_offset);
     let _ = file.sync_data();
@@ -1355,6 +1359,108 @@ mod tests {
             })
             .collect();
         assert_eq!(names, (0..64).map(|i| format!("n{i}")).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
+    async fn disk_full_seals_the_log_and_leaves_no_torn_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append_acked(
+            &EntryPayload::Rename {
+                name: "good".into(),
+            },
+            2,
+        )
+        .await
+        .unwrap();
+        let good_len = std::fs::metadata(log.path()).unwrap().len();
+
+        // ENOSPC halfway through the line: the classic torn-write (T1-2b).
+        log.inject_fault(WriteFault::TearThenFail);
+        let err = log
+            .append_acked(
+                &EntryPayload::Rename {
+                    name: "doomed".into(),
+                },
+                3,
+            )
+            .await
+            .expect_err("a failed write must not report success");
+
+        // Clean error surface: it says what happened and what to do next.
+        let msg = err.to_string();
+        assert!(msg.contains("session log is sealed"), "{msg}");
+        assert!(
+            msg.contains("intact on disk"),
+            "the error must be a prompt: {msg}"
+        );
+
+        // No torn entries: the file is byte-identical to its last acked state.
+        assert_eq!(std::fs::metadata(log.path()).unwrap().len(), good_len);
+        let content = std::fs::read_to_string(log.path()).unwrap();
+        for line in content.lines() {
+            serde_json::from_str::<Entry>(line).expect("every surviving line parses whole");
+        }
+        // And what survived still replays — the prior work is not lost.
+        let replayed = replay(log.path()).expect("a sealed log still replays");
+        assert!(replayed.warnings.is_empty(), "{:?}", replayed.warnings);
+
+        // Log-sealed is terminal and read-only: every subsequent append is rejected.
+        assert!(log.is_sealed());
+        assert!(log
+            .append_acked(
+                &EntryPayload::Rename {
+                    name: "after".into()
+                },
+                4
+            )
+            .await
+            .is_err());
+        assert!(log
+            .append(
+                &EntryPayload::Rename {
+                    name: "after".into()
+                },
+                5
+            )
+            .is_err());
+        assert_eq!(std::fs::metadata(log.path()).unwrap().len(), good_len);
+    }
+
+    #[tokio::test]
+    async fn a_failure_before_any_byte_lands_also_seals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let before = std::fs::read_to_string(log.path()).unwrap();
+        log.inject_fault(WriteFault::FailBeforeWrite);
+        assert!(log
+            .append_acked(&EntryPayload::Rename { name: "x".into() }, 2)
+            .await
+            .is_err());
+        assert!(log.is_sealed());
+        assert_eq!(std::fs::read_to_string(log.path()).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn a_sealed_log_never_advances_the_parent_chain() {
+        // The T1-2b corruption path: a failed append that still advanced `last_id`
+        // would chain the *next* entry onto a line that no longer exists.
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append_acked(&EntryPayload::Rename { name: "one".into() }, 2)
+            .await
+            .unwrap();
+        log.inject_fault(WriteFault::TearThenFail);
+        let _ = log
+            .append_acked(&EntryPayload::Rename { name: "two".into() }, 3)
+            .await;
+        // Nothing more can be written, so the chain on disk is whole by construction.
+        let replayed = replay(log.path()).expect("replay");
+        assert!(
+            replayed.warnings.is_empty(),
+            "a sealed log must not leave a broken chain: {:?}",
+            replayed.warnings
+        );
     }
 
     #[test]
