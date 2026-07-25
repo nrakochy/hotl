@@ -66,23 +66,30 @@ pub fn word(buffer: &str, cursor: (usize, usize)) -> Option<String> {
     Some(chars[1..upto].iter().collect())
 }
 
-/// Match quality, sortable ascending: prefix hits before substring hits,
-/// then shorter names before longer, then built-ins before skills as the
-/// final tiebreak. Length must outrank built-in status — otherwise a skill
-/// whose name is a strict prefix of a longer builtin (a skill named `mod`
-/// against the builtin `mode`) would be unreachable via Enter, since the
-/// builtin would always outrank it despite matching a longer needle.
-/// `None` = no match.
-fn rank(cmd: &Command, needle: &str) -> Option<(u8, usize, bool)> {
+/// Match quality, sortable ascending: exact matches before prefix hits
+/// before substring hits, then built-ins before skills, then shorter names
+/// before longer as the final tiebreak. `None` = no match.
+///
+/// The exact tier exists so a skill named identically to a builtin's strict
+/// prefix (a skill named `mod` against the builtin `mode`) is still
+/// reachable via Enter: typing `/mod` makes the skill an exact match while
+/// the builtin is only a prefix match, so the skill wins regardless of
+/// built-in status. Built-ins must outrank skills within a shared tier —
+/// otherwise any skill shorter than the shortest builtin (this repo ships
+/// `run`, `init`, `loop`, `auth`, all shorter than `mode`/`plan`) would
+/// pre-empt every builtin on a bare `/`.
+fn rank(cmd: &Command, needle: &str) -> Option<(u8, bool, usize)> {
     let name = cmd.name.to_lowercase();
-    let tier = if name.starts_with(needle) {
+    let tier = if name == needle {
         0
-    } else if name.contains(needle) {
+    } else if name.starts_with(needle) {
         1
+    } else if name.contains(needle) {
+        2
     } else {
         return None;
     };
-    Some((tier, name.chars().count(), !cmd.builtin))
+    Some((tier, !cmd.builtin, name.chars().count()))
 }
 
 /// The popup for this buffer, or `None` when there is nothing to show.
@@ -97,12 +104,12 @@ pub fn recompute(
         return None;
     }
     let needle = word(buffer, cursor)?.to_lowercase();
-    let mut scored: Vec<((u8, usize, bool, String), usize)> = commands
+    let mut scored: Vec<((u8, bool, usize, String), usize)> = commands
         .iter()
         .enumerate()
         .filter_map(|(i, c)| {
             rank(c, &needle)
-                .map(|(tier, len, skill)| ((tier, len, skill, c.name.to_lowercase()), i))
+                .map(|(tier, skill, len)| ((tier, skill, len, c.name.to_lowercase()), i))
         })
         .collect();
     if scored.is_empty() {
@@ -160,6 +167,9 @@ mod tests {
             ("review", "review a pull request"),
             ("rag-recall", "search the retrieval index"),
             ("superpowers:brainstorming", "turn an idea into a design"),
+            // Shorter than every builtin — pins "built-ins first" against the
+            // ordering that puts name length ahead of built-in status.
+            ("run", "launch and drive the app"),
         ] {
             cmds.push(Command {
                 name: name.into(),
@@ -188,11 +198,13 @@ mod tests {
                 "mode",
                 "plan",
                 "rename",
+                "run",
                 "review",
                 "rag-recall",
                 "superpowers:brainstorming",
             ],
-            "built-ins first, then skills; shorter names before longer"
+            "built-ins first even though `run` is shorter than every builtin; \
+             shorter names before longer within each group"
         );
     }
 
