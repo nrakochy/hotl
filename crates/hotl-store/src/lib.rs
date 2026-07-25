@@ -809,6 +809,11 @@ pub const LINEAGE_DEPTH_CAP: usize = 32;
 /// `replay_chain_detects_a_self_parent_cycle`,
 /// `replay_chain_detects_an_a_b_a_cycle`, and
 /// `replay_chain_warns_when_ancestry_exceeds_the_depth_cap`.
+///
+/// INVARIANT: a missing *ancestor* costs history, never the session — only the
+/// requested session's own log is required. Enforced by
+/// `replay_chain_survives_a_pruned_ancestor` and
+/// `replay_chain_still_fails_when_the_requested_session_is_gone`.
 pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut warnings = Vec::new();
     let mut lineage = Vec::new();
@@ -817,7 +822,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     // False only if the walk ran out of depth (as opposed to reaching a root
     // or stopping deliberately).
     let mut terminated = false;
-    for _ in 0..LINEAGE_DEPTH_CAP {
+    for depth in 0..LINEAGE_DEPTH_CAP {
         if !visited.insert(current.clone()) {
             warnings.push(format!(
                 "session {current} appears twice in its own ancestry — the lineage is a cycle, \
@@ -828,7 +833,22 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             break;
         }
         let path = dir.join(format!("{current}.jsonl"));
-        let header = read_header(&path)?;
+        let header = match read_header(&path) {
+            Ok(header) => header,
+            // The *requested* session must exist — there is nothing to show
+            // without it. An **ancestor** that is gone (pruned by `hotl gc`,
+            // or hand-deleted) costs older history, not this session (T2-5).
+            Err(e) if depth > 0 => {
+                warnings.push(format!(
+                    "an earlier session in this conversation is missing ({e}) — it was most \
+                     likely removed by `hotl gc`. Everything from that point back is not in \
+                     context; ask the user to restate anything older that matters."
+                ));
+                terminated = true;
+                break;
+            }
+            Err(e) => return Err(e),
+        };
         let parent = header.parent_session_id.clone();
         lineage.push((path, header));
         match parent {
@@ -2019,5 +2039,61 @@ mod tests {
             "a chain exactly at the cap is clean, got {:?}",
             replayed.warnings
         );
+    }
+
+    #[test]
+    fn replay_chain_survives_a_pruned_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        parent
+            .append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: "old".into(),
+                        synthetic: None,
+                    },
+                },
+                2,
+            )
+            .unwrap();
+        let parent_path = parent.path().to_path_buf();
+        let parent_id = parent.session_id.clone();
+        drop(parent);
+
+        let mut child =
+            SessionLog::create(dir.path(), "m", Some(parent_id), Masker::empty(), 3).unwrap();
+        child
+            .append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: "current".into(),
+                        synthetic: None,
+                    },
+                },
+                4,
+            )
+            .unwrap();
+
+        // What `hotl gc` does today (T2-5).
+        std::fs::remove_file(&parent_path).unwrap();
+
+        let replayed = replay_chain(dir.path(), &child.session_id)
+            .expect("a pruned ancestor must not destroy the child");
+        assert_eq!(replayed.items.len(), 1, "the child's own history survives");
+        assert!(
+            replayed
+                .warnings
+                .iter()
+                .any(|w| w.contains("missing") && w.contains("gc")),
+            "a pruned ancestor must warn and name the cause, got {:?}",
+            replayed.warnings
+        );
+    }
+
+    #[test]
+    fn replay_chain_still_fails_when_the_requested_session_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = replay_chain(dir.path(), "01NOPE").expect_err("nothing to show is a hard error");
+        assert!(err.contains("01NOPE"), "got {err}");
     }
 }
