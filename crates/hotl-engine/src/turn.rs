@@ -379,7 +379,11 @@ impl Turn {
             + usage.cache_read_input_tokens
             + usage.cache_creation_input_tokens
             + usage.output_tokens;
-        self.anchor = Some((reported, snapshot.len() + 1));
+        // `+ 1` for the assistant item this sample produced, which `reported`
+        // already covers through `output_tokens`. Anchoring on *durable* length
+        // keeps the ephemeral todo reminder out of the position (T2-1); with no
+        // todos the two are equal and the value is byte-identical to before.
+        self.anchor = Some((reported, durable_len(&snapshot) + 1));
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
         };
@@ -743,13 +747,7 @@ impl Turn {
     /// cost of the last sample plus the (overcounting) estimate of everything
     /// appended since. Falls back to a full estimate before the first sample.
     fn estimate_tokens(&self, snapshot: &[Item]) -> u64 {
-        use hotl_context::tokens;
-        match self.anchor {
-            Some((reported, len)) if snapshot.len() >= len => {
-                reported + tokens::estimate_items(&snapshot[len..])
-            }
-            _ => tokens::estimate_text(&self.shared.system) + tokens::estimate_items(snapshot),
-        }
+        anchored_estimate(self.anchor, &self.shared.system, snapshot)
     }
 
     /// Just-in-time nested AGENTS.md injection (M2), deduped per turn and
@@ -933,6 +931,37 @@ impl Turn {
             _ => return,
         };
         self.emit(mapped).await;
+    }
+}
+
+/// The durable prefix of a snapshot. `actor::snapshot_with_todos` appends an
+/// ephemeral todo reminder as the last item when the list is non-empty; that
+/// item is regenerated on every snapshot and must never be counted as a durable
+/// position, or the anchor slips one item forward and the tool results
+/// committed after the sample are never counted at all (T2-1).
+fn durable_len(snapshot: &[Item]) -> usize {
+    match snapshot.last() {
+        Some(Item::User {
+            synthetic: Some(SyntheticReason::Todos),
+            ..
+        }) => snapshot.len() - 1,
+        _ => snapshot.len(),
+    }
+}
+
+/// Anchored context estimate for the next request: the provider-reported cost
+/// of the last sample plus the (overcounting) estimate of everything appended
+/// since. Falls back to a full estimate before the first sample.
+/// INVARIANT: everything committed after the anchored sample is counted exactly
+/// once. Enforced by `the_anchor_counts_tool_results_even_with_todos_active` and
+/// `compaction_still_triggers_with_todos_active`.
+fn anchored_estimate(anchor: Option<(u64, usize)>, system: &str, snapshot: &[Item]) -> u64 {
+    use hotl_context::tokens;
+    match anchor {
+        Some((reported, len)) if snapshot.len() >= len => {
+            reported + tokens::estimate_items(&snapshot[len..])
+        }
+        _ => tokens::estimate_text(system) + tokens::estimate_items(snapshot),
     }
 }
 
@@ -1132,6 +1161,64 @@ mod tests {
             text: text.into(),
             synthetic: Some(SyntheticReason::Todos),
         }
+    }
+
+    fn tool_results(content: &str) -> Item {
+        Item::ToolResults {
+            results: vec![ToolResultItem {
+                tool_use_id: "t1".into(),
+                content: content.into(),
+                is_error: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn durable_len_excludes_only_the_ephemeral_todo_reminder() {
+        let base = vec![Item::User {
+            text: "hi".into(),
+            synthetic: None,
+        }];
+        assert_eq!(durable_len(&base), 1);
+        let mut with_reminder = base.clone();
+        with_reminder.push(todos_item("<todos>\n[x] done\n</todos>"));
+        assert_eq!(durable_len(&with_reminder), 1);
+        // A *durable* user item that merely ends the projection is not ephemeral.
+        let mut trailing_user = base.clone();
+        trailing_user.push(Item::User {
+            text: "next".into(),
+            synthetic: None,
+        });
+        assert_eq!(durable_len(&trailing_user), 2);
+    }
+
+    #[test]
+    fn the_anchor_counts_tool_results_even_with_todos_active() {
+        // D = 1 durable item at sample 1; the snapshot also carries the
+        // ephemeral reminder, so anchoring on snapshot.len() skips the tool
+        // results committed between the two samples (T2-1).
+        let prompt = Item::User {
+            text: "go".into(),
+            synthetic: None,
+        };
+        let reminder = todos_item("<todos>\n[x] done\n</todos>");
+        let sample1 = vec![prompt.clone(), reminder.clone()];
+        let anchor = Some((500, durable_len(&sample1) + 1));
+
+        let big = "x".repeat(3_000);
+        let sample2 = vec![
+            prompt,
+            Item::Assistant {
+                blocks: vec![json!({"type": "text", "text": "ok"})],
+            },
+            tool_results(&big),
+            reminder,
+        ];
+        let estimate = anchored_estimate(anchor, "sys", &sample2);
+        assert!(
+            estimate >= 500 + 1_000,
+            "tool results must be inside the estimate, got {estimate}"
+        );
     }
 
     #[test]
