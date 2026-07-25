@@ -93,18 +93,66 @@ fn mechanism_available() -> Result<&'static str, String> {
     }
     #[cfg(target_os = "linux")]
     {
-        use landlock::{Access, AccessFs, Ruleset, RulesetAttr, ABI};
-        // Creating (not applying) a ruleset probes kernel support.
-        return match Ruleset::default().handle_access(AccessFs::from_all(ABI::V2)) {
-            Ok(r) => match r.create() {
-                Ok(_) => Ok("landlock"),
-                Err(e) => Err(format!("landlock unavailable: {e}")),
-            },
-            Err(e) => Err(format!("landlock unavailable: {e}")),
-        };
+        return linux_mechanism();
     }
     #[allow(unreachable_code)]
     Err("no sandbox mechanism for this OS".into())
+}
+
+/// The highest Landlock ABI this kernel actually honors. `HardRequirement`
+/// makes an unsupported level an error rather than a silent downgrade, so the
+/// first level that builds is the truth. `None` = no Landlock at all.
+///
+/// (`landlock`'s own current-ABI query is private in 0.4.5 — the ladder is the
+/// supported public route. The list is bounded by the ABI levels that crate
+/// version knows about; a newer kernel simply reports the highest it names.)
+#[cfg(target_os = "linux")]
+fn landlock_abi() -> Option<landlock::ABI> {
+    use landlock::{Access, AccessFs, CompatLevel, Compatible, Ruleset, RulesetAttr, ABI};
+    static ABI_LEVEL: std::sync::OnceLock<Option<ABI>> = std::sync::OnceLock::new();
+    *ABI_LEVEL.get_or_init(|| {
+        for abi in [
+            ABI::V7,
+            ABI::V6,
+            ABI::V5,
+            ABI::V4,
+            ABI::V3,
+            ABI::V2,
+            ABI::V1,
+        ] {
+            let ok = Ruleset::default()
+                .set_compatibility(CompatLevel::HardRequirement)
+                .handle_access(AccessFs::from_all(abi))
+                .and_then(|r| r.create());
+            if ok.is_ok() {
+                return Some(abi);
+            }
+        }
+        None
+    })
+}
+
+/// Which Landlock posture this kernel earns. ABI v3 (Linux 6.2) is the first
+/// level carrying the truncate right; below it the floor is genuinely partial
+/// and is never certified silently.
+#[cfg(target_os = "linux")]
+fn linux_mechanism() -> Result<&'static str, String> {
+    let Some(abi) = landlock_abi() else {
+        return Err("landlock unavailable: kernel has no Landlock support".into());
+    };
+    if (abi as i32) >= 3 {
+        return Ok("landlock");
+    }
+    if std::env::var("HOTL_SANDBOX").is_ok_and(|v| v == "best-effort") {
+        return Ok("landlock(partial)");
+    }
+    Err(format!(
+        "landlock ABI v{} (kernel < 6.2): the truncate right does not exist here, so a \
+         `truncate(2)` by path outside the workspace is unconfined. Set \
+         HOTL_SANDBOX=best-effort to accept the partial floor (every ask is labeled \
+         `sandboxed:landlock(partial)`), or upgrade the kernel.",
+        abi as i32
+    ))
 }
 
 /// A directory we can really write to that is **outside** everything the
@@ -237,7 +285,9 @@ pub fn build_command(
     let cmd = match status {
         SandboxStatus::Enforced("seatbelt") => seatbelt_command(command, egress),
         #[cfg(target_os = "linux")]
-        SandboxStatus::Enforced("landlock") => landlock_command(command, egress),
+        SandboxStatus::Enforced("landlock") | SandboxStatus::Enforced("landlock(partial)") => {
+            landlock_command(command, egress)
+        }
         _ => {
             let mut cmd = tokio::process::Command::new("sh");
             cmd.arg("-c").arg(command);
@@ -261,7 +311,9 @@ pub fn build_argv(
     let cmd = match status {
         SandboxStatus::Enforced("seatbelt") => seatbelt_argv(program, args, egress),
         #[cfg(target_os = "linux")]
-        SandboxStatus::Enforced("landlock") => landlock_argv(program, args, egress),
+        SandboxStatus::Enforced("landlock") | SandboxStatus::Enforced("landlock(partial)") => {
+            landlock_argv(program, args, egress)
+        }
         _ => {
             let mut cmd = tokio::process::Command::new(program);
             cmd.args(args);
@@ -421,7 +473,17 @@ fn build_landlock_ruleset(egress: &EgressState) -> Option<std::os::unix::io::Own
         RulesetAttr, RulesetCreatedAttr, ABI,
     };
 
-    let abi = ABI::V2;
+    // ABI v3 (Linux 6.2) is the first level that carries
+    // LANDLOCK_ACCESS_FS_TRUNCATE. Landlock only restricts rights present in
+    // the *handled* mask, so pinning v2 here left `truncate(2)` by path
+    // unconfined on every kernel, not merely on old ones — a raw
+    // `truncate(2)` (not `truncate -s 0`, which opens O_WRONLY first and is
+    // already denied by WriteFile) could zero any file on the host from an
+    // auto-approved bash. BestEffort still degrades gracefully below v3 —
+    // `probe()` is what reports the degradation instead of hiding it.
+    // INVARIANT: the handled mask includes Truncate wherever the kernel offers
+    // it. Enforced by `landlock_confines_truncate_by_path`.
+    let abi = ABI::V3;
     let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let tmp = canon(std::env::temp_dir());
     let confine_network = matches!(egress, EgressState::Off | EgressState::Proxy(_));
@@ -711,5 +773,121 @@ mod tests {
         // Reads outside stay allowed (floor is write-confinement).
         let read = run(&format!("ls {home} > /dev/null")).await;
         assert!(read.status.success(), "reads outside cwd should be allowed");
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::*;
+
+    async fn run(cmd: &str) -> std::process::Output {
+        let status = probe();
+        assert!(
+            matches!(status, SandboxStatus::Enforced(_)),
+            "no landlock here? {status:?}"
+        );
+        build_command(cmd, &status, &EgressState::Open)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .expect("spawn")
+    }
+
+    /// `seatbelt_confines_writes` had no Linux twin. This is it.
+    #[tokio::test]
+    async fn landlock_confines_writes() {
+        let dir = probe_dir().expect("a probe dir outside the confinement");
+        let target = dir.join(format!("hotl-ll-write-{}", std::process::id()));
+        let _ = std::fs::remove_file(&target);
+
+        // Inside cwd: allowed.
+        let ok = run(&format!(
+            "touch ./.hotl-ll-ok-{0} && rm ./.hotl-ll-ok-{0}",
+            std::process::id()
+        ))
+        .await;
+        assert!(
+            ok.status.success(),
+            "cwd write must be allowed: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+
+        // Outside: denied, and nothing lands.
+        let denied = run(&format!("echo x > {}", target.display())).await;
+        let leaked = target.exists();
+        if leaked {
+            let _ = std::fs::remove_file(&target);
+        }
+        assert!(
+            !denied.status.success(),
+            "write outside cwd must fail under landlock"
+        );
+        assert!(!leaked, "file must not exist outside the sandbox");
+
+        // Reads outside stay allowed (the floor is write-confinement).
+        assert!(run("ls / > /dev/null").await.status.success());
+    }
+
+    /// A shell word that calls `truncate(2)` **by path** on `victim`.
+    ///
+    /// The demonstrator has to reach the raw syscall. Neither `truncate -s 0`
+    /// (GNU coreutils `open`s the file `O_WRONLY` first) nor `> file` (open
+    /// with `O_CREAT|O_TRUNC`) will do: `AccessFs::WriteFile` already denies
+    /// both at ABI v1, so they are denied whether or not the truncate right is
+    /// handled and prove nothing either way. Measured against the v2 ruleset:
+    /// coreutils and the redirect are denied with EACCES while a raw
+    /// `truncate(2)` zeroes the file. `perl` first, `python3` as the fallback;
+    /// with neither the test fails loudly rather than skipping (a skip here
+    /// would be indistinguishable from enforcement).
+    fn truncate_by_path(victim: &std::path::Path) -> String {
+        let p = victim.display();
+        if std::path::Path::new("/usr/bin/perl").exists() {
+            return format!("perl -e 'truncate($ARGV[0], 0) or die $!' {p}");
+        }
+        format!("python3 -c \"import os,sys; os.truncate(sys.argv[1], 0)\" {p}")
+    }
+
+    /// The verified hole: `truncate(2)` by path is a *v3* right and the
+    /// ruleset only handled v2, so this succeeded on every kernel.
+    #[tokio::test]
+    async fn landlock_confines_truncate_by_path() {
+        if !matches!(probe(), SandboxStatus::Enforced("landlock")) {
+            // A `landlock(partial)` host genuinely cannot enforce this; the
+            // label says so. Assert *that*, rather than skipping silently.
+            assert!(
+                landlock_abi().is_some_and(|a| (a as i32) < 3),
+                "v3+ host must certify fully"
+            );
+            return;
+        }
+        let dir = probe_dir().expect("a probe dir");
+        let victim = dir.join(format!("hotl-ll-trunc-{}", std::process::id()));
+        std::fs::write(&victim, b"important").unwrap();
+        let out = run(&truncate_by_path(&victim)).await;
+        let size = std::fs::metadata(&victim).map(|m| m.len()).unwrap_or(0);
+        let _ = std::fs::remove_file(&victim);
+        assert!(
+            !out.status.success(),
+            "truncate outside cwd must be denied: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(size, 9, "the file outside the workspace must be untouched");
+    }
+
+    #[test]
+    fn abi_below_v3_is_not_silently_certified() {
+        // Whatever this kernel is, the verdict and the ABI must agree.
+        match (probe(), landlock_abi()) {
+            (SandboxStatus::Enforced("landlock"), Some(abi)) => assert!(abi as i32 >= 3),
+            (SandboxStatus::Enforced("landlock(partial)"), Some(abi)) => {
+                assert!((abi as i32) < 3);
+                assert_eq!(std::env::var("HOTL_SANDBOX").as_deref(), Ok("best-effort"));
+            }
+            (SandboxStatus::Unavailable(reason), Some(abi)) => {
+                assert!((abi as i32) < 3 && reason.contains("truncate"), "{reason}");
+            }
+            (status, abi) => panic!("inconsistent: {status:?} / {abi:?}"),
+        }
     }
 }

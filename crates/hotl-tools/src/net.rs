@@ -91,8 +91,12 @@ pub async fn egress_state() -> EgressState {
 fn kernel_backing(status: &SandboxStatus) -> Result<(), String> {
     match status {
         SandboxStatus::Enforced("seatbelt") => Ok(()),
+        // A partial *fs* floor still has a full net story: the net ABI is
+        // checked independently, and hard.
         #[cfg(target_os = "linux")]
-        SandboxStatus::Enforced("landlock") => crate::sandbox::landlock_net_supported(),
+        SandboxStatus::Enforced("landlock") | SandboxStatus::Enforced("landlock(partial)") => {
+            crate::sandbox::landlock_net_supported()
+        }
         SandboxStatus::Enforced(m) => Err(format!("`{m}` cannot confine the network")),
         SandboxStatus::Unavailable(r) => Err(format!("no sandbox floor: {r}")),
         SandboxStatus::Disabled => Err("HOTL_SANDBOX=off".into()),
