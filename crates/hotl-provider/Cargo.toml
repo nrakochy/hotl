@@ -18,6 +18,11 @@ thiserror = { workspace = true }
 futures-util = { workspace = true }
 async-stream = { workspace = true }
 bytes = "1"
+# Only for the read-idle bound in `drive_sse` (T1-4). `time` alone keeps this
+# crate buildable for wasm32-unknown-unknown.
+tokio = { version = "1", default-features = false, features = ["time"] }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# `test-util` powers `#[tokio::test(start_paused = true)]`, so the idle-timeout
+# tests assert the bound without spending wall-clock time on CI.
+tokio = { workspace = true, features = ["test-util"] }

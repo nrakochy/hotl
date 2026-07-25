@@ -17,6 +17,30 @@ use hotl_types::{Item, StopReason, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// The three bounds every HTTP provider applies, in one place so the two
+/// dialect crates cannot drift.
+///
+/// A single request-level timeout is deliberately *not* used: it would bound
+/// the response body, and the response body of a streaming sample is the whole
+/// turn. Each bound below covers one place a request can actually stop making
+/// progress.
+pub mod timeouts {
+    use std::time::Duration;
+
+    /// TCP + TLS handshake. A stalled handshake is the fastest-failing case
+    /// and needs no generosity.
+    pub const CONNECT: Duration = Duration::from_secs(10);
+
+    /// Request sent, response headers not yet received. Generous: a local
+    /// server loading model weights can delay headers by a minute.
+    pub const HEADERS: Duration = Duration::from_secs(120);
+
+    /// Maximum gap between two SSE chunks once the stream is open. Long
+    /// enough for extended thinking between pings, short enough that a dead
+    /// connection is noticed within a coffee break.
+    pub const STREAM_IDLE: Duration = Duration::from_secs(300);
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
     pub name: String,
@@ -592,10 +616,16 @@ pub trait SseAssembler {
 }
 
 /// Drive an SSE byte stream through the line parser and an assembler.
-/// Shared by every HTTP provider; wasm-clean (no HTTP client dependency).
+/// Shared by every HTTP provider; no HTTP client dependency (the only
+/// non-`std`/`futures` dep is `tokio::time`, which is wasm-supported).
+///
+/// INVARIANT (T1-4): a gap longer than `idle` between chunks ends the stream
+/// with `ProviderError::Transport`. Enforced by
+/// `drive_sse_tests::a_silent_stream_times_out_instead_of_hanging`.
 pub fn drive_sse<B, E, A>(
     bytes: B,
     mut assembler: A,
+    idle: std::time::Duration,
 ) -> impl futures_util::Stream<Item = Result<StreamEvent, ProviderError>>
 where
     B: futures_util::Stream<Item = Result<bytes::Bytes, E>>,
@@ -606,7 +636,19 @@ where
         let mut parser = SseParser::default();
         futures_util::pin_mut!(bytes);
         use futures_util::StreamExt;
-        while let Some(chunk) = bytes.next().await {
+        loop {
+            let next = match tokio::time::timeout(idle, bytes.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    yield Err(ProviderError::Transport(format!(
+                        "stream stalled: no data for {}s. The connection is likely dead \
+                         (a proxy dropped it without closing); retry the request.",
+                        idle.as_secs()
+                    )));
+                    return;
+                }
+            };
+            let Some(chunk) = next else { break };
             let chunk = match chunk {
                 Ok(c) => c,
                 Err(e) => {
@@ -625,6 +667,70 @@ where
                 }
             }
         }
+        // Task 3 adds the end-of-stream flush here.
         yield assembler.finish();
+    }
+}
+
+#[cfg(test)]
+mod drive_sse_tests {
+    use super::*;
+    use futures_util::StreamExt;
+    use std::time::Duration;
+
+    struct NeverEnds;
+    impl SseAssembler for NeverEnds {
+        fn handle(&mut self, _: &str) -> Result<Vec<StreamEvent>, ProviderError> {
+            Ok(vec![])
+        }
+        fn finish(self) -> Result<StreamEvent, ProviderError> {
+            Err(ProviderError::Parse("unreachable".into()))
+        }
+    }
+
+    /// INVARIANT (T1-4): a stream that goes silent is abandoned, never awaited
+    /// forever. The real-world shape is a load balancer dropping the
+    /// connection without a FIN — the bytes stream neither yields nor ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_stream_times_out_instead_of_hanging() {
+        let stalled = futures_util::stream::pending::<Result<bytes::Bytes, std::io::Error>>();
+        let s = drive_sse(stalled, NeverEnds, Duration::from_secs(5));
+        futures_util::pin_mut!(s);
+        let first = s.next().await.expect("an event, not a hang");
+        match first {
+            Err(ProviderError::Transport(m)) => {
+                assert!(m.contains("stalled"), "{m}");
+                assert!(m.contains("retry"), "errors are prompts: {m}");
+            }
+            other => panic!("expected a transport timeout, got {other:?}"),
+        }
+        assert!(
+            s.next().await.is_none(),
+            "the stream must end after the timeout"
+        );
+    }
+
+    /// A stream that keeps delivering inside the idle window is never cut,
+    /// however long it runs in total. This is why the bound is per-chunk and
+    /// not a request-level `.timeout()`.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_but_live_stream_is_not_cut() {
+        let chunks = futures_util::stream::unfold(0u32, |n| async move {
+            if n == 6 {
+                return None;
+            }
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Some((
+                Ok::<_, std::io::Error>(bytes::Bytes::from_static(b":keepalive\n\n")),
+                n + 1,
+            ))
+        });
+        let s = drive_sse(chunks, NeverEnds, Duration::from_secs(5));
+        futures_util::pin_mut!(s);
+        let evs: Vec<_> = s.collect().await;
+        // 24s of wall time, 5s idle bound, no timeout: only the assembler's
+        // own end-of-stream error comes back.
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(evs[0], Err(ProviderError::Parse(_))), "{evs:?}");
     }
 }

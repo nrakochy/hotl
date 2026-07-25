@@ -39,21 +39,57 @@ pub fn messages_url(base: &str) -> String {
     format!("{}/messages", hotl_provider::v1_base(base))
 }
 
+/// The one client constructor. A default `reqwest` client has no connect
+/// timeout, no read timeout, and no keepalive; T1-4 traces a wedged session
+/// straight back to it.
+///
+/// `expect` rather than a fallback to a default client on purpose: T3-12 found
+/// exactly that fallback silently discarding a redirect policy and a timeout
+/// elsewhere in the tree. A client that cannot be built with these options is
+/// a broken TLS backend, and shipping an unbounded client instead is worse
+/// than failing loudly at construction.
+fn http_client(connect: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+        .expect("reqwest client with timeouts (TLS backend unavailable?)")
+}
+
 pub struct AnthropicProvider {
     client: reqwest::Client,
     key_source: Arc<dyn KeySource>,
     api_url: String,
     no_credential: bool,
+    headers_timeout: std::time::Duration,
+    stream_idle_timeout: std::time::Duration,
 }
 
 impl AnthropicProvider {
     pub fn new(key_source: Arc<dyn KeySource>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: http_client(hotl_provider::timeouts::CONNECT),
             key_source,
             api_url: messages_url(DEFAULT_BASE_URL),
             no_credential: false,
+            headers_timeout: hotl_provider::timeouts::HEADERS,
+            stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
         }
+    }
+
+    /// Override the defaults (a slow local endpoint, or a test that wants a
+    /// short bound). `connect` rebuilds the client.
+    pub fn with_timeouts(
+        mut self,
+        connect: std::time::Duration,
+        headers: std::time::Duration,
+        stream_idle: std::time::Duration,
+    ) -> Self {
+        self.client = http_client(connect);
+        self.headers_timeout = headers;
+        self.stream_idle_timeout = stream_idle;
+        self
     }
 
     /// Point at an Anthropic-shaped endpoint that is not Anthropic.
@@ -268,6 +304,8 @@ impl Provider for AnthropicProvider {
         let source = self.key_source.clone();
         let api_url = self.api_url.clone();
         let no_credential = self.no_credential;
+        let headers_timeout = self.headers_timeout;
+        let stream_idle_timeout = self.stream_idle_timeout;
 
         Box::pin(async_stream::stream! {
             let mut attempt: u32 = 0;
@@ -296,7 +334,24 @@ impl Provider for AnthropicProvider {
                         }
                     }
                 };
-                match send_attempt(&client, &api_url, &key, &body, attempt).await {
+                let sent = tokio::time::timeout(
+                    headers_timeout,
+                    send_attempt(&client, &api_url, &key, &body, attempt),
+                )
+                .await;
+                let outcome = match sent {
+                    Ok(a) => a,
+                    // A timed-out attempt is retryable, not terminal.
+                    Err(_) => classify_send(
+                        ProviderError::Transport(format!(
+                            "no response headers within {}s",
+                            headers_timeout.as_secs()
+                        )),
+                        attempt,
+                        "response header timeout".into(),
+                    ),
+                };
+                match outcome {
                     Attempt::Ok(resp) => break resp,
                     Attempt::Retry { reason, wait_secs } => {
                         yield Ok(StreamEvent::Retrying { attempt, reason });
@@ -318,7 +373,11 @@ impl Provider for AnthropicProvider {
                 }
             };
             yield Ok(StreamEvent::Started);
-            let inner = hotl_provider::drive_sse(response.bytes_stream(), sse::Assembler::default());
+            let inner = hotl_provider::drive_sse(
+                response.bytes_stream(),
+                sse::Assembler::default(),
+                stream_idle_timeout,
+            );
             futures_util::pin_mut!(inner);
             while let Some(ev) = inner.next().await {
                 yield ev;
@@ -422,6 +481,20 @@ mod tests {
             cache_static: false,
             turn_context: None,
         }
+    }
+
+    /// INVARIANT (T1-4): the HTTP client is never the default one.
+    /// `Client::new()` has no connect timeout, so a stalled TLS handshake
+    /// hangs the session forever and Ctrl-C cannot reach it.
+    #[test]
+    fn the_client_is_built_with_timeouts() {
+        let src = include_str!("lib.rs");
+        // Split so this test's own source is not a match for itself.
+        assert!(
+            !src.contains(concat!("reqwest::Client", "::new()")),
+            "use http_client(); a default reqwest client has no timeout of any kind"
+        );
+        assert!(src.contains("connect_timeout"));
     }
 
     #[tokio::test]
