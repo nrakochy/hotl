@@ -877,7 +877,27 @@ fn respawn_turn(
     let Some(cmd_tx) = cmd_tx.upgrade() else {
         return;
     };
-    tokio::spawn(turn::run(shared.clone(), cmd_tx, events.clone(), token));
+    let supervisor_tx = cmd_tx.clone();
+    let handle = tokio::spawn(turn::run(shared.clone(), cmd_tx, events.clone(), token));
+    // INVARIANT: exactly one `TurnFinished` per spawned turn, panic included —
+    // `running` is cleared and the prompt queue drains on every exit path.
+    // Enforced by `a_panicking_turn_reports_an_error_and_the_session_keeps_working`.
+    // The supervisor's strong sender drops the moment the turn task ends, so it
+    // never keeps the command channel (or the actor) alive on its own.
+    tokio::spawn(async move {
+        if handle.await.is_err() {
+            let _ = supervisor_tx
+                .send(SessionCmd::TurnFinished {
+                    end: TurnEnd::Outcome(Outcome::Error {
+                        message: "the turn ended unexpectedly (internal error). \
+                                  The session is intact — retry, or rephrase the request."
+                            .into(),
+                    }),
+                    usage: TokenUsage::default(),
+                })
+                .await;
+        }
+    });
 }
 
 #[cfg(test)]

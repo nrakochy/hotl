@@ -591,11 +591,11 @@ impl Turn {
     /// ToolDone. `&self` only, so approved parallel-safe calls in one chunk
     /// can run concurrently; a call the gate already resolved passes through.
     async fn execute(&self, tu: &ToolUse, gate: Gate) -> ToolOutcome {
-        let Gate::Ready { input, summary } = gate else {
-            let Gate::Resolved(outcome) = gate else {
-                unreachable!()
-            };
-            return outcome;
+        // Exhaustive by construction: a new `Gate` variant is a compile error
+        // here, not a runtime panic on a supervised task (T1-5).
+        let (input, summary) = match gate {
+            Gate::Ready { input, summary } => (input, summary),
+            Gate::Resolved(outcome) => return outcome,
         };
         self.emit(EngineEvent::ToolStart {
             name: tu.name.clone(),
