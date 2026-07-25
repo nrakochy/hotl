@@ -394,10 +394,26 @@ async fn edit_in(root: &std::path::Path, input: &Value) -> ToolResult {
         crate::matcher::Match::Ambiguous(n) => Err(ToolOutcome::err(format!(
             "`old_string` matches {n} places in `{path}`. Add surrounding lines so it matches exactly once."
         ))),
-        crate::matcher::Match::Unique { start, end, exact } => {
-            let updated = format!("{}{new}{}", &content[..start], &content[end..]);
+        crate::matcher::Match::Unique {
+            start,
+            end,
+            exact,
+            reindent,
+        } => {
+            // A tolerant match fired *because* the model's whitespace differs
+            // from the file's, so splicing `new_string` verbatim would install
+            // the model's indentation over the file's.
+            let spliced = match &reindent {
+                Some(r) => crate::matcher::rebase_indent(new, r),
+                None => new.to_string(),
+            };
+            let updated = format!("{}{spliced}{}", &content[..start], &content[end..]);
             write_guarded(root, &placement, path, updated.as_bytes())?;
-            let note = if exact { "" } else { " (whitespace-tolerant match)" };
+            let note = if exact {
+                ""
+            } else {
+                " (whitespace-tolerant match; the file's indentation was preserved)"
+            };
             Ok(ToolOutcome::ok(format!("Edited {path}.{note}")))
         }
     }
@@ -1066,6 +1082,36 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&target).unwrap(),
             "export PATH=/usr/bin\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_keeps_the_files_indentation_on_a_tolerant_match() {
+        let (_o, root, _home) = fsguard::tests::fixture();
+        // File uses tabs; the model reproduces the block with spaces.
+        std::fs::write(root.join("f.rs"), "fn f() {\n\tif x {\n\t\ta();\n\t}\n}\n").unwrap();
+        let ok = done(
+            edit_in(
+                &root,
+                &json!({
+                    "path": "f.rs",
+                    "old_string": "    if x {\n        a();\n    }",
+                    "new_string": "    if x {\n        b();\n    }",
+                }),
+            )
+            .await,
+        );
+        assert!(!ok.is_error, "{}", ok.content);
+        // The file's tabs survive; only the content changed.
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.rs")).unwrap(),
+            "fn f() {\n\tif x {\n\t\tb();\n\t}\n}\n",
+            "the model's indentation must not overwrite the file's"
+        );
+        assert!(
+            ok.content.contains("indentation was preserved"),
+            "{}",
+            ok.content
         );
     }
 
