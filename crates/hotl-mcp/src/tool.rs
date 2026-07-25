@@ -61,6 +61,10 @@ pub type Connector =
 /// while the `OnceCell` dedupes concurrent first-connects of the same server.
 type ClientSlot = Arc<tokio::sync::OnceCell<Arc<Client>>>;
 
+/// A server that dies on every connect must not be respawned in a loop for the
+/// life of the session.
+const MAX_RECONNECTS: u32 = 3;
+
 pub struct McpTool {
     servers: Vec<ServerConfig>,
     clients: tokio::sync::Mutex<HashMap<String, ClientSlot>>,
@@ -77,6 +81,8 @@ pub struct McpTool {
     /// `run_without_a_permission_screen_records_no_grant_and_refuses` and
     /// `a_binary_swapped_after_the_screen_does_not_connect`.
     screened: Mutex<HashMap<String, Fingerprint>>,
+    /// How many times each server has been respawned after dying.
+    reconnects: Mutex<HashMap<String, u32>>,
     connector: Connector,
     description: String,
     /// Cumulative external-content budget for this tool instance (one
@@ -121,6 +127,7 @@ impl McpTool {
             clients: tokio::sync::Mutex::new(HashMap::new()),
             trust: Mutex::new(trust),
             screened: Mutex::new(HashMap::new()),
+            reconnects: Mutex::new(HashMap::new()),
             connector,
             description,
             budget: Budget::default(),
@@ -183,7 +190,41 @@ impl McpTool {
         }
 
         let slot: ClientSlot = {
+            // The outer lock is held only for the swap, never across a connect,
+            // so a slow reconnect to one server does not stall the others.
             let mut clients = self.clients.lock().await;
+            // T2-13a: a session-lifetime `OnceCell` that is never invalidated
+            // means a crashed server is waited on forever. Detect and replace
+            // it. Being under the lock is what makes two tasks racing on the
+            // same dead client idempotent.
+            //
+            // INVARIANT: a request is never issued to a client already known
+            // dead. Enforced by `a_crashed_server_is_reconnected_not_waited_on`.
+            let dead = clients
+                .get(&cfg.name)
+                .is_some_and(|s| s.get().is_some_and(|c| c.is_dead()));
+            if dead {
+                clients.insert(cfg.name.clone(), ClientSlot::default());
+                let n = {
+                    let mut counts = self
+                        .reconnects
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let n = counts
+                        .entry(cfg.name.clone())
+                        .and_modify(|n| *n += 1)
+                        .or_insert(1);
+                    *n
+                };
+                if n > MAX_RECONNECTS {
+                    return Err(format!(
+                        "`{}` has crashed {MAX_RECONNECTS} times this session; hotl \
+                         stopped restarting it. Tell the user to check the server, or \
+                         use another tool.",
+                        cfg.name
+                    ));
+                }
+            }
             clients.entry(cfg.name.clone()).or_default().clone()
         };
         let client = slot
@@ -206,7 +247,7 @@ impl McpTool {
         Ok(client.clone())
     }
 
-    async fn run_impl(&self, input: Value) -> ToolOutcome {
+    async fn run_impl(&self, input: Value, cancel: CancellationToken) -> ToolOutcome {
         let Some(server_name) = input.get("server").and_then(Value::as_str) else {
             return ToolOutcome::err(
                 "`server` is required. See the tool description for configured servers.",
@@ -239,7 +280,7 @@ impl McpTool {
             None => self.list(server_name, &client).await,
             Some(tool) => {
                 let arguments = input.get("arguments").cloned().unwrap_or(json!({}));
-                match client.call_tool(tool, arguments).await {
+                match client.call_tool_cancellable(tool, arguments, &cancel).await {
                     Ok((text, is_error)) => ToolOutcome {
                         content: self.envelope(server_name, tool, &text),
                         is_error,
@@ -349,8 +390,8 @@ impl Tool for McpTool {
         }
     }
 
-    fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(self.run_impl(input))
+    fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(self.run_impl(input, cancel))
     }
 }
 

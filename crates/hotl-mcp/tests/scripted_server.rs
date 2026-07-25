@@ -125,8 +125,211 @@ fn scripted_tool_with_hashable_binary(dir: &std::path::Path) -> McpTool {
     scripted_tool_for(&hashable_binary(dir), dir)
 }
 
+/// Answers the handshake, serves exactly `calls_before_exit` tool calls, then
+/// hangs up. Models a server that crashes partway through a session.
+async fn dying_server(stream: tokio::io::DuplexStream, calls_before_exit: u32) {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    let mut calls = 0u32;
+    while let Ok(Some(line)) = lines.next_line().await {
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        let id = msg.get("id").cloned().unwrap_or(Value::Null);
+        let reply = match msg.get("method").and_then(Value::as_str) {
+            Some("notifications/initialized") => continue,
+            Some("initialize") => json!({"jsonrpc":"2.0","id":id,"result":{}}),
+            Some("tools/call") => {
+                if calls >= calls_before_exit {
+                    return; // hang up mid-call: EOF with a request pending
+                }
+                calls += 1;
+                let msg_arg = msg
+                    .pointer("/params/arguments/msg")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let reply = json!({"jsonrpc":"2.0","id":id,"result":{
+                    "content":[{"type":"text","text":format!("echo: {msg_arg}")}],
+                    "isError": false
+                }});
+                let mut out = reply.to_string();
+                out.push('\n');
+                if write.write_all(out.as_bytes()).await.is_err() {
+                    return;
+                }
+                if calls >= calls_before_exit {
+                    // Quota served: hang up *now*, so the client observes the
+                    // death before the next call rather than during it.
+                    return;
+                }
+                continue;
+            }
+            _ => json!({"jsonrpc":"2.0","id":id,"result":{"tools":[]}}),
+        };
+        let mut out = reply.to_string();
+        out.push('\n');
+        if write.write_all(out.as_bytes()).await.is_err() {
+            return;
+        }
+    }
+}
+
+fn dying_server_tool(bin: &std::path::Path, trust_dir: &std::path::Path, calls: u32) -> McpTool {
+    McpTool::with_connector(
+        vec![docs_cfg_for(bin)],
+        TrustStore::load(trust_dir),
+        Box::new(move |_cfg| {
+            Box::pin(async move {
+                let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(dying_server(server_end, calls));
+                let (read, write) = tokio::io::split(client_end);
+                let client = Client::from_streams(read, write);
+                client.initialize().await?;
+                Ok(client)
+            })
+        }),
+    )
+}
+
+/// Exits after its first `tools/call`; the next call must reconnect.
+fn one_shot_server_tool(dir: &std::path::Path) -> McpTool {
+    dying_server_tool(&hashable_binary(dir), dir, 1)
+}
+
+/// Hangs up on the very first `tools/call`, with the request in flight.
+fn server_that_dies_mid_call(dir: &std::path::Path) -> McpTool {
+    dying_server_tool(&hashable_binary(dir), dir, 0)
+}
+
+/// Answers the handshake and then never replies to anything.
+async fn silent_server(stream: tokio::io::DuplexStream) {
+    let (read, mut write) = tokio::io::split(stream);
+    let mut lines = BufReader::new(read).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let msg: Value = serde_json::from_str(&line).unwrap();
+        if msg.get("method").and_then(Value::as_str) == Some("initialize") {
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            let out = json!({"jsonrpc":"2.0","id":id,"result":{}});
+            if write
+                .write_all(format!("{out}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        // Everything else: silence. The caller must cancel, not wait 600s.
+    }
+}
+
+fn never_replying_server_tool(dir: &std::path::Path) -> McpTool {
+    let bin = hashable_binary(dir);
+    McpTool::with_connector(
+        vec![docs_cfg_for(&bin)],
+        TrustStore::load(dir),
+        Box::new(|_cfg| {
+            Box::pin(async {
+                let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+                tokio::spawn(silent_server(server_end));
+                let (read, write) = tokio::io::split(client_end);
+                let client = Client::from_streams(read, write);
+                client.initialize().await?;
+                Ok(client)
+            })
+        }),
+    )
+}
+
 async fn run(tool: &McpTool, input: Value) -> hotl_tools::ToolOutcome {
     tool.run(input, CancellationToken::new()).await
+}
+
+#[tokio::test]
+async fn a_crashed_server_is_reconnected_not_waited_on() {
+    // T2-13a. The scripted server exits after its first tools/call; the
+    // second call must reconnect within seconds, not time out at 600s.
+    let dir = tempfile::tempdir().unwrap();
+    let tool = one_shot_server_tool(dir.path());
+    let _ = tool.permission(&json!({"server": "docs", "tool": "echo"}));
+    assert!(
+        !run(
+            &tool,
+            json!({"server":"docs","tool":"echo","arguments":{"msg":"a"}})
+        )
+        .await
+        .is_error
+    );
+    // Let the reader observe the EOF. The reconnect fires when the client is
+    // *known* dead; a call that races the death instead gets a fast, actionable
+    // disconnect error and the call after it reconnects. There is deliberately
+    // no transparent retry of an in-flight `tools/call` — the server may have
+    // already run it, and a duplicate side effect is worse than an error.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let second = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        run(
+            &tool,
+            json!({"server":"docs","tool":"echo","arguments":{"msg":"b"}}),
+        ),
+    )
+    .await
+    .expect("must not wait out the 600s tools/call timeout");
+    assert!(
+        second.content.contains("echo: b"),
+        "reconnected: {}",
+        second.content
+    );
+}
+
+#[tokio::test]
+async fn eof_with_a_pending_request_fails_immediately_with_diagnostics() {
+    // The other half of T2-13a: a request already in flight when the server dies.
+    let dir = tempfile::tempdir().unwrap();
+    let tool = server_that_dies_mid_call(dir.path());
+    let _ = tool.permission(&json!({"server": "docs", "tool": "echo"}));
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        run(
+            &tool,
+            json!({"server":"docs","tool":"echo","arguments":{"msg":"a"}}),
+        ),
+    )
+    .await
+    .expect("must not wait out 600s");
+    assert!(out.is_error);
+    assert!(
+        out.content.contains("trust=\"untrusted\""),
+        "still enveloped: {}",
+        out.content
+    );
+    assert!(
+        out.content.contains("disconnected") || out.content.contains("stderr"),
+        "{}",
+        out.content
+    );
+}
+
+#[tokio::test]
+async fn escape_cancels_an_in_flight_call() {
+    // T2-13c: ESC used to wait the full 600s.
+    let dir = tempfile::tempdir().unwrap();
+    let tool = never_replying_server_tool(dir.path());
+    let _ = tool.permission(&json!({"server": "docs", "tool": "echo"}));
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        c.cancel();
+    });
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tool.run(json!({"server":"docs","tool":"echo"}), cancel),
+    )
+    .await
+    .expect("cancel must not wait out the 600s timeout");
+    assert!(
+        out.is_error && out.content.contains("cancel"),
+        "{}",
+        out.content
+    );
 }
 
 #[tokio::test]

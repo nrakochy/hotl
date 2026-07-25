@@ -13,6 +13,15 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
+
+/// Resolves when the caller cancels; never, when there is no token to watch.
+async fn wait_for_cancel(cancel: Option<&CancellationToken>) {
+    match cancel {
+        Some(c) => c.cancelled().await,
+        None => std::future::pending().await,
+    }
+}
 
 const REQUEST_TIMEOUT_SECS: u64 = 30;
 /// `tools/call` runs real work (builds, migrations, browser automation) and
@@ -271,7 +280,7 @@ impl Client {
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.request_with_timeout(method, params, REQUEST_TIMEOUT_SECS)
+        self.request_with_timeout(method, params, REQUEST_TIMEOUT_SECS, None)
             .await
     }
 
@@ -280,6 +289,7 @@ impl Client {
         method: &str,
         params: Value,
         timeout_secs: u64,
+        cancel: Option<&CancellationToken>,
     ) -> Result<Value, String> {
         // T2-13a: a request is never issued to a connection already known dead
         // — that is what turned a crashed server into a full 600s wait.
@@ -300,8 +310,20 @@ impl Client {
         };
         self.send(&json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}))
             .await?;
-        let reply =
-            match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx).await {
+        // `biased` so an already-cancelled token wins deterministically rather
+        // than racing the timeout branch. `PendingGuard` removes the pending
+        // entry when the dropped branch's future dies — which is exactly what
+        // makes the select-drop safe.
+        let reply = tokio::select! {
+            biased;
+            _ = wait_for_cancel(cancel) => {
+                // Same reasoning as the timeout arm: without this the server
+                // keeps computing work nobody is waiting for, and a user
+                // pressing ESC repeatedly accumulates orphan server-side work.
+                self.cancel_server_side(id, "the user cancelled this call").await;
+                return Err("the user cancelled this call".to_string());
+            }
+            r = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx) => match r {
                 Ok(Ok(reply)) => reply,
                 // The sender was dropped: the reader died and cleared pending.
                 Ok(Err(_)) => return Err(self.death_note("server disconnected").await),
@@ -310,7 +332,8 @@ impl Client {
                         .await;
                     return Err(format!("`{method}` timed out after {timeout_secs}s"));
                 }
-            };
+            },
+        };
         // A reply means the reader already removed the entry.
         guard.disarm();
         if let Some(err) = reply.get("error") {
@@ -378,11 +401,32 @@ impl Client {
 
     /// Returns (joined text content, is_error).
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<(String, bool), String> {
+        self.call_tool_inner(name, arguments, None).await
+    }
+
+    /// `call_tool` that honours the user's cancellation token (T2-13c): ESC
+    /// used to wait out the full 600s `tools/call` leash.
+    pub async fn call_tool_cancellable(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancel: &CancellationToken,
+    ) -> Result<(String, bool), String> {
+        self.call_tool_inner(name, arguments, Some(cancel)).await
+    }
+
+    async fn call_tool_inner(
+        &self,
+        name: &str,
+        arguments: Value,
+        cancel: Option<&CancellationToken>,
+    ) -> Result<(String, bool), String> {
         let result = self
             .request_with_timeout(
                 "tools/call",
                 json!({"name": name, "arguments": arguments}),
                 TOOL_CALL_TIMEOUT_SECS,
+                cancel,
             )
             .await?;
         let is_error = result

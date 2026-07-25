@@ -19,12 +19,15 @@ use tokio_util::sync::CancellationToken;
 use crate::{Hit, Query, Retriever, SourceRef};
 
 /// The one MCP operation the adapter needs; `hotl_mcp::client::Client`
-/// implements it, tests inject fakes.
+/// implements it, tests inject fakes. The token is part of the signature so a
+/// cancelled search also tells the *server* to stop (T2-13c) rather than only
+/// abandoning the future on this side.
 pub trait McpCall: Send + Sync {
     fn call<'a>(
         &'a self,
         tool: &'a str,
         args: Value,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<(String, bool), String>>;
 }
 
@@ -33,8 +36,9 @@ impl McpCall for hotl_mcp::client::Client {
         &'a self,
         tool: &'a str,
         args: Value,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<(String, bool), String>> {
-        Box::pin(self.call_tool(tool, args))
+        Box::pin(async move { self.call_tool_cancellable(tool, args, &cancel).await })
     }
 }
 
@@ -201,30 +205,46 @@ impl Retriever for McpRetriever {
         }
     }
 
+    /// INVARIANT: a cancelled search returns promptly rather than waiting out
+    /// the 600s `tools/call` leash, and the server is told to stop. Enforced by
+    /// `a_cancelled_search_returns_promptly`.
     fn search<'a>(
         &'a self,
         query: &'a Query,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<Vec<Hit>, String>> {
         Box::pin(async move {
-            let client = self.ensure().await?;
-            let args = json!({
-                "query": query.text,
-                "purpose": query.purpose,
-                "k": query.k,
-            });
-            let (text, is_error) = client.call(&self.tool, args).await?;
-            if is_error {
-                return Err(text);
+            let work = async {
+                let client = self.ensure().await?;
+                let args = json!({
+                    "query": query.text,
+                    "purpose": query.purpose,
+                    "k": query.k,
+                });
+                let (text, is_error) = client.call(&self.tool, args, cancel.clone()).await?;
+                if is_error {
+                    return Err(text);
+                }
+                Ok(vec![Hit {
+                    source: SourceRef::Server {
+                        name: self.cfg.name.clone(),
+                    },
+                    excerpt: text,
+                    score: None,
+                    indexed_at_unix: None,
+                }])
+            };
+            // The token also covers `ensure()` (the connect), and holds for a
+            // backend that ignores it. `biased` so an already-cancelled token
+            // wins deterministically instead of racing the work.
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => Err(
+                    "the user cancelled this search; do not retry it unless they ask."
+                        .to_string(),
+                ),
+                r = work => r,
             }
-            Ok(vec![Hit {
-                source: SourceRef::Server {
-                    name: self.cfg.name.clone(),
-                },
-                excerpt: text,
-                score: None,
-                indexed_at_unix: None,
-            }])
         })
     }
 }
@@ -244,6 +264,7 @@ mod tests {
             &'a self,
             _tool: &'a str,
             _args: serde_json::Value,
+            _cancel: CancellationToken,
         ) -> futures_util::future::BoxFuture<'a, Result<(String, bool), String>> {
             let reply = self.reply.clone();
             Box::pin(async move { reply })
@@ -366,6 +387,25 @@ mod tests {
             !store.is_trusted("docs", &fp),
             "no grant may be persisted without a screen"
         );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_search_returns_promptly() {
+        // T2-13c mirror: `search` discarded its token, so ESC waited out the
+        // full 600s `tools/call` leash.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let r = retriever(Ok(("found it".into(), false)), dir.path());
+        let _ = r.permission("q");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let err = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            r.search(&query(), cancel),
+        )
+        .await
+        .expect("a cancelled search must not wait")
+        .expect_err("cancellation is an error, not an empty result");
+        assert!(err.contains("cancel"), "errors-as-prompt: {err}");
     }
 
     #[tokio::test]
