@@ -27,6 +27,15 @@ const COMPACT_TRIGGER: f64 = 0.8;
 /// background so it is (usually) already done when [`COMPACT_TRIGGER`] hits,
 /// and the fold needs no blocking model call.
 const SPECULATE_TRIGGER: f64 = 0.6;
+/// Wall-clock bound on waiting for a speculative digest at the fold. The task
+/// has had whole samples to run in, so a digest that still isn't ready is a
+/// stalled provider call, not a slow one — the inline summarize is then the
+/// faster path *and* the interruptible one.
+/// INVARIANT: no await in the turn path is unbounded or un-cancellable.
+/// Enforced by `the_speculation_bound_abandons_a_stalled_digest` (the bound),
+/// `hung_speculation_falls_back_to_the_inline_summarize` (end to end), and
+/// `interrupt_lands_during_the_speculative_summarize` (the cancel race).
+const SPECULATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Shared per-prompt budget for "intercept the end-turn, inject a reminder,
 /// continue" gates (index E4): the TodoGate and the `Stop` hook veto
@@ -50,10 +59,6 @@ pub(crate) async fn run(
 ) {
     let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel);
     let end = turn.drive().await;
-    // A speculation the turn never consumed has no fold to serve — stop it.
-    if let Some(handle) = turn.speculation.take() {
-        handle.abort();
-    }
     let usage = turn.usage;
     let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
 }
@@ -91,20 +96,47 @@ fn parallel_chunks<'a>(uses: &'a [ToolUse], registry: &hotl_tools::Registry) -> 
 fn spawn_speculation(
     shared: &Arc<SharedDeps>,
     snapshot: &Arc<Vec<Item>>,
+    cancel: &CancellationToken,
 ) -> Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>> {
     let tail_budget = (shared.config.context_window as f64 * crate::actor::TAIL_RATIO) as u64;
     let plan = hotl_context::compaction::plan(snapshot, tail_budget)?;
     let shared = Arc::clone(shared);
     let snapshot = Arc::clone(snapshot);
+    let cancel = cancel.clone();
     Some(tokio::spawn(async move {
         let folded = &snapshot[plan.prefix_end..plan.kept_from];
-        let text = crate::actor::summarize(&shared, folded).await?;
+        // A cancelled turn stops paying for a digest nobody will fold.
+        let text = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            text = crate::actor::summarize(&shared, folded) => text,
+        }?;
         Some(crate::SpecDigest {
             prefix_end: plan.prefix_end,
             kept_from: plan.kept_from,
             text,
         })
     }))
+}
+
+/// Race a speculative digest against the turn's cancellation and a wall-clock
+/// bound, aborting the task on either. Abandoning the digest is a handled path
+/// — `actor::compact` falls back to the inline summarize — so this never waits
+/// on a stalled provider call. Split out from [`Turn::take_speculation`] so the
+/// race is unit-testable without a session behind it.
+async fn await_speculation(
+    handle: tokio::task::JoinHandle<Option<crate::SpecDigest>>,
+    cancel: &CancellationToken,
+    wait: std::time::Duration,
+) -> Option<crate::SpecDigest> {
+    // Cloned out first: `handle` itself moves into the select arm below.
+    let abort = handle.abort_handle();
+    tokio::select! {
+        biased;
+        _ = cancel.cancelled() => { abort.abort(); None }
+        _ = tokio::time::sleep(wait) => { abort.abort(); None }
+        digest = handle => digest.ok().flatten(),
+    }
 }
 
 /// A sample's terminal result, or why it couldn't produce one.
@@ -152,6 +184,20 @@ struct Turn {
     /// turn); the TodoGate is the only consumer today, bounded further by
     /// [`TODO_GATE_MAX`].
     turn_extensions: u32,
+}
+
+impl Drop for Turn {
+    /// A speculation the fold never consumed has nothing to serve — stop it on
+    /// *every* exit path, including an unwind (a panicked turn would otherwise
+    /// leak a live provider call, T1-5).
+    /// INVARIANT: no speculation outlives its turn. Enforced by
+    /// `interrupt_lands_during_the_speculative_summarize` on the cancel path;
+    /// structural on the unwind path.
+    fn drop(&mut self) {
+        if let Some(handle) = self.speculation.take() {
+            handle.abort();
+        }
+    }
 }
 
 impl Turn {
@@ -639,7 +685,7 @@ impl Turn {
             && !self.shared.config.compaction_reset
             && estimate > (window as f64 * SPECULATE_TRIGGER) as u64
         {
-            self.speculation = spawn_speculation(&self.shared, snapshot);
+            self.speculation = spawn_speculation(&self.shared, snapshot, &self.cancel);
         }
         let used_pct = self
             .shared
@@ -791,11 +837,10 @@ impl Turn {
         }
     }
 
-    /// The speculative digest, if one was fired and succeeded. Awaiting the
-    /// residual is still a win: the task has had whole samples to run in.
+    /// The speculative digest, if one was fired and finished in time.
     async fn take_speculation(&mut self) -> Option<crate::SpecDigest> {
         let handle = self.speculation.take()?;
-        handle.await.ok().flatten()
+        await_speculation(handle, &self.cancel, SPECULATION_WAIT).await
     }
 
     async fn snapshot(&self) -> Option<Arc<Vec<Item>>> {
@@ -1012,6 +1057,74 @@ mod tests {
         // The ask still shows the human-readable signatures.
         let pattern = detect_doom_loop(&[a(), a(), a()]).unwrap();
         assert_eq!(pattern, "read({\"path\":\"x\"})");
+    }
+
+    /// Sets its flag when dropped — proof that an aborted task's future was
+    /// actually torn down, not merely abandoned by the `select!`.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The paused clock is legal here: these drive `await_speculation` alone,
+    /// with no actor and therefore no writer-thread ack for the clock to
+    /// auto-advance past (0011's standing constraint).
+    #[tokio::test(start_paused = true)]
+    async fn the_speculation_bound_abandons_a_stalled_digest() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = DropFlag(Arc::clone(&dropped));
+        let handle = tokio::spawn(async move {
+            let _flag = flag;
+            std::future::pending::<()>().await;
+            None
+        });
+        let got = await_speculation(handle, &CancellationToken::new(), SPECULATION_WAIT).await;
+        assert!(got.is_none(), "a stalled digest must be abandoned");
+        tokio::task::yield_now().await;
+        assert!(
+            dropped.load(std::sync::atomic::Ordering::SeqCst),
+            "the abandoned speculation must be aborted, not left burning a provider call"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_turn_abandons_its_speculation_without_waiting_out_the_bound() {
+        let handle = tokio::spawn(async {
+            std::future::pending::<()>().await;
+            None
+        });
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let start = tokio::time::Instant::now();
+        let got = await_speculation(handle, &cancel, SPECULATION_WAIT).await;
+        assert!(got.is_none());
+        assert_eq!(
+            start.elapsed(),
+            std::time::Duration::ZERO,
+            "an interrupt must not wait out the speculation bound"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_speculation_still_reaches_the_fold() {
+        let handle = tokio::spawn(async {
+            Some(crate::SpecDigest {
+                prefix_end: 1,
+                kept_from: 4,
+                text: "DIGEST".into(),
+            })
+        });
+        // Let the task complete before the race, so the assertion is about the
+        // happy path rather than about which arm happened to be ready first.
+        tokio::task::yield_now().await;
+        let got = await_speculation(handle, &CancellationToken::new(), SPECULATION_WAIT)
+            .await
+            .expect("a finished digest must reach the fold");
+        assert_eq!(got.text, "DIGEST");
+        assert_eq!((got.prefix_end, got.kept_from), (1, 4));
     }
 
     fn todos_item(text: &str) -> Item {

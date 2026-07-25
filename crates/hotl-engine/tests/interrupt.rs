@@ -160,6 +160,70 @@ async fn interrupt_lands_during_the_inline_compaction_summarize() {
     );
 }
 
+/// T1-4: the speculative summarize hangs. The turn reaches `ContextFull`,
+/// calls `take_speculation`, and must still honor the interrupt — the test
+/// above sets `compaction_reset: true`, which DISABLES speculation and routes
+/// around this path entirely. Do not add that flag here.
+#[tokio::test]
+async fn interrupt_lands_during_the_speculative_summarize() {
+    let main = Arc::new(ScriptedProvider::new(Vec::new()));
+    let provider = Arc::new(HangingSummarize {
+        main: Arc::clone(&main),
+    });
+    let mut s = session(
+        provider,
+        EngineConfig {
+            context_window: 1000,
+            max_turns: 10,
+            ..Default::default()
+        },
+    );
+    let file = s.dir.path().join("f.txt");
+    std::fs::write(&file, "small file body").expect("fixture");
+    let path = file.to_str().expect("utf8 path").to_string();
+    let with_usage = |id: &str, input_tokens: u64| {
+        let mut script = ScriptedProvider::tool_call(id, "read", json!({"path": path}));
+        if let Some(Ok(StreamEvent::Completed { usage, .. })) = script.last_mut() {
+            usage.input_tokens = input_tokens;
+        }
+        script
+    };
+    // 650 crosses SPECULATE_TRIGGER (fires the hanging digest); 850 crosses
+    // COMPACT_TRIGGER (the next build_request returns ContextFull).
+    main.push_script(with_usage("t1", 650));
+    main.push_script(with_usage("t2", 850));
+    main.push_script(ScriptedProvider::text_reply("must never be reached"));
+
+    s.handle.prompt("start the long task".into()).await;
+    let mut tools_done = 0;
+    while tools_done < 2 {
+        match next_event(&mut s).await {
+            // Same protected ask as the test above: the filler `read` targets
+            // an absolute tempdir path outside the guard's anchor. Approve it —
+            // this test is about the speculation window, not permissions.
+            EngineEvent::Ask { reply, .. } => {
+                let _ = reply.send(AskReply::Allow);
+            }
+            EngineEvent::ToolDone { .. } => tools_done += 1,
+            _ => {}
+        }
+    }
+    // The turn is now parked in take_speculation on a task that will never
+    // finish. The interrupt must land there, not after the process is killed.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    s.handle.interrupt();
+    let outcome = loop {
+        if let EngineEvent::TurnDone { outcome, .. } = next_event(&mut s).await {
+            break outcome;
+        }
+    };
+    assert_eq!(outcome, Outcome::Cancelled);
+    assert!(
+        main.request_count() <= 2,
+        "the continuation must not sample after an interrupt"
+    );
+}
+
 #[tokio::test]
 async fn actor_exits_once_the_handle_drops() {
     let provider = Arc::new(ScriptedProvider::new(Vec::new()));

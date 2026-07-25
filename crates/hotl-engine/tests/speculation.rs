@@ -293,6 +293,62 @@ async fn failed_speculation_falls_back_to_inline_summarize() {
     assert!(!degraded, "a failed speculation must not floor the digest");
 }
 
+/// Hangs the FIRST summarize request (the speculative one) forever and answers
+/// every later one — the fold must give up on the speculation and take the
+/// inline path rather than wait on it.
+struct HangFirstSummarize {
+    main: Arc<ScriptedProvider>,
+    summarize: Arc<ScriptedProvider>,
+    seen: AtomicUsize,
+}
+
+impl Provider for HangFirstSummarize {
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        if !req.system.contains("compress") {
+            return self.main.stream(req);
+        }
+        if self.seen.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Box::pin(futures_util::stream::pending());
+        }
+        self.summarize.stream(req)
+    }
+}
+
+/// T1-4, the no-human half: nobody presses Ctrl-C, so the wall-clock bound
+/// alone has to save the turn. Deliberately on the real clock — a paused clock
+/// can no longer drive the actor's write path (0011's standing constraint), so
+/// this pays `SPECULATION_WAIT` in real time. The precise race (bound fires,
+/// cancel wins, handle is aborted) is unit-tested in `turn.rs` instead.
+#[tokio::test]
+async fn hung_speculation_falls_back_to_the_inline_summarize() {
+    let main = Arc::new(ScriptedProvider::new(Vec::new()));
+    let summarize = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "INLINE DIGEST after the speculation was abandoned",
+    )]));
+    let provider = Arc::new(HangFirstSummarize {
+        main: Arc::clone(&main),
+        summarize: Arc::clone(&summarize),
+        seen: AtomicUsize::new(0),
+    });
+    let mut s = session(provider, cfg());
+    push_main_scripts(&main, s.dir.path());
+
+    s.handle.prompt("start the long task".into()).await;
+    let outcome = wait_done(&mut s).await;
+    assert_eq!(
+        outcome,
+        Outcome::Done {
+            text: "done after compaction".into()
+        }
+    );
+    let (digest, degraded) = compaction_digest(&s.log_path).expect("compaction entry");
+    assert!(digest.contains("INLINE DIGEST"), "digest was: {digest}");
+    assert!(!degraded, "the inline path succeeded; no floor digest");
+}
+
 #[tokio::test]
 async fn reset_mode_compaction_stays_inline() {
     // Reset-mode folds everything after the prefix; a speculative digest
