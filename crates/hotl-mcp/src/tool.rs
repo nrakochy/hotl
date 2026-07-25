@@ -51,7 +51,9 @@ pub(crate) fn checked_tool_name(tool: &str) -> Result<&str, String> {
     Ok(tool)
 }
 
-type Connector =
+/// How a server config becomes a live client. Public so integration tests can
+/// name it when they share one connector across several fixtures.
+pub type Connector =
     Box<dyn Fn(ServerConfig) -> BoxFuture<'static, Result<Arc<Client>, String>> + Send + Sync>;
 
 /// One connect slot per server: the outer map lock is held only to fetch the
@@ -63,10 +65,18 @@ pub struct McpTool {
     servers: Vec<ServerConfig>,
     clients: tokio::sync::Mutex<HashMap<String, ClientSlot>>,
     trust: Mutex<TrustStore>,
-    /// Fingerprint per server, computed once and reused for the trust screen
-    /// and the recorded grant (H-07): the value the user is shown is exactly
-    /// the value persisted, and the file isn't re-read on every call.
-    hashes: Mutex<HashMap<String, Fingerprint>>,
+    /// Fingerprints this tool has actually *shown* to the human, per server.
+    /// `permission()` writes here; `ensure_client()` refuses to connect without
+    /// a match. This is what makes the "run() implies an approved ask" claim
+    /// real — the engine's gate lives in another crate, so the enforcement has
+    /// to be here.
+    ///
+    /// INVARIANT: no MCP server is spawned, and no trust grant is persisted,
+    /// without a `permission()` screen of the *same* fingerprint immediately
+    /// before. Enforced by
+    /// `run_without_a_permission_screen_records_no_grant_and_refuses` and
+    /// `a_binary_swapped_after_the_screen_does_not_connect`.
+    screened: Mutex<HashMap<String, Fingerprint>>,
     connector: Connector,
     description: String,
     /// Cumulative external-content budget for this tool instance (one
@@ -110,7 +120,7 @@ impl McpTool {
             servers,
             clients: tokio::sync::Mutex::new(HashMap::new()),
             trust: Mutex::new(trust),
-            hashes: Mutex::new(HashMap::new()),
+            screened: Mutex::new(HashMap::new()),
             connector,
             description,
             budget: Budget::default(),
@@ -132,29 +142,46 @@ impl McpTool {
         )
     }
 
-    /// Cached fingerprint for a server (computed once per session). The
-    /// fingerprint is computed before taking the lock — racing computes are
-    /// idempotent — so a slow file read never holds the cache against other
-    /// servers.
-    fn hash_of(&self, cfg: &ServerConfig) -> Fingerprint {
-        if let Some(fp) = self
-            .hashes
+    async fn ensure_client(&self, cfg: &ServerConfig) -> Result<Arc<Client>, String> {
+        // T2-7d: recomputed immediately before the spawn rather than cached for
+        // the session, so a mid-session binary swap cannot go unnoticed. This
+        // also narrows H-07's TOCTOU window from "once per session" to "one
+        // recompute immediately before the spawn".
+        let fresh = Fingerprint::of(cfg);
+        // Keyed by server name: the engine may hand `run()` a different input
+        // than `permission()` saw (`AskReply::AllowEdited`), and an edit that
+        // switches servers finds no screened entry and fails closed — which is
+        // the correct outcome.
+        let shown = self
+            .screened
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&cfg.name)
-        {
-            return fp.clone();
+            .cloned();
+        match shown {
+            None => {
+                return Err(format!(
+                    "`{}` has not been through the approval screen in this session, so \
+                     hotl did not start it. Retry this call — you will be asked to \
+                     approve the server first.",
+                    cfg.name
+                ))
+            }
+            Some(shown) if shown.key() != fresh.key() => {
+                self.screened
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&cfg.name);
+                return Err(format!(
+                    "the program for `{}` changed since you approved it, so hotl did \
+                     not start it. Retry this call — you will be asked to approve the \
+                     new program.",
+                    cfg.name
+                ));
+            }
+            Some(_) => {}
         }
-        let fp = Fingerprint::of(cfg);
-        self.hashes
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(cfg.name.clone())
-            .or_insert(fp)
-            .clone()
-    }
 
-    async fn ensure_client(&self, cfg: &ServerConfig) -> Result<Arc<Client>, String> {
         let slot: ClientSlot = {
             let mut clients = self.clients.lock().await;
             clients.entry(cfg.name.clone()).or_default().clone()
@@ -162,18 +189,17 @@ impl McpTool {
         let client = slot
             .get_or_try_init(|| async {
                 let client = (self.connector)(cfg.clone()).await?;
-                // Reaching run() means the (protected) ask was approved
-                // upstream — record the grant now, keyed to the *same* hash
-                // the screen showed (H-07: shown value == recorded value,
-                // from one read).
-                let fp = self.hash_of(cfg);
-                // An unhashable binary refuses the grant, so the protected ask
-                // comes back every time (T2-7b). Task 7 surfaces the reason.
+                // The grant records the fingerprint the screen showed (H-07:
+                // shown value == recorded value, from one read). An unhashable
+                // binary refuses the grant (T2-7b), which is not fatal — the
+                // human approved *this* screen — and is not swallowed either:
+                // `permission()` says on every screen that hotl will keep
+                // asking, and why.
                 let _ = self
                     .trust
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .record(&cfg.name, &fp);
+                    .record(&cfg.name, &fresh);
                 Ok::<_, String>(client)
             })
             .await?;
@@ -193,21 +219,25 @@ impl McpTool {
                 known.join(", ")
             ));
         };
+        // Validated before the connect, so it covers the Ok *and* the Err arm of
+        // `call_tool` — the error path is the one T1-8 flagged, since it
+        // envelopes the attacker-chosen name — and so a call we are going to
+        // reject never starts a server process.
+        let tool = match input.get("tool").and_then(Value::as_str) {
+            Some(tool) => match checked_tool_name(tool) {
+                Ok(t) => Some(t),
+                // Not enveloped: this is our text, not the server's.
+                Err(e) => return ToolOutcome::err(e),
+            },
+            None => None,
+        };
         let client = match self.ensure_client(cfg).await {
             Ok(c) => c,
             Err(e) => return ToolOutcome::err(self.envelope(server_name, "connect", &e)),
         };
-        match input.get("tool").and_then(Value::as_str) {
+        match tool {
             None => self.list(server_name, &client).await,
             Some(tool) => {
-                // Before `call_tool`, so this covers the Ok *and* the Err arm —
-                // the error path is the one T1-8 flagged, since it envelopes
-                // the attacker-chosen name.
-                let tool = match checked_tool_name(tool) {
-                    Ok(t) => t,
-                    // Not enveloped: this is our text, not the server's.
-                    Err(e) => return ToolOutcome::err(e),
-                };
                 let arguments = input.get("arguments").cloned().unwrap_or(json!({}));
                 match client.call_tool(tool, arguments).await {
                     Ok((text, is_error)) => ToolOutcome {
@@ -280,15 +310,31 @@ impl Tool for McpTool {
             // Unknown server: run() errors without side effects.
             return Permission::None;
         };
-        let fp = self.hash_of(cfg);
-        if self
+        // Fresh on every call — a session-lifetime cache made a mid-session
+        // binary swap invisible (T2-7d).
+        let fp = Fingerprint::of(cfg);
+        let trusted = self
             .trust
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_trusted(server, &fp)
-        {
+            .is_trusted(server, &fp);
+        // Record what was actually screened; `ensure_client` will not connect
+        // without a matching entry.
+        self.screened
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(cfg.name.clone(), fp.clone());
+        if trusted {
             Permission::Ask { summary }
         } else {
+            // An unhashable binary can never be recorded (T2-7b), so say so
+            // here rather than letting the screen reappear mysteriously.
+            let recurring = if fp.is_hashed() {
+                ""
+            } else {
+                "\nThis program cannot be hashed, so hotl cannot record the approval \
+                 and will ask again every time."
+            };
             Permission::AskProtected {
                 summary,
                 // `Fingerprint`'s Display *is* the screen text, so the value
@@ -297,7 +343,7 @@ impl Tool for McpTool {
                     "first use of MCP server `{server}` (or its program changed).\n\
                      {fp}\n\
                      Approving runs this program on your machine and lets its \
-                     output into the model's context."
+                     output into the model's context.{recurring}"
                 ),
             }
         }

@@ -12,4 +12,4 @@ pub mod sanitize;
 pub mod tool;
 pub mod trust;
 
-pub use tool::McpTool;
+pub use tool::{Connector, McpTool};
