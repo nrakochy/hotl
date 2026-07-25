@@ -657,15 +657,20 @@ impl Tool for GrepTool {
         Permission::None
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(grep_impl(&input, cancel).await) })
+        Box::pin(async move { done(grep_in(fsguard::workspace_root(), &input, cancel).await) })
     }
 }
 
-async fn grep_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
+/// INVARIANT: ripgrep does not follow links while walking, but it DOES follow
+/// a link passed as an explicit path argument — so the argument is resolved
+/// through the guard before it becomes argv. Enforced by
+/// `grep_refuses_a_symlinked_path_argument` (the walk half, which ripgrep
+/// already gets right, is pinned by `grep_does_not_follow_links_inside_the_tree`).
+async fn grep_in(root: &std::path::Path, input: &Value, cancel: CancellationToken) -> ToolResult {
     let pattern = str_arg(input, "pattern")?;
     let given = input.get("path").and_then(Value::as_str).unwrap_or(".");
-    let root = guarded_search_root("grep", fsguard::workspace_root(), given, false)?;
-    grep_search(pattern, &root, input, cancel).await
+    let target = guarded_search_root("grep", root, given, false)?;
+    grep_search(pattern, &target, input, cancel).await
 }
 
 /// The ripgrep invocation itself, taking an already-resolved root (relative-
@@ -1303,6 +1308,49 @@ mod tests {
         // A no-match result is success (a prompt), not an error to retry.
         assert!(!miss.is_error, "no-match must not be an error");
         assert!(miss.content.to_lowercase().contains("no matches"));
+    }
+
+    #[tokio::test]
+    async fn grep_refuses_a_symlinked_path_argument() {
+        // ripgrep does not follow links while *walking*, but it does follow one
+        // handed to it as an explicit path argument — so `path: "link"` with
+        // `link -> ~` searched the whole home directory under `Permission::None`.
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::os::unix::fs::symlink(&home, root.join("link")).unwrap();
+        let out = done(
+            grep_in(
+                &root,
+                &json!({"pattern": "BEGIN PRIVATE KEY", "path": "link"}),
+                CancellationToken::new(),
+            )
+            .await,
+        );
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            !out.content.contains("id_rsa"),
+            "leaked the home directory: {}",
+            out.content
+        );
+        assert!(out.content.contains("symlink"), "{}", out.content);
+    }
+
+    #[tokio::test]
+    async fn grep_does_not_follow_links_inside_the_tree() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::os::unix::fs::symlink(&home, root.join("src/out")).unwrap();
+        let out = done(
+            grep_in(
+                &root,
+                &json!({"pattern": "PRIVATE"}),
+                CancellationToken::new(),
+            )
+            .await,
+        );
+        assert!(
+            !out.content.contains("id_rsa"),
+            "rg followed an in-tree link: {}",
+            out.content
+        );
     }
 
     #[tokio::test]
