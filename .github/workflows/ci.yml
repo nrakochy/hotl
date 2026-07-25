@@ -62,6 +62,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: harness
+      # The grep tool spawns the `rg` binary, which the runner image does not
+      # ship — without it the grep test dies at spawn, before reaching the
+      # exit-code semantics it exists to pin. Installed rather than
+      # skipped-when-absent: a test that quietly evaporates on the one machine
+      # gating master is not coverage.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Clippy (harness crates + binary)
         run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)

@@ -148,10 +148,30 @@ mod tests {
         if !matches!(sandbox::probe(), SandboxStatus::Enforced(_)) {
             return;
         }
-        // Home is outside the cwd/tmp/dev write set the floor permits.
+        // Home stands in for "outside the cwd/tmp/dev write set the floor
+        // permits" — but only where the harness leaves it there. nix's builder
+        // exports `HOME=$(mktemp -d)`, putting it *inside* the permitted temp
+        // subtree: the write then succeeds on its own merits and the assertion
+        // below would report a floor escape that never happened. Skip rather
+        // than assert a lie. Mirrors the write set in `sandbox.rs`, so the two
+        // cannot drift apart.
         let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
             return;
         };
+        let canon = |p: std::path::PathBuf| p.canonicalize().unwrap_or(p);
+        let home = canon(home);
+        let permitted = [
+            Some(std::env::temp_dir()),
+            std::env::current_dir().ok(),
+            Some(std::path::PathBuf::from("/dev")),
+        ];
+        if permitted
+            .into_iter()
+            .flatten()
+            .any(|allowed| home.starts_with(canon(allowed)))
+        {
+            return;
+        }
         let outside = home.join(format!(".hotl-diag-escape-{}", std::process::id()));
         let _ = std::fs::remove_file(&outside);
         let d = diag(&format!(

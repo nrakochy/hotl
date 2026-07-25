@@ -63,6 +63,14 @@
           # still run it.
           doCheck = false;
 
+          # The grep tool spawns the `rg` binary, so the suite needs it on
+          # PATH. nativeCheckInputs, so it lands only where doCheck is on —
+          # inert here, active in `checks.package`, and the same input a
+          # nixpkgs build (tests on) would want. Nothing reaches runtime: a
+          # nix-installed hotl still finds `rg` only if the user has it, and
+          # degrades to a legible error if not.
+          nativeCheckInputs = [ pkgs.ripgrep ];
+
           # Nothing here demands $HOME, but /homeless-shelter is not writable
           # and a single test reaching for it would be an opaque failure.
           preCheck = "export HOME=$(mktemp -d)";
