@@ -88,6 +88,45 @@ struct Executed {
     chargeable: bool,
 }
 
+/// Why a proposal did or didn't land. `propose` returned a bare `bool`, and both
+/// failure modes rendered as "session log is sealed" — so an ordinary shutdown
+/// was reported to the user as log corruption (T3-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Commit {
+    Committed,
+    /// The actor refused the append: the log is sealed.
+    Sealed,
+    /// The actor is gone (channel closed / reply dropped): normal shutdown.
+    Gone,
+}
+
+impl Commit {
+    /// `Some(accepted)` from the actor, `None` if it never answered.
+    fn from_reply(reply: Option<bool>) -> Self {
+        match reply {
+            Some(true) => Commit::Committed,
+            Some(false) => Commit::Sealed,
+            None => Commit::Gone,
+        }
+    }
+
+    fn ok(self) -> bool {
+        matches!(self, Commit::Committed)
+    }
+
+    /// Every failure string is a prompt: it tells the reader what to do next.
+    fn message(self) -> &'static str {
+        match self {
+            Commit::Committed => "committed",
+            Commit::Sealed => {
+                "the session log is sealed — nothing further can be recorded; \
+                 start a new session to keep working"
+            }
+            Commit::Gone => "the session is shutting down",
+        }
+    }
+}
+
 /// Chunk a batch for execution: contiguous runs of parallel-safe calls form
 /// one chunk (they may overlap); every other call is its own single-entry
 /// chunk, keeping strict source order around anything mutating or unknown.
@@ -327,7 +366,14 @@ impl Turn {
                     let stop_reason = self.consult_stop(&text).await;
                     if todo_fires || stop_reason.is_some() {
                         self.turn_extensions += 1;
-                        self.inject_gate_nudge(todo_fires, stop_reason).await;
+                        let commit = self.inject_gate_nudge(todo_fires, stop_reason).await;
+                        if !commit.ok() {
+                            // The reminder never landed: looping would burn a
+                            // sample on a nudge the model will never see (T3-6).
+                            return TurnEnd::Outcome(Outcome::Error {
+                                message: commit.message().into(),
+                            });
+                        }
                         continue;
                     }
                     return TurnEnd::Outcome(Outcome::Done { text });
@@ -379,7 +425,7 @@ impl Turn {
     /// their sections ride inside a single `<system-reminder>`, in fixed
     /// order (TodoGate section first, Stop section second), never as two
     /// adjacent items.
-    async fn inject_gate_nudge(&mut self, todo_fires: bool, stop_reason: Option<String>) -> bool {
+    async fn inject_gate_nudge(&mut self, todo_fires: bool, stop_reason: Option<String>) -> Commit {
         let mut body = String::new();
         if todo_fires {
             body.push_str(
@@ -438,14 +484,14 @@ impl Turn {
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
         };
-        if !self
+        let commit = self
             .propose(vec![
                 EntryPayload::Item { item: assistant },
                 EntryPayload::Usage { usage },
             ])
-            .await
-        {
-            return SampleEnd::Fatal("session log is sealed".into());
+            .await;
+        if !commit.ok() {
+            return SampleEnd::Fatal(commit.message().into());
         }
         SampleEnd::Completed { stop, blocks }
     }
@@ -474,8 +520,16 @@ impl Turn {
                 !matches!(cont, AskReply::Allow | AskReply::AllowEdited { .. })
             };
             if stop {
-                self.abort_batch(&uses, "Stopped: a repeating tool-call loop was detected.")
+                let commit = self
+                    .abort_batch(&uses, "Stopped: a repeating tool-call loop was detected.")
                     .await;
+                if !commit.ok() {
+                    // A `DoomLoop` outcome would name a batch the log will
+                    // never carry; report why the record failed instead (T3-6).
+                    return Some(Outcome::Error {
+                        message: commit.message().into(),
+                    });
+                }
                 return Some(Outcome::DoomLoop { pattern });
             }
             self.call_sigs.clear();
@@ -548,9 +602,10 @@ impl Turn {
                 .into_iter()
                 .map(|item| EntryPayload::Item { item }),
         );
-        if !self.propose(entries).await {
+        let commit = self.propose(entries).await;
+        if !commit.ok() {
             return Some(Outcome::Error {
-                message: "session log is sealed".into(),
+                message: commit.message().into(),
             });
         }
         if cancelled {
@@ -785,12 +840,12 @@ impl Turn {
     }
 
     /// Complete protocol pairing for a batch that will not execute.
-    async fn abort_batch(&mut self, uses: &[ToolUse], message: &str) {
+    async fn abort_batch(&mut self, uses: &[ToolUse], message: &str) -> Commit {
         let results = uses.iter().map(|tu| pair(tu, message, true)).collect();
         self.propose(vec![EntryPayload::Item {
             item: Item::ToolResults { results },
         }])
-        .await;
+        .await
     }
 
     /// Pre-flight: the compaction threshold check (M2), then the request with
@@ -967,7 +1022,7 @@ impl Turn {
         rx.await.ok()
     }
 
-    async fn propose(&self, entries: Vec<EntryPayload>) -> bool {
+    async fn propose(&self, entries: Vec<EntryPayload>) -> Commit {
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
@@ -975,9 +1030,9 @@ impl Turn {
             .await
             .is_err()
         {
-            return false;
+            return Commit::Gone;
         }
-        rx.await.unwrap_or(false)
+        Commit::from_reply(rx.await.ok())
     }
 
     /// Ask the human via the event channel; a dropped reply means deny.
@@ -987,6 +1042,9 @@ impl Turn {
     /// records are best-effort: a sealed log never blocks the ask itself.
     async fn ask(&self, summary: String, why: Option<String>) -> AskReply {
         let id = hotl_types::new_ulid();
+        // INVARIANT: the ask itself never blocks on the log — a sealed log
+        // degrades the audit record, never the human moment. Enforced by
+        // construction (both results are deliberately discarded).
         let _ = self
             .propose(vec![EntryPayload::PendingAsk {
                 id: id.clone(),
@@ -1279,6 +1337,20 @@ mod tests {
             text: text.into(),
             synthetic: Some(SyntheticReason::Todos),
         }
+    }
+
+    /// T3-5: `propose` returned a bare `bool`, and both failure modes rendered
+    /// as "session log is sealed" — so an ordinary shutdown was reported to the
+    /// user as log corruption.
+    #[test]
+    fn a_dropped_actor_is_not_reported_as_a_sealed_log() {
+        assert_eq!(Commit::from_reply(Some(true)), Commit::Committed);
+        assert_eq!(Commit::from_reply(Some(false)), Commit::Sealed);
+        assert_eq!(Commit::from_reply(None), Commit::Gone);
+        assert!(Commit::Sealed.message().contains("sealed"));
+        assert!(!Commit::Gone.message().contains("sealed"));
+        assert!(Commit::Gone.message().contains("shutting down"));
+        assert!(Commit::Committed.ok() && !Commit::Sealed.ok() && !Commit::Gone.ok());
     }
 
     fn tool_results(content: &str) -> Item {
