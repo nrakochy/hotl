@@ -221,19 +221,22 @@ impl Shadow {
     }
 }
 
-/// Newest session shadow under the root (by directory mtime).
+/// The newest session shadow under the root, by **session id**.
+///
+/// INVARIANT: selection never depends on filesystem timestamps. Ids are ULIDs,
+/// which sort lexicographically in creation order, so the maximum id is the
+/// most recently started session — where directory mtime is whatever last
+/// touched the tree, which is not the same thing (T2-15c). Enforced by
+/// `latest_session_picks_the_newest_id_not_the_newest_directory`.
 pub fn latest_session(shadow_root: &Path) -> Option<String> {
-    let entries = std::fs::read_dir(shadow_root).ok()?;
-    let mut dirs: Vec<(std::time::SystemTime, String)> = entries
+    std::fs::read_dir(shadow_root)
+        .ok()?
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().into_string().ok()?;
-            let id = name.strip_suffix(".git")?.to_string();
-            Some((e.metadata().ok()?.modified().ok()?, id))
+            name.strip_suffix(".git").map(str::to_string)
         })
-        .collect();
-    dirs.sort_by_key(|(t, _)| std::cmp::Reverse(*t));
-    dirs.into_iter().next().map(|(_, id)| id)
+        .max()
 }
 
 #[cfg(test)]
@@ -316,6 +319,27 @@ mod tests {
         );
         assert!(touched.iter().any(|f| f == "a.txt"), "touched: {touched:?}");
         assert!(touched.iter().any(|f| f == "b.txt"), "touched: {touched:?}");
+    }
+
+    #[test]
+    fn latest_session_picks_the_newest_id_not_the_newest_directory() {
+        let root = tempfile::tempdir().unwrap();
+        // ULIDs sort in creation order. Create them in an order where the
+        // most-recently-touched directory is NOT the newest session.
+        for id in [
+            "01HZZZZZZZZZZZZZZZZZZZZZZZ",
+            "01HAAAAAAAAAAAAAAAAAAAAAAA",
+            "01HMMMMMMMMMMMMMMMMMMMMMMM",
+        ] {
+            std::fs::create_dir_all(root.path().join(format!("{id}.git"))).unwrap();
+        }
+        // The last-created dir (…MMM…) has the newest mtime; the newest session
+        // is …ZZZ…, created first.
+        assert_eq!(
+            latest_session(root.path()).as_deref(),
+            Some("01HZZZZZZZZZZZZZZZZZZZZZZZ"),
+            "undo must target the newest session, not the most recently touched directory"
+        );
     }
 
     #[test]
