@@ -152,6 +152,7 @@ mod tests {
                 protected_why: None,
                 input: String::new(),
                 denying: false,
+                diff: Vec::new(),
             };
             assert_eq!(loop_glyph(&phase), GAP, "the gap never animates");
         }
@@ -184,6 +185,7 @@ mod tests {
             protected_why: None,
             input: String::new(),
             denying: false,
+            diff: Vec::new(),
         };
         assert_eq!(strip_line(&s), "╭─╮╰ ╯ waiting on you");
         s.phase = Phase::Compacting { ticks: 1 };

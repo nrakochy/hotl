@@ -9,7 +9,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::anim;
-use crate::app::{Phase, Scroll, State, ToolStatus, TranscriptItem};
+use crate::app::{DiffOp, Phase, Scroll, State, ToolStatus, TranscriptItem};
 use crate::vim::Mode;
 use crate::wrap;
 
@@ -593,6 +593,7 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
         protected_why,
         input,
         denying,
+        diff,
         ..
     } = &state.phase
     else {
@@ -604,6 +605,22 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
             format!("⚠ {why}"),
             Style::new().fg(p.blocked).bold(),
         ));
+    }
+    // The proposed change, between the summary and the y/n line — approving a
+    // write without seeing it is the gap this closes. Empty until the engine's
+    // ask carries the tool input (RQ-2), and an empty diff must render exactly
+    // as the card did before.
+    if !diff.is_empty() {
+        lines.push(Line::raw(""));
+        for l in diff {
+            let (prefix, style) = match l.op {
+                DiffOp::Add => ("+ ", Style::new().fg(p.idle)),
+                DiffOp::Del => ("- ", Style::new().fg(p.blocked)),
+                DiffOp::Ctx => ("  ", Style::new().fg(p.muted)),
+                DiffOp::Trailer => ("  ", Style::new().fg(p.faint).dim()),
+            };
+            lines.push(Line::styled(format!("{prefix}{}", l.text), style));
+        }
     }
     lines.push(Line::raw(""));
     if *denying {
@@ -854,6 +871,80 @@ mod tests {
         assert!(out.contains("line6"), "{out}");
     }
 
+    #[test]
+    fn the_ask_card_renders_a_diff_when_one_is_supplied() {
+        use crate::app::DiffLine;
+        let mut s = State::test_default();
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "edit ./x.rs".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: vec![
+                DiffLine {
+                    op: DiffOp::Ctx,
+                    text: "fn main() {".into(),
+                },
+                DiffLine {
+                    op: DiffOp::Del,
+                    text: "    old();".into(),
+                },
+                DiffLine {
+                    op: DiffOp::Add,
+                    text: "    new();".into(),
+                },
+            ],
+        };
+        let out = draw(&s).join("\n");
+        assert!(out.contains("- ") && out.contains("old();"), "{out}");
+        assert!(out.contains("+ ") && out.contains("new();"), "{out}");
+    }
+
+    /// Until R2 lands RQ-2 every ask arrives without a diff; that path must
+    /// stay exactly the card it was.
+    #[test]
+    fn an_ask_with_no_diff_renders_exactly_as_before() {
+        let mut s = State::test_default();
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "write ./x".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: Vec::new(),
+        };
+        let rows = draw(&s);
+        assert!(rows.join("\n").contains("write ./x"));
+        // Scoped to the card: the input box's own "-- INSERT --" title would
+        // otherwise trip a whole-screen search for a `- ` prefix.
+        for row in card_rows(&rows) {
+            let body = row.trim();
+            assert!(
+                !body.starts_with("+ ") && !body.starts_with("- "),
+                "diff row in a diffless card: {row:?}"
+            );
+        }
+    }
+
+    /// The interior rows of the bordered ask card.
+    fn card_rows(rows: &[String]) -> Vec<String> {
+        let edges: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.contains('┌') || r.contains('└'))
+            .map(|(i, _)| i)
+            .collect();
+        let (&top, &bottom) = (
+            edges.first().expect("card top"),
+            edges.last().expect("card bottom"),
+        );
+        rows[top + 1..bottom]
+            .iter()
+            .map(|r| r.replace(['│', '┃'], " "))
+            .collect()
+    }
+
     /// Tracker #13. A permission ask owns the keyboard; the hint must name the
     /// keys `on_ask_key` actually handles, not the four a live Ctrl-R
     /// advertises — all of which that handler ignores.
@@ -869,6 +960,7 @@ mod tests {
             protected_why: None,
             input: String::new(),
             denying: false,
+            diff: Vec::new(),
         };
         let hint = draw(&s)[HINT].clone();
         assert!(hint.contains("y allow"), "got: {hint}");
@@ -968,6 +1060,7 @@ mod tests {
             protected_why: Some("protected path".into()),
             input: String::new(),
             denying: false,
+            diff: Vec::new(),
         };
         let rows = draw(&s);
         let all = rows.join("\n");
@@ -1464,6 +1557,7 @@ mod tests {
             protected_why: None,
             input: String::new(),
             denying: false,
+            diff: Vec::new(),
         };
         let all = draw(&s).join("\n").replace('\n', " ");
         assert!(
@@ -1548,6 +1642,7 @@ mod tests {
             protected_why: None,
             input: String::new(),
             denying: false,
+            diff: Vec::new(),
         };
         let rows = draw(&s);
         assert!(

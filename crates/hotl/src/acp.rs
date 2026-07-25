@@ -464,6 +464,17 @@ async fn drain_events(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(req_id, reply);
+                // INVARIANT (unimplemented — see
+                // specs/exec-plans/active/0020-remediation-surface.md RQ-2):
+                // an `edit`/`write` ask also carries `"diff"`, the proposed
+                // change, so the human approving a write can see it. The
+                // generator (`crate::diffgen::for_tool`) and the client's
+                // renderer are both built and tested; this call site cannot
+                // use them because `EngineEvent::Ask` carries no `tool`/
+                // `input`. Once it does, this becomes:
+                //     let diff = crate::diffgen::for_tool(tool, input);
+                // plus `"diff": diff.map(|d| d.iter().map(DiffLine::to_json)…)`
+                // in the params below.
                 send(&writer, &json!({
                     "jsonrpc": "2.0", "id": req_id, "method": "session/request_permission",
                     "params": {"sessionId": session_id, "summary": summary, "protectedWhy": protected_why},

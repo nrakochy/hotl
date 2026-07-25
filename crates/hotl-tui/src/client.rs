@@ -7,6 +7,8 @@
 //! separators, not to byte-linewise framing of serde output.)
 
 use hotl_tools::ask::{Question, QuestionOption};
+
+use crate::app::{DiffLine, DiffOp};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -19,6 +21,10 @@ pub enum ServerMsg {
         req_id: u64,
         summary: String,
         protected_why: Option<String>,
+        /// The proposed change, when the server sent one. Absent today for
+        /// every ask — the engine's ask carries no tool input to diff (RQ-2,
+        /// see `hotl::diffgen::for_tool`) — so this decodes to empty.
+        diff: Vec<DiffLine>,
     },
     /// A `session/request_question` reverse-request (`ask_user`, tier-1
     /// gap #4) — NOT a permission gate; answering it never authorizes a tool.
@@ -103,6 +109,27 @@ pub async fn read_server_msg<R: AsyncBufRead + Unpin>(r: &mut R) -> Option<Serve
     }
 }
 
+/// `params.diff` rows, or empty when the server sent none. Unknown ops are
+/// dropped rather than guessed — a newer server's row type must not render as
+/// an unlabelled line in an approval card.
+fn decode_diff(v: Option<&Value>) -> Vec<DiffLine> {
+    let Some(arr) = v.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|row| {
+            Some(DiffLine {
+                op: DiffOp::from_wire(row.get("op").and_then(Value::as_str)?)?,
+                text: row
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
 fn decode(msg: &Value) -> Option<ServerMsg> {
     match msg.get("method").and_then(Value::as_str) {
         Some("session/update") => Some(ServerMsg::Update(msg.pointer("/params/update")?.clone())),
@@ -117,6 +144,7 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
                 .pointer("/params/protectedWhy")
                 .and_then(Value::as_str)
                 .map(String::from),
+            diff: decode_diff(msg.pointer("/params/diff")),
         }),
         Some("session/request_question") => {
             let options = msg
@@ -237,6 +265,7 @@ mod tests {
                 req_id: 7,
                 summary: "run bash".into(),
                 protected_why: Some("prod".into()),
+                diff: Vec::new(),
             }),
             "malformed line is skipped, not fatal"
         );
@@ -248,6 +277,51 @@ mod tests {
             })
         );
         assert_eq!(read_server_msg(&mut r).await, None, "EOF");
+    }
+
+    /// The client half of the diff pipeline. Nothing sends `params.diff` yet
+    /// (RQ-2), so this pins the decode against a hand-built frame — including
+    /// that an absent diff is empty, not a decode failure.
+    #[test]
+    fn a_permission_request_decodes_its_diff_rows() {
+        let msg = json!({
+            "method": "session/request_permission",
+            "id": 3,
+            "params": {"summary": "edit ./x", "diff": [
+                {"op": "ctx", "text": "keep"},
+                {"op": "del", "text": "was"},
+                {"op": "add", "text": "now"},
+                {"op": "sideways", "text": "from a newer server"},
+            ]},
+        });
+        let Some(ServerMsg::PermissionRequest { diff, .. }) = decode(&msg) else {
+            panic!("not a permission request");
+        };
+        assert_eq!(
+            diff,
+            vec![
+                DiffLine {
+                    op: DiffOp::Ctx,
+                    text: "keep".into()
+                },
+                DiffLine {
+                    op: DiffOp::Del,
+                    text: "was".into()
+                },
+                DiffLine {
+                    op: DiffOp::Add,
+                    text: "now".into()
+                },
+            ],
+            "an unknown op is dropped, never rendered unlabelled"
+        );
+
+        let bare = json!({"method": "session/request_permission", "id": 3,
+                          "params": {"summary": "edit ./x"}});
+        let Some(ServerMsg::PermissionRequest { diff, .. }) = decode(&bare) else {
+            panic!("not a permission request");
+        };
+        assert!(diff.is_empty(), "no diff field decodes to no rows");
     }
 
     #[tokio::test]

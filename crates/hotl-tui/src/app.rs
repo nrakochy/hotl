@@ -31,6 +31,10 @@ pub enum Phase {
         protected_why: Option<String>,
         input: String,
         denying: bool,
+        /// The proposed change, when the server sent one. Empty for every ask
+        /// today — see `hotl::diffgen::for_tool`'s unimplemented-invariant
+        /// marker (RQ-2): the engine's ask carries no tool input to diff.
+        diff: Vec<DiffLine>,
     },
     /// A structured `ask_user` question (tier-1 gap #4) — NOT a permission
     /// ask: answering it never authorizes a tool, it only supplies text the
@@ -46,6 +50,36 @@ pub enum Phase {
     Compacting {
         ticks: u64,
     },
+}
+
+/// One row of a proposed change, as it arrives on the wire. The generator
+/// lives in the runtime crate (`hotl::diffgen` — `write`'s "before" is a file
+/// read); this crate only renders what it is handed, so the core stays pure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffOp {
+    Ctx,
+    Add,
+    Del,
+    /// The `[+N more lines]` trailer; never file content.
+    Trailer,
+}
+
+impl DiffOp {
+    pub fn from_wire(s: &str) -> Option<Self> {
+        Some(match s {
+            "ctx" => DiffOp::Ctx,
+            "add" => DiffOp::Add,
+            "del" => DiffOp::Del,
+            "trailer" => DiffOp::Trailer,
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiffLine {
+    pub op: DiffOp,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,6 +263,9 @@ pub enum Msg {
         req_id: u64,
         summary: String,
         protected_why: Option<String>,
+        /// The proposed change, when the server sent one — empty for every
+        /// ask until the engine's ask carries tool input (RQ-2).
+        diff: Vec<DiffLine>,
     },
     QuestionRequest {
         req_id: u64,
@@ -299,6 +336,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             req_id,
             summary,
             protected_why,
+            diff,
         } => {
             state.phase = Phase::WaitingAsk {
                 req_id,
@@ -306,6 +344,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 protected_why,
                 input: String::new(),
                 denying: false,
+                diff,
             };
             // The ask owns the keyboard and the screen now. A popup or a live
             // reverse-i-search left over from mid-typing would steal the first
@@ -1119,6 +1158,7 @@ mod tests {
                 req_id: 7,
                 summary: "run bash: rm -rf ./x".into(),
                 protected_why: None,
+                diff: Vec::new(),
             },
         );
     }
@@ -1233,6 +1273,7 @@ mod tests {
                 req_id: 1,
                 summary: "write ./x".into(),
                 protected_why: None,
+                diff: Vec::new(),
             },
         );
         assert!(
@@ -1380,6 +1421,7 @@ mod tests {
                 req_id: 7,
                 summary: "run bash".into(),
                 protected_why: Some("prod".into()),
+                diff: Vec::new(),
             },
         );
         let before = s.phase.clone();

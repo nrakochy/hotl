@@ -60,6 +60,7 @@ fn ask(state: &mut State) -> Vec<Cmd> {
             req_id: 1,
             summary: "bash: cargo test".into(),
             protected_why: None,
+            diff: Vec::new(),
         },
     )
 }

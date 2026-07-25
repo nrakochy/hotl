@@ -185,10 +185,12 @@ fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
             req_id,
             summary,
             protected_why,
+            diff,
         } => Some(Msg::PermissionRequest {
             req_id,
             summary,
             protected_why,
+            diff,
         }),
         ServerMsg::QuestionRequest { req_id, question } => {
             Some(Msg::QuestionRequest { req_id, question })
