@@ -151,6 +151,11 @@ pub struct AllowRule {
     prefix: Option<String>,
     #[serde(default)]
     path_prefix: Option<String>,
+    /// Which input key this rule matches against, overriding [`SUBJECTS`].
+    /// Required on the *allow* side for any tool absent from that table —
+    /// hotl never infers what a grant over an unknown tool would mean.
+    #[serde(default)]
+    field: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +276,99 @@ impl Rules {
     }
 }
 
+/// How a rule's string is compared against a tool's input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubjectKind {
+    /// A shell command line: segmented and lexed into argv before matching.
+    Command,
+    /// A filesystem path: component-normalized before matching.
+    Path,
+    /// Anything else — a URL, a query, a server or skill name.
+    Text,
+}
+
+/// The declared permission subject of every tool hotl ships: which input keys
+/// a rule matches against, and how they are read. Derived from each tool's
+/// `schema()` — keep in sync when a tool's input changes.
+///
+/// INVARIANT: a tool missing from this table is still governable — a deny rule
+/// falls back to scanning every string leaf, an allow rule requires an explicit
+/// `field`. Enforced by
+/// `unknown_tool_deny_over_matches_while_unknown_tool_allow_under_matches`.
+const SUBJECTS: &[(&str, SubjectKind, &[&str])] = &[
+    ("bash", SubjectKind::Command, &["command"]),
+    ("read", SubjectKind::Path, &["path"]),
+    ("write", SubjectKind::Path, &["path"]),
+    ("edit", SubjectKind::Path, &["path"]),
+    ("glob", SubjectKind::Path, &["path"]),
+    ("grep", SubjectKind::Path, &["path"]),
+    ("web_fetch", SubjectKind::Text, &["urls"]),
+    ("web_search", SubjectKind::Text, &["query"]),
+    ("recall", SubjectKind::Text, &["query", "backend"]),
+    ("skill", SubjectKind::Text, &["name", "source"]),
+    ("spawn", SubjectKind::Text, &["agent_type", "task"]),
+    ("mcp", SubjectKind::Text, &["server", "tool"]),
+];
+
+/// Depth/width caps on the unknown-tool leaf scan: a deny must not become a
+/// denial-of-service on a pathological input tree.
+const LEAF_SCAN_DEPTH: usize = 4;
+const LEAF_SCAN_MAX: usize = 64;
+
+/// The strings a rule tests against, and how to interpret them.
+/// `None` means "this rule cannot apply here" (the allow-side fail-safe).
+fn subject_values(
+    tool: &str,
+    input: &Value,
+    rule: &AllowRule,
+    for_deny: bool,
+) -> Option<(SubjectKind, Vec<String>)> {
+    let declared = SUBJECTS.iter().find(|(t, _, _)| *t == tool);
+    let kind = declared.map(|(_, k, _)| *k).unwrap_or(SubjectKind::Text);
+    if let Some(field) = &rule.field {
+        return Some((kind, strings_at(input, field)));
+    }
+    if let Some((_, _, keys)) = declared {
+        return Some((
+            kind,
+            keys.iter().flat_map(|k| strings_at(input, k)).collect(),
+        ));
+    }
+    // Undeclared tool, undeclared field: deny scans everything, allow declines.
+    for_deny.then(|| (SubjectKind::Text, string_leaves(input)))
+}
+
+/// A top-level key's string value, or the strings of a string array.
+fn strings_at(input: &Value, key: &str) -> Vec<String> {
+    match input.get(key) {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every string in the input tree, bounded in depth and count.
+fn string_leaves(input: &Value) -> Vec<String> {
+    fn walk(v: &Value, depth: usize, out: &mut Vec<String>) {
+        if depth > LEAF_SCAN_DEPTH || out.len() >= LEAF_SCAN_MAX {
+            return;
+        }
+        match v {
+            Value::String(s) => out.push(s.clone()),
+            Value::Array(items) => items.iter().for_each(|i| walk(i, depth + 1, out)),
+            Value::Object(map) => map.values().for_each(|i| walk(i, depth + 1, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(input, 0, &mut out);
+    out
+}
+
 /// Allow-rule matching with the over-allowing carve-outs (verbatim from the
 /// original single-tier loop): bash needs the sandbox floor and refuses
 /// shell operators after the prefix; paths resolve `..` lexically first.
@@ -284,60 +382,91 @@ fn match_allow(
         if rule.tool != tool {
             continue;
         }
-        match tool {
-            "bash" => {
+        let Some((kind, values)) = subject_values(tool, input, rule, false) else {
+            continue; // undeclared subject: a grant is never inferred
+        };
+        match kind {
+            SubjectKind::Command => {
                 if !sandbox_enforced {
                     continue; // carve-out 2: bash rules need the floor
                 }
                 let Some(prefix) = &rule.prefix else { continue };
-                let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
                 // Carve-out 3 (H-02): a prefix is a command-family grant, not
                 // an argument scope. A shell control operator after the prefix
                 // (`git status; curl … | sh`) turns one into arbitrary
                 // execution, so any command carrying one falls back to the ask.
-                if cmd.starts_with(prefix.as_str()) && !has_shell_operator(cmd) {
+                // INVARIANT: a command containing ; | & < > ` \n \r ( ) { } $
+                // never auto-allows. Enforced by
+                // `bash_shell_operators_never_auto_allow`.
+                if values
+                    .iter()
+                    .any(|cmd| cmd.starts_with(prefix.as_str()) && !has_shell_operator(cmd))
+                {
                     return Some(format!("bash prefix `{prefix}`"));
                 }
             }
-            "write" | "edit" => {
+            SubjectKind::Path => {
                 let Some(pp) = &rule.path_prefix else {
                     continue;
                 };
-                let path = input.get("path").and_then(Value::as_str).unwrap_or("");
                 // Carve-out 4 (H-03): resolve `.`/`..` lexically before the
                 // prefix test. `src/../../etc/x` normalizes to `../etc/x`,
                 // which no `src/`-shaped prefix matches, so traversal out of
                 // the intended scope falls back to the ask instead of Auto.
-                if let Some(resolved) = lexically_contained(path, pp) {
+                // INVARIANT: no `..` escape and no absolute path ever matches a
+                // relative allow prefix. Enforced by
+                // `path_traversal_never_auto_allows`.
+                if let Some(resolved) = values.iter().find_map(|p| lexically_contained(p, pp)) {
                     return Some(format!("{tool} path `{pp}` ({resolved})"));
                 }
             }
-            _ => {}
+            SubjectKind::Text => {
+                let Some(prefix) = &rule.prefix else { continue };
+                if values.iter().any(|v| v.starts_with(prefix.as_str())) {
+                    return Some(format!("{tool} `{prefix}`"));
+                }
+            }
         }
     }
     None
 }
 
-/// Deny matching deliberately over-matches: no sandbox or shell-operator
-/// carve-outs (those exist to prevent over-ALLOWING), and paths are tested
-/// both raw and lexically normalized so traversal can't dodge a deny.
+/// Deny matching is the strict side of the pipeline and is deliberately
+/// *broader* than allow matching: no sandbox and no shell-operator carve-out
+/// (those exist to prevent over-ALLOWING), and paths are tested both raw and
+/// lexically normalized so traversal can't dodge a deny.
+///
+/// Every comparison here is `legacy || new`: the raw string tests the original
+/// single-tier loop performed are retained verbatim and OR'd with the sharper
+/// ones, so this tier is monotone in denial — no input denied before a change
+/// is admitted after it.
 fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> {
     for rule in rules {
         if rule.tool != tool {
             continue;
         }
+        let Some((kind, values)) = subject_values(tool, input, rule, true) else {
+            continue;
+        };
         if let Some(prefix) = &rule.prefix {
-            let cmd = input.get("command").and_then(Value::as_str).unwrap_or("");
-            if cmd.starts_with(prefix.as_str()) {
+            // The legacy comparison read `command` for *every* tool, so it is
+            // kept for every kind rather than folded into the Command arm.
+            let legacy = input.get("command").and_then(Value::as_str).unwrap_or("");
+            let hit = legacy.starts_with(prefix.as_str())
+                || match kind {
+                    SubjectKind::Path => false, // path rules use path_prefix
+                    _ => values.iter().any(|v| v.starts_with(prefix.as_str())),
+                };
+            if hit {
                 return Some(format!("{tool} prefix `{prefix}`"));
             }
         }
         if let Some(pp) = &rule.path_prefix {
-            let path = input.get("path").and_then(Value::as_str).unwrap_or("");
             let pp_trim = pp.trim_start_matches("./");
-            if path.trim_start_matches("./").starts_with(pp_trim)
-                || lexical_normalize(path).starts_with(pp_trim)
-            {
+            if values.iter().any(|path| {
+                path.trim_start_matches("./").starts_with(pp_trim)
+                    || lexical_normalize(path).starts_with(pp_trim)
+            }) {
                 return Some(format!("{tool} path `{pp}`"));
             }
         }
@@ -936,5 +1065,127 @@ path_prefix = "src/"
                 "command with a shell operator must not auto-allow: `{evil}`"
             );
         }
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))] // asserts fall-through to auto
+    fn rules_govern_tools_beyond_bash_write_edit() {
+        let r = Rules::from_toml(
+            r#"
+[[deny]]
+tool = "web_fetch"
+field = "urls"
+prefix = "http://evil"
+
+[[deny]]
+tool = "recall"
+field = "query"
+prefix = "secret"
+
+[[deny]]
+tool = "mcp"
+field = "server"
+prefix = "payments"
+"#,
+        )
+        .unwrap()
+        .with_mode(PermissionMode::Auto);
+
+        // web_fetch takes an ARRAY of urls: any element matching denies the call.
+        assert!(matches!(
+            r.evaluate(
+                r.mode(),
+                "web_fetch",
+                &json!({"urls": ["https://ok.example", "http://evil.example/x"]}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            r.evaluate(
+                r.mode(),
+                "web_fetch",
+                &json!({"urls": ["https://ok.example"]}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Auto { .. }
+        ));
+        // recall / mcp: keys that are not `command` or `path`.
+        assert!(matches!(
+            r.evaluate(
+                r.mode(),
+                "recall",
+                &json!({"query": "secret keys"}),
+                true,
+                false,
+                true
+            ),
+            Verdict::Deny { .. }
+        ));
+        assert!(matches!(
+            r.evaluate(
+                r.mode(),
+                "mcp",
+                &json!({"server": "payments", "tool": "refund"}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn unknown_tool_deny_over_matches_while_unknown_tool_allow_under_matches() {
+        // A tool with no entry in SUBJECTS and a rule with no `field`.
+        let denied = Rules::from_toml("[[deny]]\ntool = \"acme_pay\"\nprefix = \"transfer\"\n")
+            .unwrap()
+            .with_mode(PermissionMode::Auto);
+        // Deny scans every string leaf — a future tool cannot be ungovernable.
+        assert!(matches!(
+            denied.evaluate(
+                denied.mode(),
+                "acme_pay",
+                &json!({"op": {"kind": "transfer_funds", "to": "acct-9"}}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Deny { .. }
+        ));
+        // Allow does NOT: a grant over an undeclared subject is never inferred.
+        let granted =
+            Rules::from_toml("[[allow]]\ntool = \"acme_pay\"\nprefix = \"read\"\n").unwrap();
+        assert_eq!(
+            granted.evaluate(
+                PermissionMode::Ask,
+                "acme_pay",
+                &json!({"op": "read_balance"}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Ask
+        );
+        // …unless the rule declares the field explicitly.
+        let explicit =
+            Rules::from_toml("[[allow]]\ntool = \"acme_pay\"\nfield = \"op\"\nprefix = \"read\"\n")
+                .unwrap();
+        assert!(matches!(
+            explicit.evaluate(
+                PermissionMode::Ask,
+                "acme_pay",
+                &json!({"op": "read_balance"}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Auto { .. }
+        ));
     }
 }
