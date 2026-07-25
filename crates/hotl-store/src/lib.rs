@@ -1,9 +1,22 @@
-//! L5 — persistence, M0 slice: one append-only JSONL file per session.
+//! L5 — persistence: one append-only JSONL file per session, written by a
+//! dedicated blocking writer thread.
 //!
 //! The log is permanent by design (log-first spine), which is exactly why
-//! secrets are masked **at ingestion, before bytes land**:
-//! a later cleanup pass can never reach what was already written. Durable-ack
-//! commit semantics arrive with the M1 writer actor; M0 flushes per entry.
+//! secrets are masked **at ingestion, before bytes land**: a later cleanup
+//! pass can never reach what was already written.
+//!
+//! INVARIANT: commit means durable-ack — the writer `sync_data()`s before it
+//! acks, and the actor advances its projection only after that ack
+//! (`specs/design-docs/commit-protocol.md` §Durability ordering). Enforced by
+//! `durable_append_fsyncs_before_it_acks` and, at the engine level, by
+//! `hotl-engine/tests/durability.rs`.
+//!
+//! INVARIANT (unimplemented — see
+//! specs/exec-plans/active/0018-remediation-session-lifecycle.md): the read
+//! path does not yet check `format_version`, and `apply_log` still hard-errors
+//! on a torn trailing line instead of tolerating it at EOF. The write path can
+//! no longer produce one (`seal_and_truncate`), but a log truncated by
+//! anything else still bricks on read.
 
 pub mod retention;
 pub mod shadow;
@@ -174,6 +187,10 @@ pub enum AckTier {
     FlushAndAck,
     /// Ack on enqueue, before the bytes are written. UI telemetry ONLY —
     /// never canon.
+    ///
+    /// INVARIANT: reaching this tier takes naming it; both canon entry points
+    /// (`append`, `append_acked`) are `Durable`. Enforced by
+    /// `buffered_tier_does_not_fsync_and_is_never_the_canon_default`.
     Buffered,
 }
 
@@ -344,10 +361,12 @@ impl SessionLog {
 
     /// Write an oversized tool result to a masked blob beside the log.
     /// Path: `<log stem>.blobs/<sanitized id>[-<hash>].txt`, 0600 in a 0700
-    /// dir, created on first use. The store owns masking, so a secret in the
-    /// result never lands unmasked even in the blob. Blocking, for callers
-    /// outside the actor; the write itself still runs on the writer thread.
-    /// Returns the blob path.
+    /// dir, created on first use. Blocking, for callers outside the actor; the
+    /// write itself still runs on the writer thread. Returns the blob path.
+    ///
+    /// INVARIANT: the store owns masking, so a secret in the result never
+    /// lands unmasked even in the blob. Enforced by
+    /// `blob_is_masked_and_beside_the_log`.
     pub fn write_blob(&self, tool_use_id: &str, content: &str) -> std::io::Result<PathBuf> {
         let (dir, path, bytes) = self.blob_request(tool_use_id, content);
         let (tx, rx) = mpsc::sync_channel(1);
@@ -584,8 +603,10 @@ fn sealed_error(reason: &str) -> std::io::Error {
     ))
 }
 
-/// The one thread that touches the log file. Blocking by construction: this is
-/// where the fsync stall lives, off the async runtime (T1-3).
+/// The one thread that touches the log file — a dedicated OS thread, not a
+/// tokio task, so the `sync_data` stall never lands on an executor worker
+/// (T1-3). That much is a property of how `create` spawns it rather than one a
+/// test asserts; for what an ack *means*, see `SessionLog`'s INVARIANT.
 fn writer_loop(
     mut file: File,
     mut offset: u64,
@@ -1569,6 +1590,31 @@ mod tests {
             "a sealed log must not leave a broken chain: {:?}",
             replayed.warnings
         );
+    }
+
+    #[test]
+    fn the_header_pins_the_wire_format_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 7).unwrap();
+        let first = std::fs::read_to_string(log.path()).unwrap();
+        let first = first.lines().next().expect("a header line");
+
+        // Read side (R8) will key off this field, so pin the *wire* shape, not
+        // just the struct: a rename or a type change must break this test.
+        let raw: serde_json::Value = serde_json::from_str(first).unwrap();
+        assert_eq!(raw["payload"]["kind"], "header");
+        assert_eq!(raw["payload"]["header"]["format_version"], FORMAT_VERSION);
+        assert!(raw["payload"]["header"]["format_version"].is_u64());
+
+        // And it is the first entry, so a reader can decide compatibility from one
+        // line without parsing the log.
+        let entry: Entry = serde_json::from_str(first).unwrap();
+        assert!(entry.parent_id.is_none());
+        let EntryPayload::Header { header } = entry.payload else {
+            panic!("not a header")
+        };
+        assert_eq!(header.format_version, FORMAT_VERSION);
+        assert_eq!(header.created_at_ms, 7);
     }
 
     #[test]
