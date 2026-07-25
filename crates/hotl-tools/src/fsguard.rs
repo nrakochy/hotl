@@ -140,9 +140,6 @@ const OPEN_RD: libc::c_int = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW
 
 /// Open `rel` (root-relative, `..`-free) for reading with no symlink
 /// traversal. Linux takes one atomic `openat2`; everything else descends.
-// Wired into `read` by the next commit (R5 task 2); until then the guard's own
-// tests are the only caller.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn open_beneath(root: &Path, rel: &Path) -> Result<File, GuardError> {
     let file = open_leaf(root, rel, OPEN_RD)?;
     let meta = file.metadata().map_err(GuardError::Io)?;

@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::stream::BoxStream;
-use hotl_engine::{spawn_session, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
+use hotl_engine::{
+    spawn_session, AskReply, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle,
+};
 use hotl_platform::SystemClock;
 use hotl_provider::{Provider, ProviderError, SamplingRequest, ScriptedProvider, StreamEvent};
 use hotl_store::{Masker, SessionLog};
@@ -129,8 +131,17 @@ async fn interrupt_lands_during_the_inline_compaction_summarize() {
     s.handle.prompt("start the long task".into()).await;
     let mut tools_done = 0;
     while tools_done < 2 {
-        if let EngineEvent::ToolDone { .. } = next_event(&mut s).await {
-            tools_done += 1;
+        match next_event(&mut s).await {
+            // The filler `read` targets an absolute tempdir path, which is
+            // outside the working directory the tool guard is anchored to, so
+            // it is a protected ask. Approve it — this test is about the
+            // compaction window, not about permissions. (`speculation.rs`
+            // drives the same script the same way.)
+            EngineEvent::Ask { reply, .. } => {
+                let _ = reply.send(AskReply::Allow);
+            }
+            EngineEvent::ToolDone { .. } => tools_done += 1,
+            _ => {}
         }
     }
     // Let the turn finish and the actor park in the hanging summarize, then

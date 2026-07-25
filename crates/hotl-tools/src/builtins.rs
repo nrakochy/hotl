@@ -89,29 +89,79 @@ impl Tool for ReadTool {
         true
     }
     fn description(&self) -> &str {
-        "Read a text file from the local filesystem. Returns at most 2000 lines / 200KB per call; use `offset` (1-indexed start line) to continue a truncated read."
+        "Read a text file. Paths are relative to the working directory; a path outside it (or one \
+         that leaves it through a symlink) is allowed but requires explicit approval. Returns at \
+         most 2000 lines / 200KB per call; use `offset` (1-indexed start line) to continue a \
+         truncated read."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "File path (absolute or relative to the working directory)"},
+                "path": {"type": "string", "description": "File path, relative to the working directory. An absolute path outside the working directory is permitted but prompts for approval."},
                 "offset": {"type": "integer", "description": "1-indexed line to start from (for continuing truncated reads)"}
             },
             "required": ["path"]
         })
     }
-    fn permission(&self, _input: &Value) -> Permission {
-        Permission::None
+    /// INVARIANT: a read that stays inside the workspace runs unprompted; a
+    /// read that leaves it is `AskProtected` — the one tier that outranks
+    /// `mode=auto` (`rules.rs:232` vs `rules.rs:253`) — so the boundary is
+    /// real in the shipped default configuration, not just in `ask` mode.
+    /// Enforced by `read_outside_the_workspace_is_protected_not_free`.
+    fn permission(&self, input: &Value) -> Permission {
+        let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
+        match fsguard::classify(fsguard::workspace_root(), path) {
+            fsguard::Placement::Inside(_) => Permission::None,
+            fsguard::Placement::Outside(_) => Permission::AskProtected {
+                summary: format!("read {path}"),
+                // Show the human where it really lands, links resolved.
+                why: format!(
+                    "outside the working directory{}: the workspace boundary does not cover it",
+                    match std::fs::canonicalize(path) {
+                        Ok(real) if real != std::path::Path::new(path) =>
+                            format!(" (resolves to {})", real.display()),
+                        _ => String::new(),
+                    }
+                ),
+            },
+        }
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(read_impl(&input).await) })
+        Box::pin(async move { done(read_in(fsguard::workspace_root(), &input).await) })
     }
 }
 
-async fn read_impl(input: &Value) -> ToolResult {
-    use tokio::io::AsyncBufReadExt;
+/// `root`-parameterized so tests drive it against a tempdir without touching
+/// the process-global cwd (the same reason `glob_walk`/`grep_search` were
+/// split out).
+///
+/// INVARIANT: permission-time classification and run-time resolution must
+/// agree, or the call is refused. A path `classify` called `Inside` that turns
+/// out to escape through a symlink is refused with a prompt — never silently
+/// opened, and never silently upgraded to the protected ask it should have
+/// had. That is what makes the fd check safe to do *after* the ask, with no
+/// shared state between the two. Enforced by
+/// `read_refuses_a_symlink_out_of_the_workspace_and_says_how_to_proceed`.
+async fn read_in(root: &std::path::Path, input: &Value) -> ToolResult {
     let path = str_arg(input, "path")?;
+    let file = match fsguard::classify(root, path) {
+        // Inside: the fd descent is the boundary.
+        fsguard::Placement::Inside(rel) => fsguard::open_beneath(root, &rel)
+            .map_err(|e| ToolOutcome::err(e.prompt("read", path)))?,
+        // Outside: the human approved *this path*, so open it plainly —
+        // following links is what they agreed to.
+        fsguard::Placement::Outside(_) => std::fs::File::open(path).map_err(|e| {
+            ToolOutcome::err(format!(
+                "Could not read `{path}`: {e}. Check the path (use `glob`) and try again."
+            ))
+        })?,
+    };
+    read_stream(tokio::fs::File::from_std(file), path, input).await
+}
+
+async fn read_stream(file: tokio::fs::File, path: &str, input: &Value) -> ToolResult {
+    use tokio::io::AsyncBufReadExt;
     let offset = input
         .get("offset")
         .and_then(Value::as_u64)
@@ -123,8 +173,9 @@ async fn read_impl(input: &Value) -> ToolResult {
         ))
     };
     // Stream line by line: nothing before `offset` or past the caps is ever
-    // retained, but lines are still counted to the end for honest totals.
-    let file = tokio::fs::File::open(path).await.map_err(read_err)?;
+    // retained, but lines are still counted to the end for honest totals. The
+    // handle arrives already validated by the guard — this never re-opens by
+    // name, which is the whole point of the containment layer.
     let mut lines = tokio::io::BufReader::new(file).lines();
     let mut out = String::new();
     let mut taken = 0usize;
@@ -712,6 +763,69 @@ mod tests {
             .build()
             .unwrap()
             .block_on(tool.run(input, CancellationToken::new()))
+    }
+
+    #[test]
+    fn read_inside_the_workspace_needs_no_permission() {
+        let inside = json!({"path": "Cargo.toml"});
+        assert_eq!(ReadTool.permission(&inside), Permission::None);
+        assert_eq!(
+            ReadTool.permission(&json!({"path": "src/../src/lib.rs"})),
+            Permission::None
+        );
+    }
+
+    #[test]
+    fn read_outside_the_workspace_is_protected_not_free() {
+        // T1-6's headline: this ran with NO prompt, in every mode, including
+        // plan and dontask.
+        let out = ReadTool.permission(&json!({"path": "/Users/you/.ssh/id_rsa"}));
+        match out {
+            Permission::AskProtected { summary, why } => {
+                assert!(summary.contains("id_rsa"));
+                assert!(why.contains("outside the working directory"), "{why}");
+            }
+            other => panic!("out-of-workspace read must be protected, got {other:?}"),
+        }
+        // `..` escapes are the same class.
+        assert!(matches!(
+            ReadTool.permission(&json!({"path": "../../etc/shadow"})),
+            Permission::AskProtected { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_refuses_a_symlink_out_of_the_workspace_and_says_how_to_proceed() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        std::os::unix::fs::symlink(home.join("id_rsa"), root.join("notes.md")).unwrap();
+        let out = done(read_in(&root, &json!({"path": "notes.md"})).await);
+        assert!(out.is_error);
+        assert!(
+            !out.content.contains("BEGIN PRIVATE KEY"),
+            "leaked through the link"
+        );
+        assert!(
+            out.content.contains("absolute path"),
+            "must be a prompt: {}",
+            out.content
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approved_absolute_read_still_works() {
+        // The escalation is an ask, not a ban: reading ~/.gitconfig is a
+        // legitimate request that should simply be prompted.
+        let (_o, _root, home) = fsguard::tests::fixture();
+        let p = home.join("id_rsa");
+        let out = done(
+            read_in(
+                fsguard::workspace_root(),
+                &json!({"path": p.to_str().unwrap()}),
+            )
+            .await,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("BEGIN PRIVATE KEY"));
     }
 
     #[test]

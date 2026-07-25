@@ -562,8 +562,12 @@ mod tests {
 
     #[tokio::test]
     async fn auto_mode_doom_loop_stops_without_asking() {
+        // A *relative* path: `read` is only unprompted inside the working
+        // directory, and an absolute one is a protected ask that deliberately
+        // outranks `mode=auto`. This test is about auto mode not asking for an
+        // ordinary call, so the call has to be an ordinary one.
         let scripts: Vec<_> = (0..5)
-            .map(|_| ScriptedProvider::tool_call("t", "read", json!({"path": "/same"})))
+            .map(|_| ScriptedProvider::tool_call("t", "read", json!({"path": "same"})))
             .collect();
         let mut h = Harness::with_rules(
             scripts,
@@ -604,9 +608,23 @@ mod tests {
                 text: "The file says hello.".into()
             }
         );
+        // The fixture is an absolute tempdir path, i.e. outside the working
+        // directory, so the read is a protected ask before it runs. The
+        // pending_ask/ask_resolved pair is part of the golden: it pins that an
+        // out-of-tree read is gated and that the gate is journalled.
         assert_eq!(
             h.kinds(),
-            ["header", "item", "item", "usage", "item", "item", "usage"]
+            [
+                "header",
+                "item",
+                "item",
+                "usage",
+                "pending_ask",
+                "ask_resolved",
+                "item",
+                "item",
+                "usage"
+            ]
         );
         // Golden: the normalized transcript is stable across runs.
         let t1 = h.transcript();
