@@ -138,15 +138,17 @@ fn format_hits(hits: &[Hit]) -> String {
     out.trim_end().to_string()
 }
 
+// INVARIANT: `recall` is NOT read-only. Its shipped backend (`McpRetriever`)
+// spawns an arbitrary configured program, so plan mode must deny it and a
+// `ToolScope::ReadOnly` subagent must not receive it (T2-8). The trait default
+// is `false` and `recall` takes it — there is deliberately no override here.
+// Enforced by `recall_is_not_read_only_because_a_backend_may_spawn_a_program`.
 impl Tool for RecallTool {
     fn name(&self) -> &'static str {
         "recall"
     }
     fn description(&self) -> &str {
         &self.description
-    }
-    fn read_only(&self) -> bool {
-        true
     }
     fn schema(&self) -> Value {
         json!({
@@ -279,6 +281,16 @@ mod tests {
         assert!(out.is_error);
         assert!(out.content.contains("source=\"recall:notes\""));
         assert_eq!(out.content.matches("</tool-result>").count(), 1, "defanged");
+    }
+
+    #[test]
+    fn recall_is_not_read_only_because_a_backend_may_spawn_a_program() {
+        let tool = RecallTool::new(vec![notes(one_hit())]);
+        assert!(
+            !tool.read_only(),
+            "T2-8: read_only() gates plan mode, ReadOnly subagents, and all_read_only(); \
+             the shipped MCP backend spawns an arbitrary configured program"
+        );
     }
 
     #[tokio::test]

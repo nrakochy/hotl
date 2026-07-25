@@ -9,12 +9,11 @@ use futures_util::future::BoxFuture;
 use hotl_engine::{spawn_session, AskReply, EngineConfig, EngineEvent, SessionDeps, SessionHandle};
 use hotl_platform::SystemClock;
 use hotl_provider::ScriptedProvider;
-use hotl_retrieval::{Hit, Query, RecallTool, Retriever, SourceRef};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::rules::{PermissionMode, Rules};
-use hotl_tools::{Permission, Registry};
+use hotl_tools::{Permission, Registry, Tool, ToolOutcome};
 use hotl_types::{EntryPayload, Item};
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 struct Session {
@@ -104,33 +103,41 @@ async fn plan_mode_denies_write_tool_result() {
     );
 }
 
-/// A backend whose permission still asks (not `Permission::None`) but is
-/// structurally read-only: `recall` never mutates. Plan mode must not
-/// plan-block it — only *classify* it via `Tool::read_only()`, exactly what
-/// the gate is supposed to consult.
-struct AskingRetriever {
-    hits: Vec<Hit>,
-}
+/// A tool whose permission still asks (not `Permission::None`) but which is
+/// structurally read-only. Plan mode must not plan-block it — only *classify*
+/// it via `Tool::read_only()`, exactly what the gate is supposed to consult.
+///
+/// This used to be `RecallTool` wrapped around a static backend. It is a
+/// hand-rolled tool now because `recall` left this class: its shipped backend
+/// spawns an arbitrary configured program, so `RecallTool::read_only()` is
+/// `false` (T2-8). The gate's behaviour is unchanged — only the vehicle is.
+struct AskingReadOnlyTool;
 
-impl Retriever for AskingRetriever {
-    fn name(&self) -> &str {
-        "notes"
+impl Tool for AskingReadOnlyTool {
+    fn name(&self) -> &'static str {
+        "peek"
     }
     fn description(&self) -> &str {
-        "test notes"
+        "look something up without changing it"
     }
-    fn permission(&self, query: &str) -> Permission {
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"]
+        })
+    }
+    fn permission(&self, input: &Value) -> Permission {
+        let query = input.get("query").and_then(Value::as_str).unwrap_or("?");
         Permission::Ask {
-            summary: format!("recall: notes \"{query}\""),
+            summary: format!("peek: \"{query}\""),
         }
     }
-    fn search<'a>(
-        &'a self,
-        _query: &'a Query,
-        _cancel: CancellationToken,
-    ) -> BoxFuture<'a, Result<Vec<Hit>, String>> {
-        let hits = self.hits.clone();
-        Box::pin(async move { Ok(hits) })
+    fn run<'a>(&'a self, _input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async { ToolOutcome::ok("Prefer thiserror for library errors.") })
     }
 }
 
@@ -141,19 +148,9 @@ async fn plan_mode_does_not_block_a_read_only_tool_that_still_asks() {
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
         .expect("session log");
     let mut registry = Registry::builtin();
-    registry.register(Box::new(RecallTool::new(vec![Box::new(AskingRetriever {
-        hits: vec![Hit {
-            source: SourceRef::File {
-                path: "notes/rust.md".into(),
-                line: Some(12),
-            },
-            excerpt: "Prefer thiserror for library errors.".into(),
-            score: None,
-            indexed_at_unix: None,
-        }],
-    })])));
+    registry.register(Box::new(AskingReadOnlyTool));
     let provider = Arc::new(ScriptedProvider::new(vec![
-        ScriptedProvider::tool_call("t1", "recall", json!({"query": "error handling style"})),
+        ScriptedProvider::tool_call("t1", "peek", json!({"query": "error handling style"})),
         ScriptedProvider::text_reply("done"),
     ]));
     let handle = spawn_session(SessionDeps {
