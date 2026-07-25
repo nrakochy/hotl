@@ -40,8 +40,14 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         Err(code) => return code,
     };
     match (parsed.schema, parsed.prompt) {
-        (Some(schema), Some(prompt)) => structured_main(&prompt, &schema, parsed.name).await,
-        (None, Some(prompt)) => run_session(prompt, parsed.json_events, parsed.name).await,
+        (Some(schema), Some(prompt)) => match prompt.resolve() {
+            Ok(text) => structured_main(&text, &schema, parsed.name).await,
+            Err(code) => code,
+        },
+        (None, Some(prompt)) => match prompt.resolve() {
+            Ok(text) => run_session(text, parsed.json_events, parsed.name).await,
+            Err(code) => code,
+        },
         // Reachable via e.g. `hotl --json` with no -p (main.rs routes any
         // headless flag here); the interactive console is bare `hotl`.
         (_, None) => {
@@ -1450,22 +1456,72 @@ impl Surface {
 }
 
 /// `(-p prompt, --json)`; `Err(exit_code)` on bad usage.
+/// Where the headless prompt comes from. `-p -`, and a bare `-p`, mean
+/// stdin — the shape people actually type when piping.
+#[derive(Debug, PartialEq, Eq)]
+enum Prompt {
+    Text(String),
+    Stdin,
+}
+
+impl Prompt {
+    /// Resolve to the prompt text, reading stdin to EOF when that is the
+    /// source. `Err` carries the exit code.
+    fn resolve(self) -> Result<String, i32> {
+        let text = match self {
+            Prompt::Text(t) => t,
+            Prompt::Stdin => {
+                use std::io::IsTerminal;
+                // A tty with no prompt is the old usage error, not a hang
+                // waiting for someone to type a document and press Ctrl-D.
+                if std::io::stdin().is_terminal() {
+                    eprintln!("hotl: -p requires a prompt (or pipe one in: `echo … | hotl -p -`)");
+                    return Err(2);
+                }
+                let mut buf = String::new();
+                if let Err(e) = std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                    eprintln!("hotl: could not read the prompt from stdin: {e}");
+                    return Err(2);
+                }
+                buf
+            }
+        };
+        if text.trim().is_empty() {
+            eprintln!("hotl: -p requires a prompt");
+            return Err(2);
+        }
+        Ok(text)
+    }
+}
+
 struct Args {
-    prompt: Option<String>,
+    prompt: Option<Prompt>,
     json_events: bool,
     schema: Option<PathBuf>,
     name: Option<String>,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
-    let mut prompt: Option<String> = None;
+    let mut prompt: Option<Prompt> = None;
     let mut json_events = false;
     let mut schema: Option<PathBuf> = None;
     let mut name: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "-p" | "--print" => prompt = iter.next(),
+            // `-p -` and a bare `-p` both read stdin. A following flag is
+            // not a prompt: `-p --json` means "prompt on stdin, JSON out".
+            "-p" | "--print" => {
+                prompt = Some(match iter.as_slice().first() {
+                    Some(next) if next == "-" => {
+                        iter.next();
+                        Prompt::Stdin
+                    }
+                    Some(next) if next.starts_with('-') => Prompt::Stdin,
+                    None => Prompt::Stdin,
+                    _ => Prompt::Text(iter.next().expect("peeked")),
+                })
+            }
             "--json" => json_events = true,
             "--json-schema" => schema = iter.next().map(PathBuf::from),
             "-n" | "--name" => {
@@ -1486,10 +1542,6 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
                 return Err(2);
             }
         }
-    }
-    if prompt.is_some() && prompt.as_deref().map(str::trim).unwrap_or("").is_empty() {
-        eprintln!("hotl: -p requires a prompt");
-        return Err(2);
     }
     if schema.is_some() && prompt.is_none() {
         eprintln!("hotl: --json-schema requires -p \"<prompt>\"");
@@ -2739,6 +2791,25 @@ mod tests {
         let err = select_provider(&cfg, &MapSecrets::default()).err().unwrap();
         assert!(err.contains("ANTHROPIC_API_KEY"), "{err}");
         assert!(err.contains("api_key_helper"), "{err}");
+    }
+
+    #[test]
+    fn dash_prompt_and_piped_stdin_are_accepted() {
+        fn v(args: &[&str]) -> Vec<String> {
+            args.iter().map(|s| s.to_string()).collect()
+        }
+
+        assert_eq!(
+            parse_args(v(&["-p", "-"])).unwrap().prompt,
+            Some(Prompt::Stdin)
+        );
+        assert_eq!(
+            parse_args(v(&["-p", "hello"])).unwrap().prompt,
+            Some(Prompt::Text("hello".into()))
+        );
+        // Bare -p keeps meaning "read stdin"; the tty check happens at the caller.
+        assert_eq!(parse_args(v(&["-p"])).unwrap().prompt, Some(Prompt::Stdin));
+        assert!(parse_args(v(&["-p", "--nope"])).is_err());
     }
 
     #[test]

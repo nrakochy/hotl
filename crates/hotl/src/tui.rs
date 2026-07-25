@@ -270,6 +270,12 @@ async fn run_loop(
         while let Some(cmd) = queue.pop_front() {
             // The wire-bound half is shared with the e2e harness; what comes
             // back is the terminal-bound remainder this loop owns.
+            // `@[file]` expands on the way out only.
+            let cmd = match cmd {
+                Cmd::SendPrompt(text) => Cmd::SendPrompt(outbound(&text)),
+                Cmd::SendSteer(text) => Cmd::SendSteer(outbound(&text)),
+                other => other,
+            };
             let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids).await else {
                 continue;
             };
@@ -288,6 +294,15 @@ async fn run_loop(
             }
         }
     }
+}
+
+/// What actually leaves for the model: `@[path]` references expanded to file
+/// contents. Expansion happens here, not in `hotl-tui`, because it reads the
+/// filesystem and the core crate must stay pure. The consequence is the right
+/// one: the transcript shows what the human typed, the model receives the
+/// expansion — matching how `-p` already behaves.
+fn outbound(text: &str) -> String {
+    crate::setup::expand_file_refs(text)
 }
 
 /// Transcript items per wheel notch — a third of a page (`scroll::PAGE`).
@@ -544,6 +559,16 @@ mod tests {
     use hotl_tui::app::Msg;
     use serde_json::json;
     use std::time::SystemTime;
+
+    #[test]
+    fn file_refs_expand_on_the_way_out_not_in_the_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("note.txt");
+        std::fs::write(&p, "CONTENTS").unwrap();
+        let typed = format!("look at @[{}]", p.display());
+        assert!(super::outbound(&typed).contains("CONTENTS"));
+        assert_eq!(super::outbound("plain"), "plain");
+    }
 
     #[test]
     fn handshake_reads_the_mode_and_context_window() {
