@@ -38,6 +38,14 @@ const MAX_COMPACT_STREAK: u32 = 2;
 /// INVARIANT: the actor's command loop stalls for at most this long on a fold.
 /// Enforced by `a_hung_inline_summarize_degrades_instead_of_wedging`.
 const COMPACT_SUMMARIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Queued prompts before new ones coalesce into the last entry (T3-7).
+const QUEUE_MAX: usize = 64;
+/// Bytes of held steering (or coalesced prompt) text before folding truncates
+/// with a marker.
+const HELD_BYTES_MAX: usize = 64 * 1024;
+/// In-band disclosure that a fold dropped text. Stripped before each new fold
+/// so repeated folding never stacks markers.
+const FOLD_MARK: &str = "\n[… later text truncated]";
 
 /// Dependencies shared with turn tasks. The log is *not* here: only the actor
 /// loop writes it, so it lives as a local in [`run`].
@@ -517,6 +525,29 @@ fn outcome_detail(outcome: &Outcome) -> String {
     }
 }
 
+/// Append `text` to `dst`, keeping the *head* and disclosing any truncation
+/// in-band. Dropping a user's words silently is worse than telling the model
+/// some were dropped, and an unbounded buffer is worse than both.
+/// INVARIANT: neither the prompt queue nor the held-steer buffer grows without
+/// bound. Enforced by `folding_bounds_the_buffer_and_discloses_the_truncation`.
+fn fold_into(dst: &mut String, text: &str, max_bytes: usize) {
+    if dst.ends_with(FOLD_MARK) {
+        dst.truncate(dst.len() - FOLD_MARK.len());
+    }
+    if !dst.is_empty() {
+        dst.push_str("\n\n");
+    }
+    dst.push_str(text);
+    if dst.len() > max_bytes {
+        let mut end = max_bytes;
+        while !dst.is_char_boundary(end) {
+            end -= 1;
+        }
+        dst.truncate(end);
+        dst.push_str(FOLD_MARK);
+    }
+}
+
 /// Whether the projection is mid-batch: it ends on an assistant turn whose
 /// tool calls have no results yet. Both APIs require those results to be the
 /// very next message, so nothing else may be appended in this window.
@@ -551,7 +582,13 @@ async fn admit_steer(
     text: String,
 ) {
     if sampling || awaiting_tool_results(items) {
-        held.push(text);
+        // Past the byte cap, coalesce into the last held steer rather than grow
+        // without bound — every entry is committed at once on release.
+        let total: usize = held.iter().map(String::len).sum();
+        match held.last_mut() {
+            Some(last) if total >= HELD_BYTES_MAX => fold_into(last, &text, HELD_BYTES_MAX),
+            _ => held.push(text),
+        }
         return;
     }
     append_steer(shared, log, items, text).await;
@@ -848,7 +885,17 @@ async fn admit_prompt(
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
     if running {
-        queue.push_back((text, synthetic));
+        let full = queue.len() >= QUEUE_MAX;
+        match queue.back_mut() {
+            // Past the cap the prompt is folded into the last pending entry
+            // rather than pushed: memory is bounded and nothing vanishes
+            // without the model being told. It *was* absorbed, so the event is
+            // still `PromptQueued`. A folded prompt inherits the tag of the
+            // entry it joins — only reachable past QUEUE_MAX pending prompts,
+            // where provenance has already stopped being per-prompt.
+            Some(last) if full => fold_into(&mut last.0, &text, HELD_BYTES_MAX),
+            _ => queue.push_back((text, synthetic)),
+        }
         let _ = events.send(EngineEvent::PromptQueued).await;
         return true;
     }
@@ -993,7 +1040,7 @@ fn respawn_turn(
 #[cfg(test)]
 mod tests {
     use super::COMPACT_SUMMARIZE_TIMEOUT;
-    use super::{awaiting_tool_results, pair_tool_results, summarize_bounded};
+    use super::{awaiting_tool_results, fold_into, pair_tool_results, summarize_bounded};
     use hotl_types::{Item, SyntheticReason, ToolResultItem};
     use serde_json::json;
 
@@ -1047,6 +1094,42 @@ mod tests {
                 is_error: false,
             }],
         }
+    }
+
+    /// T3-7: dropping a user's words silently is worse than telling the model
+    /// some were dropped, and an unbounded buffer is worse than both.
+    #[test]
+    fn folding_bounds_the_buffer_and_discloses_the_truncation() {
+        let mut dst = String::from("first");
+        fold_into(&mut dst, &"x".repeat(10_000), 128);
+        assert!(
+            dst.len() <= 128 + 64,
+            "fold must bound the entry, got {}",
+            dst.len()
+        );
+        assert!(
+            dst.starts_with("first"),
+            "the oldest text is kept, not clobbered"
+        );
+        assert!(
+            dst.contains("truncated"),
+            "truncation must be disclosed in-band"
+        );
+        // Idempotent under repeated folding — 1000 folds stay bounded, and the
+        // marker never stacks.
+        for _ in 0..1_000 {
+            fold_into(&mut dst, "more", 128);
+        }
+        assert!(dst.len() <= 128 + 64, "got {}", dst.len());
+        assert!(dst.starts_with("first"));
+    }
+
+    #[test]
+    fn folding_under_the_cap_keeps_every_word() {
+        let mut dst = String::from("first");
+        fold_into(&mut dst, "second", 1_024);
+        assert!(dst.contains("first") && dst.contains("second"));
+        assert!(!dst.contains("truncated"), "nothing was dropped: {dst}");
     }
 
     #[test]
