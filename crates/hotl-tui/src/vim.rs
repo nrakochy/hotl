@@ -191,6 +191,17 @@ impl Editor {
                 }
                 EditorEvent::None
             }
+            // Line motions, as every text editor binds them. The transcript's
+            // document-start/end is Ctrl-Home/Ctrl-End, intercepted in
+            // `app::on_key` before the key ever reaches here.
+            KeyCode::Home => {
+                self.cursor.1 = 0;
+                EditorEvent::None
+            }
+            KeyCode::End => {
+                self.cursor.1 = char_len(&self.lines[self.cursor.0]);
+                EditorEvent::None
+            }
             KeyCode::Char(c) => {
                 self.end_recall();
                 let (row, col) = self.cursor;

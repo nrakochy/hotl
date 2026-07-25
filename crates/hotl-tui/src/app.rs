@@ -182,6 +182,9 @@ pub enum Msg {
         usage: Value,
     },
     Key(KeyEvent),
+    /// Transcript scroll from a key or the mouse wheel. Vim's `j`/`k` reach
+    /// the same `scroll::apply` via `EditorEvent::Scroll*`.
+    Scroll(crate::scroll::Intent),
     Tick,
     /// `$EDITOR` result; `None` = unchanged/aborted.
     EditorDone(Option<String>),
@@ -265,6 +268,10 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             usage,
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage),
         Msg::Key(key) => on_key(state, key),
+        Msg::Scroll(intent) => {
+            crate::scroll::apply(state, intent);
+            Vec::new()
+        }
         Msg::Tick => {
             on_tick(state);
             Vec::new()
@@ -487,6 +494,27 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     if matches!(state.phase, Phase::WaitingQuestion { .. }) {
         return on_question_key(state, key);
     }
+    // Transcript scrolling, unconditional — not gated on vim mode, which is
+    // the whole defect (`vim.rs::vertical` was the only emitter and needs
+    // `[behavior] vim_mode = true`). PageUp/PageDown have no meaning in a
+    // ten-row input box, so they need no layering; Ctrl-Home/Ctrl-End is the
+    // document-start/end convention, leaving bare Home/End as line motions.
+    // This sits above the editor because the generic Ctrl swallow in
+    // `Editor::handle` would otherwise eat Ctrl-Home.
+    // INVARIANT: reachable with `[behavior] vim_mode = false`. Enforced by
+    // `page_keys_scroll_the_transcript_without_vim_mode`.
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let intent = match key.code {
+        KeyCode::PageUp => Some(crate::scroll::Intent::Up(crate::scroll::PAGE)),
+        KeyCode::PageDown => Some(crate::scroll::Intent::Down(crate::scroll::PAGE)),
+        KeyCode::Home if ctrl => Some(crate::scroll::Intent::Top),
+        KeyCode::End if ctrl => Some(crate::scroll::Intent::Bottom),
+        _ => None,
+    };
+    if let Some(intent) = intent {
+        crate::scroll::apply(state, intent);
+        return Vec::new();
+    }
     if key.code == KeyCode::Esc && state.phase != Phase::Idle && state.editor.is_empty() {
         if !state.interrupt_sent {
             state.interrupt_sent = true;
@@ -551,21 +579,11 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         }
         EditorEvent::OpenExternal(text) => vec![Cmd::OpenEditor(text)],
         EditorEvent::ScrollUp => {
-            let cur = match state.scroll {
-                Scroll::Follow => state.transcript.len(),
-                Scroll::At(i) => i,
-            };
-            state.scroll = Scroll::At(cur.saturating_sub(1));
+            crate::scroll::apply(state, crate::scroll::Intent::Up(1));
             Vec::new()
         }
         EditorEvent::ScrollDown => {
-            if let Scroll::At(i) = state.scroll {
-                state.scroll = if i + 1 >= state.transcript.len() {
-                    Scroll::Follow
-                } else {
-                    Scroll::At(i + 1)
-                };
-            }
+            crate::scroll::apply(state, crate::scroll::Intent::Down(1));
             Vec::new()
         }
         EditorEvent::None => Vec::new(),
@@ -882,6 +900,19 @@ mod tests {
         )
     }
 
+    /// A non-`Char` key with modifiers (Ctrl-Home, Ctrl-End, …).
+    fn press_mod(s: &mut State, code: KeyCode, mods: KeyModifiers) -> Vec<Cmd> {
+        update(s, Msg::Key(KeyEvent::new(code, mods)))
+    }
+
+    fn notices(n: usize) -> Vec<TranscriptItem> {
+        (0..n)
+            .map(|i| TranscriptItem::Notice {
+                text: i.to_string(),
+            })
+            .collect()
+    }
+
     fn type_str(s: &mut State, text: &str) {
         for c in text.chars() {
             press(s, KeyCode::Char(c));
@@ -897,6 +928,36 @@ mod tests {
                 protected_why: None,
             },
         );
+    }
+
+    #[test]
+    fn page_keys_scroll_the_transcript_without_vim_mode() {
+        // The regression: scroll used to be reachable only from vim Normal
+        // mode, which `[behavior] vim_mode = false` (the default) makes
+        // unreachable.
+        let mut s = State::new(false, "m".into());
+        s.transcript = notices(30);
+        press(&mut s, KeyCode::PageUp);
+        assert_eq!(s.scroll, Scroll::At(20));
+        press_mod(&mut s, KeyCode::Home, KeyModifiers::CONTROL);
+        assert_eq!(s.scroll, Scroll::At(0));
+        press_mod(&mut s, KeyCode::End, KeyModifiers::CONTROL);
+        assert_eq!(s.scroll, Scroll::Follow);
+        press(&mut s, KeyCode::PageDown);
+        assert_eq!(s.scroll, Scroll::Follow);
+        assert!(s.editor.text().is_empty(), "scroll keys must not type");
+    }
+
+    #[test]
+    fn bare_home_and_end_are_line_motions_not_scroll() {
+        let mut s = State::new(false, "m".into());
+        s.transcript = notices(30);
+        s.editor.set_text("hello world");
+        press(&mut s, KeyCode::Home);
+        assert_eq!(s.editor.cursor(), (0, 0));
+        assert_eq!(s.scroll, Scroll::Follow, "bare Home must not scroll");
+        press(&mut s, KeyCode::End);
+        assert_eq!(s.editor.cursor(), (0, 11));
     }
 
     #[test]
