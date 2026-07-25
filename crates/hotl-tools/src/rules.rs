@@ -468,11 +468,7 @@ fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> 
             }
         }
         if let Some(pp) = &rule.path_prefix {
-            let pp_trim = pp.trim_start_matches("./");
-            if values.iter().any(|path| {
-                path.trim_start_matches("./").starts_with(pp_trim)
-                    || lexical_normalize(path).starts_with(pp_trim)
-            }) {
+            if values.iter().any(|path| deny_path_matches(path, pp)) {
                 return Some(format!("{tool} path `{pp}`"));
             }
         }
@@ -509,6 +505,48 @@ fn probe(tool: &str) -> AllowRule {
         path_prefix: None,
         field: None,
     }
+}
+
+/// Deny-side path matching, component-anchored in both directions.
+///
+/// An **absolute** `path_prefix` anchors at the filesystem root. A **relative**
+/// one matches its component sequence anywhere in the path, so `.ssh/` denies
+/// `.ssh/id_rsa`, `src/../.ssh/config`, and `/Users/you/.ssh/authorized_keys`
+/// alike. That is a deliberate over-match: on the deny side, catching a path
+/// the user did not mean costs an ask, while missing one costs the secret.
+/// Users who want anchoring write an absolute prefix.
+///
+/// Matching is on whole components — `.ssh/` never matches `.sshfs/`.
+///
+/// INVARIANT: relative deny prefixes match at any depth, absolute ones only at
+/// the root. Enforced by `deny_path_prefix_matches_absolute_and_relative`.
+fn deny_path_matches(path: &str, prefix: &str) -> bool {
+    // Legacy raw comparison, preserved so this change only ever adds denials.
+    let pp_trim = prefix.trim_start_matches("./");
+    if path.trim_start_matches("./").starts_with(pp_trim)
+        || lexical_normalize(path).starts_with(pp_trim)
+    {
+        return true;
+    }
+    let pat: Vec<&str> = components(prefix);
+    if pat.is_empty() {
+        return true; // an empty prefix denies everything, as before
+    }
+    let normalized = lexical_normalize(path);
+    let hay: Vec<&str> = components(&normalized);
+    if prefix.starts_with('/') {
+        return normalized.starts_with('/')
+            && hay.len() >= pat.len()
+            && hay[..pat.len()] == pat[..];
+    }
+    hay.windows(pat.len()).any(|w| w == pat.as_slice())
+}
+
+/// Path components, with empty/`.` segments dropped.
+fn components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect()
 }
 
 /// `$` and `` ` `` mean the command that runs is not the command in the string:
@@ -700,7 +738,11 @@ fn lexical_normalize(path: &str) -> String {
         }
     }
     // Preserve absoluteness so an absolute path never matches a relative
-    // prefix (and vice-versa) after normalization.
+    // prefix (and vice-versa) after normalization. This is an ALLOW-side
+    // property — see `deny_path_matches`, which deliberately compares
+    // component-wise in both directions.
+    // INVARIANT: no absolute path satisfies a relative allow prefix. Enforced
+    // by `path_traversal_never_auto_allows`.
     if absolute {
         format!("/{}", out.join("/"))
     } else {
@@ -1510,5 +1552,39 @@ prefix = "payments"
             ),
             Verdict::Auto { .. }
         ));
+    }
+
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn deny_path_prefix_matches_absolute_and_relative() {
+        let r = Rules::from_toml(
+            "[[deny]]\ntool = \"write\"\npath_prefix = \".ssh/\"\n\n[[deny]]\ntool = \"edit\"\npath_prefix = \"/etc/\"\n",
+        )
+        .unwrap()
+        .with_mode(PermissionMode::Auto);
+        let denied = |tool: &str, path: &str| {
+            matches!(
+                r.evaluate(r.mode(), tool, &json!({"path": path}), true, false, false),
+                Verdict::Deny { .. }
+            )
+        };
+
+        // The §8 gap: a relative deny prefix must catch the absolute form.
+        for path in [
+            ".ssh/authorized_keys",
+            "./.ssh/authorized_keys",
+            "src/../.ssh/config",
+            "/Users/you/.ssh/authorized_keys",
+            "/home/you/.ssh/id_ed25519",
+            "../../.ssh/known_hosts",
+        ] {
+            assert!(denied("write", path), "deny must block `{path}`");
+        }
+        // An absolute deny prefix anchors at the root — no accidental suffix match.
+        assert!(denied("edit", "/etc/cron.d/x"));
+        assert!(!denied("edit", "/home/you/etc/notes.md"));
+        // Component-anchored, not substring: `.sshfs` is a different directory.
+        assert!(!denied("write", ".sshfs/config"));
+        assert!(!denied("write", "docs/notes.md"));
     }
 }
