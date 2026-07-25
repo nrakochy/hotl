@@ -11,6 +11,8 @@ use tokio_util::sync::CancellationToken;
 
 const READ_MAX_BYTES: usize = 200 * 1024;
 const READ_MAX_LINES: usize = 2000;
+/// The most one "line" may ever occupy. A minified bundle is one line.
+const READ_MAX_LINE: usize = 8 * 1024;
 const BASH_DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const BASH_MAX_TIMEOUT_MS: u64 = 600_000;
 const BASH_MAX_OUTPUT: usize = 50 * 1024;
@@ -127,15 +129,16 @@ impl Tool for ReadTool {
     fn description(&self) -> &str {
         "Read a text file. Paths are relative to the working directory; a path outside it (or one \
          that leaves it through a symlink) is allowed but requires explicit approval. Returns at \
-         most 2000 lines / 200KB per call; use `offset` (1-indexed start line) to continue a \
-         truncated read."
+         most 2000 lines / 200KB per call, and any single line over 8KB is clipped; use \
+         `offset`/`limit` to continue a truncated read."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path, relative to the working directory. An absolute path outside the working directory is permitted but prompts for approval."},
-                "offset": {"type": "integer", "description": "1-indexed line to start from (for continuing truncated reads)"}
+                "offset": {"type": "integer", "description": "1-indexed line to start from (for continuing truncated reads)"},
+                "limit": {"type": "integer", "description": "Maximum lines to return (default 2000)"}
             },
             "required": ["path"]
         })
@@ -196,55 +199,146 @@ async fn read_in(root: &std::path::Path, input: &Value) -> ToolResult {
     read_stream(tokio::fs::File::from_std(file), path, input).await
 }
 
+/// The output window: which lines were kept, and where the next call resumes.
+struct ReadWindow {
+    out: String,
+    offset: usize,
+    limit: usize,
+    taken: usize,
+    last: usize,
+    /// Set once the window closed; the line the next call should start at.
+    next: Option<usize>,
+}
+
+impl ReadWindow {
+    fn push(&mut self, lineno: usize, line: &[u8], clipped: bool) {
+        if self.next.is_some() || lineno < self.offset {
+            return;
+        }
+        let text = String::from_utf8_lossy(line);
+        // Always emit at least one line, however long — it is already capped
+        // at READ_MAX_LINE, so "at least one" is bounded too.
+        if self.taken > 0 && self.out.len() + text.len() > READ_MAX_BYTES {
+            self.next = Some(lineno); // this line did not fit
+            return;
+        }
+        self.out.push_str(&format!("{lineno:>6}\t{text}"));
+        if clipped {
+            self.out.push_str("…[long line truncated at 8KB]");
+        }
+        self.out.push('\n');
+        self.taken += 1;
+        self.last = lineno;
+        if self.taken >= self.limit {
+            self.next = Some(lineno + 1);
+        }
+    }
+}
+
+/// Append to the line in hand, never past `READ_MAX_LINE`.
+///
+/// This is the whole of T3-25: the cap applies *while streaming*, so a 4MB
+/// "line" costs 8KB of memory instead of 4MB. `BufRead::lines` buffered the
+/// entire line first and consulted the byte cap only afterwards — by which
+/// point the allocation had already happened, and the result was a window
+/// showing nothing at all.
+fn stage_line(line: &mut Vec<u8>, clipped: &mut bool, bytes: &[u8]) {
+    let room = READ_MAX_LINE.saturating_sub(line.len());
+    if bytes.len() > room {
+        *clipped = true;
+    }
+    line.extend_from_slice(&bytes[..room.min(bytes.len())]);
+}
+
+/// INVARIANT: no single line ever allocates more than `READ_MAX_LINE`,
+/// whatever the file contains, and reading stops as soon as the window is
+/// full rather than scanning to EOF for a total nobody asked for. Enforced by
+/// `read_caps_a_single_enormous_line` and `read_honors_limit_and_offset`.
+///
+/// The handle arrives already validated by the guard — this never re-opens by
+/// name, which is the whole point of the containment layer.
 async fn read_stream(file: tokio::fs::File, path: &str, input: &Value) -> ToolResult {
-    use tokio::io::AsyncBufReadExt;
+    use tokio::io::AsyncReadExt;
     let offset = input
         .get("offset")
         .and_then(Value::as_u64)
         .unwrap_or(1)
         .max(1) as usize;
+    let limit = input
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map_or(READ_MAX_LINES, |n| (n as usize).clamp(1, READ_MAX_LINES));
     let read_err = |e: std::io::Error| {
         ToolOutcome::err(format!(
-            "Could not read `{path}`: {e}. Check the path (use `bash` with `ls` to explore) and try again."
+            "Could not read `{path}`: {e}. Check the path (use `glob`) and try again."
         ))
     };
-    // Stream line by line: nothing before `offset` or past the caps is ever
-    // retained, but lines are still counted to the end for honest totals. The
-    // handle arrives already validated by the guard — this never re-opens by
-    // name, which is the whole point of the containment layer.
-    let mut lines = tokio::io::BufReader::new(file).lines();
-    let mut out = String::new();
-    let mut taken = 0usize;
-    let mut total = 0usize;
-    // 0-based index of the first line the caps excluded.
-    let mut truncated_at: Option<usize> = None;
-    while let Some(line) = lines.next_line().await.map_err(read_err)? {
-        let i = total;
-        total += 1;
-        if i + 1 < offset || truncated_at.is_some() {
-            continue;
+
+    let mut file = file;
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut line: Vec<u8> = Vec::new();
+    let mut clipped = false;
+    let mut lineno = 0usize;
+    let mut eof = false;
+    let mut w = ReadWindow {
+        out: String::new(),
+        offset,
+        limit,
+        taken: 0,
+        last: 0,
+        next: None,
+    };
+
+    'read: while w.next.is_none() {
+        let n = file.read(&mut chunk).await.map_err(read_err)?;
+        if n == 0 {
+            eof = true;
+            break;
         }
-        if taken >= READ_MAX_LINES || out.len() + line.len() > READ_MAX_BYTES {
-            truncated_at = Some(i);
-            continue;
+        let mut rest = &chunk[..n];
+        while let Some(nl) = rest.iter().position(|b| *b == b'\n') {
+            stage_line(&mut line, &mut clipped, &rest[..nl]);
+            rest = &rest[nl + 1..];
+            lineno += 1;
+            w.push(lineno, &line, clipped);
+            line.clear();
+            clipped = false;
+            if w.next.is_some() {
+                break 'read;
+            }
         }
-        out.push_str(&format!("{:>6}\t{line}\n", i + 1));
-        taken += 1;
+        stage_line(&mut line, &mut clipped, rest);
     }
-    if offset > total && total > 0 {
+    // A trailing run with no final newline is still a line.
+    if w.next.is_none() && (!line.is_empty() || clipped) {
+        lineno += 1;
+        w.push(lineno, &line, clipped);
+    }
+
+    if eof && offset > lineno && lineno > 0 {
         return Err(ToolOutcome::err(format!(
-            "`{path}` has only {total} lines; offset {offset} is past the end."
+            "`{path}` has only {lineno} lines; offset {offset} is past the end."
         )));
     }
-    if let Some(i) = truncated_at {
-        out.push_str(&format!(
-            "\n[truncated: showing lines {offset}-{i} of {total}; continue with offset={}]",
-            i + 1
-        ));
+    // Totals are only reported when EOF was actually reached — stopping early
+    // is the point, and claiming a total we never counted would be a lie.
+    if let Some(next) = w.next {
+        if !(eof && next > lineno) {
+            let total = if eof {
+                format!(" of {lineno}")
+            } else {
+                String::new()
+            };
+            w.out.push_str(&format!(
+                "\n[truncated: showing lines {offset}-{}{total}; continue with offset={next}]",
+                w.last
+            ));
+        }
     }
-    if out.is_empty() {
-        out = "[empty file]".into();
+    if w.out.is_empty() {
+        w.out = "[empty file]".into();
     }
+    let out = w.out;
     Ok(ToolOutcome::ok(out))
 }
 
@@ -1049,6 +1143,54 @@ mod tests {
         );
         assert!(!out.is_error, "{}", out.content);
         assert!(out.content.contains("BEGIN PRIVATE KEY"));
+    }
+
+    #[tokio::test]
+    async fn read_caps_a_single_enormous_line() {
+        let (_o, root, _home) = fsguard::tests::fixture();
+        // No newline at all — a minified bundle or a binary blob.
+        std::fs::write(root.join("bundle.js"), "x".repeat(4 * 1024 * 1024)).unwrap();
+        let out = done(read_in(&root, &json!({"path": "bundle.js"})).await);
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.len() < 300 * 1024,
+            "buffered the whole blob: {}",
+            out.content.len()
+        );
+        assert!(
+            out.content.contains("long line truncated"),
+            "{}",
+            out.content
+        );
+        // ...and the cap *shows* the head of the line rather than dropping the
+        // file whole, which is what the old whole-line buffer ended up doing.
+        assert!(out.content.contains(&"x".repeat(1000)));
+    }
+
+    #[tokio::test]
+    async fn read_honors_limit_and_offset() {
+        let (_o, root, _home) = fsguard::tests::fixture();
+        let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(root.join("many.txt"), &body).unwrap();
+        let out = done(
+            read_in(
+                &root,
+                &json!({"path": "many.txt", "offset": 50, "limit": 10}),
+            )
+            .await,
+        );
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("line 50") && out.content.contains("line 59"));
+        assert!(
+            !out.content.contains("line 49") && !out.content.contains("line 60"),
+            "window leaked: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("offset=60"),
+            "must hint the next window: {}",
+            out.content
+        );
     }
 
     #[tokio::test]

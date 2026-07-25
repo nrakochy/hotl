@@ -1425,7 +1425,11 @@ mod tests {
     async fn read_big_with_threshold(threshold: u64) -> String {
         let dir = tempfile::tempdir().unwrap();
         let big = dir.path().join("big.txt");
-        std::fs::write(&big, "B".repeat(60_000)).unwrap();
+        // 60KB spread over 1000 lines, not one 60KB line: `read` clips any
+        // single line at 8KB, so a one-line fixture is no longer a large
+        // *result* and would never reach the eviction threshold this test is
+        // about.
+        std::fs::write(&big, format!("{}\n", "B".repeat(59)).repeat(1000)).unwrap();
         let mut h = Harness::new(
             vec![
                 ScriptedProvider::tool_call("t1", "read", json!({"path": big.to_str().unwrap()})),
