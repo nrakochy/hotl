@@ -1,26 +1,42 @@
-//! Allow-rule persistence (unlocked by the sandbox floor).
+//! Permission rules: the `[[allow]]`/`[[deny]]` sections of
+//! `~/.config/hotl/config.toml` plus the root-owned admin tier.
 //!
-//! Deliberately config-only: rules live in the `[[allow]]` section of
-//! `~/.config/hotl/config.toml` and are written by the human with an editor,
+//! Deliberately config-only: rules are written by the human with an editor,
 //! never by an in-REPL "always allow" reflex — ask-fatigue was the attack the
 //! round-2 review flagged, so persistence is deliberate configuration, not a
 //! keystroke.
 //!
-//! Evaluation is deny-first with two hard carve-outs:
-//! 1. **Protected execute-later paths never auto-allow**, no matter what a
-//!    rule says.
-//! 2. **Bash rules only apply while the kernel sandbox floor is enforced** —
-//!    on an unsandboxed host every bash call still asks.
+//! **What a prefix allow actually grants.** `prefix = "cargo "` is a grant over
+//! `cargo`'s *entire argument surface*, not over "building and testing".
+//! `cargo run --manifest-path /tmp/evil/Cargo.toml` and
+//! `cargo test --config build.rustc-wrapper=/tmp/x` are arbitrary code
+//! execution with zero shell metacharacters, and both auto-run under that
+//! grant; `prefix = "git "` likewise auto-runs `git -c core.pager=/tmp/x log`.
+//! `args_must_not_contain` narrows a grant, but it is a blacklist and cannot
+//! make one safe. **Grant prefixes only for binaries you would let the model
+//! run with any arguments at all.**
+//!
+//! **Deny is the strict side and is broader by construction** (T1-7): commands
+//! are matched per executed component (basename-resolved, env prefixes and
+//! `sh -c` wrappers seen through), a command hiding its argv behind `$`/`` ` ``
+//! expansion is refused rather than admitted, relative path prefixes match at
+//! any depth, and every tool is governable — `field = "<input key>"` covers
+//! anything without a declared subject.
+//!
+//! Two carve-outs hold in every mode and tier:
+//! 1. **Protected execute-later paths never auto-allow.**
+//! 2. **Bash rules only apply while the kernel sandbox floor is enforced.**
 //!
 //! ```toml
-//! # ~/.config/hotl/config.toml
 //! [[allow]]
 //! tool = "bash"
-//! prefix = "cargo "        # command prefix
+//! prefix = "cargo "
+//! args_must_not_contain = ["--config", "--manifest-path"]
 //!
-//! [[allow]]
-//! tool = "write"           # or "edit"
-//! path_prefix = "src/"
+//! [[deny]]
+//! tool = "web_fetch"
+//! field = "urls"
+//! prefix = "http://"
 //! ```
 
 use serde::Deserialize;
@@ -156,6 +172,16 @@ pub struct AllowRule {
     /// hotl never infers what a grant over an unknown tool would mean.
     #[serde(default)]
     field: Option<String>,
+    /// ALLOW-side only: substrings that veto this grant. `prefix = "cargo "`
+    /// plus `args_must_not_contain = ["--config"]` grants the family minus the
+    /// arguments that turn it into arbitrary execution. Blacklist-shaped, so it
+    /// narrows a grant — it never makes one safe (see the module doc).
+    #[serde(default)]
+    args_must_not_contain: Vec<String>,
+    /// Unknown keys, captured rather than dropped so [`Rules::lint`] can report
+    /// a typo instead of silently producing a rule that matches nothing.
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -190,6 +216,48 @@ impl Rules {
 
     pub fn mode(&self) -> PermissionMode {
         self.mode
+    }
+
+    /// Rules that cannot match anything, as human-readable warnings. A typo'd
+    /// key or a missing predicate used to be silent — and a silent permission
+    /// rule is the whole shape of T1-7. Pure; the binary prints these at
+    /// startup and in `hotl doctor`.
+    pub fn lint(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for (kind, set) in [
+            ("allow", &self.allow),
+            ("deny", &self.deny),
+            ("admin allow", &self.admin_allow),
+            ("admin deny", &self.admin_deny),
+        ] {
+            for rule in set {
+                for key in rule.extra.keys() {
+                    out.push(format!(
+                        "[[{kind}]] rule for `{}` has unknown key `{key}` — it matches nothing; \
+                         valid keys are tool, prefix, path_prefix, field, args_must_not_contain",
+                        rule.tool
+                    ));
+                }
+                if rule.prefix.is_none() && rule.path_prefix.is_none() {
+                    out.push(format!(
+                        "[[{kind}]] rule for `{}` has no `prefix` or `path_prefix` — it matches \
+                         nothing",
+                        rule.tool
+                    ));
+                    continue;
+                }
+                let declared = SUBJECTS.iter().any(|(t, _, _)| *t == rule.tool);
+                if !declared && rule.field.is_none() && kind.ends_with("allow") {
+                    out.push(format!(
+                        "[[{kind}]] rule for `{}` names no `field` and that tool has no declared \
+                         permission subject — an allow rule over it can never match; add \
+                         field = \"<input key>\"",
+                        rule.tool
+                    ));
+                }
+            }
+        }
+        out
     }
 
     /// Install the admin tier (trust-checked by the caller).
@@ -385,6 +453,15 @@ fn match_allow(
         let Some((kind, values)) = subject_values(tool, input, rule, false) else {
             continue; // undeclared subject: a grant is never inferred
         };
+        // The allow-side escape hatch, applied uniformly across every kind: an
+        // argument the user excluded narrows the grant back to the ask.
+        if rule
+            .args_must_not_contain
+            .iter()
+            .any(|needle| values.iter().any(|v| v.contains(needle.as_str())))
+        {
+            continue; // narrowed out: fall through to the ask
+        }
         match kind {
             SubjectKind::Command => {
                 if !sandbox_enforced {
@@ -504,6 +581,8 @@ fn probe(tool: &str) -> AllowRule {
         prefix: None,
         path_prefix: None,
         field: None,
+        args_must_not_contain: Vec::new(),
+        extra: Default::default(),
     }
 }
 
@@ -1586,5 +1665,82 @@ prefix = "payments"
         // Component-anchored, not substring: `.sshfs` is a different directory.
         assert!(!denied("write", ".sshfs/config"));
         assert!(!denied("write", "docs/notes.md"));
+    }
+
+    #[test]
+    fn args_must_not_contain_narrows_a_prefix_grant() {
+        let r = Rules::from_toml(
+            r#"
+[[allow]]
+tool = "bash"
+prefix = "cargo "
+args_must_not_contain = ["--config", "--manifest-path"]
+"#,
+        )
+        .unwrap();
+        let verdict = |cmd: &str| {
+            r.evaluate(
+                PermissionMode::Ask,
+                "bash",
+                &json!({"command": cmd}),
+                true,
+                false,
+                false,
+            )
+        };
+        assert!(matches!(verdict("cargo test"), Verdict::Auto { .. }));
+        // The escape hatch: an argument the user excluded falls back to the ask.
+        assert_eq!(
+            verdict("cargo test --config build.rustc-wrapper=/tmp/x"),
+            Verdict::Ask
+        );
+        assert_eq!(
+            verdict("cargo run --manifest-path /tmp/evil/Cargo.toml"),
+            Verdict::Ask
+        );
+        // A deny rule ignores the key entirely (deny is already the strict side).
+        let d = Rules::from_toml(
+            "[[deny]]\ntool = \"bash\"\nprefix = \"curl \"\nargs_must_not_contain = [\"--zzz\"]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            d.evaluate(
+                PermissionMode::Ask,
+                "bash",
+                &json!({"command": "curl x"}),
+                true,
+                false,
+                false
+            ),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn lint_reports_rules_that_can_never_match() {
+        let r = Rules::from_toml(
+            r#"
+[[allow]]
+tool = "write"
+path_prefx = "src/"        # typo: silently matched nothing before
+
+[[deny]]
+tool = "bash"              # no predicate at all
+
+[[allow]]
+tool = "acme_pay"          # unknown tool, no `field` — an allow can't apply
+prefix = "read"
+"#,
+        )
+        .unwrap();
+        let warnings = r.lint();
+        // rule 1 warns twice (unknown key, and — because the typo dropped its only
+        // predicate — no predicate at all); rules 2 and 3 warn once each.
+        assert_eq!(warnings.len(), 4, "{warnings:#?}");
+        assert!(warnings.iter().any(|w| w.contains("path_prefx")));
+        assert!(warnings.iter().any(|w| w.contains("no `prefix`")));
+        assert!(warnings.iter().any(|w| w.contains("field")));
+        // A well-formed rule set lints clean.
+        assert!(rules().lint().is_empty());
     }
 }
