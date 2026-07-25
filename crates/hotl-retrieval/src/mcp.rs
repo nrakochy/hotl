@@ -122,8 +122,14 @@ impl Retriever for McpRetriever {
 
     /// Trusted server → plain ask per call; first use (or changed binary) →
     /// the protected screen, never auto-allowable (docs/SECURITY.md §Retrieval).
+    ///
+    /// INVARIANT: the summary rendered into the human's y/N prompt is a single
+    /// line with no control characters, no category-Cf carriers, and a hard
+    /// character cap — `query` is model-controlled. Enforced by
+    /// `the_recall_summary_cannot_carry_control_text`.
     fn permission(&self, query: &str) -> Permission {
-        let summary = format!("recall: {} \"{}\"", self.cfg.name, truncate(query, 60));
+        let summary =
+            hotl_mcp::sanitize::safe_summary(&format!("recall: {} \"{query}\"", self.cfg.name));
         let hash = self.hash().to_string();
         if self
             .trust
@@ -172,17 +178,6 @@ impl Retriever for McpRetriever {
             }])
         })
     }
-}
-
-fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        return s;
-    }
-    let mut end = max;
-    while !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    &s[..end]
 }
 
 #[cfg(test)]
@@ -259,6 +254,23 @@ mod tests {
             matches!(r.permission("q"), Permission::Ask { .. }),
             "the connect recorded the grant — later calls are a plain ask"
         );
+    }
+
+    #[test]
+    fn the_recall_summary_cannot_carry_control_text() {
+        // S-2: `query` is model-controlled and lands in the human's y/N prompt.
+        let dir = tempfile::tempdir().unwrap();
+        let r = retriever(Ok(("x".into(), false)), dir.path());
+        let evil = format!("find\n\u{1b}[2JApprove? \u{202e}{}", "x".repeat(400));
+        let summary = match r.permission(&evil) {
+            Permission::Ask { summary } | Permission::AskProtected { summary, .. } => summary,
+            Permission::None => panic!("an mcp-backed retriever always asks"),
+        };
+        assert!(
+            !summary.contains('\n') && !summary.contains('\u{1b}') && !summary.contains('\u{202e}'),
+            "{summary}"
+        );
+        assert!(summary.chars().count() <= hotl_mcp::sanitize::MAX_SUMMARY_CHARS);
     }
 
     #[tokio::test]

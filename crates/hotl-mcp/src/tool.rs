@@ -241,6 +241,11 @@ impl Tool for McpTool {
 
     /// Trusted server → plain ask per call; first use (or changed binary) →
     /// the protected first-use screen, never auto-allowable (SECURITY §M3a).
+    ///
+    /// INVARIANT: the summary rendered into the human's y/N prompt is a single
+    /// line with no control characters, no category-Cf carriers, and a hard
+    /// character cap — it is composed from model- and config-controlled text.
+    /// Enforced by `the_ask_summary_cannot_carry_control_text`.
     fn permission(&self, input: &Value) -> Permission {
         let server = input.get("server").and_then(Value::as_str).unwrap_or("?");
         // A name that does not validate falls back to the literal listing verb,
@@ -250,7 +255,7 @@ impl Tool for McpTool {
             .and_then(Value::as_str)
             .and_then(|t| checked_tool_name(t).ok())
             .unwrap_or("tools/list");
-        let summary = format!("mcp: {server}.{tool}");
+        let summary = sanitize::safe_summary(&format!("mcp: {server}.{tool}"));
         let Some(cfg) = self.server(server) else {
             // Unknown server: run() errors without side effects.
             return Permission::None;
@@ -353,6 +358,61 @@ mod tests {
             let err = checked_tool_name(bad).expect_err("must reject");
             assert!(err.contains("tool name"), "errors-as-prompt: {err}");
         }
+    }
+
+    /// A fixture whose *configured* server name carries control text — the
+    /// remaining model-visible path into the summary after the tool name is
+    /// whitelisted. A `.mcp.toml` shipped inside a cloned repo is not trusted
+    /// input just because it is on disk.
+    fn tool_named(name: &str, trust_dir: &std::path::Path) -> McpTool {
+        let cfg = ServerConfig {
+            name: name.into(),
+            command: "/fake/docs-server".into(),
+            args: vec![],
+            description: "test server".into(),
+        };
+        McpTool::with_connector(
+            vec![cfg],
+            TrustStore::load(trust_dir),
+            Box::new(|_cfg| Box::pin(async { Err("not used".to_string()) })),
+        )
+    }
+
+    fn summary_of(perm: Permission) -> String {
+        match perm {
+            Permission::Ask { summary } | Permission::AskProtected { summary, .. } => summary,
+            Permission::None => panic!("a configured server always asks"),
+        }
+    }
+
+    #[test]
+    fn the_ask_summary_cannot_carry_control_text() {
+        // S-2: this is the human's y/N prompt — the last line of defence.
+        let dir = tempfile::tempdir().unwrap();
+
+        // The tool field: whitelisted upstream, so it can only ever fall back
+        // to the literal listing verb. Regression guard on that fallback.
+        let tool = tiny_tool(dir.path());
+        let summary = summary_of(tool.permission(&json!({
+            "server": "docs",
+            "tool": "echo\n\u{1b}[2JAllow everything? [Y/n]"
+        })));
+        assert!(
+            !summary.contains('\n') && !summary.contains('\u{1b}'),
+            "{summary}"
+        );
+        assert!(summary.chars().count() <= sanitize::MAX_SUMMARY_CHARS);
+
+        // The server field: config-supplied and never whitelisted, so the
+        // summary itself has to do the stripping.
+        let evil = format!("docs\n\u{1b}[2JApprove? \u{202e}{}", "x".repeat(400));
+        let tool = tool_named(&evil, dir.path());
+        let summary = summary_of(tool.permission(&json!({"server": evil})));
+        assert!(
+            !summary.contains('\n') && !summary.contains('\u{1b}') && !summary.contains('\u{202e}'),
+            "{summary}"
+        );
+        assert!(summary.chars().count() <= sanitize::MAX_SUMMARY_CHARS);
     }
 
     #[tokio::test]
