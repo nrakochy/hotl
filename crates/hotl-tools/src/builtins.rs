@@ -376,6 +376,17 @@ async fn with_diagnostics(
 /// is a symlink out of the tree is refused rather than silently rewriting the
 /// link's target. Enforced by `edit_through_a_symlink_does_not_touch_the_target`.
 async fn edit_in(root: &std::path::Path, input: &Value) -> ToolResult {
+    edit_with_hook(root, input, || {}).await
+}
+
+/// `between` runs after the match and before the write-back — the window an
+/// external writer would land in. Production passes a no-op; the test seam
+/// passes a real mutation.
+async fn edit_with_hook(
+    root: &std::path::Path,
+    input: &Value,
+    between: impl FnOnce(),
+) -> ToolResult {
     let path = str_arg(input, "path")?;
     let old = str_arg(input, "old_string")?;
     let new = str_arg(input, "new_string")?;
@@ -408,6 +419,29 @@ async fn edit_in(root: &std::path::Path, input: &Value) -> ToolResult {
                 None => new.to_string(),
             };
             let updated = format!("{}{spliced}{}", &content[..start], &content[end..]);
+            between();
+            // INVARIANT: an edit either applies to exactly the bytes it matched
+            // or it fails loudly — a concurrent external write is never
+            // silently overwritten. Enforced by
+            // `edit_detects_a_concurrent_modification_instead_of_losing_it`.
+            //
+            // INVARIANT (partial): the compare and the rename are not one
+            // operation. Concurrent modification is *detected*
+            // (compare-then-replace) and the write is *atomic* (tmp + fsync +
+            // renameat + parent fsync), but a writer landing between the
+            // re-read and the `renameat` is still lost. That window is
+            // microseconds, not zero. Closing it fully needs either an
+            // advisory lock (not portable enough to rely on, and no other
+            // process in the workspace takes one) or edit-after-read staleness
+            // tracking in the engine — tracked in the tech-debt tracker.
+            let now = read_guarded_to_string(root, &placement, path)?;
+            if now != content {
+                return Err(ToolOutcome::err(format!(
+                    "`{path}` changed on disk between the match and the write, so the edit was \
+                     not applied (nothing was lost). Re-read the file and re-issue the edit \
+                     against the current text."
+                )));
+            }
             write_guarded(root, &placement, path, updated.as_bytes())?;
             let note = if exact {
                 ""
@@ -1083,6 +1117,32 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "export PATH=/usr/bin\n"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_detects_a_concurrent_modification_instead_of_losing_it() {
+        let (_o, root, _home) = fsguard::tests::fixture();
+        let p = root.join("f.txt");
+        std::fs::write(&p, "aaa\nbbb\nccc\n").unwrap();
+        let external = "aaa\nbbb\nEXTERNAL\n";
+        // The seam fires between the match and the write-back — exactly where
+        // an external writer would land.
+        let out = done(
+            edit_with_hook(
+                &root,
+                &json!({"path": "f.txt", "old_string": "bbb", "new_string": "BBB"}),
+                || std::fs::write(&p, external).unwrap(),
+            )
+            .await,
+        );
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("changed on disk") && out.content.contains("Re-read"),
+            "must be a prompt: {}",
+            out.content
+        );
+        // The external change survives intact — the edit did not clobber it.
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), external);
     }
 
     #[tokio::test]

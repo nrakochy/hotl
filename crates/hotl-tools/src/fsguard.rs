@@ -202,12 +202,29 @@ pub(crate) fn create_beneath(root: &Path, rel: &Path, mkparents: bool) -> Result
 /// it, `renameat` over the target, then `fsync` the parent directory.
 ///
 /// INVARIANT: a crash mid-write leaves either the old file or the new one,
-/// never a truncated one, and the target's mode survives the swap. Enforced by
+/// never a truncated one; the target's mode survives the swap; and a symlink
+/// standing where the target should be is refused rather than followed *or*
+/// silently replaced (`renameat` does not follow links, so without the check
+/// an atomic replace would quietly delete the link). Enforced by
 /// `replace_is_atomic_and_durable` and
 /// `edit_inside_the_tree_still_works_and_keeps_the_mode`.
 pub(crate) fn replace_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> Result<(), GuardError> {
     use std::io::Write;
     let (dir, leaf) = split_parent(root, rel, false)?;
+    // What is standing there now, if anything — checked before a byte is
+    // staged, so a refusal leaves no debris.
+    let existing = stat_mode_at(&dir, &leaf);
+    if let Some(mode) = existing {
+        match mode & libc::S_IFMT {
+            libc::S_IFREG => {}
+            libc::S_IFLNK => {
+                return Err(GuardError::Escape {
+                    at: rel.to_path_buf(),
+                })
+            }
+            _ => return Err(GuardError::NotRegular),
+        }
+    }
     let tmp = std::ffi::OsString::from(format!(
         ".hotl-tmp-{}-{}",
         std::process::id(),
@@ -222,8 +239,8 @@ pub(crate) fn replace_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> Result<(
     // Carry the target's mode across, or an atomic replace would silently
     // drop the executable bit off every script it edits.
     let staged = (|| {
-        if let Some(mode) = mode_at(&dir, &leaf) {
-            fchmod(&f, mode)?;
+        if let Some(mode) = existing {
+            fchmod(&f, mode & 0o7777)?;
         }
         f.write_all(bytes)?;
         f.sync_all()
@@ -356,10 +373,9 @@ fn openat_leaf(
     )
 }
 
-/// The permission bits of `name` in `dir`, or `None` if it does not exist
-/// (or is not a regular file — a mode is only meaningful to carry across for
-/// one that is).
-fn mode_at(dir: &File, name: &OsStr) -> Option<libc::mode_t> {
+/// The full `st_mode` of `name` in `dir` without following a final symlink,
+/// or `None` if it does not exist.
+fn stat_mode_at(dir: &File, name: &OsStr) -> Option<libc::mode_t> {
     let c = CString::new(name.as_bytes()).ok()?;
     // SAFETY: `stat` is a plain repr(C) struct; all-zero is a valid instance.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -372,10 +388,10 @@ fn mode_at(dir: &File, name: &OsStr) -> Option<libc::mode_t> {
             libc::AT_SYMLINK_NOFOLLOW,
         )
     };
-    if rc != 0 || (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+    if rc != 0 {
         return None;
     }
-    Some(st.st_mode & 0o7777)
+    Some(st.st_mode)
 }
 
 fn fchmod(f: &File, mode: libc::mode_t) -> std::io::Result<()> {
@@ -746,6 +762,49 @@ pub(crate) mod tests {
             open_beneath(&root, std::path::Path::new("pipe")),
             Err(GuardError::NotRegular)
         ));
+    }
+
+    fn tmp_siblings(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".hotl-tmp-"))
+            .collect()
+    }
+
+    #[test]
+    fn replace_is_atomic_and_durable() {
+        let (_o, root, home) = fixture();
+        let rel = std::path::Path::new("src/lib.rs");
+        replace_beneath(&root, rel, b"fn b() {}\n").unwrap();
+        // Fully the new bytes — never a truncated prefix of them.
+        assert_eq!(
+            std::fs::read_to_string(root.join("src/lib.rs")).unwrap(),
+            "fn b() {}\n"
+        );
+        assert!(
+            tmp_siblings(&root.join("src")).is_empty(),
+            "a temp sibling survived a successful replace"
+        );
+
+        // A symlinked leaf is refused before anything is staged: the link is
+        // neither followed (the target keeps its bytes) nor clobbered (the
+        // link is still a link), and no debris is left behind.
+        symlink(home.join("id_rsa"), root.join("notes.md")).unwrap();
+        assert!(matches!(
+            replace_beneath(&root, std::path::Path::new("notes.md"), b"evil"),
+            Err(GuardError::Escape { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(home.join("id_rsa")).unwrap(),
+            "BEGIN PRIVATE KEY\n"
+        );
+        assert!(std::fs::symlink_metadata(root.join("notes.md"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(tmp_siblings(&root).is_empty(), "debris after a refusal");
     }
 
     #[test]
