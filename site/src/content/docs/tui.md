@@ -64,6 +64,36 @@ Top to bottom:
 3. **Input** — bordered editor, title shows `-- INSERT --` / `-- NORMAL --`.
 4. **Hint row** — the keys that matter right now.
 
+### Scrolling
+
+| Key | Effect |
+|---|---|
+| `PageUp` / `PageDown` | Scroll the transcript a page (ten items) |
+| `Ctrl-Home` / `Ctrl-End` | Jump to the top / back to following the newest |
+| mouse wheel | Scroll three items a notch |
+| `j` / `k` | One item, in vim Normal mode with the input empty |
+
+`Home` and `End` on their own are line motions in the input, which is why the
+document-level jumps are the `Ctrl` pair.
+
+Mouse capture costs you the terminal's own drag-select. Hold `Shift` to bypass
+it on most emulators, or set `HOTL_MOUSE=0` to leave the mouse alone entirely.
+
+### Pasting
+
+Multi-line paste works: the terminal hands the whole payload over at once and it
+lands in the input as text. It does not submit — press `Enter` when you are
+ready. (Before bracketed paste, a ten-line paste arrived as ten `Enter`
+presses and fired ten turns.)
+
+### Model thinking
+
+When the provider returns reasoning, it renders dimmed under a faint spine,
+collapsed to the first three lines with a `[+N lines · ctrl-t]` trailer.
+`Ctrl-T` toggles the full text. `HOTL_THINKING=0` turns extended thinking off
+at the engine, which is what you want if you are not reading it — it is billed
+either way.
+
 There is **no bell, ever** — salience is visual only. `hotl watch` is the thing that pings across panes; the console itself is silent.
 
 ## Prompting and steering
@@ -89,6 +119,11 @@ own.
 | `/rename <name>` | Rename the session (1–64 chars); the badge and terminal title follow. |
 | `/plan` | Switch to plan mode: read-only until you approve a plan (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). |
 | `/mode <ask\|auto\|plan\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing. |
+| `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. |
+| `/status` | What this session is running: name, model, permission mode, context window, todo count. |
+| `/cost` | Session token totals and, when the provider reports one, cost. |
+| `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
+| `/quit` | Leave the console (the session log is already on disk). |
 | `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments. |
 
 Typing `/` opens a menu of every command and skill, filtered as you keep
@@ -98,7 +133,21 @@ roster entry and cost nothing by default: the always-sent tool description
 omits them, and the model only sees one if it explicitly queries the skill
 tool for it.
 
-A non-default mode shows as a badge on the strip next to the session name.
+### The permission-mode badge
+
+The strip **always** shows the session's permission mode, next to the session
+name. Read it before you walk away from a run.
+
+The mode it shows is the one the engine is actually enforcing: it arrives from
+the server when the session opens and again whenever it changes, so it is never
+a guess. If a build coerces your request — a `security-enforced` build forces
+`auto` back to `ask` — the badge shows what you got, not what you asked for.
+`auto` and `dontask` wear the blocked color, because in those modes nobody is
+being consulted before a tool runs.
+
+**`hotl setup` writes `mode = "auto"`.** If you took the setup default, your
+sessions approve mutating tool calls without asking. `/mode ask` switches back.
+
 Switching mode never starts a turn — it's session bookkeeping, and it's
 durable (`hotl resume` restores whichever mode you left the session in).
 

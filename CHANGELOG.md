@@ -6,8 +6,49 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The transcript scrolls without vim mode.** `PageUp`/`PageDown`,
+  `Ctrl-Home`/`Ctrl-End`, and the mouse wheel now scroll; previously scroll
+  was reachable only from vim Normal mode, which `[behavior] vim_mode`
+  (default `false`) makes unreachable. Set `HOTL_MOUSE=0` to keep terminal
+  text selection. Bare `Home`/`End` became real line motions in the input.
+- **Bracketed paste.** A multi-line paste is inserted as text. It used to
+  arrive as one `Enter` per line and submit one turn per line.
+- **The permission badge shows the real mode.** The session's effective mode
+  now travels on the wire (`session/new` result and a `mode_changed`
+  notification) and is always displayed. The badge previously read `ask`
+  unconditionally while `hotl setup` writes `mode = "auto"` — so the shipped
+  default auto-approved mutating tool calls while the UI rendered exactly as
+  if it were prompting per-action.
+- **The hint row no longer advertises dead keys** while a permission ask is
+  open during a `Ctrl-R` search, and a modal now clears the live search
+  (tech-debt #13).
+- **`hotl watch` restores every terminal mode it set**, and the signal-path
+  restore now disables mouse reporting and bracketed paste too — a killed TUI
+  no longer leaves your shell emitting escape sequences on mouse movement.
+- **Library code no longer writes to stderr mid-TUI.** `build_registry`
+  returns its warnings; one caller, outside the terminal guard, prints them
+  (T3-23, the half this crate owns).
+
+### Changed
+
+- **`-p --json` schema version 2.** `turn_done.outcome` is now the tagged
+  object `{"kind": …}` instead of a Rust `Debug` string, and
+  `thinking_delta` carries `text`. Consumers pinned to v1 must update. The
+  frame schema is now pinned by a test — nothing pinned it before, which is
+  how the `Debug` string survived inside a stream documented as a contract.
+- **`hotl attach` renders every update type**, not the four it handled
+  before (it silently dropped denials, auto-allow rules, retries, fallbacks,
+  queued prompts, todos, and thinking).
+
 ### Added
 
+- Model thinking renders collapsed in the transcript (`ctrl-t` expands);
+  `HOTL_THINKING=0` disables it.
+- Cache reads, session token totals, and context fullness on the status strip.
+- `/help`, `/status`, `/cost`, `/clear`, `/quit`.
+- `hotl -p -` reads the prompt from stdin; `@[file]` works in the console too.
 - **TUI command completion.** Typing `/` opens a filtering popup of every
   built-in command and loadable skill: `↑↓` picks, `tab` completes, `enter`
   runs, `esc` dismisses. `initialize`'s `skills` field now carries

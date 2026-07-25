@@ -247,6 +247,8 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 | `HOTL_CONCURRENCY_SUBPROCS` | `[concurrency].subprocs` | Reserved (subprocess batching; no effect yet). |
 | `HOTL_CONCURRENCY_WORKER_THREADS` | `[concurrency].worker_threads` | Reserved (tokio worker-thread pool; parsed but deliberately not wired — see below). |
 | `HOTL_CONCURRENCY_BLOCKING_THREADS` | `[concurrency].blocking_threads` | `spawn_blocking` pool cap (bounds `glob`'s tree walk; default 16). |
+| `HOTL_MOUSE` | *(pending `[behavior].mouse`)* | `0` disables console mouse capture, keeping your terminal's own drag-select and middle-click paste. Anything else leaves the wheel scrolling the transcript. |
+| `HOTL_THINKING` | *(pending `[behavior].thinking`)* | `0` turns off extended thinking. It is billed whether or not you read it, so this is the switch that matters if you don't. |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 
 ### Allow-rules (`[[allow]]`)
@@ -350,7 +352,28 @@ Protected paths outrank admin grants; admin denies outrank everything.
 
 `hotl -p "PROMPT"` runs one turn and exits. Because no human is present, **every permission ask is auto-denied** — headless runs cannot perform gated actions unless an allow-rule covers them. Configure `[[allow]]` rules in config.toml for anything a headless run must do.
 
-`--json` emits one JSON object per line (a stable-ish event stream for scripts): event types include `text_delta`, `tool_start`, `tool_done`, `ask_denied`, `compacted`, and a terminal `turn_done` carrying the outcome and token usage.
+`hotl -p -` reads the prompt from stdin instead (`git log | hotl -p -`); a bare
+`-p` with something piped in does the same. A terminal with no prompt is still
+a usage error rather than a silent wait.
+
+`--json` emits one JSON object per line — a machine contract, not a log. Every
+frame carries `"schema_version"` and a `"type"`: `text_delta`,
+`thinking_delta` (with its `text`), `tool_start`, `tool_done`, `tool_denied`,
+`tool_auto_allowed`, `retrying`, `fallback_model`, `prompt_queued`,
+`compacted`, `todos_changed`, `ask_denied`, `question_no_human`, and a terminal
+`turn_done` carrying token usage and a tagged outcome:
+
+```json
+{"type":"turn_done","outcome":{"kind":"done","text":"…"},"usage":{…},"schema_version":2}
+```
+
+`outcome.kind` is one of `done`, `cancelled`, `turn_limit`, `refused`,
+`doom_loop` (with `pattern`), `tool_failure_budget` (with `tool`), or `error`
+(with `message`).
+
+**Schema version 2 is a breaking change.** In v1 `outcome` was a Rust `Debug`
+string (`"Done { text: \"…\" }"`), which no parser could read reliably.
+Consumers pinned to v1 must update.
 
 ### Exit codes
 
