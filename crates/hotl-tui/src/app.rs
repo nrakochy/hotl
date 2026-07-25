@@ -1523,6 +1523,28 @@ mod tests {
         );
     }
 
+    /// Finding 4 (minor): `complete::BUILTINS` and `slash_command`'s match
+    /// arms are two unpinned sources of truth for the same list — nothing
+    /// enforces that a name in one exists in the other. This pins them: a
+    /// name only `slash_command` recognizes just doesn't show up in the
+    /// popup (silently missable), but a name only `BUILTINS` advertises is
+    /// worse — the popup completes it and then Enter dispatches to the
+    /// `unknown command: /<name>` notice. Add a 4th entry to `BUILTINS`
+    /// without a matching arm and this test catches it.
+    #[test]
+    fn every_builtin_name_dispatches_to_something_other_than_unknown_command() {
+        for cmd in complete::builtins() {
+            let mut s = State::test_default();
+            type_and_submit(&mut s, &format!("/{}", cmd.name));
+            let unknown = format!("unknown command: /{}", cmd.name);
+            assert!(
+                !matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if *text == unknown),
+                "BUILTINS lists `{}` but slash_command has no matching dispatch arm for it",
+                cmd.name
+            );
+        }
+    }
+
     #[test]
     fn a_known_skill_name_after_slash_prompts_for_that_skill() {
         let mut s = State::test_default();
