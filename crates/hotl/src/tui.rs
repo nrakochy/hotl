@@ -292,6 +292,9 @@ fn terminal_msg(ev: Event) -> Option<Msg> {
     use crossterm::event::MouseEventKind;
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),
+        // Bracketed paste: the terminal hands us the whole payload as one
+        // event instead of one `Enter` per line.
+        Event::Paste(text) => Some(Msg::Paste(text)),
         Event::Mouse(m) => match m.kind {
             MouseEventKind::ScrollUp => {
                 Some(Msg::Scroll(hotl_tui::scroll::Intent::Up(WHEEL_LINES)))

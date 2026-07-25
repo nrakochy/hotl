@@ -182,6 +182,10 @@ pub enum Msg {
         usage: Value,
     },
     Key(KeyEvent),
+    /// Bracketed-paste payload. Literal text, never keys — see `Msg::Key`.
+    /// A multi-line paste used to arrive as one `Enter` per line and submit
+    /// one turn per line.
+    Paste(String),
     /// Transcript scroll from a key or the mouse wheel. Vim's `j`/`k` reach
     /// the same `scroll::apply` via `EditorEvent::Scroll*`.
     Scroll(crate::scroll::Intent),
@@ -268,6 +272,11 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             usage,
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage),
         Msg::Key(key) => on_key(state, key),
+        Msg::Paste(text) => {
+            state.editor.insert_text(&text);
+            refresh(state);
+            Vec::new()
+        }
         Msg::Scroll(intent) => {
             crate::scroll::apply(state, intent);
             Vec::new()
@@ -928,6 +937,16 @@ mod tests {
                 protected_why: None,
             },
         );
+    }
+
+    #[test]
+    fn a_multiline_paste_fires_no_turns() {
+        let mut s = State::new(false, "m".into());
+        let cmds = update(&mut s, Msg::Paste("a\nb\nc\nd".into()));
+        assert!(cmds.is_empty(), "paste must not emit SendPrompt: {cmds:?}");
+        assert_eq!(s.editor.text(), "a\nb\nc\nd");
+        assert_eq!(s.phase, Phase::Idle);
+        assert!(s.transcript.is_empty());
     }
 
     #[test]

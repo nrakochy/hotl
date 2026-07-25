@@ -151,6 +151,49 @@ impl Editor {
         self.cursor
     }
 
+    #[cfg(test)]
+    pub(crate) fn cursor_to(&mut self, cursor: (usize, usize)) {
+        self.cursor = cursor;
+    }
+
+    /// Insert clipboard text at the cursor, literally. A paste is not a key
+    /// sequence: newlines split the buffer instead of submitting, which is the
+    /// entire point of bracketed paste (this file's Enter arms submit — see
+    /// `handle_insert`/`handle_normal`). `\r\n` and lone `\r` normalize to
+    /// `\n` for Windows clipboards and translating terminals.
+    /// INVARIANT: never submits and never emits an `EditorEvent`. Enforced by
+    /// `paste_inserts_literally_and_never_submits`.
+    pub fn insert_text(&mut self, text: &str) {
+        // Recall and a live reverse-i-search both own the buffer; pasting into
+        // either has no sane meaning, and a live search would otherwise
+        // swallow the pasted text as query keys.
+        self.end_recall();
+        self.clear_search();
+        let (row, col) = self.cursor;
+        let tail = char_split_off(&mut self.lines[row], col);
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let mut segments: Vec<&str> = normalized.split('\n').collect();
+        let last = segments.pop().unwrap_or_default();
+        let mut at = row;
+        for seg in segments {
+            self.lines[at].push_str(seg);
+            at += 1;
+            self.lines.insert(at, String::new());
+        }
+        self.lines[at].push_str(last);
+        self.cursor = (at, char_len(&self.lines[at]));
+        self.lines[at].push_str(&tail);
+    }
+
+    /// Resolve a live `Ctrl-R` search without committing it, restoring the
+    /// buffer the search started from. Also used when a permission ask takes
+    /// the screen (tracker #13). Idempotent when not searching.
+    pub fn clear_search(&mut self) {
+        if let Some(s) = self.search.take() {
+            self.set_text(&s.origin);
+        }
+    }
+
     fn handle_insert(&mut self, key: KeyEvent) -> EditorEvent {
         match key.code {
             KeyCode::Esc if self.vim => {
@@ -704,6 +747,38 @@ mod tests {
             events.push(ed.handle(key));
         }
         events
+    }
+
+    /// The first-five-minutes bug: without bracketed paste a 10-line paste
+    /// arrived as 10 Enters and fired 10 turns. Pasted text is literal — it
+    /// never submits, in either mode.
+    #[test]
+    fn paste_inserts_literally_and_never_submits() {
+        let mut e = Editor::new(true);
+        e.set_text("head");
+        e.insert_text("\nline1\nline2");
+        assert_eq!(e.text(), "head\nline1\nline2");
+        assert_eq!(e.cursor(), (2, 5));
+    }
+
+    #[test]
+    fn paste_normalizes_crlf_and_works_mid_line() {
+        let mut e = Editor::new(false);
+        e.set_text("ab");
+        e.cursor_to((0, 1));
+        e.insert_text("X\r\nY\rZ");
+        assert_eq!(e.text(), "aX\nY\nZb");
+    }
+
+    #[test]
+    fn paste_cancels_a_live_reverse_i_search() {
+        let mut e = Editor::new(false);
+        e.load_history(vec!["cargo test".into()]);
+        e.handle(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(e.search_prompt().is_some());
+        e.insert_text("pasted");
+        assert!(e.search_prompt().is_none(), "paste must resolve the search");
+        assert!(e.text().contains("pasted"));
     }
 
     /// Plan-style scripts assume a Normal start; the editor opens in Insert
