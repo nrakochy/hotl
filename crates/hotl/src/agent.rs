@@ -1570,6 +1570,12 @@ fn engine_config(
         Some(v) => v != "1",
         None => cfg.context.show_used_pct.unwrap_or(true),
     };
+    // Extended thinking is billed whether or not anything renders it, so the
+    // off switch matters. Env-only until R4 adds `[behavior] thinking` — see
+    // specs/exec-plans/active/0020-remediation-surface.md RQ-1.
+    if secrets.get("HOTL_THINKING").as_deref() == Some("0") {
+        config.thinking = false;
+    }
     config
 }
 

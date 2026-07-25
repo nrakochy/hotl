@@ -25,6 +25,12 @@ use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
 #[allow(dead_code)]
 mod acp;
 
+// `acp.rs` renders its frames through the shared renderer; pull that in too,
+// so `crate::wire` resolves the same way it does in the binary.
+#[path = "../src/wire.rs"]
+#[allow(dead_code)]
+mod wire;
+
 type Reader = BufReader<ReadHalf<DuplexStream>>;
 type Client = AcpClient<WriteHalf<DuplexStream>>;
 

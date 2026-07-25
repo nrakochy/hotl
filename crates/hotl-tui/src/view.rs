@@ -23,6 +23,10 @@ const INPUT_MAX_ROWS: usize = 10;
 /// the human should type another character rather than scroll a menu.
 const COMPLETE_MAX_ROWS: usize = 8;
 
+/// How much model reasoning shows before it is folded behind `ctrl-t`.
+/// Reasoning is context for a decision, not the decision.
+const THINKING_COLLAPSED_LINES: usize = 3;
+
 pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     let area = frame.area();
     let [transcript, strip, input, hint] = Layout::vertical([
@@ -66,7 +70,13 @@ fn render_transcript(state: &State, p: &Palette, frame: &mut Frame, area: Rect) 
             }
         }
         item_starts.push(lines.len());
-        lines.extend(item_visual_lines(item, p, width, gutter));
+        lines.extend(item_visual_lines(
+            item,
+            p,
+            width,
+            gutter,
+            state.thinking_expanded,
+        ));
     }
     let total = lines.len();
     let skip = match state.scroll {
@@ -131,8 +141,9 @@ fn item_visual_lines<'a>(
     p: &Palette,
     width: usize,
     gutter: usize,
+    thinking_expanded: bool,
 ) -> Vec<Line<'a>> {
-    let (spine, content) = item_block(item, p);
+    let (spine, content) = item_block(item, p, thinking_expanded);
     // `gutter + 2` = the pad plus the one-column glyph and its trailing space.
     let inner = width.saturating_sub(gutter + 2).max(1);
     let mut out = Vec::new();
@@ -232,7 +243,11 @@ fn bullet(raw: &str) -> Option<(&str, &str)> {
 
 /// The spine and the content spans for one item — the content no longer
 /// carries its own marker prefix; the spine owns that column now.
-fn item_block<'a>(item: &TranscriptItem, p: &Palette) -> (Spine, Vec<Line<'a>>) {
+fn item_block<'a>(
+    item: &TranscriptItem,
+    p: &Palette,
+    thinking_expanded: bool,
+) -> (Spine, Vec<Line<'a>>) {
     match item {
         TranscriptItem::User { text } => (
             // You are the anchor: high-contrast caret, no continuation bar.
@@ -336,6 +351,37 @@ fn item_block<'a>(item: &TranscriptItem, p: &Palette) -> (Spine, Vec<Line<'a>>) 
                 Style::new().fg(p.muted).italic(),
             )],
         ),
+        // Reasoning: dimmed italic behind a faint spine, collapsed by default.
+        // The trailer names the toggle so it is discoverable without opening
+        // the help overlay.
+        TranscriptItem::Thinking { text } => {
+            let style = Style::new().fg(p.faint).italic();
+            let all: Vec<&str> = text.split('\n').collect();
+            let mut lines: Vec<Line> = Vec::new();
+            let shown = if thinking_expanded {
+                all.len()
+            } else {
+                THINKING_COLLAPSED_LINES.min(all.len())
+            };
+            for l in &all[..shown] {
+                lines.push(Line::styled(l.to_string(), style));
+            }
+            if shown < all.len() {
+                lines.push(Line::styled(
+                    format!("… [+{} lines · ctrl-t]", all.len() - shown),
+                    Style::new().fg(p.faint).dim(),
+                ));
+            }
+            (
+                Spine {
+                    marker: "·",
+                    cont: " ",
+                    marker_style: Style::new().fg(p.faint),
+                    cont_style: Style::new(),
+                },
+                lines,
+            )
+        }
     }
 }
 
@@ -789,6 +835,24 @@ mod tests {
     const STRIP: usize = 19;
     const INPUT_TOP: usize = 20;
     const HINT: usize = 23;
+
+    #[test]
+    fn thinking_collapses_to_three_lines_with_a_toggle_hint() {
+        let mut s = State::test_default();
+        s.transcript = vec![TranscriptItem::Thinking {
+            text: (1..=6)
+                .map(|i| format!("line{i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        }];
+        let out = draw(&s).join("\n");
+        assert!(out.contains("line3") && !out.contains("line4"), "{out}");
+        assert!(out.contains("ctrl-t"), "the toggle must be named: {out}");
+
+        s.thinking_expanded = true;
+        let out = draw(&s).join("\n");
+        assert!(out.contains("line6"), "{out}");
+    }
 
     /// Tracker #13. A permission ask owns the keyboard; the hint must name the
     /// keys `on_ask_key` actually handles, not the four a live Ctrl-R

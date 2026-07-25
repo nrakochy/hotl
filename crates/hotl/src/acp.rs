@@ -537,41 +537,17 @@ async fn drain_events(
     }
 }
 
+/// The `session/update` payload for an event, or `None` when the event is not
+/// a stream frame. Thin alias over [`crate::wire::update_frame`] — there used
+/// to be three copies of this mapping and they had already drifted (§7); one
+/// renderer means a new `EngineEvent` variant cannot reach one surface and
+/// silently miss another.
 pub(crate) fn update_payload(event: &EngineEvent) -> Option<Value> {
-    Some(match event {
-        EngineEvent::TextDelta(t) => json!({"type": "text_delta", "text": t}),
-        EngineEvent::ThinkingDelta(_) => json!({"type": "thinking_delta"}),
-        EngineEvent::ToolStart { name, summary } => {
-            json!({"type": "tool_start", "name": name, "summary": summary})
-        }
-        EngineEvent::ToolDone { name, ok } => json!({"type": "tool_done", "name": name, "ok": ok}),
-        EngineEvent::ToolDenied { name } => json!({"type": "tool_denied", "name": name}),
-        EngineEvent::ToolAutoAllowed { name, rule } => {
-            json!({"type": "tool_auto_allowed", "name": name, "rule": rule})
-        }
-        EngineEvent::Retrying { attempt, reason } => {
-            json!({"type": "retrying", "attempt": attempt, "reason": reason})
-        }
-        EngineEvent::FallbackModel { model } => json!({"type": "fallback_model", "model": model}),
-        EngineEvent::PromptQueued => json!({"type": "prompt_queued"}),
-        EngineEvent::Compacted { degraded } => json!({"type": "compacted", "degraded": degraded}),
-        EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
-        EngineEvent::Ask { .. } | EngineEvent::Question { .. } | EngineEvent::TurnDone { .. } => {
-            return None
-        }
-    })
+    crate::wire::update_frame(event)
 }
 
 pub(crate) fn outcome_tag(outcome: &Outcome) -> Value {
-    match outcome {
-        Outcome::Done { text } => json!({"kind": "done", "text": text}),
-        Outcome::Cancelled => json!({"kind": "cancelled"}),
-        Outcome::TurnLimit => json!({"kind": "turn_limit"}),
-        Outcome::Refused => json!({"kind": "refused"}),
-        Outcome::DoomLoop { pattern } => json!({"kind": "doom_loop", "pattern": pattern}),
-        Outcome::ToolFailureBudget { tool } => json!({"kind": "tool_failure_budget", "tool": tool}),
-        Outcome::Error { message } => json!({"kind": "error", "message": message}),
-    }
+    crate::wire::outcome_frame(outcome)
 }
 
 async fn notify(writer: &Writer, session_id: &str, update: Value) {

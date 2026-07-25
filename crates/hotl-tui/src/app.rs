@@ -62,6 +62,17 @@ pub enum TranscriptItem {
     Assistant {
         text: String,
     },
+    /// Model reasoning, when the provider returns it. Billed on every turn
+    /// (`EngineConfig.thinking` defaults true) and, before this, never shown
+    /// — T3-15. Collapsed to `view::THINKING_COLLAPSED_LINES` unless
+    /// `State.thinking_expanded`. Its own variant rather than part of
+    /// `Assistant`: the spine marker and style differ, and the transcript is
+    /// what `Scroll::At` indexes, so conflating them would make thinking
+    /// un-skippable. Empty deltas create no item — until R3 sends
+    /// `thinking.display: "summarized"` the text really is empty.
+    Thinking {
+        text: String,
+    },
     Tool {
         name: String,
         summary: String,
@@ -142,6 +153,10 @@ pub struct State {
     /// Esc closed the popup; suppresses it until the buffer stops being a
     /// `/` command, so the next fresh slash opens it again.
     pub dismissed: bool,
+    /// `Ctrl-T`: show model reasoning in full rather than collapsed.
+    /// Reasoning is context for a decision, not the decision — collapsed is
+    /// the default posture.
+    pub thinking_expanded: bool,
 }
 
 impl State {
@@ -166,6 +181,7 @@ impl State {
             commands: complete::builtins(),
             completion: None,
             dismissed: false,
+            thinking_expanded: false,
         }
     }
 
@@ -357,6 +373,21 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             });
             enter_streaming(state);
         }
+        // T3-15: thinking is billed on every turn and used to be dropped on
+        // the floor (`_ => {}`). Deltas accumulate into one item so a burst
+        // of reasoning is one collapsible block, not fifty.
+        "thinking_delta" => {
+            let delta = text_of("text");
+            if !delta.is_empty() {
+                match state.transcript.last_mut() {
+                    Some(TranscriptItem::Thinking { text }) => text.push_str(&delta),
+                    _ => state
+                        .transcript
+                        .push(TranscriptItem::Thinking { text: delta }),
+                }
+                enter_streaming(state);
+            }
+        }
         "tool_auto_allowed" => state.pending_auto_rule = Some(text_of("rule")),
         "todos_changed" => {
             state.todos = v
@@ -519,6 +550,13 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             Phase::Idle => vec![Cmd::Quit],
             _ => vec![Cmd::Cancel],
         };
+    }
+    // Ctrl-T expands model reasoning. Above the editor for the same reason as
+    // the scroll keys: `Editor::handle` swallows every Ctrl chord it does not
+    // itself bind.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+        state.thinking_expanded = !state.thinking_expanded;
+        return Vec::new();
     }
     if matches!(state.phase, Phase::WaitingAsk { .. }) {
         return on_ask_key(state, key);
@@ -960,6 +998,41 @@ mod tests {
                 protected_why: None,
             },
         );
+    }
+
+    #[test]
+    fn thinking_deltas_accumulate_into_one_item() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type": "thinking_delta", "text": "first "}));
+        upd(&mut s, json!({"type": "thinking_delta", "text": "second"}));
+        assert_eq!(
+            s.transcript,
+            vec![TranscriptItem::Thinking {
+                text: "first second".into()
+            }]
+        );
+        // Text after thinking starts a separate assistant item.
+        upd(&mut s, json!({"type": "text_delta", "text": "answer"}));
+        assert_eq!(s.transcript.len(), 2);
+    }
+
+    #[test]
+    fn empty_thinking_deltas_create_nothing() {
+        // Until R3 sends `thinking.display: "summarized"` the deltas are empty
+        // — that must render as nothing, not as an empty dimmed block.
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type": "thinking_delta", "text": ""}));
+        assert!(s.transcript.is_empty());
+    }
+
+    #[test]
+    fn ctrl_t_toggles_thinking_expansion() {
+        let mut s = State::test_default();
+        assert!(!s.thinking_expanded);
+        ctrl(&mut s, 't');
+        assert!(s.thinking_expanded);
+        ctrl(&mut s, 't');
+        assert!(!s.thinking_expanded);
     }
 
     #[test]

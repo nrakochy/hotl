@@ -17,6 +17,12 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 #[allow(dead_code)]
 mod acp;
 
+// `acp.rs` renders its frames through the shared renderer; pull that in too,
+// so `crate::wire` resolves the same way it does in the binary.
+#[path = "../src/wire.rs"]
+#[allow(dead_code)]
+mod wire;
+
 /// A session whose scripted model calls bash (a gated tool → a permission
 /// ask) then replies with text.
 fn scripted_factory() -> acp::SessionFactory {
