@@ -146,3 +146,53 @@ async fn max_turns_is_enforced_across_a_compaction() {
         main.request_count()
     );
 }
+
+/// T2-3: `compact_streak` counts folds *without an intervening completed
+/// sample*. Three folds with real work between them is a long turn, not a
+/// fold-the-digest spiral, and must not be reported as an error.
+#[tokio::test]
+async fn three_folds_with_progress_do_not_exhaust_the_streak() {
+    let main = Arc::new(ScriptedProvider::new(Vec::new()));
+    let summarize = Arc::new(ScriptedProvider::new(
+        (0..6)
+            .map(|i| ScriptedProvider::text_reply(&format!("DIGEST {i}")))
+            .collect(),
+    ));
+    let provider = Arc::new(Router {
+        main: Arc::clone(&main),
+        summarize,
+    });
+    let mut s = session(
+        provider,
+        EngineConfig {
+            context_window: 1000,
+            max_turns: 20,
+            ..Default::default()
+        },
+    );
+    let file = s.dir.path().join("f.txt");
+    std::fs::write(&file, "small file body").expect("fixture");
+    let path = file.to_str().expect("utf8 path").to_string();
+    let call = |i: usize, tokens: u64| {
+        tool_call_reporting(&format!("t{i}"), "read", json!({ "path": path }), tokens)
+    };
+    // 650 arms speculation; each 850 puts the NEXT request over the trigger.
+    // After a fold the anchor is stale, so the continuation's first estimate is
+    // a full one (small) and it samples before folding again.
+    main.push_script(call(0, 650));
+    main.push_script(call(1, 850)); // fold 1
+    main.push_script(call(2, 850)); // fold 2
+    main.push_script(call(3, 850)); // fold 3
+    main.push_script(ScriptedProvider::text_reply("done after three folds"));
+
+    s.handle.prompt("a genuinely long turn".into()).await;
+    let (outcome, folds) = run_to_done(&mut s).await;
+
+    assert_eq!(folds, 3, "the fixture must fold three times");
+    assert_eq!(
+        outcome,
+        Outcome::Done {
+            text: "done after three folds".into()
+        }
+    );
+}

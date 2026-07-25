@@ -117,7 +117,8 @@ pub enum TurnEnd {
 /// turn has to cross it. Reconstructing a `Turn` from `Default` here is what let
 /// `max_turns` be defeated by the very scenario it exists for.
 /// INVARIANT: every per-turn safety counter survives a compaction respawn.
-/// Enforced by `max_turns_is_enforced_across_a_compaction`.
+/// Enforced by `max_turns_is_enforced_across_a_compaction` and
+/// `three_folds_with_progress_do_not_exhaust_the_streak`.
 #[derive(Debug, Default)]
 pub struct TurnContinuation {
     /// Steps already spent against [`EngineConfig::max_turns`].
@@ -131,6 +132,10 @@ pub struct TurnContinuation {
     pub(crate) consecutive_failures: std::collections::HashMap<String, u32>,
     /// The shared per-prompt "reminder and continue" budget.
     pub(crate) turn_extensions: u32,
+    /// Completed samples since the last fold — the compaction streak's
+    /// "intervening completed sample" (T2-3). Read by `actor::try_compact`;
+    /// a fresh continuation restarts the count at zero.
+    pub(crate) samples_since_compact: u32,
 }
 
 /// A compaction digest computed speculatively *during* the turn, overlapping

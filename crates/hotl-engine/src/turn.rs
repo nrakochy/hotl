@@ -188,6 +188,9 @@ struct Turn {
     /// Steps spent against `EngineConfig::max_turns`. A `Turn` field rather
     /// than a `drive()` local precisely so it can cross a fold (T2-2).
     spent: i64,
+    /// Completed samples since the last fold — the "intervening progress" the
+    /// compaction streak is defined against (T2-3).
+    samples_since_compact: u32,
 }
 
 impl Drop for Turn {
@@ -238,6 +241,10 @@ impl Turn {
             speculation: None,
             turn_extensions: cont.turn_extensions,
             spent: cont.spent,
+            // A continuation starts a fresh progress count: the value it
+            // inherited was already read by `try_compact`, and re-carrying it
+            // would let one productive stretch excuse every later fold.
+            samples_since_compact: 0,
         }
     }
 
@@ -249,6 +256,7 @@ impl Turn {
             call_sigs: std::mem::take(&mut self.call_sigs),
             consecutive_failures: std::mem::take(&mut self.consecutive_failures),
             turn_extensions: self.turn_extensions,
+            samples_since_compact: self.samples_since_compact,
         }
     }
 
@@ -396,6 +404,9 @@ impl Turn {
             Err(end) => return end,
         };
         self.usage += usage;
+        // A completed sample is the "intervening progress" the compaction
+        // streak is defined against (T2-3).
+        self.samples_since_compact += 1;
         // Anchor: what the provider says this request cost, plus its output —
         // the base cost of the next request before any new items.
         let reported = usage.input_tokens

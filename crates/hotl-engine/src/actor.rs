@@ -26,7 +26,18 @@ const SUMMARIZE_ATTEMPTS: u32 = 2;
 const SUMMARIZE_MAX_TOKENS: u32 = 2_000;
 /// Compactions without an intervening completed sample before giving up —
 /// prevents a fold-the-digest spiral when the tail alone overflows.
+/// INVARIANT: a fold with progress behind it never draws down this cap.
+/// Enforced by `three_folds_with_progress_do_not_exhaust_the_streak`.
 const MAX_COMPACT_STREAK: u32 = 2;
+/// Wall-clock bound on the inline compaction summarize. The actor's command
+/// loop is blocked for its duration (T3-4), so it is bounded even though the
+/// provider call has its own retries: a degraded floor digest is a handled
+/// outcome, an unresponsive session is not. Sized as one full retry budget
+/// ([`SUMMARIZE_ATTEMPTS`] attempts under the provider's own per-request
+/// timeout) so the outer net never cuts a legitimate retry short.
+/// INVARIANT: the actor's command loop stalls for at most this long on a fold.
+/// Enforced by `a_hung_inline_summarize_degrades_instead_of_wedging`.
+const COMPACT_SUMMARIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Dependencies shared with turn tasks. The log is *not* here: only the actor
 /// loop writes it, so it lives as a local in [`run`].
@@ -371,6 +382,13 @@ async fn try_compact(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> Option<Outcome> {
+    // INVARIANT: the streak counts folds with no intervening completed sample
+    // — a long, productive turn folds as often as it needs to, and only a
+    // fold-the-digest spiral (no progress between folds) trips the cap.
+    // Enforced by `three_folds_with_progress_do_not_exhaust_the_streak`.
+    if cont.samples_since_compact > 0 {
+        *compact_streak = 0;
+    }
     *compact_streak += 1;
     // The token interrupt() cancels right now belongs to the turn that just
     // ended with `Compact`. Honor it through the whole compaction window —
@@ -706,10 +724,13 @@ async fn compact(
         plan
     };
     let folded = &items[plan.prefix_end..plan.kept_from];
-    let (digest, degraded) = match summarize(shared, folded).await {
-        Some(text) => (vec![compaction::digest_item(&text)], false),
-        None => (vec![compaction::floor_digest()], true),
-    };
+    // Timeout or two failed attempts: the floor digest keeps the session moving
+    // rather than ending the turn on housekeeping.
+    let (digest, degraded) =
+        match summarize_bounded(summarize(shared, folded), COMPACT_SUMMARIZE_TIMEOUT).await {
+            Some(text) => (vec![compaction::digest_item(&text)], false),
+            None => (vec![compaction::floor_digest()], true),
+        };
     let payload = EntryPayload::Compaction {
         digest: digest.clone(),
         prefix_end: plan.prefix_end,
@@ -721,6 +742,17 @@ async fn compact(
     }
     *items = Arc::new(compaction::apply(items, &plan, &digest));
     Ok(degraded)
+}
+
+/// The inline fold's summarize under a wall-clock bound. `None` on either a
+/// failed summarize or an exceeded bound — both degrade to the floor digest,
+/// which is why one return type covers them. Split out from [`compact`] so the
+/// bound is testable without a session behind it.
+async fn summarize_bounded(
+    fut: impl std::future::Future<Output = Option<String>>,
+    bound: std::time::Duration,
+) -> Option<String> {
+    tokio::time::timeout(bound, fut).await.ok().flatten()
 }
 
 pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
@@ -922,9 +954,33 @@ fn respawn_turn(
 
 #[cfg(test)]
 mod tests {
-    use super::{awaiting_tool_results, pair_tool_results};
+    use super::COMPACT_SUMMARIZE_TIMEOUT;
+    use super::{awaiting_tool_results, pair_tool_results, summarize_bounded};
     use hotl_types::{Item, SyntheticReason, ToolResultItem};
     use serde_json::json;
+
+    /// T3-4. The paused clock is legal here: this drives `summarize_bounded`
+    /// alone, with no actor and therefore no writer-thread ack for the clock to
+    /// auto-advance past (0011's standing constraint). `compact` calls exactly
+    /// this function, so the bound under test is the shipped one.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_inline_summarize_degrades_instead_of_wedging() {
+        let hung = summarize_bounded(std::future::pending(), COMPACT_SUMMARIZE_TIMEOUT).await;
+        assert!(
+            hung.is_none(),
+            "a hung summarize must degrade to the floor digest, not stall the command loop"
+        );
+        let answered = summarize_bounded(
+            std::future::ready(Some("DIGEST".to_string())),
+            COMPACT_SUMMARIZE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            answered.as_deref(),
+            Some("DIGEST"),
+            "a summarize that answers inside the bound must still be used"
+        );
+    }
 
     fn user(text: &str) -> Item {
         Item::User {
