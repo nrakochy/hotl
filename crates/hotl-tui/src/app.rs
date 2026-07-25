@@ -798,6 +798,60 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
             };
             set_mode(state, mode.as_str())
         }
+        // `?` only opens help while the buffer is empty, so the moment you
+        // have typed anything help is unreachable — a discoverability bug,
+        // not a new feature.
+        "help" => {
+            state.help_open = true;
+            Vec::new()
+        }
+        // The single highest-value "what am I actually running?" answer, and
+        // exactly the state the §5.7 mode bug proved users could not see.
+        "status" => {
+            let name = state.session_name.as_deref().unwrap_or("(unnamed)");
+            let todos = state.todos.len();
+            notice(
+                state,
+                format!(
+                    "{name} · model {} · mode {} · context {} tok · {todos} todo(s)",
+                    state.model, state.mode, state.context_window
+                ),
+            );
+            Vec::new()
+        }
+        // The strip shows a compact line; this prints the breakdown without
+        // stealing strip width.
+        "cost" => {
+            let u = state.session_usage;
+            let mut text = format!(
+                "session: {} in · {} out · {} cached",
+                tok(u.input),
+                tok(u.output),
+                tok(u.cache_read)
+            );
+            match u.cost_usd {
+                Some(c) => text.push_str(&format!(" · ${c:.2}")),
+                // R4 owns the price catalog; inventing a number here would be
+                // worse than saying nothing.
+                None => text.push_str(" · cost not reported by the provider"),
+            }
+            notice(state, text);
+            Vec::new()
+        }
+        // The transcript is a projection, so clearing the *view* is safe and
+        // client-side. The notice must say so: a user who thinks this
+        // truncated the model's context is worse off than one who never ran it.
+        "clear" => {
+            state.transcript.clear();
+            state.scroll = Scroll::Follow;
+            notice(
+                state,
+                "cleared the transcript view — the session log and the model's context are untouched"
+                    .into(),
+            );
+            Vec::new()
+        }
+        "quit" => vec![Cmd::Quit],
         other if state.skills.iter().any(|s| s == other) => {
             // Desugars to an ordinary prompt: the model calls the skill
             // tool, so the TUI never reads skill files itself.
@@ -1579,10 +1633,11 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/");
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(4));
+        // Eight built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(9));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "rename");
-        // `rename` and `review` prefix-match; `plan` and `mode` contain no "re".
+        // `rename` and `review` prefix-match; no other built-in contains "re".
         assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(2));
     }
 
@@ -1859,6 +1914,69 @@ mod tests {
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("/frobnicate"))
         );
+    }
+
+    fn slash(s: &mut State, rest: &str) -> Vec<Cmd> {
+        slash_command(s, rest)
+    }
+
+    fn last_notice(s: &State) -> String {
+        match s.transcript.last() {
+            Some(TranscriptItem::Notice { text }) => text.clone(),
+            other => panic!("expected a notice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_new_builtins_dispatch_and_are_completable() {
+        // `complete::BUILTINS` and `slash_command`'s arms must agree — the pin
+        // test below covers the set; this covers each one's effect.
+        let mut s = State::test_default();
+        assert!(slash(&mut s, "help").is_empty());
+        assert!(s.help_open);
+
+        let mut s = State::test_default();
+        s.mode = "auto".into();
+        s.model = "claude-opus-4-8".into();
+        slash(&mut s, "status");
+        let text = last_notice(&s);
+        assert!(
+            text.contains("auto") && text.contains("claude-opus-4-8"),
+            "{text}"
+        );
+
+        let mut s = State::test_default();
+        s.session_usage.input = 1_500;
+        slash(&mut s, "cost");
+        assert!(last_notice(&s).contains("1.5k"), "{}", last_notice(&s));
+
+        let mut s = State::test_default();
+        s.transcript = vec![TranscriptItem::Notice { text: "old".into() }];
+        slash(&mut s, "clear");
+        assert_eq!(
+            s.transcript.len(),
+            1,
+            "the clear notice replaces the transcript"
+        );
+        assert!(
+            last_notice(&s).contains("view"),
+            "must not imply the log was cleared: {}",
+            last_notice(&s)
+        );
+
+        let mut s = State::test_default();
+        assert_eq!(slash(&mut s, "quit"), vec![Cmd::Quit]);
+    }
+
+    #[test]
+    fn unknown_slash_still_reaches_no_model() {
+        let mut s = State::test_default();
+        let cmds = slash(&mut s, "compact");
+        assert!(
+            cmds.is_empty(),
+            "/compact is deferred; it must not become a prompt"
+        );
+        assert!(last_notice(&s).contains("unknown command"));
     }
 
     /// Finding 4 (minor): `complete::BUILTINS` and `slash_command`'s match

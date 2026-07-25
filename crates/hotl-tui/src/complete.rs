@@ -27,10 +27,15 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 3] = [
+const BUILTINS: [(&str, &str); 8] = [
     ("rename", "name this session"),
     ("plan", "switch to plan mode"),
     ("mode", "set the permission mode"),
+    ("help", "show the key bindings"),
+    ("status", "what this session is running"),
+    ("cost", "token and cost breakdown"),
+    ("clear", "clear the transcript view"),
+    ("quit", "leave the console"),
 ];
 
 pub fn builtins() -> Vec<Command> {
@@ -195,9 +200,14 @@ mod tests {
         assert_eq!(
             names(&cmds, &c),
             vec![
+                "cost",
+                "help",
                 "mode",
                 "plan",
+                "quit",
+                "clear",
                 "rename",
+                "status",
                 "run",
                 "review",
                 "rag-recall",
