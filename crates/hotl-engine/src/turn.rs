@@ -67,8 +67,25 @@ pub(crate) async fn run(
 /// One gated call: ready to execute with its (possibly hook-rewritten or
 /// human-edited) input, or already answered without running.
 enum Gate {
-    Ready { input: Value, summary: String },
-    Resolved(ToolOutcome),
+    Ready {
+        input: Value,
+        summary: String,
+    },
+    /// Answered without running. `chargeable` is false for outcomes the model
+    /// cannot fix by trying again — a human denial, a hook block, an
+    /// interrupted turn — so they never draw down the retry budget and never
+    /// get a `<retry attempts_left>` hint that contradicts the message (T3-1).
+    Resolved {
+        outcome: ToolOutcome,
+        chargeable: bool,
+    },
+}
+
+/// What [`Turn::execute`] produces: the result, plus whether it counts against
+/// the per-tool failure budget.
+struct Executed {
+    outcome: ToolOutcome,
+    chargeable: bool,
 }
 
 /// Chunk a batch for execution: contiguous runs of parallel-safe calls form
@@ -473,7 +490,17 @@ impl Turn {
     /// Mutating batches (anything beyond `read`) are bracketed by shadow
     /// snapshots so `hotl undo` can restore the pre-batch tree (M3b).
     async fn run_tool_batch(&mut self, uses: &[ToolUse]) -> Option<Outcome> {
-        let mutating = uses.iter().any(|tu| tu.name != "read");
+        // `Tool::read_only()` is the tool's own answer, so a `glob`/`grep`
+        // batch stops taking two pointless snapshots and any future read tool
+        // is classified correctly (T3-2). An unknown tool is not `read_only`,
+        // so it counts as mutating — the conservative direction, deliberately.
+        let mutating = uses.iter().any(|tu| {
+            !self
+                .shared
+                .registry
+                .get(&tu.name)
+                .is_some_and(|t| t.read_only())
+        });
         if mutating {
             self.snap(format!("pre batch {}", self.samples)).await;
         }
@@ -499,9 +526,9 @@ impl Turn {
                     .map(|(tu, gate)| self.execute(tu, gate)),
             )
             .await;
-            for (tu, mut outcome) in chunk.iter().zip(outcomes) {
-                self.maybe_evict(tu, &mut outcome).await;
-                let (content, failed) = self.apply_failure_budget(tu, outcome, &mut budget_blown);
+            for (tu, mut executed) in chunk.iter().zip(outcomes) {
+                self.maybe_evict(tu, &mut executed.outcome).await;
+                let (content, failed) = self.apply_failure_budget(tu, executed, &mut budget_blown);
                 results.push(ToolResultItem {
                     tool_use_id: tu.id.clone(),
                     content,
@@ -537,10 +564,21 @@ impl Turn {
     fn apply_failure_budget(
         &mut self,
         tu: &ToolUse,
-        outcome: ToolOutcome,
+        executed: Executed,
         budget_blown: &mut Option<String>,
     ) -> (String, bool) {
+        let Executed {
+            outcome,
+            chargeable,
+        } = executed;
         let mut content = outcome.content;
+        if outcome.is_error && !chargeable {
+            // Not a malfunction and not retryable: it neither draws down the
+            // budget nor earns a `<retry>` hint contradicting its own message.
+            // It must not *clear* the counter either — a denial cannot launder
+            // a genuinely failing tool's streak (T3-1).
+            return (content, true);
+        }
         if outcome.is_error {
             let n = self
                 .consecutive_failures
@@ -567,7 +605,12 @@ impl Turn {
     /// any execution in its chunk — the ask is a one-at-a-time human moment.
     async fn gate(&self, tu: &ToolUse) -> Gate {
         let Some(tool) = self.shared.registry.get(&tu.name) else {
-            return Gate::Resolved(unknown_tool(&self.tool_defs, &tu.name));
+            // Chargeable: an invalid tool name is a model mistake the model can
+            // fix, and repeating it is what the budget exists to stop.
+            return Gate::Resolved {
+                outcome: unknown_tool(&self.tool_defs, &tu.name),
+                chargeable: true,
+            };
         };
         // PreToolUse: a wrap-style intercept may block or rewrite the call.
         let mut input = tu.input.clone();
@@ -580,9 +623,12 @@ impl Turn {
                         name: tu.name.clone(),
                     })
                     .await;
-                    return Gate::Resolved(ToolOutcome::err(format!(
-                        "A hook blocked this tool call: {message}"
-                    )));
+                    return Gate::Resolved {
+                        outcome: ToolOutcome::err(format!(
+                            "A hook blocked this tool call: {message}"
+                        )),
+                        chargeable: false,
+                    };
                 }
                 crate::hooks::PreToolDecision::Rewrite { input: rewritten } => {
                     input = crate::hooks::restore_capped(&input, rewritten)
@@ -591,7 +637,10 @@ impl Turn {
             // The hook may have been abandoned by an interrupt rather than
             // answered; a cancelled turn executes nothing further.
             if self.cancel.is_cancelled() {
-                return Gate::Resolved(ToolOutcome::err("Not executed (turn stopped)."));
+                return Gate::Resolved {
+                    outcome: ToolOutcome::err("Not executed (turn stopped)."),
+                    chargeable: false,
+                };
             }
         }
         let (summary, why) = match tool.permission(&input) {
@@ -611,19 +660,25 @@ impl Turn {
                         ok: true,
                     })
                     .await;
-                    return Gate::Resolved(ToolOutcome::ok(content));
+                    return Gate::Resolved {
+                        outcome: ToolOutcome::ok(content),
+                        chargeable: true,
+                    };
                 }
                 AskReply::Deny { message } => {
                     self.emit(EngineEvent::ToolDenied {
                         name: tu.name.clone(),
                     })
                     .await;
-                    return Gate::Resolved(match message {
-                        Some(m) => ToolOutcome::err(format!("The user declined this tool call: {m}")),
-                        None => ToolOutcome::err(
-                            "The user declined this tool call. Ask what they'd like to do instead, or proceed another way.",
-                        ),
-                    });
+                    return Gate::Resolved {
+                        outcome: match message {
+                            Some(m) => ToolOutcome::err(format!("The user declined this tool call: {m}")),
+                            None => ToolOutcome::err(
+                                "The user declined this tool call. Ask what they'd like to do instead, or proceed another way.",
+                            ),
+                        },
+                        chargeable: false,
+                    };
                 }
             }
         }
@@ -636,12 +691,20 @@ impl Turn {
     /// Execute an approved call: ToolStart → run → PostToolUse hook →
     /// ToolDone. `&self` only, so approved parallel-safe calls in one chunk
     /// can run concurrently; a call the gate already resolved passes through.
-    async fn execute(&self, tu: &ToolUse, gate: Gate) -> ToolOutcome {
+    async fn execute(&self, tu: &ToolUse, gate: Gate) -> Executed {
         // Exhaustive by construction: a new `Gate` variant is a compile error
         // here, not a runtime panic on a supervised task (T1-5).
         let (input, summary) = match gate {
             Gate::Ready { input, summary } => (input, summary),
-            Gate::Resolved(outcome) => return outcome,
+            Gate::Resolved {
+                outcome,
+                chargeable,
+            } => {
+                return Executed {
+                    outcome,
+                    chargeable,
+                }
+            }
         };
         self.emit(EngineEvent::ToolStart {
             name: tu.name.clone(),
@@ -649,7 +712,12 @@ impl Turn {
         })
         .await;
         let Some(tool) = self.shared.registry.get(&tu.name) else {
-            return unknown_tool(&self.tool_defs, &tu.name); // gate checked; defensive
+            // Gate checked; defensive. Chargeable for the same reason the gate's
+            // own `unknown_tool` is: a bad name is a model mistake it can fix.
+            return Executed {
+                outcome: unknown_tool(&self.tool_defs, &tu.name),
+                chargeable: true,
+            };
         };
         let mut outcome = tool.run(input, self.cancel.clone()).await;
         // PostToolUse: a node-style proposal may replace a successful result.
@@ -668,7 +736,11 @@ impl Turn {
             ok: !outcome.is_error,
         })
         .await;
-        outcome
+        // A tool that actually ran and failed is exactly what the budget is for.
+        Executed {
+            outcome,
+            chargeable: true,
+        }
     }
 
     /// Allow-rules (deny-first, sandbox-gated, protected carve-out) or the
