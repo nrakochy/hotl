@@ -94,7 +94,9 @@ own.
 Typing `/` opens a menu of every command and skill, filtered as you keep
 typing: `↑` / `↓` pick, `Tab` completes the highlighted name, `Enter` runs
 it, `Esc` dismisses. The descriptions beside each skill come from its
-roster entry — they are drawn for you and are never sent to the model.
+roster entry and cost nothing by default: the always-sent tool description
+omits them, and the model only sees one if it explicitly queries the skill
+tool for it.
 
 A non-default mode shows as a badge on the strip next to the session name.
 Switching mode never starts a turn — it's session bookkeeping, and it's

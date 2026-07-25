@@ -10,9 +10,13 @@ semver promise of their own.
 
 - **TUI command completion.** Typing `/` opens a filtering popup of every
   built-in command and loadable skill: `↑↓` picks, `tab` completes, `enter`
-  runs, `esc` dismisses. `initialize` now advertises skills as
-  `[{name, description}]` (the bare-string form is still accepted); the
-  descriptions are client-facing only and add nothing to the model's context.
+  runs, `esc` dismisses. `initialize`'s `skills` field now carries
+  `{name, description}` objects instead of bare strings; compatibility runs
+  one way — a newer TUI still reads the old bare-string shape from an older
+  engine, but a client parsing the documented bare-string shape needs
+  updating to read this one. Descriptions cost nothing by default: the
+  always-sent tool description omits them, and the model only sees one if
+  it explicitly queries the skill tool.
 
 ## [0.5.1] - 2026-07-24
 

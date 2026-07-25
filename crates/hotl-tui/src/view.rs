@@ -640,7 +640,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "d c y operators · dd cc yy x p u",
         "j k scroll transcript when input is empty",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
-        "/ opens command completion · ↑↓ pick · tab complete · enter run",
+        "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
         "ctrl-e or :e open $EDITOR · ctrl-c quit/cancel",
         "any key closes this help",
     ]
