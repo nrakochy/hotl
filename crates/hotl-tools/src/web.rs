@@ -253,20 +253,80 @@ fn parse_fetchable(raw: &str) -> Option<(reqwest::Url, String)> {
     Some((url, host))
 }
 
-/// Hosts named in an input's `urls`, for the permission-ask summary — best
-/// effort: unparseable entries are simply omitted (the ask still names every
-/// host that *is* a real target; `run` reports the parse failure).
-fn hosts_of(input: &Value) -> Vec<String> {
-    input
-        .get("urls")
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_str)
-                .filter_map(|s| parse_fetchable(s).map(|(_, host)| host))
-                .collect()
-        })
-        .unwrap_or_default()
+/// A URL in an ask is shown whole — a host alone hides the exfiltration
+/// channel the comment on `permission` already names. Long URLs are elided in
+/// the query with an explicit count, never silently cut.
+const URL_SUMMARY_MAX: usize = 160;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AddressClass {
+    Public,
+    Private,
+    Loopback,
+    Metadata,
+}
+
+/// Classify a URL host. Literal addresses only — a *name* that resolves into
+/// the private range is not caught here.
+///
+/// INVARIANT (unimplemented — see specs/exec-plans/active/0019-remediation-sandbox.md,
+/// Task 7 decision log): DNS names resolving to private addresses are not
+/// classified; only literals and `localhost` are.
+pub(crate) fn address_class(host: &str) -> AddressClass {
+    let bare = host.trim_start_matches('[').trim_end_matches(']');
+    if bare.eq_ignore_ascii_case("localhost") || bare.to_ascii_lowercase().ends_with(".localhost") {
+        return AddressClass::Loopback;
+    }
+    let Ok(ip) = bare.parse::<std::net::IpAddr>() else {
+        return AddressClass::Public;
+    };
+    let ip = match ip {
+        // Unwrap v4-mapped/compatible v6 so ::ffff:169.254.169.254 classifies too.
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    };
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            const METADATA: [std::net::Ipv4Addr; 2] = [
+                std::net::Ipv4Addr::new(169, 254, 169, 254), // EC2/GCE/Azure IMDS
+                std::net::Ipv4Addr::new(169, 254, 170, 2),   // ECS task metadata
+            ];
+            if METADATA.contains(&v4) {
+                AddressClass::Metadata
+            } else if v4.is_loopback() {
+                AddressClass::Loopback
+            } else if v4.is_private()
+                || v4.is_link_local()
+                || v4.octets()[0] == 0
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+            // CGNAT
+            {
+                AddressClass::Private
+            } else {
+                AddressClass::Public
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let s = v6.segments();
+            if v6.is_loopback() {
+                AddressClass::Loopback
+            } else if s[0] == 0xfd00 && s[1] == 0x0ec2 {
+                AddressClass::Metadata // fd00:ec2::254
+            } else if (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 {
+                AddressClass::Private // ULA / link-local
+            } else {
+                AddressClass::Public
+            }
+        }
+    }
+}
+
+fn elide(url: &str) -> String {
+    if url.len() <= URL_SUMMARY_MAX {
+        return url.to_string();
+    }
+    let head: String = url.chars().take(URL_SUMMARY_MAX).collect();
+    format!("{head}…(+{} chars)", url.len() - head.len())
 }
 
 pub struct WebFetchTool {
@@ -445,16 +505,62 @@ impl Tool for WebFetchTool {
         })
     }
     /// Network side effect (a fetch can exfiltrate via the URL itself), so
-    /// this always asks — even under an allowlist that would otherwise let
-    /// it through silently.
+    /// this always asks — and the ask carries the **whole URL**, query
+    /// included: a host-only summary hides exactly the channel this comment
+    /// names (T3-11). A target inside the private network, on loopback, or at
+    /// a cloud-metadata address escalates to `AskProtected` — the same
+    /// treatment `write`/`edit` give an execute-later path.
+    ///
+    /// INVARIANT: the approver sees every byte of the URL, elided only with an
+    /// explicit remainder count. Enforced by
+    /// `permission_shows_the_whole_url_including_the_query`.
     fn permission(&self, input: &Value) -> Permission {
-        let hosts = hosts_of(input);
-        let summary = if hosts.is_empty() {
+        let targets: Vec<(String, AddressClass)> = input
+            .get("urls")
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .map(|raw| {
+                        let class = parse_fetchable(raw)
+                            .map(|(_, host)| address_class(&host))
+                            .unwrap_or(AddressClass::Public);
+                        (elide(raw), class)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let summary = if targets.is_empty() {
             "web_fetch".to_string()
         } else {
-            format!("web_fetch: {}", hosts.join(", "))
+            format!(
+                "web_fetch: {}",
+                targets
+                    .iter()
+                    .map(|(u, _)| u.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
         };
-        Permission::Ask { summary }
+        let escalated: Vec<&str> = targets
+            .iter()
+            .filter(|(_, c)| !matches!(c, AddressClass::Public))
+            .map(|(u, _)| u.as_str())
+            .collect();
+        if escalated.is_empty() {
+            Permission::Ask { summary }
+        } else {
+            Permission::AskProtected {
+                why: format!(
+                    "targets the private network or a cloud-metadata address ({}). A fetch \
+                     here reaches services that are not on the public internet — including \
+                     instance credentials — and the response comes back into the model's \
+                     context.",
+                    escalated.join(", ")
+                ),
+                summary,
+            }
+        }
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(self.run_impl(input, cancel))
@@ -703,6 +809,81 @@ mod tests {
         assert!(err.content.contains("at most 20"));
         let ok = extract_urls(&json!({"urls": ["http://a", "http://b"]})).unwrap();
         assert_eq!(ok, vec!["http://a".to_string(), "http://b".to_string()]);
+    }
+
+    #[test]
+    fn permission_shows_the_whole_url_including_the_query() {
+        let tool = WebFetchTool::new(SessionConcurrency::new(ConcurrencyLimits::default()));
+        let secret = "A".repeat(400);
+        let perm =
+            tool.permission(&json!({"urls": [format!("https://pastebin.com/p?d={secret}")]}));
+        let Permission::Ask { summary } = perm else {
+            panic!("web_fetch must ask")
+        };
+        assert!(
+            summary.contains("pastebin.com/p"),
+            "path must be shown: {summary}"
+        );
+        assert!(
+            summary.contains("?d="),
+            "the query must be visible, not hidden: {summary}"
+        );
+        assert!(
+            summary.contains('+'),
+            "the elided remainder must be counted: {summary}"
+        );
+        assert!(
+            summary.len() < 400,
+            "the summary stays one line: {}",
+            summary.len()
+        );
+    }
+
+    #[test]
+    fn a_private_or_metadata_target_escalates_the_ask() {
+        let tool = WebFetchTool::new(SessionConcurrency::new(ConcurrencyLimits::default()));
+        for url in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:8080/admin",
+            "http://10.0.0.5/",
+            "http://[::1]:9/",
+        ] {
+            match tool.permission(&json!({"urls": [url]})) {
+                Permission::AskProtected { summary, why } => {
+                    assert!(
+                        summary.contains(url.trim_end_matches('/'))
+                            || summary.contains("169.254")
+                            || summary.contains("127.0.0.1")
+                            || summary.contains("10.0.0.5")
+                            || summary.contains("::1")
+                    );
+                    assert!(!why.is_empty(), "the escalation must say why");
+                }
+                other => panic!("{url} must escalate, got {other:?}"),
+            }
+        }
+        // A public host stays an ordinary ask.
+        assert!(matches!(
+            tool.permission(&json!({"urls": ["https://docs.rs/x"]})),
+            Permission::Ask { .. }
+        ));
+    }
+
+    #[test]
+    fn address_class_sees_through_integer_and_mapped_forms() {
+        // The WHATWG URL parser normalizes these before we ever see the host.
+        assert_eq!(
+            parse_fetchable("http://2130706433/").unwrap().1,
+            "127.0.0.1"
+        );
+        assert_eq!(address_class("127.0.0.1"), AddressClass::Loopback);
+        assert_eq!(address_class("169.254.169.254"), AddressClass::Metadata);
+        assert_eq!(address_class("10.1.2.3"), AddressClass::Private);
+        assert_eq!(address_class("100.64.0.1"), AddressClass::Private); // CGNAT
+        assert_eq!(address_class("[fd00::1]"), AddressClass::Private); // ULA
+        assert_eq!(address_class("fe80::1"), AddressClass::Private); // link-local
+        assert_eq!(address_class("localhost"), AddressClass::Loopback);
+        assert_eq!(address_class("example.com"), AddressClass::Public);
     }
 
     #[test]
