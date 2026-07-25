@@ -81,7 +81,10 @@ impl Shadow {
         };
         std::fs::write(shadow.git_dir.join("info/exclude"), EXCLUDES).ok()?;
         // Record the work tree so `hotl undo` (a later process) can find it.
-        shadow.git(&[
+        // `git_ok`, not `git`: a failed config write means `Shadow::open` later
+        // cannot find the work tree, so fall back to no-snapshots rather than
+        // pretend this session has undo.
+        shadow.git_ok(&[
             "config",
             "hotl.worktree",
             &shadow.work_tree.display().to_string(),
@@ -109,9 +112,15 @@ impl Shadow {
 
     /// Commit the current tree under `label`. Blocking (child process) —
     /// async callers wrap in spawn_blocking.
+    ///
+    /// INVARIANT: `Some(hash)` means the commit reflects the workspace as it
+    /// was read. Every git step's exit status is checked, so a failed `add`
+    /// can no longer be followed by a `commit --allow-empty` that silently
+    /// records the *previous* tree. Enforced by
+    /// `snapshot_fails_when_the_index_is_locked`.
     pub fn snapshot(&self, label: &str) -> Option<String> {
-        self.git(&["add", "-A", "."])?;
-        self.git(&[
+        self.git_ok(&["add", "-A", "."])?;
+        self.git_ok(&[
             "-c",
             "user.name=hotl",
             "-c",
@@ -122,10 +131,8 @@ impl Shadow {
             "-m",
             label,
         ])?;
-        let out = self.git(&["rev-parse", "HEAD"])?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let out = self.git_ok(&["rev-parse", "HEAD"])?;
+        Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
     /// The most recent commit whose label starts with "pre " — the state
@@ -159,7 +166,7 @@ impl Shadow {
             "could not checkpoint the current tree — refusing to restore over unsaved work",
         )?;
         let diff = self
-            .git(&["diff", "--name-only", hash, "HEAD"])
+            .git_ok(&["diff", "--name-only", hash, "HEAD"])
             .ok_or("git diff failed")?;
         let files: Vec<String> = String::from_utf8_lossy(&diff.stdout)
             .lines()
@@ -168,7 +175,7 @@ impl Shadow {
         // Paths that exist only *after* the snapshot. `git checkout <hash> -- .`
         // will not remove them (they are not in `<hash>`), so name them.
         let added = self
-            .git(&["diff", "--name-only", "--diff-filter=A", hash, "HEAD"])
+            .git_ok(&["diff", "--name-only", "--diff-filter=A", hash, "HEAD"])
             .ok_or("git diff failed")?;
         let added: Vec<String> = String::from_utf8_lossy(&added.stdout)
             .lines()
@@ -195,6 +202,12 @@ impl Shadow {
 
     pub fn work_tree(&self) -> &Path {
         &self.work_tree
+    }
+
+    /// `git`, but a non-zero exit is a failure. `git` alone only reports
+    /// whether the *process spawned* — the distinction that made T2-15b silent.
+    fn git_ok(&self, args: &[&str]) -> Option<std::process::Output> {
+        self.git(args).filter(|o| o.status.success())
     }
 
     fn git(&self, args: &[&str]) -> Option<std::process::Output> {
@@ -303,6 +316,27 @@ mod tests {
         );
         assert!(touched.iter().any(|f| f == "a.txt"), "touched: {touched:?}");
         assert!(touched.iter().any(|f| f == "b.txt"), "touched: {touched:?}");
+    }
+
+    #[test]
+    fn snapshot_fails_when_the_index_is_locked() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.txt"), "v1").unwrap();
+        let shadow = Shadow::create(root.path(), "LOCKED", work.path()).expect("create");
+        assert!(shadow.snapshot("pre batch 1").is_some(), "baseline works");
+
+        // Exactly what a concurrent snapshot or a crashed git leaves behind.
+        std::fs::write(root.path().join("LOCKED.git/index.lock"), "").unwrap();
+        std::fs::write(work.path().join("a.txt"), "v2").unwrap();
+
+        assert!(
+            shadow.snapshot("pre batch 2").is_none(),
+            "a failed `git add` must not yield a snapshot of the previous tree"
+        );
     }
 
     #[test]
