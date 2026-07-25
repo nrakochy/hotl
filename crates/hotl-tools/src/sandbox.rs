@@ -43,32 +43,187 @@ fn canon(p: PathBuf) -> PathBuf {
     p.canonicalize().unwrap_or(p)
 }
 
+/// Hard ceiling on the smoke test. A wedged `sandbox-exec` must never wedge
+/// startup; on expiry the child is killed and the verdict is Unavailable
+/// (fail-closed).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Probe what this host can enforce.
+///
+/// INVARIANT: `Enforced(m)` is returned only after a child spawned under `m`
+/// *failed* to create a file outside the confinement on this host — the
+/// mechanism's presence on disk is never sufficient (D-9). Enforced by
+/// `tests/sandbox_probe.rs::probe_refuses_a_mechanism_that_does_not_confine`.
+///
+/// Memoized: exactly one smoke-test spawn per process. `builtins.rs`,
+/// `doctor.rs`, `shell_hooks.rs` and `agent.rs` all call this directly.
 pub fn probe() -> SandboxStatus {
+    static STATUS: std::sync::OnceLock<SandboxStatus> = std::sync::OnceLock::new();
+    STATUS.get_or_init(probe_uncached).clone()
+}
+
+fn probe_uncached() -> SandboxStatus {
     if std::env::var("HOTL_SANDBOX").is_ok_and(|v| v == "off") {
         return SandboxStatus::Disabled;
     }
+    let mechanism = match mechanism_available() {
+        Ok(m) => m,
+        Err(reason) => return SandboxStatus::Unavailable(reason),
+    };
+    match verify_confinement_with(mechanism, |script| {
+        build_command(
+            script,
+            &SandboxStatus::Enforced(mechanism),
+            &EgressState::Open,
+        )
+    }) {
+        Ok(()) => SandboxStatus::Enforced(mechanism),
+        Err(reason) => SandboxStatus::Unavailable(reason),
+    }
+}
+
+/// Is the mechanism *present*? (The old `probe` stopped here — that is D-9.)
+fn mechanism_available() -> Result<&'static str, String> {
     #[cfg(target_os = "macos")]
     {
         if std::path::Path::new("/usr/bin/sandbox-exec").exists() {
-            return SandboxStatus::Enforced("seatbelt");
+            return Ok("seatbelt");
         }
-        return SandboxStatus::Unavailable("sandbox-exec not found".into());
+        return Err("sandbox-exec not found".into());
     }
     #[cfg(target_os = "linux")]
     {
         use landlock::{Access, AccessFs, Ruleset, RulesetAttr, ABI};
         // Creating (not applying) a ruleset probes kernel support.
-        match Ruleset::default().handle_access(AccessFs::from_all(ABI::V2)) {
+        return match Ruleset::default().handle_access(AccessFs::from_all(ABI::V2)) {
             Ok(r) => match r.create() {
-                Ok(_) => return SandboxStatus::Enforced("landlock"),
-                Err(e) => return SandboxStatus::Unavailable(format!("landlock unavailable: {e}")),
+                Ok(_) => Ok("landlock"),
+                Err(e) => Err(format!("landlock unavailable: {e}")),
             },
-            Err(e) => return SandboxStatus::Unavailable(format!("landlock unavailable: {e}")),
-        }
+            Err(e) => Err(format!("landlock unavailable: {e}")),
+        };
     }
     #[allow(unreachable_code)]
-    SandboxStatus::Unavailable("no sandbox mechanism for this OS".into())
+    Err("no sandbox mechanism for this OS".into())
+}
+
+/// A directory we can really write to that is **outside** everything the
+/// floor re-allows (cwd, `TMPDIR`, `/private/tmp`, `/dev`). Returning it is a
+/// positive control: the parent creates and deletes a file here first, so a
+/// later "the file does not exist" assertion cannot pass merely because the
+/// path was unwritable anyway (the vacuous-negative trap).
+pub fn probe_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os("HOTL_SANDBOX_PROBE_DIR") {
+        return writable(&canon(PathBuf::from(dir)));
+    }
+    let allowed: Vec<PathBuf> = vec![
+        canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        canon(std::env::temp_dir()),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/dev"),
+    ];
+    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("/var/tmp")];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(home));
+    }
+    let mut last = "no candidate directory outside the confinement".to_string();
+    for cand in candidates {
+        let cand = canon(cand);
+        if allowed.iter().any(|a| cand.starts_with(a)) {
+            continue; // inside the write set — proves nothing
+        }
+        match writable(&cand) {
+            Ok(dir) => return Ok(dir),
+            Err(e) => last = e,
+        }
+    }
+    Err(format!(
+        "cannot verify the sandbox: {last}. Set HOTL_SANDBOX_PROBE_DIR to a writable \
+         directory outside the working directory and outside TMPDIR."
+    ))
+}
+
+fn writable(dir: &std::path::Path) -> Result<PathBuf, String> {
+    let probe = dir.join(format!("hotl-sbx-writable-{}", std::process::id()));
+    std::fs::write(&probe, b"x").map_err(|e| format!("{} is not writable: {e}", dir.display()))?;
+    let _ = std::fs::remove_file(&probe);
+    Ok(dir.to_path_buf())
+}
+
+/// Single-quote a path for `sh -c`. `None` when the path cannot be quoted
+/// safely (a NUL or a non-UTF-8 component) — the caller then falls through to
+/// a fail-closed verdict rather than building a dubious shell word.
+fn shell_single_quote(p: &std::path::Path) -> Option<String> {
+    let s = p.to_str()?;
+    if s.contains('\0') {
+        return None;
+    }
+    Some(format!("'{}'", s.replace('\'', r"'\''")))
+}
+
+/// Spawn a child under `build` that tries to create a file outside the
+/// confinement, and certify the mechanism only if it fails **and** the file
+/// does not exist afterwards. `build` is injected so the negative case is
+/// testable on any host, with no sandbox required.
+pub fn verify_confinement_with(
+    mechanism: &str,
+    build: impl Fn(&str) -> tokio::process::Command,
+) -> Result<(), String> {
+    let dir = probe_dir()?;
+    let target = dir.join(format!(
+        "hotl-sbx-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::remove_file(&target);
+    let quoted = shell_single_quote(&target)
+        .ok_or_else(|| format!("cannot verify {mechanism}: unquotable probe path"))?;
+    let outcome = run_bounded(build(&format!("echo hotl-probe > {quoted}")));
+    let leaked = target.exists();
+    if leaked {
+        let _ = std::fs::remove_file(&target);
+    }
+    match outcome {
+        Ok(success) if leaked || success => Err(format!(
+            "`{mechanism}` did not confine a write to {} — the profile/ruleset is not \
+             being applied on this host, so bash cannot be auto-approved",
+            target.display()
+        )),
+        Ok(_) => Ok(()),
+        Err(e) => Err(format!("`{mechanism}` could not be verified: {e}")),
+    }
+}
+
+/// Run to completion under `PROBE_TIMEOUT` using the **std** command inside
+/// the tokio one: `probe()` is sync and is called from contexts with and
+/// without a tokio runtime (`doctor.rs` vs `builtins.rs`), so it must not
+/// depend on a reactor. `as_std_mut` keeps any `pre_exec` closure the Landlock
+/// path installed. Returns Ok(child_succeeded).
+fn run_bounded(mut cmd: tokio::process::Command) -> std::io::Result<bool> {
+    let std_cmd = cmd.as_std_mut();
+    std_cmd
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = std_cmd.spawn()?;
+    let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait()? {
+            Some(status) => return Ok(status.success()),
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("probe did not exit within {PROBE_TIMEOUT:?}"),
+                ));
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    }
 }
 
 /// Build the command for `sh -c <command>` under the active floor and the
