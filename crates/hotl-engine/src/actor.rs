@@ -117,10 +117,19 @@ impl SharedDeps {
         mode
     }
 
-    /// Durable append (flush inside `SessionLog`); false = log sealed.
+    /// Commit one entry: forward it to the writer at the `Durable` tier and
+    /// await the ack ("Writer fsyncs, acks with the byte offset" —
+    /// commit-protocol.md §Durability ordering). `false` = the log is sealed,
+    /// and the caller must NOT advance the projection.
+    ///
+    /// INVARIANT: the projection only ever advances after this returns `true`,
+    /// so a crash can leave the log ahead of the projection but never the
+    /// reverse. Enforced by
+    /// `a_writer_death_before_fsync_never_leaves_the_projection_ahead_of_the_log`.
+    ///
     /// The failure surfaces to the user via the turn outcome, not stderr.
-    fn append(&self, log: &mut SessionLog, payload: &EntryPayload) -> bool {
-        log.append(payload, self.clock.now_ms()).is_ok()
+    async fn append(&self, log: &mut SessionLog, payload: &EntryPayload) -> bool {
+        log.append_acked(payload, self.clock.now_ms()).await.is_ok()
     }
 }
 
@@ -193,10 +202,12 @@ pub(crate) async fn run(
                 }
             }
             SessionCmd::Steer(text) => {
-                admit_steer(&shared, &mut log, &mut items, &mut held_steers, text)
+                admit_steer(&shared, &mut log, &mut items, &mut held_steers, text).await
             }
             SessionCmd::Rename(name) => {
-                let _ = shared.append(&mut log, &EntryPayload::Rename { name });
+                let _ = shared
+                    .append(&mut log, &EntryPayload::Rename { name })
+                    .await;
             }
             SessionCmd::SetMode(mode) => {
                 // Effective immediately: the atomic, not a rebuilt `Rules`,
@@ -206,21 +217,25 @@ pub(crate) async fn run(
                 // build's log never claims `auto` while it actually ran
                 // `ask`.
                 let mode = shared.set_mode(mode);
-                let _ = shared.append(
-                    &mut log,
-                    &EntryPayload::ModeSet {
-                        mode: mode.as_str().into(),
-                    },
-                );
+                let _ = shared
+                    .append(
+                        &mut log,
+                        &EntryPayload::ModeSet {
+                            mode: mode.as_str().into(),
+                        },
+                    )
+                    .await;
             }
             SessionCmd::SetTodos(new_todos) => {
                 todos = new_todos;
-                let _ = shared.append(
-                    &mut log,
-                    &EntryPayload::Todos {
-                        items: todos.clone(),
-                    },
-                );
+                let _ = shared
+                    .append(
+                        &mut log,
+                        &EntryPayload::Todos {
+                            items: todos.clone(),
+                        },
+                    )
+                    .await;
                 let _ = events
                     .send(EngineEvent::TodosChanged {
                         items: todos.clone(),
@@ -231,9 +246,9 @@ pub(crate) async fn run(
                 let _ = reply.send(snapshot_with_todos(&items, &todos));
             }
             SessionCmd::Propose { entries, reply } => {
-                let committed = commit(&shared, &mut log, &mut items, entries);
+                let committed = commit(&shared, &mut log, &mut items, entries).await;
                 // The results a held steer was waiting on may have just landed.
-                release_steers(&shared, &mut log, &mut items, &mut held_steers);
+                release_steers(&shared, &mut log, &mut items, &mut held_steers).await;
                 let _ = reply.send(committed);
             }
             SessionCmd::WriteBlob {
@@ -251,8 +266,8 @@ pub(crate) async fn run(
                 // The turn is over, so nothing will answer an open batch now.
                 // Close it, then let held steers land before a queued prompt
                 // starts the next turn behind them.
-                close_open_batch(&shared, &mut log, &mut items);
-                release_steers(&shared, &mut log, &mut items, &mut held_steers);
+                close_open_batch(&shared, &mut log, &mut items).await;
+                release_steers(&shared, &mut log, &mut items, &mut held_steers).await;
                 on_turn_finished(
                     TurnFinishedCtx {
                         shared: &shared,
@@ -400,7 +415,7 @@ async fn end_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
-    annotate(shared, log, &outcome);
+    annotate(shared, log, &outcome).await;
     // Notification: the turn completed — fire-and-forget, computed before
     // `outcome` moves into the event below.
     if let Some(hooks) = &shared.hooks {
@@ -471,7 +486,7 @@ fn awaiting_tool_results(items: &[Item]) -> bool {
 /// results away from the calls they answer. Such a steer is held instead and
 /// released once the results land. The model sees it at the same moment either
 /// way: the next sample happens after the batch closes.
-fn admit_steer(
+async fn admit_steer(
     shared: &SharedDeps,
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
@@ -482,10 +497,10 @@ fn admit_steer(
         held.push(text);
         return;
     }
-    append_steer(shared, log, items, text);
+    append_steer(shared, log, items, text).await;
 }
 
-fn append_steer(
+async fn append_steer(
     shared: &SharedDeps,
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
@@ -497,7 +512,7 @@ fn append_steer(
             synthetic: Some(SyntheticReason::Steer),
         },
     };
-    if shared.append(log, &payload) {
+    if shared.append(log, &payload).await {
         if let EntryPayload::Item { item } = payload {
             Arc::make_mut(items).push(item);
         }
@@ -506,7 +521,7 @@ fn append_steer(
 
 /// Append the steers that were waiting on a batch, oldest first, once the
 /// pairing is closed.
-fn release_steers(
+async fn release_steers(
     shared: &SharedDeps,
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
@@ -516,14 +531,14 @@ fn release_steers(
         return;
     }
     for text in held.drain(..) {
-        append_steer(shared, log, items, text);
+        append_steer(shared, log, items, text).await;
     }
 }
 
 /// Answer a batch nothing will answer any more. A turn that dies before it can
 /// report leaves calls hanging; the next request would be rejected for the
 /// missing results, so the protocol gets completed here instead.
-fn close_open_batch(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>) {
+async fn close_open_batch(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<Vec<Item>>) {
     let Some(Item::Assistant { blocks }) = items.last() else {
         return;
     };
@@ -543,7 +558,7 @@ fn close_open_batch(shared: &SharedDeps, log: &mut SessionLog, items: &mut Arc<V
                 .collect(),
         },
     };
-    if shared.append(log, &payload) {
+    if shared.append(log, &payload).await {
         if let EntryPayload::Item { item } = payload {
             Arc::make_mut(items).push(item);
         }
@@ -600,14 +615,14 @@ pub(crate) fn pair_tool_results(items: Vec<Item>) -> Vec<Item> {
 }
 
 /// Commit a proposal: append each entry durably, then project it.
-fn commit(
+async fn commit(
     shared: &SharedDeps,
     log: &mut SessionLog,
     items: &mut Arc<Vec<Item>>,
     entries: Vec<EntryPayload>,
 ) -> bool {
     for payload in entries {
-        if !shared.append(log, &payload) {
+        if !shared.append(log, &payload).await {
             return false;
         }
         if let EntryPayload::Item { item } = payload {
@@ -618,7 +633,7 @@ fn commit(
 }
 
 /// Non-Done outcomes leave a durable annotation in the log.
-fn annotate(shared: &SharedDeps, log: &mut SessionLog, outcome: &Outcome) {
+async fn annotate(shared: &SharedDeps, log: &mut SessionLog, outcome: &Outcome) {
     let reason = match outcome {
         Outcome::Cancelled => Some("user interrupt".to_string()),
         Outcome::TurnLimit => Some(format!("max_turns ({}) reached", shared.config.max_turns)),
@@ -628,7 +643,9 @@ fn annotate(shared: &SharedDeps, log: &mut SessionLog, outcome: &Outcome) {
         Outcome::Done { .. } | Outcome::Refused => None,
     };
     if let Some(reason) = reason {
-        shared.append(log, &EntryPayload::Cancelled { reason });
+        shared
+            .append(log, &EntryPayload::Cancelled { reason })
+            .await;
     }
 }
 
@@ -659,7 +676,7 @@ async fn compact(
                     kept_from: spec.kept_from,
                     degraded: false,
                 };
-                if !shared.append(log, &payload) {
+                if !shared.append(log, &payload).await {
                     return Err("session log is sealed".into());
                 }
                 let plan = compaction::Plan {
@@ -697,7 +714,7 @@ async fn compact(
         kept_from: plan.kept_from,
         degraded,
     };
-    if !shared.append(log, &payload) {
+    if !shared.append(log, &payload).await {
         return Err("session log is sealed".into());
     }
     *items = Arc::new(compaction::apply(items, &plan, &digest));
@@ -793,7 +810,7 @@ async fn start_turn(
     let payload = EntryPayload::Item {
         item: Item::User { text, synthetic },
     };
-    if !shared.append(log, &payload) {
+    if !shared.append(log, &payload).await {
         let _ = events
             .send(EngineEvent::TurnDone {
                 outcome: Outcome::Error {
@@ -820,7 +837,7 @@ async fn start_turn(
                     synthetic: Some(SyntheticReason::SystemReminder),
                 },
             };
-            if shared.append(log, &reminder) {
+            if shared.append(log, &reminder).await {
                 if let EntryPayload::Item { item } = reminder {
                     Arc::make_mut(items).push(item);
                 }
