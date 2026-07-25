@@ -483,7 +483,11 @@ fn apply_proxy_env(
 /// loopback (the mDNSResponder unix socket means DNS resolution still works —
 /// documented in SECURITY.md as a resolution, not exfil-confinement, limit).
 #[cfg(target_os = "macos")]
-fn seatbelt_profile(confine_network: bool, unix_sockets: UnixSockets) -> String {
+fn seatbelt_profile(
+    confine_network: bool,
+    unix_sockets: UnixSockets,
+    automation: Automation,
+) -> String {
     let mut profile = String::from(
         r#"(version 1)
 (allow default)
@@ -503,6 +507,29 @@ fn seatbelt_profile(confine_network: bool, unix_sockets: UnixSockets) -> String 
 (allow network-inbound (local ip "localhost:*"))
 "#,
         );
+    }
+    // `(allow default)` above leaves Apple Events open, so an
+    // `osascript -e 'tell app "Terminal" to do script "…"'` would execute its
+    // payload in a process that is *not* a descendant of this sandbox — an
+    // escape with no disk write. Denying the event send is the surgical
+    // control: a blanket `(deny mach-lookup)` would need a long,
+    // release-fragile allowlist for cfprefsd/notifyd/launchd, and denying the
+    // AppleEvents/LaunchServices brokers by name was measured to convert a
+    // fast refusal into an indefinite hang (see the plan's execution
+    // findings), which is a worse outcome than the refusal it replaces.
+    //
+    // INVARIANT (partially verified — see specs/exec-plans/active/
+    // 0019-remediation-sandbox.md, execution findings): no Apple Event leaves
+    // a confined child unless the operator set HOTL_MACOS_AUTOMATION=allow.
+    // The positive direction — that plain AppleScript still runs — is enforced
+    // by `seatbelt_denies_apple_events_without_breaking_plain_applescript`.
+    // The negative direction is NOT covered by a test: no cross-application
+    // Apple Event is observable on the author's host either way (TCC gates the
+    // reachable targets, and the one that works unsandboxed is already refused
+    // by the pre-existing profile), so any such assertion would pass before
+    // the change too. Re-verify on a Mac with an Automation TCC grant.
+    if matches!(automation, Automation::Deny) {
+        profile.push_str("(deny appleevent-send)\n");
     }
     // Kept at the *end* of the profile so no later clause can widen it back. A
     // unix socket connect is a network operation, not a file write, so the
@@ -531,7 +558,11 @@ fn seatbelt_base(egress: &EgressState) -> tokio::process::Command {
     let tmp = canon(std::env::temp_dir());
     let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p")
-        .arg(seatbelt_profile(confine_network, unix_socket_policy()))
+        .arg(seatbelt_profile(
+            confine_network,
+            unix_socket_policy(),
+            automation_policy(),
+        ))
         .arg("-D")
         .arg(format!("CWD={}", cwd.display()))
         .arg("-D")
@@ -924,16 +955,22 @@ mod tests {
     /// behavioral tests below and `seatbelt_confines_writes` prove enforcement.
     #[test]
     fn seatbelt_profile_carries_every_required_clause() {
-        let open = seatbelt_profile(false, UnixSockets::DenyDaemons);
+        let open = seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Deny);
         for clause in [
             "(deny file-write*)",
             "(subpath (param \"CWD\"))",
             "(subpath (param \"TMP\"))",
+            "(deny appleevent-send)",
             "docker",
         ] {
             assert!(open.contains(clause), "profile lost `{clause}`:\n{open}");
         }
-        let confined = seatbelt_profile(true, UnixSockets::DenyDaemons);
+        // Both opt-outs really opt out.
+        assert!(
+            !seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Allow)
+                .contains("appleevent-send")
+        );
+        let confined = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny);
         for clause in [
             "(deny network*)",
             "(allow network* (local unix) (remote unix))",
@@ -950,7 +987,7 @@ mod tests {
     #[test]
     fn seatbelt_denies_the_container_daemon_socket_class_in_both_network_modes() {
         for confined in [false, true] {
-            let p = seatbelt_profile(confined, UnixSockets::DenyDaemons);
+            let p = seatbelt_profile(confined, UnixSockets::DenyDaemons, Automation::Deny);
             // The first *deny* on network-outbound: the `(allow
             // network-outbound (remote ip …))` of the confined profile also
             // contains the operation name, so match on the deny itself.
@@ -973,7 +1010,7 @@ mod tests {
             }
         }
         // The opt-out really opts out.
-        assert!(!seatbelt_profile(false, UnixSockets::Open).contains("docker"));
+        assert!(!seatbelt_profile(false, UnixSockets::Open, Automation::Deny).contains("docker"));
     }
 
     #[tokio::test]
@@ -1005,6 +1042,33 @@ mod tests {
             !denied.status.success(),
             "a *.docker.sock connect must be denied"
         );
+    }
+
+    /// The honest half of the AppleEvents denial.
+    ///
+    /// What this proves: `(deny appleevent-send)` does not break plain
+    /// AppleScript. That matters — the clause is worthless if it makes
+    /// `osascript` unusable, and a blanket `(deny mach-lookup)` would.
+    ///
+    /// What it deliberately does *not* claim: that a cross-application Apple
+    /// Event is newly blocked. On this host no such event is observable either
+    /// way — `Terminal`/`Finder` hang identically with and without any sandbox
+    /// (TCC gates them), and `System Events`, the one target that works
+    /// unsandboxed, is already refused (-10004) by the *existing* profile. An
+    /// assertion that the event fails would therefore pass before the change
+    /// as well: a vacuous test. See the plan's execution findings.
+    #[tokio::test]
+    async fn seatbelt_denies_apple_events_without_breaking_plain_applescript() {
+        if !std::path::Path::new("/usr/bin/osascript").exists() {
+            panic!("osascript is part of the base system; its absence is the bug, not a skip");
+        }
+        let ok = run("osascript -e 'return 1 + 1'").await;
+        assert!(
+            ok.status.success(),
+            "osascript itself must still run under the deny: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert!(String::from_utf8_lossy(&ok.stdout).contains('2'));
     }
 
     #[test]
