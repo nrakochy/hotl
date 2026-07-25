@@ -15,9 +15,10 @@ use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, sandbox, Registry};
 use tokio::signal::unix::{signal, SignalKind};
 
-/// Stable schema version of the `-p --json` event stream (MD Tier-1 contract;
-/// bump only on a breaking change to a frame's shape).
-pub const JSON_STREAM_SCHEMA_VERSION: u32 = 1;
+// The `-p --json` stream's schema version and every frame's shape live
+// together in `crate::wire` — `JSON_STREAM_SCHEMA_VERSION` moved there so the
+// version and the frames it describes cannot drift apart. `render_json` below
+// contributes only the side effects.
 
 /// Context inherited from an earlier session (`hotl resume` — M3b).
 pub(crate) struct Resumed {
@@ -1391,63 +1392,49 @@ impl Surface {
     }
 
     fn render_json(&mut self, event: EngineEvent) {
-        let v = match event {
-            EngineEvent::TextDelta(t) => serde_json::json!({"type":"text_delta","text":t}),
-            EngineEvent::ThinkingDelta(_) => serde_json::json!({"type":"thinking_delta"}),
-            EngineEvent::ToolStart { name, summary } => {
-                serde_json::json!({"type":"tool_start","name":name,"summary":summary})
-            }
-            EngineEvent::ToolDone { name, ok } => {
-                serde_json::json!({"type":"tool_done","name":name,"ok":ok})
-            }
-            EngineEvent::ToolDenied { name } => {
-                serde_json::json!({"type":"tool_denied","name":name})
-            }
-            EngineEvent::ToolAutoAllowed { name, rule } => {
-                serde_json::json!({"type":"tool_auto_allowed","name":name,"rule":rule})
-            }
-            EngineEvent::Retrying { attempt, reason } => {
-                serde_json::json!({"type":"retrying","attempt":attempt,"reason":reason})
-            }
-            EngineEvent::FallbackModel { model } => {
-                serde_json::json!({"type":"fallback_model","model":model})
-            }
-            EngineEvent::PromptQueued => serde_json::json!({"type":"prompt_queued"}),
-            EngineEvent::Compacted { degraded } => {
-                serde_json::json!({"type":"compacted","degraded":degraded})
-            }
-            EngineEvent::Ask { summary, reply, .. } => {
-                // JSON mode is headless automation: default-deny, emit the record.
+        // Side effects only. Headless automation has no human, so an ask
+        // default-denies and a question resolves to the documented no-human
+        // answer (never a hang, never a permission grant) — but the *shape*
+        // of every frame lives in `wire::json_frame`, one renderer for all
+        // surfaces, which is what `tests/json_stream_schema.rs` can pin.
+        //
+        // The reply channels are `oneshot::Sender`s, which can only be sent
+        // on by value; taking them out of the borrowed event first leaves a
+        // `&EngineEvent` for the renderer without cloning a sender.
+        let event = match event {
+            EngineEvent::Ask {
+                summary,
+                protected_why,
+                reply,
+            } => {
+                let (dead, _) = tokio::sync::oneshot::channel();
                 let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
-                serde_json::json!({"type":"ask_denied","summary":summary})
+                EngineEvent::Ask {
+                    summary,
+                    protected_why,
+                    reply: dead,
+                }
             }
             EngineEvent::Question {
-                question, reply, ..
+                id,
+                question,
+                reply,
             } => {
-                // JSON mode is headless automation too: no human to ask, so
-                // resolve to the documented no-human default (never a hang,
-                // never a permission grant) and emit the record.
-                let _ = reply.send(hotl_engine::QuestionAnswer::NoHuman);
-                serde_json::json!({
-                    "type": "question_no_human",
-                    "header": question.header,
-                    "prompt": question.prompt,
-                    "options": question.options,
-                })
+                let (dead, _) = tokio::sync::oneshot::channel();
+                let _ = reply.send(hotl_types::QuestionAnswer::NoHuman);
+                EngineEvent::Question {
+                    id,
+                    question,
+                    reply: dead,
+                }
             }
-            EngineEvent::TurnDone { outcome, usage } => {
+            EngineEvent::TurnDone { .. } => {
                 self.turn_running = false;
-                serde_json::json!({"type":"turn_done","outcome":format!("{outcome:?}"),"usage":usage})
+                event
             }
-            EngineEvent::TodosChanged { items } => {
-                serde_json::json!({"type":"todos_changed","items":items})
-            }
+            other => other,
         };
-        // MD contract freeze: every -p/--json frame carries the stable stream
-        // schema version so a consumer can pin to it (Tier-1 contract).
-        let mut framed = v;
-        framed["schema_version"] = serde_json::json!(JSON_STREAM_SCHEMA_VERSION);
-        println!("{framed}");
+        println!("{}", crate::wire::json_frame(&event));
     }
 }
 

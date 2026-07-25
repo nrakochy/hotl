@@ -34,6 +34,7 @@ mod structured;
 mod term;
 mod tui;
 mod watch;
+mod wire;
 
 /// The zsh `:` prefix: a line starting with `: ` becomes
 /// an agent prompt; everything else runs as normal shell.
