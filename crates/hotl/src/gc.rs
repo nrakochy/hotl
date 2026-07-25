@@ -122,3 +122,19 @@ fn human_bytes(n: u64) -> String {
         format!("{v:.1} {}", U[i])
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_and_sizes_parse() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(flag_value(&a(&["--days", "30"]), "--days"), Some("30"));
+        assert_eq!(flag_value(&a(&["--days"]), "--days"), None, "trailing flag");
+        assert_eq!(flag_value(&a(&["--keep", "5"]), "--days"), None);
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1536), "1.5 KB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
+    }
+}

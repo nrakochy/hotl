@@ -70,12 +70,7 @@ fn run(
             last_tick = Instant::now();
             Some(Msg::Tick)
         } else {
-            let scan_left = tick.saturating_sub(last_tick.elapsed());
-            let timeout = if working {
-                scan_left.min(ANIM_INTERVAL.saturating_sub(last_anim.elapsed()))
-            } else {
-                scan_left
-            };
+            let timeout = wait_for(tick, last_tick.elapsed(), working, last_anim.elapsed());
             match next_key(timeout)? {
                 Some((code, mods)) => Some(decode_key(code, mods, state.vim_mode, &mut pending)),
                 None => None,
@@ -99,6 +94,19 @@ fn run(
         terminal.draw(|f| watch_tui::view(&state, &palette, f))?;
     }
     Ok(())
+}
+
+/// How long to block on a key: never past the next scan, and — while
+/// something is working — never past the next animation frame either. Pure,
+/// so the saturating arithmetic that keeps an overdue deadline from
+/// underflowing is testable without a clock.
+fn wait_for(tick: Duration, since_tick: Duration, working: bool, since_anim: Duration) -> Duration {
+    let scan_left = tick.saturating_sub(since_tick);
+    if working {
+        scan_left.min(ANIM_INTERVAL.saturating_sub(since_anim))
+    } else {
+        scan_left
+    }
 }
 
 fn next_key(timeout: Duration) -> io::Result<Option<(KeyCode, KeyModifiers)>> {
@@ -160,5 +168,27 @@ fn ping() {
                 let _ = child.wait();
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_poll_timeout_never_outruns_the_animation() {
+        let tick = Duration::from_millis(1000);
+        // Idle: wait out the whole scan interval.
+        assert_eq!(wait_for(tick, Duration::ZERO, false, Duration::ZERO), tick);
+        // Working: never sleep past the next animation frame.
+        assert_eq!(
+            wait_for(tick, Duration::ZERO, true, Duration::ZERO),
+            ANIM_INTERVAL
+        );
+        // Overdue on both: zero, not an underflow.
+        assert_eq!(
+            wait_for(tick, tick * 2, true, ANIM_INTERVAL * 2),
+            Duration::ZERO
+        );
     }
 }

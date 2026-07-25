@@ -8,8 +8,9 @@
 
 use hotl_tools::ask::{Question, QuestionOption};
 
-use crate::app::{DiffLine, DiffOp};
+use crate::app::{Cmd, DiffLine, DiffOp, Msg};
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// One decoded server→client line.
@@ -203,10 +204,168 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
     }
 }
 
+/// One server message → an Elm message, or `None` for frames the loop only
+/// needs as bookkeeping (an ack for steer/cancel/rename is noise).
+///
+/// Lives here, not in the runtime, because it is pure — `ServerMsg` and `Msg`
+/// are both this crate's types. `crates/hotl/tests/tui_e2e.rs` used to keep a
+/// hand-copy that had already drifted from the real one (§7); both now call
+/// this.
+pub fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
+    match msg {
+        ServerMsg::Update(v) => Some(Msg::Update(v)),
+        ServerMsg::PermissionRequest {
+            req_id,
+            summary,
+            protected_why,
+            diff,
+        } => Some(Msg::PermissionRequest {
+            req_id,
+            summary,
+            protected_why,
+            diff,
+        }),
+        ServerMsg::QuestionRequest { req_id, question } => {
+            Some(Msg::QuestionRequest { req_id, question })
+        }
+        ServerMsg::Response { id, result } => {
+            // Only prompt replies become messages; steer/cancel acks are noise.
+            let pos = prompt_ids.iter().position(|&p| p == id)?;
+            prompt_ids.remove(pos);
+            Some(prompt_result_msg(result))
+        }
+    }
+}
+
+/// A prompt reply as a `Msg`. The outcome's human-readable payload lives under
+/// a different key per kind, so all four are searched — reading only
+/// `/outcome/text` silently drops the reason a doom-loop or failure-budget
+/// turn ended.
+fn prompt_result_msg(result: Result<Value, String>) -> Msg {
+    match result {
+        Ok(v) => {
+            let text = ["text", "message", "pattern", "tool"]
+                .iter()
+                .find_map(|k| v.pointer(&format!("/outcome/{k}")).and_then(Value::as_str))
+                .map(String::from);
+            Msg::PromptResult {
+                outcome_kind: v
+                    .pointer("/outcome/kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+                outcome_text: text,
+                usage: v.get("usage").cloned().unwrap_or(Value::Null),
+            }
+        }
+        Err(e) => Msg::PromptResult {
+            outcome_kind: "error".into(),
+            outcome_text: Some(e),
+            usage: Value::Null,
+        },
+    }
+}
+
+/// Execute the wire-bound half of a `Cmd`, returning the commands it did not
+/// handle — the terminal-bound ones (title, `$EDITOR`, history, quit) the
+/// runtime owns. Shared by `hotl`'s run loop and the e2e harness so neither
+/// can test against a divergent copy.
+pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
+    cmd: Cmd,
+    client: &mut AcpClient<W>,
+    prompt_ids: &mut VecDeque<u64>,
+) -> Option<Cmd> {
+    match cmd {
+        Cmd::SendPrompt(text) => {
+            prompt_ids.push_back(
+                client
+                    .request("session/prompt", json!({"text": text}))
+                    .await,
+            );
+        }
+        Cmd::SendSteer(text) => {
+            client.request("session/steer", json!({"text": text})).await;
+        }
+        Cmd::Cancel => {
+            client.request("session/cancel", Value::Null).await;
+        }
+        // Acks are noise, exactly as for steer: `translate` only surfaces
+        // prompt-id responses.
+        Cmd::Rename(name) => {
+            client
+                .request("session/rename", json!({"name": name}))
+                .await;
+        }
+        Cmd::SetMode(mode) => {
+            client
+                .request("session/set_mode", json!({"mode": mode}))
+                .await;
+        }
+        Cmd::ReplyPermission {
+            req_id,
+            allow,
+            message,
+        } => client.reply_permission(req_id, allow, message).await,
+        Cmd::ReplyQuestion {
+            req_id,
+            selected,
+            free_text,
+        } => client.reply_question(req_id, selected, free_text).await,
+        // Not ours: the runtime owns the terminal and the history file.
+        other => return Some(other),
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, BufReader};
+
+    /// The e2e harness used to keep a hand-copy of this mapping, and the copy
+    /// had already drifted: it read only `/outcome/text`, so `doom_loop` and
+    /// `tool_failure_budget` outcomes lost their payload. One implementation,
+    /// called by both the runtime loop and the test.
+    #[test]
+    fn translate_finds_outcome_text_for_every_outcome_shape() {
+        for (key, kind) in [
+            ("text", "done"),
+            ("message", "error"),
+            ("pattern", "doom_loop"),
+            ("tool", "tool_failure_budget"),
+        ] {
+            let mut ids = VecDeque::from([7]);
+            let msg = ServerMsg::Response {
+                id: 7,
+                result: Ok(json!({"outcome": {"kind": kind, key: "payload"}})),
+            };
+            let Some(Msg::PromptResult {
+                outcome_kind,
+                outcome_text,
+                ..
+            }) = translate(msg, &mut ids)
+            else {
+                panic!("not a prompt result")
+            };
+            assert_eq!(outcome_kind, kind);
+            assert_eq!(outcome_text.as_deref(), Some("payload"), "key `{key}`");
+        }
+    }
+
+    /// Acks for steer/cancel/rename are noise — only prompt replies become
+    /// messages, which is what keeps the transcript from sprouting phantom
+    /// turn results.
+    #[test]
+    fn translate_ignores_responses_that_are_not_prompt_replies() {
+        let mut ids = VecDeque::from([7]);
+        let ack = ServerMsg::Response {
+            id: 99,
+            result: Ok(json!({"ok": true})),
+        };
+        assert!(translate(ack, &mut ids).is_none());
+        assert_eq!(ids.len(), 1, "an unrelated ack consumes no prompt id");
+    }
 
     #[tokio::test]
     async fn request_writes_jsonl_with_incrementing_ids() {

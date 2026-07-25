@@ -15,7 +15,7 @@ use crossterm::execute;
 use crossterm::terminal::SetTitle;
 use hotl_theme::Palette;
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
-use hotl_tui::client::{read_server_msg, AcpClient, ServerMsg};
+use hotl_tui::client::{exec_wire_cmd, read_server_msg, translate, AcpClient, ServerMsg};
 use hotl_tui::view::view;
 
 use crate::term::TerminalGuard;
@@ -268,43 +268,12 @@ async fn run_loop(
         let Some(msg) = msg else { continue };
         let mut queue: VecDeque<Cmd> = update(&mut state, msg).into();
         while let Some(cmd) = queue.pop_front() {
+            // The wire-bound half is shared with the e2e harness; what comes
+            // back is the terminal-bound remainder this loop owns.
+            let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids).await else {
+                continue;
+            };
             match cmd {
-                Cmd::SendPrompt(text) => {
-                    prompt_ids.push_back(
-                        client
-                            .request("session/prompt", json!({"text": text}))
-                            .await,
-                    );
-                }
-                Cmd::SendSteer(text) => {
-                    client.request("session/steer", json!({"text": text})).await;
-                }
-                Cmd::Cancel => {
-                    client.request("session/cancel", Value::Null).await;
-                }
-                Cmd::Rename(name) => {
-                    // Ack is noise (like steer): translate() only surfaces
-                    // prompt-id responses.
-                    client
-                        .request("session/rename", json!({"name": name}))
-                        .await;
-                }
-                Cmd::SetMode(mode) => {
-                    // Ack is noise, same as rename/steer.
-                    client
-                        .request("session/set_mode", json!({"mode": mode}))
-                        .await;
-                }
-                Cmd::ReplyPermission {
-                    req_id,
-                    allow,
-                    message,
-                } => client.reply_permission(req_id, allow, message).await,
-                Cmd::ReplyQuestion {
-                    req_id,
-                    selected,
-                    free_text,
-                } => client.reply_question(req_id, selected, free_text).await,
                 Cmd::SetTitle(title) => {
                     let _ = execute!(io::stdout(), SetTitle(&title));
                 }
@@ -314,6 +283,8 @@ async fn run_loop(
                     queue.extend(update(&mut state, Msg::EditorDone(content)));
                 }
                 Cmd::Quit => return Ok(0),
+                // `exec_wire_cmd` handled every other variant.
+                handled => debug_assert!(false, "unhandled cmd: {handled:?}"),
             }
         }
     }
@@ -346,57 +317,6 @@ fn terminal_msg(ev: Event) -> Option<Msg> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
-    match msg {
-        ServerMsg::Update(v) => Some(Msg::Update(v)),
-        ServerMsg::PermissionRequest {
-            req_id,
-            summary,
-            protected_why,
-            diff,
-        } => Some(Msg::PermissionRequest {
-            req_id,
-            summary,
-            protected_why,
-            diff,
-        }),
-        ServerMsg::QuestionRequest { req_id, question } => {
-            Some(Msg::QuestionRequest { req_id, question })
-        }
-        ServerMsg::Response { id, result } => {
-            // Only prompt replies become messages; steer/cancel acks are noise.
-            let pos = prompt_ids.iter().position(|&p| p == id)?;
-            prompt_ids.remove(pos);
-            Some(prompt_result_msg(result))
-        }
-    }
-}
-
-fn prompt_result_msg(result: Result<Value, String>) -> Msg {
-    match result {
-        Ok(v) => {
-            let text = ["text", "message", "pattern", "tool"]
-                .iter()
-                .find_map(|k| v.pointer(&format!("/outcome/{k}")).and_then(Value::as_str))
-                .map(String::from);
-            Msg::PromptResult {
-                outcome_kind: v
-                    .pointer("/outcome/kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("error")
-                    .to_string(),
-                outcome_text: text,
-                usage: v.get("usage").cloned().unwrap_or(Value::Null),
-            }
-        }
-        Err(e) => Msg::PromptResult {
-            outcome_kind: "error".into(),
-            outcome_text: Some(e),
-            usage: Value::Null,
-        },
     }
 }
 

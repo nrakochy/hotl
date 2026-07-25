@@ -13,7 +13,7 @@ use hotl_store::{Masker, SessionLog};
 use hotl_theme::Palette;
 use hotl_tools::{rules::Rules, Registry};
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
-use hotl_tui::client::{read_server_msg, AcpClient, ServerMsg};
+use hotl_tui::client::{exec_wire_cmd, read_server_msg, translate, AcpClient, ServerMsg};
 use hotl_tui::view::view;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -177,84 +177,28 @@ async fn next(reader: &mut Reader) -> ServerMsg {
         .expect("server hung up")
 }
 
-/// Mirror of the runtime's translate: server msg → Elm msg.
-fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
-    match msg {
-        ServerMsg::Update(v) => Some(Msg::Update(v)),
-        ServerMsg::PermissionRequest {
-            req_id,
-            summary,
-            protected_why,
-            diff,
-        } => Some(Msg::PermissionRequest {
-            req_id,
-            summary,
-            protected_why,
-            diff,
-        }),
-        ServerMsg::QuestionRequest { req_id, question } => {
-            Some(Msg::QuestionRequest { req_id, question })
-        }
-        ServerMsg::Response { id, result } => {
-            let pos = prompt_ids.iter().position(|&p| p == id)?;
-            prompt_ids.remove(pos);
-            let v = result.expect("prompt result");
-            Some(Msg::PromptResult {
-                outcome_kind: v
-                    .pointer("/outcome/kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("error")
-                    .to_string(),
-                outcome_text: v
-                    .pointer("/outcome/text")
-                    .and_then(Value::as_str)
-                    .map(String::from),
-                usage: v.get("usage").cloned().unwrap_or(Value::Null),
-            })
-        }
+/// The runtime's own dispatch, not a copy of it: `translate` and
+/// `exec_wire_cmd` are the same functions `hotl`'s run loop calls. The copies
+/// this file used to carry had already drifted (§7) — the `translate` mirror
+/// read only `/outcome/text`, so it could not have caught a bug in the real
+/// one.
+/// INVARIANT: this harness drives the real dispatch. Enforced by
+/// `the_e2e_harness_uses_the_real_dispatch`.
+async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64>) {
+    for cmd in cmds {
+        // The terminal-bound remainder (title, editor, history, quit) has no
+        // meaning in a headless test; the runtime handles those.
+        let _ = exec_wire_cmd(cmd, client, prompt_ids).await;
     }
 }
 
-/// Mirror of the runtime's cmd executor for the wire-bound commands.
-async fn exec(cmds: Vec<Cmd>, client: &mut Client, prompt_ids: &mut VecDeque<u64>) {
-    for cmd in cmds {
-        match cmd {
-            Cmd::SendPrompt(text) => {
-                prompt_ids.push_back(
-                    client
-                        .request("session/prompt", json!({"text": text}))
-                        .await,
-                );
-            }
-            Cmd::SendSteer(text) => {
-                client.request("session/steer", json!({"text": text})).await;
-            }
-            Cmd::Cancel => {
-                client.request("session/cancel", Value::Null).await;
-            }
-            Cmd::Rename(name) => {
-                client
-                    .request("session/rename", json!({"name": name}))
-                    .await;
-            }
-            Cmd::SetMode(mode) => {
-                client
-                    .request("session/set_mode", json!({"mode": mode}))
-                    .await;
-            }
-            Cmd::ReplyPermission {
-                req_id,
-                allow,
-                message,
-            } => client.reply_permission(req_id, allow, message).await,
-            Cmd::ReplyQuestion {
-                req_id,
-                selected,
-                free_text,
-            } => client.reply_question(req_id, selected, free_text).await,
-            Cmd::OpenEditor(_) | Cmd::SetTitle(_) | Cmd::AppendHistory(_) | Cmd::Quit => {}
-        }
-    }
+#[test]
+fn the_e2e_harness_uses_the_real_dispatch() {
+    let src = include_str!("tui_e2e.rs");
+    assert!(
+        !src.contains(concat!("Mirror of the ", "runtime")),
+        "copies drift — call it"
+    );
 }
 
 fn draw(state: &State) -> Vec<String> {
