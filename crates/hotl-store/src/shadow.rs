@@ -13,11 +13,19 @@ use std::process::Command;
 
 /// Paths excluded from every snapshot, via `info/exclude`. Two purposes:
 /// heavy build dirs that make snapshots slow and undo useless, and
-/// secret-bearing files that must not be
-/// duplicated into a second, history-retaining location. The shadow repo
-/// mirrors the user's own files, but git history means a transient secret
-/// persists in shadow objects after the workspace file is deleted or rotated,
-/// so credentials are kept out of it entirely.
+/// secret-bearing files that must not be duplicated into a second,
+/// history-retaining location. The shadow repo mirrors the user's own files,
+/// but git history means a transient secret persists in shadow objects after
+/// the workspace file is deleted or rotated, so credentials are kept out of it
+/// entirely.
+///
+/// INVARIANT (best-effort — this is a blocklist, not a guarantee): the names
+/// listed here never enter a snapshot. Enforced by
+/// `secret_files_are_excluded_from_snapshots` and
+/// `credential_shaped_files_never_enter_a_snapshot`. A blocklist cannot be
+/// complete; a content-scanning or allowlist approach is tracked as tech debt.
+/// Every session re-runs `Shadow::create`, which rewrites `info/exclude`, so
+/// additions here reach existing installs on the next session with no migration.
 const EXCLUDES: &str = "\
 .git/
 target/
@@ -44,6 +52,21 @@ id_ed25519
 secrets.*
 *.secret
 credentials
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform/
+kubeconfig
+*.kubeconfig
+.kube/
+.git-credentials
+*.jks
+*.keystore
+*.p8
+*.ovpn
+serviceaccount*.json
+.gnupg/
+*.kdbx
 ";
 
 pub struct Shadow {
@@ -275,6 +298,59 @@ mod tests {
         assert!(
             !tracked.contains("id_rsa"),
             "private keys must be excluded (H-13)"
+        );
+    }
+
+    #[test]
+    fn credential_shaped_files_never_enter_a_snapshot() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("main.rs"), "fn main() {}").unwrap();
+
+        // Every one of these is a routine file in a normal repo, and every one
+        // would persist in shadow git objects after the user rotated it (T2-15d).
+        let files = [
+            "terraform.tfstate",
+            "terraform.tfstate.backup",
+            "kubeconfig",
+            ".git-credentials",
+            "release.jks",
+            "app.keystore",
+            "client.ovpn",
+            "serviceaccount-prod.json",
+            "prod.tfvars",
+        ];
+        for f in files {
+            std::fs::write(work.path().join(f), "CREDENTIAL").unwrap();
+        }
+        std::fs::create_dir_all(work.path().join(".kube")).unwrap();
+        std::fs::write(work.path().join(".kube/config"), "CREDENTIAL").unwrap();
+
+        let shadow = Shadow::create(root.path(), "SEC2", work.path()).expect("create");
+        shadow.snapshot("pre batch 1").expect("snapshot");
+
+        let listing = std::process::Command::new("git")
+            .arg(format!(
+                "--git-dir={}",
+                root.path().join("SEC2.git").display()
+            ))
+            .args(["ls-files"])
+            .output()
+            .unwrap();
+        let tracked = String::from_utf8_lossy(&listing.stdout);
+        assert!(
+            tracked.contains("main.rs"),
+            "workspace source should snapshot"
+        );
+        for f in files {
+            assert!(!tracked.contains(f), "{f} must be excluded (T2-15d)");
+        }
+        assert!(
+            !tracked.contains(".kube/"),
+            ".kube/ must be excluded (T2-15d)"
         );
     }
 
