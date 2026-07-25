@@ -15,6 +15,9 @@ categories = ["command-line-utilities"]
 [dependencies]
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.5.1", features = ["ratatui"] }
 hotl-tools = { path = "../hotl-tools", version = "0.5.1" }
+# A leaf crate with no I/O — added to *remove* a hand-copied
+# `normalize_session_name`, not to reach the engine (§7).
+hotl-types = { path = "../hotl-types", version = "0.5.1" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 serde_json = { workspace = true }

@@ -3,12 +3,9 @@ use std::io::{self, Stdout, Write};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use ratatui::prelude::*;
 
+use crate::term::TerminalGuard;
 use watch_listener::Listener;
 use watch_tmux::TmuxSurface;
 use watch_tui::{decode_key, update, AppState, Cmd, Msg};
@@ -16,46 +13,6 @@ use watch_types::{AgentObservation, HotlConfig, Status};
 
 // Spinner advances this often, but only while an agent is working.
 const ANIM_INTERVAL: Duration = Duration::from_millis(125);
-
-/// Owns the terminal's raw-mode / alternate-screen state and restores it on
-/// drop — so an early `?` during setup, a normal exit, or a panic inside the
-/// run loop all leave the user's shell usable instead of stuck in raw mode.
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-}
-
-impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
-        crate::term::capture();
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        // If entering the alt screen fails, undo raw mode before propagating.
-        if let Err(e) = execute!(stdout, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(e);
-        }
-        let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
-            Ok(t) => t,
-            Err(e) => {
-                let _ = execute!(io::stdout(), LeaveAlternateScreen);
-                let _ = disable_raw_mode();
-                return Err(e);
-            }
-        };
-        crate::term::arm();
-        Ok(TerminalGuard { terminal })
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        // Best-effort restore; nothing actionable if these fail on the way out.
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
-        crate::term::disarm();
-    }
-}
 
 /// Entry point for `hotl watch` — the dashboard, exactly as it shipped pre-merge.
 pub fn watch_main() -> io::Result<()> {
@@ -69,7 +26,7 @@ pub fn watch_main() -> io::Result<()> {
     // `catch_unwind` below covers panics; signals skip every destructor, so
     // they get their own restore.
     crate::term::trap_signals();
-    let mut guard = TerminalGuard::enter()?;
+    let mut guard = TerminalGuard::enter(false)?;
     // Catch a panic in the run loop so the guard's Drop restores the terminal
     // first, then re-raise so the panic message renders on the real screen.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

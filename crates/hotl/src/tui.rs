@@ -4,25 +4,21 @@
 //! TUI is a pure ACP client — it never touches the engine directly.
 
 use std::collections::VecDeque;
-use std::io::{self, Stdout};
+use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    KeyEventKind,
-};
+use crossterm::event::{Event, KeyEventKind};
 use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen, SetTitle,
-};
+use crossterm::terminal::SetTitle;
 use hotl_theme::Palette;
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
 use hotl_tui::client::{read_server_msg, AcpClient, ServerMsg};
 use hotl_tui::view::view;
-use ratatui::prelude::*;
+
+use crate::term::TerminalGuard;
 use serde_json::{json, Value};
 use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
@@ -88,7 +84,11 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     // the guard's `Drop` must not strand the terminal in raw mode.
     crate::term::restore_on_panic();
     crate::term::trap_signals();
-    let mut guard = match TerminalGuard::enter() {
+    // Mouse capture makes the wheel scroll the transcript, at the cost of the
+    // terminal's own drag-select (hold Shift on most emulators, or set
+    // HOTL_MOUSE=0). Env-only until R4 adds `[behavior] mouse` — RQ-1.
+    let mouse = std::env::var("HOTL_MOUSE").as_deref() != Ok("0");
+    let mut guard = match TerminalGuard::enter(mouse) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("hotl: {e}");
@@ -614,90 +614,6 @@ fn age(t: SystemTime) -> String {
         60..=3599 => format!("{}m ago", secs / 60),
         3600..=86399 => format!("{}h ago", secs / 3600),
         s => format!("{}d ago", s / 86400),
-    }
-}
-
-/// Owns raw mode + alt screen, restoring on drop (mirrors watch.rs) — an
-/// early error, normal exit, or panic all leave the shell usable. Every mode
-/// it enables is also in `term::RESTORE`, which is what the signal path writes.
-struct TerminalGuard {
-    terminal: Terminal<CrosstermBackend<Stdout>>,
-    /// Mouse capture is on. Recorded so `suspend`/`resume`/`Drop` stay
-    /// symmetric with whatever `enter` decided.
-    mouse: bool,
-}
-
-impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
-        crate::term::capture();
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        if let Err(e) = execute!(stdout, EnterAlternateScreen) {
-            let _ = disable_raw_mode();
-            return Err(e);
-        }
-        // Mouse capture makes the wheel scroll the transcript, at the cost of
-        // the terminal's own drag-select (hold Shift on most emulators, or set
-        // HOTL_MOUSE=0). Opt-out is env-only until R4 adds `[behavior] mouse`
-        // — see specs/exec-plans/active/0020-remediation-surface.md RQ-1.
-        let mouse = std::env::var("HOTL_MOUSE").as_deref() != Ok("0");
-        if mouse {
-            let _ = execute!(stdout, EnableMouseCapture);
-        }
-        let _ = execute!(stdout, EnableBracketedPaste);
-        match Terminal::new(CrosstermBackend::new(stdout)) {
-            Ok(terminal) => {
-                crate::term::arm();
-                Ok(TerminalGuard { terminal, mouse })
-            }
-            Err(e) => {
-                let _ = execute!(
-                    io::stdout(),
-                    DisableBracketedPaste,
-                    DisableMouseCapture,
-                    LeaveAlternateScreen
-                );
-                let _ = disable_raw_mode();
-                Err(e)
-            }
-        }
-    }
-
-    /// Hand the real screen to `$EDITOR`… (mouse reporting and bracketed paste
-    /// go with it — `$EDITOR` sets its own).
-    fn suspend(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
-        if self.mouse {
-            let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
-        }
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        crate::term::disarm();
-    }
-
-    /// …and take it back.
-    fn resume(&mut self) {
-        let _ = enable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
-        if self.mouse {
-            let _ = execute!(self.terminal.backend_mut(), EnableMouseCapture);
-        }
-        let _ = execute!(self.terminal.backend_mut(), EnableBracketedPaste);
-        let _ = self.terminal.clear();
-        crate::term::arm();
-    }
-}
-
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
-        if self.mouse {
-            let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
-        }
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
-        let _ = self.terminal.show_cursor();
-        crate::term::disarm();
     }
 }
 

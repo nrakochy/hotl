@@ -797,24 +797,22 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
         .unwrap_or((rest.trim(), ""));
     match cmd {
         "rename" => {
-            // Same rules as hotl_types::normalize_session_name (this crate
-            // has no hotl-types dep): trimmed, non-empty, ≤ 64 chars.
-            let name = arg.trim();
-            if name.is_empty() || name.chars().count() > 64 {
+            // The one source of truth for what a session name may be — the
+            // same function `acp.rs` validates against, so the TUI and the
+            // wire can never disagree (this file already imports
+            // `hotl_tools::rules::PermissionMode` for exactly that reason).
+            let Some(name) = hotl_types::normalize_session_name(arg) else {
                 notice(state, "usage: /rename <name> (1–64 chars)".into());
                 return Vec::new();
-            }
-            state.session_name = Some(name.to_string());
+            };
+            state.session_name = Some(name.clone());
             notice(state, format!("session renamed to {name}"));
             let suffix = if state.phase == Phase::Idle {
                 ""
             } else {
                 " — working"
             };
-            vec![
-                Cmd::Rename(name.to_string()),
-                Cmd::SetTitle(title(state, suffix)),
-            ]
+            vec![Cmd::Rename(name), Cmd::SetTitle(title(state, suffix))]
         }
         "plan" => set_mode(state, "plan"),
         "mode" => {
@@ -1974,6 +1972,20 @@ mod tests {
             Some(TranscriptItem::Notice { text }) => text.clone(),
             other => panic!("expected a notice, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rename_uses_the_shared_normalizer() {
+        let mut s = State::test_default();
+        slash(&mut s, "rename   spaced name  ");
+        assert_eq!(s.session_name.as_deref(), Some("spaced name"));
+        slash(&mut s, &format!("rename {}", "x".repeat(65)));
+        assert!(last_notice(&s).contains("1–64"));
+        // The one source of truth, not a copy of its rules.
+        assert_eq!(
+            hotl_types::normalize_session_name("  ok  ").as_deref(),
+            Some("ok")
+        );
     }
 
     #[test]

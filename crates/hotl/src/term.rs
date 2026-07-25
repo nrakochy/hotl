@@ -21,7 +21,17 @@
 //! against a `termios` captured before raw mode, so it never waits on
 //! crossterm's mutex.
 
+use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::prelude::{CrosstermBackend, Terminal};
 
 /// Disable mouse reporting (button, any-motion, SGR encoding) and bracketed
 /// paste, leave the alternate screen, then show the cursor — in that order, so
@@ -32,6 +42,94 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 /// `restore_bytes_disable_mouse_and_bracketed_paste`.
 const RESTORE: &[u8] =
     b"\x1b[?1006l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h";
+
+/// Owns raw mode, the alternate screen, and — when asked — mouse reporting and
+/// bracketed paste, restoring all of it on drop. An early error during setup,
+/// a normal exit, or a panic inside a run loop all leave the shell usable.
+///
+/// One guard for both TUIs (`hotl` and `hotl watch`). They had separate,
+/// already-drifted copies (§7); this lives here because [`RESTORE`] — the
+/// async-signal-safe byte string the signal handler writes — must disable
+/// exactly the set `enter` enables.
+pub(crate) struct TerminalGuard {
+    pub(crate) terminal: Terminal<CrosstermBackend<Stdout>>,
+    /// Mouse capture is on. Recorded so `suspend`/`resume`/`Drop` stay
+    /// symmetric with whatever `enter` decided.
+    mouse: bool,
+}
+
+impl TerminalGuard {
+    /// Take the screen. `mouse` requests wheel reporting — it costs the
+    /// terminal's own drag-select, so the console gates it on `HOTL_MOUSE`
+    /// and the watch dashboard (which has nothing to scroll) passes `false`.
+    pub(crate) fn enter(mouse: bool) -> io::Result<Self> {
+        capture();
+        enable_raw_mode()?;
+        let mut stdout = io::stdout();
+        // If entering the alt screen fails, undo raw mode before propagating.
+        if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(e);
+        }
+        if mouse {
+            let _ = execute!(stdout, EnableMouseCapture);
+        }
+        let _ = execute!(stdout, EnableBracketedPaste);
+        match Terminal::new(CrosstermBackend::new(stdout)) {
+            Ok(terminal) => {
+                arm();
+                Ok(TerminalGuard { terminal, mouse })
+            }
+            Err(e) => {
+                let _ = execute!(
+                    io::stdout(),
+                    DisableBracketedPaste,
+                    DisableMouseCapture,
+                    LeaveAlternateScreen
+                );
+                let _ = disable_raw_mode();
+                Err(e)
+            }
+        }
+    }
+
+    /// Hand the real screen to `$EDITOR` — every mode we set goes with it.
+    pub(crate) fn suspend(&mut self) {
+        self.release();
+        disarm();
+    }
+
+    /// …and take it back.
+    pub(crate) fn resume(&mut self) {
+        let _ = enable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        if self.mouse {
+            let _ = execute!(self.terminal.backend_mut(), EnableMouseCapture);
+        }
+        let _ = execute!(self.terminal.backend_mut(), EnableBracketedPaste);
+        let _ = self.terminal.clear();
+        arm();
+    }
+
+    /// Undo every mode `enter` set, in `RESTORE`'s order. Best-effort:
+    /// nothing is actionable if these fail on the way out.
+    fn release(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(self.terminal.backend_mut(), DisableBracketedPaste);
+        if self.mouse {
+            let _ = execute!(self.terminal.backend_mut(), DisableMouseCapture);
+        }
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        self.release();
+        let _ = self.terminal.show_cursor();
+        disarm();
+    }
+}
 
 /// The signals that kill a foreground TUI outright. SIGQUIT is left alone:
 /// it is the deliberate "core-dump this" escape hatch.
@@ -165,6 +263,20 @@ mod tests {
             "disable button-event mouse tracking"
         );
         assert!(s.contains("\x1b[?2004l"), "disable bracketed paste");
+    }
+
+    /// §7: two near-identical guards, already drifted — `tui.rs`'s grew
+    /// `suspend`/`resume` and mouse + bracketed paste, `watch.rs`'s did not,
+    /// so `hotl watch` would not have restored modes a future feature turns
+    /// on. One guard, in the module that already owns the signal-path restore
+    /// those modes must match.
+    #[test]
+    fn one_guard_serves_both_tuis() {
+        let src = concat!(include_str!("tui.rs"), include_str!("watch.rs"));
+        assert!(
+            !src.contains(concat!("struct Terminal", "Guard")),
+            "the guard lives in term.rs"
+        );
     }
 
     #[test]

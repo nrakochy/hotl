@@ -105,33 +105,69 @@ enum Input {
     Stop,
 }
 
-/// Route one typed line: answer a pending ask, steer a running turn, start a
-/// new turn, or handle `/stop`.
+/// What a typed line means: answer a pending ask, steer a running turn, start
+/// a new turn, or `/stop`. Pure, so the decision is testable apart from the
+/// socket write it implies.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    Stop,
+    Nothing,
+    AnswerAsk { id: u64, allow: bool },
+    Steer(String),
+    Prompt(String),
+}
+
+/// Classify a typed line. A parked ask consumes the next line as its answer —
+/// anything that is not an affirmative denies, which is the safe default.
+fn route(text: &str, turn_running: bool, pending_ask: Option<u64>) -> Action {
+    if text == "/stop" {
+        return Action::Stop;
+    }
+    if text.is_empty() {
+        return Action::Nothing;
+    }
+    if let Some(id) = pending_ask {
+        return Action::AnswerAsk {
+            id,
+            allow: matches!(text, "y" | "Y" | "yes"),
+        };
+    }
+    if turn_running {
+        Action::Steer(text.to_string())
+    } else {
+        Action::Prompt(text.to_string())
+    }
+}
+
 async fn on_input(
     text: &str,
     write: &mut tokio::net::unix::OwnedWriteHalf,
     pending_ask: &mut Option<u64>,
     turn_running: bool,
 ) -> Input {
-    if text == "/stop" {
-        let _ = send(write, json!({"t": "shutdown"})).await;
-        return Input::Stop;
-    }
-    if text.is_empty() {
-        return Input::Continue;
-    }
-    if let Some(id) = pending_ask.take() {
-        let allow = matches!(text, "y" | "Y" | "yes");
-        let _ = send(write, json!({"t": "ask_reply", "id": id, "allow": allow})).await;
-        return Input::Continue;
-    }
-    let text = crate::setup::expand_file_refs(text);
-    if turn_running {
-        let _ = send(write, json!({"t": "steer", "text": text})).await;
-        Input::Continue
-    } else {
-        let _ = send(write, json!({"t": "prompt", "text": text})).await;
-        Input::StartedTurn
+    match route(text, turn_running, *pending_ask) {
+        Action::Stop => {
+            let _ = send(write, json!({"t": "shutdown"})).await;
+            Input::Stop
+        }
+        Action::Nothing => Input::Continue,
+        Action::AnswerAsk { id, allow } => {
+            *pending_ask = None;
+            let _ = send(write, json!({"t": "ask_reply", "id": id, "allow": allow})).await;
+            Input::Continue
+        }
+        // Expansion happens here, not in `route`: reading files is I/O, and
+        // the transcript should show what the human typed.
+        Action::Steer(text) => {
+            let text = crate::setup::expand_file_refs(&text);
+            let _ = send(write, json!({"t": "steer", "text": text})).await;
+            Input::Continue
+        }
+        Action::Prompt(text) => {
+            let text = crate::setup::expand_file_refs(&text);
+            let _ = send(write, json!({"t": "prompt", "text": text})).await;
+            Input::StartedTurn
+        }
     }
 }
 
@@ -174,26 +210,69 @@ fn render(msg: &Value, pending_ask: &mut Option<u64>, turn_running: &mut bool) -
     }
 }
 
-fn render_update(update: &Value) {
-    match update.get("type").and_then(Value::as_str).unwrap_or("") {
-        "text_delta" => {
-            print!(
-                "{}",
-                update.get("text").and_then(Value::as_str).unwrap_or("")
-            );
-            let _ = std::io::Write::flush(&mut std::io::stdout());
-        }
-        "tool_start" => eprintln!(
-            "\n· {}",
-            update.get("summary").and_then(Value::as_str).unwrap_or("")
-        ),
-        "tool_done" => {
-            if update.get("ok").and_then(Value::as_bool) == Some(false) {
-                eprintln!("  (tool error — fed back to the model)");
+/// One human-readable line for a `session/update` frame, or `None` for the
+/// frames that are not lines: `text_delta` streams to stdout unadorned (the
+/// answer itself), and `tool_done` says nothing when the tool succeeded.
+///
+/// Every `type` `wire::update_frame` can produce is handled here. `_ => None`
+/// is reserved for deliberate omissions, each named — attach used to cover 4
+/// of 13 variants and silently dropped the rest (§7).
+/// INVARIANT: no streamable variant is dropped. Enforced by
+/// `attach_renders_every_update_variant`.
+fn update_line(update: &Value) -> Option<String> {
+    let s = |key: &str| update.get(key).and_then(Value::as_str).unwrap_or("");
+    let n = |key: &str| update.get(key).and_then(Value::as_u64).unwrap_or(0);
+    Some(
+        match update.get("type").and_then(Value::as_str).unwrap_or("") {
+            // Streamed to stdout by the caller, not as a labelled line.
+            "text_delta" => return None,
+            "thinking_delta" => format!("· thinking: {}", s("text")),
+            "tool_start" => format!("\n· {}", s("summary")),
+            "tool_done" => {
+                if update.get("ok").and_then(Value::as_bool) == Some(false) {
+                    "  (tool error — fed back to the model)".to_string()
+                } else {
+                    // A tool that worked needs no line; the output speaks.
+                    return None;
+                }
             }
-        }
-        "compacted" => eprintln!("(context compacted)"),
-        _ => {}
+            "tool_denied" => format!("· denied: {}", s("name")),
+            "tool_auto_allowed" => format!("· auto-allowed {} (rule: {})", s("name"), s("rule")),
+            "retrying" => format!("· retrying (attempt {}) — {}", n("attempt"), s("reason")),
+            "fallback_model" => format!("· model fallback → {}", s("model")),
+            "prompt_queued" => "· queued".to_string(),
+            "compacted" => {
+                if update.get("degraded").and_then(Value::as_bool) == Some(true) {
+                    "(context compacted — degraded)".to_string()
+                } else {
+                    "(context compacted)".to_string()
+                }
+            }
+            "todos_changed" => {
+                let n = update
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(|a| a.len())
+                    .unwrap_or(0);
+                format!("· todos: {n} item(s)")
+            }
+            "mode_changed" => format!("· permission mode → {}", s("mode")),
+            _ => return None,
+        },
+    )
+}
+
+fn render_update(update: &Value) {
+    if update.get("type").and_then(Value::as_str) == Some("text_delta") {
+        print!(
+            "{}",
+            update.get("text").and_then(Value::as_str).unwrap_or("")
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        return;
+    }
+    if let Some(line) = update_line(update) {
+        eprintln!("{line}");
     }
 }
 
@@ -208,4 +287,92 @@ async fn send(write: &mut tokio::net::unix::OwnedWriteHalf, frame: Value) -> std
     line.push('\n');
     write.write_all(line.as_bytes()).await?;
     write.flush().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hotl_engine::EngineEvent;
+
+    /// Every streamable engine event, for coverage assertions.
+    fn every_streamable_event() -> Vec<EngineEvent> {
+        vec![
+            EngineEvent::TextDelta("hi".into()),
+            EngineEvent::ThinkingDelta("mm".into()),
+            EngineEvent::ToolStart {
+                name: "read".into(),
+                summary: "read ./x".into(),
+            },
+            EngineEvent::ToolDone {
+                name: "read".into(),
+                ok: true,
+            },
+            EngineEvent::ToolDenied {
+                name: "write".into(),
+            },
+            EngineEvent::ToolAutoAllowed {
+                name: "bash".into(),
+                rule: "ls*".into(),
+            },
+            EngineEvent::Retrying {
+                attempt: 1,
+                reason: "429".into(),
+            },
+            EngineEvent::FallbackModel { model: "m2".into() },
+            EngineEvent::PromptQueued,
+            EngineEvent::Compacted { degraded: false },
+            EngineEvent::TodosChanged { items: Vec::new() },
+        ]
+    }
+
+    /// §7: attach rendered 4 of 13 variants, so an attached human silently
+    /// missed denials, auto-allow rules, retries, fallbacks, queued prompts,
+    /// todos, and thinking. Rendering *from* the shared frame means a new
+    /// variant can never be dropped on this surface alone again.
+    #[test]
+    fn attach_renders_every_update_variant() {
+        // The two deliberate `None`s, each for a stated reason: `text_delta`
+        // is the answer itself (streamed to stdout unadorned), and a tool that
+        // *succeeded* needs no line — its output already spoke.
+        let exempt = ["text_delta", "tool_done"];
+        for e in every_streamable_event() {
+            let Some(frame) = crate::wire::update_frame(&e) else {
+                continue;
+            };
+            if exempt.contains(&frame["type"].as_str().unwrap_or("")) {
+                continue;
+            }
+            assert!(
+                update_line(&frame).is_some(),
+                "attach drops `{}`",
+                frame["type"]
+            );
+        }
+        // A tool that failed does get a line — the exemption is about success.
+        let failed = crate::wire::update_frame(&EngineEvent::ToolDone {
+            name: "read".into(),
+            ok: false,
+        })
+        .unwrap();
+        assert!(update_line(&failed).is_some(), "a tool error must be shown");
+    }
+
+    #[test]
+    fn typed_lines_route_correctly() {
+        assert_eq!(route("/stop", false, None), Action::Stop);
+        assert_eq!(
+            route("y", false, Some(4)),
+            Action::AnswerAsk { id: 4, allow: true }
+        );
+        assert_eq!(
+            route("no", false, Some(4)),
+            Action::AnswerAsk {
+                id: 4,
+                allow: false
+            }
+        );
+        assert_eq!(route("", false, None), Action::Nothing);
+        assert_eq!(route("hi", true, None), Action::Steer("hi".into()));
+        assert_eq!(route("hi", false, None), Action::Prompt("hi".into()));
+    }
 }

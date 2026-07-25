@@ -922,6 +922,7 @@ dependencies = [
  "crossterm",
  "hotl-theme",
  "hotl-tools",
+ "hotl-types",
  "ratatui",
  "serde_json",
  "tokio",
