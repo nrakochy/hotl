@@ -261,10 +261,12 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 input: String::new(),
                 denying: false,
             };
-            // The ask owns the keyboard and the screen now; a popup left
-            // open from mid-typing would steal the first Esc and draw a
-            // stale "commands" menu under the "waiting on you" card.
+            // The ask owns the keyboard and the screen now. A popup or a live
+            // reverse-i-search left over from mid-typing would steal the first
+            // Esc, draw a stale menu under the "waiting on you" card, and
+            // advertise keys `on_ask_key` ignores (tracker #13).
             state.completion = None;
+            state.editor.clear_search();
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::QuestionRequest { req_id, question } => {
@@ -275,7 +277,9 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 options: question.options,
                 input: String::new(),
             };
+            // Same reasoning as the ask arm above (tracker #13).
             state.completion = None;
+            state.editor.clear_search();
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::PromptResult {
@@ -955,6 +959,27 @@ mod tests {
                 summary: "run bash: rm -rf ./x".into(),
                 protected_why: None,
             },
+        );
+    }
+
+    #[test]
+    fn a_modal_transition_clears_the_editor_search() {
+        let mut s = State::test_default();
+        s.editor.load_history(vec!["cargo test".into()]);
+        s.editor
+            .handle(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        assert!(s.editor.search_prompt().is_some());
+        update(
+            &mut s,
+            Msg::PermissionRequest {
+                req_id: 1,
+                summary: "write ./x".into(),
+                protected_why: None,
+            },
+        );
+        assert!(
+            s.editor.search_prompt().is_none(),
+            "search survived the ask"
         );
     }
 

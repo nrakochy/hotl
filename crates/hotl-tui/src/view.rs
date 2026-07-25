@@ -515,21 +515,24 @@ fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
 }
 
 fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
-    if state.editor.search_prompt().is_some() {
-        let hint = "type to search · ctrl-r older · enter accept · esc cancel";
-        frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
-        return;
-    }
-    // The phase arms below take priority over the popup: a permission ask
-    // or structured question owns the keyboard even if a popup was left
-    // open from mid-typing (see `app::modal_active`), and the phase hint is
-    // what actually applies to the keys that work right now.
+    // Order is the contract, and it is one-directional: a permission ask or
+    // structured question owns the keyboard (`on_ask_key`/`on_question_key`
+    // intercept every key at `app::on_key`), so their hints outrank both the
+    // completion popup and a live reverse-i-search — a hint naming keys the
+    // active handler ignores is worse than no hint at all. Mirrors `6e44471`,
+    // which fixed exactly this for the popup; tracker #13 is the sibling.
+    // INVARIANT: while `Phase` is `WaitingAsk`/`WaitingQuestion` the hint names
+    // only keys that phase's handler accepts. Enforced by
+    // `an_ask_during_a_search_shows_the_ask_hint`.
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
         (Phase::WaitingAsk { .. }, ..) => {
             "y allow · n deny · type a reason after n · ctrl-c cancel"
         }
         (Phase::WaitingQuestion { .. }, ..) => {
             "1-9 pick an option · type for free text · enter submit · esc clear"
+        }
+        _ if state.editor.search_prompt().is_some() => {
+            "type to search · ctrl-r older · enter accept · esc cancel"
         }
         _ if state.completion.is_some() => "↑↓ pick · tab complete · enter run · esc dismiss",
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
@@ -786,6 +789,30 @@ mod tests {
     const STRIP: usize = 19;
     const INPUT_TOP: usize = 20;
     const HINT: usize = 23;
+
+    /// Tracker #13. A permission ask owns the keyboard; the hint must name the
+    /// keys `on_ask_key` actually handles, not the four a live Ctrl-R
+    /// advertises — all of which that handler ignores.
+    #[test]
+    fn an_ask_during_a_search_shows_the_ask_hint() {
+        let mut s = State::test_default();
+        s.editor.load_history(vec!["cargo test".into()]);
+        s.editor
+            .handle(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "write ./x".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+        };
+        let hint = draw(&s)[HINT].clone();
+        assert!(hint.contains("y allow"), "got: {hint}");
+        assert!(
+            !hint.contains("ctrl-r older"),
+            "dead keys advertised: {hint}"
+        );
+    }
 
     /// §5.7 bug 3: the badge used to be silent on "ask" while the shipped
     /// default was "auto" — so "no badge" could mean either that or a terminal
