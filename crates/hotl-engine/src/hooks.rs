@@ -426,13 +426,16 @@ impl InProcessHooks {
 
 /// Deterministic most-restrictive merge over `pre_tool` results collected
 /// from every matching hook (Innovation #1): `Deny` beats `Rewrite` beats
-/// `Continue`. `results` is in **registration order** (the order the
-/// matching hooks were folded, not the order their futures completed —
-/// `join_all` preserves input order regardless of completion order), so a
-/// tie among same-severity decisions always resolves to the
-/// first-registered hook, never a race. Exposed (not just used internally by
-/// `InProcessHooks`) so lane 2 (the shell adapter) shares the exact same
-/// merge discipline instead of re-implementing it.
+/// `Continue`. `results` is in **registration order** — the caller collects
+/// matching hooks in a plain loop (T3-10 removed the `join_all` that implied a
+/// concurrency these synchronous handlers never had), so a tie among
+/// same-severity decisions always resolves to the first-registered hook, never
+/// a race. Exposed (not just used internally by `InProcessHooks`) so lane 2
+/// (the shell adapter) shares the exact same merge discipline instead of
+/// re-implementing it.
+/// INVARIANT: ties resolve by registration order, never by completion order.
+/// Enforced by `ties_among_same_severity_decisions_resolve_by_registration_order`
+/// and `in_process_hooks_run_in_registration_order`.
 pub fn merge_pre_tool(results: Vec<PreToolDecision>) -> PreToolDecision {
     if let Some(deny) = results
         .iter()
@@ -461,13 +464,20 @@ pub fn merge_stop(results: Vec<StopDecision>) -> StopDecision {
 
 impl Hooks for InProcessHooks {
     fn pre_tool<'a>(&'a self, name: &'a str, input: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+        // These handlers are synchronous `Fn`s: `join_all` over futures that are
+        // ready on first poll bought concurrency-shaped syntax and no
+        // concurrency (T3-10). Registration order is the tiebreak
+        // `merge_pre_tool` documents, and a loop states that plainly.
+        // INVARIANT: an in-process hook must not block — it runs inline on the
+        // caller's task, bounded only by `call_pre_tool`'s timeout.
         Box::pin(async move {
-            let futures = self
-                .pre
-                .iter()
-                .filter(|(matcher, _)| matcher.matches(name))
-                .map(|(_, hook)| async move { hook(name, input) });
-            merge_pre_tool(futures_util::future::join_all(futures).await)
+            let mut results = Vec::new();
+            for (matcher, hook) in &self.pre {
+                if matcher.matches(name) {
+                    results.push(hook(name, input));
+                }
+            }
+            merge_pre_tool(results)
         })
     }
     fn post_tool<'a>(&'a self, name: &'a str, result: &'a str) -> BoxFuture<'a, Option<String>> {
@@ -492,30 +502,28 @@ impl Hooks for InProcessHooks {
     }
     fn on_user_prompt<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
-            let futures = self.prompt.iter().map(|hook| async move { hook(prompt) });
-            let results = futures_util::future::join_all(futures).await;
-            join_additional_context(results.into_iter().flatten())
+            let results: Vec<_> = self.prompt.iter().filter_map(|hook| hook(prompt)).collect();
+            join_additional_context(results.into_iter())
         })
     }
     fn on_notification<'a>(&'a self, kind: NotificationKind, detail: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let futures = self
-                .notification
-                .iter()
-                .map(|hook| async move { hook(kind, detail) });
-            futures_util::future::join_all(futures).await;
+            for hook in &self.notification {
+                hook(kind, detail);
+            }
         })
     }
     fn on_stop<'a>(&'a self, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
         Box::pin(async move {
-            let futures = self.stop.iter().map(|hook| async move { hook(outcome) });
-            merge_stop(futures_util::future::join_all(futures).await)
+            let results: Vec<_> = self.stop.iter().map(|hook| hook(outcome)).collect();
+            merge_stop(results)
         })
     }
     fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(async move {
-            let futures = self.session_end.iter().map(|hook| async move { hook() });
-            futures_util::future::join_all(futures).await;
+            for hook in &self.session_end {
+                hook();
+            }
         })
     }
 }
@@ -726,6 +734,30 @@ mod tests {
             hooks.pre_tool("read", &json!({})).await,
             PreToolDecision::Continue
         );
+    }
+
+    /// T3-10's merge criterion. In-process handlers are synchronous `Fn`s, so
+    /// this pinned current observable behavior *before* `join_all` was replaced
+    /// with a plain loop, and must keep passing after: registration order is
+    /// the tiebreak `merge_stop`/`merge_pre_tool` document, and it is now
+    /// stated plainly rather than implied by `join_all`'s input ordering.
+    #[tokio::test]
+    async fn in_process_hooks_run_in_registration_order() {
+        let order: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+        let push = |order: &Arc<Mutex<Vec<&'static str>>>, tag: &'static str| {
+            let order = Arc::clone(order);
+            move |_outcome: &str| {
+                order.lock().expect("lock").push(tag);
+                StopDecision::Allow
+            }
+        };
+        let hooks = InProcessHooks::new()
+            .on_stop(push(&order, "a"))
+            .on_stop(push(&order, "b"))
+            .on_stop(push(&order, "c"));
+        // Disambiguated: the builder's `on_stop` shadows the trait's.
+        assert_eq!(Hooks::on_stop(&hooks, "done").await, StopDecision::Allow);
+        assert_eq!(*order.lock().expect("lock"), vec!["a", "b", "c"]);
     }
 
     #[test]

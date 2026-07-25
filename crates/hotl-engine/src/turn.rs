@@ -45,10 +45,21 @@ const SPECULATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30)
 /// most `TURN_EXTENSION_MAX` times total, ever, regardless of which gate(s)
 /// fired on any given pass. Capped above any single gate's own bound — it's
 /// the *combined* ceiling.
+///
+/// The budget is per **prompt**, not per `drive()` call: it rides
+/// [`crate::TurnContinuation`], so a compaction mid-turn no longer refills it
+/// (before T2-2 that claim was false — every fold reset the counter).
+/// INVARIANT: a turn is extended at most this many times per prompt, folds
+/// included. Enforced by
+/// `an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the_combined_cap`
+/// (the combined cap) and `max_turns_is_enforced_across_a_compaction` (that
+/// per-turn counters survive a fold).
 const TURN_EXTENSION_MAX: u32 = 3;
 /// The TodoGate's own bound within the shared budget (01 §agent-loop's
-/// `max_fires_per_prompt`). It never blocks in `Auto`/`DontAsk` beyond this
-/// — a gate that can wedge an unattended run is a bug.
+/// `max_fires_per_prompt`).
+/// INVARIANT: the gate never blocks an unattended (`Auto`/`DontAsk`) run beyond
+/// this — a gate that can wedge one is a bug. Enforced by
+/// `the_gate_fires_at_most_twice_then_lets_the_turn_end`.
 const TODO_GATE_MAX: u32 = 2;
 
 pub(crate) async fn run(
