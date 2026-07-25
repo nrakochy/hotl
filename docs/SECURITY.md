@@ -13,6 +13,7 @@ with it:
 |---|---|---|---|
 | Ordinary bash/write/edit/MCP | runs, no prompt, `ToolAutoAllowed` in transcript | y/N ask per action | y/N ask per action (config cannot change this) |
 | Protected execute-later paths | **always asks** (headless: denies) | always asks | always asks |
+| File tool (`read`/`write`/`edit`) outside the working directory | **always asks** (headless: denies) | always asks | always asks |
 | Admin preapproved (`/etc/hotl/preapproved.toml`) | grants apply (redundant under auto) | grants silence matching asks | grants are the admin's no-prompt channel |
 | Admin/user deny rules | refuse the call outright, with the rule named in the tool result | same | same |
 | Kernel sandbox / egress / undo / masking | on | on | on |
@@ -27,6 +28,24 @@ group/world-writable; otherwise it is refused loudly at startup and in
 ## What the sandbox is not (read this first)
 
 The kernel sandbox floor is **write-confinement, not data-loss prevention.** A `bash` command that the human approves (or that an allow-rule matches) can **read any file the user can read and send it anywhere over the network** — reads and network egress are open by design (the agent legitimately reads the tree and fetches dependencies). The floor stops the agent *tampering with the filesystem outside the working directory*; it does **not** stop *exfiltration*. Treat the human approval prompt, not the sandbox, as the exfiltration boundary — and know that a plausible-looking approved command (`run the tests`, which also `curl`s) exfiltrates freely. Egress restriction exists but is **opt-in** (`[network]` in config.toml — see "Network egress" below); the default is open. Under the default policy, do not run hotl against secrets you would not paste into a command yourself.
+
+**What this section does *not* cover, since 0.5.x: the file tools.** The
+paragraph above is about `bash`, and stays true of it word for word — an
+approved command still reads anything you can read and sends it anywhere.
+The narrower change is that `read`, `write`, `edit`, `glob`, and `grep` are
+now *workspace-contained*, and the containment is enforced on the **file
+descriptor** rather than the path string: a path is inside only if a descent
+from the workspace-root fd reached it without traversing a symlink
+(`openat2(RESOLVE_BENEATH)` on Linux, component-wise `openat` with
+`O_NOFOLLOW` elsewhere). Since the check is made on the descriptor the tool
+then uses, there is no name to re-resolve and no check/open race.
+Consequences: `glob`/`grep` refuse an out-of-tree or symlinked search root
+outright; `read` outside the tree is a **protected ask that outranks
+`mode=auto`**, so it prompts in every mode; `write`/`edit` never follow a
+symlink at any component and classify protected paths on the *resolved*
+target, so a symlink cannot launder a protected write into an ordinary one.
+This closes the "`ln -s ~ link` then `grep --path link`" read of the whole
+home directory under no prompt at all. It does **not** narrow `bash`.
 
 ## The permission gate
 

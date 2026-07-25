@@ -207,19 +207,29 @@ name is taken stays addressable as `<marketplace>:<skill>`.
 
 | Tool | Effect | Permission |
 |---|---|---|
-| `read` | Read a text file (2000 lines / 200KB per call, `offset` continues a truncated read). | None — read-only |
+| `read` | Read a text file (2000 lines / 200KB per call; any single line over 8KB is clipped; `offset`/`limit` continue a truncated read). | None inside the working directory — **outside it, a protected ask** |
 | `edit` | Exact string replacement in a file. | Ask (protected paths escalate) |
 | `write` | Write a file, creating parent directories. | Ask (protected paths escalate) |
-| `bash` | Run a shell command under the sandbox floor. | Ask |
-| `glob` | List files under the working directory matching a filename pattern (`*.rs`, `**/*.toml`, or a bare substring); hidden/vendor directories (`.git`, `node_modules`, `target`) are skipped. In-process — no subprocess, so it still works with no `rg` on `PATH` or when the sandbox floor degrades. | None — read-only |
-| `grep` | Search file contents with ripgrep (`pattern` is a regex; optional `path`, `glob` filter, `files_only`). Runs through the same sandboxed command path as `bash`, so content search inherits the kernel write-confinement floor. | None — read-only |
+| `bash` | Run a shell command under the sandbox floor. stdout and stderr share one pipe, so output arrives in the order the command actually wrote it; a failure ends with `[exit N]` or `[killed by SIGNAME]`. | Ask |
+| `glob` | List files under the working directory matching a **real glob**: `*` (does not cross `/`), `**` (recurses), `?`, `[a-z]`, `{a,b}`. A pattern with no `/` matches the file name at any depth (`*.rs`). Newest-first by default (`sort`: `"mtime"` \| `"path"`), capped at 1000. Respects `.gitignore`; `.git` is never walked; symlinks are never followed. In-process — no subprocess, so it still works with no `rg` on `PATH` or when the sandbox floor degrades, and the walk runs on the blocking pool so a large or hostile tree cannot stall the runtime. | None — read-only |
+| `grep` | Search file contents with ripgrep (`pattern` is a regex; optional `path`, `glob` filter, `files_only`). The `path` argument is resolved without following symlinks before it becomes argv. Runs through the same sandboxed command path as `bash`, so content search inherits the kernel write-confinement floor. | None — read-only |
 | `todo_write` | Replace the session's task checklist (every call sends the whole list). Keeps the model on-plan on long unattended runs and gives you a glanceable progress signal in the console strip. | None |
 | `ask_user` | Ask you a structured multiple-choice question (a header, a prompt, and 2–4 labelled options, plus free text) when the model hits a genuine ambiguity instead of guessing. | None — see below |
 | `web_fetch` | Fetch one or more URLs (an array — fetched concurrently in one call) and return their text (HTML stripped). Always registered; needs no configuration. | Ask (always, even under an allowlist) |
 | `web_search` | Search via the `[web.search]` backend you configure and get back titles/URLs/snippets; `web_fetch` a result for the full text. Registered **only** when `[web.search]` is set — absent otherwise, so nothing phones home by default. | Ask |
 | `spawn` | Delegate a self-contained subtask to a fresh, isolated sub-agent (`agent_type`: `general-purpose`, `explore`, `plan`, or your own `agents/*.md` def); `fork: true` seeds it with your own current context instead. See [agents.md](../agents/). | Ask |
 
-`glob` and `grep` are workspace-scoped: an absolute path or a `..` escape outside the working directory is refused, and both run without a permission ask because that containment is what makes them safe reads. Both are parallel-safe, so a batch of several `glob`/`grep` calls in one turn runs concurrently.
+**All five file tools are workspace-contained, and the boundary is the file descriptor.** A path is inside the working directory if — and only if — a descent from the workspace-root fd reached it *without traversing a symlink*: on Linux one `openat2(RESOLVE_BENEATH)`, everywhere else a component-by-component `openat` with `O_NOFOLLOW`. Because the check is made on the descriptor the tool then uses, there is no name to re-resolve and so no check/open race. A lexical `..`-normalising pass still runs first, but only to pick the error message and the permission — never as the boundary.
+
+What that means per tool:
+
+- `glob` and `grep` refuse an absolute path or a `..` escape outright, and refuse a search root reached through a symlink. This is why they run with no ask.
+- `read` runs unprompted inside the tree. Outside it — an absolute path, a `..` escape, or a path that leaves through a symlink — it is a **protected ask that outranks `mode=auto`**, so it prompts in every mode. That is deliberate: an ordinary ask would be auto-approved under the shipped default and protect nothing.
+- `write` and `edit` never follow a symlink at any component, including the final one, so a `docs/notes.md` that points at `~/.zshrc` is refused rather than silently writing the target. Their protected-path classification also runs on the *resolved* target, so a symlink cannot launder a protected write into an ordinary one.
+
+A refusal is a prompt: it names the offending component and tells the model to re-issue with the absolute path and take the ask. Benign in-tree symlinks are refused too — distinguishing them would mean resolving a name and comparing it, which is the very check this design removes.
+
+`glob` and `grep` are both parallel-safe, so a batch of several `glob`/`grep` calls in one turn runs concurrently.
 
 `todo_write` is session-scoped ephemeral context, not part of the model transcript: the current list rides into every request as a tagged reminder, but it never becomes part of the durable conversation the model reads back verbatim. A text-only reply with `pending`/`in_progress` items still open gets nudged to finish or update the list — bounded to at most two nudges per prompt, so it can never wedge an unattended run. Sub-agents spawned with the `spawn` tool get their own independent list, wired to their own session.
 

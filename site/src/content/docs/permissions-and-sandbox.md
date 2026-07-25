@@ -90,11 +90,52 @@ Allowed hosts are reached through a small local proxy, so `cargo fetch` and `git
 
 Three honest caveats. First, this is **opt-in**: the default stays open because the agent legitimately fetches things, and a silently broken network by default would just teach everyone to turn the feature off. Second, **only HTTP traffic can traverse the proxy** — `git` over an SSH remote (`git@github.com:…`) fails under `off`/`allowlist` no matter what you allow; switch those repos to HTTPS remotes while running restricted. Third, it is **not airtight**: an allowed host is allowed for *everything* (an allowlisted `github.com` can still receive a push of your data), DNS still resolves (macOS resolves names via a local system service; on Linux, Landlock confines TCP only, and needs kernel ≥ 6.7), so a determined DNS-tunnel can still leak — treat egress restriction as a strong brake on casual exfiltration, not a cleanroom. And if the kernel can't enforce the restriction you configured, hotl says so loudly — `NET:UNENFORCED(reason)` in every bash ask — and `bash` allow-rules stop auto-approving, the same fail-closed posture as an unsandboxed host. The full mechanics and limits live in [SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md).
 
+## The workspace boundary: the file tools stay in the project
+
+`read`, `write`, `edit`, `glob`, and `grep` are scoped to the working
+directory, and the scope is enforced on the **file descriptor**, not on the
+path string. A path counts as inside only if a descent from the
+workspace-root descriptor reached it *without traversing a symlink*. Because
+the decision is made on the descriptor the tool then uses, there is no name
+to re-resolve afterwards and therefore no check/open race to lose. (On Linux
+this is a single `openat2(RESOLVE_BENEATH)`; elsewhere it is a
+component-by-component `openat` with `O_NOFOLLOW`.)
+
+The practical consequences:
+
+- **A symlink out of the tree is refused, not followed.** `ln -s ~ link`
+  followed by `grep --path link` used to search your whole home directory
+  with no prompt. It now stops at `link`.
+- **`read` outside the working directory is a protected ask.** An absolute
+  path, a `..` escape, or a path that leaves through a symlink prompts — and
+  it is *protected*, so it prompts in **every** mode, including the default
+  `auto`. This is the one deliberate exception to "ordinary tool calls run
+  without asking", and it is deliberate for a plain reason: an ordinary ask
+  is auto-approved under the shipped default, so it would have protected
+  nothing.
+- **`write` and `edit` never follow a symlink**, at any component including
+  the last, so a `docs/notes.md` that points at `~/.zshrc` is refused rather
+  than quietly rewriting your shell config. Their protected-path
+  classification also runs on the *resolved* target, so a symlink can't
+  launder a protected write into an ordinary one.
+
+**This is the change most likely to surprise you.** If your workflow has the
+agent read `~/notes.md` mid-session, that read now prompts where it used to
+be silent. Approving it works exactly as before — the escalation is a gate,
+not a ban, and the prompt shows you where the path really lands, links
+resolved.
+
+Benign symlinks *inside* the tree are refused too. Telling "points inside"
+from "points outside" would mean resolving a name and comparing the result,
+which is precisely the name-based check this design exists to remove. The
+refusal tells the model to re-issue with the absolute path and take the ask,
+so nothing is unreachable — only gated.
+
 ## Protected paths: some writes are more dangerous than they look
 
 Writing a file is usually harmless until *later*. A `.git/hooks/pre-commit`, a `Makefile`, a `build.rs`, your `~/.zshrc`, an `~/.ssh/authorized_keys` — writing these is benign, but the *next* git command, build, shell, or login runs code or grants access you never explicitly approved. This is the "write-now, execute-later" trap.
 
-hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule — it always asks, no matter what your `config.toml's [[allow]]` says. The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), shell startup files, hotl's own config directory (`~/.config/hotl/`, including `config.toml` and its `api_key_helper` command), SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
+hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule — it always asks, no matter what your `config.toml's [[allow]]` says. The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`, `setup.py`), toolchain entrypoints that run a command on the next ordinary invocation (`.cargo/config.toml`, `package.json` npm scripts, `.envrc`, `.pre-commit-config.yaml`, compose files, `.vscode/tasks.json` and `launch.json`), CI workflows under `.github/workflows/` (they run on your next push, with the repo's secrets), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), the whole shell-startup family (`.profile`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.bashrc`, `.zshrc`, `.zshenv`, `.zprofile`, `.zlogin`), hotl's own config directory (`~/.config/hotl/`, including `config.toml` and its `api_key_helper` command), SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
 
 ## Why allow-rules are a file you edit
 
@@ -118,6 +159,7 @@ Approval is a judgment call, and judgment is fallible. So hotl photographs your 
 | Agent changes a file you didn't intend | the y/N gate + undo | — |
 | Agent writes outside the project | the sandbox floor (bash) | — |
 | Agent reads a secret and exfiltrates it | **your reading of each approved command**, plus `[network].egress` if you set it | the default sandbox (reads + egress open unless you opt in) |
+| A file tool reading or writing outside the project | the workspace boundary, enforced on the fd — out-of-tree `read` is a protected ask, and no file tool follows a symlink | `bash` — an approved command still reads anything you can read |
 | A benign-looking write that runs code later | protected-path escalation | — |
 | Ask-fatigue growing a blanket allowlist | file-only allow-rules, no in-console button | — |
 
