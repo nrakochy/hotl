@@ -12,6 +12,8 @@
 //! default. hotl has never allowlisted model names and must not start here.
 //! Enforced by `unknown_models_are_none_not_an_error`.
 
+use hotl_types::TokenUsage;
+
 /// The model hotl uses when nothing else is configured.
 ///
 /// INVARIANT (partially unimplemented — see
@@ -223,6 +225,49 @@ pub fn max_output_tokens(model: &str) -> Option<u32> {
     lookup(model).map(|m| m.max_output_tokens)
 }
 
+/// Price a turn's reported usage in USD, or `None` for an uncatalogued model.
+///
+/// Each bucket is priced at its own rate and summed. On the Anthropic wire
+/// `input_tokens` is the *uncached remainder* — cache reads and cache writes
+/// are reported separately and are not included in it — so this sum is the
+/// whole request, not a partial one.
+///
+/// INVARIANT: caching a prefix is never more expensive than not caching the
+/// same traffic. Enforced by `cost_prices_each_usage_bucket_at_its_own_rate`.
+pub fn cost_usd(model: &str, usage: &TokenUsage) -> Option<f64> {
+    let m = lookup(model)?;
+    let per = |tokens: u64, rate: f64| (tokens as f64 / 1_000_000.0) * rate;
+    Some(
+        per(usage.input_tokens, m.input_usd_per_mtok)
+            + per(usage.output_tokens, m.output_usd_per_mtok)
+            + per(usage.cache_read_input_tokens, m.cache_read_usd_per_mtok)
+            + per(
+                usage.cache_creation_input_tokens,
+                m.cache_write_usd_per_mtok,
+            ),
+    )
+}
+
+/// Shortest prompt prefix this model will actually cache, or `None` when
+/// uncatalogued.
+pub fn min_cacheable_prefix(model: &str) -> Option<u64> {
+    lookup(model).map(|m| m.min_cacheable_prefix)
+}
+
+/// Would marking a prefix of `estimated_tokens` actually produce a cache
+/// entry? A shorter prefix is silently not cached — the request succeeds and
+/// `cache_creation_input_tokens` comes back `0` — while still paying the write
+/// premium for whatever *is* cached after it.
+///
+/// Fails **towards** marking on an unknown model: a wasted mark costs the
+/// premium once, a skipped mark costs a full prefix rebuild every turn.
+pub fn is_cacheable_prefix(model: &str, estimated_tokens: u64) -> bool {
+    match min_cacheable_prefix(model) {
+        Some(min) => estimated_tokens >= min,
+        None => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +340,57 @@ mod tests {
                 m.max_output_tokens
             );
         }
+    }
+
+    #[test]
+    fn cost_prices_each_usage_bucket_at_its_own_rate() {
+        let usage = TokenUsage {
+            input_tokens: 1_000_000,
+            output_tokens: 1_000_000,
+            cache_read_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 1_000_000,
+        };
+        // Opus 4.8: 5.00 + 25.00 + 0.50 + 6.25
+        let cost = cost_usd("claude-opus-4-8", &usage).unwrap();
+        assert!((cost - 36.75).abs() < 1e-9, "was {cost}");
+
+        // Uncatalogued: no price, no guess.
+        assert!(cost_usd("llama3", &usage).is_none());
+
+        // `input_tokens` is the *uncached remainder* on the wire — a cache hit
+        // must be cheaper than the same traffic uncached, never more.
+        let cached = TokenUsage {
+            input_tokens: 0,
+            cache_read_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let uncached = TokenUsage {
+            input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        assert!(
+            cost_usd("claude-opus-4-8", &cached).unwrap()
+                < cost_usd("claude-opus-4-8", &uncached).unwrap()
+        );
+    }
+
+    #[test]
+    fn cacheable_prefix_predicate_knows_the_generation_split() {
+        // Not monotonic across generations — this is why it is data.
+        assert_eq!(min_cacheable_prefix("claude-opus-5"), Some(512));
+        assert_eq!(min_cacheable_prefix("claude-opus-4-8"), Some(1024));
+        assert_eq!(min_cacheable_prefix("claude-opus-4-6"), Some(4096));
+        assert_eq!(min_cacheable_prefix("claude-haiku-4-5"), Some(4096));
+
+        // A 300-token system prompt: a no-op mark on every model.
+        assert!(!is_cacheable_prefix("claude-opus-5", 300));
+        // 600 tokens caches on Opus 5 and silently does not on Opus 4.8.
+        assert!(is_cacheable_prefix("claude-opus-5", 600));
+        assert!(!is_cacheable_prefix("claude-opus-4-8", 600));
+        // Unknown model: assume it caches. Fail *towards* marking — a wasted
+        // mark costs a premium once; a skipped mark costs a full rebuild every
+        // turn.
+        assert!(is_cacheable_prefix("llama3", 1));
     }
 
     #[test]
