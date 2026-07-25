@@ -208,6 +208,21 @@ pub fn lookup(model: &str) -> Option<&'static ModelInfo> {
         .max_by_key(|m| m.id.len())
 }
 
+/// The model's context window in tokens, or `None` when uncatalogued.
+///
+/// Returning `Option` rather than a defaulted `u64` is deliberate: the caller
+/// is the only layer that knows whether it can *warn* about the fallback, and
+/// silently substituting 200K is precisely the defect this module exists to
+/// remove. See `config::ContextCfg::resolve_window`.
+pub fn context_window(model: &str) -> Option<u64> {
+    lookup(model).map(|m| m.context_window)
+}
+
+/// The model's maximum output tokens per request, or `None` when uncatalogued.
+pub fn max_output_tokens(model: &str) -> Option<u32> {
+    lookup(model).map(|m| m.max_output_tokens)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,6 +267,34 @@ mod tests {
         assert!(lookup("llama3").is_none());
         assert!(lookup("openai/gpt-5").is_none());
         assert!(lookup("").is_none());
+    }
+
+    #[test]
+    fn window_and_output_resolve_per_model_and_none_for_unknown() {
+        assert_eq!(context_window("claude-opus-4-8"), Some(1_000_000));
+        assert_eq!(context_window("claude-haiku-4-5"), Some(200_000));
+        assert_eq!(context_window("anthropic/claude-sonnet-5"), Some(1_000_000));
+        // Unknown: None, so the caller decides the fallback (and can warn).
+        assert_eq!(context_window("llama3"), None);
+
+        assert_eq!(max_output_tokens("claude-haiku-4-5"), Some(64_000));
+        assert_eq!(max_output_tokens("claude-opus-5"), Some(128_000));
+        assert_eq!(max_output_tokens("mistral-large"), None);
+    }
+
+    #[test]
+    fn the_engines_default_max_tokens_fits_every_catalogued_model() {
+        // `EngineConfig::default().max_tokens` is 32_000
+        // (hotl-engine/src/lib.rs:81). If a catalogued model ever caps output
+        // below that, the request 400s — catch it here, not in production.
+        for m in CATALOG {
+            assert!(
+                m.max_output_tokens >= 32_000,
+                "{} caps output at {} < the engine default 32_000",
+                m.id,
+                m.max_output_tokens
+            );
+        }
     }
 
     #[test]
