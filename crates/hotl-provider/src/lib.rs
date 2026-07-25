@@ -758,6 +758,11 @@ pub mod repair {
 pub mod api_error;
 pub mod key;
 
+/// Highest block index any assembler will materialize. Wire indices are
+/// attacker-controlled `u64`s; without a bound, `blocks.resize(index + 1, …)`
+/// is a one-field OOM (T2-9). Far above any real response.
+pub const MAX_BLOCK_INDEX: usize = 512;
+
 /// Wire-format folding, implemented per provider: turn one SSE `data:`
 /// payload into events, and produce the terminal `Completed` at end-of-stream.
 pub trait SseAssembler {

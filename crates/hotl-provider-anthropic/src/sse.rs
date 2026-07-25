@@ -19,8 +19,18 @@ pub(crate) struct Assembler {
     done: Option<StreamEvent>,
 }
 
-fn index_of(v: &Value) -> usize {
-    v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize
+/// INVARIANT (T2-9): every wire index is bounded before it reaches a `Vec`.
+/// Enforced by `an_absurd_wire_index_is_a_parse_error_not_an_allocation`.
+fn index_of(v: &Value) -> Result<usize, ProviderError> {
+    let raw = v.get("index").and_then(Value::as_u64).unwrap_or(0);
+    let index = usize::try_from(raw).unwrap_or(usize::MAX);
+    if index > hotl_provider::MAX_BLOCK_INDEX {
+        return Err(ProviderError::Parse(format!(
+            "block index {raw} exceeds the {} block limit",
+            hotl_provider::MAX_BLOCK_INDEX
+        )));
+    }
+    Ok(index)
 }
 
 impl SseAssembler for Assembler {
@@ -35,8 +45,8 @@ impl SseAssembler for Assembler {
                 }
                 Ok(vec![])
             }
-            "content_block_start" => Ok(vec![self.on_block_start(&v)]),
-            "content_block_delta" => Ok(self.on_block_delta(&v)),
+            "content_block_start" => Ok(vec![self.on_block_start(&v)?]),
+            "content_block_delta" => self.on_block_delta(&v),
             "content_block_stop" => self.on_block_stop(&v).map(|ev| vec![ev]),
             "message_delta" => {
                 self.on_message_delta(&v);
@@ -80,8 +90,8 @@ impl SseAssembler for Assembler {
 }
 
 impl Assembler {
-    fn on_block_start(&mut self, v: &Value) -> StreamEvent {
-        let index = index_of(v);
+    fn on_block_start(&mut self, v: &Value) -> Result<StreamEvent, ProviderError> {
+        let index = index_of(v)?;
         let block = v.get("content_block").cloned().unwrap_or(Value::Null);
         let kind = block
             .get("type")
@@ -92,11 +102,11 @@ impl Assembler {
             self.blocks.resize(index + 1, Value::Null);
         }
         self.blocks[index] = block;
-        StreamEvent::BlockStart { index, kind }
+        Ok(StreamEvent::BlockStart { index, kind })
     }
 
-    fn on_block_delta(&mut self, v: &Value) -> Vec<StreamEvent> {
-        let index = index_of(v);
+    fn on_block_delta(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = index_of(v)?;
         let delta = v.get("delta").cloned().unwrap_or(Value::Null);
         let text_of = |field: &str| {
             delta
@@ -109,30 +119,30 @@ impl Assembler {
             "text_delta" => {
                 let text = text_of("text");
                 self.append_str(index, "text", &text);
-                vec![StreamEvent::TextDelta { index, text }]
+                Ok(vec![StreamEvent::TextDelta { index, text }])
             }
             "thinking_delta" => {
                 let text = text_of("thinking");
                 self.append_str(index, "thinking", &text);
-                vec![StreamEvent::ThinkingDelta { index, text }]
+                Ok(vec![StreamEvent::ThinkingDelta { index, text }])
             }
             "input_json_delta" => {
                 let json = text_of("partial_json");
                 self.partial_json.entry(index).or_default().push_str(&json);
-                vec![StreamEvent::ToolInputDelta { index, json }]
+                Ok(vec![StreamEvent::ToolInputDelta { index, json }])
             }
             "signature_delta" => {
                 self.append_str(index, "signature", &text_of("signature"));
-                vec![]
+                Ok(vec![])
             }
             // Unknown delta kinds: skipped, not fatal (forward compat).
-            _ => vec![],
+            _ => Ok(vec![]),
         }
     }
 
     /// Seal accumulated tool input into the block's `input`.
     fn on_block_stop(&mut self, v: &Value) -> Result<StreamEvent, ProviderError> {
-        let index = index_of(v);
+        let index = index_of(v)?;
         if let Some(partial) = self.partial_json.remove(&index) {
             if !partial.trim().is_empty() {
                 // Arg healing (M3a): conservative repair before giving up.
@@ -184,6 +194,30 @@ impl Assembler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// INVARIANT (T2-9): a wire-supplied block index above `MAX_BLOCK_INDEX` is a
+    /// parse error, never an allocation. `"index": 4000000000` used to ask for
+    /// four billion `Value`s.
+    #[test]
+    fn an_absurd_wire_index_is_a_parse_error_not_an_allocation() {
+        let mut a = Assembler::default();
+        let data = r#"{"type":"content_block_start","index":4000000000,
+                       "content_block":{"type":"text","text":""}}"#;
+        match a.handle(data) {
+            Err(ProviderError::Parse(m)) => assert!(m.contains("index"), "{m}"),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn indices_at_the_cap_still_work() {
+        let mut a = Assembler::default();
+        let idx = hotl_provider::MAX_BLOCK_INDEX;
+        let data = format!(
+            r#"{{"type":"content_block_start","index":{idx},"content_block":{{"type":"text","text":""}}}}"#
+        );
+        assert!(a.handle(&data).is_ok());
+    }
 
     #[test]
     fn in_stream_errors_carry_availability_statuses() {

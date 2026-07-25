@@ -222,7 +222,14 @@ impl SseAssembler for Assembler {
             }
             if let Some(calls) = delta.get("tool_calls").and_then(Value::as_array) {
                 for call in calls {
-                    let idx = call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    let raw = call.get("index").and_then(Value::as_u64).unwrap_or(0);
+                    let idx = usize::try_from(raw).unwrap_or(usize::MAX);
+                    if idx > hotl_provider::MAX_BLOCK_INDEX {
+                        return Err(ProviderError::Parse(format!(
+                            "tool_call index {raw} exceeds the {} block limit",
+                            hotl_provider::MAX_BLOCK_INDEX
+                        )));
+                    }
                     while self.tools.len() <= idx {
                         self.tools
                             .push((String::new(), String::new(), String::new()));
@@ -532,6 +539,15 @@ mod tests {
         assert_eq!(msgs[3]["tool_call_id"], "toolu_1");
         assert_eq!(msgs[4]["role"], "tool");
         assert_eq!(body["tools"][0]["function"]["name"], "read");
+    }
+
+    /// The chat-completions twin of T2-9: `while self.tools.len() <= idx { push }`.
+    #[test]
+    fn an_absurd_tool_call_index_is_a_parse_error() {
+        let mut a = Assembler::default();
+        let data = r#"{"choices":[{"delta":{"tool_calls":[
+            {"index":4000000000,"id":"c","function":{"name":"read","arguments":""}}]}}]}"#;
+        assert!(matches!(a.handle(data), Err(ProviderError::Parse(_))));
     }
 
     #[test]
