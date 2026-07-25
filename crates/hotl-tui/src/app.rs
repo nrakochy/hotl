@@ -1297,6 +1297,27 @@ mod tests {
         );
     }
 
+    /// Finding 5: the one interaction the `State::skills`/`State::commands`
+    /// split risks — both are populated at a single site (`tui.rs`) and
+    /// cannot drift today, but nothing previously exercised selecting a
+    /// *skill* row (as opposed to a builtin) through the popup and running
+    /// it. `enter_runs_the_highlighted_command_not_the_literal_text` covers
+    /// the builtin case; this is its skill-row counterpart.
+    #[test]
+    fn selecting_a_skill_in_the_popup_and_pressing_enter_dispatches_it() {
+        let mut s = with_skills(&[("review", "review a pull request")]);
+        type_str(&mut s, "/rev");
+        assert_eq!(selected(&s), "review", "the skill is the highlighted match");
+        let cmds = press(&mut s, KeyCode::Enter);
+        let Some(Cmd::SendPrompt(text)) = cmds.first() else {
+            panic!("expected a prompt, got {cmds:?}");
+        };
+        assert!(
+            text.contains("Load the skill `review`"),
+            "the popup selection must dispatch the skill, not the literal typed word: {text}"
+        );
+    }
+
     #[test]
     fn esc_dismisses_and_stays_dismissed_until_the_slash_is_gone() {
         let mut s = with_skills(&[("review", "review a pull request")]);
