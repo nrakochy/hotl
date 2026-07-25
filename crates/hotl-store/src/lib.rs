@@ -855,6 +855,7 @@ fn apply_log(
     let mut header = None;
     let mut prev_id: Option<String> = None;
     let mut chain_ok = true;
+    let mut unknown_kinds = 0usize;
     // §2b: an unresolved pending_ask at end-of-log means the session stopped
     // mid-ask — surface it on resume (id → summary).
     let mut pending_asks: std::collections::HashMap<String, String> =
@@ -902,7 +903,19 @@ fn apply_log(
         }
         prev_id = Some(entry.id.clone());
         match entry.payload {
-            EntryPayload::Header { header: h } => header = Some(h),
+            EntryPayload::Header { header: h } => {
+                if h.format_version > FORMAT_VERSION {
+                    warnings.push(format!(
+                        "{}: written by a newer hotl (format_version {} > {FORMAT_VERSION}). \
+                         Entry kinds this build does not understand were skipped, so the \
+                         reconstructed conversation may be missing or mis-ordered. Upgrade \
+                         hotl before relying on this session; treat the history as partial.",
+                        path.display(),
+                        h.format_version
+                    ));
+                }
+                header = Some(h);
+            }
             EntryPayload::Item { item } => items.push(item),
             EntryPayload::Compaction {
                 digest,
@@ -944,9 +957,23 @@ fn apply_log(
             // is seeded from this (see `SessionDeps::initial_todos`), not
             // replayed into `items`.
             EntryPayload::Todos { items: list } => *todos = list,
-            EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } | EntryPayload::Unknown => {
-            }
+            EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } => {}
+            // `#[serde(other)]` keeps an old binary from crashing on a new
+            // entry kind — but a dropped kind that *re-points* the projection
+            // (the Compaction/BranchMove class) yields a silently wrong
+            // history. Count them and say so (T3-19).
+            EntryPayload::Unknown => unknown_kinds += 1,
         }
+    }
+    if unknown_kinds > 0 {
+        warnings.push(format!(
+            "{}: {unknown_kinds} log entr{} of an unrecognized kind {} skipped — this build \
+             is older than the log. The reconstructed history may be incomplete; upgrade hotl \
+             if anything looks missing.",
+            path.display(),
+            if unknown_kinds == 1 { "y" } else { "ies" },
+            if unknown_kinds == 1 { "was" } else { "were" },
+        ));
     }
     for summary in pending_asks.into_values() {
         warnings.push(format!(
@@ -1826,5 +1853,43 @@ mod tests {
             "the parent's durable item survives"
         );
         assert!(replayed.warnings.iter().any(|w| w.contains("incomplete")));
+    }
+
+    #[test]
+    fn replay_warns_when_the_log_is_from_a_newer_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("01FUTURE.jsonl");
+        let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":99,"session_id":"01FUTURE","parent_session_id":null,"model":"m","created_at_ms":0}}}"#;
+        let item = r#"{"id":"x2","parent_id":"h1","ts_ms":0,"payload":{"kind":"item","item":{"type":"user","text":"hi"}}}"#;
+        std::fs::write(&path, format!("{header}\n{item}\n")).unwrap();
+
+        let replayed = replay(&path).expect("a newer log still replays defensively");
+        assert_eq!(replayed.items.len(), 1);
+        assert!(
+            replayed
+                .warnings
+                .iter()
+                .any(|w| w.contains("format_version")),
+            "a future format must warn, got {:?}",
+            replayed.warnings
+        );
+    }
+
+    #[test]
+    fn replay_warns_about_entry_kinds_this_build_does_not_know() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("01UNKNOWN.jsonl");
+        let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":1,"session_id":"01UNKNOWN","parent_session_id":null,"model":"m","created_at_ms":0}}}"#;
+        // A future entry kind that would re-point the projection if we understood it.
+        let future = r#"{"id":"x2","parent_id":"h1","ts_ms":0,"payload":{"kind":"rewind_to_message","index":3}}"#;
+        std::fs::write(&path, format!("{header}\n{future}\n")).unwrap();
+
+        let replayed = replay(&path).expect("unknown kinds degrade, never fail");
+        assert!(replayed.items.is_empty());
+        assert!(
+            replayed.warnings.iter().any(|w| w.contains("unrecognized")),
+            "silently dropping an unknown entry is the bug, got {:?}",
+            replayed.warnings
+        );
     }
 }
