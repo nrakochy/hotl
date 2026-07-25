@@ -178,6 +178,61 @@ pub struct ContextCfg {
     pub evict_tokens: Option<u64>,
 }
 
+// Dead until `agent.rs::engine_config` calls these — decision-log request #1
+// of specs/exec-plans/active/0014-remediation-model-registry.md, owned by R10.
+// `hotl` is a bin-only crate, so `pub` confers no reachability and the lint
+// fires despite the tests below exercising both. Remove this attribute when
+// that call site lands; the lint then holds the seam honest again.
+#[allow(dead_code)]
+impl ContextCfg {
+    /// Resolve the compaction context window, in tokens.
+    ///
+    /// Precedence, highest first: `HOTL_CONTEXT_WINDOW` (passed as `env`) >
+    /// `[context] window` > the model's catalogued window >
+    /// [`hotl_provider::catalog::FALLBACK_CONTEXT_WINDOW`]. The explicit tiers
+    /// still win: a gateway that trims the window is a real configuration and
+    /// the catalog must never overrule the person who said so.
+    ///
+    /// The second element is a startup warning, present only when an
+    /// uncatalogued model fell through to the fallback. Silence there is the
+    /// original defect: a 1M-window model compacting at 160K, or an 8K local
+    /// model overflowing on turn two, with nothing on screen either way.
+    ///
+    /// INVARIANT: an explicit `[context] window` or `HOTL_CONTEXT_WINDOW` is
+    /// always honored verbatim. Enforced by
+    /// `explicit_config_and_env_still_beat_the_catalog`.
+    pub fn resolve_window(&self, model: &str, env: Option<&str>) -> (u64, Option<String>) {
+        if let Some(window) = env.and_then(|v| v.parse::<u64>().ok()).or(self.window) {
+            return (window, None);
+        }
+        match hotl_provider::catalog::context_window(model) {
+            Some(window) => (window, None),
+            None => (
+                hotl_provider::catalog::FALLBACK_CONTEXT_WINDOW,
+                Some(format!(
+                    "hotl: `{model}` is not in the model catalog — assuming a \
+                     {} token context window. If that is wrong, set \
+                     `[context] window` in config.toml (or HOTL_CONTEXT_WINDOW); \
+                     too high overflows the model, too low compacts early.",
+                    hotl_provider::catalog::FALLBACK_CONTEXT_WINDOW
+                )),
+            ),
+        }
+    }
+
+    /// The token-estimation profile for `model`. An uncatalogued model gets
+    /// the conservative default rather than a guessed ratio — overcounting is
+    /// the only safe direction (see `hotl_context::tokens`).
+    pub fn token_profile(&self, model: &str) -> hotl_context::TokenProfile {
+        match hotl_provider::catalog::lookup(model) {
+            Some(info) => {
+                hotl_context::TokenProfile::from_chars_per_token(info.ascii_chars_per_token)
+            }
+            None => hotl_context::TokenProfile::CONSERVATIVE,
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct BehaviorCfg {
     /// `false` disables the bash sandbox floor.
@@ -401,6 +456,91 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), toml).unwrap();
         Config::load(dir.path())
+    }
+
+    #[test]
+    fn window_resolves_from_the_catalog_when_unconfigured() {
+        // The headline fix: the 1M-window default model stops compacting at
+        // 160K because someone hardcoded 200_000.
+        let (window, warning) = cfg_with("").context.resolve_window("claude-opus-4-8", None);
+        assert_eq!(window, 1_000_000);
+        assert!(warning.is_none());
+
+        // A small model gets its small window, so default config stops
+        // guaranteeing an overflow on it.
+        let (window, _) = cfg_with("")
+            .context
+            .resolve_window("claude-haiku-4-5", None);
+        assert_eq!(window, 200_000);
+    }
+
+    #[test]
+    fn explicit_config_and_env_still_beat_the_catalog() {
+        let cfg = cfg_with("[context]\nwindow = 64000\n");
+        // config.toml over the catalog…
+        assert_eq!(
+            cfg.context.resolve_window("claude-opus-4-8", None).0,
+            64_000
+        );
+        // …and env over config.toml (unchanged project-wide precedence).
+        assert_eq!(
+            cfg.context
+                .resolve_window("claude-opus-4-8", Some("32000"))
+                .0,
+            32_000
+        );
+        // A garbage env value is ignored, not fatal — config still wins.
+        assert_eq!(
+            cfg.context
+                .resolve_window("claude-opus-4-8", Some("banana"))
+                .0,
+            64_000
+        );
+    }
+
+    #[test]
+    fn an_uncatalogued_model_falls_back_loudly_not_silently() {
+        let (window, warning) = cfg_with("").context.resolve_window("openai/llama3", None);
+        assert_eq!(window, hotl_provider::catalog::FALLBACK_CONTEXT_WINDOW);
+        let warning = warning.expect("must warn — a silent wrong window is the bug we are fixing");
+        assert!(warning.contains("llama3"), "{warning}");
+        assert!(
+            warning.contains("[context] window"),
+            "name the knob: {warning}"
+        );
+        // Configured explicitly: no warning, the user has answered the question.
+        let cfg = cfg_with("[context]\nwindow = 8192\n");
+        let (window, warning) = cfg.context.resolve_window("openai/llama3", None);
+        assert_eq!(window, 8192);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn token_profile_follows_the_model() {
+        let cfg = cfg_with("");
+        // A catalogued model gets its own ratio…
+        let opus = cfg.context.token_profile("claude-opus-4-8");
+        assert_eq!(opus, hotl_context::TokenProfile::from_chars_per_token(3.0));
+        // …and an unknown one gets the conservative default, never a guess.
+        assert_eq!(
+            cfg.context.token_profile("llama3"),
+            hotl_context::TokenProfile::CONSERVATIVE
+        );
+    }
+
+    #[test]
+    fn default_model_matches_the_anthropic_provider() {
+        // Pin, not a fix: `DEFAULT_MODEL` is defined three times
+        // (catalog, hotl-provider-anthropic/src/lib.rs:23,
+        // hotl-engine/src/lib.rs:80). The latter two belong to R3 and R2, who
+        // have decision-log requests to re-export the catalog's. Until they
+        // land, this fails loudly the moment the copies drift.
+        assert_eq!(
+            hotl_provider::catalog::DEFAULT_MODEL,
+            hotl_provider_anthropic::DEFAULT_MODEL
+        );
+        // And the default model must itself be catalogued.
+        assert!(hotl_provider::catalog::lookup(hotl_provider::catalog::DEFAULT_MODEL).is_some());
     }
 
     #[test]
