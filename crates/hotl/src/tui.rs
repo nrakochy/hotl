@@ -74,8 +74,8 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut reader = BufReader::new(cread);
     let mut client = AcpClient::new(cwrite);
 
-    let (session_name, skills) = match handshake(&mut client, &mut reader, spec, name).await {
-        Ok(pair) => pair,
+    let opened = match handshake(&mut client, &mut reader, spec, name).await {
+        Ok(o) => o,
         Err(e) => {
             eprintln!("hotl: {e}");
             return 1;
@@ -95,8 +95,18 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
             return 1;
         }
     };
+    let Opened {
+        name: session_name,
+        skills,
+        mode,
+        context_window,
+    } = opened;
     let mut state = State::new(vim_mode, model);
     state.session_name = session_name;
+    // Server-side truth, seeded before the first draw: the badge must never
+    // render a mode the session is not actually running (evaluation §5.7).
+    state.mode = mode;
+    state.context_window = context_window;
     state.skills = skills.iter().map(|(n, _)| n.clone()).collect();
     state
         .commands
@@ -158,16 +168,44 @@ fn parse_skills(hello: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
+/// Session settings from the handshake pair. The session's own `mode` wins
+/// over the server default (a resumed session inherits and coerces its own);
+/// both fall back so a newer client against an older server still runs — it
+/// simply shows the library default instead of guessing.
+fn open_settings(hello: &Value, opened: &Value) -> (String, u64) {
+    let mode = opened
+        .get("mode")
+        .or_else(|| hello.get("defaultMode"))
+        .and_then(Value::as_str)
+        .unwrap_or("ask")
+        .to_string();
+    let window = hello
+        .get("contextWindow")
+        .and_then(Value::as_u64)
+        .filter(|&w| w > 0)
+        .unwrap_or(hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
+    (mode, window)
+}
+
+/// What the pre-TUI handshake learned: the opened session's display name
+/// (server-confirmed), the skills `initialize` advertised (what makes
+/// `/<skill>` resolvable), and the session's effective permission mode plus
+/// context window — both server-side truth the client renders, never infers.
+struct Opened {
+    name: Option<String>,
+    skills: Vec<(String, String)>,
+    mode: String,
+    context_window: u64,
+}
+
 /// initialize + session/new|load before entering raw mode, so wiring errors
-/// print as plain lines instead of corrupting an alt-screen. Returns the
-/// opened session's display name (server-confirmed) and the skills
-/// `initialize` advertised, which is what makes `/<skill>` resolvable.
+/// print as plain lines instead of corrupting an alt-screen.
 async fn handshake(
     client: &mut Client,
     reader: &mut ServerReader,
     spec: Option<String>,
     name: Option<String>,
-) -> Result<(Option<String>, Vec<(String, String)>), String> {
+) -> Result<Opened, String> {
     let init = client.request("initialize", Value::Null).await;
     let hello = wait_response(reader, init).await?;
     let skills = parse_skills(&hello);
@@ -180,10 +218,13 @@ async fn handshake(
         }
     };
     let v = wait_response(reader, open).await?;
-    Ok((
-        v.get("name").and_then(Value::as_str).map(String::from),
+    let (mode, context_window) = open_settings(&hello, &v);
+    Ok(Opened {
+        name: v.get("name").and_then(Value::as_str).map(String::from),
         skills,
-    ))
+        mode,
+        context_window,
+    })
 }
 
 async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, String> {
@@ -665,6 +706,20 @@ mod tests {
     use hotl_tui::app::Msg;
     use serde_json::json;
     use std::time::SystemTime;
+
+    #[test]
+    fn handshake_reads_the_mode_and_context_window() {
+        let hello = json!({"defaultMode": "auto", "contextWindow": 1_000_000});
+        let opened = json!({"sessionId": "s", "name": null, "mode": "plan"});
+        let (mode, window) = super::open_settings(&hello, &opened);
+        assert_eq!(mode, "plan", "the session's mode beats the server default");
+        assert_eq!(window, 1_000_000);
+
+        // An older server that reports neither must not brick the client.
+        let (mode, window) = super::open_settings(&json!({}), &json!({}));
+        assert_eq!(mode, "ask");
+        assert_eq!(window, hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
+    }
 
     #[test]
     fn wheel_events_become_scroll_messages() {

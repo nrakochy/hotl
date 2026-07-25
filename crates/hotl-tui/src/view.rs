@@ -402,10 +402,14 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         }
     }
 
-    // Mode badge, just left of the name chip. `ask` is the default
-    // posture — it stays silent; every other mode (plan's read-only stance
-    // most of all) is worth a standing reminder while it's active.
-    if state.mode != "ask" {
+    // Mode badge, just left of the name chip. Always drawn: silence used to
+    // mean "ask", but a narrow terminal drops the chip too, so absence was
+    // ambiguous — and the mode it implied was wrong (`hotl setup` writes
+    // `mode = "auto"`, evaluation §5.7). A supervision tool states its
+    // posture; it does not imply it by omission.
+    // INVARIANT: every mode renders its own name. Enforced by
+    // `the_mode_badge_is_always_drawn`.
+    {
         let chip = format!(" {} ", state.mode);
         let w = chip.chars().count() as u16;
         if w <= area.width {
@@ -415,10 +419,12 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
                 .map(|n| (n.chars().count() as u16 + 2).min(area.width.saturating_sub(14).max(2)))
                 .unwrap_or(0);
             if w + name_w <= area.width {
-                let style = if state.mode == "plan" {
-                    Style::new().fg(p.band).bg(p.accent).bold()
-                } else {
-                    Style::new().fg(p.muted).bg(p.band)
+                // Unattended postures wear the blocked color: nobody is being
+                // consulted on this session's tool calls.
+                let style = match state.mode.as_str() {
+                    "plan" => Style::new().fg(p.band).bg(p.accent).bold(),
+                    "auto" | "dontask" => Style::new().fg(p.band).bg(p.blocked).bold(),
+                    _ => Style::new().fg(p.muted).bg(p.band),
                 };
                 let rect = Rect {
                     x: area.x + area.width - name_w - w,
@@ -781,6 +787,19 @@ mod tests {
     const INPUT_TOP: usize = 20;
     const HINT: usize = 23;
 
+    /// §5.7 bug 3: the badge used to be silent on "ask" while the shipped
+    /// default was "auto" — so "no badge" could mean either that or a terminal
+    /// too narrow for the chip. Every mode is now stated outright.
+    #[test]
+    fn the_mode_badge_is_always_drawn() {
+        for mode in ["ask", "auto", "plan", "dontask"] {
+            let mut s = State::test_default();
+            s.mode = mode.into();
+            let rendered = draw(&s).join("\n");
+            assert!(rendered.contains(mode), "mode `{mode}` is not on screen");
+        }
+    }
+
     #[test]
     fn idle_layout_shows_resting_glyph_and_hint_row() {
         let rows = draw(&State::new(true, "m".into()));
@@ -1056,7 +1075,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_badge_renders_and_ask_mode_stays_silent() {
+    fn the_mode_badge_lands_on_the_strip() {
         let mut s = State::new(true, "m".into());
         s.mode = "plan".into();
         let rows = draw(&s);
@@ -1066,13 +1085,16 @@ mod tests {
             rows[STRIP]
         );
 
-        // ask is the default posture — no need to shout about it.
+        // `ask` used to render nothing, on the reasoning that it is the
+        // default posture. That only held if the value were true, and §5.7
+        // found it was not — `hotl setup` writes `mode = "auto"`. It is
+        // stated now, on the same row.
         let s = State::new(true, "m".into());
         assert_eq!(s.mode, "ask");
         let rows = draw(&s);
         assert!(
-            !rows[STRIP].to_lowercase().contains("ask"),
-            "ask should not badge: {:?}",
+            rows[STRIP].to_lowercase().contains("ask"),
+            "ask must badge too: {:?}",
             rows[STRIP]
         );
     }

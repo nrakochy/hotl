@@ -89,6 +89,12 @@ pub enum Scroll {
     At(usize),
 }
 
+/// The library's context window, used until the handshake reports the real
+/// one (`initialize`'s `contextWindow`). Only a fallback: an older server
+/// that does not report it still leaves the client rendering something
+/// honest rather than dividing by zero.
+pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
+
 #[derive(Debug)]
 pub struct State {
     pub phase: Phase,
@@ -108,10 +114,15 @@ pub struct State {
     /// Display name (badge + titles); seeded from the open handshake,
     /// updated by `/rename`.
     pub session_name: Option<String>,
-    /// Effective permission mode (`ask` | `auto` | `plan` | `dontask`);
-    /// updated optimistically by `/plan` and `/mode`. Defaults to `ask` —
-    /// the library default — until the engine says otherwise.
+    /// Effective permission mode (`ask` | `auto` | `plan` | `dontask`).
+    /// Seeded from the open handshake and corrected by every `mode_changed`
+    /// notification, so it is what the engine enforces rather than what the
+    /// user asked for. `/plan` and `/mode` update it optimistically; the
+    /// notification is what makes an engine coercion visible.
     pub mode: String,
+    /// Model context window in tokens, from the handshake. What the context
+    /// gauge divides by; `DEFAULT_CONTEXT_WINDOW` until a server reports one.
+    pub context_window: u64,
     /// Every loadable skill name, from the `initialize` result. `/<name>`
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
@@ -148,6 +159,7 @@ impl State {
             pending_auto_rule: None,
             session_name: None,
             mode: "ask".into(),
+            context_window: DEFAULT_CONTEXT_WINDOW,
             skills: Vec::new(),
             density: hotl_theme::Density::default(),
             todos: Vec::new(),
@@ -360,6 +372,13 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             state.model = text_of("model");
             notice(state, format!("model fallback → {}", state.model));
         }
+        // Server-side truth, not a client guess: the badge showed "ask" while
+        // the shipped default ran "auto" (evaluation §5.7). Optimistic /mode
+        // and /plan updates are corrected here when the engine coerces them
+        // (a security-enforced build forces Auto→Ask).
+        // INVARIANT: `state.mode` is what the engine enforces, never what the
+        // user asked for. Enforced by `mode_changed_updates_the_badge_state`.
+        "mode_changed" => state.mode = text_of("mode"),
         "prompt_queued" => {
             if let Some(TranscriptItem::Steer { queued, .. }) = state
                 .transcript
@@ -937,6 +956,14 @@ mod tests {
                 protected_why: None,
             },
         );
+    }
+
+    #[test]
+    fn mode_changed_updates_the_badge_state() {
+        let mut s = State::test_default();
+        assert_eq!(s.mode, "ask");
+        upd(&mut s, json!({"type": "mode_changed", "mode": "auto"}));
+        assert_eq!(s.mode, "auto");
     }
 
     #[test]
