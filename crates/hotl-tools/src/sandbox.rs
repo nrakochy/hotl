@@ -29,14 +29,62 @@ pub enum SandboxStatus {
     Disabled,
 }
 
+/// Whether the container/orchestrator daemon socket class is reachable from a
+/// confined command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnixSockets {
+    /// Deny the container/orchestrator daemon socket class (default).
+    DenyDaemons,
+    /// Everything allowed — `HOTL_UNIX_SOCKETS=open`. Labeled in every ask.
+    Open,
+}
+
+/// Whether a confined command may drive other applications through Apple
+/// Events / LaunchServices.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Automation {
+    Deny,
+    Allow,
+}
+
+fn unix_socket_policy() -> UnixSockets {
+    if std::env::var("HOTL_UNIX_SOCKETS").is_ok_and(|v| v == "open") {
+        UnixSockets::Open
+    } else {
+        UnixSockets::DenyDaemons
+    }
+}
+
+fn automation_policy() -> Automation {
+    if std::env::var("HOTL_MACOS_AUTOMATION").is_ok_and(|v| v == "allow") {
+        Automation::Allow
+    } else {
+        Automation::Deny
+    }
+}
+
 impl SandboxStatus {
     pub fn label(&self) -> String {
         match self {
-            SandboxStatus::Enforced(m) => format!("sandboxed:{m}"),
+            SandboxStatus::Enforced(m) => label_with(m, unix_socket_policy(), automation_policy()),
             SandboxStatus::Unavailable(_) => "UNSANDBOXED".to_string(),
             SandboxStatus::Disabled => "UNSANDBOXED(by HOTL_SANDBOX=off)".to_string(),
         }
     }
+}
+
+/// Pure renderer. Silence is the hardened default; a marker appears only
+/// where the operator opted *out* of a denial — the same convention
+/// `net::label_suffix` uses (no marker under the default Open egress).
+fn label_with(mechanism: &str, unix: UnixSockets, automation: Automation) -> String {
+    let mut out = format!("sandboxed:{mechanism}");
+    if matches!(unix, UnixSockets::Open) {
+        out.push_str(" unix:open");
+    }
+    if matches!(automation, Automation::Allow) {
+        out.push_str(" automation:allow");
+    }
+    out
 }
 
 fn canon(p: PathBuf) -> PathBuf {
@@ -430,7 +478,7 @@ fn apply_proxy_env(
 /// loopback (the mDNSResponder unix socket means DNS resolution still works —
 /// documented in SECURITY.md as a resolution, not exfil-confinement, limit).
 #[cfg(target_os = "macos")]
-fn seatbelt_profile(confine_network: bool) -> String {
+fn seatbelt_profile(confine_network: bool, unix_sockets: UnixSockets) -> String {
     let mut profile = String::from(
         r#"(version 1)
 (allow default)
@@ -451,6 +499,21 @@ fn seatbelt_profile(confine_network: bool) -> String {
 "#,
         );
     }
+    // Kept at the *end* of the profile so no later clause can widen it back. A
+    // unix socket connect is a network operation, not a file write, so the
+    // file-write floor above does not touch it — and `/var/run/docker.sock` is
+    // a root-equivalent escape (mount the host root, write anywhere).
+    // Not denied here: ssh-agent/gpg-agent (capability-limited, and denying
+    // them breaks `git push` over SSH) — see docs/SECURITY.md.
+    // INVARIANT: the daemon socket class is unreachable unless the operator
+    // set HOTL_UNIX_SOCKETS=open. Enforced by
+    // `seatbelt_blocks_a_connect_to_a_denied_daemon_socket`.
+    if matches!(unix_sockets, UnixSockets::DenyDaemons) {
+        profile.push_str(
+            "(deny network-outbound (regex #\"(docker|podman|containerd|crio|dockershim)[^/]*\\.sock$\"))\n\
+             (deny network-outbound (regex #\"^/(private/)?(var/)?run/(docker|containerd|crio)/\"))\n",
+        );
+    }
     profile
 }
 
@@ -463,7 +526,7 @@ fn seatbelt_base(egress: &EgressState) -> tokio::process::Command {
     let tmp = canon(std::env::temp_dir());
     let mut cmd = tokio::process::Command::new("/usr/bin/sandbox-exec");
     cmd.arg("-p")
-        .arg(seatbelt_profile(confine_network))
+        .arg(seatbelt_profile(confine_network, unix_socket_policy()))
         .arg("-D")
         .arg(format!("CWD={}", cwd.display()))
         .arg("-D")
@@ -824,35 +887,106 @@ mod tests {
             .expect("spawn")
     }
 
+    /// Replaces `seatbelt_profile_strings_do_not_drift`, which asserted a
+    /// literal equals itself — a pure change detector proving nothing about
+    /// enforcement. This asserts the *properties* the profile must have; the
+    /// behavioral tests below and `seatbelt_confines_writes` prove enforcement.
     #[test]
-    fn seatbelt_profile_strings_do_not_drift() {
-        // Open: exactly the pre-egress profile, byte for byte.
-        assert_eq!(
-            seatbelt_profile(false),
-            r#"(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write*
-  (subpath (param "CWD"))
-  (subpath (param "TMP"))
-  (subpath "/private/tmp")
-  (subpath "/dev"))
-"#
-        );
-        // Confined: the same file-write clauses plus network confinement —
-        // deny all, re-allow unix-domain sockets and loopback.
-        let confined = seatbelt_profile(true);
+    fn seatbelt_profile_carries_every_required_clause() {
+        let open = seatbelt_profile(false, UnixSockets::DenyDaemons);
+        for clause in [
+            "(deny file-write*)",
+            "(subpath (param \"CWD\"))",
+            "(subpath (param \"TMP\"))",
+            "docker",
+        ] {
+            assert!(open.contains(clause), "profile lost `{clause}`:\n{open}");
+        }
+        let confined = seatbelt_profile(true, UnixSockets::DenyDaemons);
+        for clause in [
+            "(deny network*)",
+            "(allow network* (local unix) (remote unix))",
+        ] {
+            assert!(
+                confined.contains(clause),
+                "confined profile lost `{clause}`"
+            );
+        }
+        // Network confinement is additive over the open profile's file clauses.
+        assert!(confined.contains("(deny file-write*)"));
+    }
+
+    #[test]
+    fn seatbelt_denies_the_container_daemon_socket_class_in_both_network_modes() {
+        for confined in [false, true] {
+            let p = seatbelt_profile(confined, UnixSockets::DenyDaemons);
+            // The first *deny* on network-outbound: the `(allow
+            // network-outbound (remote ip …))` of the confined profile also
+            // contains the operation name, so match on the deny itself.
+            let deny = p
+                .find("(deny network-outbound")
+                .expect("a unix-socket deny clause");
+            // The clause is a regex, so `docker` and `.sock` are not adjacent
+            // in the profile text — assert both halves of the alternation.
+            assert!(
+                p[deny..].contains("docker") && p[deny..].contains(".sock"),
+                "the docker daemon socket class must be denied:\n{p}"
+            );
+            if confined {
+                // Keep the denies terminal: they are appended after the
+                // re-allow so no later clause can widen them back.
+                assert!(
+                    deny > p.find("(allow network* (local unix)").unwrap(),
+                    "the daemon deny must follow the unix re-allow"
+                );
+            }
+        }
+        // The opt-out really opts out.
+        assert!(!seatbelt_profile(false, UnixSockets::Open).contains("docker"));
+    }
+
+    #[tokio::test]
+    async fn seatbelt_blocks_a_connect_to_a_denied_daemon_socket() {
+        // A real unix socket at a denied path, in a temp dir we control, so the
+        // test proves the *deny*, not the absence of Docker.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("docker.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+        });
+        // Positive control: a *differently named* socket in the same dir connects.
+        let allowed = dir.path().join("ok.sock");
+        let l2 = std::os::unix::net::UnixListener::bind(&allowed).unwrap();
+        std::thread::spawn(move || {
+            let _ = l2.accept();
+        });
+
+        let connect = |p: &std::path::Path| format!("nc -U {} < /dev/null", p.display());
+        let denied = run(&connect(&sock)).await;
+        let ok = run(&connect(&allowed)).await;
         assert!(
-            confined.starts_with(&seatbelt_profile(false)),
-            "file-write clauses unchanged"
+            ok.status.success(),
+            "the control socket must still connect: {}",
+            String::from_utf8_lossy(&ok.stderr)
         );
+        assert!(
+            !denied.status.success(),
+            "a *.docker.sock connect must be denied"
+        );
+    }
+
+    #[test]
+    fn label_marks_only_the_opted_out_state() {
         assert_eq!(
-            confined.strip_prefix(&seatbelt_profile(false)).unwrap(),
-            r#"(deny network*)
-(allow network* (local unix) (remote unix))
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-inbound (local ip "localhost:*"))
-"#
+            SandboxStatus::Enforced("seatbelt").label(),
+            "sandboxed:seatbelt"
+        );
+        // With the opt-out active the marker rides every ask; here assert the
+        // pure renderer.
+        assert_eq!(
+            label_with("seatbelt", UnixSockets::Open, Automation::Allow),
+            "sandboxed:seatbelt unix:open automation:allow"
         );
     }
 
