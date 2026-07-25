@@ -256,7 +256,7 @@ pub(crate) async fn run(
                 content,
                 reply,
             } => {
-                let result = match log.write_blob(&tool_use_id, &content) {
+                let result = match log.write_blob_acked(&tool_use_id, &content).await {
                     Ok(path) => Ok(path.display().to_string()),
                     Err(_) => Err(content), // hand the content back — never lose it
                 };

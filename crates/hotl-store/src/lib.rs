@@ -215,6 +215,41 @@ pub struct SessionLog {
     pub session_id: String,
 }
 
+/// Blob ceiling. A tool result already over this is unreadable to a model;
+/// the blob is an escape hatch for the log, not an archive.
+const BLOB_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// FNV-1a over the *raw* id. Not cryptographic — it only has to make two ids
+/// that sanitize alike land on different files (T3-17).
+fn fnv1a64(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Blob filename for a provider-generated tool-use id.
+///
+/// INVARIANT: distinct ids always map to distinct filenames, and the same id
+/// always maps to the same one. Enforced by
+/// `blob_names_never_collide_after_sanitization`.
+fn blob_file_name(tool_use_id: &str) -> String {
+    let safe: String = tool_use_id
+        .chars()
+        .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
+        .take(96) // keep well inside every filesystem's NAME_MAX
+        .collect();
+    if !safe.is_empty() && safe.len() == tool_use_id.len() {
+        // Nothing was stripped and nothing was clamped: the name is already
+        // one-to-one, so keep it plain and greppable.
+        return format!("{safe}.txt");
+    }
+    let stem = if safe.is_empty() { "blob" } else { &safe };
+    format!("{stem}-{:016x}.txt", fnv1a64(tool_use_id))
+}
+
 impl SessionLog {
     /// Create `<dir>/<ulid>.jsonl` and write the header entry.
     pub fn create(
@@ -280,37 +315,72 @@ impl SessionLog {
         &self.path
     }
 
-    /// Write an oversized tool result to a masked blob beside the log.
-    /// Path: `<log stem>.blobs/<tool_use_id>.txt`, 0600, created on
-    /// first use. The store owns masking, so a secret in the result never lands
-    /// unmasked even in the blob. Returns the blob path.
-    pub fn write_blob(&self, tool_use_id: &str, content: &str) -> std::io::Result<PathBuf> {
+    /// The dir, path and masked-and-capped bytes for one blob write. Shared by
+    /// both entry points so they can never produce different files.
+    fn blob_request(&self, tool_use_id: &str, content: &str) -> (PathBuf, PathBuf, Vec<u8>) {
         let stem = self
             .path
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("session");
         let dir = self.path.with_file_name(format!("{stem}.blobs"));
-        DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
-        // Tool-use ids are provider-generated tokens; keep the filename safe.
-        let safe: String = tool_use_id
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
-            .collect();
-        let path = dir.join(format!(
-            "{}.txt",
-            if safe.is_empty() { "blob" } else { &safe }
-        ));
-        let masked = self.masker.apply(content);
-        let mut f = OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            .open(&path)?;
-        f.write_all(masked.as_bytes())?;
-        f.flush()?;
-        Ok(path)
+        let path = dir.join(blob_file_name(tool_use_id));
+        let mut masked = self.masker.apply(content);
+        if masked.len() > BLOB_MAX_BYTES {
+            let cut = (0..=BLOB_MAX_BYTES)
+                .rev()
+                .find(|i| masked.is_char_boundary(*i))
+                .unwrap_or(0);
+            masked.truncate(cut);
+            masked.push_str(
+                "\n[truncated: the tool result exceeded the 8MiB blob cap; \
+                 re-run the tool with a narrower query to see the rest]\n",
+            );
+        } else if !masked.ends_with('\n') {
+            masked.push('\n');
+        }
+        (dir, path, masked.into_bytes())
+    }
+
+    /// Write an oversized tool result to a masked blob beside the log.
+    /// Path: `<log stem>.blobs/<sanitized id>[-<hash>].txt`, 0600 in a 0700
+    /// dir, created on first use. The store owns masking, so a secret in the
+    /// result never lands unmasked even in the blob. Blocking, for callers
+    /// outside the actor; the write itself still runs on the writer thread.
+    /// Returns the blob path.
+    pub fn write_blob(&self, tool_use_id: &str, content: &str) -> std::io::Result<PathBuf> {
+        let (dir, path, bytes) = self.blob_request(tool_use_id, content);
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.tx
+            .send(WriterCmd::Blob {
+                dir,
+                path,
+                bytes,
+                ack: AckSink::Blocking(tx),
+            })
+            .map_err(|_| self.writer_gone())?;
+        rx.recv().map_err(|_| self.writer_gone())?
+    }
+
+    /// The actor's path: same blob, awaited rather than blocked on. The write
+    /// runs on the log's writer thread — a megabyte blob must not stall the
+    /// actor task (T1-3).
+    pub async fn write_blob_acked(
+        &self,
+        tool_use_id: &str,
+        content: &str,
+    ) -> std::io::Result<PathBuf> {
+        let (dir, path, bytes) = self.blob_request(tool_use_id, content);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriterCmd::Blob {
+                dir,
+                path,
+                bytes,
+                ack: AckSink::Async(tx),
+            })
+            .map_err(|_| self.writer_gone())?;
+        rx.await.map_err(|_| self.writer_gone())?
     }
 
     /// Build the masked, newline-terminated line for `payload` and mint its id.
@@ -477,6 +547,12 @@ enum WriterCmd {
         tier: AckTier,
         ack: AckSink<Ack>,
     },
+    Blob {
+        dir: PathBuf,
+        path: PathBuf,
+        bytes: Vec<u8>,
+        ack: AckSink<PathBuf>,
+    },
 }
 
 fn fault_to_u8(f: WriteFault) -> u8 {
@@ -589,8 +665,33 @@ fn writer_loop(
                     }
                 }
             }
+            // Blobs ride the same thread as the log: a blob is durable before
+            // the entry that points at it can be, and the actor never pays a
+            // megabyte write on its own task.
+            WriterCmd::Blob {
+                dir,
+                path,
+                bytes,
+                ack,
+            } => {
+                ack.send(write_blob_file(&dir, &path, &bytes));
+            }
         }
     }
+}
+
+/// The writer thread's half: all blob filesystem work in one place.
+fn write_blob_file(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    let mut f = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)?;
+    f.sync_data()?;
+    Ok(path.to_path_buf())
 }
 
 /// Roll the file back to the last acked offset and seal.
@@ -1467,6 +1568,49 @@ mod tests {
             replayed.warnings.is_empty(),
             "a sealed log must not leave a broken chain: {:?}",
             replayed.warnings
+        );
+    }
+
+    #[test]
+    fn blob_names_never_collide_after_sanitization() {
+        // Two ids that sanitize identically must not share a file (T3-17).
+        assert_ne!(blob_file_name("toolu/a"), blob_file_name("toolu:a"));
+        // An id that needs no sanitizing keeps its plain, greppable name.
+        assert_eq!(blob_file_name("toolu_01ABC"), "toolu_01ABC.txt");
+        // An id with nothing usable left still yields a distinct, stable name.
+        assert_ne!(blob_file_name("///"), blob_file_name("..."));
+        assert!(blob_file_name("///").ends_with(".txt"));
+        // Stable across calls — the same id must resolve to the same blob.
+        assert_eq!(blob_file_name("toolu/a"), blob_file_name("toolu/a"));
+    }
+
+    #[tokio::test]
+    async fn two_ids_that_sanitize_alike_keep_separate_blobs() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let a = log.write_blob_acked("toolu/a", "result A").await.unwrap();
+        let b = log.write_blob_acked("toolu:a", "result B").await.unwrap();
+        assert_ne!(a, b, "the second blob overwrote the first");
+        assert_eq!(std::fs::read_to_string(&a).unwrap(), "result A\n");
+        assert_eq!(std::fs::read_to_string(&b).unwrap(), "result B\n");
+    }
+
+    #[tokio::test]
+    async fn oversized_blobs_are_capped_with_a_visible_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let huge = "x".repeat(BLOB_MAX_BYTES + 4096);
+        let p = log.write_blob_acked("toolu_big", &huge).await.unwrap();
+        let on_disk = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            on_disk.len() <= BLOB_MAX_BYTES + 256,
+            "cap not applied: {}",
+            on_disk.len()
+        );
+        assert!(on_disk.ends_with('\n'));
+        assert!(
+            on_disk.contains("[truncated"),
+            "the cap must be visible, not silent"
         );
     }
 
