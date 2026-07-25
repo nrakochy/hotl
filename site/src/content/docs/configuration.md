@@ -345,7 +345,7 @@ Protected paths outrank admin grants; admin denies outrank everything.
 | `0` | The turn completed (`Done`). |
 | `130` | Interrupted (`Ctrl-C` / cancelled). |
 | `1` | Any other outcome: error, refusal, turn-limit, doom-loop, tool-failure-budget, or a `doctor` FAIL. |
-| `2` | Bad usage, or a reserved subcommand (`fleet`, `update`). |
+| `2` | Bad usage, a reserved subcommand (`fleet`), or the console with no TTY. |
 
 ## Data at rest
 

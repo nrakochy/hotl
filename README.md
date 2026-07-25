@@ -4,22 +4,20 @@
 
 Running one agent is easy. Running several, all day, is a supervision
 problem: knowing which one is blocked on you, trusting what they're allowed
-to do, and recovering when one goes sideways. hotl is one binary that takes
-that problem in three stages — watch the agents you already run, run its own
-agent with guardrails you can see, and eventually orchestrate fleets — with
-you on the loop at every stage:
+to do, and recovering when one goes sideways. hotl is one static binary — no
+Node, no Python, no daemon, no telemetry — that takes that problem in three
+stages, with you on the loop at every stage:
 
 | Capability | Command | Status |
 |---|---|---|
-| **Execute** | `hotl` | **Shipped** — a personal agent harness (event-log-as-canon, ACP-native): steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context (compaction/memory), MCP client, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
+| **Execute** | `hotl` | **Shipped** — a personal agent harness (event-log-as-canon, ACP-native): steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context, skills, sub-agents, MCP, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
 | **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it |
-| **Orchestrate** | `hotl fleet` | **Future** — drives fleets of agents over the same protocol any editor uses; only its seams exist today |
+| **Orchestrate** | `hotl fleet` | **Reserved** — will drive fleets of agents over the same protocol any editor uses; exits 2 today, only its seams exist |
 
-> **Pre-1.0 — and a breaking change at 0.2.0:** bare `hotl` is now the
-> **agent**; the dashboard moved to `hotl watch`. Every mutating or executing
-> tool call passes a permission gate, and a kernel sandbox floor confines
-> `bash` writes. Expect breaking changes at every 0.x minor — see
-> [CHANGELOG.md](CHANGELOG.md).
+> **Pre-1.0:** bare `hotl` is the **agent**; the tmux dashboard is
+> `hotl watch`. Expect breaking changes at every 0.x minor — see
+> [CHANGELOG.md](CHANGELOG.md). The internal library crates publish in
+> lockstep with the binary and carry no semver promise of their own.
 
 ## Why hotl
 
@@ -30,28 +28,62 @@ it discovers every agent across your tmux session, shows who's working and
 who's waiting, pings when one needs you, and `enter` jumps focus straight to
 it. Your attention goes where it's actually needed.
 
-**A safety floor that never turns off — and prompts only if you want them.**
-By default hotl runs uninterrupted: no per-action y/n. What always holds:
-`bash` executes under a kernel sandbox floor (Seatbelt on macOS, Landlock on
-Linux) confining writes to the working directory; writes to execute-later
-paths — git hooks, shell rc, Makefiles, agent-instruction files — always
-stop and ask, in every mode; every silenced prompt is visible in the
-transcript; and `hotl undo` reverses any approved-by-default change. Prefer
-per-action approval? `[permissions] mode = "ask"`. Need it guaranteed?
-Compile with `--features security-enforced` and prompting cannot be disabled
-by any config. The stance is written down honestly, including what the
-sandbox does **not** cover: [`docs/SECURITY.md`](docs/SECURITY.md).
+**A safety floor under a gate you choose.** Four permission modes set how
+much you're asked: `auto` (default — ordinary calls run without prompting),
+`ask` (approve every mutating or executing call), `plan` (read-only until you
+approve a plan), and `dontask` (never wait for input; deny anything not
+pre-approved — the `-p`/CI posture). An unrecognized mode fails closed to
+`ask`. Underneath, regardless of mode: `bash` (and hooks, and diagnostics)
+runs confined by the kernel — Seatbelt on macOS, Landlock on Linux ≥ 5.13
+including WSL2 — with writes limited to the working directory and temp;
+writes to execute-later and credential paths (git hooks, shell rc, Makefiles,
+`.ssh/`, credential stores, agent-instruction files) always prompt, and are
+checked *before* allow-rules; and every silenced prompt stays visible in the
+transcript. Where the floor can't be enforced, hotl degrades **fail-closed** —
+each exec is individually gated behind an `UNSANDBOXED` banner and bash
+allow-rules stop applying. `HOTL_SANDBOX=off` disables it loudly, never
+quietly. Need the gate guaranteed? Build with `--features security-enforced`
+and the mode key is ignored entirely. This is write-confinement, not
+exfiltration prevention — the stance is written down honestly, including what
+it does **not** cover: [`docs/SECURITY.md`](docs/SECURITY.md).
+
+**Egress you can close.** `[network] egress` is `open` (default), `off`
+(loopback and unix sockets only), or `allowlist` (loopback plus
+`[network].allow` hosts, with `*.domain` wildcards). Allowed hosts are reached
+through a small local proxy, and tools that ignore proxy env vars don't slip
+past it — they hit the kernel's loopback-only wall and fail. An unknown value
+fails closed to `off`, and `web_fetch`/`web_search` honor that same single
+authority — there is no second allowlist to keep in sync. Three honest limits:
+it's opt-in, only HTTP traverses the proxy (SSH git remotes fail while
+restricted), and it is not airtight — an allowed host is allowed for
+*everything*, and DNS still resolves, so treat it as a strong brake on casual
+exfiltration, not a cleanroom. On Linux, egress confinement needs kernel
+≥ 6.7 (TCP only); where it can't be enforced you get `NET:UNENFORCED(reason)`
+on every bash ask and allow-rules stop auto-approving.
 
 **Nothing is ever lost.** Resume any session, `undo` the agent's file
 changes, steer mid-turn without losing the thread. This works because every
 session is recorded as an append-only log that nothing rewrites — even
 context compaction adds a summary on top instead of destroying history, so
-a failed compaction can't brick a session.
+a failed compaction can't brick a session. Secrets are masked at log write
+time, and secret-bearing files never enter the snapshot store.
 
-**Standard protocols, any model.** Anthropic or any OpenAI-compatible
-endpoint (OpenAI, Groq, Ollama, a local server — it's just a base URL). MCP
-for tools, ACP for embedding in editors — the same contract the future
-`hotl fleet` orchestrator will speak, so the seams are already in place.
+**Context stays slim by construction.** Tool results past a size threshold
+are evicted to files (`[context].evict_tokens`) — a preview stays inline and
+the agent pages the full result back on demand. Compaction summaries are
+precomputed in the background from ~60% context-full and fold in at ~80%, so
+the fold never pauses the session. The prompt prefix is byte-stable, keeping
+provider prompt caches hot.
+
+**Untrusted content stays data.** Anything returned by a sub-agent, `recall`,
+`web_fetch`/`web_search`, or an MCP tool arrives inside a provenance-tagged
+envelope — material that can inform the work, never an instruction the model
+may act on unprompted.
+
+**Standard protocols, any model.** Anthropic (Messages API) or any
+OpenAI-compatible endpoint — OpenAI, Groq, Ollama, LiteLLM, a local server;
+it's just a base URL. MCP for tools, ACP for embedding in editors — the same
+contract the future `hotl fleet` orchestrator will speak.
 
 ## Install
 
@@ -87,7 +119,48 @@ Point `HOTL_MODEL` at a model (`provider/model` — `anthropic/…` or `openai/�
     hotl           # interactive console TUI
     hotl -p "fix the typo in main.rs"   # headless one-shot
 
+Keys never live in `config.toml`: use env vars, or an `api_key_helper`
+command whose stdout is the key. Precedence is always env var > config.toml >
+default.
+
 Full tutorial: [quickstart](https://nrakochy.github.io/hotl/quickstart/).
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `hotl` | Console TUI; `-p "<prompt>"` headless, `--json` for a JSONL event stream |
+| `hotl resume` / `hotl undo` | Continue a session; reverse the agent's file edits |
+| `hotl bg` / `hotl attach` | Run a session detached from any terminal, reconnect later |
+| `hotl acp` | Serve ACP over stdio so an ACP-speaking editor can embed the agent |
+| `hotl skills` | Manage skills and skill marketplaces |
+| `hotl doctor` / `hotl setup` | Setup check (nonzero on failure); write a commented starter config |
+| `hotl gc` | Prune sessions and snapshots per `[retention]` |
+| `hotl watch` | The tmux supervision dashboard |
+
+Exit codes: `0` turn completed · `130` interrupted · `1` any other outcome
+(error, refusal, turn-limit, doom-loop, tool-failure budget, a `doctor` FAIL)
+· `2` bad usage or a reserved subcommand.
+
+### Extending it
+
+| Extension point | Shape | Docs |
+|---|---|---|
+| **Skills** | `skills/*.md` procedures plus `hotl skills` marketplaces. Indexed, never preloaded — the agent sees a grouped index and pulls a skill's text only when it loads one | [skills via configuration](https://nrakochy.github.io/hotl/configuration/) |
+| **Sub-agents** | `spawn` with built-in types (`general-purpose`, `explore`, `plan`) or your own `agents/*.md`; plus `fork` | [agents](https://nrakochy.github.io/hotl/agents/) |
+| **MCP servers** | `[[mcp]]`, stdio transport | [mcp](https://nrakochy.github.io/hotl/mcp/) |
+| **Retrieval** | `[[retrieval]]` backends behind one `recall` tool; nothing configured by default, no built-in backend touches the network | [retrieval](https://nrakochy.github.io/hotl/retrieval/) |
+| **Hooks & diagnostics** | Six events (`pre_tool`, `post_tool`, `user_prompt`, `notification`, `stop`, `session_end`) that can block or add context but never *grant*; `[diagnostics]` commands run after edits | [hooks](https://nrakochy.github.io/hotl/hooks/) |
+| **Shell integration** | zsh `: ` prefix turns a shell line into an agent prompt; `@[path]` file capture, OSC-133 marks | [shell](https://nrakochy.github.io/hotl/shell/) |
+| **Gateways** | OpenAI-compatible gateways and command-sourced API keys | [gateway](https://nrakochy.github.io/hotl/gateway/) |
+
+Claude Code's `~/.claude/skills`, `~/.claude/agents`, and plugin layouts load
+in place — no porting.
+
+State lives in the open: config at `~/.config/hotl/config.toml` (the only
+settings file — permissions, MCP, hooks, and retrieval are all sections in
+it), append-only session logs at `~/.local/share/hotl/sessions/<ulid>.jsonl`,
+and per-session git snapshots under `~/.local/share/hotl/shadow/`.
 
 ## Watch — quick start
 
@@ -104,14 +177,28 @@ Keys: `j`/`k` (or ↓/↑) move · `enter` jump to the selected agent · `r` ref
 
 ## The docs
 
-[`ARCHITECTURE.md`](ARCHITECTURE.md) is the harness at a glance — the layers, the connective planes, and how a prompt flows through the system. The [user docs](https://nrakochy.github.io/hotl/) (source in `site/src/content/docs/`, deployed on each release) cover installing and running the agent, and [`docs/SECURITY.md`](docs/SECURITY.md) is the security stance.
+The [user docs](https://nrakochy.github.io/hotl/) (source in
+`site/src/content/docs/`, deployed on each release) cover installing and
+running the agent — start at
+[overview](https://nrakochy.github.io/hotl/overview/) for the design
+commitments, or
+[configuration](https://nrakochy.github.io/hotl/configuration/) to look up any
+subcommand, config key, env var, or exit code. Pointing an AI agent at hotl?
+[`llms.txt`](https://nrakochy.github.io/hotl/llms.txt) is the machine-readable
+map.
+
+In this repo: [`ARCHITECTURE.md`](ARCHITECTURE.md) is the harness at a glance
+— the layers, the connective planes, and how a prompt flows through the
+system; [`docs/SECURITY.md`](docs/SECURITY.md) is the security stance; and
+[`docs/RELIABILITY.md`](docs/RELIABILITY.md) covers the failure behavior.
 
 ## Releasing
 
 Cut a release with the helper script — it bumps the workspace version (and
-every internal path-dep pin, which publish in lockstep), commits, tags
-`vX.Y.Z`, and pushes. The tag triggers the crates.io publish and the
-prebuilt-binary/installer workflows.
+every internal path-dep pin, which publish in lockstep), promotes the
+changelog's `[Unreleased]` section, commits, tags `vX.Y.Z`, and pushes. The
+tag triggers the crates.io publish and the prebuilt-binary/installer
+workflows.
 
     scripts/release.sh patch    # bug fix
     scripts/release.sh minor    # feature, or breaking pre-1.0
