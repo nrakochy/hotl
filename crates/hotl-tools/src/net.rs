@@ -28,6 +28,125 @@ use crate::sandbox::SandboxStatus;
 /// and headers in this is malformed (or hostile).
 const MAX_HEAD: usize = 16 * 1024;
 
+/// A cooperating client sends its whole request head immediately. Anything
+/// slower is malformed or hostile, and without this an unfinished head pins a
+/// task and a socket for the life of the process (T3-31).
+const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Ceiling on live proxied connections. Beyond it the proxy answers 503
+/// rather than accepting unbounded work — the same Layer-B discipline
+/// `SessionConcurrency` applies to subprocesses and requests.
+const MAX_PROXY_CONNS: usize = 64;
+
+/// Base64 (RFC 4648, standard alphabet, padded). Encode-only, ~15 lines, so
+/// the proxy credential needs no new workspace dependency. The server side
+/// compares against a precomputed string, so no decoder is required.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// An RFC 7617 `Basic` credential value, ready to compare against a
+/// `Proxy-Authorization` header.
+fn basic_auth_value(user: &str, pass: &str) -> String {
+    format!(
+        "Basic {}",
+        base64_encode(format!("{user}:{pass}").as_bytes())
+    )
+}
+
+/// The per-session proxy token: 128 bits from a SplitMix64 seeded on the
+/// wall clock, the pid, and a stack address.
+///
+/// **Not cryptographic, and deliberately so.** The credential guards a
+/// loopback listener against *other local processes* for the lifetime of one
+/// session; it is visible to anything running as this user (it rides the
+/// child's `HTTP_PROXY`), which is precisely the boundary it does not claim to
+/// defend. Predicting it buys an attacker the egress allowlist they could
+/// already reach by reading the environment.
+fn proxy_token() -> &'static str {
+    static TOKEN: OnceLock<String> = OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let local = 0u64;
+        let mut state =
+            nanos ^ ((std::process::id() as u64) << 32) ^ (&local as *const u64 as usize as u64);
+        let mut out = String::with_capacity(32);
+        for _ in 0..2 {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^= z >> 31;
+            out.push_str(&format!("{z:016x}"));
+        }
+        out
+    })
+}
+
+/// The credential `handle_conn` requires, or `None` under
+/// `HOTL_PROXY_AUTH=off` (for a client that honors the proxy host but drops
+/// proxy credentials).
+fn proxy_credential() -> Option<&'static str> {
+    if std::env::var("HOTL_PROXY_AUTH").is_ok_and(|v| v == "off") {
+        return None;
+    }
+    static CRED: OnceLock<String> = OnceLock::new();
+    Some(CRED.get_or_init(|| basic_auth_value("hotl", proxy_token())))
+}
+
+/// The `user:pass` for the proxy URL handed to children, or `None` when auth
+/// is off. `sandbox::apply_proxy_env` formats it into `HTTP_PROXY`.
+pub(crate) fn proxy_user_info() -> Option<String> {
+    proxy_credential().map(|_| format!("hotl:{}", proxy_token()))
+}
+
+/// Length-independent-of-content comparison over equal-length inputs.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Does the head carry `name: expected`? Compared in constant time.
+fn header_matches(head: &str, name: &str, expected: &str) -> bool {
+    head.lines().skip(1).any(|line| {
+        let Some((k, v)) = line.split_once(':') else {
+            return false;
+        };
+        k.trim().eq_ignore_ascii_case(name) && ct_eq(v.trim().as_bytes(), expected.as_bytes())
+    })
+}
+
 /// The configured policy (what the owner asked for).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EgressPolicy {
@@ -197,12 +316,30 @@ async fn proxy_port(patterns: &'static [String]) -> Option<u16> {
 async fn start_proxy(patterns: &'static [String]) -> Option<u16> {
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.ok()?;
     let port = listener.local_addr().ok()?.port();
+    let credential = proxy_credential();
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONNS));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, _)) => {
-                    tokio::spawn(handle_conn(stream, patterns));
-                }
+                // Accepts stay cheap; *live* connections are capped. Over the
+                // limit the client gets an immediate 503 rather than joining
+                // an unbounded task queue.
+                Ok((stream, _)) => match limit.clone().try_acquire_owned() {
+                    Ok(permit) => {
+                        tokio::spawn(handle_conn(stream, patterns, permit, credential));
+                    }
+                    Err(_) => {
+                        tokio::spawn(async move {
+                            let mut s = stream;
+                            respond(
+                                &mut s,
+                                "503 Service Unavailable",
+                                "hotl egress proxy: too many concurrent connections",
+                            )
+                            .await;
+                        });
+                    }
+                },
                 // Transient accept failure (fd pressure): back off, keep serving.
                 Err(_) => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
             }
@@ -214,23 +351,53 @@ async fn start_proxy(patterns: &'static [String]) -> Option<u16> {
 /// One proxied connection: read the request head, check the target host,
 /// tunnel or deny. The 403 body is an errors-as-prompts message — the model
 /// sees it in tool output and learns which control blocked it.
-async fn handle_conn(mut client: TcpStream, patterns: &'static [String]) {
-    // Read until the end of the head (CRLFCRLF), capped.
-    let mut buf: Vec<u8> = Vec::with_capacity(1024);
-    let head_end = loop {
-        if let Some(end) = find_head_end(&buf) {
-            break end;
-        }
-        if buf.len() >= MAX_HEAD {
-            return respond(&mut client, "400 Bad Request", "request head too large").await;
-        }
-        let mut chunk = [0u8; 4096];
-        match client.read(&mut chunk).await {
-            Ok(0) | Err(_) => return, // client went away mid-head
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+async fn handle_conn(
+    mut client: TcpStream,
+    patterns: &'static [String],
+    _permit: tokio::sync::OwnedSemaphorePermit, // released when the conn ends
+    credential: Option<&'static str>,
+) {
+    // Read until the end of the head (CRLFCRLF), capped and time-bounded.
+    let read_head = async {
+        let mut buf: Vec<u8> = Vec::with_capacity(1024);
+        loop {
+            if let Some(end) = find_head_end(&buf) {
+                return Some((buf, end));
+            }
+            if buf.len() >= MAX_HEAD {
+                return None;
+            }
+            let mut chunk = [0u8; 4096];
+            match client.read(&mut chunk).await {
+                Ok(0) | Err(_) => return None, // client went away mid-head
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
         }
     };
+    let Ok(head_read) = tokio::time::timeout(HEAD_TIMEOUT, read_head).await else {
+        return respond(
+            &mut client,
+            "408 Request Timeout",
+            "request head not completed",
+        )
+        .await;
+    };
+    let Some((buf, head_end)) = head_read else {
+        return;
+    };
     let head = String::from_utf8_lossy(&buf[..head_end]).into_owned();
+    // INVARIANT: only a caller holding this session's credential can spend the
+    // egress allowlist. Enforced by `the_proxy_requires_its_credential`.
+    if let Some(expected) = credential {
+        if !header_matches(&head, "proxy-authorization", expected) {
+            return respond(
+                &mut client,
+                "407 Proxy Authentication Required",
+                "hotl egress proxy: this proxy serves only the hotl session that started it",
+            )
+            .await;
+        }
+    }
     let mut parts = head.lines().next().unwrap_or("").split_ascii_whitespace();
     let (method, target) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
 
@@ -308,13 +475,27 @@ fn http_target(target: &str, head: &str) -> Option<(String, u16)> {
     split_host_port(&authority, Some(80))
 }
 
+/// The `Host` header, or `None` when there is not exactly one. Two `Host`
+/// headers let the policy check one value while the upstream honors the other
+/// — request smuggling by construction, so it is refused (400), not resolved.
+///
+/// INVARIANT: exactly one `Host` header reaches the policy check. Enforced by
+/// `duplicate_host_headers_are_refused_not_silently_first_wins`.
 fn host_header(head: &str) -> Option<String> {
-    head.lines().skip(1).find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.trim()
-            .eq_ignore_ascii_case("host")
-            .then(|| value.trim().to_string())
-    })
+    let mut found: Option<String> = None;
+    for line in head.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("host") {
+            continue;
+        }
+        if found.is_some() {
+            return None; // more than one
+        }
+        found = Some(value.trim().to_string());
+    }
+    found
 }
 
 /// Split `host[:port]` (brackets tolerated for IPv6 literals). With no
@@ -441,17 +622,105 @@ mod tests {
         assert_eq!(http_target("/path", "GET /path HTTP/1.1\r\n"), None);
     }
 
-    /// Spawn a proxy loop on an ephemeral port with the given allowlist.
-    async fn test_proxy(allow: &[&str]) -> u16 {
+    /// Spawn a proxy loop on an ephemeral port with the given allowlist and
+    /// (optionally) a required credential — the same shape `start_proxy`
+    /// builds, so the tests exercise the production `handle_conn`.
+    async fn test_proxy_with(allow: &[&str], credential: Option<&'static str>) -> u16 {
         let patterns: &'static [String] = Box::leak(Box::new(patterns(allow)));
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_PROXY_CONNS));
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
-                tokio::spawn(handle_conn(stream, patterns));
+                if let Ok(permit) = limit.clone().try_acquire_owned() {
+                    tokio::spawn(handle_conn(stream, patterns, permit, credential));
+                }
             }
         });
         port
+    }
+
+    async fn test_proxy(allow: &[&str]) -> u16 {
+        test_proxy_with(allow, None).await
+    }
+
+    async fn test_proxy_authed(allow: &[&str], secret: &str) -> u16 {
+        let expected: &'static str = Box::leak(basic_auth_value("hotl", secret).into_boxed_str());
+        test_proxy_with(allow, Some(expected)).await
+    }
+
+    #[tokio::test]
+    async fn an_unfinished_head_does_not_hold_the_connection_forever() {
+        let proxy = test_proxy(&["127.0.0.1"]).await;
+        let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+        client
+            .write_all(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\n")
+            .await
+            .unwrap(); // no CRLFCRLF
+        let mut reply = String::new();
+        let read = tokio::time::timeout(
+            HEAD_TIMEOUT + std::time::Duration::from_secs(2),
+            client.read_to_string(&mut reply),
+        )
+        .await;
+        assert!(
+            read.is_ok(),
+            "the proxy must close an idle half-open request head"
+        );
+        assert!(
+            reply.is_empty() || reply.starts_with("HTTP/1.1 408"),
+            "got: {reply}"
+        );
+    }
+
+    #[test]
+    fn duplicate_host_headers_are_refused_not_silently_first_wins() {
+        assert_eq!(
+            host_header("GET / HTTP/1.1\r\nHost: a.example\r\n"),
+            Some("a.example".to_string())
+        );
+        assert_eq!(
+            host_header("GET / HTTP/1.1\r\nHost: a.example\r\nhost: b.example\r\n"),
+            None,
+            "two Host headers is a smuggling attempt, not a first-wins choice"
+        );
+        assert_eq!(
+            http_target("/p", "GET /p HTTP/1.1\r\nHost: a\r\nHost: b\r\n"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_proxy_requires_its_credential() {
+        let proxy = test_proxy_authed(&["127.0.0.1"], "s3cret").await;
+        // No credential: 407, and no tunnel.
+        let mut anon = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+        anon.write_all(b"CONNECT 127.0.0.1:1 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        anon.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 407"), "got: {reply}");
+        // With it: the request reaches the policy check (403 for an unlisted host).
+        let mut authed = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+        let cred = basic_auth_value("hotl", "s3cret");
+        authed
+            .write_all(
+                format!("CONNECT evil.example:443 HTTP/1.1\r\nproxy-authorization: {cred}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        authed.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 403"), "got: {reply}");
+    }
+
+    #[test]
+    fn basic_auth_encodes_like_rfc7617() {
+        assert_eq!(basic_auth_value("hotl", "s3cret"), "Basic aG90bDpzM2NyZXQ=");
+        assert_eq!(basic_auth_value("a", "b"), "Basic YTpi"); // 3 bytes → no pad
+        assert_eq!(basic_auth_value("a", "bc"), "Basic YTpiYw=="); // 4 bytes → two pads
     }
 
     async fn read_until_head_end(stream: &mut TcpStream) -> String {

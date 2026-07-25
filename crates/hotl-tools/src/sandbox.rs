@@ -455,7 +455,12 @@ fn apply_proxy_env(
     egress: &EgressState,
 ) -> tokio::process::Command {
     if let EgressState::Proxy(port) = egress {
-        let proxy = format!("http://127.0.0.1:{port}");
+        // The credential rides the standard proxy URL, which curl, git, pip
+        // and cargo all forward as `Proxy-Authorization`.
+        let proxy = match crate::net::proxy_user_info() {
+            Some(userinfo) => format!("http://{userinfo}@127.0.0.1:{port}"),
+            None => format!("http://127.0.0.1:{port}"),
+        };
         for key in [
             "HTTP_PROXY",
             "HTTPS_PROXY",
@@ -722,6 +727,38 @@ fn landlock_argv(program: &str, args: &[String], egress: &EgressState) -> tokio:
 mod env_tests {
     use super::*;
 
+    /// The proxy URL a child sees. Since Task 9 it carries the session
+    /// credential as userinfo (curl/git/pip/cargo forward that as
+    /// `Proxy-Authorization`), so this asserts the *shape* — right authority,
+    /// and a non-empty credential when auth is on — rather than re-deriving
+    /// the token, which would make the assertion a tautology.
+    fn assert_proxy_url(envs: &[(String, Option<String>)], key: &str, port: u16) {
+        let value = envs
+            .iter()
+            .find(|(k, _)| k == key)
+            .and_then(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("{key} must be set"));
+        let authority = format!("@127.0.0.1:{port}");
+        match crate::net::proxy_user_info() {
+            Some(_) => {
+                assert!(
+                    value.ends_with(&authority),
+                    "{key} must point at the proxy: {value}"
+                );
+                let userinfo = value
+                    .strip_prefix("http://")
+                    .and_then(|r| r.strip_suffix(&authority))
+                    .unwrap_or_default();
+                let secret = userinfo.strip_prefix("hotl:").unwrap_or_default();
+                assert!(
+                    !secret.is_empty(),
+                    "{key} must carry a non-empty session credential: {value}"
+                );
+            }
+            None => assert_eq!(value, format!("http://127.0.0.1:{port}")),
+        }
+    }
+
     #[test]
     fn proxy_state_injects_proxy_env_and_off_does_not() {
         // Env injection is OS-independent (it rides the Command itself).
@@ -744,10 +781,7 @@ mod env_tests {
             "https_proxy",
             "ALL_PROXY",
         ] {
-            assert!(
-                envs.contains(&(key.to_string(), Some("http://127.0.0.1:9123".to_string()))),
-                "{key} must point at the proxy"
-            );
+            assert_proxy_url(&envs, key, 9123);
         }
         for key in ["NO_PROXY", "no_proxy"] {
             assert!(
@@ -858,10 +892,7 @@ mod env_tests {
                 )
             })
             .collect();
-        assert!(envs.contains(&(
-            "HTTP_PROXY".to_string(),
-            Some("http://127.0.0.1:9123".to_string())
-        )));
+        assert_proxy_url(&envs, "HTTP_PROXY", 9123);
     }
 }
 
