@@ -26,9 +26,6 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(20);
 /// Cap discipline matching `ReadTool`/`bash`: a page beyond this is
 /// truncated with a continuation note rather than dumped whole.
 const MAX_BODY_BYTES: usize = 100 * 1024;
-/// Above this, the (synchronous, hand-rolled) HTML→text pass moves to the
-/// blocking pool so a huge page's strip doesn't stall the async runtime.
-const HTML_BLOCKING_THRESHOLD: usize = 256 * 1024;
 const MAX_URLS_PER_CALL: usize = 20;
 const USER_AGENT: &str = concat!("hotl-web-fetch/", env!("CARGO_PKG_VERSION"));
 /// Matches reqwest's own default redirect-chain cap (`redirect::Policy`'s
@@ -375,8 +372,36 @@ fn elide(url: &str) -> String {
 }
 
 pub struct WebFetchTool {
-    client: reqwest::Client,
+    /// `Err` when the client could not be built. Storing the failure keeps
+    /// `new`'s signature (agent.rs constructs it infallibly) while making the
+    /// failure *loud at call time* instead of silently substituting a client
+    /// with no redirect policy and no timeout (T3-12).
+    ///
+    /// INVARIANT: every request this tool issues carries the egress-checking
+    /// redirect policy and the 20s timeout, or no request is issued at all.
+    /// Enforced by `a_failed_client_build_is_reported_not_silently_downgraded`.
+    client: Result<reqwest::Client, String>,
     concurrency: SessionConcurrency,
+}
+
+/// The errors-as-prompt a tool renders when its HTTP client could not be
+/// built: a configuration fault, not a transient one, so the model is told not
+/// to retry.
+fn client_build_failure(tool: &str, e: &str) -> ToolOutcome {
+    ToolOutcome::err(format!(
+        "{tool} is unavailable: the HTTP client could not be built ({e}). This is a \
+         build/TLS configuration problem, not something to retry — tell the user, and use \
+         `bash` with `curl` only if they ask you to."
+    ))
+}
+
+fn build_web_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(FETCH_TIMEOUT)
+        .redirect(redirect_policy())
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 impl WebFetchTool {
@@ -385,12 +410,13 @@ impl WebFetchTool {
     /// permit from it, so a batch here and a batch from another session in
     /// the same process draw from one budget.
     pub fn new(concurrency: SessionConcurrency) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(FETCH_TIMEOUT)
-            .redirect(redirect_policy())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        Self::from_client_result(build_web_client(), concurrency)
+    }
+
+    pub(crate) fn from_client_result(
+        client: Result<reqwest::Client, String>,
+        concurrency: SessionConcurrency,
+    ) -> Self {
         Self {
             client,
             concurrency,
@@ -398,6 +424,10 @@ impl WebFetchTool {
     }
 
     async fn run_impl(&self, input: Value, cancel: CancellationToken) -> ToolOutcome {
+        let client = match &self.client {
+            Ok(c) => c.clone(),
+            Err(e) => return client_build_failure("web_fetch", e),
+        };
         let urls = match extract_urls(&input) {
             Ok(u) => u,
             Err(e) => return e,
@@ -406,6 +436,10 @@ impl WebFetchTool {
         let mut results: Vec<Option<Result<String, String>>> = vec![None; urls.len()];
         let mut join_set: tokio::task::JoinSet<(usize, Result<String, String>)> =
             tokio::task::JoinSet::new();
+        // Task id → result slot, so a task that *panicked* can be reported as
+        // a panic rather than left `None` and rendered as a cancellation.
+        let mut slot_of: std::collections::HashMap<tokio::task::Id, usize> =
+            std::collections::HashMap::new();
 
         // Egress check stays synchronous and first (index spec): every URL
         // is checked before any permit is acquired or task spawned, so a
@@ -428,12 +462,13 @@ impl WebFetchTool {
                 results[idx] = Some(Err(format!("refused: {reason}")));
                 continue;
             }
-            let client = self.client.clone();
+            let client = client.clone();
             let concurrency = self.concurrency.clone();
-            join_set.spawn(async move {
+            let handle = join_set.spawn(async move {
                 let _permit = concurrency.request().await;
                 (idx, fetch_one(&client, url, &host).await)
             });
+            slot_of.insert(handle.id(), idx);
         }
 
         loop {
@@ -443,9 +478,19 @@ impl WebFetchTool {
                     join_set.abort_all();
                     break;
                 }
-                joined = join_set.join_next() => match joined {
-                    Some(Ok((idx, res))) => results[idx] = Some(res),
-                    Some(Err(_)) => {} // aborted/panicked: left None, reported below
+                joined = join_set.join_next_with_id() => match joined {
+                    Some(Ok((_, (idx, res)))) => results[idx] = Some(res),
+                    Some(Err(e)) => {
+                        // A panicked task is a hotl bug, not a cancellation.
+                        if let Some(&idx) = slot_of.get(&e.id()) {
+                            if !e.is_cancelled() {
+                                results[idx] = Some(Err(
+                                    "the fetch task panicked; this is a bug in hotl — report \
+                                     it and try `bash` with `curl` for this URL".to_string(),
+                                ));
+                            }
+                        }
+                    }
                     None => break,
                 }
             }
@@ -455,10 +500,11 @@ impl WebFetchTool {
     }
 }
 
-/// GET one URL, cap the body, strip HTML if the content-type says so, and
-/// envelope the result. `spawn_blocking` only above `HTML_BLOCKING_THRESHOLD`
-/// — the strip pass is cheap for ordinary pages and doesn't need the hop for
-/// them.
+/// GET one URL, cap the body at `MAX_BODY_BYTES`, strip HTML if the
+/// content-type says so, and envelope the result. The strip pass runs inline:
+/// the body is already capped at 100 KB before it gets here, so there is no
+/// page large enough to justify a blocking-pool hop (the old 256 KB threshold
+/// was unreachable by construction — D-7).
 async fn fetch_one(
     client: &reqwest::Client,
     url: reqwest::Url,
@@ -486,17 +532,7 @@ async fn fetch_one(
     let cap = MAX_BODY_BYTES.min(bytes.len());
     let text = String::from_utf8_lossy(&bytes[..cap]).into_owned();
 
-    let mut rendered = if is_html {
-        if text.len() > HTML_BLOCKING_THRESHOLD {
-            tokio::task::spawn_blocking(move || html_to_text(&text))
-                .await
-                .unwrap_or_default()
-        } else {
-            html_to_text(&text)
-        }
-    } else {
-        text
-    };
+    let mut rendered = if is_html { html_to_text(&text) } else { text };
     if truncated {
         rendered.push_str(&format!(
             "\n[truncated: page exceeds {MAX_BODY_BYTES} bytes; showing the first {MAX_BODY_BYTES}]"
@@ -732,7 +768,10 @@ fn format_hits(hits: &[&SearchHit]) -> String {
 
 pub struct WebSearchTool {
     backend: SearchBackend,
-    client: reqwest::Client,
+    /// Same stored-failure discipline as `WebFetchTool::client` — a client
+    /// that could not be built is reported, never replaced by a bare
+    /// `Client::new()` with no redirect policy and no timeout (T3-12).
+    client: Result<reqwest::Client, String>,
     concurrency: SessionConcurrency,
 }
 
@@ -743,20 +782,18 @@ impl WebSearchTool {
     /// together, matching the index's governance table and the docs' claim
     /// that `[concurrency].requests` bounds both.
     pub fn new(backend: SearchBackend, concurrency: SessionConcurrency) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(FETCH_TIMEOUT)
-            .redirect(redirect_policy())
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             backend,
-            client,
+            client: build_web_client(),
             concurrency,
         }
     }
 
     async fn run_impl(&self, input: Value, _cancel: CancellationToken) -> ToolOutcome {
+        let client = match &self.client {
+            Ok(c) => c.clone(),
+            Err(e) => return client_build_failure("web_search", e),
+        };
         let Some(query) = input.get("query").and_then(Value::as_str) else {
             return ToolOutcome::err(
                 "`query` is required: the search query, in natural language or keywords.",
@@ -773,7 +810,7 @@ impl WebSearchTool {
         if let HostVerdict::Denied(reason) = net::host_allowed(&host) {
             return ToolOutcome::err(format!("web_search refused: {reason}"));
         }
-        let mut req = self.client.get(&self.backend.url).query(&[("q", query)]);
+        let mut req = client.get(&self.backend.url).query(&[("q", query)]);
         if let Some(key) = &self.backend.api_key {
             req = req.bearer_auth(key);
         }
@@ -863,6 +900,52 @@ mod tests {
         assert!(err.content.contains("at most 20"));
         let ok = extract_urls(&json!({"urls": ["http://a", "http://b"]})).unwrap();
         assert_eq!(ok, vec!["http://a".to_string(), "http://b".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_client_build_is_reported_not_silently_downgraded() {
+        // The stored-error path renders as an errors-as-prompt, never as a
+        // fetch attempt with an unprotected client.
+        let tool = WebFetchTool::from_client_result(
+            Err("tls backend unavailable".to_string()),
+            SessionConcurrency::new(ConcurrencyLimits::default()),
+        );
+        let out = tool
+            .run(
+                json!({"urls": ["https://example.com"]}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("tls backend unavailable"));
+        assert!(
+            out.content.contains("not something to retry"),
+            "must tell the model what to do"
+        );
+    }
+
+    #[test]
+    fn the_dead_html_threshold_is_gone() {
+        // D-7: the constant guarded a branch the 100KB body cap made
+        // unreachable. The needle is assembled at compile time so this file
+        // does not itself contain the string it searches for — `include_str!`
+        // reads this very file, test module included.
+        let needle = concat!("HTML_BLOCKING", "_THRESHOLD");
+        let src = include_str!("web.rs");
+        assert!(!src.contains(needle), "dead constant still present");
+    }
+
+    #[test]
+    fn a_panicked_fetch_task_is_not_reported_as_cancelled() {
+        let results = vec![Some(Err("the fetch task panicked".to_string())), None];
+        let out = format_fetch_results(&["http://a".to_string(), "http://b".to_string()], results);
+        assert!(out.content.contains("panicked"));
+        assert!(out.content.contains("cancelled"));
+        assert_ne!(
+            out.content.matches("cancelled").count(),
+            2,
+            "a panic must not be reported as a cancellation"
+        );
     }
 
     #[test]
