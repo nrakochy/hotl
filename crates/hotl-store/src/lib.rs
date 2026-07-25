@@ -1048,6 +1048,36 @@ fn apply_log(
     header.ok_or_else(|| format!("{}: no header entry", path.display()))
 }
 
+/// The parent session id recorded in a log's header, if any — a first-line
+/// read, never a replay. `None` for a root session or an unreadable log.
+pub fn session_parent(path: &Path) -> Option<String> {
+    read_header(path).ok().and_then(|h| h.parent_session_id)
+}
+
+/// Every ancestor of `session_id`, nearest-first, excluding the session
+/// itself. Reads one line per ancestor.
+///
+/// INVARIANT: terminates on any input — a repeated id ends the walk (cycle),
+/// `LINEAGE_DEPTH_CAP` bounds it (depth), and a missing or unreadable ancestor
+/// ends it. Enforced by `ancestor_ids_walks_the_chain_and_survives_a_cycle`.
+pub fn ancestor_ids(dir: &Path, session_id: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<String> =
+        std::collections::HashSet::from([session_id.to_string()]);
+    let mut current = session_id.to_string();
+    for _ in 0..LINEAGE_DEPTH_CAP {
+        let Some(parent) = session_parent(&dir.join(format!("{current}.jsonl"))) else {
+            break;
+        };
+        if !visited.insert(parent.clone()) {
+            break;
+        }
+        out.push(parent.clone());
+        current = parent;
+    }
+    out
+}
+
 /// The session's display name: the last `rename` entry in its log, if any.
 /// A cheap line-scan (substring pre-filter, then parse) — listing and name
 /// resolution must not pay for a full replay.
@@ -2095,5 +2125,32 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = replay_chain(dir.path(), "01NOPE").expect_err("nothing to show is a hard error");
         assert!(err.contains("01NOPE"), "got {err}");
+    }
+
+    #[test]
+    fn ancestor_ids_walks_the_chain_and_survives_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent: Option<String> = None;
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let log =
+                SessionLog::create(dir.path(), "m", parent.clone(), Masker::empty(), 1).unwrap();
+            parent = Some(log.session_id.clone());
+            ids.push(log.session_id.clone());
+        }
+        let newest = ids.pop().unwrap();
+        let mut ancestors = ancestor_ids(dir.path(), &newest);
+        ancestors.sort();
+        ids.sort();
+        assert_eq!(
+            ancestors, ids,
+            "every ancestor, excluding the session itself"
+        );
+
+        // Self-parent: must terminate, and must not name itself.
+        let path = dir.path().join("01SELF2.jsonl");
+        let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":1,"session_id":"01SELF2","parent_session_id":"01SELF2","model":"m","created_at_ms":0}}}"#;
+        std::fs::write(&path, format!("{header}\n")).unwrap();
+        assert!(ancestor_ids(dir.path(), "01SELF2").is_empty());
     }
 }

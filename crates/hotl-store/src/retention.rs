@@ -4,6 +4,10 @@
 //! repo — so nothing is left half-deleted. Never touches the workspace, never
 //! rewrites a file in place (append-only stays append-only; deletion is the
 //! only GC, per the retention row in SECURITY.md/RELIABILITY.md).
+//!
+//! **Lineage-aware** (T2-5): resume is fork, so a resumed conversation is a
+//! chain whose ancestors are old by definition. GC never prunes a session that
+//! a retained session descends from.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -34,6 +38,10 @@ pub struct PrunedSession {
 #[derive(Debug, Default)]
 pub struct GcReport {
     pub pruned: Vec<PrunedSession>,
+    /// Sessions the age/count policy selected but lineage rescued: a retained
+    /// session descends from them, so deleting them would destroy a live
+    /// conversation (T2-5).
+    pub protected: Vec<String>,
     pub dry_run: bool,
 }
 
@@ -45,6 +53,11 @@ impl GcReport {
 
 /// Prune sessions under `data_dir` (which holds `sessions/`, `shadow/`) per
 /// `policy`. `dry_run` reports what *would* go without deleting.
+///
+/// INVARIANT: a session that any retained session descends from is never
+/// pruned. Resume is fork, so a resumed conversation's ancestors are old by
+/// definition and an age/count policy alone would delete the history the user
+/// considers current. Enforced by `gc_never_prunes_an_ancestor_of_a_retained_session`.
 pub fn gc(data_dir: &Path, policy: &RetentionPolicy, dry_run: bool) -> GcReport {
     let sessions_dir = data_dir.join("sessions");
     let shadow_dir = data_dir.join("shadow");
@@ -56,14 +69,38 @@ pub fn gc(data_dir: &Path, policy: &RetentionPolicy, dry_run: bool) -> GcReport 
         dry_run,
         ..Default::default()
     };
-    for (idx, (id, log_path, modified)) in sessions.iter().enumerate() {
-        let too_old = policy.max_age.is_some_and(|max| {
-            now.duration_since(*modified)
-                .map(|age| age > max)
-                .unwrap_or(false)
-        });
-        let over_count = policy.max_sessions.is_some_and(|keep| idx >= keep);
-        if !too_old && !over_count {
+
+    // Pass 1 — what age/count alone would take.
+    let over_policy: Vec<bool> = sessions
+        .iter()
+        .enumerate()
+        .map(|(idx, (_, _, modified))| {
+            let too_old = policy.max_age.is_some_and(|max| {
+                now.duration_since(*modified)
+                    .map(|age| age > max)
+                    .unwrap_or(false)
+            });
+            let over_count = policy.max_sessions.is_some_and(|keep| idx >= keep);
+            too_old || over_count
+        })
+        .collect();
+
+    // Pass 2 — the ancestor closure of everything pass 1 keeps. `ancestor_ids`
+    // walks the *whole* chain from each retained session, so a rescued
+    // ancestor's own ancestors are already in the set; no fixpoint is needed.
+    let mut protected: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for ((id, _, _), over) in sessions.iter().zip(&over_policy) {
+        if !over {
+            protected.extend(crate::ancestor_ids(&sessions_dir, id));
+        }
+    }
+
+    for ((id, log_path, _), over) in sessions.iter().zip(&over_policy) {
+        if !over {
+            continue;
+        }
+        if protected.contains(id) {
+            report.protected.push(id.clone());
             continue;
         }
         let targets = session_paths(log_path, &shadow_dir, id);
@@ -128,6 +165,82 @@ mod tests {
         std::fs::create_dir_all(shadow.join(format!("{id}.git"))).unwrap();
         std::fs::write(shadow.join(format!("{id}.git/HEAD")), "ref").unwrap();
         id
+    }
+
+    /// A parent→child chain of `depth` sessions; returns the ids oldest-first.
+    fn make_chain(sessions: &Path, shadow: &Path, depth: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        let mut parent: Option<String> = None;
+        for _ in 0..depth {
+            let log =
+                SessionLog::create(sessions, "m", parent.clone(), Masker::empty(), 0).unwrap();
+            let id = log.session_id.clone();
+            log.write_blob("t1", "big result").unwrap();
+            std::fs::create_dir_all(shadow.join(format!("{id}.git"))).unwrap();
+            parent = Some(id.clone());
+            ids.push(id);
+        }
+        ids
+    }
+
+    #[test]
+    fn gc_never_prunes_an_ancestor_of_a_retained_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let sessions = data.join("sessions");
+        let shadow = data.join("shadow");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+
+        // One conversation, resumed twice → a 3-deep chain. Keep 1.
+        let chain = make_chain(&sessions, &shadow, 3);
+        let policy = RetentionPolicy {
+            max_sessions: Some(1),
+            max_age: None,
+        };
+        let report = gc(data, &policy, false);
+
+        assert!(
+            report.pruned.is_empty(),
+            "every session is an ancestor of the one retained: {:?}",
+            report.pruned.iter().map(|p| &p.id).collect::<Vec<_>>()
+        );
+        assert_eq!(report.protected.len(), 2, "two ancestors rescued");
+        for id in &chain {
+            assert!(
+                sessions.join(format!("{id}.jsonl")).exists(),
+                "{id} must survive — a live conversation depends on it"
+            );
+        }
+    }
+
+    #[test]
+    fn gc_still_prunes_a_session_nothing_descends_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let sessions = data.join("sessions");
+        let shadow = data.join("shadow");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+
+        let orphan = make_chain(&sessions, &shadow, 1).pop().unwrap();
+        let chain = make_chain(&sessions, &shadow, 2); // newer than the orphan
+        let newest = chain.last().unwrap().clone();
+
+        let policy = RetentionPolicy {
+            max_sessions: Some(1),
+            max_age: None,
+        };
+        let report = gc(data, &policy, false);
+
+        let pruned: Vec<&str> = report.pruned.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            pruned,
+            [orphan.as_str()],
+            "only the standalone session goes"
+        );
+        assert!(sessions.join(format!("{newest}.jsonl")).exists());
+        assert!(!sessions.join(format!("{orphan}.jsonl")).exists());
     }
 
     #[test]
