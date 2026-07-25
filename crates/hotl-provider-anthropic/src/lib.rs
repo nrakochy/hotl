@@ -145,7 +145,10 @@ impl AnthropicProvider {
             body["tools"] = json!(tools);
         }
         if req.thinking {
-            body["thinking"] = json!({"type": "adaptive"});
+            // `display` defaults to "omitted" on current models: without this
+            // the stream still bills reasoning tokens and every
+            // `thinking_delta` arrives empty (T3-15).
+            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
         }
         body
     }
@@ -614,6 +617,25 @@ mod tests {
         }
     }
 
+    /// INVARIANT (T3-15): reasoning that is billed is also *sent*. Without
+    /// `display: "summarized"` the model's default is `"omitted"` and every
+    /// `ThinkingDelta` carries an empty string — paid for, never visible.
+    #[test]
+    fn thinking_requests_a_visible_summary() {
+        let mut req = sampling_req();
+        req.thinking = true;
+        let body = AnthropicProvider::build_body(&req);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
+
+        // And it is absent entirely when thinking is off.
+        let mut off = sampling_req();
+        off.thinking = false;
+        assert!(AnthropicProvider::build_body(&off)
+            .get("thinking")
+            .is_none());
+    }
+
     #[test]
     fn body_shape_and_cache_placement() {
         let req = SamplingRequest {
@@ -649,6 +671,7 @@ mod tests {
         let body = AnthropicProvider::build_body(&req);
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["thinking"]["display"], "summarized");
         // system block carries a cache marker; so does the last tool def
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
