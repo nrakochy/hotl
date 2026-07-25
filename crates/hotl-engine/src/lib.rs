@@ -103,10 +103,34 @@ impl Default for EngineConfig {
 pub enum TurnEnd {
     Outcome(Outcome),
     /// Compact, folding with the speculative digest when the turn managed to
-    /// precompute one — `None` falls back to the inline summarize.
+    /// precompute one — `None` falls back to the inline summarize. `cont`
+    /// carries the per-turn counters the respawn must not reset (boxed so the
+    /// variant stays small).
     Compact {
         spec: Option<SpecDigest>,
+        cont: Box<TurnContinuation>,
     },
+}
+
+/// The per-turn state a compaction respawn must NOT reset (T2-2). A fold is
+/// "no new user item, same logical turn" — so every counter that bounds that
+/// turn has to cross it. Reconstructing a `Turn` from `Default` here is what let
+/// `max_turns` be defeated by the very scenario it exists for.
+/// INVARIANT: every per-turn safety counter survives a compaction respawn.
+/// Enforced by `max_turns_is_enforced_across_a_compaction`.
+#[derive(Debug, Default)]
+pub struct TurnContinuation {
+    /// Steps already spent against [`EngineConfig::max_turns`].
+    pub(crate) spent: i64,
+    /// Fallback-model position: a continuation does not silently revert to the
+    /// primary model that just failed.
+    pub(crate) model_idx: usize,
+    /// The doom detector's trailing signature window.
+    pub(crate) call_sigs: std::collections::VecDeque<crate::turn::CallSig>,
+    /// Per-tool consecutive failures (the tool-failure budget).
+    pub(crate) consecutive_failures: std::collections::HashMap<String, u32>,
+    /// The shared per-prompt "reminder and continue" budget.
+    pub(crate) turn_extensions: u32,
 }
 
 /// A compaction digest computed speculatively *during* the turn, overlapping

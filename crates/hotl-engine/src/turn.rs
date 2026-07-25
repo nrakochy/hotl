@@ -56,8 +56,9 @@ pub(crate) async fn run(
     cmd_tx: mpsc::Sender<SessionCmd>,
     events: mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
+    cont: crate::TurnContinuation,
 ) {
-    let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel);
+    let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel, cont);
     let end = turn.drive().await;
     let usage = turn.usage;
     let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
@@ -180,10 +181,13 @@ struct Turn {
     /// `Compact`, aborted otherwise.
     speculation: Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>>,
     /// Shared per-prompt "reminder and continue" budget (index E4) — see
-    /// [`TURN_EXTENSION_MAX`]. Reset per `drive()` call (one call == one
-    /// turn); the TodoGate is the only consumer today, bounded further by
-    /// [`TODO_GATE_MAX`].
+    /// [`TURN_EXTENSION_MAX`]. Carried across a compaction respawn (one logical
+    /// *prompt*, not one `drive()` call); the TodoGate is the only consumer
+    /// today, bounded further by [`TODO_GATE_MAX`].
     turn_extensions: u32,
+    /// Steps spent against `EngineConfig::max_turns`. A `Turn` field rather
+    /// than a `drive()` local precisely so it can cross a fold (T2-2).
+    spent: i64,
 }
 
 impl Drop for Turn {
@@ -206,7 +210,10 @@ impl Turn {
         cmd_tx: mpsc::Sender<SessionCmd>,
         events: mpsc::Sender<EngineEvent>,
         cancel: CancellationToken,
+        cont: crate::TurnContinuation,
     ) -> Self {
+        // `models` is rebuilt from config — only the *index* carries, so a
+        // config change between folds is still honored.
         let mut models = vec![shared.config.model.clone()];
         models.extend(shared.config.fallback_models.iter().cloned());
         Self {
@@ -216,16 +223,32 @@ impl Turn {
             events,
             cancel,
             models,
-            model_idx: 0,
-            call_sigs: VecDeque::new(),
-            consecutive_failures: HashMap::new(),
+            model_idx: cont.model_idx,
+            call_sigs: cont.call_sigs,
+            consecutive_failures: cont.consecutive_failures,
             usage: TokenUsage::default(),
+            // `anchor`/`injected_hints`/`last_snapshot` deliberately do NOT
+            // carry: the fold rewrites the projection, so a stale anchor would
+            // mis-slice it and a hint whose item was just folded away *should*
+            // be re-injected.
             anchor: None,
             samples: 0,
             injected_hints: HashSet::new(),
             last_snapshot: None,
             speculation: None,
-            turn_extensions: 0,
+            turn_extensions: cont.turn_extensions,
+            spent: cont.spent,
+        }
+    }
+
+    /// The state the continuation inherits.
+    fn continuation(&mut self) -> crate::TurnContinuation {
+        crate::TurnContinuation {
+            spent: self.spent,
+            model_idx: self.model_idx,
+            call_sigs: std::mem::take(&mut self.call_sigs),
+            consecutive_failures: std::mem::take(&mut self.consecutive_failures),
+            turn_extensions: self.turn_extensions,
         }
     }
 
@@ -235,15 +258,15 @@ impl Turn {
         // branches below — done, cancelled, compaction, refusal, tool budget
         // — so cancellation and the context-full path stay the real floor.
         let bound = self.shared.config.max_turns;
-        let mut spent: i64 = 0;
-        while bound < 0 || spent < bound {
-            spent += 1;
+        while bound < 0 || self.spent < bound {
+            self.spent += 1;
             let (stop, blocks) = match self.sample().await {
                 SampleEnd::Completed { stop, blocks } => (stop, blocks),
                 SampleEnd::Cancelled => return TurnEnd::Outcome(Outcome::Cancelled),
                 SampleEnd::ContextFull => {
                     return TurnEnd::Compact {
                         spec: self.take_speculation().await,
+                        cont: Box::new(self.continuation()),
                     }
                 }
                 SampleEnd::Unavailable(_) if self.model_idx + 1 < self.models.len() => {
@@ -1016,7 +1039,8 @@ const DOOM_WINDOW: usize = 9;
 /// the ask embeds. The display rides along (bounded by [`DOOM_WINDOW`])
 /// because the repeating block can span batches — it can't always be
 /// re-derived from the current batch's tool uses.
-struct CallSig {
+#[derive(Debug)]
+pub(crate) struct CallSig {
     hash: u64,
     display: String,
 }

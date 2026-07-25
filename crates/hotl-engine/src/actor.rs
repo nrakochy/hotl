@@ -320,7 +320,7 @@ struct TurnFinishedCtx<'a> {
 async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: TokenUsage) {
     let outcome = match end {
         TurnEnd::Outcome(outcome) => Some(outcome),
-        TurnEnd::Compact { spec } => {
+        TurnEnd::Compact { spec, cont } => {
             *ctx.carry_usage += usage;
             usage = TokenUsage::default();
             try_compact(
@@ -329,6 +329,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
                 ctx.items,
                 ctx.compact_streak,
                 spec,
+                cont,
                 ctx.cmd_tx,
                 ctx.events,
                 ctx.current_turn,
@@ -365,6 +366,7 @@ async fn try_compact(
     items: &mut Arc<Vec<Item>>,
     compact_streak: &mut u32,
     spec: Option<crate::SpecDigest>,
+    cont: Box<crate::TurnContinuation>,
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
@@ -394,7 +396,7 @@ async fn try_compact(
             if cancel.is_cancelled() {
                 return Some(Outcome::Cancelled);
             }
-            respawn_turn(shared, cmd_tx, events, cancel);
+            respawn_turn(shared, cmd_tx, events, cancel, *cont);
             None // still running: same logical turn continues
         }
         Err(message) => Some(Outcome::Error { message }),
@@ -860,17 +862,29 @@ fn spawn_turn(
     *current_turn
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
-    respawn_turn(shared, cmd_tx, events, token);
+    // A fresh prompt is a fresh turn: no counters carry in.
+    respawn_turn(
+        shared,
+        cmd_tx,
+        events,
+        token,
+        crate::TurnContinuation::default(),
+    );
 }
 
-/// Spawn a turn task under an existing token. Compaction respawns use this
-/// directly (no new user item, same logical turn — the interrupt token
-/// carries over so a cancel during the fold still lands).
+/// Spawn a turn task under an existing token, seeded with `cont`. Compaction
+/// respawns use this directly (no new user item, same logical turn — the
+/// interrupt token carries over so a cancel during the fold still lands, and
+/// `cont` carries the per-turn safety counters so `max_turns`, the doom
+/// detector and the failure budget bound the *whole* turn).
+/// INVARIANT: a compaction respawn continues the same logical turn, counters
+/// included. Enforced by `max_turns_is_enforced_across_a_compaction`.
 fn respawn_turn(
     shared: &Arc<SharedDeps>,
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     token: CancellationToken,
+    cont: crate::TurnContinuation,
 ) {
     // The turn task holds a strong sender for its lifetime; a failed upgrade
     // means the handle is gone and there is nobody left to run for.
@@ -878,7 +892,13 @@ fn respawn_turn(
         return;
     };
     let supervisor_tx = cmd_tx.clone();
-    let handle = tokio::spawn(turn::run(shared.clone(), cmd_tx, events.clone(), token));
+    let handle = tokio::spawn(turn::run(
+        shared.clone(),
+        cmd_tx,
+        events.clone(),
+        token,
+        cont,
+    ));
     // INVARIANT: exactly one `TurnFinished` per spawned turn, panic included —
     // `running` is cleared and the prompt queue drains on every exit path.
     // Enforced by `a_panicking_turn_reports_an_error_and_the_session_keeps_working`.
