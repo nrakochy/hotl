@@ -142,12 +142,22 @@ impl Shadow {
             })
     }
 
-    /// Files that differ between the current tree and `hash` (what a
-    /// restore would touch), then restore tracked files to that snapshot.
-    /// Files created after the snapshot are reported but not deleted.
+    /// Files that differ between the current tree and `hash` (what a restore
+    /// touched), restoring the workspace to that snapshot.
+    ///
+    /// INVARIANT: after `restore`, every non-excluded path matches `hash` —
+    /// including files created after the snapshot, which are deleted, not kept.
+    /// `git clean` cannot do this: the checkpoint commit taken below tracks
+    /// those files, so they are never untracked. Excluded paths (secrets,
+    /// build output) are never tracked, never in the diff, never touched.
+    /// Enforced by `snapshot_and_undo_roundtrip` and
+    /// `undo_never_touches_excluded_files`.
+    ///
+    /// Reversible: the checkpoint commit still holds everything removed here.
     pub fn restore(&self, hash: &str) -> Result<Vec<String>, String> {
-        self.snapshot("checkpoint before undo")
-            .ok_or("could not checkpoint the current tree")?;
+        self.snapshot("checkpoint before undo").ok_or(
+            "could not checkpoint the current tree — refusing to restore over unsaved work",
+        )?;
         let diff = self
             .git(&["diff", "--name-only", hash, "HEAD"])
             .ok_or("git diff failed")?;
@@ -155,11 +165,30 @@ impl Shadow {
             .lines()
             .map(String::from)
             .collect();
+        // Paths that exist only *after* the snapshot. `git checkout <hash> -- .`
+        // will not remove them (they are not in `<hash>`), so name them.
+        let added = self
+            .git(&["diff", "--name-only", "--diff-filter=A", hash, "HEAD"])
+            .ok_or("git diff failed")?;
+        let added: Vec<String> = String::from_utf8_lossy(&added.stdout)
+            .lines()
+            .map(String::from)
+            .collect();
+
         let out = self
             .git(&["checkout", "-q", hash, "--", "."])
             .ok_or("git checkout failed")?;
         if !out.status.success() {
             return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+        }
+        if !added.is_empty() {
+            // `git rm` with an empty pathspec is a fatal error, hence the guard.
+            let mut args: Vec<&str> = vec!["rm", "-q", "-f", "--ignore-unmatch", "--"];
+            args.extend(added.iter().map(String::as_str));
+            let rm = self.git(&args).ok_or("git rm failed")?;
+            if !rm.status.success() {
+                return Err(String::from_utf8_lossy(&rm.stderr).into_owned());
+            }
         }
         Ok(files)
     }
@@ -247,22 +276,64 @@ mod tests {
         shadow.snapshot("pre batch 1").expect("pre snapshot");
         std::fs::write(work.path().join("a.txt"), "v2-broken").unwrap();
         std::fs::write(work.path().join("b.txt"), "new file").unwrap();
+        std::fs::create_dir_all(work.path().join("sub")).unwrap();
+        std::fs::write(work.path().join("sub/c.txt"), "also new").unwrap();
         shadow.snapshot("post batch 1").expect("post snapshot");
 
-        // A later process finds the session and its work tree.
-        assert_eq!(latest_session(root.path()).as_deref(), Some("SESSION1"));
+        // A later process finds the session's work tree.
         let reopened = Shadow::open(root.path(), "SESSION1").expect("open");
         assert_eq!(reopened.work_tree(), work.path());
 
         let (hash, label) = reopened.latest_pre().expect("pre commit");
         assert_eq!(label, "pre batch 1");
         let touched = reopened.restore(&hash).expect("restore");
+
         assert_eq!(
             std::fs::read_to_string(work.path().join("a.txt")).unwrap(),
-            "v1"
+            "v1",
+            "modified files are restored"
         );
-        // Created-after files survive (reported, not deleted) — documented.
-        assert!(work.path().join("b.txt").exists());
+        assert!(
+            !work.path().join("b.txt").exists(),
+            "undo must remove files created after the snapshot (T2-15)"
+        );
+        assert!(
+            !work.path().join("sub/c.txt").exists(),
+            "including files in directories created after the snapshot"
+        );
         assert!(touched.iter().any(|f| f == "a.txt"), "touched: {touched:?}");
+        assert!(touched.iter().any(|f| f == "b.txt"), "touched: {touched:?}");
+    }
+
+    #[test]
+    fn undo_never_touches_excluded_files() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.txt"), "v1").unwrap();
+
+        let shadow = Shadow::create(root.path(), "SESSION2", work.path()).expect("create");
+        shadow.snapshot("pre batch 1").expect("pre snapshot");
+
+        // Created after the snapshot, but excluded — an undo must not delete the
+        // user's credentials or their build output.
+        std::fs::write(work.path().join(".env"), "SECRET=x").unwrap();
+        std::fs::create_dir_all(work.path().join("target")).unwrap();
+        std::fs::write(work.path().join("target/out"), "build").unwrap();
+        std::fs::write(work.path().join("a.txt"), "v2").unwrap();
+        shadow.snapshot("post batch 1").expect("post snapshot");
+
+        let (hash, _) = shadow.latest_pre().expect("pre commit");
+        shadow.restore(&hash).expect("restore");
+        assert!(
+            work.path().join(".env").exists(),
+            "excluded secrets survive undo"
+        );
+        assert!(
+            work.path().join("target/out").exists(),
+            "excluded build output survives undo"
+        );
     }
 }
