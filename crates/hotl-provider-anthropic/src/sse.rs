@@ -223,23 +223,24 @@ mod tests {
             r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
             "\n\n",
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hel"}}"#,
-            "\n",
+            "\n\n",
             r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}"#,
-            "\n",
+            "\n\n",
             r#"data: {"type":"content_block_stop","index":0}"#,
-            "\n",
+            "\n\n",
             r#"data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"read","input":{}}}"#,
-            "\n",
+            "\n\n",
             r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":"}}"#,
-            "\n",
+            "\n\n",
             r#"data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"\"a.rs\"}"}}"#,
-            "\n",
+            "\n\n",
             r#"data: {"type":"content_block_stop","index":1}"#,
-            "\n",
+            "\n\n",
             r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#,
-            "\n",
+            "\n\n",
+            // Deliberately no trailing newline: the terminal event must
+            // survive the flush path (it was silently dropped before R3).
             r#"data: {"type":"message_stop"}"#,
-            "\n",
         );
         let bytes = wire.as_bytes();
         let mut events = Vec::new();
@@ -248,6 +249,9 @@ mod tests {
             for data in p.feed(chunk).unwrap() {
                 events.extend(a.handle(&data).unwrap());
             }
+        }
+        for data in p.finish().unwrap() {
+            events.extend(a.handle(&data).unwrap());
         }
         let done = a.finish().expect("completed");
         let StreamEvent::Completed {

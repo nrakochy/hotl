@@ -276,34 +276,41 @@ mod base_url_tests {
     }
 }
 
-/// SSE line parsing shared by HTTP providers: turns raw byte chunks into
-/// complete `data:` payload strings. Chunks can split mid-line (and mid-UTF-8
-/// code point), so bytes are buffered, not lossily decoded per chunk.
+/// SSE parsing shared by HTTP providers (WHATWG server-sent events).
+///
+/// Chunks split mid-line and mid-UTF-8 code point, so bytes are buffered, not
+/// lossily decoded per chunk. Fields accumulate until a blank line dispatches
+/// the event; consecutive `data:` fields join with `\n`.
+///
+/// INVARIANT: no input can make this allocate without bound — a line is capped
+/// at [`SSE_MAX_BUFFER`] and an event at [`SSE_MAX_EVENT`]. Enforced by
+/// `sse_parser_tests::over_cap_input_is_a_parse_error_not_an_oom`.
 #[derive(Default)]
 pub struct SseParser {
     buf: Vec<u8>,
+    /// `data:` field values for the event currently accumulating.
+    data: Vec<String>,
+    data_len: usize,
 }
 
 /// A stream that never sends a newline must not buffer without bound.
-const SSE_MAX_BUFFER: usize = 1024 * 1024;
+pub const SSE_MAX_BUFFER: usize = 1024 * 1024;
+/// Nor may one that sends endless `data:` lines and never a blank line.
+pub const SSE_MAX_EVENT: usize = 4 * 1024 * 1024;
 
 impl SseParser {
-    /// Feed a chunk; returns complete `data:` payloads (`[DONE]` filtered).
-    /// Errors when a single line exceeds [`SSE_MAX_BUFFER`].
+    /// Feed a chunk; returns the payloads of every event completed by it
+    /// (`[DONE]` filtered).
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<String>, ProviderError> {
         self.buf.extend_from_slice(chunk);
         let mut out = Vec::new();
         let mut start = 0;
         while let Some(pos) = self.buf[start..].iter().position(|&b| b == b'\n') {
-            let line = String::from_utf8_lossy(&self.buf[start..start + pos]);
-            let line = line.trim_end_matches('\r');
-            if let Some(data) = line.strip_prefix("data:") {
-                let data = data.trim_start();
-                if !data.is_empty() && data != "[DONE]" {
-                    out.push(data.to_string());
-                }
-            }
+            let line = String::from_utf8_lossy(&self.buf[start..start + pos])
+                .trim_end_matches('\r')
+                .to_string();
             start += pos + 1;
+            self.line(&line, &mut out)?;
         }
         self.buf.drain(..start);
         if self.buf.len() > SSE_MAX_BUFFER {
@@ -312,6 +319,149 @@ impl SseParser {
             )));
         }
         Ok(out)
+    }
+
+    /// End-of-stream flush: a final line with no trailing newline, and an
+    /// event never terminated by a blank line, are both real (servers close
+    /// the socket after the last `data:`). Dropping them loses the terminal
+    /// event and turns a complete response into a parse error.
+    pub fn finish(&mut self) -> Result<Vec<String>, ProviderError> {
+        let mut out = Vec::new();
+        if !self.buf.is_empty() {
+            let tail = std::mem::take(&mut self.buf);
+            let line = String::from_utf8_lossy(&tail)
+                .trim_end_matches('\r')
+                .to_string();
+            self.line(&line, &mut out)?;
+        }
+        self.dispatch(&mut out);
+        Ok(out)
+    }
+
+    fn line(&mut self, line: &str, out: &mut Vec<String>) -> Result<(), ProviderError> {
+        if line.is_empty() {
+            self.dispatch(out);
+            return Ok(());
+        }
+        if line.starts_with(':') {
+            return Ok(()); // comment / keep-alive
+        }
+        // `event:`, `id:`, `retry:` carry nothing this seam uses; both
+        // dialects put the whole event in `data`.
+        let Some(value) = line.strip_prefix("data:") else {
+            return Ok(());
+        };
+        // Spec: strip exactly one leading space, not all whitespace.
+        let value = value.strip_prefix(' ').unwrap_or(value);
+        self.data_len += value.len() + 1;
+        if self.data_len > SSE_MAX_EVENT {
+            return Err(ProviderError::Parse(format!(
+                "SSE event exceeded {SSE_MAX_EVENT} bytes without a blank line"
+            )));
+        }
+        self.data.push(value.to_string());
+        Ok(())
+    }
+
+    fn dispatch(&mut self, out: &mut Vec<String>) {
+        self.data_len = 0;
+        if self.data.is_empty() {
+            return;
+        }
+        let payload = std::mem::take(&mut self.data).join("\n");
+        if !payload.is_empty() && payload != "[DONE]" {
+            out.push(payload);
+        }
+    }
+}
+
+#[cfg(test)]
+mod sse_parser_tests {
+    use super::*;
+
+    /// INVARIANT: consecutive `data:` fields in one event are joined with a
+    /// newline and dispatched at the blank line (WHATWG SSE). A payload split
+    /// across two `data:` lines is legal and must parse as one JSON document.
+    #[test]
+    fn multi_line_data_fields_are_joined() {
+        let mut p = SseParser::default();
+        let out = p
+            .feed(b"event: x\ndata: {\"a\":\ndata: 1}\n\ndata: {\"b\":2}\n\n")
+            .unwrap();
+        assert_eq!(
+            out,
+            vec!["{\"a\":\n1}".to_string(), "{\"b\":2}".to_string()]
+        );
+        // Both are valid JSON, which is the whole point.
+        for payload in &out {
+            serde_json::from_str::<serde_json::Value>(payload).expect(payload);
+        }
+    }
+
+    /// INVARIANT: a final event with no trailing newline is delivered, not
+    /// dropped. Servers close the socket after the last line all the time.
+    #[test]
+    fn the_unterminated_final_line_is_flushed() {
+        let mut p = SseParser::default();
+        assert!(p
+            .feed(b"data: {\"type\":\"message_stop\"}")
+            .unwrap()
+            .is_empty());
+        assert_eq!(p.finish().unwrap(), vec!["{\"type\":\"message_stop\"}"]);
+    }
+
+    /// An event terminated by end-of-stream rather than a blank line is also
+    /// flushed — same failure mode, one newline later.
+    #[test]
+    fn a_trailing_event_without_a_blank_line_is_flushed() {
+        let mut p = SseParser::default();
+        assert!(p.feed(b"data: {\"n\":1}\n").unwrap().is_empty());
+        assert_eq!(p.finish().unwrap(), vec!["{\"n\":1}"]);
+    }
+
+    /// Comments (`:` keep-alives) and non-`data` fields are ignored, and
+    /// `[DONE]` never reaches an assembler.
+    #[test]
+    fn comments_other_fields_and_done_are_filtered() {
+        let mut p = SseParser::default();
+        let out = p
+            .feed(b": keepalive\nevent: ping\nid: 7\nretry: 100\ndata: [DONE]\n\ndata: {}\n\n")
+            .unwrap();
+        assert_eq!(out, vec!["{}".to_string()]);
+    }
+
+    /// INVARIANT: a stream that never sends a newline, and one that never
+    /// sends a blank line, are both bounded. Neither may grow without limit.
+    #[test]
+    fn over_cap_input_is_a_parse_error_not_an_oom() {
+        let mut p = SseParser::default();
+        let big = vec![b'x'; SSE_MAX_BUFFER + 1];
+        assert!(matches!(p.feed(&big), Err(ProviderError::Parse(_))));
+
+        let mut q = SseParser::default();
+        let line = format!("data: {}\n", "y".repeat(64 * 1024));
+        let err = loop {
+            if let Err(e) = q.feed(line.as_bytes()) {
+                break e;
+            }
+        };
+        assert!(matches!(err, ProviderError::Parse(_)), "{err:?}");
+    }
+
+    /// Reassembly across arbitrary chunk boundaries still holds, including
+    /// mid-UTF-8 splits.
+    #[test]
+    fn chunk_boundaries_and_utf8_splits_survive() {
+        let wire = "data: {\"t\":\"héllo → wörld\"}\n\n".as_bytes();
+        let mut p = SseParser::default();
+        let mut out = Vec::new();
+        for c in wire.chunks(3) {
+            out.extend(p.feed(c).unwrap());
+        }
+        out.extend(p.finish().unwrap());
+        assert_eq!(out.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&out[0]).unwrap();
+        assert_eq!(v["t"], "héllo → wörld");
     }
 }
 
@@ -667,7 +817,17 @@ where
                 }
             }
         }
-        // Task 3 adds the end-of-stream flush here.
+        match parser.finish() {
+            Ok(payloads) => {
+                for data in payloads {
+                    match assembler.handle(&data) {
+                        Ok(events) => for ev in events { yield Ok(ev); },
+                        Err(e) => { yield Err(e); return; }
+                    }
+                }
+            }
+            Err(e) => { yield Err(e); return; }
+        }
         yield assembler.finish();
     }
 }
