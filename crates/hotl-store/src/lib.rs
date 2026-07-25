@@ -731,6 +731,7 @@ fn seal_and_truncate(file: &mut File, good_offset: u64, seal_now: &impl Fn(Strin
 /// Reconstruct the projection from a session log (M3b): items append,
 /// compactions and branch moves re-point, supersede digests append. This is
 /// the replay half of log-first — the projection is always derivable.
+#[derive(Debug)]
 pub struct Replayed {
     pub header: hotl_types::SessionHeader,
     pub items: Vec<hotl_types::Item>,
@@ -837,6 +838,11 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
 /// name the previous entry as its parent. A break is collected as a warning
 /// rather than a hard failure — replay stays defensive either way, but a
 /// tampered or truncated log should not be trusted silently.
+///
+/// INVARIANT: an unparseable *final* line is recovered as a warning (the crash
+/// signature of a non-atomic append); an unparseable line anywhere else is a
+/// hard error. Enforced by `replay_recovers_the_prefix_of_a_torn_final_line`
+/// and `replay_still_rejects_corruption_in_the_middle_of_a_log`.
 fn apply_log(
     path: &Path,
     items: &mut Vec<hotl_types::Item>,
@@ -856,10 +862,36 @@ fn apply_log(
     // Same shape, for a dangling `ask_user` question at end-of-log.
     let mut pending_questions: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    for (n, line) in BufReader::new(file).lines().enumerate() {
+    // One-item lookahead so a parse failure can ask "was that the last line?".
+    let mut lines = BufReader::new(file).lines().enumerate().peekable();
+    while let Some((n, line)) = lines.next() {
         let line = line.map_err(|e| format!("read {}: {e}", path.display()))?;
-        let entry: Entry = serde_json::from_str(&line)
-            .map_err(|e| format!("{}:{} unparseable entry: {e}", path.display(), n + 1))?;
+        let entry: Entry = match serde_json::from_str(&line) {
+            Ok(entry) => entry,
+            // A torn *final* line is the crash signature of a non-atomic append
+            // (T1-2): everything before it was durably written. Recover the
+            // prefix instead of bricking the session forever.
+            Err(e) if lines.peek().is_none() => {
+                warnings.push(format!(
+                    "{}: the final log line is incomplete ({e}) — the process was killed \
+                     mid-append. Everything written before it was recovered; only the last \
+                     entry is lost. Continue from the recovered state; if the user expected \
+                     something newer, ask them to restate it.",
+                    path.display()
+                ));
+                break;
+            }
+            // Anything else is corruption *inside* the log, not a torn tail.
+            Err(e) => {
+                return Err(format!(
+                    "{}:{} unparseable entry: {e}. This is damage in the middle of the log, \
+                     not a truncated tail, so the projection cannot be trusted. Copy the file \
+                     aside before doing anything else, then start a fresh session.",
+                    path.display(),
+                    n + 1
+                ))
+            }
+        };
         if chain_ok && entry.parent_id != prev_id {
             warnings.push(format!(
                 "{}: broken parent_id chain at entry {} — the log was edited or truncated after it was written",
@@ -1702,5 +1734,97 @@ mod tests {
         )
         .unwrap();
         assert_eq!(session_name(log.path()), None);
+    }
+
+    #[test]
+    fn replay_recovers_the_prefix_of_a_torn_final_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        let user = |t: &str| Item::User {
+            text: t.into(),
+            synthetic: None,
+        };
+        for text in ["one", "two", "three"] {
+            log.append(&EntryPayload::Item { item: user(text) }, 2)
+                .unwrap();
+        }
+        drop(log);
+
+        // Simulate a crash mid-append: keep everything through the third item's
+        // newline, then re-add a partial fourth line.
+        let whole = std::fs::read_to_string(&path).unwrap();
+        let mut kept: String = whole.lines().take(4).collect::<Vec<_>>().join("\n");
+        kept.push('\n');
+        kept.push_str(r#"{"id":"01TORN","parent_id":"01"#); // torn mid-write
+        std::fs::write(&path, &kept).unwrap();
+
+        let replayed = replay(&path).expect("a torn tail must not brick the session");
+        let texts: Vec<_> = replayed
+            .items
+            .iter()
+            .map(|i| match i {
+                Item::User { text, .. } => text.as_str(),
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            texts,
+            ["one", "two", "three"],
+            "the durable prefix survives"
+        );
+        assert!(
+            replayed.warnings.iter().any(|w| w.contains("incomplete")),
+            "recovery must warn, got {:?}",
+            replayed.warnings
+        );
+    }
+
+    #[test]
+    fn replay_still_rejects_corruption_in_the_middle_of_a_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("01MIDBAD.jsonl");
+        let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":1,"session_id":"01MIDBAD","parent_session_id":null,"model":"m","created_at_ms":0}}}"#;
+        let good = r#"{"id":"x2","parent_id":"h1","ts_ms":0,"payload":{"kind":"item","item":{"type":"user","text":"ok"}}}"#;
+        // Garbage in the middle, a well-formed line after it: not a torn tail.
+        std::fs::write(&path, format!("{header}\n{{not json\n{good}\n")).unwrap();
+
+        let err = replay(&path).expect_err("mid-file corruption is not recoverable");
+        assert!(err.contains("unparseable entry"), "got {err}");
+    }
+
+    #[test]
+    fn replay_chain_recovers_a_torn_ancestor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        parent
+            .append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: "from-parent".into(),
+                        synthetic: None,
+                    },
+                },
+                2,
+            )
+            .unwrap();
+        let parent_path = parent.path().to_path_buf();
+        let parent_id = parent.session_id.clone();
+        drop(parent);
+        let child =
+            SessionLog::create(dir.path(), "m", Some(parent_id), Masker::empty(), 3).unwrap();
+
+        let mut whole = std::fs::read_to_string(&parent_path).unwrap();
+        whole.push_str(r#"{"id":"01TORN""#);
+        std::fs::write(&parent_path, whole).unwrap();
+
+        let replayed = replay_chain(dir.path(), &child.session_id)
+            .expect("a torn ancestor must not brick the whole chain");
+        assert_eq!(
+            replayed.items.len(),
+            1,
+            "the parent's durable item survives"
+        );
+        assert!(replayed.warnings.iter().any(|w| w.contains("incomplete")));
     }
 }
