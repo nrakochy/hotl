@@ -469,35 +469,141 @@ mod sse_parser_tests {
 /// on prose). Both HTTP providers consult this; budgets reset per sample.
 pub mod retry {
     use super::ProviderError;
+    use std::time::Duration;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Decision {
-        /// Wait this many seconds, then retry the request.
-        Retry { after_secs: u64 },
+        /// Wait this long, then retry. The value is the *deterministic* base;
+        /// apply [`with_jitter`] at the sleep site.
+        Retry { delay: Duration },
         /// Not recoverable by retrying (auth, parse, client errors).
         Fatal,
     }
 
-    pub const MAX_ATTEMPTS: u32 = 3;
+    /// Five attempts: four retries at base 1/2/4/8s. Three was thin for
+    /// `overloaded_error` (529), the case this loop primarily exists for.
+    pub const MAX_ATTEMPTS: u32 = 5;
 
-    /// `attempt` is 1-based (the attempt that just failed).
+    /// No single backoff exceeds this, however large `Retry-After` is. A
+    /// server answering `Retry-After: 3600` must not sleep the session for an
+    /// hour with only Ctrl-C as an exit (T2-16).
+    pub const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
+
+    /// `attempt` is 1-based (the attempt that just failed). Deterministic and
+    /// jitter-free on purpose, so the policy is exactly assertable.
     pub fn classify(err: &ProviderError, attempt: u32) -> Decision {
         if attempt >= MAX_ATTEMPTS {
             return Decision::Fatal;
         }
+        let backoff = Duration::from_secs(1u64 << (attempt - 1));
         match err {
             ProviderError::Http {
                 status,
                 retry_after,
                 ..
             } if *status == 429 || *status >= 500 => Decision::Retry {
-                after_secs: retry_after.unwrap_or(1u64 << (attempt - 1)),
+                delay: retry_after
+                    .map(Duration::from_secs)
+                    .unwrap_or(backoff)
+                    .min(RETRY_AFTER_CAP),
             },
             ProviderError::Transport(_) => Decision::Retry {
-                after_secs: 1u64 << (attempt - 1),
+                delay: backoff.min(RETRY_AFTER_CAP),
             },
             _ => Decision::Fatal,
         }
+    }
+
+    /// Full jitter (AWS "Exponential Backoff and Jitter"): a uniform draw in
+    /// `[base/2, base]`.
+    ///
+    /// INVARIANT (T2-16): concurrent hotl processes do not retry in lockstep.
+    /// Enforced by `jitter_stays_in_range_and_actually_varies`.
+    ///
+    /// The entropy source is deliberately dependency-free: `RandomState` is
+    /// seeded per process and advances per call, which is exactly the
+    /// cross-process divergence a thundering herd needs. Not a security
+    /// context — do not reuse this for anything that is.
+    pub fn with_jitter(base: Duration) -> Duration {
+        use std::hash::{BuildHasher, Hasher};
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u32(nanos);
+        h.write_u32(std::process::id());
+        let half = base / 2;
+        let span = base.saturating_sub(half).as_nanos() as u64;
+        if span == 0 {
+            return base;
+        }
+        half + Duration::from_nanos(h.finish() % (span + 1))
+    }
+
+    /// Seconds since the Unix epoch, for [`parse_retry_after`].
+    pub fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Parse a `Retry-After` header in **either** RFC 9110 form: delta-seconds
+    /// (`120`) or an IMF-fixdate (`Wed, 21 Oct 2015 07:28:00 GMT`). Returns
+    /// seconds to wait; a date already in the past yields `0`.
+    ///
+    /// Only the fixdate form is accepted for the date variant — the two
+    /// obsolete forms (RFC 850, asctime) are not emitted by any modern API and
+    /// a miss falls back to exponential backoff, which is safe.
+    pub fn parse_retry_after(value: &str, now_unix: u64) -> Option<u64> {
+        let v = value.trim();
+        if let Ok(secs) = v.parse::<u64>() {
+            return Some(secs);
+        }
+        // "Wed, 21 Oct 2015 07:28:00 GMT"
+        let rest = v.split_once(", ")?.1;
+        let mut parts = rest.split(' ');
+        let day: u32 = parts.next()?.parse().ok()?;
+        let month = match parts.next()? {
+            "Jan" => 1,
+            "Feb" => 2,
+            "Mar" => 3,
+            "Apr" => 4,
+            "May" => 5,
+            "Jun" => 6,
+            "Jul" => 7,
+            "Aug" => 8,
+            "Sep" => 9,
+            "Oct" => 10,
+            "Nov" => 11,
+            "Dec" => 12,
+            _ => return None,
+        };
+        let year: i64 = parts.next()?.parse().ok()?;
+        let mut hms = parts.next()?.split(':');
+        let h: u64 = hms.next()?.parse().ok()?;
+        let m: u64 = hms.next()?.parse().ok()?;
+        let s: u64 = hms.next()?.parse().ok()?;
+        if h > 23 || m > 59 || s > 60 || !(1..=31).contains(&day) {
+            return None;
+        }
+        let secs =
+            days_from_civil(year, month, day).checked_mul(86_400)? as u64 + h * 3600 + m * 60 + s;
+        Some(secs.saturating_sub(now_unix))
+    }
+
+    /// Days since 1970-01-01 for a proleptic-Gregorian civil date
+    /// (Howard Hinnant's `days_from_civil`). ~15 lines of `std` instead of a
+    /// date crate for one header.
+    fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400; // [0, 399]
+        let mp = if m > 2 { m - 3 } else { m + 9 } as i64; // Mar = 0
+        let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        era * 146_097 + doe - 719_468
     }
 
     /// Availability-class errors are the only ones that justify falling back
@@ -562,6 +668,88 @@ pub mod retry {
             assert!(!is_context_overflow(&plain_400));
         }
 
+        /// INVARIANT (T2-16): a server-supplied `Retry-After` never sleeps the
+        /// session for longer than `RETRY_AFTER_CAP`. `Retry-After: 3600` used
+        /// to sleep an hour, escapable only by killing the process.
+        #[test]
+        fn retry_after_is_capped() {
+            let hostile = ProviderError::Http {
+                status: 429,
+                message: String::new(),
+                retry_after: Some(3600),
+            };
+            assert_eq!(
+                classify(&hostile, 1),
+                Decision::Retry {
+                    delay: RETRY_AFTER_CAP
+                }
+            );
+        }
+
+        /// Backoff deepens for 529s: five attempts, base 1/2/4/8s.
+        #[test]
+        fn budget_is_deep_enough_for_an_overload() {
+            let overload = ProviderError::Http {
+                status: 529,
+                message: String::new(),
+                retry_after: None,
+            };
+            assert_eq!(MAX_ATTEMPTS, 5);
+            for (attempt, secs) in [(1u32, 1u64), (2, 2), (3, 4), (4, 8)] {
+                assert_eq!(
+                    classify(&overload, attempt),
+                    Decision::Retry {
+                        delay: std::time::Duration::from_secs(secs)
+                    },
+                    "attempt {attempt}"
+                );
+            }
+            assert_eq!(classify(&overload, MAX_ATTEMPTS), Decision::Fatal);
+        }
+
+        /// INVARIANT (T2-16): retries are jittered, so N processes backing off
+        /// the same upstream do not return in lockstep.
+        #[test]
+        fn jitter_stays_in_range_and_actually_varies() {
+            let base = std::time::Duration::from_secs(8);
+            let mut seen = std::collections::HashSet::new();
+            for _ in 0..500 {
+                let d = with_jitter(base);
+                assert!(d >= base / 2 && d <= base, "{d:?} outside [base/2, base]");
+                seen.insert(d.as_millis());
+            }
+            assert!(
+                seen.len() > 10,
+                "jitter is not varying: {} values",
+                seen.len()
+            );
+        }
+
+        /// Both `Retry-After` forms parse. The date form silently fell back to
+        /// exponential before R3.
+        #[test]
+        fn retry_after_parses_seconds_and_http_date() {
+            // 2015-10-21T07:28:00Z
+            const WHEN: u64 = 1_445_412_480;
+            assert_eq!(parse_retry_after("120", WHEN), Some(120));
+            assert_eq!(parse_retry_after("  120  ", WHEN), Some(120));
+            assert_eq!(
+                parse_retry_after("Wed, 21 Oct 2015 07:30:00 GMT", WHEN),
+                Some(120)
+            );
+            // A date already in the past means "retry now".
+            assert_eq!(
+                parse_retry_after("Wed, 21 Oct 2015 07:00:00 GMT", WHEN),
+                Some(0)
+            );
+            assert_eq!(parse_retry_after("not a date", WHEN), None);
+            // Leap-year and month-boundary sanity for the civil-days math.
+            assert_eq!(
+                parse_retry_after("Mon, 29 Feb 2016 00:00:01 GMT", 1_456_704_000),
+                Some(1)
+            );
+        }
+
         #[test]
         fn classify_rules() {
             let overload = ProviderError::Http {
@@ -569,13 +757,23 @@ pub mod retry {
                 message: String::new(),
                 retry_after: Some(7),
             };
-            assert_eq!(classify(&overload, 1), Decision::Retry { after_secs: 7 });
+            assert_eq!(
+                classify(&overload, 1),
+                Decision::Retry {
+                    delay: std::time::Duration::from_secs(7)
+                }
+            );
             assert_eq!(classify(&overload, MAX_ATTEMPTS), Decision::Fatal);
             let auth = ProviderError::Auth("bad".into());
             assert_eq!(classify(&auth, 1), Decision::Fatal);
             assert!(!is_availability(&auth));
             let transport = ProviderError::Transport("reset".into());
-            assert_eq!(classify(&transport, 2), Decision::Retry { after_secs: 2 });
+            assert_eq!(
+                classify(&transport, 2),
+                Decision::Retry {
+                    delay: std::time::Duration::from_secs(2)
+                }
+            );
             assert!(is_availability(&transport));
             let bad_req = ProviderError::Http {
                 status: 400,

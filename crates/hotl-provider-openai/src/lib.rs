@@ -298,15 +298,18 @@ impl SseAssembler for Assembler {
 /// letting it yield `Retrying` events live (during the backoff, not after).
 enum Attempt {
     Ok(reqwest::Response),
-    Retry { reason: String, wait_secs: u64 },
+    Retry {
+        reason: String,
+        wait: std::time::Duration,
+    },
     Fail(ProviderError),
 }
 
 fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
     match hotl_provider::retry::classify(&err, attempt) {
-        hotl_provider::retry::Decision::Retry { after_secs } => Attempt::Retry {
+        hotl_provider::retry::Decision::Retry { delay } => Attempt::Retry {
             reason,
-            wait_secs: after_secs,
+            wait: hotl_provider::retry::with_jitter(delay),
         },
         hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
     }
@@ -321,7 +324,7 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
         .headers()
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+        .and_then(|v| hotl_provider::retry::parse_retry_after(v, hotl_provider::retry::now_unix()));
     // Read the error class before the body consumes the response.
     let error_type = resp
         .headers()
@@ -377,10 +380,14 @@ impl Provider for OpenAiCompatProvider {
         let stream_idle_timeout = self.stream_idle_timeout;
 
         Box::pin(async_stream::stream! {
-            let mut attempt: u32 = 0;
+            // INVARIANT (T2-16): `attempt` counts network/HTTP attempts only.
+            // An auth refresh is a separate, once-per-request budget owned by
+            // `AuthRetry`, so a 401 → refresh → 429 sequence still has its
+            // full retry allowance.
+            let mut attempts_used: u32 = 0;
             let mut auth_retry = AuthRetry::default();
             let response = loop {
-                attempt += 1;
+                let attempt = attempts_used + 1;
                 let key = match source.get().await {
                     Ok(k) => k,
                     Err(e) => {
@@ -407,11 +414,13 @@ impl Provider for OpenAiCompatProvider {
                 };
                 match outcome {
                     Attempt::Ok(resp) => break resp,
-                    Attempt::Retry { reason, wait_secs } => {
+                    Attempt::Retry { reason, wait } => {
+                        attempts_used = attempt;
                         yield Ok(StreamEvent::Retrying { attempt, reason });
-                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                        tokio::time::sleep(wait).await;
                     }
                     Attempt::Fail(ProviderError::Auth(msg)) => {
+                        // attempts_used deliberately unchanged.
                         match auth_retry.on_auth_error(source.refreshable()) {
                             AuthAction::RefreshAndRetry => match source.refresh().await {
                                 Ok(()) => {

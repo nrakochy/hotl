@@ -207,15 +207,18 @@ fn build_messages(items: &[Item], cache_static: bool) -> Vec<Value> {
 /// letting it yield `Retrying` events live (during the backoff, not after).
 enum Attempt {
     Ok(reqwest::Response),
-    Retry { reason: String, wait_secs: u64 },
+    Retry {
+        reason: String,
+        wait: std::time::Duration,
+    },
     Fail(ProviderError),
 }
 
 fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
     match hotl_provider::retry::classify(&err, attempt) {
-        hotl_provider::retry::Decision::Retry { after_secs } => Attempt::Retry {
+        hotl_provider::retry::Decision::Retry { delay } => Attempt::Retry {
             reason,
-            wait_secs: after_secs,
+            wait: hotl_provider::retry::with_jitter(delay),
         },
         hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
     }
@@ -230,7 +233,7 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
         .headers()
         .get("retry-after")
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok());
+        .and_then(|v| hotl_provider::retry::parse_retry_after(v, hotl_provider::retry::now_unix()));
     // Read the error class before the body consumes the response.
     let error_type = resp
         .headers()
@@ -308,10 +311,15 @@ impl Provider for AnthropicProvider {
         let stream_idle_timeout = self.stream_idle_timeout;
 
         Box::pin(async_stream::stream! {
-            let mut attempt: u32 = 0;
+            // INVARIANT (T2-16): `attempt` counts network/HTTP attempts only.
+            // An auth refresh is a separate, once-per-request budget owned by
+            // `AuthRetry`, so a 401 → refresh → 429 sequence still has its
+            // full retry allowance. Enforced by
+            // `the_auth_refresh_does_not_consume_a_retry_slot`.
+            let mut attempts_used: u32 = 0;
             let mut auth_retry = AuthRetry::default();
             let response = loop {
-                attempt += 1;
+                let attempt = attempts_used + 1;
                 // Subscription mode short-circuits before `source.get()` — the
                 // key source is never consulted, so an environment key cannot
                 // reach a bridge even if one is configured.
@@ -353,11 +361,13 @@ impl Provider for AnthropicProvider {
                 };
                 match outcome {
                     Attempt::Ok(resp) => break resp,
-                    Attempt::Retry { reason, wait_secs } => {
+                    Attempt::Retry { reason, wait } => {
+                        attempts_used = attempt;
                         yield Ok(StreamEvent::Retrying { attempt, reason });
-                        tokio::time::sleep(std::time::Duration::from_secs(wait_secs)).await;
+                        tokio::time::sleep(wait).await;
                     }
                     Attempt::Fail(ProviderError::Auth(msg)) => {
+                        // attempts_used deliberately unchanged.
                         match handle_auth_fail(&source, &mut auth_retry, msg).await {
                             Ok(reason) => yield Ok(StreamEvent::Retrying { attempt, reason }),
                             Err(e) => {
@@ -435,6 +445,7 @@ mod tests {
 
     const SSE_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     const AUTH_401: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad api key";
+    const RETRY_429: &str = "HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/plain\r\nretry-after: 0\r\ncontent-length: 5\r\nconnection: close\r\n\r\nslow!";
 
     /// Serve `responses` to consecutive connections; record each request's
     /// `x-api-key` header (lowercased) into `seen`.
@@ -506,6 +517,32 @@ mod tests {
         let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
         assert_eq!(*seen.lock().unwrap(), vec!["key-1", "key-2"]);
+    }
+
+    /// INVARIANT (T2-16): an auth refresh is not a retry. A 401 → refresh →
+    /// 429 sequence must still have its full retry budget.
+    #[tokio::test]
+    async fn the_auth_refresh_does_not_consume_a_retry_slot() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        // 401 (refresh), then 429 (retry #1), then success.
+        let base = tcp_double(vec![AUTH_401, RETRY_429, SSE_OK], seen.clone()).await;
+        let p =
+            AnthropicProvider::new(Arc::new(FlippingKey(StdMutex::new(1)))).with_base_url(&base);
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        assert_eq!(seen.lock().unwrap().len(), 3);
+        // The HTTP retry reports attempt 1, not attempt 2 — the auth pass did
+        // not consume the counter.
+        let attempts: Vec<u32> = events
+            .iter()
+            .filter_map(|e| match e {
+                Ok(StreamEvent::Retrying { attempt, reason }) if reason.starts_with("HTTP") => {
+                    Some(*attempt)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attempts, vec![1]);
     }
 
     #[test]
