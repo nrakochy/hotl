@@ -1078,10 +1078,57 @@ pub fn ancestor_ids(dir: &Path, session_id: &str) -> Vec<String> {
     out
 }
 
+/// How much of a log's tail `session_name` reads before falling back to a full
+/// scan. Renames land late (and resume copies them into a child log's first
+/// entries), so this hits on the first read for every realistic session.
+const NAME_TAIL_BYTES: u64 = 256 * 1024;
+
 /// The session's display name: the last `rename` entry in its log, if any.
 /// A cheap line-scan (substring pre-filter, then parse) — listing and name
 /// resolution must not pay for a full replay.
+///
+/// INVARIANT: returns the same name a full forward scan would — the tail scan
+/// runs backward, so the last rename in any suffix containing one *is* the last
+/// rename overall, and a tail with none falls back to the full scan. Enforced by
+/// `session_name_finds_the_last_rename_in_a_large_log` and
+/// `session_name_falls_back_to_a_full_scan_when_the_tail_has_no_rename`.
 pub fn session_name(path: &Path) -> Option<String> {
+    name_in_tail(path).or_else(|| name_by_full_scan(path))
+}
+
+/// Scan the last `NAME_TAIL_BYTES` backward. Reads bytes (not `read_to_string`)
+/// because the window boundary can land mid-codepoint.
+fn name_in_tail(path: &Path) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(NAME_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start)).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    // When the window is a true suffix, its first line is probably partial.
+    let body = if start > 0 {
+        text.split_once('\n').map(|(_, rest)| rest)?
+    } else {
+        text.as_ref()
+    };
+    body.lines().rev().find_map(|line| {
+        if !line.contains("\"rename\"") {
+            return None;
+        }
+        match serde_json::from_str::<Entry>(line) {
+            Ok(Entry {
+                payload: EntryPayload::Rename { name },
+                ..
+            }) => Some(name),
+            _ => None,
+        }
+    })
+}
+
+/// The original forward scan — the fallback when no rename is in the tail.
+fn name_by_full_scan(path: &Path) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut name = None;
     for line in BufReader::new(file).lines() {
@@ -2152,5 +2199,72 @@ mod tests {
         let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":1,"session_id":"01SELF2","parent_session_id":"01SELF2","model":"m","created_at_ms":0}}}"#;
         std::fs::write(&path, format!("{header}\n")).unwrap();
         assert!(ancestor_ids(dir.path(), "01SELF2").is_empty());
+    }
+
+    #[test]
+    fn session_name_finds_the_last_rename_in_a_large_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        // A rename buried at the very start, then enough bulk to push past the
+        // tail window, then the rename that must win.
+        log.append(
+            &EntryPayload::Rename {
+                name: "early".into(),
+            },
+            2,
+        )
+        .unwrap();
+        let filler = "x".repeat(4096);
+        for _ in 0..128 {
+            log.append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: filler.clone(),
+                        synthetic: None,
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        }
+        log.append(
+            &EntryPayload::Rename {
+                name: "late".into(),
+            },
+            4,
+        )
+        .unwrap();
+
+        assert_eq!(session_name(&path).as_deref(), Some("late"));
+        assert_eq!(replay(&path).unwrap().name.as_deref(), Some("late"));
+    }
+
+    #[test]
+    fn session_name_falls_back_to_a_full_scan_when_the_tail_has_no_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(
+            &EntryPayload::Rename {
+                name: "only".into(),
+            },
+            2,
+        )
+        .unwrap();
+        let filler = "y".repeat(4096);
+        for _ in 0..128 {
+            log.append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: filler.clone(),
+                        synthetic: None,
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        }
+        assert_eq!(session_name(&path).as_deref(), Some("only"));
     }
 }
