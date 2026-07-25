@@ -51,6 +51,23 @@ pub(crate) fn checked_tool_name(tool: &str) -> Result<&str, String> {
     Ok(tool)
 }
 
+/// Told the model when a server announced `notifications/tools/list_changed`
+/// since it last listed. Empty when nothing changed.
+///
+/// INVARIANT: when a server announces a tool-list change, the *model* is told —
+/// a stale schema in context is worse than a stale cache. Enforced by
+/// `a_changed_tool_set_is_announced_to_the_model`.
+fn staleness_notice(server: &str, client: &Client) -> String {
+    if !client.tools_changed() {
+        return String::new();
+    }
+    format!(
+        "\n\n[`{}`'s tool list changed since you last listed it. Call `mcp` with \
+         only {{\"server\"}} to see the current tools before relying on a schema.]",
+        sanitize::attr_safe(server)
+    )
+}
+
 /// How a server config becomes a live client. Public so integration tests can
 /// name it when they share one connector across several fixtures.
 pub type Connector =
@@ -281,10 +298,14 @@ impl McpTool {
             Some(tool) => {
                 let arguments = input.get("arguments").cloned().unwrap_or(json!({}));
                 match client.call_tool_cancellable(tool, arguments, &cancel).await {
-                    Ok((text, is_error)) => ToolOutcome {
-                        content: self.envelope(server_name, tool, &text),
-                        is_error,
-                    },
+                    Ok((text, is_error)) => {
+                        let mut content = self.envelope(server_name, tool, &text);
+                        // Our text, appended outside the envelope body: it must
+                        // not go through `defang`, and it must not read as
+                        // something the server said.
+                        content.push_str(&staleness_notice(server_name, &client));
+                        ToolOutcome { content, is_error }
+                    }
                     Err(e) => ToolOutcome::err(self.envelope(server_name, tool, &e)),
                 }
             }

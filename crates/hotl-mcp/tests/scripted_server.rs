@@ -1,5 +1,16 @@
-//! Golden MCP scenarios against an in-process scripted server (duplex
-//! streams — the real client/reader/writer stack, no child process).
+//! MCP scenarios against in-process scripted servers (duplex streams — the
+//! real client/reader/writer stack, no child process).
+//!
+//! Covered here: the golden happy path (screen → trust → sanitized traffic);
+//! the screened-fingerprint gate (no screen, and a binary swapped between the
+//! screen and the spawn); shown == recorded (H-07); a crashed server being
+//! reconnected rather than waited on; EOF with a request in flight; ESC
+//! cancelling an in-flight call; a changed tool set being announced to the
+//! model; a malformed line not wedging the reader; and `notifications/cancelled`
+//! reaching the server. Transport-level failure modes (string ids, oversized
+//! lines, blocked writers, stderr capture) live in `src/client.rs`.
+
+use std::sync::{Arc, Mutex};
 
 use hotl_mcp::client::Client;
 use hotl_mcp::config::ServerConfig;
@@ -243,6 +254,152 @@ async fn run(tool: &McpTool, input: Value) -> hotl_tools::ToolOutcome {
 }
 
 #[tokio::test]
+async fn a_changed_tool_set_is_announced_to_the_model() {
+    // §8: `tools_stale` was written in two places and read nowhere. The gap
+    // that matters is not the cache — it is that the model was never told the
+    // tool set moved under it, and kept relying on a schema it had cached.
+    let dir = tempfile::tempdir().unwrap();
+    let tool = scripted_tool(dir.path()); // fires list_changed after each call
+    let _ = tool.permission(&json!({"server": "docs", "tool": "echo"}));
+    let _ = run(
+        &tool,
+        json!({"server":"docs","tool":"echo","arguments":{"msg":"hi"}}),
+    )
+    .await;
+    // Poll: the notification is async.
+    let mut announced = false;
+    for _ in 0..20 {
+        let out = run(
+            &tool,
+            json!({"server":"docs","tool":"echo","arguments":{"msg":"hi"}}),
+        )
+        .await;
+        if out.content.contains("tool list changed") {
+            announced = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        announced,
+        "the model must be told to re-list, not silently served stale schemas"
+    );
+}
+
+#[tokio::test]
+async fn malformed_json_does_not_wedge_the_connection() {
+    // A server that emits a garbage line, then a valid reply: the garbage is
+    // skipped and the valid reply still lands.
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(server_end);
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            let mut out = String::from("{ this is not json at all ]\n");
+            out.push_str(&json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}}).to_string());
+            out.push('\n');
+            if write.write_all(out.as_bytes()).await.is_err() {
+                return;
+            }
+        }
+    });
+    let (r, w) = tokio::io::split(client_end);
+    let client = Client::from_streams(r, w);
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.request("ping", json!({})),
+    )
+    .await
+    .expect("a garbage line must not wedge the reader")
+    .expect("the valid reply still lands");
+    assert_eq!(got, json!({"ok": true}));
+    assert!(!client.is_dead(), "a skipped line is not a fatal desync");
+}
+
+#[tokio::test]
+async fn a_cancelled_call_notifies_the_server_and_stays_usable() {
+    // Covers the `notifications/cancelled` emit that had no test. It is
+    // exercised through the *cancel* arm, which shares the one helper with the
+    // timeout arm — the timeout arm itself cannot be reached in a test without
+    // waiting out the 600s `tools/call` leash.
+    let cancelled_id: Arc<Mutex<Option<Value>>> = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&cancelled_id);
+    let (client_end, server_end) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let (read, mut write) = tokio::io::split(server_end);
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let msg: Value = serde_json::from_str(&line).unwrap();
+            let id = msg.get("id").cloned().unwrap_or(Value::Null);
+            match msg.get("method").and_then(Value::as_str) {
+                // Never answered: the caller must cancel.
+                Some("tools/call") => continue,
+                Some("notifications/cancelled") => {
+                    *seen.lock().unwrap() = msg.pointer("/params/requestId").cloned();
+                    continue;
+                }
+                Some("notifications/initialized") => continue,
+                _ => {
+                    let out = json!({"jsonrpc":"2.0","id":id,"result":{"ok":true}});
+                    if write
+                        .write_all(format!("{out}\n").as_bytes())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+    });
+    let (r, w) = tokio::io::split(client_end);
+    let client = Client::from_streams(r, w);
+    client.initialize().await.expect("handshake");
+
+    let cancel = CancellationToken::new();
+    let c = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        c.cancel();
+    });
+    let err = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.call_tool_cancellable("echo", json!({}), &cancel),
+    )
+    .await
+    .expect("cancel must not wait out the 600s timeout")
+    .expect_err("a cancelled call is an error");
+    assert!(err.contains("cancel"), "{err}");
+
+    // The server was told to stop the work, carrying the request's id.
+    let mut saw = None;
+    for _ in 0..50 {
+        if let Some(id) = cancelled_id.lock().unwrap().clone() {
+            saw = Some(id);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        saw.is_some(),
+        "a cancelled call must tell the server to stop, or it keeps computing"
+    );
+
+    // And the connection is still usable — cancellation is not a death.
+    assert!(!client.is_dead());
+    let got = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client.request("ping", json!({})),
+    )
+    .await
+    .expect("still usable")
+    .expect("ok");
+    assert_eq!(got, json!({"ok": true}));
+}
+
+#[tokio::test]
 async fn a_crashed_server_is_reconnected_not_waited_on() {
     // T2-13a. The scripted server exits after its first tools/call; the
     // second call must reconnect within seconds, not time out at 600s.
@@ -455,6 +612,12 @@ async fn first_use_screen_then_trust_then_sanitized_traffic() {
     // 6. Unknown servers and unknown tools fail as data, not crashes.
     let unknown = run(&tool, json!({"server": "nope"})).await;
     assert!(unknown.is_error && unknown.content.contains("Configured servers: docs"));
+    // `missing` is a *well-formed* name that the whitelist accepts — it is the
+    // server that rejects it. So this proves the remaining half: an unknown-tool
+    // error is still enveloped as untrusted, and the name it carries has already
+    // been through `checked_tool_name` (T1-8), which is why the envelope's
+    // `source` attribute cannot be forged from it.
     let bad_tool = run(&tool, json!({"server": "docs", "tool": "missing"})).await;
     assert!(bad_tool.is_error && bad_tool.content.contains("trust=\"untrusted\""));
+    assert!(bad_tool.content.contains("source=\"mcp:docs/missing\""));
 }
