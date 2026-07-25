@@ -457,7 +457,13 @@ async fn scaffold(
     // `build_registry` consumes the original for the web tools, so the
     // `agents` cap and the `requests` cap draw from one shared budget, not
     // two independently-built ones.
-    let (registry, skills) = build_registry(&cfg, &config_dir, concurrency.clone());
+    let (registry, skills, discovery_warnings) =
+        build_registry(&cfg, &config_dir, concurrency.clone());
+    // The one place that owns stdout: `scaffold` runs before any terminal
+    // guard takes the screen, so these land as plain lines (T3-23).
+    for w in discovery_warnings {
+        eprintln!("hotl: {w}");
+    }
     let registry = Arc::new(registry);
     let hooks = load_hooks(&cfg, concurrency.clone());
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
@@ -744,11 +750,20 @@ fn snapshot_provider(
 /// a `fork` can bind to that session's own actor. `web_fetch` is always
 /// registered; `web_search` only when `[web] search` is configured (the
 /// `recall` gate).
+/// The tool registry, the skill catalog for `/`-dispatch, and the warnings
+/// discovery produced.
+///
+/// INVARIANT: no output from this function — it can run with the alternate
+/// screen active, where a stray `eprintln!` corrupts the TUI (T3-23).
+/// Warnings are returned to the one caller that owns stdout, matching the
+/// pattern `load_rules_with` already establishes in this file. Enforced by
+/// `build_registry_has_no_direct_output`.
 fn build_registry(
     cfg: &crate::config::Config,
     config_dir: &std::path::Path,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
-) -> (Registry, Vec<(String, String)>) {
+) -> (Registry, Vec<(String, String)>, Vec<String>) {
+    let mut discovery_warnings: Vec<String> = Vec::new();
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
     let diagnostics = cfg
         .hooks_toml()
@@ -769,9 +784,7 @@ fn build_registry(
     // are hotl's own and load regardless.
     let include_claude = cfg.skills.claude.unwrap_or(true);
     let (marketplaces, warnings) = cfg.skills.marketplace_roots(config_dir);
-    for w in warnings {
-        eprintln!("hotl: {w}");
-    }
+    discovery_warnings.extend(warnings);
     // One discovery walk: the names for `/`-dispatch and their descriptions
     // come off the same tool that goes into the registry, never a second
     // scan of the roots.
@@ -794,9 +807,7 @@ fn build_registry(
         .unwrap_or_default();
     if !retrieval.is_empty() {
         let (backends, warnings) = hotl_retrieval::config::build(retrieval, config_dir);
-        for w in warnings {
-            eprintln!("hotl: {w}");
-        }
+        discovery_warnings.extend(warnings);
         if !backends.is_empty() {
             registry.register(Box::new(hotl_retrieval::RecallTool::new(backends)));
         }
@@ -833,7 +844,7 @@ fn build_registry(
             search_concurrency,
         )));
     }
-    (registry, skills_catalog)
+    (registry, skills_catalog, discovery_warnings)
 }
 
 /// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
@@ -1987,6 +1998,22 @@ pub(crate) fn sessions_dir() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// Library code inside a TUI process must not write to stderr — it lands
+    /// on the alternate screen (T3-23). Warnings are returned; exactly one
+    /// caller, outside the terminal guard, prints them.
+    #[test]
+    fn build_registry_has_no_direct_output() {
+        let src = include_str!("agent.rs");
+        let start = src.find("fn build_registry").expect("build_registry");
+        let end = src[start..]
+            .find("\nfn ")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(!body.contains("eprintln!"), "build_registry still prints");
+        assert!(!body.contains("println!"), "build_registry still prints");
+    }
+
     /// `/`-dispatch names come out of the registry's own discovery walk.
     /// If this ever needs a second `SkillTool::new`, the roster is being
     /// scanned twice per start again.
@@ -2001,7 +2028,7 @@ mod tests {
         // developer's machine and would leak into this assertion.
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (_registry, catalog) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (_registry, catalog, _warnings) = build_registry(&cfg, dir.path(), test_concurrency());
         assert_eq!(
             catalog,
             vec![("deploy".to_string(), "Deploy checklist".to_string())],
@@ -2010,7 +2037,8 @@ mod tests {
 
         // No skills configured → no names, and no tool registered.
         let empty = tempfile::tempdir().unwrap();
-        let (_registry, catalog) = build_registry(&cfg, empty.path(), test_concurrency());
+        let (_registry, catalog, _warnings) =
+            build_registry(&cfg, empty.path(), test_concurrency());
         assert!(catalog.is_empty(), "{catalog:?}");
     }
 
@@ -2197,14 +2225,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (registry, _) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (registry, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_none());
 
         let cfg = config_from_toml(
             "[web]\n[web.search]\nurl = \"https://s.example/api\"\napi_key_env = \"SEARCH_KEY\"\n",
         );
-        let (registry, _) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (registry, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_some());
     }
