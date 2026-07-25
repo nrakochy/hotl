@@ -42,6 +42,10 @@ pub struct GcReport {
     /// session descends from them, so deleting them would destroy a live
     /// conversation (T2-5).
     pub protected: Vec<String>,
+    /// `(session id, first error)` for a session whose deletion failed in whole
+    /// or in part. `pruned[].bytes` counts only bytes actually removed, so a
+    /// report can never claim space it did not free (T2-5b).
+    pub failed: Vec<(String, String)>,
     pub dry_run: bool,
 }
 
@@ -104,11 +108,22 @@ pub fn gc(data_dir: &Path, policy: &RetentionPolicy, dry_run: bool) -> GcReport 
             continue;
         }
         let targets = session_paths(log_path, &shadow_dir, id);
-        let bytes = targets.iter().map(|p| dir_or_file_size(p)).sum();
-        if !dry_run {
-            for p in &targets {
-                remove(p);
+        let mut bytes = 0u64;
+        let mut failure: Option<String> = None;
+        for p in &targets {
+            let size = dir_or_file_size(p);
+            if dry_run {
+                bytes += size;
+                continue;
             }
+            match remove(p) {
+                Ok(()) => bytes += size,
+                Err(e) if failure.is_none() => failure = Some(format!("{}: {e}", p.display())),
+                Err(_) => {}
+            }
+        }
+        if let Some(e) = failure {
+            report.failed.push((id.clone(), e));
         }
         report.pruned.push(PrunedSession {
             id: id.clone(),
@@ -141,15 +156,18 @@ fn dir_or_file_size(p: &Path) -> u64 {
     }
 }
 
-fn remove(p: &Path) {
+/// INVARIANT: reported bytes were actually freed. A deletion that fails lands
+/// in `failed` and contributes nothing to `bytes_freed()`. Enforced by
+/// `a_failed_delete_is_reported_and_not_counted_as_freed`.
+fn remove(p: &Path) -> std::io::Result<()> {
     let Ok(meta) = std::fs::symlink_metadata(p) else {
-        return;
+        return Ok(()); // already gone — nothing to free, nothing to report
     };
-    let _ = if meta.is_dir() {
+    if meta.is_dir() {
         std::fs::remove_dir_all(p)
     } else {
         std::fs::remove_file(p)
-    };
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +183,17 @@ mod tests {
         std::fs::create_dir_all(shadow.join(format!("{id}.git"))).unwrap();
         std::fs::write(shadow.join(format!("{id}.git/HEAD")), "ref").unwrap();
         id
+    }
+
+    /// Backdate a session's log so age-based policy sees it as `ago` old.
+    /// Replaces `thread::sleep` for mtime ordering — exact, and it works on
+    /// coarse-mtime filesystems where a 10 ms sleep does not (§8 flakiness).
+    fn backdate(sessions: &Path, id: &str, ago: Duration) {
+        let path = sessions.join(format!("{id}.jsonl"));
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        let when = SystemTime::now() - ago;
+        f.set_times(std::fs::FileTimes::new().set_modified(when))
+            .unwrap();
     }
 
     /// A parent→child chain of `depth` sessions; returns the ids oldest-first.
@@ -252,12 +281,11 @@ mod tests {
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::create_dir_all(&shadow).unwrap();
 
-        let ids: Vec<String> = (0..3)
-            .map(|_| {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                make_session(&sessions, &shadow)
-            })
-            .collect();
+        let ids: Vec<String> = (0..3).map(|_| make_session(&sessions, &shadow)).collect();
+        // Deterministic newest-first ordering without sleeping (§8 flakiness).
+        for (i, id) in ids.iter().enumerate() {
+            backdate(&sessions, id, Duration::from_secs(3600 * (3 - i as u64)));
+        }
 
         // Keep the newest 1 → the two oldest are pruned.
         let policy = RetentionPolicy {
@@ -280,6 +308,69 @@ mod tests {
                 "shadow repo pruned"
             );
         }
+    }
+
+    #[test]
+    fn max_age_prunes_only_what_is_older_than_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let sessions = data.join("sessions");
+        let shadow = data.join("shadow");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+
+        let old = make_session(&sessions, &shadow);
+        let fresh = make_session(&sessions, &shadow);
+        backdate(&sessions, &old, Duration::from_secs(30 * 86_400));
+        backdate(&sessions, &fresh, Duration::from_secs(60));
+
+        let policy = RetentionPolicy {
+            max_age: Some(Duration::from_secs(7 * 86_400)),
+            max_sessions: None,
+        };
+        let report = gc(data, &policy, false);
+        let pruned: Vec<&str> = report.pruned.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(pruned, [old.as_str()], "only the 30-day-old session");
+        assert!(sessions.join(format!("{fresh}.jsonl")).exists());
+    }
+
+    #[test]
+    fn a_failed_delete_is_reported_and_not_counted_as_freed() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let sessions = data.join("sessions");
+        let shadow = data.join("shadow");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+        let id = make_session(&sessions, &shadow);
+        let log_bytes = std::fs::metadata(sessions.join(format!("{id}.jsonl")))
+            .unwrap()
+            .len();
+
+        // Make the log undeletable by sealing its parent directory.
+        let mut perms = std::fs::metadata(&sessions).unwrap().permissions();
+        let original = perms.clone();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
+        std::fs::set_permissions(&sessions, perms).unwrap();
+
+        let policy = RetentionPolicy {
+            max_sessions: Some(0),
+            max_age: None,
+        };
+        let report = gc(data, &policy, false);
+        std::fs::set_permissions(&sessions, original).unwrap();
+
+        assert_eq!(report.failed.len(), 1, "the failure must surface");
+        assert_eq!(report.failed[0].0, id);
+        assert!(
+            sessions.join(format!("{id}.jsonl")).exists(),
+            "the log really did survive — the report must not claim otherwise"
+        );
+        assert!(
+            report.bytes_freed() < log_bytes,
+            "the surviving log's {log_bytes} bytes must not be counted as freed, got {}",
+            report.bytes_freed()
+        );
     }
 
     #[test]
