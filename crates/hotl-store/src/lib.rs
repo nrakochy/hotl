@@ -776,38 +776,78 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     })
 }
 
+/// Read just a log's header entry — the first line, never the whole file.
+/// Shared by the lineage walk and by retention's ancestor closure.
+fn read_header(path: &Path) -> Result<hotl_types::SessionHeader, String> {
+    let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut first_line = String::new();
+    BufReader::new(file)
+        .read_line(&mut first_line)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    if first_line.is_empty() {
+        return Err(format!("{}: empty log", path.display()));
+    }
+    let first: Entry = serde_json::from_str(first_line.trim_end_matches(['\n', '\r']))
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    match first.payload {
+        EntryPayload::Header { header } => Ok(header),
+        _ => Err(format!("{}: first entry is not a header", path.display())),
+    }
+}
+
+/// The maximum ancestry depth a lineage walk follows. Resume is fork, so this
+/// is "how many resumes of one conversation stay in context".
+pub const LINEAGE_DEPTH_CAP: usize = 32;
+
 /// Replay a session *and its ancestry*: a resumed session's log starts from
 /// the parent's projection, so entry indices (compaction, branch moves) are
-/// relative to inherited-plus-own items. Cycle/depth capped at 32.
+/// relative to inherited-plus-own items.
+///
+/// INVARIANT: the walk terminates and never applies a log twice — a repeated
+/// session id ends it (cycle) and `LINEAGE_DEPTH_CAP` bounds it (depth). Both
+/// emit a warning rather than passing silently. Enforced by
+/// `replay_chain_detects_a_self_parent_cycle`,
+/// `replay_chain_detects_an_a_b_a_cycle`, and
+/// `replay_chain_warns_when_ancestry_exceeds_the_depth_cap`.
 pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
+    let mut warnings = Vec::new();
     let mut lineage = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut current = session_id.to_string();
-    for _ in 0..32 {
-        let path = dir.join(format!("{current}.jsonl"));
-        // The lineage walk needs only the header — read the first line, not the file.
-        let file = File::open(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let mut first_line = String::new();
-        BufReader::new(file)
-            .read_line(&mut first_line)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        if first_line.is_empty() {
-            return Err(format!("{}: empty log", path.display()));
+    // False only if the walk ran out of depth (as opposed to reaching a root
+    // or stopping deliberately).
+    let mut terminated = false;
+    for _ in 0..LINEAGE_DEPTH_CAP {
+        if !visited.insert(current.clone()) {
+            warnings.push(format!(
+                "session {current} appears twice in its own ancestry — the lineage is a cycle, \
+                 so the walk stopped there. History before that point is not in context; if the \
+                 user refers to something older, ask them to restate it."
+            ));
+            terminated = true;
+            break;
         }
-        let first: Entry = serde_json::from_str(first_line.trim_end_matches(['\n', '\r']))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        let EntryPayload::Header { header } = first.payload else {
-            return Err(format!("{}: first entry is not a header", path.display()));
-        };
+        let path = dir.join(format!("{current}.jsonl"));
+        let header = read_header(&path)?;
         let parent = header.parent_session_id.clone();
         lineage.push((path, header));
         match parent {
             Some(p) => current = p,
-            None => break,
+            None => {
+                terminated = true;
+                break;
+            }
         }
+    }
+    if !terminated {
+        warnings.push(format!(
+            "this conversation has been resumed more than {LINEAGE_DEPTH_CAP} times; only the \
+             newest {LINEAGE_DEPTH_CAP} sessions were replayed, so older history is not in \
+             context. Ask the user for anything you need from before that point."
+        ));
     }
     let (_, newest_header) = lineage.first().cloned().ok_or("empty lineage")?;
     let mut items = Vec::new();
-    let mut warnings = Vec::new();
     // Parent-first, so a child's rename/mode-set/todos naturally overwrites
     // the parent's.
     let mut name = None;
@@ -1889,6 +1929,94 @@ mod tests {
         assert!(
             replayed.warnings.iter().any(|w| w.contains("unrecognized")),
             "silently dropping an unknown entry is the bug, got {:?}",
+            replayed.warnings
+        );
+    }
+
+    #[test]
+    fn replay_chain_detects_a_self_parent_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("01SELF.jsonl");
+        // A header naming itself as parent — hand-planted, since `create` cannot
+        // produce one (the id is generated inside).
+        let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":1,"session_id":"01SELF","parent_session_id":"01SELF","model":"m","created_at_ms":0}}}"#;
+        let item = r#"{"id":"x2","parent_id":"h1","ts_ms":0,"payload":{"kind":"item","item":{"type":"user","text":"once"}}}"#;
+        std::fs::write(&path, format!("{header}\n{item}\n")).unwrap();
+
+        let replayed = replay_chain(dir.path(), "01SELF").expect("a cycle degrades, never hangs");
+        assert_eq!(
+            replayed.items.len(),
+            1,
+            "a self-parent must be applied once, not 32 times"
+        );
+        assert!(
+            replayed.warnings.iter().any(|w| w.contains("cycle")),
+            "a cycle must warn, got {:?}",
+            replayed.warnings
+        );
+    }
+
+    #[test]
+    fn replay_chain_detects_an_a_b_a_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let plant = |id: &str, parent: &str, text: &str| {
+            let header = format!(
+                r#"{{"id":"h1","parent_id":null,"ts_ms":0,"payload":{{"kind":"header","header":{{"format_version":1,"session_id":"{id}","parent_session_id":"{parent}","model":"m","created_at_ms":0}}}}}}"#
+            );
+            let item = format!(
+                r#"{{"id":"x2","parent_id":"h1","ts_ms":0,"payload":{{"kind":"item","item":{{"type":"user","text":"{text}"}}}}}}"#
+            );
+            std::fs::write(
+                dir.path().join(format!("{id}.jsonl")),
+                format!("{header}\n{item}\n"),
+            )
+            .unwrap();
+        };
+        plant("01A", "01B", "from-a");
+        plant("01B", "01A", "from-b");
+
+        let replayed = replay_chain(dir.path(), "01A").expect("a cycle degrades, never hangs");
+        assert_eq!(replayed.items.len(), 2, "each log applied exactly once");
+        assert!(replayed.warnings.iter().any(|w| w.contains("cycle")));
+    }
+
+    #[test]
+    fn replay_chain_warns_when_ancestry_exceeds_the_depth_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        // 33 forks — one more than the cap. Resume forks on every resume, so this
+        // is a conversation resumed 33 times, not a pathological input.
+        let mut parent: Option<String> = None;
+        for _ in 0..(LINEAGE_DEPTH_CAP + 1) {
+            let log =
+                SessionLog::create(dir.path(), "m", parent.clone(), Masker::empty(), 1).unwrap();
+            parent = Some(log.session_id.clone());
+        }
+        let newest = parent.unwrap();
+
+        let replayed = replay_chain(dir.path(), &newest).expect("replay still succeeds");
+        assert!(
+            replayed
+                .warnings
+                .iter()
+                .any(|w| w.contains("older history")),
+            "silently amputating ancestry is the bug, got {:?}",
+            replayed.warnings
+        );
+    }
+
+    #[test]
+    fn replay_chain_within_the_depth_cap_is_silent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent: Option<String> = None;
+        for _ in 0..LINEAGE_DEPTH_CAP {
+            let log =
+                SessionLog::create(dir.path(), "m", parent.clone(), Masker::empty(), 1).unwrap();
+            parent = Some(log.session_id.clone());
+        }
+        let replayed = replay_chain(dir.path(), &parent.unwrap()).unwrap();
+        assert!(
+            replayed.warnings.is_empty(),
+            "a chain exactly at the cap is clean, got {:?}",
             replayed.warnings
         );
     }
