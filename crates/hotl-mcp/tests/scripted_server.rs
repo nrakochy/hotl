@@ -118,10 +118,15 @@ async fn first_use_screen_then_trust_then_sanitized_traffic() {
     assert!(listing.content.contains("trust=\"untrusted\""));
     assert!(listing.content.contains("source=\"mcp:docs/tools/list\""));
 
-    // 3. Trust is now recorded: subsequent permission is a plain ask.
+    // 3. T2-7b: this fixture's binary does not exist, so it cannot be hashed —
+    //    and an unhashable binary is never recorded as trusted. The screen
+    //    comes back *protected* every time rather than decaying to a plain ask
+    //    against the literal string `unavailable:{e}`, which is what used to be
+    //    persisted and then matched forever. The trusted path is covered
+    //    separately with a real, hashable fixture binary.
     assert!(matches!(
         tool.permission(&json!({"server": "docs", "tool": "echo"})),
-        Permission::Ask { .. }
+        Permission::AskProtected { .. }
     ));
 
     // 4. A call round-trips and is enveloped with per-tool provenance.

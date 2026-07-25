@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use crate::client::Client;
 use crate::config::ServerConfig;
 use crate::sanitize::{self, wrap_budgeted, Budget, MCP_TRAILER};
-use crate::trust::{binary_hash, TrustStore};
+use crate::trust::{Fingerprint, TrustStore};
 
 /// Cap chosen to fit any real MCP tool name with headroom while bounding what
 /// can be interpolated anywhere downstream.
@@ -63,10 +63,10 @@ pub struct McpTool {
     servers: Vec<ServerConfig>,
     clients: tokio::sync::Mutex<HashMap<String, ClientSlot>>,
     trust: Mutex<TrustStore>,
-    /// Binary hash per server, computed once and reused for the trust screen
+    /// Fingerprint per server, computed once and reused for the trust screen
     /// and the recorded grant (H-07): the value the user is shown is exactly
     /// the value persisted, and the file isn't re-read on every call.
-    hashes: Mutex<HashMap<String, String>>,
+    hashes: Mutex<HashMap<String, Fingerprint>>,
     connector: Connector,
     description: String,
     /// Cumulative external-content budget for this tool instance (one
@@ -132,24 +132,25 @@ impl McpTool {
         )
     }
 
-    /// Cached binary hash for a server (computed once per session). The hash
-    /// is computed before taking the lock — racing computes are idempotent —
-    /// so a slow file read never holds the cache against other servers.
-    fn hash_of(&self, cfg: &ServerConfig) -> String {
-        if let Some(hash) = self
+    /// Cached fingerprint for a server (computed once per session). The
+    /// fingerprint is computed before taking the lock — racing computes are
+    /// idempotent — so a slow file read never holds the cache against other
+    /// servers.
+    fn hash_of(&self, cfg: &ServerConfig) -> Fingerprint {
+        if let Some(fp) = self
             .hashes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(&cfg.name)
         {
-            return hash.clone();
+            return fp.clone();
         }
-        let hash = binary_hash(&cfg.command);
+        let fp = Fingerprint::of(cfg);
         self.hashes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .entry(cfg.name.clone())
-            .or_insert(hash)
+            .or_insert(fp)
             .clone()
     }
 
@@ -165,11 +166,14 @@ impl McpTool {
                 // upstream — record the grant now, keyed to the *same* hash
                 // the screen showed (H-07: shown value == recorded value,
                 // from one read).
-                let hash = self.hash_of(cfg);
-                self.trust
+                let fp = self.hash_of(cfg);
+                // An unhashable binary refuses the grant, so the protected ask
+                // comes back every time (T2-7b). Task 7 surfaces the reason.
+                let _ = self
+                    .trust
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .record(&cfg.name, &hash);
+                    .record(&cfg.name, &fp);
                 Ok::<_, String>(client)
             })
             .await?;
@@ -276,23 +280,24 @@ impl Tool for McpTool {
             // Unknown server: run() errors without side effects.
             return Permission::None;
         };
-        let hash = self.hash_of(cfg);
+        let fp = self.hash_of(cfg);
         if self
             .trust
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_trusted(server, &hash)
+            .is_trusted(server, &fp)
         {
             Permission::Ask { summary }
         } else {
             Permission::AskProtected {
                 summary,
+                // `Fingerprint`'s Display *is* the screen text, so the value
+                // shown and the value recorded come from one read (H-07).
                 why: format!(
-                    "first use of MCP server `{server}` (or its binary changed).\n\
-                     binary: {}\n  {hash}\n\
+                    "first use of MCP server `{server}` (or its program changed).\n\
+                     {fp}\n\
                      Approving runs this program on your machine and lets its \
-                     output into the model's context.",
-                    cfg.command
+                     output into the model's context."
                 ),
             }
         }

@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use futures_util::future::BoxFuture;
 use hotl_mcp::config::ServerConfig;
-use hotl_mcp::trust::{binary_hash, TrustStore};
+use hotl_mcp::trust::{Fingerprint, TrustStore};
 use hotl_tools::Permission;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -46,7 +46,7 @@ pub struct McpRetriever {
     tool: String,
     slot: tokio::sync::OnceCell<Arc<dyn McpCall>>,
     trust: Mutex<TrustStore>,
-    hash: OnceLock<String>,
+    hash: OnceLock<Fingerprint>,
     connector: Connector,
 }
 
@@ -88,8 +88,8 @@ impl McpRetriever {
         }
     }
 
-    fn hash(&self) -> &str {
-        self.hash.get_or_init(|| binary_hash(&self.cfg.command))
+    fn hash(&self) -> &Fingerprint {
+        self.hash.get_or_init(|| Fingerprint::of(&self.cfg))
     }
 
     async fn ensure(&self) -> Result<Arc<dyn McpCall>, String> {
@@ -100,11 +100,13 @@ impl McpRetriever {
                 // Reaching search() means the (protected) ask was approved
                 // upstream — record the grant, keyed to the same hash the
                 // screen showed (the McpTool H-07 discipline).
-                let hash = self.hash().to_string();
-                self.trust
+                // An unhashable binary refuses the grant, so the protected ask
+                // comes back every time (T2-7b). Task 7 surfaces the reason.
+                let _ = self
+                    .trust
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
-                    .record(&self.cfg.name, &hash);
+                    .record(&self.cfg.name, self.hash());
                 Ok::<_, String>(client)
             })
             .await?;
@@ -130,23 +132,25 @@ impl Retriever for McpRetriever {
     fn permission(&self, query: &str) -> Permission {
         let summary =
             hotl_mcp::sanitize::safe_summary(&format!("recall: {} \"{query}\"", self.cfg.name));
-        let hash = self.hash().to_string();
+        let fp = self.hash();
         if self
             .trust
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .is_trusted(&self.cfg.name, &hash)
+            .is_trusted(&self.cfg.name, fp)
         {
             Permission::Ask { summary }
         } else {
             Permission::AskProtected {
                 summary,
+                // `Fingerprint`'s Display *is* the screen text, so the value
+                // shown and the value recorded come from one read (H-07).
                 why: format!(
-                    "first use of retrieval backend `{}` (or its binary changed).\n\
-                     binary: {}\n  {hash}\n\
+                    "first use of retrieval backend `{}` (or its program changed).\n\
+                     {fp}\n\
                      Approving runs this program on your machine and lets its \
                      output into the model's context.",
-                    self.cfg.name, self.cfg.command
+                    self.cfg.name
                 ),
             }
         }
@@ -201,10 +205,17 @@ mod tests {
         }
     }
 
+    /// The fixture writes a real file into the tempdir and points the config at
+    /// it, so `Fingerprint::of` produces a `sha256:` and the *trusted* path is
+    /// actually exercised. A command that cannot be hashed (a system binary
+    /// that may be absent, or `/fake/...`) can only ever exercise the
+    /// fail-closed path after T2-7b.
     fn retriever(reply: Result<(String, bool), String>, dir: &std::path::Path) -> McpRetriever {
+        let bin = dir.join("docs-server");
+        std::fs::write(&bin, b"#!/bin/sh\nexit 0\n").expect("fixture binary");
         let cfg = hotl_mcp::config::ServerConfig {
             name: "docs".into(),
-            command: "/bin/true".into(),
+            command: bin.to_str().expect("utf-8 tempdir").into(),
             args: vec![],
             description: "doc search".into(),
         };
