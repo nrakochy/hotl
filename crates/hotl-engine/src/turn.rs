@@ -542,64 +542,88 @@ impl Turn {
         SampleEnd::Completed { stop, blocks }
     }
 
-    /// Doom-loop guard, then the gated tool batch. `Some(outcome)` ends the turn.
+    /// Extract this sample's tool calls and dispatch them. The doom-loop
+    /// guard now lives at the top of [`Turn::run_tool_batch`] itself (§S1
+    /// diet 2) — folded in at dispatch time rather than a separate
+    /// pre-dispatch pass here, since a call's args are already final the
+    /// moment `uses` exists.
     async fn run_tool_phase(&mut self, blocks: &[Value]) -> Option<Outcome> {
         let uses = assistant_tool_uses(blocks);
-        for tu in &uses {
-            self.call_sigs.push_back(CallSig::new(tu));
-        }
-        while self.call_sigs.len() > DOOM_WINDOW {
-            self.call_sigs.pop_front();
-        }
-        if let Some(pattern) = detect_doom_loop(self.call_sigs.make_contiguous()) {
-            // Auto and DontAsk are the unattended postures: nobody is watching,
-            // and the doom guard is a malfunction brake, not a permission —
-            // stop the turn instead of asking a question no one will answer.
-            // INVARIANT: an unattended mode never emits an unanswerable Ask.
-            // Enforced by `dont_ask_mode_hard_stops_on_a_doom_loop`.
-            let unattended = matches!(
-                self.shared.effective_mode(),
-                hotl_tools::rules::PermissionMode::Auto
-                    | hotl_tools::rules::PermissionMode::DontAsk
-            );
-            let stop = if unattended {
-                true
-            } else {
-                let cont = self
-                    .ask(
-                        format!("the agent keeps repeating: {pattern} — let it continue?"),
-                        None,
-                    )
-                    .await;
-                !matches!(cont, AskReply::Allow | AskReply::AllowEdited { .. })
-            };
-            if stop {
-                let commit = self
-                    .abort_batch(&uses, "Stopped: a repeating tool-call loop was detected.")
-                    .await;
-                if !commit.ok() {
-                    // A `DoomLoop` outcome would name a batch the log will
-                    // never carry; report why the record failed instead (T3-6).
-                    return Some(Outcome::Error {
-                        message: commit.message().into(),
-                    });
-                }
-                return Some(Outcome::DoomLoop { pattern });
-            }
-            self.call_sigs.clear();
-        }
         self.run_tool_batch(&uses).await
     }
 
-    /// Execute the batch with results paired in source order. A single-tool
-    /// batch — the majority case — runs inline, skipping the chunking and
-    /// `join_all` machinery below (§S1 diet (1)). Everything else is split
-    /// into chunks: contiguous runs of parallel-safe calls (pure reads,
-    /// isolated children) execute concurrently; everything else runs alone,
-    /// in order. Gating stays serial — asks are one-at-a-time human moments.
+    /// Fold this batch's new call signatures into the trailing window and
+    /// check it (§S1 diet 2: `fold_call_sigs` — at dispatch time, not a
+    /// batch pass between the tool join and the next sample).
+    fn fold_doom_window(&mut self, uses: &[ToolUse]) -> Option<String> {
+        fold_call_sigs(&mut self.call_sigs, uses);
+        detect_doom_loop(self.call_sigs.make_contiguous())
+    }
+
+    /// A detected pattern: hard-stop in an unattended mode, else ask
+    /// whether to continue. `Some(outcome)` ends the turn (doom-aborted, or
+    /// a commit failure reporting why); `None` means the human allowed it —
+    /// the window is cleared so continuing doesn't immediately re-trigger
+    /// the same warning on the very next batch.
+    async fn handle_doom_loop(&mut self, uses: &[ToolUse], pattern: String) -> Option<Outcome> {
+        // Auto and DontAsk are the unattended postures: nobody is watching,
+        // and the doom guard is a malfunction brake, not a permission —
+        // stop the turn instead of asking a question no one will answer.
+        // INVARIANT: an unattended mode never emits an unanswerable Ask.
+        // Enforced by `dont_ask_mode_hard_stops_on_a_doom_loop`.
+        let unattended = matches!(
+            self.shared.effective_mode(),
+            hotl_tools::rules::PermissionMode::Auto | hotl_tools::rules::PermissionMode::DontAsk
+        );
+        let stop = if unattended {
+            true
+        } else {
+            let cont = self
+                .ask(
+                    format!("the agent keeps repeating: {pattern} — let it continue?"),
+                    None,
+                )
+                .await;
+            !matches!(cont, AskReply::Allow | AskReply::AllowEdited { .. })
+        };
+        if stop {
+            let commit = self
+                .abort_batch(uses, "Stopped: a repeating tool-call loop was detected.")
+                .await;
+            if !commit.ok() {
+                // A `DoomLoop` outcome would name a batch the log will
+                // never carry; report why the record failed instead (T3-6).
+                return Some(Outcome::Error {
+                    message: commit.message().into(),
+                });
+            }
+            return Some(Outcome::DoomLoop { pattern });
+        }
+        self.call_sigs.clear();
+        None
+    }
+
+    /// Execute the batch with results paired in source order. Doom-loop
+    /// detection for this batch's own new calls happens first — see
+    /// [`Turn::fold_doom_window`]/[`Turn::handle_doom_loop`] — before either
+    /// dispatch path below runs anything, so a detected pattern never
+    /// executes the call that completed it. A single-tool batch — the
+    /// majority case — runs inline, skipping the chunking and `join_all`
+    /// machinery below (§S1 diet (1)). Everything else is split into
+    /// chunks: contiguous runs of parallel-safe calls (pure reads, isolated
+    /// children) execute concurrently; everything else runs alone, in
+    /// order. Gating stays serial — asks are one-at-a-time human moments.
     /// Mutating batches (anything beyond `read`) are bracketed by shadow
     /// snapshots so `hotl undo` can restore the pre-batch tree (M3b).
     async fn run_tool_batch(&mut self, uses: &[ToolUse]) -> Option<Outcome> {
+        if let Some(pattern) = self.fold_doom_window(uses) {
+            if let Some(outcome) = self.handle_doom_loop(uses, pattern).await {
+                return Some(outcome);
+            }
+            // The human allowed continuing past the warning; `handle_doom_
+            // loop` already cleared the window. Fall through and dispatch
+            // this same batch normally.
+        }
         // `Tool::read_only()` is the tool's own answer, so a `glob`/`grep`
         // batch stops taking two pointless snapshots and any future read tool
         // is classified correctly (T3-2). An unknown tool is not `read_only`,
@@ -1316,6 +1340,20 @@ impl CallSig {
     }
 }
 
+/// Fold a batch's new call signatures into the trailing window, evicting
+/// from the front past [`DOOM_WINDOW`] (§S1 diet 2). A call's args are
+/// final the moment it exists in `uses` — there is nothing to gain by
+/// waiting for dispatch or a result — so `Turn::fold_doom_window` runs this
+/// right at dispatch time instead of a separate pass in the caller. Kept
+/// free of `Turn` so the fold order is unit-testable without an engine
+/// harness (`fold_call_sigs_preserves_source_order_and_evicts_from_the_front`).
+fn fold_call_sigs(window: &mut VecDeque<CallSig>, uses: &[ToolUse]) {
+    window.extend(uses.iter().map(CallSig::new));
+    while window.len() > DOOM_WINDOW {
+        window.pop_front();
+    }
+}
+
 /// Repeating suffix patterns over tool-call signatures: any period p ≤ 3
 /// whose block repeats 3× at the tail (a repetition detector).
 fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
@@ -1373,6 +1411,54 @@ mod tests {
         // The ask still shows the human-readable signatures.
         let pattern = detect_doom_loop(&[a(), a(), a()]).unwrap();
         assert_eq!(pattern, "read({\"path\":\"x\"})");
+    }
+
+    fn uses(pairs: &[(&str, Value)]) -> Vec<ToolUse> {
+        pairs
+            .iter()
+            .enumerate()
+            .map(|(i, (name, input))| ToolUse {
+                id: i.to_string(),
+                name: (*name).into(),
+                input: input.clone(),
+            })
+            .collect()
+    }
+
+    /// §S1 diet 2: `fold_call_sigs` is what `Turn::fold_doom_window` calls
+    /// at dispatch time instead of the old pre-dispatch batch pass. Pins two
+    /// properties across a multi-tool batch: entries land in source order
+    /// (never reordered, e.g. by a concurrent fold), and the window still
+    /// evicts from the front once a fold crosses `DOOM_WINDOW` — including
+    /// evicting an entire *prior* batch's entries when a later batch is big
+    /// enough to push them out.
+    #[test]
+    fn fold_call_sigs_preserves_source_order_and_evicts_from_the_front() {
+        let mut window: VecDeque<CallSig> = VecDeque::new();
+        let batch1 = uses(&[
+            ("read", json!({"path": "a"})),
+            ("bash", json!({"command": "ls"})),
+        ]);
+        fold_call_sigs(&mut window, &batch1);
+        let displays: Vec<&str> = window.iter().map(|s| s.display.as_str()).collect();
+        assert_eq!(
+            displays,
+            vec![r#"read({"path":"a"})"#, r#"bash({"command":"ls"})"#]
+        );
+
+        // A second batch exactly `DOOM_WINDOW` long pushes the combined
+        // fold to `DOOM_WINDOW` + 2: trimming must evict batch1's two
+        // entries first (oldest first) and leave batch2 intact, in order.
+        let batch2 = uses(
+            &(0..DOOM_WINDOW)
+                .map(|i| ("t", json!(i)))
+                .collect::<Vec<_>>(),
+        );
+        fold_call_sigs(&mut window, &batch2);
+        assert_eq!(window.len(), DOOM_WINDOW);
+        let displays: Vec<String> = window.iter().map(|s| s.display.clone()).collect();
+        let expected: Vec<String> = (0..DOOM_WINDOW).map(|i| format!("t({i})")).collect();
+        assert_eq!(displays, expected);
     }
 
     /// Sets its flag when dropped — proof that an aborted task's future was
