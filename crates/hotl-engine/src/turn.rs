@@ -154,17 +154,58 @@ impl Commit {
     }
 }
 
-/// Bytes at or above this size have their masking pass moved onto
+/// Payloads at or above this size (by [`payload_size_estimate`], checked
+/// BEFORE any work runs) have both serialization and masking moved onto
 /// `tokio::task::spawn_blocking` (commit-protocol.md §Proposal payloads;
 /// speed-architecture design's "CpuPool past the 1ms threshold", Rule 0 —
 /// the workspace has no CpuPool, so `spawn_blocking` is the sanctioned
-/// stand-in). Serialization stays inline unconditionally regardless of this
-/// threshold: it is one linear serde pass with no per-pair scan, so it is
-/// cheap even for a large payload — masking is the O(pairs × len) cost with
-/// a per-pair allocation the design doc names (T3-16), and checking the
-/// threshold against the already-serialized length (rather than a
-/// pre-serialization heuristic) is exact rather than a guess.
+/// stand-in). Both steps, not just masking: for the spec's own worst case
+/// (ten tool results at ~19K tokens each, ~570KB), `serde_json::to_string`
+/// alone is ms-scale and blocking the turn task's async executor for it
+/// defeats half the point of offloading — T3-16 names masking's
+/// O(pairs × len) cost, but that was never a claim that serialization is
+/// free at this size, only that it's *cheaper than masking*, which still
+/// leaves it too expensive to run inline unblocked past this threshold.
 const PREPARE_OFFLOAD_BYTES: usize = 256 * 1024;
+
+/// Cheap, allocation-free lower-bound estimate of `payload`'s eventual
+/// serialized size — used only to decide whether `prepare_entry` offloads
+/// onto `spawn_blocking`, never to size anything durable. Deliberately not a
+/// full `serde_json::to_string` call: that IS the cost the offload decision
+/// has to be made *before* paying, so the estimate must be cheaper than the
+/// thing it estimates. An under-estimate is safe — the worst case is a large
+/// payload staying inline, which is correct, just not optimally fast; the
+/// only kind that can realistically cross the 256KiB threshold is `Item`
+/// (a tool result or a long assistant/user message), so every other kind
+/// estimates at 0 and always takes the inline path.
+fn payload_size_estimate(payload: &EntryPayload) -> usize {
+    match payload {
+        EntryPayload::Item { item } => item_size_estimate(item),
+        _ => 0,
+    }
+}
+
+fn item_size_estimate(item: &Item) -> usize {
+    match item {
+        Item::User { text, .. } | Item::System { text } => text.len(),
+        Item::ToolResults { results } => results.iter().map(|r| r.content.len()).sum(),
+        Item::Assistant { blocks } => blocks.iter().map(value_size_estimate).sum(),
+        Item::Unknown => 0,
+    }
+}
+
+/// Sum of string byte lengths in a `serde_json::Value` tree — an
+/// under-estimate of its eventual JSON size (it ignores structural
+/// punctuation, key names, and escaping expansion), which is exactly the
+/// safe direction for [`payload_size_estimate`]'s purpose.
+fn value_size_estimate(value: &Value) -> usize {
+    match value {
+        Value::String(s) => s.len(),
+        Value::Array(items) => items.iter().map(value_size_estimate).sum(),
+        Value::Object(map) => map.values().map(value_size_estimate).sum(),
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
 
 /// `prepare_entry` failed to produce a `PreparedEntry`. Both arms are
 /// effectively unreachable in practice (see call sites), but a proposal
@@ -174,13 +215,17 @@ const PREPARE_OFFLOAD_BYTES: usize = 256 * 1024;
 enum PrepareError {
     /// `serde_json::to_string` on an `EntryPayload` errored — none of this
     /// crate's payload shapes contain non-finite floats or non-string map
-    /// keys, so this is defensive, not expected. Neither call site inspects
-    /// the underlying `serde_json::Error` (both just fall back to
-    /// `Commit::Gone`), so it is not carried — see `Commit::message`'s
-    /// `StaleEpoch`/`Gone` text for what the user actually sees.
+    /// keys, so this should never actually happen (hence the `debug_assert`
+    /// at the one call site that observes this variant specifically, in
+    /// `Turn::propose_at_epoch`). Neither call site inspects the underlying
+    /// `serde_json::Error` (both just fall back to `Commit::Gone`), so it is
+    /// not carried — see `Commit::message`'s `StaleEpoch`/`Gone` text for
+    /// what the user actually sees.
     Serialize,
-    /// The `spawn_blocking` task masking a large payload panicked or was
-    /// aborted (a runtime shutting down mid-proposal).
+    /// The `spawn_blocking` task preparing a large payload panicked or was
+    /// aborted (a runtime shutting down mid-proposal) — unlike `Serialize`,
+    /// this CAN legitimately happen on a real shutdown race, so it is never
+    /// asserted against.
     Offload,
 }
 
@@ -202,28 +247,41 @@ async fn prepare_entry(
     // The exact value the turn already built in memory — kept for the
     // actor's live projection, never re-parsed from the bytes below (that
     // would just move T3-16's per-entry cost back onto the actor).
+    // Unconditional: every `Item` entry needs its own owned copy for the
+    // projection regardless of size or which branch below runs, so there is
+    // no smaller class of payload this could be deferred for.
     let item = match payload {
         EntryPayload::Item { item } => Some(item.clone()),
         _ => None,
     };
-    let json = hotl_store::serialize_payload(payload)?;
     let kind = hotl_store::EntryKind::from(payload);
-    let bytes = if json.len() >= PREPARE_OFFLOAD_BYTES {
+    let bytes = if payload_size_estimate(payload) >= PREPARE_OFFLOAD_BYTES {
+        // Large enough that BOTH the serde pass and the masking scan are
+        // worth moving off the turn task's async context — the whole
+        // prepare runs on spawn_blocking, not just masking, so a
+        // >-threshold tool result never blocks the executor for either
+        // step. `payload.clone()` here is the one real cost of this path
+        // (an EntryPayload::Item clone on top of the `item` clone above),
+        // bounded to exactly the payloads already crossing the threshold —
+        // eliminating it would need `item`/`payload` to share ownership
+        // (e.g. an `Arc<Item>`), which is a larger type change than this
+        // fix warrants.
         let masker = Arc::clone(masker);
-        tokio::task::spawn_blocking(move || hotl_store::mask_json(&masker, json))
-            .await
-            .map_err(|_| PrepareError::Offload)?
+        let owned = payload.clone();
+        tokio::task::spawn_blocking(move || -> Result<hotl_store::MaskedBytes, PrepareError> {
+            let json = hotl_store::serialize_payload(&owned)?;
+            Ok(hotl_store::mask_json(&masker, json))
+        })
+        .await
+        .map_err(|_| PrepareError::Offload)??
     } else {
+        let json = hotl_store::serialize_payload(payload)?;
         hotl_store::mask_json(masker, json)
     };
-    Ok(crate::PreparedEntry {
-        payload: hotl_store::PreparedPayload {
-            bytes,
-            kind,
-            rules_epoch,
-        },
+    Ok(crate::PreparedEntry::new(
+        hotl_store::PreparedPayload::new(bytes, kind, rules_epoch),
         item,
-    })
+    ))
 }
 
 /// Chunk a batch for execution: contiguous runs of parallel-safe calls form
@@ -1290,7 +1348,20 @@ impl Turn {
         for payload in entries {
             match prepare_entry(payload, masker, epoch).await {
                 Ok(entry) => prepared.push(entry),
-                Err(_) => return Commit::Gone,
+                Err(PrepareError::Serialize) => {
+                    // Not expected — see `PrepareError::Serialize`'s doc —
+                    // so surface it loudly in dev/test builds rather than
+                    // just silently dropping the entry and reporting a
+                    // generic shutdown to the user.
+                    debug_assert!(
+                        false,
+                        "EntryPayload serialization must not fail for hotl's own payload shapes"
+                    );
+                    return Commit::Gone;
+                }
+                // `Offload` CAN legitimately happen on a real shutdown race
+                // (the spawn_blocking task got aborted) — not asserted.
+                Err(PrepareError::Offload) => return Commit::Gone,
             }
         }
         let (tx, rx) = oneshot::channel();
@@ -1803,9 +1874,9 @@ mod tests {
             },
         };
         let prepared = prepare_entry(&payload, &masker, 7).await.expect("prepare");
-        assert_eq!(prepared.payload.rules_epoch, 7);
-        assert_eq!(prepared.payload.kind, hotl_store::EntryKind::Item);
-        let text = std::str::from_utf8(&prepared.payload.bytes).unwrap();
+        assert_eq!(prepared.payload.rules_epoch(), 7);
+        assert_eq!(prepared.payload.kind(), hotl_store::EntryKind::Item);
+        let text = std::str::from_utf8(prepared.payload.bytes()).unwrap();
         assert!(
             !text.contains("sk-super-secret-turntest-1"),
             "secret must be masked before it ever reaches the actor: {text}"
@@ -1822,7 +1893,7 @@ mod tests {
         };
         let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
         assert!(prepared.item.is_none());
-        assert_eq!(prepared.payload.kind, hotl_store::EntryKind::Usage);
+        assert_eq!(prepared.payload.kind(), hotl_store::EntryKind::Usage);
     }
 
     #[tokio::test]
@@ -1835,7 +1906,7 @@ mod tests {
         };
         let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
         let raw = hotl_store::serialize_payload(&payload).unwrap();
-        assert_eq!(prepared.payload.bytes.as_ref(), raw.as_bytes());
+        assert_eq!(prepared.payload.bytes().as_ref(), raw.as_bytes());
     }
 
     #[tokio::test]
@@ -1852,7 +1923,7 @@ mod tests {
         let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
         let raw = hotl_store::serialize_payload(&payload).unwrap();
         let expected = masker.apply(&raw);
-        assert_eq!(prepared.payload.bytes.as_ref(), expected.as_bytes());
+        assert_eq!(prepared.payload.bytes().as_ref(), expected.as_bytes());
     }
 
     /// requirement 7: payloads at/above `PREPARE_OFFLOAD_BYTES` still
@@ -1873,7 +1944,72 @@ mod tests {
             "fixture must actually cross the offload threshold"
         );
         let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
-        assert_eq!(prepared.payload.bytes.as_ref(), raw.as_bytes());
+        assert_eq!(prepared.payload.bytes().as_ref(), raw.as_bytes());
+    }
+
+    /// IMPORTANT 2 (task 8 review): the offload decision has to be made
+    /// BEFORE serialization, from an estimate — this pins that the
+    /// estimator actually reflects the spec's own worst case (many tool
+    /// results, none individually huge, together well past the threshold),
+    /// not just a single large field.
+    #[test]
+    fn payload_size_estimate_sums_tool_result_content_across_the_batch() {
+        // Each result alone is well under the threshold; only the sum
+        // crosses it — proves the estimator aggregates across the batch
+        // instead of looking at (say) just the largest result.
+        let each = PREPARE_OFFLOAD_BYTES / 5;
+        let payload = EntryPayload::Item {
+            item: Item::ToolResults {
+                results: (0..10)
+                    .map(|i| ToolResultItem {
+                        tool_use_id: format!("t{i}"),
+                        content: "x".repeat(each),
+                        is_error: false,
+                    })
+                    .collect(),
+            },
+        };
+        assert!(
+            each < PREPARE_OFFLOAD_BYTES,
+            "fixture must keep each individual result under the threshold"
+        );
+        assert!(
+            payload_size_estimate(&payload) >= PREPARE_OFFLOAD_BYTES,
+            "ten results at PREPARE_OFFLOAD_BYTES/5 each must sum past the threshold"
+        );
+    }
+
+    #[test]
+    fn payload_size_estimate_is_zero_for_kinds_that_never_offload() {
+        assert_eq!(
+            payload_size_estimate(&EntryPayload::Usage {
+                usage: TokenUsage::default()
+            }),
+            0
+        );
+    }
+
+    /// The estimate is what gates offload — confirm the gate itself fires
+    /// from the estimate alone, without needing to serialize first (unlike
+    /// the pre-fix version, which checked `json.len()` after the inline
+    /// `serde_json::to_string` had already run).
+    #[tokio::test]
+    async fn prepare_entry_offload_decision_uses_the_pre_serialization_estimate() {
+        let masker = Arc::new(hotl_store::Masker::empty());
+        let payload = EntryPayload::Item {
+            item: Item::ToolResults {
+                results: vec![ToolResultItem {
+                    tool_use_id: "t1".into(),
+                    content: "y".repeat(PREPARE_OFFLOAD_BYTES + 4096),
+                    is_error: false,
+                }],
+            },
+        };
+        assert!(payload_size_estimate(&payload) >= PREPARE_OFFLOAD_BYTES);
+        let raw = hotl_store::serialize_payload(&payload).unwrap();
+        let prepared = prepare_entry(&payload, &masker, 3).await.expect("prepare");
+        assert_eq!(prepared.payload.bytes().as_ref(), raw.as_bytes());
+        assert_eq!(prepared.payload.rules_epoch(), 3);
     }
 
     #[test]

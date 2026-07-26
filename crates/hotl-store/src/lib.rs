@@ -166,15 +166,57 @@ impl From<&EntryPayload> for EntryKind {
     }
 }
 
+/// Bytes that came out of [`mask_json`] — either genuinely masked, or
+/// provably clean (the `Cow::Borrowed` fast path, which needs no masking by
+/// construction — see `Masker::mask_cow`). The inner `Bytes` is private and
+/// this type has no public constructor, so the only way to obtain one is to
+/// call `mask_json` (or `prepare_payload`, which calls it). This is what
+/// makes "masked before disk" (commit-protocol.md §Proposal payloads) a
+/// type-checked invariant rather than a doc comment: a `PreparedPayload`
+/// cannot be built from arbitrary, unmasked bytes.
+#[derive(Clone, Debug)]
+pub struct MaskedBytes(Bytes);
+
+impl MaskedBytes {
+    pub fn as_bytes(&self) -> &Bytes {
+        &self.0
+    }
+}
+
 /// An entry payload already serialized and masked, exactly once, upstream of
-/// the actor (commit-protocol.md §Proposal payloads). `bytes` is canon: the
+/// the actor (commit-protocol.md §Proposal payloads). `bytes()` is canon: the
 /// actor splices it into the entry envelope verbatim
-/// ([`SessionLog::append_prepared`]) and never re-derives it.
+/// ([`SessionLog::append_prepared`]) and never re-derives it. Fields are
+/// private — [`PreparedPayload::new`] is the only constructor, and it can
+/// only accept a [`MaskedBytes`], so a caller can't hand-assemble one from
+/// raw bytes that skipped masking.
 #[derive(Clone, Debug)]
 pub struct PreparedPayload {
-    pub bytes: Bytes,
-    pub kind: EntryKind,
-    pub rules_epoch: u32,
+    bytes: MaskedBytes,
+    kind: EntryKind,
+    rules_epoch: u32,
+}
+
+impl PreparedPayload {
+    pub fn new(bytes: MaskedBytes, kind: EntryKind, rules_epoch: u32) -> Self {
+        Self {
+            bytes,
+            kind,
+            rules_epoch,
+        }
+    }
+
+    pub fn bytes(&self) -> &Bytes {
+        self.bytes.as_bytes()
+    }
+
+    pub fn kind(&self) -> EntryKind {
+        self.kind
+    }
+
+    pub fn rules_epoch(&self) -> u32 {
+        self.rules_epoch
+    }
 }
 
 /// Serialize `payload` alone (not the entry envelope) — the cheap half of
@@ -187,8 +229,9 @@ pub fn serialize_payload(payload: &EntryPayload) -> serde_json::Result<String> {
 
 /// Mask an already-serialized payload. Uses [`Masker::mask_cow`]'s fast path:
 /// clean `json` is returned without a second allocation (only the original
-/// `String`'s buffer moves into `Bytes`).
-pub fn mask_json(masker: &Masker, json: String) -> Bytes {
+/// `String`'s buffer moves into `Bytes`). The only producer of
+/// [`MaskedBytes`].
+pub fn mask_json(masker: &Masker, json: String) -> MaskedBytes {
     // Scoped so the borrow of `json` inside `Cow::Borrowed` ends before
     // `json` is reused below — `masked_owned` carries no borrowed data out
     // of this block either way.
@@ -196,10 +239,10 @@ pub fn mask_json(masker: &Masker, json: String) -> Bytes {
         Cow::Borrowed(_) => None,
         Cow::Owned(s) => Some(s),
     };
-    match masked_owned {
+    MaskedBytes(match masked_owned {
         Some(s) => Bytes::from(s.into_bytes()),
         None => Bytes::from(json.into_bytes()),
-    }
+    })
 }
 
 /// Serialize + mask `payload` in one call — the turn-side half of
@@ -212,11 +255,11 @@ pub fn prepare_payload(
     rules_epoch: u32,
 ) -> serde_json::Result<PreparedPayload> {
     let json = serialize_payload(payload)?;
-    Ok(PreparedPayload {
-        bytes: mask_json(masker, json),
-        kind: EntryKind::from(payload),
+    Ok(PreparedPayload::new(
+        mask_json(masker, json),
+        EntryKind::from(payload),
         rules_epoch,
-    })
+    ))
 }
 
 /// Register `value` under `name` in `pairs` (raw + JSON-encoded forms),
@@ -682,7 +725,7 @@ impl SessionLog {
         if let Some(reason) = self.seal_reason() {
             return Err(sealed_error(&reason));
         }
-        let (id, bytes) = self.splice_prepared(&prepared.bytes, now_ms)?;
+        let (id, bytes) = self.splice_prepared(prepared.bytes(), now_ms)?;
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriterCmd::Append {
@@ -2730,11 +2773,21 @@ mod tests {
     async fn append_prepared_rejects_invalid_json_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
-        let bogus = PreparedPayload {
-            bytes: bytes::Bytes::from_static(b"not json"),
-            kind: EntryKind::Item,
-            rules_epoch: 0,
-        };
+        // `MaskedBytes`'s tuple field is private everywhere except this
+        // module and its descendants (this test module included) — exactly
+        // the boundary `MaskedBytes` exists to enforce for outside callers.
+        let bogus = PreparedPayload::new(
+            MaskedBytes(bytes::Bytes::from_static(b"not json")),
+            EntryKind::Item,
+            0,
+        );
         assert!(log.append_prepared(bogus, 2).await.is_err());
+    }
+
+    #[test]
+    fn masked_bytes_only_comes_from_mask_json() {
+        let masker = Masker::empty();
+        let masked = mask_json(&masker, "clean".to_string());
+        assert_eq!(masked.as_bytes().as_ref(), b"clean");
     }
 }

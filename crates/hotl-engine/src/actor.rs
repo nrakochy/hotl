@@ -377,12 +377,24 @@ pub(crate) async fn run(
                 // assistant item.
                 let closes_sample = entries
                     .iter()
-                    .any(|e| matches!(&e.item, Some(Item::Assistant { .. })));
+                    .any(|e| matches!(e.item(), Some(Item::Assistant { .. })));
                 let result = commit_prepared(&shared, &mut log, &mut items, entries).await;
-                if closes_sample {
-                    sampling = false;
+                // A stale-epoch reject commits nothing — the turn is about to
+                // re-mask and resend the SAME entries (commit-protocol.md
+                // §Proposal payloads). Treating it like a real commit here
+                // would flip `sampling` false and release any held steer
+                // immediately, landing that steer in the log BEFORE the
+                // retried assistant blocks it was held to avoid preceding —
+                // exactly the inversion the held-steer rule (72a6f1b) exists
+                // to prevent. Leave `sampling`/`held_steers` untouched, as if
+                // this proposal never arrived; the retry's own successful
+                // commit is what actually closes the sample.
+                if !matches!(result, crate::ProposeReply::StaleEpoch) {
+                    if closes_sample {
+                        sampling = false;
+                    }
+                    release_steers(&shared, &mut log, &mut items, &mut held_steers, sampling).await;
                 }
-                release_steers(&shared, &mut log, &mut items, &mut held_steers, sampling).await;
                 let _ = reply.send(result);
             }
             SessionCmd::WriteBlob {
@@ -421,6 +433,9 @@ pub(crate) async fn run(
                     usage,
                 )
                 .await;
+            }
+            SessionCmd::BumpRulesEpoch => {
+                shared.rules_epoch.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -849,17 +864,23 @@ async fn commit_prepared(
     entries: Vec<crate::PreparedEntry>,
 ) -> crate::ProposeReply {
     let current_epoch = shared.rules_epoch();
+    // "Predates" (commit-protocol.md §Proposal payloads), not merely
+    // "differs": epoch only ever advances, and the actor is its sole owner,
+    // so a proposal can never legitimately carry an epoch newer than the
+    // actor's own — but an equal-or-newer stamp is never rejected either,
+    // matching the spec's literal wording rather than a stricter `!=`.
     if entries
         .iter()
-        .any(|e| e.payload.rules_epoch != current_epoch)
+        .any(|e| e.payload().rules_epoch() < current_epoch)
     {
         return crate::ProposeReply::StaleEpoch;
     }
     for entry in entries {
-        if !shared.append_prepared(log, entry.payload).await {
+        let (payload, item) = entry.into_parts();
+        if !shared.append_prepared(log, payload).await {
             return crate::ProposeReply::Sealed;
         }
-        if let Some(item) = entry.item {
+        if let Some(item) = item {
             Arc::make_mut(items).push(item);
         }
     }
@@ -1194,6 +1215,7 @@ mod tests {
     use hotl_store::SessionLog;
     use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
     use serde_json::json;
+    use std::sync::atomic::Ordering;
     use std::sync::Arc;
 
     /// T3-4. The paused clock is legal here: this drives `summarize_bounded`
@@ -1377,23 +1399,28 @@ mod tests {
     /// tested directly against `commit_prepared`, the actor's real commit
     /// path for prepared entries, not just a hand-extracted predicate.
     #[tokio::test]
-    async fn commit_prepared_rejects_a_stale_epoch_and_commits_nothing() {
+    async fn commit_prepared_rejects_an_entry_whose_epoch_predates_current_and_commits_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let (shared, mut log) = test_shared(dir.path());
         let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
         let before = std::fs::read_to_string(log.path()).unwrap();
 
-        let stale_epoch = shared.rules_epoch() + 1;
+        // A genuinely OLDER epoch, not merely a different one: bump the
+        // actor's real epoch, then stamp the entry with what used to be
+        // current — exactly the shape a real reject-then-retry produces
+        // (commit-protocol.md §Proposal payloads: "rejects a payload whose
+        // epoch PREDATES the current masking rules").
+        let old_epoch = shared.rules_epoch();
+        shared.rules_epoch.fetch_add(1, Ordering::Relaxed);
+        assert!(shared.rules_epoch() > old_epoch);
+
         let payload = hotl_types::EntryPayload::Usage {
             usage: hotl_types::TokenUsage::default(),
         };
         let prepared =
-            hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), stale_epoch)
+            hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), old_epoch)
                 .expect("prepare");
-        let entries = vec![crate::PreparedEntry {
-            payload: prepared,
-            item: None,
-        }];
+        let entries = vec![crate::PreparedEntry::new(prepared, None)];
 
         let result = commit_prepared(&shared, &mut log, &mut items, entries).await;
         assert_eq!(result, crate::ProposeReply::StaleEpoch);
@@ -1403,6 +1430,30 @@ mod tests {
         );
         let after = std::fs::read_to_string(log.path()).unwrap();
         assert_eq!(before, after, "a stale proposal must not reach the log");
+    }
+
+    /// The check is "predates", not "differs from": an entry stamped with an
+    /// epoch that is not older than current — including one newer than the
+    /// actor has ever advanced to, which can't happen in production since
+    /// the actor is the epoch's sole owner, but pins the direction the guard
+    /// actually checks — is accepted, not rejected.
+    #[tokio::test]
+    async fn commit_prepared_accepts_an_entry_whose_epoch_is_not_older_than_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, mut log) = test_shared(dir.path());
+        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+
+        let newer_epoch = shared.rules_epoch() + 1;
+        let payload = hotl_types::EntryPayload::Usage {
+            usage: hotl_types::TokenUsage::default(),
+        };
+        let prepared =
+            hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), newer_epoch)
+                .expect("prepare");
+        let entries = vec![crate::PreparedEntry::new(prepared, None)];
+
+        let result = commit_prepared(&shared, &mut log, &mut items, entries).await;
+        assert_eq!(result, crate::ProposeReply::Committed);
     }
 
     #[tokio::test]
@@ -1415,10 +1466,7 @@ mod tests {
         let payload = EntryPayload::Item { item: user("hi") };
         let prepared = hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), epoch)
             .expect("prepare");
-        let entries = vec![crate::PreparedEntry {
-            payload: prepared,
-            item: Some(user("hi")),
-        }];
+        let entries = vec![crate::PreparedEntry::new(prepared, Some(user("hi")))];
 
         let result = commit_prepared(&shared, &mut log, &mut items, entries).await;
         assert_eq!(result, crate::ProposeReply::Committed);

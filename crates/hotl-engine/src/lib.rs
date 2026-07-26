@@ -285,9 +285,43 @@ impl std::fmt::Debug for EngineEvent {
 /// (that would just move T3-16's per-entry cost back onto the actor rather
 /// than delete it). `None` for entries that never enter the projection
 /// (`Usage`, `PendingAsk`/`AskResolved`).
+///
+/// Fields are private: `payload` and `item` are two independently-built
+/// views of the same logical entry, and nothing about the types alone
+/// guarantees they agree. [`PreparedEntry::new`] is the only constructor —
+/// it debug-asserts that `item`'s presence matches `payload.kind()`, so a
+/// future call site that passes a mismatched pair (wrong variable, copied
+/// from a different entry) fails loudly in tests/dev builds instead of
+/// silently diverging the projection from the log.
 pub struct PreparedEntry {
-    pub payload: hotl_store::PreparedPayload,
-    pub item: Option<Item>,
+    payload: hotl_store::PreparedPayload,
+    item: Option<Item>,
+}
+
+impl PreparedEntry {
+    pub fn new(payload: hotl_store::PreparedPayload, item: Option<Item>) -> Self {
+        debug_assert_eq!(
+            item.is_some(),
+            matches!(payload.kind(), hotl_store::EntryKind::Item),
+            "PreparedEntry::new: item's presence must match payload.kind() == EntryKind::Item"
+        );
+        Self { payload, item }
+    }
+
+    pub fn payload(&self) -> &hotl_store::PreparedPayload {
+        &self.payload
+    }
+
+    pub fn item(&self) -> Option<&Item> {
+        self.item.as_ref()
+    }
+
+    /// Consume the entry: the actor's commit loop needs to move `payload`
+    /// into `SessionLog::append_prepared` and, separately, `item` (if any)
+    /// into the live projection.
+    pub fn into_parts(self) -> (hotl_store::PreparedPayload, Option<Item>) {
+        (self.payload, self.item)
+    }
 }
 
 /// What [`SessionCmd::ProposePrepared`] answers with — plain `bool` has no
@@ -305,6 +339,10 @@ pub enum ProposeReply {
     StaleEpoch,
 }
 
+// `BumpRulesEpoch` (below) is a real, data-free variant a test sends over
+// the wire, not a non-exhaustiveness marker — clippy's heuristic can't tell
+// those apart for a `#[doc(hidden)]` unit variant in last position.
+#[allow(clippy::manual_non_exhaustive)]
 pub enum SessionCmd {
     /// A user prompt. Starts a turn, or queues (one-at-a-time promotion).
     Prompt(String),
@@ -370,6 +408,18 @@ pub enum SessionCmd {
     },
     /// Turn task → actor: the turn is over (or needs a compaction respawn).
     TurnFinished { end: TurnEnd, usage: TokenUsage },
+    /// Test-only: bump the actor's masking-rules epoch by one
+    /// (commit-protocol.md §Proposal payloads' `rules_epoch` guard). Nothing
+    /// in production sends this — the epoch is constant today — but an
+    /// integration test needs a way to force a real
+    /// reject-stale→re-mask→retry round trip through the actor's actual
+    /// command loop, not just a hand-called commit function. `#[doc(hidden)]`
+    /// rather than `#[cfg(test)]`: this crate's tests live in a separate
+    /// compilation unit (`hotl-engine/tests/*.rs`) that only sees `pub` API,
+    /// the same reason `hotl_store::SessionLog::inject_fault` is shaped this
+    /// way.
+    #[doc(hidden)]
+    BumpRulesEpoch,
 }
 
 /// Workspace snapshots around mutating tool batches (M3b shadow-git).
@@ -722,5 +772,49 @@ async fn propose_via(cmd_tx: &mpsc::WeakSender<SessionCmd>, entries: Vec<EntryPa
         .is_ok()
     {
         let _ = reply_rx.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// IMPORTANT 3 (task 8 review): `PreparedEntry::new`'s debug_assert
+    /// catches a mismatched pair — the bug class the reviewer flagged
+    /// (bytes and item as two unchecked sources of truth).
+    #[test]
+    #[should_panic(expected = "item's presence must match payload.kind()")]
+    fn prepared_entry_new_rejects_a_mismatched_item_and_kind() {
+        let masker = hotl_store::Masker::empty();
+        let payload = hotl_store::prepare_payload(
+            &EntryPayload::Usage {
+                usage: TokenUsage::default(),
+            },
+            &masker,
+            0,
+        )
+        .unwrap();
+        // `item` is `Some`, but `payload` was built from `Usage`, not `Item`.
+        let _ = PreparedEntry::new(
+            payload,
+            Some(Item::User {
+                text: "x".into(),
+                synthetic: None,
+            }),
+        );
+    }
+
+    #[test]
+    fn prepared_entry_new_accepts_a_matching_item_and_kind() {
+        let masker = hotl_store::Masker::empty();
+        let item = Item::User {
+            text: "x".into(),
+            synthetic: None,
+        };
+        let payload =
+            hotl_store::prepare_payload(&EntryPayload::Item { item: item.clone() }, &masker, 0)
+                .unwrap();
+        let entry = PreparedEntry::new(payload, Some(item));
+        assert!(entry.item().is_some());
     }
 }
