@@ -94,17 +94,18 @@ pub enum CachePolicy {
     /// compaction summarize call, and fixtures.
     Off,
     /// Explicit marker placement. `prefix_ttl` is the lifetime the *prefix*
-    /// breakpoints ask for; it is consumed by the breakpoint planner in a
-    /// later phase — today every `Static` renders exactly the M0 three
-    /// markers (tools tail / system / latest durable user block) with no ttl
-    /// field on the wire.
+    /// breakpoints (and the rolling anchors — `cache_plan::Plan::anchors`)
+    /// ask for; the serializer's LATEST marker always renders plain
+    /// regardless of `prefix_ttl` (its segment is rewritten every sample, so
+    /// the longer-lived write premium there recurs per turn and buys
+    /// nothing — see `hotl-provider-anthropic`'s marker sites).
     Static { prefix_ttl: CacheTtl },
 }
 
 impl CachePolicy {
     /// Whether this request wants explicit breakpoints at all. The one
-    /// question this phase's serializers ask; `prefix_ttl` stays unread until
-    /// the planner lands.
+    /// question serializers ask before consulting `prefix_ttl` for the
+    /// per-marker lifetime.
     pub fn marks_breakpoints(self) -> bool {
         matches!(self, Self::Static { .. })
     }

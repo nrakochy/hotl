@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hotl_platform::Clock;
-use hotl_provider::Provider;
+use hotl_provider::{CacheTtl, Provider};
 use hotl_store::SessionLog;
 use hotl_tools::{
     rules::{PermissionMode, Rules},
@@ -72,6 +72,15 @@ pub struct EngineConfig {
     pub max_turns: i64,
     pub thinking: bool,
     pub cache_static: bool,
+    /// The lifetime `compose_request` asks explicit-cache breakpoints for
+    /// when `cache_static` is set (`CachePolicy::Static { prefix_ttl }` —
+    /// consumed by the Anthropic serializer's prefix and rolling-anchor
+    /// markers; the latest marker always renders plain regardless). Default
+    /// `FiveMinutes`; long-lived human-supervised surfaces (`hotl tui`,
+    /// `hotl acp`, `hotl bg`/attach) raise it to `OneHour` after `scaffold()`
+    /// returns, and sub-agent children pin it back to `FiveMinutes`
+    /// explicitly in `HotlChildBuilder::spawn_child`.
+    pub cache_ttl: CacheTtl,
     /// Availability-only fallback models (≤3 total — RELIABILITY.md).
     pub fallback_models: Vec<String>,
     /// Consecutive failures of one tool before the turn stops.
@@ -112,6 +121,7 @@ impl Default for EngineConfig {
             max_turns: 100,
             thinking: true,
             cache_static: true,
+            cache_ttl: CacheTtl::FiveMinutes,
             fallback_models: Vec::new(),
             tool_failure_budget: 5,
             context_window: 200_000,

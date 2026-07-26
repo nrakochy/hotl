@@ -7,9 +7,7 @@ use std::sync::Arc;
 
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
-use hotl_provider::{
-    retry, CachePolicy, CacheTtl, ProviderError, SamplingRequest, StreamEvent, ToolDef,
-};
+use hotl_provider::{retry, CachePolicy, ProviderError, SamplingRequest, StreamEvent, ToolDef};
 use hotl_tools::rules::Verdict;
 use hotl_tools::{Permission, ToolOutcome};
 use hotl_types::{
@@ -1562,7 +1560,9 @@ impl Turn {
     /// The snapshot's two channels stay two channels all the way to the wire:
     /// `durable` is the only thing a provider may mark, `tail` is serialized
     /// after every marker. This is also where `EngineConfig::cache_static`
-    /// (still a bool this phase) becomes a [`CachePolicy`].
+    /// (still a bool this phase) becomes a [`CachePolicy`], carrying
+    /// `EngineConfig::cache_ttl` straight through as `prefix_ttl` — the
+    /// serializer, not this layer, decides which markers actually honor it.
     fn compose_request(
         &self,
         snapshot: &crate::actor::Snapshot,
@@ -1591,7 +1591,7 @@ impl Turn {
             thinking: self.shared.config.thinking,
             cache: if self.shared.config.cache_static {
                 CachePolicy::Static {
-                    prefix_ttl: CacheTtl::FiveMinutes,
+                    prefix_ttl: self.shared.config.cache_ttl,
                 }
             } else {
                 CachePolicy::Off

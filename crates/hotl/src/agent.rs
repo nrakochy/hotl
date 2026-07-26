@@ -10,6 +10,7 @@ use std::sync::Arc;
 use hotl_context::{load_memory, load_system_prompt, project_instructions};
 use hotl_engine::{EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
 use hotl_platform::{Clock, EnvSecrets, SecretStore, SystemClock};
+use hotl_provider::CacheTtl;
 use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, sandbox, Registry};
@@ -170,10 +171,18 @@ pub(crate) async fn acp_factory(
             return Err(1);
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
+    let mut scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(code) => return Err(code),
     };
+    // §Task 4 (mode-derived 1h TTL): `hotl tui`/`hotl acp` sessions are
+    // human-approval-gated and long-lived — pauses > 5 min are the dominant
+    // cost pattern, and the stable prefix and rolling anchors are read every
+    // sample, so the 1h write premium pays for itself interactively. Set
+    // AFTER `scaffold()` returns, on the config `Scaffold::deps` clones per
+    // session — `spawn_builder`'s captured config predates this mutation
+    // (see `HotlChildBuilder::spawn_child`), so children are unaffected.
+    scaffold.config.cache_ttl = CacheTtl::OneHour;
     let model = scaffold.model.clone();
     let skills: Vec<crate::acp::SkillInfo> = scaffold
         .skills
@@ -327,10 +336,15 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
             return 1;
         }
     };
-    let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
+    let mut scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(code) => return code,
     };
+    // §Task 4 (mode-derived 1h TTL): attach-at-any-time is `hotl bg`'s design
+    // center — sessions are long-lived and human-supervised, same rationale
+    // as `acp_factory`. Set AFTER `scaffold()` returns; see that comment for
+    // why children stay unaffected.
+    scaffold.config.cache_ttl = CacheTtl::OneHour;
     let mut log = match SessionLog::create(
         &sessions_dir(),
         &scaffold.model,
@@ -1001,6 +1015,17 @@ impl HotlChildBuilder {
         if let Some(model) = &def.model {
             config.model = model.clone();
         }
+        // Task 4 (mode-derived 1h TTL): children pin FiveMinutes
+        // deliberately — short-lived, no human pauses to amortize a 1h
+        // write premium over. Set explicitly rather than left to whatever
+        // `self.config` already carries: `self.config` is captured inside
+        // `scaffold()` (via `child_builder(...)`) *before* `acp_factory`/
+        // `serve_main` mutate their own copy to `OneHour`, so today it would
+        // happen to read `FiveMinutes` anyway — but that's an accident of
+        // capture order, not a guarantee, and must not be the mechanism a
+        // future refactor (or an `engine_config()` default change) silently
+        // breaks.
+        config.cache_ttl = CacheTtl::FiveMinutes;
         // `def.effort` is parsed but intentionally not applied: hotl's
         // `EngineConfig` has no effort ladder today (only `thinking: bool`)
         // — see `AgentDef::effort`'s doc comment. A future plan wires it.
@@ -2255,6 +2280,50 @@ mod tests {
             sandbox_enforced: false,
             initial_helper_key: None,
         }
+    }
+
+    /// Task 4's named trap: `child_builder()` captures a *clone* of
+    /// `Scaffold::config` inside `scaffold()`, before `acp_factory`/
+    /// `serve_main` mutate their own copy to `CacheTtl::OneHour` — so a child
+    /// that merely inherited whatever `self.config` already carried would
+    /// happen to run `FiveMinutes` today only because the capture predates
+    /// that mutation, never because anything pins it. Set the parent's own
+    /// config to `OneHour` directly (as if capture order ran the other way,
+    /// or a future default changed) and assert `spawn_child` still forces
+    /// `FiveMinutes` explicitly on the wire request the child actually sent.
+    #[tokio::test]
+    async fn spawned_children_never_carry_the_one_hour_ttl() {
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("child result"),
+        ]));
+        let mut cb = test_child_builder();
+        cb.provider = provider.clone();
+        // The parent's own live config already asks for the 1h TTL — the
+        // exact case that would leak into a child if `spawn_child` merely
+        // inherited `self.config` unchanged.
+        cb.config.cache_ttl = CacheTtl::OneHour;
+
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let mut handle = cb.spawn_child(&general, Vec::new()).expect("child spawns");
+        handle.prompt("go".into()).await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                break;
+            }
+        }
+
+        let request = provider.last_request().expect("one request");
+        assert_eq!(
+            request.cache,
+            hotl_provider::CachePolicy::Static {
+                prefix_ttl: CacheTtl::FiveMinutes
+            },
+            "a child must never inherit the parent's 1h TTL — short-lived, no human pauses"
+        );
     }
 
     /// The def's `ToolScope` is a structural cap on the child's registry —

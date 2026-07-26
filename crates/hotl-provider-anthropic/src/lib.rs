@@ -19,7 +19,8 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{
-    ArmGuard, Provider, ProviderError, SamplingRequest, StreamEvent, ToolDef, Warmable,
+    ArmGuard, CachePolicy, CacheTtl, Provider, ProviderError, SamplingRequest, StreamEvent,
+    ToolDef, Warmable,
 };
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
@@ -140,16 +141,24 @@ impl AnthropicProvider {
 
     fn build_body(req: &SamplingRequest) -> Value {
         let mark = req.cache.marks_breakpoints();
+        // The lifetime the PREFIX marker and the rolling ANCHOR markers ask
+        // for (Task 4). Meaningless when `mark` is false (`CachePolicy::Off`
+        // emits no `cache_control` at all, so this value is never read) —
+        // `FiveMinutes` is just a harmless placeholder for that case.
+        let ttl = match req.cache {
+            CachePolicy::Static { prefix_ttl } => prefix_ttl,
+            CachePolicy::Off => CacheTtl::FiveMinutes,
+        };
         // One plan per body, from the durable items alone — see `cache_plan`
         // for why the planner may not remember anything.
         let plan = mark.then(|| cache_plan::plan(&req.items));
-        let mut messages = build_messages(&req.items, plan.as_ref());
+        let mut messages = build_messages(&req.items, plan.as_ref(), ttl);
         // The ephemeral suffix, in wire order: after every durable message and
         // so after the deepest marker, before MOIM. Passing no plan is not a
         // policy decision made here — these items are not in `req.items`, so
         // the planner above never saw them and could not have picked one. That
         // is the whole point of the split.
-        messages.extend(build_messages(&req.ephemeral_tail, None));
+        messages.extend(build_messages(&req.ephemeral_tail, None, ttl));
         // MOIM rides last of all, after the cache marker: it changes every
         // sample without invalidating the cached prefix (suffix position).
         if let Some(tc) = &req.turn_context {
@@ -170,7 +179,7 @@ impl AnthropicProvider {
         if !req.system.is_empty() {
             let mut sys = json!({"type": "text", "text": req.system.as_ref()});
             if mark {
-                sys["cache_control"] = json!({"type": "ephemeral"});
+                sys["cache_control"] = ttl_marker(ttl);
             }
             body["system"] = json!([sys]);
         }
@@ -178,7 +187,7 @@ impl AnthropicProvider {
             let mut tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
             if mark && req.system.is_empty() {
                 if let Some(last) = tools.last_mut() {
-                    last["cache_control"] = json!({"type": "ephemeral"});
+                    last["cache_control"] = ttl_marker(ttl);
                 }
             }
             body["tools"] = json!(tools);
@@ -220,6 +229,17 @@ fn tool_json(t: &ToolDef) -> Value {
     json!({"name": t.name, "description": t.description, "input_schema": t.input_schema})
 }
 
+/// The `cache_control` value a ttl-eligible marker (prefix or rolling anchor)
+/// emits. `FiveMinutes` stays byte-identical to the pre-Task-4 wire shape —
+/// no `ttl` key at all, since Anthropic's default breakpoint lifetime already
+/// *is* five minutes — only `OneHour` needs to say so explicitly.
+fn ttl_marker(ttl: CacheTtl) -> Value {
+    match ttl {
+        CacheTtl::FiveMinutes => json!({"type": "ephemeral"}),
+        CacheTtl::OneHour => json!({"type": "ephemeral", "ttl": "1h"}),
+    }
+}
+
 /// Render `items` as Anthropic messages, placing a cache breakpoint on every
 /// block `plan` names.
 ///
@@ -234,8 +254,23 @@ fn tool_json(t: &ToolDef) -> Value {
 /// loop and [`cache_plan::plan`] must walk the list the same way — that shared
 /// walk is why `cache_plan::item_blocks` is required to mirror the match arms
 /// below.
-fn build_messages(items: &[Item], plan: Option<&cache_plan::Plan>) -> Vec<Value> {
-    let marks = |idx: usize, block: usize| plan.is_some_and(|p| p.marks(idx, block));
+///
+/// `ttl` is only ever consulted for a rolling ANCHOR: the LATEST marker
+/// (`Plan::is_latest`) always renders plain (Task 4's rule — see
+/// `CachePolicy::Static`'s doc comment for why), regardless of what the
+/// caller passed. Ignored entirely when `plan` is `None` (the ephemeral tail
+/// has no plan and so never marks anything).
+fn build_messages(items: &[Item], plan: Option<&cache_plan::Plan>, ttl: CacheTtl) -> Vec<Value> {
+    let marker = |idx: usize, block: usize| -> Option<Value> {
+        let p = plan?;
+        if p.is_latest(idx, block) {
+            Some(json!({"type": "ephemeral"}))
+        } else if p.is_anchor(idx, block) {
+            Some(ttl_marker(ttl))
+        } else {
+            None
+        }
+    };
     let mut out = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
         match item {
@@ -244,8 +279,8 @@ fn build_messages(items: &[Item], plan: Option<&cache_plan::Plan>) -> Vec<Value>
             Item::System { .. } | Item::Unknown => continue,
             Item::User { text, .. } => {
                 let mut block = json!({"type": "text", "text": text});
-                if marks(idx, 0) {
-                    block["cache_control"] = json!({"type": "ephemeral"});
+                if let Some(cc) = marker(idx, 0) {
+                    block["cache_control"] = cc;
                 }
                 out.push(json!({"role": "user", "content": [block]}));
             }
@@ -270,8 +305,8 @@ fn build_messages(items: &[Item], plan: Option<&cache_plan::Plan>) -> Vec<Value>
                         // Interior positions are markable: an anchor inside a
                         // wide batch is what keeps the next marker within the
                         // API's lookback.
-                        if marks(idx, block) {
-                            v["cache_control"] = json!({"type": "ephemeral"});
+                        if let Some(cc) = marker(idx, block) {
+                            v["cache_control"] = cc;
                         }
                         v
                     })
@@ -1239,6 +1274,21 @@ mod tests {
         out
     }
 
+    /// In wire order, every marker's `ttl` field (`None` when the marker is
+    /// plain — no `ttl` key at all, whether because it's the LATEST marker or
+    /// because the whole request is `FiveMinutes`).
+    fn marker_ttls(body: &Value) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        for msg in body["messages"].as_array().unwrap() {
+            for block in msg["content"].as_array().unwrap() {
+                if let Some(cc) = block.get("cache_control") {
+                    out.push(cc.get("ttl").map(|v| v.as_str().unwrap().to_string()));
+                }
+            }
+        }
+        out
+    }
+
     /// The prefix marker's fallback. With no system prompt there is no system
     /// block to seal tools with, so the marker goes back on the last tool def
     /// — otherwise the tool schemas (often thousands of tokens) sit outside
@@ -1352,6 +1402,109 @@ mod tests {
             .filter(|b| b.get("cache_control").is_some())
             .count();
         assert_eq!(inside, 3, "two anchors and the latest, all interior");
+    }
+
+    /// Task 4: under `OneHour`, the PREFIX marker (system) and every rolling
+    /// ANCHOR carry `"ttl":"1h"`; the LATEST marker never does — and, in the
+    /// prompt order the API actually parses (tools/system prefix, then
+    /// messages in wire order — commit-protocol's "prefix < anchors <
+    /// latest"), every ttl-carrying marker precedes the one plain marker.
+    #[test]
+    fn ttl_ordering_one_hour_markers_precede_five_minute() {
+        let mut req = static_req(
+            "sys",
+            vec![
+                Item::User {
+                    text: "go".into(),
+                    synthetic: None,
+                },
+                assistant(1),
+                tool_results(40),
+            ],
+        );
+        req.cache = CachePolicy::Static {
+            prefix_ttl: CacheTtl::OneHour,
+        };
+        let body = wire_body(&req);
+
+        // The prefix marker.
+        assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+
+        // The two anchors and the latest, in wire order: ttl, ttl, then the
+        // one marker with no ttl key at all.
+        let ttls = marker_ttls(&body);
+        assert_eq!(
+            ttls,
+            vec![Some("1h".to_string()), Some("1h".to_string()), None],
+            "anchors carry ttl, latest does not: {ttls:?}"
+        );
+        // Restated as the ordering claim itself: the only plain marker is the
+        // last one — every ttl-carrying marker precedes it.
+        let (ttl_carrying, plain): (Vec<_>, Vec<_>) = ttls.iter().partition(|t| t.is_some());
+        assert_eq!(plain.len(), 1, "exactly one plain marker: the latest");
+        assert_eq!(ttl_carrying.len(), 2, "prefix's sibling anchors both ttl'd");
+        assert!(
+            ttls.iter().position(|t| t.is_none()) == Some(ttls.len() - 1),
+            "the plain marker must be the last one in wire order: {ttls:?}"
+        );
+    }
+
+    /// Golden, both modes: `FiveMinutes` stays byte-identical to the
+    /// pre-Task-4 wire shape (no `"ttl"` anywhere); `OneHour` differs from it
+    /// *only* by adding `"ttl":"1h"` to the prefix and anchor markers — the
+    /// latest marker and everything else is untouched.
+    #[test]
+    fn golden_five_minutes_has_no_ttl_one_hour_adds_it_structurally() {
+        let five = static_req(
+            "sys",
+            vec![
+                Item::User {
+                    text: "go".into(),
+                    synthetic: None,
+                },
+                assistant(1),
+                tool_results(40),
+            ],
+        );
+        let five_body = wire_body(&five);
+        assert!(
+            !five_body.to_string().contains("\"ttl\""),
+            "FiveMinutes must never emit a ttl key: {five_body}"
+        );
+
+        let mut one = five.clone();
+        one.cache = CachePolicy::Static {
+            prefix_ttl: CacheTtl::OneHour,
+        };
+        let one_body = wire_body(&one);
+
+        // Strip every `ttl` field a ttl-marker may carry; what's left must be
+        // byte-identical to the FiveMinutes body.
+        fn strip_ttl(v: &mut Value) {
+            match v {
+                Value::Object(map) => {
+                    map.remove("ttl");
+                    for val in map.values_mut() {
+                        strip_ttl(val);
+                    }
+                }
+                Value::Array(items) => items.iter_mut().for_each(strip_ttl),
+                _ => {}
+            }
+        }
+        let mut one_stripped = one_body.clone();
+        strip_ttl(&mut one_stripped);
+        assert_eq!(
+            five_body, one_stripped,
+            "OneHour must differ from FiveMinutes only by added ttl fields"
+        );
+
+        // And the ttl fields it adds land exactly on the prefix + 2 anchors,
+        // never on the latest.
+        assert_eq!(one_body["system"][0]["cache_control"]["ttl"], "1h");
+        let ttls = marker_ttls(&one_body);
+        assert_eq!(ttls.iter().filter(|t| t.is_some()).count(), 2, "{ttls:?}");
+        assert_eq!(ttls.last().unwrap(), &None, "latest stays plain: {ttls:?}");
     }
 
     /// The budget assertion is a `debug_assert` in `build_body`; this is the

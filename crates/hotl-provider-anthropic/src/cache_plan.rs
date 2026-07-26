@@ -76,14 +76,30 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
-    /// Does a `cache_control` marker belong on this rendered block?
-    ///
-    /// Anchors are deduped against `latest` when the plan is built, so this
-    /// can never answer yes twice for the same block — the API rejects two
-    /// markers on one content block.
+    /// Does a `cache_control` marker belong on this rendered block at all —
+    /// i.e. is it either the LATEST marker or a rolling ANCHOR? Anchors are
+    /// deduped against `latest` when the plan is built, so the two can never
+    /// both answer yes for the same block — the API rejects two markers on
+    /// one content block.
+    #[cfg(test)]
     pub(crate) fn marks(&self, item: usize, block: usize) -> bool {
-        let hit = |m: &Mark| m.item == item && m.block == block;
-        self.latest.as_ref().is_some_and(hit) || self.anchors.iter().any(hit)
+        self.is_latest(item, block) || self.is_anchor(item, block)
+    }
+
+    /// Is this rendered block the single LATEST marker — the one Task 4
+    /// (mode-derived 1h TTL) requires to always render plain, regardless of
+    /// `CachePolicy::Static`'s `prefix_ttl`? Its segment is rewritten every
+    /// sample, so a longer-lived write premium there recurs per turn and buys
+    /// nothing.
+    pub(crate) fn is_latest(&self, item: usize, block: usize) -> bool {
+        self.latest == Some(Mark { item, block })
+    }
+
+    /// Is this rendered block a rolling anchor — ttl-eligible, unlike
+    /// `latest`? Mutually exclusive with [`Self::is_latest`] by construction
+    /// (anchors are deduped against `latest` when the plan is built).
+    pub(crate) fn is_anchor(&self, item: usize, block: usize) -> bool {
+        self.anchors.contains(&Mark { item, block })
     }
 }
 
