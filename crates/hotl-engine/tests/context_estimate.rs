@@ -1,7 +1,9 @@
-//! T2-1: with a todo list active the snapshot carries an ephemeral reminder
-//! as its last item. Anchoring on snapshot length rather than durable length
-//! makes the next estimate skip the tool results entirely, so the compaction
-//! trigger never fires in the default (todo-driven) workflow.
+//! T2-1: a snapshot has two channels — `Snapshot { durable, tail }` — and the
+//! todo reminder lives in the ephemeral `tail`, never in `durable`. The
+//! context estimate must anchor on the DURABLE list: anchoring on a length
+//! that counts the reminder would put the anchor one item past the real
+//! history, making the next estimate skip the tool results entirely, so the
+//! compaction trigger would never fire in the default (todo-driven) workflow.
 
 use std::sync::Arc;
 use std::time::Duration;

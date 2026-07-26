@@ -44,13 +44,15 @@ pub trait ChildBuilder: Send + Sync {
     ) -> Result<SessionHandle, String>;
 }
 
-/// Reaches back into *this session's own actor* to ask for its current
-/// projection (`fork`'s history seed) — the same `SessionCmd::Snapshot`
-/// round trip a turn task uses at sample boundaries, just called from a tool
-/// instead of from inside the engine. Bound at construction to a per-session
-/// weak sender (mirrors `todo_write`/`ask_user`'s sink pattern — see
-/// `agent.rs::spawn_session_with_todos`): a *strong* sender here would be a
-/// reference cycle keeping the session's actor alive forever.
+/// Reaches back into *this session's own actor* to read its current
+/// projection (`fork`'s history seed) — the same epoch-fenced published head a
+/// turn task reads at sample boundaries, just read from a tool instead of from
+/// inside the engine. A *read* of a watch channel the actor publishes only
+/// after durability, not a mailbox round trip: nothing is asked of the actor,
+/// so a `fork` cannot queue behind an in-flight turn. Bound after the fact to
+/// this session's own head reader (`agent.rs::spawn_session_with_todos` fills
+/// the cell the instant the session exists, and always before any turn — and
+/// so any `fork` — can run).
 ///
 /// Yields the **durable** projection only — never the ephemeral per-sample
 /// tail (see `agent.rs::snapshot_provider`). A fork seed is committed into the

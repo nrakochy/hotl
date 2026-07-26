@@ -218,8 +218,9 @@ impl AnthropicProvider {
 /// serialize *identically at the wire level*, not merely structurally —
 /// commit-protocol.md case 9 requires the adopted speculative request to be
 /// proven equal to the sequential rebuild "against the provider-serialized
-/// body". Production code has no reason to call this; the streaming path
-/// builds its own body inline.
+/// body". It is the same `build_body` [`AnthropicProvider::stream`] calls, not
+/// a test-only reimplementation — which is what makes an assertion over these
+/// bytes an assertion about the wire.
 #[doc(hidden)]
 pub fn wire_body(req: &SamplingRequest) -> Value {
     AnthropicProvider::build_body(req)

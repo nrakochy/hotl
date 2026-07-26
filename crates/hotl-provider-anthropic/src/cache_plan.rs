@@ -7,8 +7,23 @@
 //! which point the new marker cannot see the entry the previous sample wrote,
 //! the lookup misses, and the whole history re-bills at write price on every
 //! sample from then on. The fix is rolling *anchors*: extra markers dropped at
-//! fixed stride crossings so no two markers are ever further apart than the
-//! lookback, even inside one wide turn.
+//! fixed stride crossings, close enough together that the next sample's
+//! markers can still reach the entries this one wrote.
+//!
+//! "Close enough together" is a claim about *markable* positions, and two
+//! things can still open a gap wider than the lookback:
+//!
+//! - An assistant item wider than ~19 blocks. Assistant blocks are never
+//!   markable (see [`candidates`]), so a single wide turn pushes its anchor to
+//!   the first candidate past it and nothing can be placed inside — the
+//!   residual pinned by `an_oversized_assistant_turn_degrades_deterministically`.
+//! - Budget exhaustion: only the last [`MAX_ANCHORS`] crossings are kept, so
+//!   the shallow ones are dropped as history grows. This one is harmless —
+//!   cache entries are prefix-cumulative, so a dropped shallow anchor is
+//!   already sealed behind the deeper ones that replaced it.
+//!
+//! Both are degradations, not correctness bugs: the placement stays
+//! deterministic and append-stable either way.
 //!
 //! Two properties make this safe, and both come from the same decision — the
 //! planner is a pure function of `items` with no state and no config:
@@ -23,10 +38,21 @@
 
 use hotl_types::Item;
 
-/// Stride, in wire content blocks, between rolling anchors. Under the API's
-/// ~20-block lookback with room to spare: consecutive markers land at most one
-/// stride plus one item's width apart, and 15 leaves 5 blocks of slack for the
-/// item that straddles a crossing.
+/// Stride, in wire content blocks, between rolling anchors.
+///
+/// Both numbers come from Anthropic's prompt-caching documentation: the
+/// lookback that walks ~20 content blocks back from a breakpoint, and its own
+/// remedy for long conversations — place an intermediate breakpoint roughly
+/// every 15 blocks. 15 under 20 leaves 5 blocks of slack, which covers the
+/// item straddling a crossing **when that item is at most 5 blocks wide**; a
+/// wider straddling item eats into the margin, and one wider than the lookback
+/// itself opens a real gap (see the module doc's residuals).
+///
+/// The premise the whole scheme rests on: a `cache_control` marker is
+/// *metadata*, NOT part of the prefix the API hashes. Moving a marker between
+/// requests therefore invalidates nothing — which is exactly why anchors may
+/// roll, and why a marker this request drops costs nothing beyond the entry it
+/// stops refreshing.
 pub(crate) const ANCHOR_STRIDE: usize = 15;
 
 /// The API's per-request `cache_control` budget. Spent as: 1 prefix marker
