@@ -387,4 +387,26 @@ mod tests {
             .iter()
             .any(|e| matches!(e, StreamEvent::TextDelta { .. })));
     }
+
+    #[test]
+    fn message_start_usage_carries_both_cache_fields() {
+        let mut a = Assembler::default();
+        a.handle(
+            r#"{"type":"message_start","message":{"usage":{
+                "input_tokens":20,"cache_read_input_tokens":300,
+                "cache_creation_input_tokens":150
+            }}}"#,
+        )
+        .unwrap();
+        a.handle(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#)
+            .unwrap();
+        a.handle(r#"{"type":"message_stop"}"#).unwrap();
+        let StreamEvent::Completed { usage, .. } = a.finish().expect("completed") else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.cache_read_input_tokens, 300);
+        assert_eq!(usage.cache_creation_input_tokens, 150);
+        assert_eq!(usage.output_tokens, 9);
+    }
 }

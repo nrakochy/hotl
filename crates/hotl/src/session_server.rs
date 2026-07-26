@@ -305,7 +305,7 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                         "t": "turn_done",
                         "schemaVersion": UPDATE_SCHEMA_VERSION,
                         "outcome": outcome_tag(&outcome),
-                        "usage": usage,
+                        "usage": crate::wire::usage_frame(&usage),
                     }),
                 )
                 .await;

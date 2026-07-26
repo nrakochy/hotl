@@ -127,6 +127,36 @@ fn thinking_deltas_carry_their_text() {
 }
 
 #[test]
+fn turn_done_usage_carries_hit_ratio_when_cache_activity_is_present() {
+    let usage = TokenUsage {
+        input_tokens: 25,
+        output_tokens: 5,
+        cache_read_input_tokens: 50,
+        cache_creation_input_tokens: 25,
+    };
+    let f = wire::json_frame(&EngineEvent::TurnDone {
+        outcome: Outcome::Done { text: "ok".into() },
+        usage,
+    });
+    assert_eq!(f["usage"]["hit_ratio"], json!(0.5));
+}
+
+#[test]
+fn turn_done_usage_omits_hit_ratio_without_cache_activity() {
+    // Today's exact bytes for a plain, uncached scripted scenario: no
+    // `hit_ratio` key at all, not `null` — the golden-transcript byte
+    // stability rule extended to this new derived field.
+    let f = wire::json_frame(&EngineEvent::TurnDone {
+        outcome: Outcome::Done { text: "ok".into() },
+        usage: TokenUsage::default(),
+    });
+    assert!(
+        f["usage"].get("hit_ratio").is_none(),
+        "no cache activity must mean no hit_ratio key: {f}"
+    );
+}
+
+#[test]
 fn the_schema_version_reflects_the_breaking_outcome_change() {
     // Read off a real frame rather than the constant: what a consumer pins to
     // is the stamped value, and this way the stamping itself is under test.

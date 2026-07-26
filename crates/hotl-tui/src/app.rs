@@ -576,6 +576,12 @@ fn format_usage(state: &State, usage: &Value) -> String {
     if u.cache_read > 0 {
         parts.push(format!("{} cached", tok(u.cache_read)));
     }
+    // Per-turn, not accumulated (a session-wide average would blur a cold
+    // first turn into a warm tenth one) — present only when this turn had
+    // cache activity to report (§S1 cache telemetry).
+    if let Some(ratio) = usage.get("hit_ratio").and_then(Value::as_f64) {
+        parts.push(format!("{:.0}% hit", ratio * 100.0));
+    }
     // What the *next* turn starts from: everything resident in this turn's
     // context, not the session's running total.
     let live = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
@@ -1186,6 +1192,35 @@ mod tests {
         );
         // (2_000 + 8_000) / 200_000 of the window is live in the latest turn.
         assert!(line.contains("5% ctx"), "context gauge: {line}");
+    }
+
+    #[test]
+    fn hit_ratio_percentage_shows_when_present() {
+        let mut s = State::test_default();
+        s.context_window = 200_000;
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({
+                "input_tokens": 25, "output_tokens": 5,
+                "cache_read_input_tokens": 50, "cache_creation_input_tokens": 25,
+                "hit_ratio": 0.5
+            }),
+        );
+        let line = s.usage_line.clone().unwrap();
+        assert!(line.contains("50% hit"), "hit ratio must show: {line}");
+    }
+
+    #[test]
+    fn hit_ratio_is_omitted_when_the_payload_carries_none() {
+        let mut s = State::test_default();
+        on_result(&mut s, "done", None, &json!({"input_tokens": 10}));
+        assert!(
+            !s.usage_line.as_ref().unwrap().contains("hit"),
+            "no cache activity in the payload, no hit-ratio segment: {:?}",
+            s.usage_line
+        );
     }
 
     #[test]

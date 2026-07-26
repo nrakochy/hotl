@@ -16,6 +16,7 @@
 //! `tests/json_stream_schema.rs::every_frame_is_tagged_and_versioned`.
 
 use hotl_engine::{EngineEvent, Outcome};
+use hotl_types::TokenUsage;
 use serde_json::{json, Value};
 
 /// Stable schema version of the `-p --json` event stream (an MD Tier-1
@@ -88,6 +89,19 @@ pub fn outcome_frame(outcome: &Outcome) -> Value {
     }
 }
 
+/// A turn's usage as JSON, `hit_ratio` added on top when there was cache
+/// activity to report (§S1 cache telemetry). Single derivation site so
+/// headless `--json` and the ACP wire (`acp.rs`'s `TurnDone` handling) can't
+/// drift on the formula. Omitted, not `null`, when absent — a plain,
+/// uncached turn's usage bytes are unchanged from before this field existed.
+pub fn usage_frame(usage: &TokenUsage) -> Value {
+    let mut v = json!(usage);
+    if let Some(ratio) = usage.hit_ratio() {
+        v["hit_ratio"] = json!(ratio);
+    }
+    v
+}
+
 /// One `-p --json` line: an update frame, or the turn-done/ask/question frames
 /// only that stream emits — always version-stamped.
 ///
@@ -102,7 +116,7 @@ pub fn json_frame(event: &EngineEvent) -> Value {
             EngineEvent::TurnDone { outcome, usage } => json!({
                 "type": "turn_done",
                 "outcome": outcome_frame(outcome),
-                "usage": usage,
+                "usage": usage_frame(usage),
             }),
             EngineEvent::Ask { summary, .. } => {
                 json!({"type": "ask_denied", "summary": summary})

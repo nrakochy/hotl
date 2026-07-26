@@ -534,7 +534,11 @@ async fn drain_events(
                     reply_ok(
                         &writer,
                         id,
-                        json!({"schemaVersion": UPDATE_SCHEMA_VERSION, "outcome": outcome_tag(&outcome), "usage": usage}),
+                        json!({
+                            "schemaVersion": UPDATE_SCHEMA_VERSION,
+                            "outcome": outcome_tag(&outcome),
+                            "usage": crate::wire::usage_frame(&usage),
+                        }),
                     )
                     .await;
                 }

@@ -161,6 +161,23 @@ impl std::ops::AddAssign for TokenUsage {
     }
 }
 
+impl TokenUsage {
+    /// Fraction of prompt tokens (input + cache reads + cache writes) served
+    /// from the cache. `None` when there was no cache activity at all (no
+    /// reads, no writes) — that is "nothing to report", not a 0% hit rate,
+    /// so a plain uncached request never shows a misleading `0%`. Division
+    /// by zero never happens: the guard only lets the divide run once the
+    /// denominator has a cache-derived term in it.
+    pub fn hit_ratio(&self) -> Option<f64> {
+        if self.cache_read_input_tokens == 0 && self.cache_creation_input_tokens == 0 {
+            return None;
+        }
+        let total =
+            self.input_tokens + self.cache_read_input_tokens + self.cache_creation_input_tokens;
+        Some(self.cache_read_input_tokens as f64 / total as f64)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionHeader {
     pub format_version: u32,
@@ -501,6 +518,47 @@ mod tests {
         let ej = serde_json::to_string(&e).unwrap();
         assert!(ej.contains("\"kind\":\"todos\""));
         assert_eq!(serde_json::from_str::<EntryPayload>(&ej).unwrap(), e);
+    }
+
+    #[test]
+    fn hit_ratio_is_absent_without_cache_activity() {
+        // Plain uncached usage: no reads, no writes. `Some(0.0)` would read
+        // as "0% cache hit"; the correct signal is "no cache info at all".
+        let usage = TokenUsage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..Default::default()
+        };
+        assert_eq!(usage.hit_ratio(), None);
+    }
+
+    #[test]
+    fn hit_ratio_divides_reads_by_total_prompt_tokens() {
+        let usage = TokenUsage {
+            input_tokens: 25,
+            output_tokens: 10,
+            cache_read_input_tokens: 50,
+            cache_creation_input_tokens: 25,
+        };
+        assert_eq!(usage.hit_ratio(), Some(0.5));
+    }
+
+    #[test]
+    fn hit_ratio_is_present_and_zero_on_a_cache_write_with_no_reads() {
+        // A cold prefix write with nothing yet read back: cache activity
+        // happened (so the ratio is meaningful), but the hit rate is 0%.
+        let usage = TokenUsage {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_read_input_tokens: 0,
+            cache_creation_input_tokens: 100,
+        };
+        assert_eq!(usage.hit_ratio(), Some(0.0));
+    }
+
+    #[test]
+    fn hit_ratio_never_divides_by_zero() {
+        assert_eq!(TokenUsage::default().hit_ratio(), None);
     }
 
     #[test]
