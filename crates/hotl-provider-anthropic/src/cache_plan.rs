@@ -18,9 +18,16 @@
 //!   the first candidate past it and nothing can be placed inside — the
 //!   residual pinned by `an_oversized_assistant_turn_degrades_deterministically`.
 //! - Budget exhaustion: only the last [`MAX_ANCHORS`] crossings are kept, so
-//!   the shallow ones are dropped as history grows. This one is harmless —
-//!   cache entries are prefix-cumulative, so a dropped shallow anchor is
-//!   already sealed behind the deeper ones that replaced it.
+//!   the shallow ones are dropped as history grows. This one is harmless when
+//!   crossings accumulate gradually, one or two per turn — cache entries are
+//!   prefix-cumulative, so a dropped shallow anchor is already sealed behind
+//!   the deeper ones that replaced it. It is NOT harmless when a single turn
+//!   appends ≥3 stride crossings at once (a ~45+ block user-role turn): the
+//!   shallowest of those brand-new crossings is dropped before any request
+//!   ever marked it, so this request's markers can land more than the
+//!   lookback past the *previous* request's deepest entry — that one request
+//!   re-bills its whole history at write price, self-healing on the next
+//!   sample once growth returns to normal.
 //!
 //! Both are degradations, not correctness bugs: the placement stays
 //! deterministic and append-stable either way.

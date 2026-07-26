@@ -253,6 +253,12 @@ pub fn max_output_tokens(model: &str) -> Option<u32> {
 /// total is priced at the 5m rate — a documented underestimate for any of
 /// that traffic actually written at the 1h TTL, chosen because it is the
 /// cheaper of the two rather than fabricating a split hotl was never told.
+/// The same fallback applies to whatever the breakdown *doesn't* cover: when
+/// the two buckets are present but their sum falls short of
+/// `cache_creation_input_tokens` (a shape the wire is not documented to send,
+/// but nothing rules out), the saturating excess is priced at the 5m rate
+/// too, so the total charged always accounts for every creation token
+/// reported rather than quietly pricing the remainder at zero.
 ///
 /// INVARIANT: caching a prefix is never more expensive than not caching the
 /// same traffic. Enforced by `cost_prices_each_usage_bucket_at_its_own_rate`.
@@ -267,13 +273,16 @@ pub fn cost_usd(model: &str, usage: &TokenUsage) -> Option<f64> {
             m.cache_write_usd_per_mtok,
         )
     } else {
+        let excess = usage.cache_creation_input_tokens.saturating_sub(
+            usage.cache_creation_5m_input_tokens + usage.cache_creation_1h_input_tokens,
+        );
         per(
             usage.cache_creation_5m_input_tokens,
             m.cache_write_usd_per_mtok,
         ) + per(
             usage.cache_creation_1h_input_tokens,
             m.cache_write_1h_usd_per_mtok,
-        )
+        ) + per(excess, m.cache_write_usd_per_mtok)
     };
     Some(
         per(usage.input_tokens, m.input_usd_per_mtok)
@@ -424,6 +433,25 @@ mod tests {
         // Opus 4.8: 5m bucket at 6.25 + 1h bucket at 10.00 (2x input).
         let cost = cost_usd("claude-opus-4-8", &usage).unwrap();
         assert!((cost - 16.25).abs() < 1e-9, "was {cost}");
+    }
+
+    #[test]
+    fn cost_prices_the_breakdown_shortfall_at_the_5m_rate() {
+        // Both TTL buckets are present (so the fallback path is not taken),
+        // but they undercount the reported total by 200,000 tokens — a
+        // mixed shape the wire is not documented to send, but one this
+        // function must still be total-preserving over: every creation
+        // token reported gets priced, none of it at $0.
+        let usage = TokenUsage {
+            cache_creation_5m_input_tokens: 500_000,
+            cache_creation_1h_input_tokens: 300_000,
+            cache_creation_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        // Opus 4.8: 5m bucket 0.5*6.25 = 3.125, 1h bucket 0.3*10.00 = 3.00,
+        // and the 200,000 excess priced at the 5m rate: 0.2*6.25 = 1.25.
+        let cost = cost_usd("claude-opus-4-8", &usage).unwrap();
+        assert!((cost - 7.375).abs() < 1e-9, "was {cost}");
     }
 
     #[test]

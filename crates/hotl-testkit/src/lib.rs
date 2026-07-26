@@ -1748,6 +1748,14 @@ mod tests {
     /// Claim 4 is the one a byte-identity test cannot make: it is a statement
     /// about two *different* requests, and it is what the original bug broke.
     ///
+    /// Claim 4a is therefore not a universal property of the planner: a
+    /// fixture whose single turn appends ≥3 stride crossings at once (a
+    /// ~45+ block user-role turn) will fail it even though the code is
+    /// behaving exactly as designed — see the budget-exhaustion note in
+    /// `cache_plan`'s module doc. That one request legitimately re-bills its
+    /// history once and self-heals on the next sample, so such a fixture
+    /// needs its own assertion, not this one.
+    ///
     /// (4b) deliberately admits N+1's own shallower markers as chain links.
     /// Not because a deeper breakpoint can *read* one — within a single
     /// request the lookup runs against entries that already existed, and
@@ -1966,16 +1974,19 @@ mod tests {
             cfg(),
             ping_registry(),
         );
-        h.prompt_and_wait("first").await;
+        let first = h.prompt_and_wait("first").await;
+        assert!(matches!(first, Outcome::Done { .. }), "turn 1: {first:?}");
         h.handle.set_todos(vec![done_todo("write the suite")]).await;
-        h.prompt_and_wait("second").await;
+        let second = h.prompt_and_wait("second").await;
+        assert!(matches!(second, Outcome::Done { .. }), "turn 2: {second:?}");
         h.handle
             .set_todos(vec![
                 done_todo("write the suite"),
                 done_todo("sweep the docs"),
             ])
             .await;
-        h.prompt_and_wait("third").await;
+        let third = h.prompt_and_wait("third").await;
+        assert!(matches!(third, Outcome::Done { .. }), "turn 3: {third:?}");
 
         let requests = h.provider.requests();
         assert_eq!(requests.len(), 3, "one sample per turn");

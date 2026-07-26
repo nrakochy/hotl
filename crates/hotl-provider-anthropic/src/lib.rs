@@ -1167,11 +1167,16 @@ mod tests {
 
     /// The two invariants the phase is judged on, as a differential test.
     ///
-    /// (a) todos INACTIVE under `Static` is byte-identical to what
-    /// `cache_static: true` produced before the split — nothing about markers,
-    /// order or MOIM moved. (b) todos ACTIVE differs from (a) by exactly one
-    /// appended unmarked message, inserted before MOIM: every durable byte and
-    /// every marker is untouched.
+    /// (a) todos INACTIVE under `Static` is the same wire body an ordinary
+    /// request produces when the tail is simply empty — nothing about
+    /// markers, order or MOIM depends on the tail feature existing at all.
+    /// (This is no longer byte-identical to what `cache_static: true`
+    /// produced before the split: today's rolling-anchor scheme folds the
+    /// tools marker into the system marker for short histories, so a request
+    /// like this one now carries two markers where the pre-split code wrote
+    /// three.) (b) todos ACTIVE differs from (a) by exactly one appended
+    /// unmarked message, inserted before MOIM: every durable byte and every
+    /// marker is untouched.
     #[test]
     fn an_active_tail_changes_nothing_but_appends_one_unmarked_message() {
         let base = SamplingRequest {
