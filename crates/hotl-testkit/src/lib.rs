@@ -106,6 +106,26 @@ impl Harness {
         Self::build_with(scripts, config, Vec::new(), None, registry)
     }
 
+    /// Construct a harness with a custom tool registry and the writer's
+    /// `sync_data()` no-op'd (`hotl_store::SessionLog::set_sync_noop`) — the
+    /// §S1 loop-overhead CI gate's scenario, isolating measured overhead
+    /// from real disk sync latency.
+    pub fn with_registry_sync_noop(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        registry: Registry,
+    ) -> Self {
+        Self::build_full(
+            scripts,
+            config,
+            Vec::new(),
+            None,
+            registry,
+            Rules::default(),
+            true,
+        )
+    }
+
     fn build(
         scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
         config: EngineConfig,
@@ -129,6 +149,7 @@ impl Harness {
             None,
             Registry::builtin(),
             rules,
+            false,
         )
     }
 
@@ -146,6 +167,7 @@ impl Harness {
             hooks,
             registry,
             Rules::default(),
+            false,
         )
     }
 
@@ -156,10 +178,14 @@ impl Harness {
         hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
         registry: Registry,
         rules: Rules,
+        sync_noop: bool,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
             .expect("session log");
+        if sync_noop {
+            log.set_sync_noop(true);
+        }
         let log_path = log.path().to_path_buf();
         let provider = Arc::new(ScriptedProvider::new(scripts));
         let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
