@@ -101,9 +101,24 @@ impl Pipeline {
         self.fifo.is_empty()
     }
 
-    /// Assign the next commit order. Within a proposal, `seq` is assigned per
-    /// entry in proposal order, so the run is contiguous and `seq` order
-    /// still equals disk order.
+    /// Assign the next commit order, at the mint that is about to happen.
+    ///
+    /// **Every** commit the actor makes calls this — `Sync` proposals,
+    /// `Pipelined` proposals and actor-originated inline appends alike —
+    /// because §Ordering authority defines `seq` as the global commit order
+    /// across the whole session, not a count of the pipelined subset. A
+    /// counter that skipped the other paths would also make S2c's watch
+    /// predicate (`epoch >= my_ack_seq`, where `epoch` is the seq of the
+    /// newest entry applied to the published head) compare two different
+    /// numberings.
+    ///
+    /// Assigned at validation, before the write, so a ticket carries it
+    /// eagerly — which means a mint the writer then refuses burns its
+    /// number. That is harmless: the head simply never stops on it, and
+    /// `seq` is monotonic either way.
+    ///
+    /// Within a proposal it is assigned per entry in proposal order, so the
+    /// run is contiguous and `seq` order still equals disk order.
     fn next_seq(&mut self) -> u64 {
         self.seq += 1;
         self.seq
@@ -348,6 +363,7 @@ impl SharedDeps {
         payload: &EntryPayload,
     ) -> bool {
         pipeline.drain(items, Resolution::Ack).await;
+        pipeline.next_seq();
         log.append_acked(payload, self.clock.now_ms()).await.is_ok()
     }
 
@@ -1157,6 +1173,7 @@ async fn commit_prepared(
             pipeline.drain(items, Resolution::Ack).await;
             for entry in entries {
                 let (payload, item) = entry.into_parts();
+                pipeline.next_seq();
                 if !shared.append_prepared(log, payload).await {
                     return crate::ProposeReply::Sealed;
                 }
@@ -1937,6 +1954,61 @@ mod tests {
         assert_eq!(
             ticket.ack.await.expect("resolved"),
             Err(crate::CommitFailed::LogSealed)
+        );
+    }
+
+    /// §Ordering authority: `seq` is "global commit order across the whole
+    /// session", not a count of the pipelined subset. Every commit the actor
+    /// makes advances it — a `Sync` proposal and an actor-originated inline
+    /// append included — or the watch predicate S2c is built on
+    /// (`epoch >= my_ack_seq`, where `epoch` is the seq of the newest entry
+    /// applied to the published head) is comparing two different counters.
+    #[tokio::test]
+    async fn seq_is_the_session_wide_commit_order_not_the_pipelined_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, mut log) = test_shared(dir.path());
+        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let mut pipeline = Pipeline::default();
+
+        // A Sync proposal…
+        commit_prepared(
+            &shared,
+            &mut log,
+            &mut items,
+            &mut pipeline,
+            vec![prepared(&shared, user("sync"))],
+            crate::AckMode::Sync,
+        )
+        .await;
+        // …and an actor-originated inline append.
+        assert!(
+            shared
+                .append(
+                    &mut log,
+                    &mut pipeline,
+                    &mut items,
+                    &EntryPayload::Rename {
+                        name: "inline".into()
+                    },
+                )
+                .await
+        );
+
+        let reply = commit_prepared(
+            &shared,
+            &mut log,
+            &mut items,
+            &mut pipeline,
+            vec![prepared(&shared, user("pipelined"))],
+            crate::AckMode::Pipelined,
+        )
+        .await;
+        let crate::ProposeReply::Ticket(ticket) = reply else {
+            panic!("expected a ticket")
+        };
+        assert_eq!(
+            ticket.seq, 3,
+            "the third commit of the session carries seq 3, not seq 1"
         );
     }
 

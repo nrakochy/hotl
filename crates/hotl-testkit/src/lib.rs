@@ -1289,37 +1289,59 @@ mod tests {
         );
     }
 
-    /// The revision's first counter assertion, at the engine level: a
-    /// proposal carrying several entries rides ONE `sync_data`, so a session
-    /// spends fewer syncs than it writes entries. (The group-commit property
-    /// itself is pinned deterministically in hotl-store's
+    /// The revision's first counter assertion, at the engine level, measured
+    /// against a real baseline rather than a bound that is true by accident:
+    /// the SAME session in `Sync` mode spends exactly one `sync_data` per
+    /// entry (queue depth 1, by construction), and `Pipelined` must beat it.
+    /// (The 3-entries-1-sync property itself is pinned deterministically in
+    /// hotl-store's
     /// `a_queued_batch_syncs_once_and_acks_every_entry_with_its_own_offset`;
-    /// this is the end-to-end half.)
+    /// this is the end-to-end half, where the grouping is a real race against
+    /// a real writer thread.)
     #[tokio::test]
-    async fn a_multi_entry_pipelined_proposal_spends_fewer_syncs_than_entries() {
-        let mut h = Harness::new(vec![], cfg());
-        for sub in ["web", "api"] {
-            let dir = h.dir().join(sub);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::write(dir.join("AGENTS.md"), format!("{sub} rules")).unwrap();
-            std::fs::write(dir.join("page.txt"), "content").unwrap();
-        }
+    async fn a_multi_entry_pipelined_proposal_spends_fewer_syncs_than_sync_mode() {
         // One batch, two fresh subdirs: the tool-results entry plus two
-        // subdir-instruction entries travel as one pipelined proposal.
-        h.provider.push_script(tool_batch(&[
-            ("t1", "read", json!({"path": h.dir().join("web/page.txt")})),
-            ("t2", "read", json!({"path": h.dir().join("api/page.txt")})),
-        ]));
-        h.provider
-            .push_script(ScriptedProvider::text_reply("read both"));
-        let outcome = h.prompt_and_wait("read both pages").await;
-        assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+        // subdir-instruction entries travel as ONE proposal — three entries
+        // that a group commit collapses to one sync.
+        async fn run(mode: hotl_engine::AckMode) -> (u64, u64) {
+            let mut h = Harness::new(vec![], cfg_with(mode));
+            for sub in ["web", "api"] {
+                let dir = h.dir().join(sub);
+                std::fs::create_dir_all(&dir).unwrap();
+                std::fs::write(dir.join("AGENTS.md"), format!("{sub} rules")).unwrap();
+                std::fs::write(dir.join("page.txt"), "content").unwrap();
+            }
+            h.provider.push_script(tool_batch(&[
+                (
+                    "t1",
+                    "read",
+                    json!({"path": h.dir().join("web/page.txt").to_str().unwrap()}),
+                ),
+                (
+                    "t2",
+                    "read",
+                    json!({"path": h.dir().join("api/page.txt").to_str().unwrap()}),
+                ),
+            ]));
+            h.provider
+                .push_script(ScriptedProvider::text_reply("read both"));
+            let outcome = h.prompt_and_wait("read both pages").await;
+            assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+            (h.fsync_count(), h.entries().len() as u64)
+        }
 
-        let entries = h.entries().len() as u64;
+        let (sync_syncs, sync_entries) = run(hotl_engine::AckMode::Sync).await;
+        assert_eq!(
+            sync_syncs, sync_entries,
+            "without pipelining every entry pays its own fsync"
+        );
+
+        let (syncs, entries) = run(hotl_engine::AckMode::Pipelined).await;
+        assert_eq!(entries, sync_entries, "the same session, the same log");
         assert!(
-            h.fsync_count() < entries,
-            "group commit must spend fewer syncs than entries: {} syncs, {entries} entries",
-            h.fsync_count()
+            syncs < sync_syncs,
+            "group commit must beat the serial baseline: {syncs} syncs vs {sync_syncs} \
+             for {entries} entries"
         );
     }
 

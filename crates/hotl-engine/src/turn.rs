@@ -71,25 +71,40 @@ pub(crate) async fn run(
     cont: crate::TurnContinuation,
 ) {
     let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel, cont);
-    let mut end = turn.drive().await;
+    let end = turn.drive().await;
     // Barrier (c) (commit-protocol.md §Pipelined commits): "a turn does not
     // finish while it still holds an unresolved claim on the log." Every exit
     // path from `drive` passes through here, cancellation and panic-free
-    // errors included. A commit that failed after the turn thought it was
-    // done overrides only a `Done` — every other end is already terminal, and
-    // overriding `Cancelled` would break Cancelled ≠ Failed.
-    let commit = turn.pipeline.drain().await;
-    if !commit.ok() {
-        if let TurnEnd::Outcome(Outcome::Done { .. }) = end {
-            end = TurnEnd::Outcome(commit.outcome());
-        }
-    }
+    // errors included.
+    let end = seal_end(end, turn.pipeline.drain().await);
     let usage = turn.usage;
     // Flush the ledger (§S1) on the existing event channel — never the
     // canon log — before telling the actor the turn is over.
     let report = turn.ledger.summary(crate::ledger::max_rss_bytes());
     let _ = turn.events.send(EngineEvent::LedgerReport(report)).await;
     let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
+}
+
+/// Reconcile a turn's end with what barrier (c) found. A commit that failed
+/// after the turn thought it was finished invalidates the end reason: the log
+/// does not contain what that reason names, which is the same rule
+/// [`Turn::handle_doom_loop`] already applies inline ("a `DoomLoop` outcome
+/// would name a batch the log will never carry"). Two ends survive: one that
+/// is already an error — keep the first cause — and a cancellation, because
+/// Cancelled ≠ Failed. A `Compact` end needs no override: the fold runs
+/// against the sealed log next and fails there, with its own message.
+fn seal_end(end: TurnEnd, commit: Commit) -> TurnEnd {
+    if commit.ok() {
+        return end;
+    }
+    match end {
+        TurnEnd::Outcome(Outcome::Cancelled) => TurnEnd::Outcome(Outcome::Cancelled),
+        TurnEnd::Outcome(Outcome::Error { message }) => {
+            TurnEnd::Outcome(Outcome::Error { message })
+        }
+        TurnEnd::Outcome(_) => TurnEnd::Outcome(commit.outcome()),
+        compact @ TurnEnd::Compact { .. } => compact,
+    }
 }
 
 /// One gated call: ready to execute with its (possibly hook-rewritten or
@@ -139,6 +154,12 @@ enum Commit {
     /// were in flight (commit-protocol.md §conflict table, Abort). The bytes
     /// already forwarded are canon; the turn's claim on them is not.
     Aborted,
+    /// A pipelined proposal's ticket reached a caller that does not wait on
+    /// tickets, so nothing ever confirmed the commit. An internal routing
+    /// bug, not a disk one — and never reported as success, because "an
+    /// unwaited commit" and "a durable commit" are exactly what
+    /// fsync-before-ack keeps apart.
+    Unconfirmed,
     /// `PreparedPayload::rules_epoch` predated the actor's current rules
     /// (commit-protocol.md §Proposal payloads' guard) and the one retry in
     /// `Turn::propose` also came back stale — vanishingly unlikely (the
@@ -152,13 +173,23 @@ enum Commit {
 impl Commit {
     /// The actor's reply, `None` if it never answered. A `Ticket` is not a
     /// commit yet — it is settled at a barrier, by
-    /// [`TicketPipeline::resolve_oldest`] — so it never reaches here.
+    /// [`TicketPipeline::resolve_oldest`] — so it must never reach here, and
+    /// the arm below is a guard rather than a translation.
     fn from_reply(reply: Option<crate::ProposeReply>) -> Self {
         match reply {
             Some(crate::ProposeReply::Committed) => Commit::Committed,
             Some(crate::ProposeReply::Sealed) => Commit::Sealed,
             Some(crate::ProposeReply::StaleEpoch) => Commit::StaleEpoch,
-            Some(crate::ProposeReply::Ticket(_)) => Commit::Committed,
+            Some(crate::ProposeReply::Ticket(_)) => {
+                // Dropping the ticket here would report an unwaited commit as
+                // durable — the one thing fsync-before-ack forbids. Loud in
+                // tests, safe in release.
+                debug_assert!(
+                    false,
+                    "a ticket is not a commit: a Pipelined reply must go through TicketPipeline"
+                );
+                Commit::Unconfirmed
+            }
             None => Commit::Gone,
         }
     }
@@ -194,6 +225,10 @@ impl Commit {
         match self {
             Commit::Committed => "committed",
             Commit::Aborted => "the turn was superseded and will be restarted",
+            Commit::Unconfirmed => {
+                "an internal error left a commit unconfirmed — nothing can be trusted \
+                 as recorded; start a new session to keep working"
+            }
             Commit::Sealed => {
                 "the session log is sealed — nothing further can be recorded; \
                  start a new session to keep working"
@@ -2319,5 +2354,77 @@ mod tests {
         drop(tx);
         pipeline.submit(ticket).await;
         assert_eq!(pipeline.drain().await, Commit::Gone);
+    }
+
+    /// A ticket is an unresolved claim, never a durable commit. Reporting one
+    /// as `Committed` would be a fsync-before-ack hole: the turn would go on
+    /// as though bytes it never waited for were on disk. Unreachable today —
+    /// the actor branches on `AckMode` — so the guard is what keeps it that
+    /// way through S2c, which rewrites exactly this routing.
+    #[test]
+    #[should_panic(expected = "a ticket is not a commit")]
+    fn from_reply_refuses_to_treat_a_ticket_as_a_durable_commit() {
+        let (_tx, rx) = oneshot::channel();
+        let _ = Commit::from_reply(Some(crate::ProposeReply::Ticket(crate::CommitTicket {
+            id: "x".into(),
+            seq: 1,
+            ack: rx,
+        })));
+    }
+
+    /// …and in release, where the `debug_assert` is compiled out, the same
+    /// misroute has to fail safe rather than silently succeed.
+    #[test]
+    fn an_unconfirmed_commit_is_never_ok() {
+        assert!(!Commit::Unconfirmed.ok());
+        assert!(matches!(
+            Commit::Unconfirmed.outcome(),
+            Outcome::Error { .. }
+        ));
+    }
+
+    /// Barrier (c): a commit that failed after the turn thought it was
+    /// finished replaces the end reason, because the log does not contain
+    /// what that reason names — the same T3-6 rule
+    /// `Turn::handle_doom_loop` already applies inline ("a `DoomLoop`
+    /// outcome would name a batch the log will never carry"). The two
+    /// exceptions are an end that is already an error (keep the first
+    /// cause) and a cancellation (Cancelled ≠ Failed).
+    #[test]
+    fn a_failed_barrier_c_replaces_every_end_reason_it_invalidates() {
+        let sealed = |outcome| match seal_end(TurnEnd::Outcome(outcome), Commit::Sealed) {
+            TurnEnd::Outcome(o) => o,
+            TurnEnd::Compact { .. } => unreachable!(),
+        };
+        for outcome in [
+            Outcome::Done { text: "hi".into() },
+            Outcome::TurnLimit,
+            Outcome::Refused,
+            Outcome::DoomLoop {
+                pattern: "read".into(),
+            },
+            Outcome::ToolFailureBudget {
+                tool: "bash".into(),
+            },
+        ] {
+            assert!(
+                matches!(sealed(outcome.clone()), Outcome::Error { .. }),
+                "{outcome:?} names a record the log never took"
+            );
+        }
+        assert_eq!(sealed(Outcome::Cancelled), Outcome::Cancelled);
+        let first = Outcome::Error {
+            message: "the original cause".into(),
+        };
+        assert_eq!(sealed(first.clone()), first);
+    }
+
+    #[test]
+    fn a_clean_barrier_c_leaves_the_end_alone() {
+        let end = seal_end(
+            TurnEnd::Outcome(Outcome::Done { text: "hi".into() }),
+            Commit::Committed,
+        );
+        assert!(matches!(end, TurnEnd::Outcome(Outcome::Done { .. })));
     }
 }

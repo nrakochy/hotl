@@ -770,17 +770,6 @@ impl SessionLog {
         self.forward_line(id, bytes)
     }
 
-    /// [`SessionLog::forward_prepared`]'s twin for actor-built entries (the
-    /// inline serialize-and-mask path steer admissions, compaction digests
-    /// and todo snapshots keep — §Proposal payloads).
-    pub fn forward(&mut self, payload: &EntryPayload, now_ms: u64) -> std::io::Result<Forwarded> {
-        if let Some(reason) = self.seal_reason() {
-            return Err(sealed_error(&reason));
-        }
-        let (id, bytes) = self.build_line(payload, now_ms)?;
-        self.forward_line(id, bytes)
-    }
-
     fn forward_line(&mut self, id: String, bytes: Vec<u8>) -> std::io::Result<Forwarded> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
@@ -1077,7 +1066,11 @@ fn commit_batch(
         if tier == AckTier::Buffered {
             // Telemetry: ack on enqueue, write on a best-effort basis.
             // NEVER canon — nothing in the engine reaches this arm. It never
-            // moves the rollback point: only a synced group does.
+            // moves the rollback point: only a synced group does, which also
+            // means a later failure in the same group can roll these bytes
+            // away *after* they were acked. That is exactly what this tier
+            // trades for its ack ("ack on enqueue, before the bytes are
+            // written"), and it is why canon may never use it.
             ack.send(Ok(Ack {
                 offset: written + line.len() as u64,
             }));
@@ -3114,25 +3107,14 @@ mod tests {
         let before = log.fsync_count();
         let mut pending = Vec::new();
 
-        pending.push(
-            log.forward(
-                &EntryPayload::Rename {
-                    name: "x".repeat(4 * 1024 * 1024),
-                },
-                2,
-            )
-            .expect("forward"),
-        );
+        let forward = |log: &mut SessionLog, name: String, ts: u64| {
+            let prepared = prepare_payload(&EntryPayload::Rename { name }, &Masker::empty(), 0)
+                .expect("prepare");
+            log.forward_prepared(prepared, ts).expect("forward")
+        };
+        pending.push(forward(&mut log, "x".repeat(4 * 1024 * 1024), 2));
         for i in 0..8 {
-            pending.push(
-                log.forward(
-                    &EntryPayload::Rename {
-                        name: format!("n{i}"),
-                    },
-                    3 + i,
-                )
-                .expect("forward"),
-            );
+            pending.push(forward(&mut log, format!("n{i}"), 3 + i));
         }
         let n = pending.len() as u64;
         let mut last = 0;
