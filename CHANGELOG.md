@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-26
+
 ### Added
 
 - **Loop overhead is now a measured, CI-gated number.** A `LoopLedger` stamps
