@@ -262,6 +262,68 @@ impl Matcher {
     }
 }
 
+/// One bit per `Hooks` event kind — the union gate every dispatch call site
+/// (`hook_gate!`) checks before doing ANY per-event work: payload
+/// construction, the ≤2KB cap copy, deadline registration, cancel-race
+/// scaffolding. A session whose `Hooks` impl doesn't register a given event
+/// pays exactly one branch on a cached `u8` for it instead (§S1 HookRouter
+/// diet).
+///
+/// This is the union half of the design doc's `{ union: EventMask,
+/// per_event: [SmallVec<[HookId;2]>; 6] }` table (design-docs §S1). hotl has
+/// exactly one `Hooks` object per session — there is no multi-hook registry
+/// to index a per-event dispatch table against — so only the union mask and
+/// its gates land here; the per-event table is deliberately left out. A
+/// future multi-hook registry would extend `EventMask` to that per-event
+/// table; until then, a registered event still runs every matching hook
+/// internally (lane 1 merges in registration order, lane 2 runs matching
+/// shell hooks concurrently) — the mask only decides whether the wrapper
+/// runs at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EventMask(u8);
+
+impl EventMask {
+    pub const PRE_TOOL: EventMask = EventMask(1 << 0);
+    pub const POST_TOOL: EventMask = EventMask(1 << 1);
+    pub const USER_PROMPT: EventMask = EventMask(1 << 2);
+    pub const NOTIFICATION: EventMask = EventMask(1 << 3);
+    pub const STOP: EventMask = EventMask(1 << 4);
+    pub const SESSION_END: EventMask = EventMask(1 << 5);
+
+    /// No events registered — a zero-hook session's cached mask.
+    pub const NONE: EventMask = EventMask(0);
+    /// Every event registered — the trait default, so an impl that hasn't
+    /// opted into narrower dispatch (an external/unknown lane) stays correct.
+    pub const ALL: EventMask = EventMask(
+        Self::PRE_TOOL.0
+            | Self::POST_TOOL.0
+            | Self::USER_PROMPT.0
+            | Self::NOTIFICATION.0
+            | Self::STOP.0
+            | Self::SESSION_END.0,
+    );
+
+    pub const fn contains(self, bit: EventMask) -> bool {
+        self.0 & bit.0 == bit.0
+    }
+    pub const fn union(self, other: EventMask) -> EventMask {
+        EventMask(self.0 | other.0)
+    }
+    /// Clear `other`'s bits from `self` — used to narrow the mask when a
+    /// three-strike eviction silences the last live hook for an event.
+    pub const fn difference(self, other: EventMask) -> EventMask {
+        EventMask(self.0 & !other.0)
+    }
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+    /// Bits outside the six defined here are masked off — forward-compat
+    /// against a stray byte rather than a panic.
+    pub const fn from_bits(bits: u8) -> EventMask {
+        EventMask(bits & Self::ALL.0)
+    }
+}
+
 pub trait Hooks: Send + Sync {
     /// Before a tool runs. The hook sees the tool name and full input.
     fn pre_tool<'a>(&'a self, name: &'a str, input: &'a Value) -> BoxFuture<'a, PreToolDecision>;
@@ -302,7 +364,44 @@ pub trait Hooks: Send + Sync {
     fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
     }
+
+    /// The union of event kinds this impl actually wants dispatched (§S1
+    /// HookRouter gate, Task 5). Default: [`EventMask::ALL`] — an
+    /// external/unknown impl (a third-party lane, a test double) that hasn't
+    /// overridden this stays correct: every event still reaches it exactly
+    /// as it did before this method existed. `ShellHooks` overrides it from
+    /// its loaded specs, narrowing to the events actually configured.
+    fn event_mask(&self) -> EventMask {
+        EventMask::ALL
+    }
 }
+
+/// §S1 HookRouter gate: the ONE macro every one of the six `Hooks` dispatch
+/// call sites expands from (`turn.rs`'s `gate`/`execute`/`consult_stop`,
+/// `actor.rs`'s `admit_prompt`/`end_turn`/shutdown, `lib.rs`'s
+/// `question_sink`), so a hand-copied gate that forgets a new event kind — a
+/// silent hook drop — can't happen: every call site is this macro, never a
+/// bespoke `if let Some(hooks) = ...`.
+///
+/// `$hooks_opt` is the `Option<Arc<dyn Hooks>>` to gate; `$mask` is the
+/// already-computed [`EventMask`] to test (a cached `u8` read, never a fresh
+/// `Hooks::event_mask` dyn call at this call site — see `SharedDeps::hook_mask`
+/// and `question_sink`'s own cached copy for where that single dyn call
+/// actually happens); `$bit` is this call site's event kind. When hooks are
+/// present AND the bit is set, `$hooks` is bound to the live `&Arc<dyn Hooks>`
+/// and `$body` runs — payload construction, the byte cap, deadline
+/// registration, cancel-race scaffolding, all inside it. Otherwise `$off`
+/// runs, doing none of that: a `None` session and a masked-off event are
+/// observationally identical, both taking this same skip branch.
+macro_rules! hook_gate {
+    ($hooks_opt:expr, $mask:expr, $bit:expr, |$hooks:ident| $body:expr, else $off:expr) => {
+        match &$hooks_opt {
+            Some($hooks) if $mask.contains($bit) => $body,
+            _ => $off,
+        }
+    };
+}
+pub(crate) use hook_gate;
 
 /// The `Notification` hook's kind (tier-1 gap #7, the `hotl watch`/desktop
 /// seam): the agent blocked on a human, went idle awaiting a prompt, or
@@ -569,6 +668,66 @@ mod tests {
     use super::*;
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn event_mask_bit_math() {
+        assert!(EventMask::ALL.contains(EventMask::PRE_TOOL));
+        assert!(EventMask::ALL.contains(EventMask::POST_TOOL));
+        assert!(EventMask::ALL.contains(EventMask::USER_PROMPT));
+        assert!(EventMask::ALL.contains(EventMask::NOTIFICATION));
+        assert!(EventMask::ALL.contains(EventMask::STOP));
+        assert!(EventMask::ALL.contains(EventMask::SESSION_END));
+        assert!(!EventMask::NONE.contains(EventMask::PRE_TOOL));
+
+        let union = EventMask::PRE_TOOL.union(EventMask::STOP);
+        assert!(union.contains(EventMask::PRE_TOOL));
+        assert!(union.contains(EventMask::STOP));
+        assert!(!union.contains(EventMask::POST_TOOL));
+
+        // Six distinct bits, no overlap.
+        let all_bits = [
+            EventMask::PRE_TOOL,
+            EventMask::POST_TOOL,
+            EventMask::USER_PROMPT,
+            EventMask::NOTIFICATION,
+            EventMask::STOP,
+            EventMask::SESSION_END,
+        ];
+        for (i, a) in all_bits.iter().enumerate() {
+            for (j, b) in all_bits.iter().enumerate() {
+                if i != j {
+                    assert!(!a.contains(*b), "bit {i} must not contain bit {j}");
+                }
+            }
+        }
+
+        // Clearing a bit that was never set is a no-op; clearing a set bit
+        // removes exactly that bit.
+        let cleared = union.difference(EventMask::PRE_TOOL);
+        assert!(!cleared.contains(EventMask::PRE_TOOL));
+        assert!(cleared.contains(EventMask::STOP));
+    }
+
+    #[test]
+    fn event_mask_default_hooks_impl_is_all() {
+        struct DefaultMaskHooks;
+        impl Hooks for DefaultMaskHooks {
+            fn pre_tool<'a>(
+                &'a self,
+                _n: &'a str,
+                _i: &'a Value,
+            ) -> BoxFuture<'a, PreToolDecision> {
+                Box::pin(std::future::ready(PreToolDecision::Continue))
+            }
+            fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+                Box::pin(std::future::ready(None))
+            }
+        }
+        // An impl that doesn't override `event_mask` (an external/unknown
+        // lane, a plain test double) stays correct: every event still
+        // dispatches to it exactly as before this task.
+        assert_eq!(DefaultMaskHooks.event_mask(), EventMask::ALL);
+    }
 
     struct HangingHooks;
 

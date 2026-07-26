@@ -65,6 +65,14 @@ pub(crate) struct SharedDeps {
     pub config: EngineConfig,
     pub snapshots: Option<Arc<dyn crate::Snapshotter>>,
     pub hooks: Option<Arc<dyn crate::hooks::Hooks>>,
+    /// §S1 HookRouter gate (Task 5): the union of event kinds `hooks`
+    /// actually wants dispatched, cached once at session start so every
+    /// `hook_gate!` call site pays one atomic load — never a fresh
+    /// `Hooks::event_mask` dyn call — to decide whether to build ANY
+    /// per-event work. `NONE` when `hooks` is `None`. Seeded from a single
+    /// `event_mask()` call in [`SharedDeps::new`], the same "compute once at
+    /// session start" shape `mode` uses for `rules.mode()`.
+    hook_mask: AtomicU8,
     /// The session-scoped `notify` drain (Finding 1 fix) — shared with
     /// whatever built this session's `SessionHandle`, so the CLI's exit-time
     /// drain call reaches the exact same detached `Notification` hook tasks
@@ -99,6 +107,12 @@ impl SharedDeps {
         notifications: crate::hooks::NotificationDrain,
     ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
+        let hook_mask = AtomicU8::new(
+            deps.hooks
+                .as_ref()
+                .map_or(crate::hooks::EventMask::NONE, |h| h.event_mask())
+                .bits(),
+        );
         let shared = Self {
             provider: deps.provider,
             registry: deps.registry,
@@ -111,9 +125,16 @@ impl SharedDeps {
             config: deps.config,
             snapshots: deps.snapshots,
             hooks: deps.hooks,
+            hook_mask,
             notifications,
         };
         (shared, deps.log)
+    }
+
+    /// The cached §S1 mask [`crate::hooks::hook_gate!`] branches on — see the
+    /// `hook_mask` field doc.
+    pub(crate) fn hook_mask(&self) -> crate::hooks::EventMask {
+        crate::hooks::EventMask::from_bits(self.hook_mask.load(Ordering::Relaxed))
     }
 
     /// The mode `evaluate` should gate against right now — not necessarily
@@ -345,9 +366,17 @@ pub(crate) async fn run(
     // itself the one `SessionHandle::finish` awaits before the one-shot
     // CLI's `block_on` drops its runtime, so a detached spawn here would
     // just move the same race somewhere else.
-    if let Some(hooks) = &shared.hooks {
-        crate::hooks::call_session_end(hooks).await;
-    }
+    // §S1 HookRouter gate: a masked-off (or hook-less) session skips the
+    // call (and its timeout registration) entirely.
+    crate::hooks::hook_gate!(
+        shared.hooks,
+        shared.hook_mask(),
+        crate::hooks::EventMask::SESSION_END,
+        |hooks| {
+            crate::hooks::call_session_end(hooks).await;
+        },
+        else {}
+    );
 }
 
 /// The mutable session state `on_turn_finished` threads back into the loop.
@@ -475,15 +504,22 @@ async fn end_turn(
 ) -> bool {
     annotate(shared, log, &outcome).await;
     // Notification: the turn completed — fire-and-forget, computed before
-    // `outcome` moves into the event below.
-    if let Some(hooks) = &shared.hooks {
-        crate::hooks::notify(
-            hooks,
-            &shared.notifications,
-            crate::hooks::NotificationKind::Done,
-            outcome_detail(&outcome),
-        );
-    }
+    // `outcome` moves into the event below. §S1 HookRouter gate: masked-off
+    // (or hook-less) skips even the `outcome_detail` computation.
+    crate::hooks::hook_gate!(
+        shared.hooks,
+        shared.hook_mask(),
+        crate::hooks::EventMask::NOTIFICATION,
+        |hooks| {
+            crate::hooks::notify(
+                hooks,
+                &shared.notifications,
+                crate::hooks::NotificationKind::Done,
+                outcome_detail(&outcome),
+            );
+        },
+        else {}
+    );
     let _ = events.send(EngineEvent::TurnDone { outcome, usage }).await;
     match queue.pop_front() {
         Some((next, synthetic)) => {
@@ -502,14 +538,20 @@ async fn end_turn(
         None => {
             // Notification: nothing queued behind it — the session goes
             // idle awaiting the next prompt.
-            if let Some(hooks) = &shared.hooks {
-                crate::hooks::notify(
-                    hooks,
-                    &shared.notifications,
-                    crate::hooks::NotificationKind::Idle,
-                    "awaiting a prompt",
-                );
-            }
+            crate::hooks::hook_gate!(
+                shared.hooks,
+                shared.hook_mask(),
+                crate::hooks::EventMask::NOTIFICATION,
+                |hooks| {
+                    crate::hooks::notify(
+                        hooks,
+                        &shared.notifications,
+                        crate::hooks::NotificationKind::Idle,
+                        "awaiting a prompt",
+                    );
+                },
+                else {}
+            );
             false
         }
     }
@@ -948,21 +990,29 @@ async fn start_turn(
     // — never a system-prompt edit (prefix-cache stability), the one
     // reminder chokepoint every injection site shares. Best-effort: a sealed
     // log here doesn't fail the turn (the prompt itself already landed).
-    if let Some(hooks) = &shared.hooks {
-        if let Some(context) = crate::hooks::call_user_prompt(hooks, &prompt_for_hooks).await {
-            let reminder = EntryPayload::Item {
-                item: Item::User {
-                    text: format!("<system-reminder>{context}</system-reminder>"),
-                    synthetic: Some(SyntheticReason::SystemReminder),
-                },
-            };
-            if shared.append(log, &reminder).await {
-                if let EntryPayload::Item { item } = reminder {
-                    Arc::make_mut(items).push(item);
+    // §S1 HookRouter gate: a masked-off (or hook-less) session skips the
+    // call (and its timeout registration) entirely.
+    crate::hooks::hook_gate!(
+        shared.hooks,
+        shared.hook_mask(),
+        crate::hooks::EventMask::USER_PROMPT,
+        |hooks| {
+            if let Some(context) = crate::hooks::call_user_prompt(hooks, &prompt_for_hooks).await {
+                let reminder = EntryPayload::Item {
+                    item: Item::User {
+                        text: format!("<system-reminder>{context}</system-reminder>"),
+                        synthetic: Some(SyntheticReason::SystemReminder),
+                    },
+                };
+                if shared.append(log, &reminder).await {
+                    if let EntryPayload::Item { item } = reminder {
+                        Arc::make_mut(items).push(item);
+                    }
                 }
             }
-        }
-    }
+        },
+        else {}
+    );
     spawn_turn(shared, cmd_tx, events, current_turn);
     true
 }

@@ -572,6 +572,14 @@ pub fn question_sink(
     hooks_handle: Option<Arc<dyn hooks::Hooks>>,
     notifications: hooks::NotificationDrain,
 ) -> hotl_tools::ask::QuestionSink {
+    // §S1 HookRouter gate: computed once here (sink-construction time, never
+    // per question) — the same "single dyn call at session start" shape
+    // `SharedDeps::hook_mask` uses — so `hook_gate!` below reads a plain
+    // cached value instead of a fresh `event_mask()` dyn call every time a
+    // tool asks a question.
+    let hook_mask = hooks_handle
+        .as_ref()
+        .map_or(hooks::EventMask::NONE, |h| h.event_mask());
     std::sync::Arc::new(move |question, cancel| {
         let cmd_tx = cmd_tx.clone();
         let events_tx = events_tx.clone();
@@ -590,14 +598,20 @@ pub fn question_sink(
             // Notification (Finding 2): the agent is blocked on a human at
             // the ask_user surface, mirroring `Turn::ask` — fire-and-forget,
             // right before the question actually surfaces.
-            if let Some(h) = &hooks_handle {
-                crate::hooks::notify(
-                    h,
-                    &notifications,
-                    crate::hooks::NotificationKind::Blocked,
-                    question.header.clone(),
-                );
-            }
+            crate::hooks::hook_gate!(
+                hooks_handle,
+                hook_mask,
+                crate::hooks::EventMask::NOTIFICATION,
+                |h| {
+                    crate::hooks::notify(
+                        h,
+                        &notifications,
+                        crate::hooks::NotificationKind::Blocked,
+                        question.header.clone(),
+                    );
+                },
+                else {}
+            );
             let answer = match events_tx.upgrade() {
                 None => hotl_types::QuestionAnswer::NoHuman,
                 Some(events) => {

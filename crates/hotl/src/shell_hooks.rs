@@ -51,11 +51,11 @@
 //! (03 lesson 5).
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 
 use futures_util::future::BoxFuture;
 use hotl_engine::hooks::{
-    cap_payload, join_additional_context, merge_pre_tool, merge_stop, Hooks, Matcher,
+    cap_payload, join_additional_context, merge_pre_tool, merge_stop, EventMask, Hooks, Matcher,
     NotificationKind, PreToolDecision, StopDecision,
 };
 use hotl_tools::concurrency::SessionConcurrency;
@@ -139,6 +139,15 @@ pub struct ShellHooks {
     /// `bash`/`grep` draw from, so a turn firing a dozen matching hooks plus
     /// a `grep` never exceeds the configured concurrent-process width.
     concurrency: SessionConcurrency,
+    /// §S1 HookRouter gate (Task 5): the union of events this instance
+    /// actually has live hooks for, cached so [`Hooks::event_mask`] is a
+    /// single atomic load rather than a scan over every strike counter.
+    /// Computed at load time from which event vecs are non-empty, then
+    /// narrowed in place by [`ShellHooks::refresh_mask_bit`] whenever a
+    /// three-strike eviction silences the last live hook for an event —
+    /// the "Arc-swapped on registry change" requirement, minus inventing a
+    /// registry: the impl just refreshes its own cheap holder.
+    mask: AtomicU8,
 }
 
 /// Parse shell hooks from a TOML string (the `[[hook]]` section of
@@ -179,6 +188,25 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
     {
         return None;
     }
+    let mut mask = EventMask::NONE;
+    if !pre.is_empty() {
+        mask = mask.union(EventMask::PRE_TOOL);
+    }
+    if !post.is_empty() {
+        mask = mask.union(EventMask::POST_TOOL);
+    }
+    if !prompt.is_empty() {
+        mask = mask.union(EventMask::USER_PROMPT);
+    }
+    if !notification.is_empty() {
+        mask = mask.union(EventMask::NOTIFICATION);
+    }
+    if !stop.is_empty() {
+        mask = mask.union(EventMask::STOP);
+    }
+    if !session_end.is_empty() {
+        mask = mask.union(EventMask::SESSION_END);
+    }
     Some(ShellHooks {
         pre,
         post,
@@ -187,6 +215,7 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
         stop,
         session_end,
         concurrency,
+        mask: AtomicU8::new(mask.bits()),
     })
 }
 
@@ -285,6 +314,33 @@ impl ShellHook {
             );
         }
     }
+
+    /// Still under [`MAX_STRIKES`] — the definition of "live" [`refresh_mask_bit`]
+    /// scans for.
+    fn is_live(&self) -> bool {
+        self.strikes.load(Ordering::Relaxed) < MAX_STRIKES
+    }
+}
+
+impl ShellHooks {
+    /// Recompute `bit` from whether any hook in `event`'s list is still
+    /// live, and store the result. Called after every invocation of that
+    /// event's hooks (never on the masked-off fast path this whole
+    /// mechanism protects) so a three-strike eviction that just silenced the
+    /// last live hook for an event narrows the cached mask as soon as the
+    /// engine could observe it — an `O(hooks-for-this-event)` scan over a
+    /// handful of entries, not a fresh dyn call reconstructing the whole
+    /// union from scratch.
+    fn refresh_mask_bit<'a>(&self, bit: EventMask, hooks: impl Iterator<Item = &'a ShellHook>) {
+        let live = hooks.into_iter().any(ShellHook::is_live);
+        let current = EventMask::from_bits(self.mask.load(Ordering::Relaxed));
+        let updated = if live {
+            current.union(bit)
+        } else {
+            current.difference(bit)
+        };
+        self.mask.store(updated.bits(), Ordering::Relaxed);
+    }
 }
 
 impl Hooks for ShellHooks {
@@ -314,7 +370,9 @@ impl Hooks for ShellHooks {
                         }
                     }
                 });
-            merge_pre_tool(futures_util::future::join_all(futures).await)
+            let decision = merge_pre_tool(futures_util::future::join_all(futures).await);
+            self.refresh_mask_bit(EventMask::PRE_TOOL, self.pre.iter().map(|(_, h)| h));
+            decision
         })
     }
 
@@ -344,6 +402,7 @@ impl Hooks for ShellHooks {
                     }
                 }
             }
+            self.refresh_mask_bit(EventMask::POST_TOOL, self.post.iter().map(|(_, h)| h));
             current
         })
     }
@@ -369,6 +428,7 @@ impl Hooks for ShellHooks {
                 }
             });
             let results = futures_util::future::join_all(futures).await;
+            self.refresh_mask_bit(EventMask::USER_PROMPT, self.prompt.iter());
             join_additional_context(results.into_iter().flatten())
         })
     }
@@ -396,6 +456,7 @@ impl Hooks for ShellHooks {
                 .iter()
                 .map(|hook| hook.invoke(&payload, "notification", &self.concurrency));
             futures_util::future::join_all(futures).await;
+            self.refresh_mask_bit(EventMask::NOTIFICATION, self.notification.iter());
         })
     }
 
@@ -415,7 +476,9 @@ impl Hooks for ShellHooks {
                     }
                 }
             });
-            merge_stop(futures_util::future::join_all(futures).await)
+            let decision = merge_stop(futures_util::future::join_all(futures).await);
+            self.refresh_mask_bit(EventMask::STOP, self.stop.iter());
+            decision
         })
     }
 
@@ -430,7 +493,12 @@ impl Hooks for ShellHooks {
                 .iter()
                 .map(|hook| hook.invoke(&payload, "session_end", &self.concurrency));
             futures_util::future::join_all(futures).await;
+            self.refresh_mask_bit(EventMask::SESSION_END, self.session_end.iter());
         })
+    }
+
+    fn event_mask(&self) -> EventMask {
+        EventMask::from_bits(self.mask.load(Ordering::Relaxed))
     }
 }
 
@@ -572,6 +640,43 @@ mod tests {
             StopDecision::Block {
                 reason: "not yet".into()
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn event_mask_reflects_only_the_configured_events() {
+        let hooks = load_str(
+            "[[hook]]\nevent = \"pre_tool\"\ncommand = \"exit 0\"\n\
+             [[hook]]\nevent = \"stop\"\ncommand = \"exit 0\"\n",
+            concurrency(),
+        )
+        .unwrap();
+        let mask = hooks.event_mask();
+        assert!(mask.contains(EventMask::PRE_TOOL));
+        assert!(mask.contains(EventMask::STOP));
+        assert!(!mask.contains(EventMask::POST_TOOL));
+        assert!(!mask.contains(EventMask::USER_PROMPT));
+        assert!(!mask.contains(EventMask::NOTIFICATION));
+        assert!(!mask.contains(EventMask::SESSION_END));
+    }
+
+    #[tokio::test]
+    async fn event_mask_narrows_once_the_last_hook_for_an_event_is_evicted() {
+        let hooks = load_str(
+            "[[hook]]\nevent = \"pre_tool\"\ncommand = \"exit 1\"\n",
+            concurrency(),
+        )
+        .unwrap();
+        assert!(
+            hooks.event_mask().contains(EventMask::PRE_TOOL),
+            "the freshly loaded hook is live"
+        );
+        for _ in 0..MAX_STRIKES {
+            hooks.pre_tool("bash", &json!({})).await;
+        }
+        assert!(
+            !hooks.event_mask().contains(EventMask::PRE_TOOL),
+            "the only pre_tool hook was evicted — the bit must clear"
         );
     }
 

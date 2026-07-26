@@ -452,11 +452,18 @@ impl Turn {
         if self.turn_extensions >= TURN_EXTENSION_MAX {
             return None;
         }
-        let hooks = self.shared.hooks.as_ref()?;
-        match crate::hooks::call_stop(hooks, outcome_text).await {
-            crate::hooks::StopDecision::Block { reason } => Some(reason),
-            crate::hooks::StopDecision::Allow => None,
-        }
+        // §S1 HookRouter gate: a masked-off (or hook-less) session skips the
+        // call (and its timeout registration) entirely.
+        crate::hooks::hook_gate!(
+            self.shared.hooks,
+            self.shared.hook_mask(),
+            crate::hooks::EventMask::STOP,
+            |hooks| match crate::hooks::call_stop(hooks, outcome_text).await {
+                crate::hooks::StopDecision::Block { reason } => Some(reason),
+                crate::hooks::StopDecision::Allow => None,
+            },
+            else None
+        )
     }
 
     /// Commit the Done-branch gate nudge(s) as ONE tagged `SystemReminder`
@@ -790,36 +797,44 @@ impl Turn {
             };
         };
         // PreToolUse: a wrap-style intercept may block or rewrite the call.
+        // §S1 HookRouter gate: masked-off (or hook-less) sessions skip the
+        // cap copy, the call, and the post-await cancel recheck entirely.
         let mut input = tu.input.clone();
-        if let Some(hooks) = &self.shared.hooks {
-            let view = crate::hooks::cap_tool_input(&input);
-            match crate::hooks::call_pre_tool(hooks, &tu.name, &view, &self.cancel).await {
-                crate::hooks::PreToolDecision::Continue => {}
-                crate::hooks::PreToolDecision::Deny { message } => {
-                    self.emit(EngineEvent::ToolDenied {
-                        name: tu.name.clone(),
-                    })
-                    .await;
+        crate::hooks::hook_gate!(
+            self.shared.hooks,
+            self.shared.hook_mask(),
+            crate::hooks::EventMask::PRE_TOOL,
+            |hooks| {
+                let view = crate::hooks::cap_tool_input(&input);
+                match crate::hooks::call_pre_tool(hooks, &tu.name, &view, &self.cancel).await {
+                    crate::hooks::PreToolDecision::Continue => {}
+                    crate::hooks::PreToolDecision::Deny { message } => {
+                        self.emit(EngineEvent::ToolDenied {
+                            name: tu.name.clone(),
+                        })
+                        .await;
+                        return Gate::Resolved {
+                            outcome: ToolOutcome::err(format!(
+                                "A hook blocked this tool call: {message}"
+                            )),
+                            chargeable: false,
+                        };
+                    }
+                    crate::hooks::PreToolDecision::Rewrite { input: rewritten } => {
+                        input = crate::hooks::restore_capped(&input, rewritten)
+                    }
+                }
+                // The hook may have been abandoned by an interrupt rather
+                // than answered; a cancelled turn executes nothing further.
+                if self.cancel.is_cancelled() {
                     return Gate::Resolved {
-                        outcome: ToolOutcome::err(format!(
-                            "A hook blocked this tool call: {message}"
-                        )),
+                        outcome: ToolOutcome::err("Not executed (turn stopped)."),
                         chargeable: false,
                     };
                 }
-                crate::hooks::PreToolDecision::Rewrite { input: rewritten } => {
-                    input = crate::hooks::restore_capped(&input, rewritten)
-                }
-            }
-            // The hook may have been abandoned by an interrupt rather than
-            // answered; a cancelled turn executes nothing further.
-            if self.cancel.is_cancelled() {
-                return Gate::Resolved {
-                    outcome: ToolOutcome::err("Not executed (turn stopped)."),
-                    chargeable: false,
-                };
-            }
-        }
+            },
+            else {}
+        );
         let (summary, why) = match tool.permission(&input) {
             Permission::None => (None, None),
             Permission::Ask { summary } => (Some(summary), None),
@@ -898,15 +913,27 @@ impl Turn {
         };
         let mut outcome = tool.run(input, self.cancel.clone()).await;
         // PostToolUse: a node-style proposal may replace a successful result.
+        // §S1 HookRouter gate: a masked-off (or hook-less) session never
+        // reaches `call_post_tool` — no cap copy, no timeout/cancel race.
         if !outcome.is_error {
-            if let Some(hooks) = &self.shared.hooks {
-                if let Some(replacement) =
-                    crate::hooks::call_post_tool(hooks, &tu.name, &outcome.content, &self.cancel)
-                        .await
-                {
-                    outcome.content = replacement;
-                }
-            }
+            crate::hooks::hook_gate!(
+                self.shared.hooks,
+                self.shared.hook_mask(),
+                crate::hooks::EventMask::POST_TOOL,
+                |hooks| {
+                    if let Some(replacement) = crate::hooks::call_post_tool(
+                        hooks,
+                        &tu.name,
+                        &outcome.content,
+                        &self.cancel,
+                    )
+                    .await
+                    {
+                        outcome.content = replacement;
+                    }
+                },
+                else {}
+            );
         }
         self.emit(EngineEvent::ToolDone {
             name: tu.name.clone(),
@@ -1186,14 +1213,22 @@ impl Turn {
         // Notification (tier-1 gap #7, the `hotl watch`/desktop seam): the
         // agent is blocked on a human, right before the ask actually
         // surfaces. Fire-and-forget — never awaited on this hot path.
-        if let Some(hooks) = &self.shared.hooks {
-            crate::hooks::notify(
-                hooks,
-                &self.shared.notifications,
-                crate::hooks::NotificationKind::Blocked,
-                summary.clone(),
-            );
-        }
+        // §S1 HookRouter gate: a masked-off (or hook-less) session skips
+        // even the `summary.clone()` this would otherwise pay for.
+        crate::hooks::hook_gate!(
+            self.shared.hooks,
+            self.shared.hook_mask(),
+            crate::hooks::EventMask::NOTIFICATION,
+            |hooks| {
+                crate::hooks::notify(
+                    hooks,
+                    &self.shared.notifications,
+                    crate::hooks::NotificationKind::Blocked,
+                    summary.clone(),
+                );
+            },
+            else {}
+        );
         let (tx, rx) = oneshot::channel();
         let event = EngineEvent::Ask {
             summary,
