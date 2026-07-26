@@ -1379,6 +1379,9 @@ impl Surface {
                     .count();
                 eprintln!("· todos: {done}/{} done", items.len());
             }
+            // §S1 telemetry, not a human-facing update — the headless
+            // terminal renderer has nothing to show for it.
+            EngineEvent::LedgerReport(_) => {}
         }
     }
 

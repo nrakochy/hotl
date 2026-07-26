@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::actor::SharedDeps;
+use crate::ledger::Phase;
 use crate::{AskReply, EngineEvent, Outcome, SessionCmd, TurnEnd};
 
 /// Compaction triggers when the estimated next request crosses this share of
@@ -72,6 +73,10 @@ pub(crate) async fn run(
     let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel, cont);
     let end = turn.drive().await;
     let usage = turn.usage;
+    // Flush the ledger (§S1) on the existing event channel — never the
+    // canon log — before telling the actor the turn is over.
+    let report = turn.ledger.summary(crate::ledger::max_rss_bytes());
+    let _ = turn.events.send(EngineEvent::LedgerReport(report)).await;
     let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
 }
 
@@ -258,6 +263,9 @@ struct Turn {
     /// Completed samples since the last fold — the "intervening progress" the
     /// compaction streak is defined against (T2-3).
     samples_since_compact: u32,
+    /// Loop-overhead instrument (§S1) — one per `Turn`, flushed once as an
+    /// `EngineEvent::LedgerReport` when [`run`] returns.
+    ledger: crate::ledger::LoopLedger,
 }
 
 impl Drop for Turn {
@@ -312,6 +320,9 @@ impl Turn {
             // inherited was already read by `try_compact`, and re-carrying it
             // would let one productive stretch excuse every later fold.
             samples_since_compact: 0,
+            // Deliberately NOT carried across a compaction respawn: each
+            // `Turn` task flushes its own report when it ends (see `run`).
+            ledger: crate::ledger::LoopLedger::new(),
         }
     }
 
@@ -335,14 +346,22 @@ impl Turn {
         let bound = self.shared.config.max_turns;
         while bound < 0 || self.spent < bound {
             self.spent += 1;
+            // `BoundaryEnd` (§S1) closes the ledger slot `sample()` opened
+            // with `BoundaryStart` — stamped at every way this iteration can
+            // end (return or `continue`), never by falling off the loop body,
+            // since a `return` from inside `while` skips straight past it.
             let (stop, blocks) = match self.sample().await {
                 SampleEnd::Completed { stop, blocks } => (stop, blocks),
-                SampleEnd::Cancelled => return TurnEnd::Outcome(Outcome::Cancelled),
+                SampleEnd::Cancelled => {
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    return TurnEnd::Outcome(Outcome::Cancelled);
+                }
                 SampleEnd::ContextFull => {
+                    self.ledger.stamp(Phase::BoundaryEnd);
                     return TurnEnd::Compact {
                         spec: self.take_speculation().await,
                         cont: Box::new(self.continuation()),
-                    }
+                    };
                 }
                 SampleEnd::Unavailable(_) if self.model_idx + 1 < self.models.len() => {
                     self.model_idx += 1;
@@ -350,19 +369,26 @@ impl Turn {
                         model: self.models[self.model_idx].clone(),
                     })
                     .await;
+                    self.ledger.stamp(Phase::BoundaryEnd);
                     continue;
                 }
                 SampleEnd::Unavailable(m) | SampleEnd::Fatal(m) => {
-                    return TurnEnd::Outcome(Outcome::Error { message: m })
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    return TurnEnd::Outcome(Outcome::Error { message: m });
                 }
             };
             match stop {
                 StopReason::ToolUse => {
-                    if let Some(outcome) = self.run_tool_phase(&blocks).await {
+                    let outcome = self.run_tool_phase(&blocks).await;
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    if let Some(outcome) = outcome {
                         return TurnEnd::Outcome(outcome);
                     }
                 }
-                StopReason::Refusal => return TurnEnd::Outcome(Outcome::Refused),
+                StopReason::Refusal => {
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    return TurnEnd::Outcome(Outcome::Refused);
+                }
                 _ => {
                     // Done branch (index E4): the TodoGate and a `Stop` hook
                     // veto both intercept "the model just stopped" and can
@@ -381,12 +407,15 @@ impl Turn {
                         if !commit.ok() {
                             // The reminder never landed: looping would burn a
                             // sample on a nudge the model will never see (T3-6).
+                            self.ledger.stamp(Phase::BoundaryEnd);
                             return TurnEnd::Outcome(Outcome::Error {
                                 message: commit.message().into(),
                             });
                         }
+                        self.ledger.stamp(Phase::BoundaryEnd);
                         continue;
                     }
+                    self.ledger.stamp(Phase::BoundaryEnd);
                     return TurnEnd::Outcome(Outcome::Done { text });
                 }
             }
@@ -463,14 +492,18 @@ impl Turn {
     /// One provider sample against a fresh snapshot; commits the assistant
     /// item + usage on completion.
     async fn sample(&mut self) -> SampleEnd {
+        self.ledger.start_sample();
+        self.ledger.stamp(Phase::BoundaryStart);
         let Some(snapshot) = self.snapshot().await else {
             return SampleEnd::Fatal("session closed".into());
         };
+        self.ledger.stamp(Phase::SnapshotReady);
         self.samples += 1;
         let request = match self.build_request(&snapshot) {
             Ok(request) => request,
             Err(end) => return end,
         };
+        self.ledger.stamp(Phase::RequestBuilt);
         self.last_snapshot = Some(snapshot.clone());
 
         let (stop, usage, blocks) = match self.collect_stream(request).await {
@@ -495,12 +528,14 @@ impl Turn {
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
         };
+        self.ledger.stamp(Phase::BatchProposed);
         let commit = self
             .propose(vec![
                 EntryPayload::Item { item: assistant },
                 EntryPayload::Usage { usage },
             ])
             .await;
+        self.ledger.stamp(Phase::WatermarkDurable);
         if !commit.ok() {
             return SampleEnd::Fatal(commit.message().into());
         }
@@ -579,6 +614,7 @@ impl Turn {
         }
         let mut results = Vec::with_capacity(uses.len());
         let mut budget_blown: Option<String> = None;
+        self.ledger.stamp(Phase::ToolsSpawned);
         for chunk in parallel_chunks(uses, &self.shared.registry) {
             if self.cancel.is_cancelled() || budget_blown.is_some() {
                 for tu in chunk {
@@ -609,6 +645,7 @@ impl Turn {
                 });
             }
         }
+        self.ledger.stamp(Phase::ToolsJoined);
         if mutating {
             self.snap(format!("post batch {}", self.samples)).await;
         }
@@ -621,7 +658,9 @@ impl Turn {
                 .into_iter()
                 .map(|item| EntryPayload::Item { item }),
         );
+        self.ledger.stamp(Phase::BatchProposed);
         let commit = self.propose(entries).await;
+        self.ledger.stamp(Phase::WatermarkDurable);
         if !commit.ok() {
             return Some(Outcome::Error {
                 message: commit.message().into(),
@@ -918,7 +957,9 @@ impl Turn {
                 _ = self.cancel.cancelled() => return Err(SampleEnd::Cancelled),
                 next = stream.next() => match next {
                     Some(Ok(event)) => {
+                        self.ledger.stamp(Phase::FirstByte);
                         if let StreamEvent::Completed { stop, usage, blocks } = event {
+                            self.ledger.stamp(Phase::LastBlockEnd);
                             completed = Some((stop, usage, blocks));
                         } else {
                             self.forward(event).await;

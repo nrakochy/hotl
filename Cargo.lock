@@ -828,6 +828,8 @@ dependencies = [
  "hotl-store",
  "hotl-tools",
  "hotl-types",
+ "libc",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",

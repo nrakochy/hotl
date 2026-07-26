@@ -9,6 +9,7 @@
 
 mod actor;
 pub mod hooks;
+mod ledger;
 mod turn;
 
 use std::path::PathBuf;
@@ -37,6 +38,12 @@ pub use hotl_types::QuestionAnswer;
 /// defined in `hooks.rs` (next to the trait method it parameterizes), not
 /// here, to keep the event vocabulary and its dispatcher together.
 pub use hooks::NotificationKind;
+
+/// Re-exported so `hotl_engine::LedgerSummary` resolves alongside
+/// `EngineEvent::LedgerReport` — the loop-overhead instrument (§S1) lives in
+/// its own module ([`ledger`]) since it is self-contained (no dependency on
+/// the rest of the engine's types) and independently unit-tested.
+pub use ledger::{LedgerSummary, Phase, PhaseDeltaSummary};
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -239,6 +246,10 @@ pub enum EngineEvent {
     TodosChanged {
         items: Vec<Todo>,
     },
+    /// Loop-overhead instrument (§S1), flushed once when the turn task ends.
+    /// UI/telemetry only — this NEVER becomes a session-log entry, so it
+    /// cannot perturb golden-transcript normalization.
+    LedgerReport(LedgerSummary),
 }
 
 impl std::fmt::Debug for EngineEvent {
@@ -258,6 +269,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::Question { question, .. } => write!(f, "Question({})", question.header),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
             Self::TodosChanged { items } => write!(f, "TodosChanged(n={})", items.len()),
+            Self::LedgerReport(s) => write!(f, "LedgerReport(samples={})", s.sample_count),
         }
     }
 }

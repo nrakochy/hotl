@@ -54,6 +54,17 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             json!({"type": "compacted", "degraded": degraded})
         }
         EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
+        // §S1 telemetry: a normal tagged frame (not a round-trip/result like
+        // `Ask`/`Question`/`TurnDone`) — the headline numbers only. The full
+        // summary (per-phase deltas, raw samples) is for the in-process
+        // consumer (Task 2's CI gate), not this wire contract.
+        EngineEvent::LedgerReport(summary) => json!({
+            "type": "ledger_report",
+            "sample_count": summary.sample_count,
+            "overhead_p50_ns": summary.overhead_p50_ns,
+            "overhead_p99_ns": summary.overhead_p99_ns,
+            "max_rss_bytes": summary.max_rss_bytes,
+        }),
         EngineEvent::Ask { .. } | EngineEvent::Question { .. } | EngineEvent::TurnDone { .. } => {
             return None
         }

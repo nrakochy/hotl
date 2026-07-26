@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use hotl_engine::{
-    spawn_session, AskReply, EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle,
+    spawn_session, AskReply, EngineConfig, EngineEvent, LedgerSummary, Outcome, SessionDeps,
+    SessionHandle,
 };
 use hotl_platform::SystemClock;
 use hotl_provider::{ProviderError, ScriptedProvider, StreamEvent};
@@ -35,6 +36,8 @@ pub struct Harness {
     pub steer_on_tool_start: Option<String>,
     /// Labels of every shadow snapshot the engine requested, in order.
     pub snapshots: Arc<std::sync::Mutex<Vec<String>>>,
+    /// Every `EngineEvent::LedgerReport` seen, in order (§S1 instrument).
+    pub ledger_reports: Vec<LedgerSummary>,
 }
 
 /// Records snapshot labels instead of running git.
@@ -186,6 +189,7 @@ impl Harness {
             ask_reply: AskReply::Allow,
             steer_on_tool_start: None,
             snapshots,
+            ledger_reports: Vec::new(),
         }
     }
 
@@ -215,6 +219,7 @@ impl Harness {
                     }
                 }
                 EngineEvent::TurnDone { outcome, .. } => return outcome,
+                EngineEvent::LedgerReport(summary) => self.ledger_reports.push(summary),
                 _ => {}
             }
         }
@@ -936,6 +941,47 @@ mod tests {
         h.handle.interrupt();
         let outcome = h.wait_for_outcome().await;
         assert_eq!(outcome, Outcome::Cancelled);
+    }
+
+    /// §S1: a turn flushes exactly one `LedgerReport`, sized to the samples
+    /// it actually took (a tool-call sample plus the follow-up text-reply
+    /// sample), and every sample's `BoundaryEnd` is at or after its
+    /// `BoundaryStart` — the instrument must never invert its own window.
+    #[tokio::test]
+    async fn a_turn_flushes_exactly_one_ledger_report_matching_its_samples() {
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "read", json!({"path": "x"})),
+                ScriptedProvider::text_reply("done"),
+            ],
+            cfg(),
+        );
+        let outcome = h.prompt_and_wait("read x then answer").await;
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "done".into()
+            }
+        );
+        assert_eq!(
+            h.ledger_reports.len(),
+            1,
+            "exactly one LedgerReport must be flushed per turn"
+        );
+        let report = &h.ledger_reports[0];
+        assert_eq!(
+            report.sample_count,
+            h.provider.request_count(),
+            "the ledger's sample count must match the samples actually taken"
+        );
+        for (i, sample) in report.samples.iter().enumerate() {
+            let start = sample[hotl_engine::Phase::BoundaryStart as usize];
+            let end = sample[hotl_engine::Phase::BoundaryEnd as usize];
+            assert!(
+                end >= start,
+                "sample {i}: BoundaryEnd ({end}) must be >= BoundaryStart ({start})"
+            );
+        }
     }
 
     #[tokio::test]
