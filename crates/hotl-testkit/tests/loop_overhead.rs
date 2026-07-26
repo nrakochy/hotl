@@ -21,6 +21,10 @@
 //! the median just as visibly (`gate_would_catch_a_real_regression` checks
 //! exactly that).
 //!
+//! Both checks take [`MEASUREMENT`] for the whole of their measurement, so
+//! they never measure each other — see that lock's comment for why the
+//! baseline is meaningless without it.
+//!
 //! Regenerate the baseline after an intentional, understood change to the
 //! boundary mechanics the ledger prices (a new machine, a real perf win, a
 //! deliberate tradeoff) — never to silence a regression you haven't
@@ -74,6 +78,23 @@ const NOISE_FLOOR_P99_NS: u64 = 1_000_000; // 1ms
 /// is relative-to-baseline instead.
 const ADVISORY_P50_NS: u64 = 300_000; // 300µs
 const ADVISORY_P99_NS: u64 = 2_000_000; // 2ms
+
+/// The two checks below must not run concurrently **with each other**.
+///
+/// `gate_would_catch_a_real_regression` deliberately pays a real
+/// `sync_data()` on every sample, and the test harness runs a binary's tests
+/// in parallel threads — so the gate would be measuring its sibling's fsync
+/// storm rather than the loop. Measured on the development machine: p50
+/// 127µs serialized against 3.2ms concurrent, a ~25x distortion that is
+/// entirely self-inflicted.
+///
+/// It is also why a baseline captured *alongside* the teeth check leaves
+/// that check nothing to trip on: the inflated baseline swallows the very
+/// fsync regression the teeth check exists to detect, and the two
+/// requirements become mutually exclusive. One process-wide lock, held for
+/// each check's whole measurement, makes the regime the baseline is
+/// recorded in the same one it is compared against.
+static MEASUREMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn baseline_path() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("loop-baseline.json")
@@ -204,6 +225,7 @@ async fn run_scenario(use_seam: bool) -> (u64, u64) {
 
 #[tokio::test]
 async fn loop_overhead_stays_within_the_regression_band() {
+    let _measuring = MEASUREMENT.lock().await;
     let mut p50s = Vec::with_capacity(TRIAL_COUNT);
     let mut p99s = Vec::with_capacity(TRIAL_COUNT);
     for _ in 0..TRIAL_COUNT {
@@ -265,6 +287,7 @@ async fn loop_overhead_stays_within_the_regression_band() {
 /// with the noise it was built to absorb.
 #[tokio::test]
 async fn gate_would_catch_a_real_regression() {
+    let _measuring = MEASUREMENT.lock().await;
     let mut p50s = Vec::with_capacity(TEETH_CHECK_TRIALS);
     let mut p99s = Vec::with_capacity(TEETH_CHECK_TRIALS);
     for _ in 0..TEETH_CHECK_TRIALS {
