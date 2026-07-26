@@ -6,6 +6,45 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **The cache marker no longer lands on the todo reminder.** The `<todos>`
+  reminder was the last user-role item in the projection, so it took the cache
+  breakpoint — and its text changes on every todo edit, so that breakpoint
+  wrote a cache entry nothing ever read and re-billed the whole history at full
+  price on every sample the list was active, which is to say the default
+  workflow. The per-sample ephemeral suffix is now a separate channel the
+  breakpoint chooser never sees, so a marker on ephemeral content is
+  unrepresentable rather than merely avoided.
+
+### Added
+
+- **Rolling cache anchors keep tool-heavy turns inside the API's lookback.** A
+  breakpoint's cache lookup walks at most ~20 content blocks back, so one wide
+  batch used to push the previous entry out of reach and full-miss every sample
+  after it. Extra breakpoints now land at deterministic stride crossings —
+  including *inside* a wide tool batch — computed as a pure function of the
+  durable items, so the marker one sample writes is the marker the next sample
+  reads and the speculative and sequential build paths still agree byte for
+  byte.
+- **A one-hour cache TTL for interactive sessions.** `hotl tui`, `hotl acp` and
+  `hotl bg`/attach ask for 1h on the prefix and anchor breakpoints — the
+  sessions that pay for a multi-minute human pause. Headless `-p` and sub-agent
+  children stay at five minutes. The latest breakpoint always stays at five
+  minutes: its segment is rewritten every sample, so a longer-lived write
+  premium there recurs per turn and buys nothing.
+- **`cost_usd` in usage frames**, priced per bucket from the model catalog and
+  surfaced in the TUI, `--json` stream and ACP wire. One-hour cache writes bill
+  at 2× input, five-minute at 1.25×, reads at 0.1×; the per-TTL split is read
+  from the wire when the provider reports one and never guessed when it does
+  not.
+
+### Changed
+
+- **Fork seeds no longer commit the todo reminder into child logs.** `fork`
+  takes the durable projection only, so an ephemeral item can no longer stop
+  being ephemeral by being written into a child's canon.
+
 ## [0.6.0] - 2026-07-26
 
 ### Added
