@@ -24,7 +24,7 @@ pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use todo::TodoWriteTool;
 pub use web::{WebFetchTool, WebSearchTool};
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use futures_util::future::BoxFuture;
 use hotl_provider::ToolDef;
@@ -112,11 +112,23 @@ pub struct Registry {
 }
 
 impl Registry {
+    /// The six builtins, cheap to call repeatedly: the tool instances are
+    /// built once — `is_read_only` (agents.rs) is the hot no-diagnostics
+    /// caller, a spawn-gate check per `spawn` call (T3-30) — and every call
+    /// after the first just clones the `Vec<Arc<dyn Tool>>` (an Arc-bump
+    /// per tool, no reconstruction). Registering onto the returned
+    /// `Registry` only ever mutates the caller's own clone, never the
+    /// memoized prototype.
     pub fn builtin() -> Self {
-        Self::builtin_with(diagnostics::Diagnostics::default())
+        static BUILTIN: OnceLock<Registry> = OnceLock::new();
+        BUILTIN
+            .get_or_init(|| Self::builtin_with(diagnostics::Diagnostics::default()))
+            .clone()
     }
 
     /// Builtins with post-mutation diagnostics (M3a) shared by edit/write.
+    /// `diag` is caller-supplied per call, so unlike `builtin` above this
+    /// always builds fresh.
     pub fn builtin_with(diag: diagnostics::Diagnostics) -> Self {
         let diag = Arc::new(diag);
         Self {
@@ -326,6 +338,38 @@ mod tests {
             reg.get("glob").unwrap().permission(&serde_json::json!({})),
             Permission::None
         );
+    }
+
+    /// §S1 diet 3 (T3-30): `builtin()` is the hot no-diagnostics path (the
+    /// `is_read_only` spawn-gate check calls it per spawn), so it must
+    /// memoize instead of rebuilding six tool structs on every call — two
+    /// calls observe the exact same tool instances, proven by trait-object
+    /// pointer identity (same data pointer + vtable) on a representative
+    /// tool.
+    #[test]
+    fn builtin_calls_share_the_same_tool_instances() {
+        let a = Registry::builtin();
+        let b = Registry::builtin();
+        assert!(std::ptr::eq(
+            a.get("read").expect("read"),
+            b.get("read").expect("read")
+        ));
+        assert!(std::ptr::eq(
+            a.get("bash").expect("bash"),
+            b.get("bash").expect("bash")
+        ));
+    }
+
+    /// `builtin_with` carries per-call diagnostics (M3a) and must never
+    /// alias across calls the way the memoized `builtin()` now does.
+    #[test]
+    fn builtin_with_still_returns_fresh_instances() {
+        let a = Registry::builtin_with(diagnostics::Diagnostics::default());
+        let b = Registry::builtin_with(diagnostics::Diagnostics::default());
+        assert!(!std::ptr::eq(
+            a.get("read").expect("read"),
+            b.get("read").expect("read")
+        ));
     }
 
     #[test]
