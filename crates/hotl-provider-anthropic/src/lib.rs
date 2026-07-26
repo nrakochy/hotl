@@ -1326,6 +1326,58 @@ mod tests {
         assert_eq!(count_markers(&body), 2);
     }
 
+    /// Task 4: the tools-fallback prefix marker (no system prompt) must honor
+    /// `prefix_ttl` exactly like the system-block prefix marker does. This
+    /// combination — empty system + `OneHour` — has its own branch in
+    /// `build_body` (`mark && req.system.is_empty()`) that the two other new
+    /// TTL tests never exercise (both use `static_req("sys", ...)`), so it
+    /// gets its own test rather than riding along on an assumption.
+    #[test]
+    fn empty_system_prompt_fallback_marker_honors_the_one_hour_ttl() {
+        let mut req = static_req(
+            "",
+            vec![Item::User {
+                text: "hi".into(),
+                synthetic: None,
+            }],
+        );
+        req.cache = CachePolicy::Static {
+            prefix_ttl: CacheTtl::OneHour,
+        };
+        req.tools = vec![
+            ToolDef {
+                name: "read".into(),
+                description: "d".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            ToolDef {
+                name: "write".into(),
+                description: "d".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+        ]
+        .into();
+        let body = wire_body(&req);
+        assert!(body.get("system").is_none(), "no system prompt was set");
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "only the LAST tool def seals the block"
+        );
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"}),
+            "the tools-fallback prefix marker must honor prefix_ttl too"
+        );
+        // The single durable item is also `latest` (only one candidate
+        // exists) and must still render plain, same as every other case.
+        assert_eq!(
+            marker_ttls(&body),
+            vec![None],
+            "the latest marker never carries a ttl"
+        );
+        assert_eq!(count_markers(&body), 2, "prefix (tools fallback) + latest");
+    }
+
     /// The one sanctioned byte change for small histories: a `Static` request
     /// with no ephemeral tail and too few blocks to cross a stride serializes
     /// exactly the system marker plus the latest marker — no tools marker, no
