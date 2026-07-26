@@ -37,6 +37,10 @@ crossterm = "0.29"
 unicode-width = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# PreparedPayload's wire buffer (commit-protocol.md §Proposal payloads):
+# cheap `Clone` (refcounted) so a prepared entry's bytes travel from the turn
+# task to the actor without a copy.
+bytes = "1"
 toml = "0.8"
 toml_edit = "0.22"
 # Harness deps (execute capability). Why: tokio is the one async runtime the

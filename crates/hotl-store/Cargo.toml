@@ -13,7 +13,11 @@ homepage.workspace = true
 [dependencies]
 hotl-types = { path = "../hotl-types", version = "0.5.2" }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: `append_prepared`'s envelope splice needs `RawValue` to embed
+# an already-serialized payload without a second JSON pass (commit-protocol.md
+# §Proposal payloads).
+serde_json = { workspace = true, features = ["raw_value"] }
+bytes = { workspace = true }
 # The session log's writer runs on its own blocking thread; the actor awaits
 # its ack (commit-protocol.md §Durability ordering). `sync` is the only
 # feature this crate uses.

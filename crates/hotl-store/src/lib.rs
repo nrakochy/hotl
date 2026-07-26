@@ -21,6 +21,7 @@
 pub mod retention;
 pub mod shadow;
 
+use std::borrow::Cow;
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -28,8 +29,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use bytes::Bytes;
 use hotl_types::{new_ulid, Entry, EntryPayload, SessionHeader, FORMAT_VERSION};
 use serde::Serialize;
+use serde_json::value::RawValue;
 
 /// Ingestion-time sentinel masking: values of secret-named env vars are
 /// replaced with `«masked:NAME»` in every serialized entry.
@@ -79,13 +82,30 @@ impl Masker {
     }
 
     pub fn apply(&self, text: &str) -> String {
+        self.mask_cow(text).into_owned()
+    }
+
+    /// Borrow-preserving `apply`: a substring-scan gate over every pair
+    /// (`contains_secret`) decides up front whether anything matches, so
+    /// clean input — the overwhelmingly common case — returns
+    /// `Cow::Borrowed` with zero allocation; only text that actually needs a
+    /// replacement pays for the copy. Same replacement loop as `apply`
+    /// (commit-protocol.md §Proposal payloads: "the clean-input fast path
+    /// stays sanctioned ... recast from RegexSet to the shipped exact-substring
+    /// masker"). This is provably equivalent to the old always-allocate
+    /// `apply`: if `contains_secret` is false, every pair's secret is absent
+    /// from `text`, so the replacement loop below would touch nothing anyway.
+    pub fn mask_cow<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        if !self.contains_secret(text) {
+            return Cow::Borrowed(text);
+        }
         let mut out = text.to_string();
         for (secret, replacement) in &self.pairs {
             if out.contains(secret.as_str()) {
                 out = out.replace(secret.as_str(), replacement);
             }
         }
-        out
+        Cow::Owned(out)
     }
 
     pub fn contains_secret(&self, text: &str) -> bool {
@@ -99,6 +119,104 @@ impl Masker {
     fn has_multiline_secret(&self) -> bool {
         self.pairs.iter().any(|(secret, _)| secret.contains('\n'))
     }
+}
+
+/// Discriminant mirroring [`EntryPayload`]'s `#[serde(tag = "kind")]`
+/// variants — small enough for validation/telemetry, carries no payload data
+/// of its own (commit-protocol.md §Proposal payloads:
+/// `PreparedPayload { bytes, kind, rules_epoch }`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntryKind {
+    Header,
+    Item,
+    Usage,
+    Cancelled,
+    Compaction,
+    BranchMove,
+    Supersede,
+    PendingAsk,
+    AskResolved,
+    Rename,
+    ModeSet,
+    PendingQuestion,
+    QuestionResolved,
+    Todos,
+    Unknown,
+}
+
+impl From<&EntryPayload> for EntryKind {
+    fn from(payload: &EntryPayload) -> Self {
+        match payload {
+            EntryPayload::Header { .. } => EntryKind::Header,
+            EntryPayload::Item { .. } => EntryKind::Item,
+            EntryPayload::Usage { .. } => EntryKind::Usage,
+            EntryPayload::Cancelled { .. } => EntryKind::Cancelled,
+            EntryPayload::Compaction { .. } => EntryKind::Compaction,
+            EntryPayload::BranchMove { .. } => EntryKind::BranchMove,
+            EntryPayload::Supersede { .. } => EntryKind::Supersede,
+            EntryPayload::PendingAsk { .. } => EntryKind::PendingAsk,
+            EntryPayload::AskResolved { .. } => EntryKind::AskResolved,
+            EntryPayload::Rename { .. } => EntryKind::Rename,
+            EntryPayload::ModeSet { .. } => EntryKind::ModeSet,
+            EntryPayload::PendingQuestion { .. } => EntryKind::PendingQuestion,
+            EntryPayload::QuestionResolved { .. } => EntryKind::QuestionResolved,
+            EntryPayload::Todos { .. } => EntryKind::Todos,
+            EntryPayload::Unknown => EntryKind::Unknown,
+        }
+    }
+}
+
+/// An entry payload already serialized and masked, exactly once, upstream of
+/// the actor (commit-protocol.md §Proposal payloads). `bytes` is canon: the
+/// actor splices it into the entry envelope verbatim
+/// ([`SessionLog::append_prepared`]) and never re-derives it.
+#[derive(Clone, Debug)]
+pub struct PreparedPayload {
+    pub bytes: Bytes,
+    pub kind: EntryKind,
+    pub rules_epoch: u32,
+}
+
+/// Serialize `payload` alone (not the entry envelope) — the cheap half of
+/// proposal build. A single linear serde pass, no per-pair scan, so unlike
+/// masking it stays inline regardless of payload size (T3-16 names masking,
+/// not serialization, as the O(pairs × len) cost).
+pub fn serialize_payload(payload: &EntryPayload) -> serde_json::Result<String> {
+    serde_json::to_string(payload)
+}
+
+/// Mask an already-serialized payload. Uses [`Masker::mask_cow`]'s fast path:
+/// clean `json` is returned without a second allocation (only the original
+/// `String`'s buffer moves into `Bytes`).
+pub fn mask_json(masker: &Masker, json: String) -> Bytes {
+    // Scoped so the borrow of `json` inside `Cow::Borrowed` ends before
+    // `json` is reused below — `masked_owned` carries no borrowed data out
+    // of this block either way.
+    let masked_owned: Option<String> = match masker.mask_cow(&json) {
+        Cow::Borrowed(_) => None,
+        Cow::Owned(s) => Some(s),
+    };
+    match masked_owned {
+        Some(s) => Bytes::from(s.into_bytes()),
+        None => Bytes::from(json.into_bytes()),
+    }
+}
+
+/// Serialize + mask `payload` in one call — the turn-side half of
+/// commit-protocol.md §Proposal payloads' split. `rules_epoch` is stamped
+/// through unexamined; the caller (the actor) is the one that knows what
+/// "current" means.
+pub fn prepare_payload(
+    payload: &EntryPayload,
+    masker: &Masker,
+    rules_epoch: u32,
+) -> serde_json::Result<PreparedPayload> {
+    let json = serialize_payload(payload)?;
+    Ok(PreparedPayload {
+        bytes: mask_json(masker, json),
+        kind: EntryKind::from(payload),
+        rules_epoch,
+    })
 }
 
 /// Register `value` under `name` in `pairs` (raw + JSON-encoded forms),
@@ -222,7 +340,11 @@ pub struct SessionLog {
     tx: mpsc::Sender<WriterCmd>,
     writer: Option<std::thread::JoinHandle<()>>,
     path: PathBuf,
-    masker: Masker,
+    /// `Arc`-wrapped so the actor's `SharedDeps` (hotl-engine) can hold a
+    /// cheap clone of the same masker the log itself uses for the inline
+    /// path — one masking policy, two callers (commit-protocol.md §Proposal
+    /// payloads). See [`SessionLog::masker_handle`].
+    masker: Arc<Masker>,
     last_id: Option<String>,
     /// `Some(reason)` = log-sealed: read-only, every further append is a
     /// terminal error (commit-protocol.md §Durability ordering).
@@ -312,7 +434,7 @@ impl SessionLog {
             tx,
             writer: Some(writer),
             path,
-            masker,
+            masker: Arc::new(masker),
             last_id: None,
             sealed,
             fsyncs,
@@ -337,6 +459,15 @@ impl SessionLog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A cheap clone of the log's own masker — the handle turn-side proposal
+    /// build (hotl-engine's `SharedDeps`) uses to call [`prepare_payload`]
+    /// with the exact same rules the inline path masks with
+    /// (commit-protocol.md §Proposal payloads: "there is no second masking
+    /// policy — only a second, cheap, caller").
+    pub fn masker_handle(&self) -> Arc<Masker> {
+        Arc::clone(&self.masker)
     }
 
     /// The dir, path and masked-and-capped bytes for one blob write. Shared by
@@ -495,6 +626,72 @@ impl SessionLog {
         let ack = rx.await.map_err(|_| self.writer_gone())??;
         // Only a committed entry advances the chain: a sealed log must not
         // leave `last_id` pointing at a line that was truncated away.
+        self.last_id = Some(id);
+        Ok(ack)
+    }
+
+    /// Mint the id and splice `prepared`'s already-serialized-and-masked
+    /// bytes into the entry envelope verbatim (commit-protocol.md §Proposal
+    /// payloads): `serde_json::value::RawValue` writes them into the
+    /// `payload` field exactly as `build_line`'s `EntryRef { payload:
+    /// &EntryPayload }` would have — no second JSON pass over the payload, no
+    /// re-masking. Byte-identity with `build_line`'s output for the same
+    /// logical entry is the load-bearing property here (see
+    /// `prepare_payload_matches_legacy_bytes_for_*` in this crate's tests).
+    fn splice_prepared(
+        &mut self,
+        payload_bytes: &Bytes,
+        now_ms: u64,
+    ) -> std::io::Result<(String, Vec<u8>)> {
+        #[derive(Serialize)]
+        struct PreparedEntryRef<'a> {
+            id: &'a str,
+            parent_id: Option<&'a str>,
+            ts_ms: u64,
+            payload: &'a RawValue,
+        }
+        let text = std::str::from_utf8(payload_bytes)
+            .map_err(|e| std::io::Error::other(format!("prepared payload is not utf8: {e}")))?;
+        let raw: &RawValue = serde_json::from_str(text).map_err(|e| {
+            std::io::Error::other(format!("prepared payload is not valid json: {e}"))
+        })?;
+        let id = new_ulid();
+        let entry = PreparedEntryRef {
+            id: &id,
+            parent_id: self.last_id.as_deref(),
+            ts_ms: now_ms,
+            payload: raw,
+        };
+        let mut bytes = serde_json::to_vec(&entry)
+            .map_err(|e| std::io::Error::other(format!("serialize entry: {e}")))?;
+        bytes.push(b'\n');
+        Ok((id, bytes))
+    }
+
+    /// The actor's path for a proposal already serialized and masked by its
+    /// proposer (commit-protocol.md §Proposal payloads): mint the id, splice
+    /// the envelope, forward to the writer at the `Durable` tier — no
+    /// serialization, no masking here. `rules_epoch` staleness is the
+    /// caller's business (hotl-engine's `SharedDeps` owns the epoch); this
+    /// method trusts it was already checked.
+    pub async fn append_prepared(
+        &mut self,
+        prepared: PreparedPayload,
+        now_ms: u64,
+    ) -> std::io::Result<Ack> {
+        if let Some(reason) = self.seal_reason() {
+            return Err(sealed_error(&reason));
+        }
+        let (id, bytes) = self.splice_prepared(&prepared.bytes, now_ms)?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriterCmd::Append {
+                line: bytes,
+                tier: AckTier::Durable,
+                ack: AckSink::Async(tx),
+            })
+            .map_err(|_| self.writer_gone())?;
+        let ack = rx.await.map_err(|_| self.writer_gone())??;
         self.last_id = Some(id);
         Ok(ack)
     }
@@ -1207,7 +1404,7 @@ pub fn list_sessions(dir: &Path) -> Vec<(String, PathBuf, std::time::SystemTime)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hotl_types::{Item, Todo, TodoStatus};
+    use hotl_types::{Item, Todo, TodoStatus, ToolResultItem};
 
     #[test]
     fn log_appends_chain_and_masks_secrets() {
@@ -2383,5 +2580,161 @@ mod tests {
             .unwrap();
         }
         assert_eq!(session_name(&path).as_deref(), Some("only"));
+    }
+
+    // --- Task 8 (S2a PreparedPayload) --------------------------------
+
+    #[test]
+    fn mask_cow_borrows_when_nothing_matches() {
+        let masker = Masker::empty().with_value("HOTL_T8_A", "not-a-real-secret-aaaa");
+        match masker.mask_cow("nothing sensitive here") {
+            Cow::Borrowed(s) => assert_eq!(s, "nothing sensitive here"),
+            Cow::Owned(_) => panic!("clean input must borrow, not allocate"),
+        }
+    }
+
+    #[test]
+    fn mask_cow_matches_apply_when_something_matches() {
+        let masker = Masker::empty().with_value("HOTL_T8_B", "not-a-real-secret-bbbb");
+        let text = r#"key is "not-a-real-secret-bbbb" twice: not-a-real-secret-bbbb"#;
+        match masker.mask_cow(text) {
+            Cow::Owned(masked) => assert_eq!(masked, masker.apply(text)),
+            Cow::Borrowed(_) => panic!("dirty input must not borrow"),
+        }
+    }
+
+    /// `payload` is always the last declared field on both `EntryRef` and
+    /// `PreparedEntryRef`, so its JSON text runs from right after
+    /// `"payload":` to the entry envelope's own closing brace — extracting
+    /// that substring (instead of parsing into `serde_json::Value`, which
+    /// would normalize away exactly the key-order/escaping/number-formatting
+    /// drift this test exists to catch) gives a true byte-for-byte compare.
+    fn payload_json_slice(line: &str) -> &str {
+        let key = "\"payload\":";
+        let start = line.find(key).expect("line has a payload field") + key.len();
+        let end = line.rfind('}').expect("line is a JSON object");
+        &line[start..end]
+    }
+
+    /// Byte-identity, per payload, between the legacy `build_line` path and
+    /// the new `PreparedPayload` splice path — task 8's load-bearing proof.
+    /// The three callers below cover plain text, escaping-heavy content
+    /// (quotes, backslash, newline, unicode) and a multi-KB tool result,
+    /// with and without a secret actually present.
+    async fn assert_prepared_matches_legacy(payload: EntryPayload, masker: Masker) {
+        // Borrow for the new path before `masker` moves into the legacy
+        // log below — one masker, same rules on both sides of the comparison.
+        let prepared = prepare_payload(&payload, &masker, 0).expect("prepare");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut legacy = SessionLog::create(dir.path(), "m", None, masker, 1000).unwrap();
+        legacy.append(&payload, 1001).unwrap();
+        let legacy_content = std::fs::read_to_string(legacy.path()).unwrap();
+        let legacy_line = legacy_content.lines().nth(1).unwrap(); // skip the header line
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let mut prepared_log =
+            SessionLog::create(dir2.path(), "m", None, Masker::empty(), 1000).unwrap();
+        prepared_log
+            .append_prepared(prepared, 1001)
+            .await
+            .expect("append_prepared");
+        let prepared_content = std::fs::read_to_string(prepared_log.path()).unwrap();
+        let prepared_line = prepared_content.lines().nth(1).unwrap();
+
+        // ids and parent_ids differ (each log mints its own from an
+        // independent header) — the payload bytes, the one thing that must
+        // be produced identically by construction, must match exactly.
+        assert_eq!(
+            payload_json_slice(legacy_line),
+            payload_json_slice(prepared_line),
+            "payload field must be byte-identical:\n legacy:   {legacy_line}\n prepared: {prepared_line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn prepare_payload_matches_legacy_bytes_for_plain_text() {
+        assert_prepared_matches_legacy(
+            EntryPayload::Item {
+                item: Item::User {
+                    text: "plain text, nothing to mask".into(),
+                    synthetic: None,
+                },
+            },
+            Masker::empty(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn prepare_payload_matches_legacy_bytes_for_escaping_heavy_content() {
+        std::env::set_var("HOTL_T8_ESC_TOKEN", r#"esc"ape\d-secret-9999"#);
+        let masker = Masker::from_env();
+        assert_prepared_matches_legacy(
+            EntryPayload::Item {
+                item: Item::User {
+                    text: "quote \" backslash \\ newline\n tab\t unicode \u{1F600} secret \
+                           esc\"ape\\d-secret-9999"
+                        .into(),
+                    synthetic: None,
+                },
+            },
+            masker,
+        )
+        .await;
+        std::env::remove_var("HOTL_T8_ESC_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn prepare_payload_matches_legacy_bytes_for_a_multi_kb_tool_result() {
+        std::env::set_var("HOTL_T8_BIG_TOKEN", "big-payload-secret-value-123456");
+        let masker = Masker::from_env();
+        let mut content = "big-payload-secret-value-123456 leaked here\n".repeat(500);
+        content.push_str(&"z".repeat(4096));
+        assert_prepared_matches_legacy(
+            EntryPayload::Item {
+                item: Item::ToolResults {
+                    results: vec![ToolResultItem {
+                        tool_use_id: "t1".into(),
+                        content,
+                        is_error: false,
+                    }],
+                },
+            },
+            masker,
+        )
+        .await;
+        std::env::remove_var("HOTL_T8_BIG_TOKEN");
+    }
+
+    #[test]
+    fn entry_kind_mirrors_the_payload_variant() {
+        assert_eq!(
+            EntryKind::from(&EntryPayload::Item {
+                item: Item::User {
+                    text: "x".into(),
+                    synthetic: None
+                }
+            }),
+            EntryKind::Item
+        );
+        assert_eq!(
+            EntryKind::from(&EntryPayload::Usage {
+                usage: Default::default()
+            }),
+            EntryKind::Usage
+        );
+    }
+
+    #[tokio::test]
+    async fn append_prepared_rejects_invalid_json_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let bogus = PreparedPayload {
+            bytes: bytes::Bytes::from_static(b"not json"),
+            kind: EntryKind::Item,
+            rules_epoch: 0,
+        };
+        assert!(log.append_prepared(bogus, 2).await.is_err());
     }
 }

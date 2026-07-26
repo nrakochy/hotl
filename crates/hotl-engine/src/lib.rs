@@ -274,6 +274,37 @@ impl std::fmt::Debug for EngineEvent {
     }
 }
 
+/// One entry a turn task proposes to the actor, already serialized and
+/// masked (commit-protocol.md §Proposal payloads): the actor's disk-write
+/// path ([`hotl_store::SessionLog::append_prepared`]) never touches
+/// `EntryPayload` again. `item` carries the typed value for entries that
+/// also live in the model-visible projection — the actor still needs it to
+/// update `SessionCmd::Snapshot`'s answer, and keeping it here is not a
+/// second serialization: it is the exact value the turn already built in
+/// memory to produce `payload`, never re-parsed from `payload`'s bytes
+/// (that would just move T3-16's per-entry cost back onto the actor rather
+/// than delete it). `None` for entries that never enter the projection
+/// (`Usage`, `PendingAsk`/`AskResolved`).
+pub struct PreparedEntry {
+    pub payload: hotl_store::PreparedPayload,
+    pub item: Option<Item>,
+}
+
+/// What [`SessionCmd::ProposePrepared`] answers with — plain `bool` has no
+/// room for the rules-epoch guard's distinction (commit-protocol.md
+/// §Proposal payloads): a stale epoch means "rebuild under the current
+/// rules and resend", a genuinely different repair than "the log is sealed,
+/// stop trying".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposeReply {
+    Committed,
+    /// The actor refused the append: the log is sealed.
+    Sealed,
+    /// `PreparedPayload::rules_epoch` predates the actor's current masking
+    /// rules epoch. Nothing in this proposal was committed.
+    StaleEpoch,
+}
+
 pub enum SessionCmd {
     /// A user prompt. Starts a turn, or queues (one-at-a-time promotion).
     Prompt(String),
@@ -303,10 +334,30 @@ pub enum SessionCmd {
     Snapshot {
         reply: oneshot::Sender<Arc<Vec<Item>>>,
     },
-    /// Turn task → actor: commit these entries (durable-ack before reply).
+    /// Pre-actor proposal path (durable-ack before reply): the ONLY caller
+    /// left is [`question_sink`]'s `PendingQuestion`/`QuestionResolved`
+    /// entries, built and sent before the actor (and its masker) exist yet
+    /// — see `question_sink`'s doc comment on why it can't reach
+    /// `SharedDeps`. Those entries are always human-sized (a question
+    /// header/prompt/options), so they stay on the actor-serializing inline
+    /// path, the same carve-out commit-protocol.md §Proposal payloads grants
+    /// steer admissions/compaction digests/todo snapshots. A turn-task
+    /// proposal uses [`SessionCmd::ProposePrepared`] instead — see that
+    /// variant's doc comment for why this one can't be reused for that.
     Propose {
         entries: Vec<EntryPayload>,
         reply: oneshot::Sender<bool>,
+    },
+    /// Turn task → actor: commit already-prepared entries
+    /// (commit-protocol.md §Proposal payloads). This is the type-level
+    /// enforcement point requirement 4 of task 8 asks for: a turn-originated
+    /// proposal can only reach the log through this channel, so a future
+    /// call site cannot reintroduce actor-side serialization for these kinds
+    /// — the entries carry pre-serialized, pre-masked `PreparedPayload`
+    /// bytes, never a raw `EntryPayload`.
+    ProposePrepared {
+        entries: Vec<PreparedEntry>,
+        reply: oneshot::Sender<ProposeReply>,
     },
     /// Turn task → actor: write an oversized tool result to a masked blob
     /// (T4 — the actor owns the log, the turn never touches it directly).

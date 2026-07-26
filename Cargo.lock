@@ -915,6 +915,7 @@ dependencies = [
 name = "hotl-store"
 version = "0.5.2"
 dependencies = [
+ "bytes",
  "hotl-types",
  "serde",
  "serde_json",

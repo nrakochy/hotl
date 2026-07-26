@@ -112,16 +112,23 @@ enum Commit {
     Committed,
     /// The actor refused the append: the log is sealed.
     Sealed,
+    /// `PreparedPayload::rules_epoch` predated the actor's current rules
+    /// (commit-protocol.md §Proposal payloads' guard) and the one retry in
+    /// `Turn::propose` also came back stale — vanishingly unlikely (the
+    /// epoch only ever advances, and the retry reads it fresh), surfaced as
+    /// a failure rather than looping.
+    StaleEpoch,
     /// The actor is gone (channel closed / reply dropped): normal shutdown.
     Gone,
 }
 
 impl Commit {
-    /// `Some(accepted)` from the actor, `None` if it never answered.
-    fn from_reply(reply: Option<bool>) -> Self {
+    /// The actor's reply, `None` if it never answered.
+    fn from_reply(reply: Option<crate::ProposeReply>) -> Self {
         match reply {
-            Some(true) => Commit::Committed,
-            Some(false) => Commit::Sealed,
+            Some(crate::ProposeReply::Committed) => Commit::Committed,
+            Some(crate::ProposeReply::Sealed) => Commit::Sealed,
+            Some(crate::ProposeReply::StaleEpoch) => Commit::StaleEpoch,
             None => Commit::Gone,
         }
     }
@@ -138,9 +145,85 @@ impl Commit {
                 "the session log is sealed — nothing further can be recorded; \
                  start a new session to keep working"
             }
+            Commit::StaleEpoch => {
+                "the masking rules changed twice while committing this entry; \
+                 start a new session to keep working"
+            }
             Commit::Gone => "the session is shutting down",
         }
     }
+}
+
+/// Bytes at or above this size have their masking pass moved onto
+/// `tokio::task::spawn_blocking` (commit-protocol.md §Proposal payloads;
+/// speed-architecture design's "CpuPool past the 1ms threshold", Rule 0 —
+/// the workspace has no CpuPool, so `spawn_blocking` is the sanctioned
+/// stand-in). Serialization stays inline unconditionally regardless of this
+/// threshold: it is one linear serde pass with no per-pair scan, so it is
+/// cheap even for a large payload — masking is the O(pairs × len) cost with
+/// a per-pair allocation the design doc names (T3-16), and checking the
+/// threshold against the already-serialized length (rather than a
+/// pre-serialization heuristic) is exact rather than a guess.
+const PREPARE_OFFLOAD_BYTES: usize = 256 * 1024;
+
+/// `prepare_entry` failed to produce a `PreparedEntry`. Both arms are
+/// effectively unreachable in practice (see call sites), but a proposal
+/// build must not panic the turn task, so they are surfaced as `Commit::Gone`
+/// rather than unwrapped.
+#[derive(Debug)]
+enum PrepareError {
+    /// `serde_json::to_string` on an `EntryPayload` errored — none of this
+    /// crate's payload shapes contain non-finite floats or non-string map
+    /// keys, so this is defensive, not expected. Neither call site inspects
+    /// the underlying `serde_json::Error` (both just fall back to
+    /// `Commit::Gone`), so it is not carried — see `Commit::message`'s
+    /// `StaleEpoch`/`Gone` text for what the user actually sees.
+    Serialize,
+    /// The `spawn_blocking` task masking a large payload panicked or was
+    /// aborted (a runtime shutting down mid-proposal).
+    Offload,
+}
+
+impl From<serde_json::Error> for PrepareError {
+    fn from(_: serde_json::Error) -> Self {
+        PrepareError::Serialize
+    }
+}
+
+/// Build one entry's `PreparedPayload` — the turn-side half of
+/// commit-protocol.md §Proposal payloads. A free function (not `&Turn`), so
+/// it is directly unit-testable (masking correctness, the epoch stamp, the
+/// offload threshold) without spinning up a session.
+async fn prepare_entry(
+    payload: &EntryPayload,
+    masker: &Arc<hotl_store::Masker>,
+    rules_epoch: u32,
+) -> Result<crate::PreparedEntry, PrepareError> {
+    // The exact value the turn already built in memory — kept for the
+    // actor's live projection, never re-parsed from the bytes below (that
+    // would just move T3-16's per-entry cost back onto the actor).
+    let item = match payload {
+        EntryPayload::Item { item } => Some(item.clone()),
+        _ => None,
+    };
+    let json = hotl_store::serialize_payload(payload)?;
+    let kind = hotl_store::EntryKind::from(payload);
+    let bytes = if json.len() >= PREPARE_OFFLOAD_BYTES {
+        let masker = Arc::clone(masker);
+        tokio::task::spawn_blocking(move || hotl_store::mask_json(&masker, json))
+            .await
+            .map_err(|_| PrepareError::Offload)?
+    } else {
+        hotl_store::mask_json(masker, json)
+    };
+    Ok(crate::PreparedEntry {
+        payload: hotl_store::PreparedPayload {
+            bytes,
+            kind,
+            rules_epoch,
+        },
+        item,
+    })
 }
 
 /// Chunk a batch for execution: contiguous runs of parallel-safe calls form
@@ -1180,11 +1263,43 @@ impl Turn {
         rx.await.ok()
     }
 
+    /// Serialize + mask every entry (commit-protocol.md §Proposal payloads)
+    /// and commit them via [`SessionCmd::ProposePrepared`] — the type-level
+    /// single-serialization-site enforcement point (task 8 requirement 4):
+    /// this is the ONLY place a `Turn` reaches the log, and it can only
+    /// reach it with `PreparedPayload`, never a raw `EntryPayload`.
     async fn propose(&self, entries: Vec<EntryPayload>) -> Commit {
+        let epoch = self.shared.rules_epoch();
+        let commit = self.propose_at_epoch(&entries, epoch).await;
+        if commit != Commit::StaleEpoch {
+            return commit;
+        }
+        // Rare (today unreachable in production — `rules_epoch` is constant
+        // for the life of a session): the masking rules' epoch advanced
+        // between build and send. Re-mask under the now-current epoch and
+        // resend once (commit-protocol.md: "the turn re-masks and
+        // re-proposes ... rare, correct"). `entries` was only ever borrowed
+        // by `propose_at_epoch`, so this costs nothing on the common path.
+        let epoch = self.shared.rules_epoch();
+        self.propose_at_epoch(&entries, epoch).await
+    }
+
+    async fn propose_at_epoch(&self, entries: &[EntryPayload], epoch: u32) -> Commit {
+        let masker = self.shared.masker();
+        let mut prepared = Vec::with_capacity(entries.len());
+        for payload in entries {
+            match prepare_entry(payload, masker, epoch).await {
+                Ok(entry) => prepared.push(entry),
+                Err(_) => return Commit::Gone,
+            }
+        }
         let (tx, rx) = oneshot::channel();
         if self
             .cmd_tx
-            .send(SessionCmd::Propose { entries, reply: tx })
+            .send(SessionCmd::ProposePrepared {
+                entries: prepared,
+                reply: tx,
+            })
             .await
             .is_err()
         {
@@ -1588,8 +1703,14 @@ mod tests {
     /// user as log corruption.
     #[test]
     fn a_dropped_actor_is_not_reported_as_a_sealed_log() {
-        assert_eq!(Commit::from_reply(Some(true)), Commit::Committed);
-        assert_eq!(Commit::from_reply(Some(false)), Commit::Sealed);
+        assert_eq!(
+            Commit::from_reply(Some(crate::ProposeReply::Committed)),
+            Commit::Committed
+        );
+        assert_eq!(
+            Commit::from_reply(Some(crate::ProposeReply::Sealed)),
+            Commit::Sealed
+        );
         assert_eq!(Commit::from_reply(None), Commit::Gone);
         assert!(Commit::Sealed.message().contains("sealed"));
         assert!(!Commit::Gone.message().contains("sealed"));
@@ -1667,5 +1788,108 @@ mod tests {
         assert!(unfinished_todos(&[todos_item("<todos>\n[ ] a\n</todos>")]));
         assert!(unfinished_todos(&[todos_item("<todos>\n[~] a\n</todos>")]));
         assert!(!unfinished_todos(&[todos_item("<todos>\n[x] a\n</todos>")]));
+    }
+
+    // --- Task 8 (S2a PreparedPayload) --------------------------------
+
+    #[tokio::test]
+    async fn prepare_entry_masks_and_stamps_the_epoch() {
+        std::env::set_var("HOTL_T8_TURN_TOKEN", "sk-super-secret-turntest-1");
+        let masker = Arc::new(hotl_store::Masker::from_env());
+        let payload = EntryPayload::Item {
+            item: Item::User {
+                text: "key: sk-super-secret-turntest-1".into(),
+                synthetic: None,
+            },
+        };
+        let prepared = prepare_entry(&payload, &masker, 7).await.expect("prepare");
+        assert_eq!(prepared.payload.rules_epoch, 7);
+        assert_eq!(prepared.payload.kind, hotl_store::EntryKind::Item);
+        let text = std::str::from_utf8(&prepared.payload.bytes).unwrap();
+        assert!(
+            !text.contains("sk-super-secret-turntest-1"),
+            "secret must be masked before it ever reaches the actor: {text}"
+        );
+        assert!(matches!(prepared.item, Some(Item::User { .. })));
+        std::env::remove_var("HOTL_T8_TURN_TOKEN");
+    }
+
+    #[tokio::test]
+    async fn prepare_entry_has_no_item_for_non_item_kinds() {
+        let masker = Arc::new(hotl_store::Masker::empty());
+        let payload = EntryPayload::Usage {
+            usage: TokenUsage::default(),
+        };
+        let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
+        assert!(prepared.item.is_none());
+        assert_eq!(prepared.payload.kind, hotl_store::EntryKind::Usage);
+    }
+
+    #[tokio::test]
+    async fn prepare_entry_clean_input_matches_raw_serialization_byte_for_byte() {
+        let masker = Arc::new(
+            hotl_store::Masker::empty().with_value("HOTL_T8_UNUSED", "not-present-anywhere-12345"),
+        );
+        let payload = EntryPayload::Usage {
+            usage: TokenUsage::default(),
+        };
+        let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
+        let raw = hotl_store::serialize_payload(&payload).unwrap();
+        assert_eq!(prepared.payload.bytes.as_ref(), raw.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn prepare_entry_dirty_input_matches_masker_apply() {
+        let masker = Arc::new(
+            hotl_store::Masker::empty().with_value("HOTL_T8_DIRTY", "present-secret-value-67890"),
+        );
+        let payload = EntryPayload::Item {
+            item: Item::User {
+                text: "token present-secret-value-67890 here".into(),
+                synthetic: None,
+            },
+        };
+        let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
+        let raw = hotl_store::serialize_payload(&payload).unwrap();
+        let expected = masker.apply(&raw);
+        assert_eq!(prepared.payload.bytes.as_ref(), expected.as_bytes());
+    }
+
+    /// requirement 7: payloads at/above `PREPARE_OFFLOAD_BYTES` still
+    /// produce byte-identical output — only *where* masking runs changes.
+    #[tokio::test]
+    async fn prepare_entry_offloads_large_payloads_with_identical_bytes() {
+        let masker = Arc::new(hotl_store::Masker::empty());
+        let big_text = "x".repeat(PREPARE_OFFLOAD_BYTES + 4096);
+        let payload = EntryPayload::Item {
+            item: Item::User {
+                text: big_text,
+                synthetic: None,
+            },
+        };
+        let raw = hotl_store::serialize_payload(&payload).unwrap();
+        assert!(
+            raw.len() >= PREPARE_OFFLOAD_BYTES,
+            "fixture must actually cross the offload threshold"
+        );
+        let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
+        assert_eq!(prepared.payload.bytes.as_ref(), raw.as_bytes());
+    }
+
+    #[test]
+    fn commit_from_reply_distinguishes_stale_epoch_from_sealed() {
+        assert_eq!(
+            Commit::from_reply(Some(crate::ProposeReply::StaleEpoch)),
+            Commit::StaleEpoch
+        );
+        assert_eq!(
+            Commit::from_reply(Some(crate::ProposeReply::Sealed)),
+            Commit::Sealed
+        );
+        assert_eq!(
+            Commit::from_reply(Some(crate::ProposeReply::Committed)),
+            Commit::Committed
+        );
+        assert_eq!(Commit::from_reply(None), Commit::Gone);
     }
 }

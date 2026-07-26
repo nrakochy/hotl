@@ -82,6 +82,17 @@ pub(crate) struct SharedDeps {
     /// drain call reaches the exact same detached `Notification` hook tasks
     /// this actor (and any `question_sink`) spawns.
     pub notifications: crate::hooks::NotificationDrain,
+    /// The same masker the log's inline path uses (commit-protocol.md
+    /// §Proposal payloads: "there is no second masking policy — only a
+    /// second, cheap, caller") — cloned from `SessionLog`'s own `Arc<Masker>`
+    /// at construction, so proposal build in the turn task masks under
+    /// exactly the rules the actor would have used.
+    masker: Arc<hotl_store::Masker>,
+    /// Monotonic masking-rules epoch (commit-protocol.md §Proposal
+    /// payloads' `rules_epoch` guard). Today masking rules never change
+    /// mid-session, so this is constant for the life of a `SharedDeps` — the
+    /// guard is implemented anyway, ahead of whatever eventually bumps it.
+    rules_epoch: std::sync::atomic::AtomicU32,
 }
 
 /// `PermissionMode` has no natural discriminant to lean on across an atomic
@@ -123,6 +134,10 @@ impl SharedDeps {
                         .bits(),
                 ))
             });
+        // Cloned before `deps.log` moves out below — cheap (an `Arc` bump),
+        // and it's how a turn-side `prepare_payload` call ends up masking
+        // under the exact same rules the log's own inline path uses.
+        let masker = deps.log.masker_handle();
         let shared = Self {
             provider: deps.provider,
             registry: deps.registry,
@@ -137,6 +152,8 @@ impl SharedDeps {
             hooks: deps.hooks,
             hook_mask,
             notifications,
+            masker,
+            rules_epoch: std::sync::atomic::AtomicU32::new(0),
         };
         (shared, deps.log)
     }
@@ -180,6 +197,30 @@ impl SharedDeps {
     /// The failure surfaces to the user via the turn outcome, not stderr.
     async fn append(&self, log: &mut SessionLog, payload: &EntryPayload) -> bool {
         log.append_acked(payload, self.clock.now_ms()).await.is_ok()
+    }
+
+    /// The masker turn-side proposal build masks under
+    /// ([`crate::turn`]'s `prepare_entry`) — see the `masker` field doc.
+    pub(crate) fn masker(&self) -> &Arc<hotl_store::Masker> {
+        &self.masker
+    }
+
+    /// The current masking-rules epoch — see the `rules_epoch` field doc.
+    pub(crate) fn rules_epoch(&self) -> u32 {
+        self.rules_epoch.load(Ordering::Relaxed)
+    }
+
+    /// Commit one already-prepared entry: no serialization, no masking here
+    /// (commit-protocol.md §Proposal payloads) — splice and forward only.
+    /// Mirrors `append`'s durable-tier/await-ack shape.
+    async fn append_prepared(
+        &self,
+        log: &mut SessionLog,
+        prepared: hotl_store::PreparedPayload,
+    ) -> bool {
+        log.append_prepared(prepared, self.clock.now_ms())
+            .await
+            .is_ok()
     }
 }
 
@@ -328,6 +369,21 @@ pub(crate) async fn run(
                 // have just landed.
                 release_steers(&shared, &mut log, &mut items, &mut held_steers, sampling).await;
                 let _ = reply.send(committed);
+            }
+            SessionCmd::ProposePrepared { entries, reply } => {
+                // Same shape as `Propose` above, computed before `entries`
+                // moves into `commit_prepared`: `item` (not `payload`, which
+                // is now opaque bytes) carries whether this is the closing
+                // assistant item.
+                let closes_sample = entries
+                    .iter()
+                    .any(|e| matches!(&e.item, Some(Item::Assistant { .. })));
+                let result = commit_prepared(&shared, &mut log, &mut items, entries).await;
+                if closes_sample {
+                    sampling = false;
+                }
+                release_steers(&shared, &mut log, &mut items, &mut held_steers, sampling).await;
+                let _ = reply.send(result);
             }
             SessionCmd::WriteBlob {
                 tool_use_id,
@@ -779,6 +835,37 @@ async fn commit(
     true
 }
 
+/// Commit a proposal of already-prepared entries (commit-protocol.md
+/// §Proposal payloads): no serialization, no masking here — see `commit`
+/// above for the actor-built-entries twin this mirrors. The rules-epoch
+/// guard is checked once, for the whole batch, before anything is
+/// appended: every entry in one turn-task proposal is built from one
+/// `rules_epoch` reading (`crate::turn::Turn::propose`), so a mixed batch
+/// would itself be a bug upstream, not something to partially commit around.
+async fn commit_prepared(
+    shared: &SharedDeps,
+    log: &mut SessionLog,
+    items: &mut Arc<Vec<Item>>,
+    entries: Vec<crate::PreparedEntry>,
+) -> crate::ProposeReply {
+    let current_epoch = shared.rules_epoch();
+    if entries
+        .iter()
+        .any(|e| e.payload.rules_epoch != current_epoch)
+    {
+        return crate::ProposeReply::StaleEpoch;
+    }
+    for entry in entries {
+        if !shared.append_prepared(log, entry.payload).await {
+            return crate::ProposeReply::Sealed;
+        }
+        if let Some(item) = entry.item {
+            Arc::make_mut(items).push(item);
+        }
+    }
+    crate::ProposeReply::Committed
+}
+
 /// Non-Done outcomes leave a durable annotation in the log.
 async fn annotate(shared: &SharedDeps, log: &mut SessionLog, outcome: &Outcome) {
     let reason = match outcome {
@@ -1100,9 +1187,14 @@ fn respawn_turn(
 #[cfg(test)]
 mod tests {
     use super::COMPACT_SUMMARIZE_TIMEOUT;
-    use super::{awaiting_tool_results, fold_into, pair_tool_results, summarize_bounded};
-    use hotl_types::{Item, SyntheticReason, ToolResultItem};
+    use super::{
+        awaiting_tool_results, commit_prepared, fold_into, pair_tool_results, summarize_bounded,
+        SharedDeps,
+    };
+    use hotl_store::SessionLog;
+    use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
     use serde_json::json;
+    use std::sync::Arc;
 
     /// T3-4. The paused clock is legal here: this drives `summarize_bounded`
     /// alone, with no actor and therefore no writer-thread ack for the clock to
@@ -1251,5 +1343,92 @@ mod tests {
     fn a_trailing_gap_survives_repair() {
         let trailing = vec![calls("t1"), user("last word")];
         assert_eq!(pair_tool_results(trailing.clone()), trailing);
+    }
+
+    // --- Task 8 (S2a PreparedPayload) --------------------------------
+
+    fn test_deps(dir: &std::path::Path, log: hotl_store::SessionLog) -> crate::SessionDeps {
+        crate::SessionDeps {
+            provider: Arc::new(hotl_provider::ScriptedProvider::new(vec![])),
+            registry: Arc::new(hotl_tools::Registry::builtin()),
+            rules: Arc::new(hotl_tools::rules::Rules::default()),
+            sandbox_enforced: false,
+            clock: Arc::new(hotl_platform::SystemClock),
+            log,
+            system: "sys".into(),
+            cwd: dir.to_path_buf(),
+            snapshots: None,
+            hooks: None,
+            initial_items: Vec::new(),
+            initial_todos: Vec::new(),
+            config: crate::EngineConfig::default(),
+        }
+    }
+
+    fn test_shared(dir: &std::path::Path) -> (Arc<SharedDeps>, SessionLog) {
+        let log = SessionLog::create(dir, "m", None, hotl_store::Masker::empty(), 0).expect("log");
+        let (shared, log) =
+            SharedDeps::new(test_deps(dir, log), crate::hooks::NotificationDrain::new());
+        (Arc::new(shared), log)
+    }
+
+    /// commit-protocol.md §Proposal payloads' rules_epoch guard: "the actor
+    /// rejects a payload whose epoch predates the current masking rules" —
+    /// tested directly against `commit_prepared`, the actor's real commit
+    /// path for prepared entries, not just a hand-extracted predicate.
+    #[tokio::test]
+    async fn commit_prepared_rejects_a_stale_epoch_and_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, mut log) = test_shared(dir.path());
+        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let before = std::fs::read_to_string(log.path()).unwrap();
+
+        let stale_epoch = shared.rules_epoch() + 1;
+        let payload = hotl_types::EntryPayload::Usage {
+            usage: hotl_types::TokenUsage::default(),
+        };
+        let prepared =
+            hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), stale_epoch)
+                .expect("prepare");
+        let entries = vec![crate::PreparedEntry {
+            payload: prepared,
+            item: None,
+        }];
+
+        let result = commit_prepared(&shared, &mut log, &mut items, entries).await;
+        assert_eq!(result, crate::ProposeReply::StaleEpoch);
+        assert!(
+            items.is_empty(),
+            "a stale proposal must not touch the projection"
+        );
+        let after = std::fs::read_to_string(log.path()).unwrap();
+        assert_eq!(before, after, "a stale proposal must not reach the log");
+    }
+
+    #[tokio::test]
+    async fn commit_prepared_commits_a_fresh_entry_and_updates_the_projection() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, mut log) = test_shared(dir.path());
+        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+
+        let epoch = shared.rules_epoch();
+        let payload = EntryPayload::Item { item: user("hi") };
+        let prepared = hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), epoch)
+            .expect("prepare");
+        let entries = vec![crate::PreparedEntry {
+            payload: prepared,
+            item: Some(user("hi")),
+        }];
+
+        let result = commit_prepared(&shared, &mut log, &mut items, entries).await;
+        assert_eq!(result, crate::ProposeReply::Committed);
+        assert_eq!(items.len(), 1, "a fresh proposal must reach the projection");
+
+        let replayed = hotl_store::replay(log.path()).expect("replay");
+        assert_eq!(
+            replayed.items.len(),
+            1,
+            "and the disk, chained after the header"
+        );
     }
 }
