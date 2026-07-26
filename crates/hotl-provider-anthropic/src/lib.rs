@@ -20,7 +20,7 @@ use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{
     ArmGuard, Provider, ProviderError, SamplingRequest, StreamEvent, ToolDef, Warmable,
 };
-use hotl_types::{Item, StopReason, TokenUsage};
+use hotl_types::{Item, StopReason, SyntheticReason, TokenUsage};
 use serde_json::{json, Value};
 
 /// §S3.2: bounds the warm request end-to-end (connect + TLS + response),
@@ -197,9 +197,17 @@ fn tool_json(t: &ToolDef) -> Value {
 }
 
 fn build_messages(items: &[Item], cache_static: bool) -> Vec<Value> {
-    let last_user_idx = items
-        .iter()
-        .rposition(|i| matches!(i, Item::User { .. } | Item::ToolResults { .. }));
+    // The engine appends an ephemeral `<todos>` reminder as the last item of
+    // every snapshot while todos are active (`Item::User { synthetic:
+    // Some(SyntheticReason::Todos), .. }`). It changes on every todo edit, so
+    // if the marker landed there the cache entry would never be re-read and
+    // the whole prefix would re-bill at full price every sample. Skip it and
+    // let the marker fall on the last *durable* user-role item instead.
+    let last_user_idx = items.iter().rposition(|i| match i {
+        Item::User { synthetic, .. } => !matches!(synthetic, Some(SyntheticReason::Todos)),
+        Item::ToolResults { .. } => true,
+        _ => false,
+    });
     let mut out = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
         let mark = cache_static && Some(idx) == last_user_idx;
@@ -985,6 +993,62 @@ mod tests {
         assert_eq!(last["content"][0]["type"], "tool_result");
         assert_eq!(last["content"][0]["cache_control"]["type"], "ephemeral");
         // the earlier user message does NOT carry a marker
+        assert!(msgs[0]["content"][0].get("cache_control").is_none());
+    }
+
+    /// STOPGAP (live cache-billing bug): the engine appends an ephemeral
+    /// `<todos>` reminder as the last item of every snapshot while todos are
+    /// active (`Item::User { synthetic: Some(SyntheticReason::Todos), .. }`).
+    /// Its text changes on every todo edit, so if the cache marker landed
+    /// there the cache entry written there would never be read again and the
+    /// whole conversation history would re-bill at full price every sample.
+    /// The marker must skip it and land on the last durable user-role item.
+    #[test]
+    fn todo_reminder_is_never_the_cache_marker() {
+        let mut req = sampling_req();
+        req.cache_static = true;
+        req.items = std::sync::Arc::new(vec![
+            Item::User {
+                text: "durable instructions".into(),
+                synthetic: None,
+            },
+            Item::ToolResults {
+                results: vec![ToolResultItem {
+                    tool_use_id: "t1".into(),
+                    content: "out".into(),
+                    is_error: false,
+                }],
+            },
+            Item::User {
+                text: "<todos>do the thing</todos>".into(),
+                synthetic: Some(SyntheticReason::Todos),
+            },
+        ]);
+        let body = wire_body(&req);
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 3);
+
+        // The synthetic todos reminder is last but carries no cache marker.
+        let todos_msg = &msgs[2];
+        assert_eq!(
+            todos_msg["content"][0]["text"],
+            "<todos>do the thing</todos>"
+        );
+        assert!(
+            todos_msg["content"][0].get("cache_control").is_none(),
+            "the todos reminder must never be the cache marker"
+        );
+
+        // The last durable user-role item (the tool results) carries it instead.
+        let last_durable = &msgs[1];
+        assert_eq!(last_durable["role"], "user");
+        assert_eq!(last_durable["content"][0]["type"], "tool_result");
+        assert_eq!(
+            last_durable["content"][0]["cache_control"]["type"],
+            "ephemeral"
+        );
+
+        // The earlier user message does NOT carry a marker.
         assert!(msgs[0]["content"][0].get("cache_control").is_none());
     }
 }
