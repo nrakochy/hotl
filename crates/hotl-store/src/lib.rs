@@ -819,6 +819,12 @@ impl SessionLog {
     /// How many `sync_data()` calls the writer has completed. Test
     /// observability: T1-1 existed partly because nothing could assert an
     /// fsync had happened.
+    ///
+    /// One per **group commit**, not per entry: under pipelining a queue
+    /// depth > 1 collapses into a single sync covering every line in it
+    /// (§Pipelined commits). A depth-1 queue — every `Sync` caller — still
+    /// counts exactly one per Durable append, which is what every existing
+    /// assertion here relies on.
     pub fn fsync_count(&self) -> u64 {
         self.fsyncs.load(Ordering::SeqCst)
     }
@@ -826,6 +832,24 @@ impl SessionLog {
     #[doc(hidden)]
     pub fn inject_fault(&self, fault: WriteFault) {
         self.fault.store(fault_to_u8(fault), Ordering::SeqCst);
+    }
+
+    /// Test-only: a detachable arm for [`SessionLog::inject_fault`]. The
+    /// crash cases that matter under pipelining land *mid-session*, after
+    /// the log has moved into a `SessionDeps`, so the arm has to be taken
+    /// while the handle is still in hand.
+    #[doc(hidden)]
+    pub fn fault_injector(&self) -> impl Fn(WriteFault) + Send + Sync + 'static {
+        let fault = Arc::clone(&self.fault);
+        move |f| fault.store(fault_to_u8(f), Ordering::SeqCst)
+    }
+
+    /// Test-only: the live `sync_data()` counter, detachable for the same
+    /// reason [`SessionLog::fault_injector`] is — a golden scenario asserts
+    /// on it after the log has moved into a session.
+    #[doc(hidden)]
+    pub fn fsync_counter(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.fsyncs)
     }
 
     /// Test-only: skip the writer's `sync_data()` syscall (both the durable

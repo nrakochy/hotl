@@ -96,13 +96,13 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     cmd_tx
         .send(SessionCmd::ProposePrepared {
             entries: vec![stale_entry],
+            mode: hotl_engine::AckMode::Sync,
             reply: tx,
         })
         .await
         .expect("send stale propose");
-    assert_eq!(
-        rx.await.expect("stale reply"),
-        ProposeReply::StaleEpoch,
+    assert!(
+        matches!(rx.await.expect("stale reply"), ProposeReply::StaleEpoch),
         "an entry stamped with the old epoch must be rejected"
     );
 
@@ -130,13 +130,13 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     cmd_tx
         .send(SessionCmd::ProposePrepared {
             entries: vec![fresh_entry],
+            mode: hotl_engine::AckMode::Sync,
             reply: tx,
         })
         .await
         .expect("send fresh propose");
-    assert_eq!(
-        rx.await.expect("fresh reply"),
-        ProposeReply::Committed,
+    assert!(
+        matches!(rx.await.expect("fresh reply"), ProposeReply::Committed),
         "the retried entry, stamped with the current epoch, must commit"
     );
 

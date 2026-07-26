@@ -38,6 +38,10 @@ pub struct Harness {
     pub snapshots: Arc<std::sync::Mutex<Vec<String>>>,
     /// Every `EngineEvent::LedgerReport` seen, in order (§S1 instrument).
     pub ledger_reports: Vec<LedgerSummary>,
+    /// The session log's live `sync_data()` counter — the group-commit
+    /// counter assertions (commit-protocol.md §Test obligations) read it
+    /// after the log itself has moved into the session.
+    fsyncs: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Records snapshot labels instead of running git.
@@ -61,6 +65,12 @@ impl Harness {
     /// the harness drops, instead of being forgotten and leaked on disk).
     pub fn keep_dir(&mut self, dir: tempfile::TempDir) {
         self.extra_dirs.push(dir);
+    }
+
+    /// The session log this harness writes — for scenarios whose scripted
+    /// tools have to read the canon while the turn is still running.
+    pub fn log_path(&self) -> &std::path::Path {
+        &self.log_path
     }
 }
 
@@ -186,6 +196,7 @@ impl Harness {
         if sync_noop {
             log.set_sync_noop(true);
         }
+        let fsyncs = log.fsync_counter();
         let log_path = log.path().to_path_buf();
         let provider = Arc::new(ScriptedProvider::new(scripts));
         let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -216,7 +227,13 @@ impl Harness {
             steer_on_tool_start: None,
             snapshots,
             ledger_reports: Vec::new(),
+            fsyncs,
         }
+    }
+
+    /// `sync_data()` calls the session's writer has completed so far.
+    pub fn fsync_count(&self) -> u64 {
+        self.fsyncs.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Send a prompt and drain events until the turn finishes.
@@ -1082,6 +1099,318 @@ mod tests {
             a, b,
             "normalized transcripts must be byte-identical across runs"
         );
+    }
+
+    // --- Task 9 (S2b pipelined commits) ------------------------------
+
+    fn cfg_with(mode: hotl_engine::AckMode) -> EngineConfig {
+        EngineConfig {
+            ack_mode: mode,
+            ..cfg()
+        }
+    }
+
+    /// A permission-free call that stays running long enough for a steer to
+    /// arrive mid-batch. Deliberately path-free and ask-free: the two ack
+    /// modes are compared on the *normalized transcript*, and a `bash` ask
+    /// would put a freshly-minted `pending_ask` id (and a tempdir path) into
+    /// it, which normalization does not erase and which differs per run
+    /// regardless of ack mode.
+    struct Dawdle;
+
+    impl hotl_tools::Tool for Dawdle {
+        fn name(&self) -> &'static str {
+            "dawdle"
+        }
+        fn description(&self) -> &str {
+            "waits, then answers"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn permission(&self, _: &serde_json::Value) -> hotl_tools::Permission {
+            hotl_tools::Permission::None
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        fn run<'a>(
+            &'a self,
+            _input: serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> futures_util::future::BoxFuture<'a, hotl_tools::ToolOutcome> {
+            Box::pin(async {
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                hotl_tools::ToolOutcome::ok("waited")
+            })
+        }
+    }
+
+    fn dawdle_registry() -> Registry {
+        let mut reg = Registry::builtin();
+        reg.register(Box::new(Dawdle));
+        reg
+    }
+
+    /// The steer-during-tools scenario, driven through both ack modes.
+    async fn steered_tool_turn(mode: hotl_engine::AckMode) -> Harness {
+        let mut h = Harness::with_registry(
+            vec![
+                ScriptedProvider::tool_call("t1", "dawdle", json!({})),
+                ScriptedProvider::text_reply("Done, and noted your steer."),
+            ],
+            cfg_with(mode),
+            dawdle_registry(),
+        );
+        h.steer_on_tool_start = Some("also check the README".into());
+        let outcome = h.prompt_and_wait("run the thing").await;
+        assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+        h
+    }
+
+    /// commit-protocol.md test matrix case 6: "Steer between pipelined
+    /// blocks → the steer is held per 72a6f1b, lands at the boundary after
+    /// the assistant blocks it did not see, and the normalized transcript
+    /// matches the same run in `Sync` mode."
+    #[tokio::test]
+    async fn a_steer_between_pipelined_commits_lands_after_the_drained_batch() {
+        let pipelined = steered_tool_turn(hotl_engine::AckMode::Pipelined).await;
+
+        let items = pipelined.items();
+        let results = items
+            .iter()
+            .position(|i| matches!(i, Item::ToolResults { .. }))
+            .expect("the batch committed");
+        let steer = items.iter().position(is_steer).expect("the steer landed");
+        assert!(
+            steer > results,
+            "a steer must never precede the results it did not see: {items:#?}"
+        );
+
+        // …and the pipeline changed nothing about what the log says.
+        let sync = steered_tool_turn(hotl_engine::AckMode::Sync).await;
+        assert_eq!(pipelined.kinds(), sync.kinds());
+        assert_eq!(
+            pipelined.transcript(),
+            sync.transcript(),
+            "pipelining must not reorder entries"
+        );
+    }
+
+    /// The revision's second counter assertion: "the same session driven
+    /// through `Sync` and `Pipelined` modes produces the same normalized
+    /// transcript". A mode switch can only move ids and timestamps, which
+    /// normalization already erases — anything else is a reordering.
+    #[tokio::test]
+    async fn both_ack_modes_produce_the_same_normalized_transcript() {
+        let run = |mode| async move {
+            let mut h = Harness::with_registry(
+                vec![
+                    ScriptedProvider::tool_call("t1", "dawdle", json!({})),
+                    ScriptedProvider::text_reply("waited, as asked"),
+                ],
+                cfg_with(mode),
+                dawdle_registry(),
+            );
+            h.prompt_and_wait("take your time").await;
+            h.transcript()
+        };
+        assert_eq!(
+            run(hotl_engine::AckMode::Pipelined).await,
+            run(hotl_engine::AckMode::Sync).await
+        );
+    }
+
+    /// A held steer is released the moment the projection stops awaiting
+    /// tool results — which, under pipelining, is the instant the FIRST
+    /// entry of a multi-entry proposal acks, with its siblings still in the
+    /// writer's queue. The actor's own inline appends therefore drain the
+    /// pipeline first: otherwise the steer would be *projected* between
+    /// entries it is *logged* after, and the next request would disagree
+    /// with the canon it was built from.
+    #[tokio::test]
+    async fn a_steer_released_mid_proposal_lands_after_the_whole_proposal() {
+        let mut h = Harness::new(vec![], cfg());
+        for sub in ["web", "api"] {
+            let dir = h.dir().join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("AGENTS.md"), format!("{sub} subproject rules")).unwrap();
+            std::fs::write(dir.join("page.txt"), "content").unwrap();
+        }
+        // One batch, two fresh subdirs: tool results + two subdir-instruction
+        // entries travel as ONE pipelined proposal.
+        h.provider.push_script(tool_batch(&[
+            (
+                "t1",
+                "read",
+                json!({"path": h.dir().join("web/page.txt").to_str().unwrap()}),
+            ),
+            (
+                "t2",
+                "read",
+                json!({"path": h.dir().join("api/page.txt").to_str().unwrap()}),
+            ),
+        ]));
+        h.provider
+            .push_script(ScriptedProvider::text_reply("read both"));
+        h.steer_on_tool_start = Some("also check the README".into());
+        let outcome = h.prompt_and_wait("read both pages").await;
+        assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+
+        // What the log says…
+        let logged = h.items();
+        let last_hint = logged
+            .iter()
+            .rposition(|i| {
+                matches!(
+                    i,
+                    Item::User {
+                        synthetic: Some(SyntheticReason::SubdirInstructions),
+                        ..
+                    }
+                )
+            })
+            .expect("both hints committed");
+        let steer = logged.iter().position(is_steer).expect("the steer landed");
+        assert!(
+            steer > last_hint,
+            "the steer is logged after the whole proposal: {logged:#?}"
+        );
+
+        // …and what the next sample was built from must agree with it, item
+        // for item. A projection that ran ahead of the log would order these
+        // differently even though both contain the same items.
+        let requests = h.provider.requests();
+        let sampled = &requests[1].items;
+        assert_eq!(
+            sampled.as_slice(),
+            &logged[..sampled.len()],
+            "the projection must be the log, in the log's order"
+        );
+    }
+
+    /// The revision's first counter assertion, at the engine level: a
+    /// proposal carrying several entries rides ONE `sync_data`, so a session
+    /// spends fewer syncs than it writes entries. (The group-commit property
+    /// itself is pinned deterministically in hotl-store's
+    /// `a_queued_batch_syncs_once_and_acks_every_entry_with_its_own_offset`;
+    /// this is the end-to-end half.)
+    #[tokio::test]
+    async fn a_multi_entry_pipelined_proposal_spends_fewer_syncs_than_entries() {
+        let mut h = Harness::new(vec![], cfg());
+        for sub in ["web", "api"] {
+            let dir = h.dir().join(sub);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("AGENTS.md"), format!("{sub} rules")).unwrap();
+            std::fs::write(dir.join("page.txt"), "content").unwrap();
+        }
+        // One batch, two fresh subdirs: the tool-results entry plus two
+        // subdir-instruction entries travel as one pipelined proposal.
+        h.provider.push_script(tool_batch(&[
+            ("t1", "read", json!({"path": h.dir().join("web/page.txt")})),
+            ("t2", "read", json!({"path": h.dir().join("api/page.txt")})),
+        ]));
+        h.provider
+            .push_script(ScriptedProvider::text_reply("read both"));
+        let outcome = h.prompt_and_wait("read both pages").await;
+        assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+
+        let entries = h.entries().len() as u64;
+        assert!(
+            h.fsync_count() < entries,
+            "group commit must spend fewer syncs than entries: {} syncs, {entries} entries",
+            h.fsync_count()
+        );
+    }
+
+    /// A tool that reports how much of the session log was on disk at the
+    /// moment it ran — barrier (a)'s only observable: "no external side
+    /// effect until the `tool_use` blocks that caused it are durable".
+    struct LogWatcher(Arc<std::sync::Mutex<Option<std::path::PathBuf>>>);
+
+    impl hotl_tools::Tool for LogWatcher {
+        fn name(&self) -> &'static str {
+            "watch_log"
+        }
+        fn description(&self) -> &str {
+            "counts durable log lines"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn permission(&self, _: &serde_json::Value) -> hotl_tools::Permission {
+            hotl_tools::Permission::None
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        fn parallel_safe(&self) -> bool {
+            true
+        }
+        fn run<'a>(
+            &'a self,
+            _input: serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> futures_util::future::BoxFuture<'a, hotl_tools::ToolOutcome> {
+            let path = self.0.lock().expect("log path").clone();
+            Box::pin(async move {
+                match path.and_then(|p| std::fs::read_to_string(p).ok()) {
+                    Some(text) => hotl_tools::ToolOutcome::ok(text.lines().count().to_string()),
+                    None => hotl_tools::ToolOutcome::err("no log"),
+                }
+            })
+        }
+    }
+
+    async fn watched_batch(calls: &[(&str, &str, serde_json::Value)]) -> Vec<String> {
+        // The registry has to exist before the session log does, so the tool
+        // is handed a cell the harness fills in once the log is created.
+        let cell = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = Registry::builtin();
+        registry.register(Box::new(LogWatcher(cell.clone())));
+        let mut h = Harness::with_registry(
+            vec![tool_batch(calls), ScriptedProvider::text_reply("done")],
+            cfg(),
+            registry,
+        );
+        *cell.lock().unwrap() = Some(h.log_path().to_path_buf());
+        let outcome = h.prompt_and_wait("watch the log").await;
+        assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+        let items = h.items();
+        let Item::ToolResults { results } = items
+            .iter()
+            .find(|i| matches!(i, Item::ToolResults { .. }))
+            .expect("results")
+        else {
+            unreachable!()
+        };
+        results.iter().map(|r| r.content.clone()).collect()
+    }
+
+    /// commit-protocol.md §Pipelined commits barrier (a): "no external side
+    /// effect until the `tool_use` blocks that caused it are durable … and it
+    /// holds on the inline single-tool execution path exactly as it does on
+    /// the spawned batch path". By the time a call runs, every entry this
+    /// turn committed — header, prompt, assistant blocks, usage — is on
+    /// disk, and the turn holds no unresolved ticket.
+    #[tokio::test]
+    async fn the_inline_tool_path_dispatches_only_behind_the_durability_barrier() {
+        let seen = watched_batch(&[("t1", "watch_log", json!({}))]).await;
+        assert_eq!(
+            seen,
+            vec!["4".to_string()],
+            "header + prompt + assistant + usage must all be durable before the call runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_tool_path_dispatches_only_behind_the_durability_barrier() {
+        let seen = watched_batch(&[
+            ("t1", "watch_log", json!({})),
+            ("t2", "watch_log", json!({})),
+        ])
+        .await;
+        assert_eq!(seen, vec!["4".to_string(), "4".to_string()]);
     }
 
     /// A tool-call sample whose Completed reports a chosen input_tokens —

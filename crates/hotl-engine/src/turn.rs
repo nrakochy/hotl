@@ -71,7 +71,19 @@ pub(crate) async fn run(
     cont: crate::TurnContinuation,
 ) {
     let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel, cont);
-    let end = turn.drive().await;
+    let mut end = turn.drive().await;
+    // Barrier (c) (commit-protocol.md §Pipelined commits): "a turn does not
+    // finish while it still holds an unresolved claim on the log." Every exit
+    // path from `drive` passes through here, cancellation and panic-free
+    // errors included. A commit that failed after the turn thought it was
+    // done overrides only a `Done` — every other end is already terminal, and
+    // overriding `Cancelled` would break Cancelled ≠ Failed.
+    let commit = turn.pipeline.drain().await;
+    if !commit.ok() {
+        if let TurnEnd::Outcome(Outcome::Done { .. }) = end {
+            end = TurnEnd::Outcome(commit.outcome());
+        }
+    }
     let usage = turn.usage;
     // Flush the ledger (§S1) on the existing event channel — never the
     // canon log — before telling the actor the turn is over.
@@ -104,6 +116,17 @@ struct Executed {
     chargeable: bool,
 }
 
+/// Unresolved commit tickets a turn may hold before it must wait on the
+/// oldest (commit-protocol.md §Pipelined commits). Counted in **tickets**,
+/// not entries: a proposal yields exactly one ticket today, and a `Group`
+/// will yield one for several entries (S2c) without changing this number.
+///
+/// The bound does two jobs — backpressure, and capping how wrong a turn can
+/// be about durability: a sealed log is detected within at most this many
+/// commits, not at turn end. That is why it is small and fixed rather than
+/// tuned.
+const ACK_WINDOW: usize = 16;
+
 /// Why a proposal did or didn't land. `propose` returned a bare `bool`, and both
 /// failure modes rendered as "session log is sealed" — so an ordinary shutdown
 /// was reported to the user as log corruption (T3-5).
@@ -112,6 +135,10 @@ enum Commit {
     Committed,
     /// The actor refused the append: the log is sealed.
     Sealed,
+    /// A compaction or branch move superseded this turn while its commits
+    /// were in flight (commit-protocol.md §conflict table, Abort). The bytes
+    /// already forwarded are canon; the turn's claim on them is not.
+    Aborted,
     /// `PreparedPayload::rules_epoch` predated the actor's current rules
     /// (commit-protocol.md §Proposal payloads' guard) and the one retry in
     /// `Turn::propose` also came back stale — vanishingly unlikely (the
@@ -123,12 +150,15 @@ enum Commit {
 }
 
 impl Commit {
-    /// The actor's reply, `None` if it never answered.
+    /// The actor's reply, `None` if it never answered. A `Ticket` is not a
+    /// commit yet — it is settled at a barrier, by
+    /// [`TicketPipeline::resolve_oldest`] — so it never reaches here.
     fn from_reply(reply: Option<crate::ProposeReply>) -> Self {
         match reply {
             Some(crate::ProposeReply::Committed) => Commit::Committed,
             Some(crate::ProposeReply::Sealed) => Commit::Sealed,
             Some(crate::ProposeReply::StaleEpoch) => Commit::StaleEpoch,
+            Some(crate::ProposeReply::Ticket(_)) => Commit::Committed,
             None => Commit::Gone,
         }
     }
@@ -137,10 +167,33 @@ impl Commit {
         matches!(self, Commit::Committed)
     }
 
+    /// Keep the first failure: a barrier reports why the *oldest* thing that
+    /// went wrong went wrong, not the last.
+    fn and(self, next: Commit) -> Commit {
+        if self.ok() {
+            next
+        } else {
+            self
+        }
+    }
+
+    /// How a turn ends when a barrier reports this. **Cancelled ≠ Failed**:
+    /// an abort is a clean supersession by a compaction or branch move, and
+    /// nothing in the UI may report it as a failure.
+    fn outcome(self) -> Outcome {
+        match self {
+            Commit::Aborted => Outcome::Cancelled,
+            other => Outcome::Error {
+                message: other.message().into(),
+            },
+        }
+    }
+
     /// Every failure string is a prompt: it tells the reader what to do next.
     fn message(self) -> &'static str {
         match self {
             Commit::Committed => "committed",
+            Commit::Aborted => "the turn was superseded and will be restarted",
             Commit::Sealed => {
                 "the session log is sealed — nothing further can be recorded; \
                  start a new session to keep working"
@@ -353,6 +406,65 @@ async fn await_speculation(
     }
 }
 
+/// The turn's bounded window of unresolved commit tickets
+/// (commit-protocol.md §Pipelined commits). A turn pushes a ticket and goes
+/// back to work; the three hard barriers — before a tool batch, before the
+/// sample-boundary snapshot refresh, and at turn end — drain it whole.
+///
+/// INVARIANT: the window never exceeds [`ACK_WINDOW`] tickets, and a turn
+/// never finishes holding one. Enforced by
+/// `the_ticket_window_waits_on_the_oldest_before_it_overflows` and barrier
+/// (c) in [`run`].
+#[derive(Default)]
+struct TicketPipeline {
+    tickets: VecDeque<crate::CommitTicket>,
+}
+
+impl TicketPipeline {
+    fn is_empty(&self) -> bool {
+        self.tickets.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.tickets.len()
+    }
+
+    /// Push a ticket, waiting on the oldest first once the window is full —
+    /// the backpressure half of the bound.
+    async fn submit(&mut self, ticket: crate::CommitTicket) -> Commit {
+        let mut commit = Commit::Committed;
+        while self.len() >= ACK_WINDOW {
+            commit = commit.and(self.resolve_oldest().await);
+        }
+        self.tickets.push_back(ticket);
+        commit
+    }
+
+    /// A barrier: resolve every outstanding ticket, oldest first, and report
+    /// the first failure.
+    async fn drain(&mut self) -> Commit {
+        let mut commit = Commit::Committed;
+        while !self.tickets.is_empty() {
+            commit = commit.and(self.resolve_oldest().await);
+        }
+        commit
+    }
+
+    async fn resolve_oldest(&mut self) -> Commit {
+        let Some(ticket) = self.tickets.pop_front() else {
+            return Commit::Committed;
+        };
+        match ticket.ack.await {
+            Ok(Ok(_)) => Commit::Committed,
+            Ok(Err(crate::CommitFailed::LogSealed)) => Commit::Sealed,
+            Ok(Err(crate::CommitFailed::Aborted)) => Commit::Aborted,
+            // The actor dropped the ticket: an ordinary shutdown, never log
+            // corruption (T3-5).
+            Err(_) => Commit::Gone,
+        }
+    }
+}
+
 /// A sample's terminal result, or why it couldn't produce one.
 enum SampleEnd {
     Completed {
@@ -407,6 +519,10 @@ struct Turn {
     /// Loop-overhead instrument (§S1) — one per `Turn`, flushed once as an
     /// `EngineEvent::LedgerReport` when [`run`] returns.
     ledger: crate::ledger::LoopLedger,
+    /// Commit tickets this turn is still carrying (§Pipelined commits).
+    /// Deliberately NOT carried across a compaction respawn: barrier (c)
+    /// empties it before the turn reports, so a continuation starts clean.
+    pipeline: TicketPipeline,
 }
 
 impl Drop for Turn {
@@ -464,6 +580,7 @@ impl Turn {
             // Deliberately NOT carried across a compaction respawn: each
             // `Turn` task flushes its own report when it ends (see `run`).
             ledger: crate::ledger::LoopLedger::new(),
+            pipeline: TicketPipeline::default(),
         }
     }
 
@@ -549,9 +666,7 @@ impl Turn {
                             // The reminder never landed: looping would burn a
                             // sample on a nudge the model will never see (T3-6).
                             self.ledger.stamp(Phase::BoundaryEnd);
-                            return TurnEnd::Outcome(Outcome::Error {
-                                message: commit.message().into(),
-                            });
+                            return TurnEnd::Outcome(commit.outcome());
                         }
                         self.ledger.stamp(Phase::BoundaryEnd);
                         continue;
@@ -628,7 +743,7 @@ impl Turn {
             }
             body.push_str(&reason);
         }
-        self.propose(vec![EntryPayload::Item {
+        self.propose_pipelined(vec![EntryPayload::Item {
             item: Item::User {
                 text: format!("<system-reminder>{body}</system-reminder>"),
                 synthetic: Some(SyntheticReason::SystemReminder),
@@ -642,6 +757,18 @@ impl Turn {
     async fn sample(&mut self) -> SampleEnd {
         self.ledger.start_sample();
         self.ledger.stamp(Phase::BoundaryStart);
+        // Barrier (b) (commit-protocol.md §Pipelined commits): the turn-read
+        // invariant — what the next sample is built from must be a projection
+        // that already contains everything this turn committed. The drain IS
+        // the barrier: a ticket is the only place a sealed log is reported,
+        // so waiting on the projection alone would wait forever on one.
+        let commit = self.pipeline.drain().await;
+        if !commit.ok() {
+            return match commit {
+                Commit::Aborted => SampleEnd::Cancelled,
+                other => SampleEnd::Fatal(other.message().into()),
+            };
+        }
         let Some(snapshot) = self.snapshot().await else {
             return SampleEnd::Fatal("session closed".into());
         };
@@ -741,9 +868,7 @@ impl Turn {
             if !commit.ok() {
                 // A `DoomLoop` outcome would name a batch the log will
                 // never carry; report why the record failed instead (T3-6).
-                return Some(Outcome::Error {
-                    message: commit.message().into(),
-                });
+                return Some(commit.outcome());
             }
             return Some(Outcome::DoomLoop { pattern });
         }
@@ -764,6 +889,16 @@ impl Turn {
     /// Mutating batches (anything beyond `read`) are bracketed by shadow
     /// snapshots so `hotl undo` can restore the pre-batch tree (M3b).
     async fn run_tool_batch(&mut self, uses: &[ToolUse]) -> Option<Outcome> {
+        // Barrier (a) (commit-protocol.md §Pipelined commits): write-ahead
+        // semantics — no external side effect until the `tool_use` blocks
+        // that caused it are durable. It is absolute for anything this
+        // process cannot take back (§The side-effect ruling), and it covers
+        // BOTH dispatch paths below plus the shadow snapshots that bracket a
+        // mutating batch, because it sits ahead of all of them.
+        let commit = self.pipeline.drain().await;
+        if !commit.ok() {
+            return Some(commit.outcome());
+        }
         if let Some(pattern) = self.fold_doom_window(uses) {
             if let Some(outcome) = self.handle_doom_loop(uses, pattern).await {
                 return Some(outcome);
@@ -789,6 +924,13 @@ impl Turn {
         let mut results = Vec::with_capacity(uses.len());
         let mut budget_blown: Option<String> = None;
         self.ledger.stamp(Phase::ToolsSpawned);
+        // Barrier (a) again, as an assertion rather than a wait: the inline
+        // path is the one the spec names explicitly, and this is what makes a
+        // future proposal site between the barrier and dispatch fail loudly.
+        debug_assert!(
+            self.pipeline.is_empty(),
+            "barrier (a): no tool may run while a commit is unresolved"
+        );
         if let [only] = uses {
             // §S1 diet (1): a single-tool batch is the majority case — skip
             // `parallel_chunks` and `join_all` entirely and run the one call
@@ -849,12 +991,10 @@ impl Turn {
         // earlier stamp rather than lose to first-stamp-wins (§S1 fix — see
         // `batch_proposed_and_watermark_durable_track_each_samples_own_final_commit`).
         self.ledger.restamp(Phase::BatchProposed);
-        let commit = self.propose(entries).await;
+        let commit = self.propose_pipelined(entries).await;
         self.ledger.restamp(Phase::WatermarkDurable);
         if !commit.ok() {
-            return Some(Outcome::Error {
-                message: commit.message().into(),
-            });
+            return Some(commit.outcome());
         }
         if cancelled {
             return Some(Outcome::Cancelled);
@@ -1137,7 +1277,7 @@ impl Turn {
         // overwrite `sample()`'s earlier stamp via `restamp`.
         self.ledger.restamp(Phase::BatchProposed);
         let commit = self
-            .propose(vec![EntryPayload::Item {
+            .propose_pipelined(vec![EntryPayload::Item {
                 item: Item::ToolResults { results },
             }])
             .await;
@@ -1343,6 +1483,54 @@ impl Turn {
     }
 
     async fn propose_at_epoch(&self, entries: &[EntryPayload], epoch: u32) -> Commit {
+        match self.send(entries, epoch, crate::AckMode::Sync).await {
+            Ok(reply) => Commit::from_reply(Some(reply)),
+            Err(commit) => commit,
+        }
+    }
+
+    /// [`Turn::propose`]'s pipelined twin (commit-protocol.md §Pipelined
+    /// commits): the actor answers with a ticket the moment it forwards, and
+    /// the turn goes back to work. Durability is settled at the next barrier
+    /// — which is where a sealed log is reported, at most [`ACK_WINDOW`]
+    /// commits later.
+    ///
+    /// Only proposals the protocol lets run ahead reach here: the
+    /// tool-results batch entry (plus any subdir-instruction entries riding
+    /// with it) and the Done-branch gate nudge. The `Completed`-boundary
+    /// assistant+usage pair and the ask journal stay `Sync` — the first
+    /// because `sampling` may only drop once the item is really projected,
+    /// the second because §2b requires the ask to be durable *before* it
+    /// surfaces.
+    async fn propose_pipelined(&mut self, entries: Vec<EntryPayload>) -> Commit {
+        if self.shared.config.ack_mode == crate::AckMode::Sync {
+            return self.propose(entries).await;
+        }
+        let epoch = self.shared.rules_epoch();
+        let commit = self.submit_pipelined(&entries, epoch).await;
+        if commit != Commit::StaleEpoch {
+            return commit;
+        }
+        let epoch = self.shared.rules_epoch();
+        self.submit_pipelined(&entries, epoch).await
+    }
+
+    async fn submit_pipelined(&mut self, entries: &[EntryPayload], epoch: u32) -> Commit {
+        match self.send(entries, epoch, crate::AckMode::Pipelined).await {
+            Ok(crate::ProposeReply::Ticket(ticket)) => self.pipeline.submit(ticket).await,
+            Ok(other) => Commit::from_reply(Some(other)),
+            Err(commit) => commit,
+        }
+    }
+
+    /// Prepare every entry and hand the proposal to the actor. `Err` is a
+    /// build or send failure, never the actor's own answer.
+    async fn send(
+        &self,
+        entries: &[EntryPayload],
+        epoch: u32,
+        mode: crate::AckMode,
+    ) -> Result<crate::ProposeReply, Commit> {
         let masker = self.shared.masker();
         let mut prepared = Vec::with_capacity(entries.len());
         for payload in entries {
@@ -1357,11 +1545,11 @@ impl Turn {
                         false,
                         "EntryPayload serialization must not fail for hotl's own payload shapes"
                     );
-                    return Commit::Gone;
+                    return Err(Commit::Gone);
                 }
                 // `Offload` CAN legitimately happen on a real shutdown race
                 // (the spawn_blocking task got aborted) — not asserted.
-                Err(PrepareError::Offload) => return Commit::Gone,
+                Err(PrepareError::Offload) => return Err(Commit::Gone),
             }
         }
         let (tx, rx) = oneshot::channel();
@@ -1369,14 +1557,15 @@ impl Turn {
             .cmd_tx
             .send(SessionCmd::ProposePrepared {
                 entries: prepared,
+                mode,
                 reply: tx,
             })
             .await
             .is_err()
         {
-            return Commit::Gone;
+            return Err(Commit::Gone);
         }
-        Commit::from_reply(rx.await.ok())
+        rx.await.map_err(|_| Commit::Gone)
     }
 
     /// Ask the human via the event channel; a dropped reply means deny.
@@ -2027,5 +2216,108 @@ mod tests {
             Commit::Committed
         );
         assert_eq!(Commit::from_reply(None), Commit::Gone);
+    }
+
+    // --- Task 9 (S2b pipelined commits) ------------------------------
+
+    /// A ticket plus the handle that decides its fate, so the window's
+    /// behaviour can be driven without an actor behind it.
+    fn ticket(
+        seq: u64,
+    ) -> (
+        crate::CommitTicket,
+        oneshot::Sender<Result<crate::CommitAck, crate::CommitFailed>>,
+    ) {
+        let (tx, rx) = oneshot::channel();
+        (
+            crate::CommitTicket {
+                id: format!("id-{seq}"),
+                seq,
+                ack: rx,
+            },
+            tx,
+        )
+    }
+
+    fn resolved(
+        seq: u64,
+        result: Result<crate::CommitAck, crate::CommitFailed>,
+    ) -> crate::CommitTicket {
+        let (ticket, tx) = ticket(seq);
+        let _ = tx.send(result);
+        ticket
+    }
+
+    /// commit-protocol.md §Pipelined commits: "a turn holding 16 unresolved
+    /// tickets waits on the oldest before it may propose again". The window
+    /// is the backpressure, so it can never grow past [`ACK_WINDOW`].
+    #[tokio::test]
+    async fn the_ticket_window_waits_on_the_oldest_before_it_overflows() {
+        let mut pipeline = TicketPipeline::default();
+        for seq in 0..ACK_WINDOW as u64 {
+            let commit = pipeline
+                .submit(resolved(seq, Ok(crate::CommitAck { offset: seq })))
+                .await;
+            assert_eq!(commit, Commit::Committed);
+        }
+        assert_eq!(pipeline.len(), ACK_WINDOW);
+
+        let commit = pipeline
+            .submit(resolved(99, Ok(crate::CommitAck { offset: 99 })))
+            .await;
+        assert_eq!(commit, Commit::Committed);
+        assert_eq!(
+            pipeline.len(),
+            ACK_WINDOW,
+            "the window is the bound, not a suggestion"
+        );
+    }
+
+    /// The bound's second job: "it caps how wrong a turn can be about
+    /// durability" — a sealed log is reported through the ticket, at the
+    /// barrier that resolves it.
+    #[tokio::test]
+    async fn a_barrier_reports_the_first_failing_ticket_and_empties_the_window() {
+        let mut pipeline = TicketPipeline::default();
+        pipeline
+            .submit(resolved(1, Ok(crate::CommitAck { offset: 1 })))
+            .await;
+        pipeline
+            .submit(resolved(2, Err(crate::CommitFailed::LogSealed)))
+            .await;
+        pipeline
+            .submit(resolved(3, Ok(crate::CommitAck { offset: 3 })))
+            .await;
+
+        assert_eq!(pipeline.drain().await, Commit::Sealed);
+        assert!(
+            pipeline.is_empty(),
+            "a barrier resolves every ticket, failure included"
+        );
+    }
+
+    /// Cancelled ≠ Failed: an `Aborted` ticket means a compaction or branch
+    /// move superseded the turn, which is a clean termination, never an
+    /// error outcome.
+    #[tokio::test]
+    async fn an_aborted_ticket_ends_the_turn_cancelled_not_failed() {
+        let mut pipeline = TicketPipeline::default();
+        pipeline
+            .submit(resolved(1, Err(crate::CommitFailed::Aborted)))
+            .await;
+        let commit = pipeline.drain().await;
+        assert_eq!(commit, Commit::Aborted);
+        assert_eq!(commit.outcome(), Outcome::Cancelled);
+    }
+
+    /// A dropped actor is a shutdown, not log corruption (T3-5) — the same
+    /// distinction `Commit::Gone` already draws for the `Sync` path.
+    #[tokio::test]
+    async fn a_dropped_ticket_channel_is_a_shutdown_not_a_seal() {
+        let mut pipeline = TicketPipeline::default();
+        let (ticket, tx) = ticket(1);
+        drop(tx);
+        pipeline.submit(ticket).await;
+        assert_eq!(pipeline.drain().await, Commit::Gone);
     }
 }

@@ -79,6 +79,15 @@ pub struct EngineConfig {
     /// Evict a successful tool result larger than this (estimated tokens) to a
     /// masked blob, leaving a head preview + read pointer (T4). `0` disables.
     pub evict_threshold_tokens: u64,
+    /// Which [`AckMode`] turn-originated proposals use where the protocol
+    /// allows pipelining (commit-protocol.md §Pipelined commits). Production
+    /// is `Pipelined`; `Sync` exists so a golden scenario can drive the same
+    /// session both ways and compare normalized transcripts — the revision's
+    /// own counter assertion. Same discipline as
+    /// `hotl_store::SessionLog::set_sync_noop`: a runtime seam, hidden from
+    /// the public API, never a cargo feature.
+    #[doc(hidden)]
+    pub ack_mode: AckMode,
 }
 
 impl Default for EngineConfig {
@@ -99,6 +108,7 @@ impl Default for EngineConfig {
             compaction_reset: false,
             show_context_pct: true,
             evict_threshold_tokens: 20_000,
+            ack_mode: AckMode::Pipelined,
         }
     }
 }
@@ -324,12 +334,60 @@ impl PreparedEntry {
     }
 }
 
+/// Whether the *proposer* waits for durability (commit-protocol.md
+/// §Vocabulary). Orthogonal to [`hotl_store::AckTier`], which is how durable
+/// the write must be before the writer acks: canon is `Durable` in both
+/// modes, and only who waits changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AckMode {
+    /// The proposer awaits the durable ack inline.
+    Sync,
+    /// The actor validates, mints, assigns `seq`, forwards to the writer and
+    /// answers immediately with a [`CommitTicket`]; durability is settled at
+    /// the turn's next barrier (§Pipelined commits).
+    #[default]
+    Pipelined,
+}
+
+/// What the writer acked with, as a proposer sees it — the shipped
+/// `hotl_store::Ack`, renamed at this boundary to match commit-protocol.md
+/// §Vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommitAck {
+    pub offset: u64,
+}
+
+/// Why a pipelined commit will never be durable. Exactly two variants
+/// (commit-protocol.md §Vocabulary).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitFailed {
+    /// The log is read-only for good; nothing further can be recorded.
+    LogSealed,
+    /// A compaction or branch move superseded the turn. The bytes already
+    /// forwarded are canon and will land — what is discarded is the turn's
+    /// claim on them, never the log (§conflict table, Abort).
+    Aborted,
+}
+
+/// Handed back the moment the actor forwards a proposal to the writer in
+/// [`AckMode::Pipelined`] (commit-protocol.md §Vocabulary). `id` and `seq`
+/// are carried **eagerly** — the actor mints the ulid and assigns `seq` at
+/// validation, before the write — so a proposer knows its own identity and
+/// its own commit order without waiting for durability. Only durability
+/// waits, and `ack` is the one place a commit failure is ever reported.
+#[derive(Debug)]
+pub struct CommitTicket {
+    pub id: String,
+    pub seq: u64,
+    pub ack: oneshot::Receiver<Result<CommitAck, CommitFailed>>,
+}
+
 /// What [`SessionCmd::ProposePrepared`] answers with — plain `bool` has no
 /// room for the rules-epoch guard's distinction (commit-protocol.md
 /// §Proposal payloads): a stale epoch means "rebuild under the current
 /// rules and resend", a genuinely different repair than "the log is sealed,
 /// stop trying".
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum ProposeReply {
     Committed,
     /// The actor refused the append: the log is sealed.
@@ -337,6 +395,10 @@ pub enum ProposeReply {
     /// `PreparedPayload::rules_epoch` predates the actor's current masking
     /// rules epoch. Nothing in this proposal was committed.
     StaleEpoch,
+    /// [`AckMode::Pipelined`] only: forwarded to the writer, durability
+    /// outstanding. One ticket per proposal, bearing the proposal's last
+    /// entry's id and seq — the shape a `Group` will keep unchanged (S2c).
+    Ticket(CommitTicket),
 }
 
 // `BumpRulesEpoch` (below) is a real, data-free variant a test sends over
@@ -395,6 +457,10 @@ pub enum SessionCmd {
     /// bytes, never a raw `EntryPayload`.
     ProposePrepared {
         entries: Vec<PreparedEntry>,
+        /// Whether the proposer waits for durability (commit-protocol.md
+        /// §Pipelined commits). `Pipelined` answers with a
+        /// [`ProposeReply::Ticket`] the moment the entries are forwarded.
+        mode: AckMode,
         reply: oneshot::Sender<ProposeReply>,
     },
     /// Turn task → actor: write an oversized tool result to a masked blob
