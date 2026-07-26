@@ -438,6 +438,44 @@ mod tests {
         assert_eq!(usage.cache_creation_1h_input_tokens, 300);
     }
 
+    /// The same breakdown, arriving on `message_delta` instead. Both events
+    /// carry `usage` and both fold through `merge_usage`, but only
+    /// `message_start` was ever covered — and `message_delta` is where the
+    /// *final* usage lands, so a breakdown that only arrived there would have
+    /// been silently dropped from the per-TTL cost split.
+    #[test]
+    fn message_delta_usage_carries_the_per_ttl_cache_creation_breakdown() {
+        let mut a = Assembler::default();
+        // message_start reports the flat total only — no breakdown yet.
+        a.handle(
+            r#"{"type":"message_start","message":{"usage":{
+                "input_tokens":20,"cache_creation_input_tokens":450
+            }}}"#,
+        )
+        .unwrap();
+        a.handle(
+            r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{
+                "output_tokens":9,
+                "cache_creation":{
+                    "ephemeral_5m_input_tokens":150,
+                    "ephemeral_1h_input_tokens":300
+                }
+            }}"#,
+        )
+        .unwrap();
+        a.handle(r#"{"type":"message_stop"}"#).unwrap();
+        let StreamEvent::Completed { usage, .. } = a.finish().expect("completed") else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(
+            usage.cache_creation_input_tokens, 450,
+            "the flat total holds"
+        );
+        assert_eq!(usage.cache_creation_5m_input_tokens, 150);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 300);
+        assert_eq!(usage.output_tokens, 9);
+    }
+
     /// The common case today: no `cache_creation` object at all. The buckets
     /// must stay zero (never guessed) while the flat total is unaffected —
     /// `catalog::cost_usd`'s fallback path depends on exactly this shape.

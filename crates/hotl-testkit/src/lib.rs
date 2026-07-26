@@ -152,6 +152,19 @@ impl Harness {
         Self::build_with(scripts, config, Vec::new(), None, registry)
     }
 
+    /// Construct a harness with a pre-seeded projection *and* a custom
+    /// registry. The cache-prefix scenarios need both at once: a history long
+    /// enough that the breakpoint planner has already placed a rolling anchor,
+    /// and the scripted tools whose batches grow it.
+    pub fn with_items_and_registry(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+        registry: Registry,
+    ) -> Self {
+        Self::build_with(scripts, config, initial_items, None, registry)
+    }
+
     /// Construct a harness with a custom tool registry and the writer's
     /// `sync_data()` no-op'd (`hotl_store::SessionLog::set_sync_noop`) — the
     /// §S1 loop-overhead CI gate's scenario, isolating measured overhead
@@ -1262,13 +1275,20 @@ mod tests {
     }
 
     /// The steer-during-tools scenario, driven through both ack modes.
+    ///
+    /// Seeded with [`anchored_history`] so the mispredict path is exercised
+    /// *with rolling anchors present* — the cancelled speculation and the
+    /// sequential rebuild both plan over a history that has already crossed a
+    /// stride boundary. The seed is a projection seed only, so the normalized
+    /// transcripts these callers compare are unaffected.
     async fn steered_tool_turn(mode: hotl_engine::AckMode) -> Harness {
-        let mut h = Harness::with_registry(
+        let mut h = Harness::with_items_and_registry(
             vec![
                 ScriptedProvider::tool_call("t1", "dawdle", json!({})),
                 ScriptedProvider::text_reply("Done, and noted your steer."),
             ],
             cfg_with(mode),
+            anchored_history(),
             dawdle_registry(),
         );
         h.steer_on_tool_start = Some("also check the README".into());
@@ -1554,16 +1574,634 @@ mod tests {
         }
     }
 
+    // --- Task 6 (Phase 5): cross-request cache-prefix stability -------
+    //
+    // Byte-identity between two builds of the *same* request is not enough:
+    // the todo-marker bug this effort exists to close passed every such test,
+    // because both build paths marked the same wrong block. The claims below
+    // are about CONSECUTIVE requests — where markers land, and whether the
+    // next request can still see the entry the last one wrote.
+
+    /// The API's cache lookback, in wire content blocks. A marker further than
+    /// this past the nearest entry the previous request wrote cannot see it,
+    /// and the segment before it re-bills at write price.
+    const CACHE_LOOKBACK: usize = 20;
+
+    /// The API's per-request `cache_control` budget (a fifth is a 400).
+    const MARKER_BUDGET: usize = 4;
+
+    /// The request as the wire would carry it with **only its durable half**:
+    /// ephemeral tail emptied, MOIM dropped. Built by re-serializing the
+    /// `SamplingRequest` (the `without_moim` pattern), never by fishing
+    /// messages back out of a built body — a tail user message is
+    /// byte-indistinguishable from a durable one once it is JSON, which is
+    /// precisely why the split had to happen upstream of the serializer.
+    fn durable_wire_body(req: &SamplingRequest) -> serde_json::Value {
+        hotl_provider_anthropic::wire_body(&SamplingRequest {
+            ephemeral_tail: Arc::new(Vec::new()),
+            turn_context: None,
+            ..req.clone()
+        })
+    }
+
+    /// Every `cache_control` key removed, recursively.
+    ///
+    /// Markers are *metadata*: they are not part of the prefix the API hashes,
+    /// so moving one between requests does not invalidate an entry. "The same
+    /// conversation, grown" therefore has to compare equal whether or not an
+    /// anchor rolled — which is exactly what makes anchor-rolling safe.
+    fn without_markers(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .filter(|(k, _)| k.as_str() != "cache_control")
+                    .map(|(k, val)| (k.clone(), without_markers(val)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(without_markers).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Every `cache_control` in a built body, counted structurally.
+    fn count_markers(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(map) => {
+                usize::from(map.contains_key("cache_control"))
+                    + map.values().map(count_markers).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count_markers).sum(),
+            _ => 0,
+        }
+    }
+
+    /// 1-based wire content-block index of every marker in `messages` — the
+    /// coordinate space the lookback counts in. The prefix marker (system, or
+    /// the last tool def) sits *before* block 1 and is represented by the
+    /// implicit start position 0.
+    fn marker_positions(body: &serde_json::Value) -> Vec<usize> {
+        let mut idx = 0usize;
+        let mut out = Vec::new();
+        for msg in body["messages"].as_array().expect("messages") {
+            for block in msg["content"].as_array().expect("content") {
+                idx += 1;
+                if block.get("cache_control").is_some() {
+                    out.push(idx);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every marker's `ttl` (`None` = plain, i.e. the API's default 5m), in
+    /// the order the API parses the prompt: tools, then system, then messages
+    /// in wire order. That order is what "longer TTL before shorter" is a
+    /// claim about.
+    fn marker_ttls_in_prompt_order(body: &serde_json::Value) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        let mut take = |v: &serde_json::Value| {
+            if let Some(cc) = v.get("cache_control") {
+                out.push(cc.get("ttl").and_then(|t| t.as_str()).map(String::from));
+            }
+        };
+        for section in ["tools", "system"] {
+            for entry in body[section].as_array().into_iter().flatten() {
+                take(entry);
+            }
+        }
+        for msg in body["messages"].as_array().expect("messages") {
+            for block in msg["content"].as_array().expect("content") {
+                take(block);
+            }
+        }
+        out
+    }
+
+    /// Claims 2 and 3, held over one request: the marker budget, and TTL
+    /// ordering (the API requires longer-lived breakpoints to precede
+    /// shorter-lived ones).
+    fn assert_marker_budget_and_ttl_order(req: &SamplingRequest, label: &str) {
+        let body = hotl_provider_anthropic::wire_body(req);
+        let markers = count_markers(&body);
+        assert!(
+            markers <= MARKER_BUDGET,
+            "{label}: {markers} cache_control markers exceeds the API budget of \
+             {MARKER_BUDGET}:\n{body:#}"
+        );
+        let ttls = marker_ttls_in_prompt_order(&body);
+        if let Some(plain) = ttls.iter().position(Option::is_none) {
+            assert!(
+                ttls[plain..].iter().all(|t| t.as_deref() != Some("1h")),
+                "{label}: a 1h marker follows a plain (5m) one — longer TTLs must \
+                 come first: {ttls:?}"
+            );
+        }
+    }
+
+    /// Is `earlier`'s durable body a **structural prefix** of `later`'s: the
+    /// same system, the same tools, and every message `earlier` carried still
+    /// present, unchanged, at the same index? Markers are ignored (see
+    /// [`without_markers`]) — a rolled anchor is growth, not a rewrite.
+    fn is_structural_prefix(earlier: &serde_json::Value, later: &serde_json::Value) -> bool {
+        if without_markers(&earlier["system"]) != without_markers(&later["system"])
+            || without_markers(&earlier["tools"]) != without_markers(&later["tools"])
+        {
+            return false;
+        }
+        let a = earlier["messages"].as_array().expect("messages");
+        let b = later["messages"].as_array().expect("messages");
+        a.len() <= b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| without_markers(x) == without_markers(y))
+    }
+
+    /// Indices `i` where request `i + 1` broke the prefix relation with
+    /// request `i`. Empty for an ordinary session; exactly one across a
+    /// compaction fold, which is the only sanctioned discontinuity.
+    fn cache_prefix_breaks(requests: &[SamplingRequest]) -> Vec<usize> {
+        requests
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| {
+                !is_structural_prefix(&durable_wire_body(&pair[0]), &durable_wire_body(&pair[1]))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// THE suite. Over a sequence of requests one session actually issued:
+    ///
+    /// 1. every request's durable body is a structural prefix of the next's;
+    /// 2. no request exceeds the `cache_control` budget;
+    /// 3. no plain marker precedes a `1h` one in prompt order;
+    /// 4. the lookback guarantee, in its two halves — (4a) the **deepest**
+    ///    entry request N wrote is reachable from a marker in request N+1
+    ///    (else the longest cached prefix N+1 can find is shallower than the
+    ///    one N just paid to write, and everything past it re-bills — this is
+    ///    the billing claim); and (4b) no marker is more than a lookback past
+    ///    the nearest marker at or before it, counting request N's markers,
+    ///    request N+1's own shallower markers, and the start.
+    ///
+    /// Claim 4 is the one a byte-identity test cannot make: it is a statement
+    /// about two *different* requests, and it is what the original bug broke.
+    ///
+    /// (4b) deliberately admits N+1's own shallower markers as anchors: cache
+    /// entries are **prefix-cumulative**, so a breakpoint that reaches back to
+    /// an entry written earlier *in the same request* is a hit, not a miss.
+    /// Requiring every marker to reach a marker of N alone would fail on
+    /// correct code — a request that adds an anchor deeper than anything the
+    /// previous request marked is exactly what a growing history is supposed
+    /// to do.
+    fn assert_stable_cache_prefix(requests: &[SamplingRequest]) {
+        assert!(
+            requests.len() >= 2,
+            "a cross-request claim needs at least two requests"
+        );
+        for (i, req) in requests.iter().enumerate() {
+            assert_marker_budget_and_ttl_order(req, &format!("request {i}"));
+        }
+        let breaks = cache_prefix_breaks(requests);
+        assert!(
+            breaks.is_empty(),
+            "the durable prefix must only ever grow; it changed at {breaks:?}"
+        );
+        for (i, pair) in requests.windows(2).enumerate() {
+            // The start (0) is always an entry: the prefix marker on
+            // system/tools seals everything before block 1.
+            let written: Vec<usize> = std::iter::once(0)
+                .chain(marker_positions(&durable_wire_body(&pair[0])))
+                .collect();
+            let now = marker_positions(&durable_wire_body(&pair[1]));
+            let deepest = *written.last().expect("0 is always written");
+
+            // (4a) the billing claim.
+            assert!(
+                now.iter()
+                    .any(|m| *m >= deepest && m - deepest <= CACHE_LOOKBACK),
+                "requests {i}->{}: nothing in {now:?} can see the deepest entry \
+                 request {i} wrote (block {deepest}) from within the \
+                 {CACHE_LOOKBACK}-block lookback — the history past it re-bills",
+                i + 1
+            );
+
+            // (4b) no marker outruns the chain.
+            let mut reachable = written.clone();
+            for p in &now {
+                let nearest = reachable
+                    .iter()
+                    .copied()
+                    .filter(|q| q <= p)
+                    .max()
+                    .expect("0 is always a candidate");
+                assert!(
+                    p - nearest <= CACHE_LOOKBACK,
+                    "requests {i}->{}: the marker at block {p} is {} blocks past the \
+                     nearest reachable entry ({reachable:?}) — outside the \
+                     {CACHE_LOOKBACK}-block lookback",
+                    i + 1,
+                    p - nearest
+                );
+                reachable.push(*p);
+                reachable.sort_unstable();
+            }
+        }
+    }
+
+    /// An instant, permission-free, parallel-safe tool. The cache scenarios
+    /// need *wide* turns (many `tool_use` blocks, many `tool_result` blocks)
+    /// to reach a stride crossing at all, and `Dawdle`'s deliberate stall
+    /// would turn a four-turn scenario into a multi-second test for nothing.
+    struct Ping;
+
+    impl hotl_tools::Tool for Ping {
+        fn name(&self) -> &'static str {
+            "ping"
+        }
+        fn description(&self) -> &str {
+            "answers immediately"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn permission(&self, _: &serde_json::Value) -> hotl_tools::Permission {
+            hotl_tools::Permission::None
+        }
+        fn read_only(&self) -> bool {
+            true
+        }
+        fn parallel_safe(&self) -> bool {
+            true
+        }
+        fn run<'a>(
+            &'a self,
+            _input: serde_json::Value,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> futures_util::future::BoxFuture<'a, hotl_tools::ToolOutcome> {
+            Box::pin(async { hotl_tools::ToolOutcome::ok("pong") })
+        }
+    }
+
+    fn ping_registry() -> Registry {
+        let mut reg = Registry::builtin();
+        reg.register(Box::new(Ping));
+        reg
+    }
+
+    /// `turns` prompts, each one wide `ping` batch followed by a text reply.
+    /// Every call carries a distinct id and input so the doom detector has no
+    /// repeating signature to trip on.
+    async fn tool_heavy_session(
+        turns: usize,
+        calls: usize,
+        cache_ttl: hotl_provider::CacheTtl,
+    ) -> Harness {
+        let ids: Vec<String> = (0..turns * calls).map(|n| format!("t{n}")).collect();
+        let mut scripts = Vec::new();
+        for turn in 0..turns {
+            let batch: Vec<(&str, &str, serde_json::Value)> = (0..calls)
+                .map(|i| {
+                    let n = turn * calls + i;
+                    (ids[n].as_str(), "ping", json!({ "n": n }))
+                })
+                .collect();
+            scripts.push(tool_batch(&batch));
+            scripts.push(ScriptedProvider::text_reply("acknowledged"));
+        }
+        let mut h = Harness::with_registry(
+            scripts,
+            EngineConfig { cache_ttl, ..cfg() },
+            ping_registry(),
+        );
+        for turn in 0..turns {
+            let outcome = h.prompt_and_wait(&format!("prompt {turn}")).await;
+            assert!(
+                matches!(outcome, Outcome::Done { .. }),
+                "turn {turn}: {outcome:?}"
+            );
+        }
+        h
+    }
+
+    /// The ordinary case, and the one the effort is *for*: a tool-heavy
+    /// session whose history outgrows the anchor stride several times over.
+    /// Every consecutive pair of requests keeps the durable prefix byte-stable
+    /// and every marker inside the lookback, so each sample reads the entry
+    /// the previous sample wrote instead of re-billing the history.
+    ///
+    /// Driven at the interactive 1h TTL — the mode this effort ships for
+    /// `hotl tui`/`acp`, and the only one that makes the TTL-ordering claim
+    /// non-vacuous (under `FiveMinutes` every marker renders plain).
+    ///
+    /// Twelve calls per batch, not three: a turn has to grow the history by
+    /// more than the lookback for claim 4 to have teeth at all. At this width,
+    /// deleting the rolling anchors fails the assertion; at a narrow width the
+    /// latest marker alone would still land inside the lookback and the suite
+    /// would pass a session that re-bills its whole history.
+    #[tokio::test]
+    async fn normal_turns_grow_the_prefix_byte_stably() {
+        let h = tool_heavy_session(3, 12, hotl_provider::CacheTtl::OneHour).await;
+        let requests = h.provider.requests();
+        assert_eq!(
+            requests.len(),
+            6,
+            "three turns, two samples each — every speculative dispatch adopted"
+        );
+        assert_stable_cache_prefix(&requests);
+
+        // Non-vacuous: the history really did outgrow the stride, so rolling
+        // anchors exist, the budget is actually spent, and 1h reached the wire.
+        let last = hotl_provider_anthropic::wire_body(requests.last().expect("requests"));
+        let marked = marker_positions(&last);
+        assert!(
+            marked.len() >= 2,
+            "the fixture must produce at least one anchor besides the latest \
+             marker, else claim 4 is trivial: {marked:?}"
+        );
+        assert_eq!(
+            count_markers(&last),
+            MARKER_BUDGET,
+            "the deepest request spends the whole budget: {last:#}"
+        );
+        assert!(
+            marker_ttls_in_prompt_order(&last)
+                .iter()
+                .any(|t| t.as_deref() == Some("1h")),
+            "OneHour must actually reach the wire"
+        );
+    }
+
+    /// A completed todo, so the reminder renders (the list is non-empty) while
+    /// the TodoGate — a different subsystem, with its own tests — never fires
+    /// and never adds samples this scenario would have to script for.
+    fn done_todo(content: &str) -> hotl_types::Todo {
+        hotl_types::Todo {
+            content: content.into(),
+            status: hotl_types::TodoStatus::Completed,
+            active_form: None,
+        }
+    }
+
+    /// The live billing bug, stated across requests. The `<todos>` reminder's
+    /// bytes change whenever the list is edited; the original bug marked it,
+    /// so every edit wrote a cache entry nothing ever read and re-billed the
+    /// whole history at write price. With the reminder in the ephemeral tail
+    /// the durable prefix is unmoved by any of it: no list → a list → an
+    /// edited list changes only the appended, unmarked tail message.
+    #[tokio::test]
+    async fn todos_toggle_keeps_prefix_bytes_identical() {
+        let mut h = Harness::with_registry(
+            vec![
+                ScriptedProvider::text_reply("no list yet"),
+                ScriptedProvider::text_reply("list noted"),
+                ScriptedProvider::text_reply("list edited"),
+            ],
+            cfg(),
+            ping_registry(),
+        );
+        h.prompt_and_wait("first").await;
+        h.handle.set_todos(vec![done_todo("write the suite")]).await;
+        h.prompt_and_wait("second").await;
+        h.handle
+            .set_todos(vec![
+                done_todo("write the suite"),
+                done_todo("sweep the docs"),
+            ])
+            .await;
+        h.prompt_and_wait("third").await;
+
+        let requests = h.provider.requests();
+        assert_eq!(requests.len(), 3, "one sample per turn");
+        assert_stable_cache_prefix(&requests);
+
+        // Non-vacuous: three genuinely different tails — absent, then two
+        // different renders of the same reminder.
+        assert!(requests[0].ephemeral_tail.is_empty(), "no list yet");
+        assert_eq!(requests[1].ephemeral_tail.len(), 1);
+        assert_eq!(requests[2].ephemeral_tail.len(), 1);
+        assert_ne!(
+            requests[1].ephemeral_tail, requests[2].ephemeral_tail,
+            "the fixture must actually edit the list"
+        );
+
+        for (i, req) in requests.iter().enumerate() {
+            let full = hotl_provider_anthropic::wire_body(req);
+            let durable = durable_wire_body(req);
+            let full_msgs = full["messages"].as_array().expect("messages");
+            let durable_msgs = durable["messages"].as_array().expect("messages");
+            // The durable region, markers included, is untouched by the tail.
+            assert_eq!(
+                full_msgs[..durable_msgs.len()],
+                durable_msgs[..],
+                "request {i}: the tail disturbed a durable byte or a marker"
+            );
+            // …and nothing after it carries a marker.
+            for msg in &full_msgs[durable_msgs.len()..] {
+                for block in msg["content"].as_array().expect("content") {
+                    assert!(
+                        block.get("cache_control").is_none(),
+                        "request {i}: the ephemeral tail carries a marker: {block:#}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A steer landing at a sample boundary is an **append**, not a rewrite:
+    /// the cancelled speculative request is a strict prefix of the sequential
+    /// rebuild that replaces it, so no cache entry the session already wrote
+    /// is orphaned by the interruption.
+    #[tokio::test]
+    async fn steer_injection_appends_without_prefix_break() {
+        let h = steered_tool_turn(hotl_engine::AckMode::Pipelined).await;
+        let requests = h.provider.requests();
+        assert_eq!(
+            requests.len(),
+            3,
+            "the first sample, the cancelled speculation, and the rebuild"
+        );
+        assert_stable_cache_prefix(&requests);
+
+        // Non-vacuous: the steer really did land, and it landed as an append.
+        let speculative = &requests[1];
+        let rebuilt = requests.last().expect("requests");
+        assert!(
+            rebuilt.items.iter().any(is_steer),
+            "the steer must reach the rebuilt request: {:#?}",
+            rebuilt.items
+        );
+        assert!(
+            speculative.items.len() < rebuilt.items.len(),
+            "the rebuild must be strictly longer than the speculation it replaced"
+        );
+        assert_eq!(
+            speculative.items[..],
+            rebuilt.items[..speculative.items.len()],
+            "the speculative request must be a prefix of its rebuild, byte for byte"
+        );
+    }
+
+    /// A session driven past its compaction trigger. Window 1000 → trigger at
+    /// 800, tail budget 300: a big first tool result, then a sample that
+    /// "reports" 750 tokens, so the next estimate crosses the trigger and the
+    /// turn folds. Shared by the golden fold test and the two cache claims
+    /// about it, so all three are talking about the same fold.
+    async fn compacting_session() -> Harness {
+        let cfg = EngineConfig {
+            context_window: 1000,
+            max_turns: 10,
+            ..Default::default()
+        };
+        let scripts = vec![
+            ScriptedProvider::tool_call(
+                "t1",
+                "bash",
+                json!({"command": format!("echo {}", "A".repeat(1100))}),
+            ),
+            tool_call_reporting(
+                "t2",
+                "bash",
+                json!({"command": format!("echo {}", "B".repeat(200))}),
+                750,
+            ),
+            ScriptedProvider::text_reply("GOAL: digest of earlier work"),
+            ScriptedProvider::text_reply("finished after compaction"),
+        ];
+        let mut h = Harness::new(scripts, cfg);
+        let outcome = h.prompt_and_wait("summarize both outputs").await;
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "finished after compaction".into()
+            }
+        );
+        h
+    }
+
+    /// Compaction is the ONE place the durable prefix is allowed to change out
+    /// from under the cache: the fold rewrites history, so the entries behind
+    /// it are dead by construction. What must survive is the *prefix* segment
+    /// — system + tools, sealed by the system marker — since that is the part
+    /// a fold does not touch and the part most expensive to rebuild.
+    #[tokio::test]
+    async fn compaction_is_the_single_sanctioned_discontinuity() {
+        let h = compacting_session().await;
+        let all = h.provider.requests();
+        // The summarize call is its own tiny conversation on the cache-off
+        // path; the session's own requests are what the prefix claim is about.
+        let session: Vec<SamplingRequest> = all
+            .iter()
+            .filter(|r| r.cache != hotl_provider::CachePolicy::Off)
+            .cloned()
+            .collect();
+        assert_eq!(
+            session.len(),
+            3,
+            "two samples before the fold, one continuation after"
+        );
+        for (i, req) in session.iter().enumerate() {
+            assert_marker_budget_and_ttl_order(req, &format!("session request {i}"));
+        }
+        assert_eq!(
+            cache_prefix_breaks(&session),
+            vec![1],
+            "exactly one discontinuity, and it is the fold"
+        );
+
+        let before = hotl_provider_anthropic::wire_body(&session[1]);
+        let after = hotl_provider_anthropic::wire_body(&session[2]);
+        assert_eq!(
+            before["system"], after["system"],
+            "the system segment — and so the entry the system marker wrote — \
+             must survive the fold byte for byte"
+        );
+        assert_eq!(before["tools"], after["tools"], "tools must survive too");
+        assert_eq!(
+            after["system"][0]["cache_control"]["type"], "ephemeral",
+            "…and the continuation must still mark it"
+        );
+    }
+
+    /// `CachePolicy::Off` is a policy, not a hint. The compaction summarize
+    /// call is the production path that uses it: a one-shot conversation that
+    /// will never be sampled against again, so a marker on it would be a write
+    /// nothing can ever read.
+    #[tokio::test]
+    async fn cache_off_paths_emit_zero_markers() {
+        let h = compacting_session().await;
+        let all = h.provider.requests();
+        let off: Vec<&SamplingRequest> = all
+            .iter()
+            .filter(|r| r.cache == hotl_provider::CachePolicy::Off)
+            .collect();
+        assert_eq!(
+            off.len(),
+            1,
+            "this scenario has exactly one cache-off path: the summarize call"
+        );
+        assert!(
+            off[0].system.contains("compress"),
+            "…and it is the summarize call: {}",
+            off[0].system
+        );
+        let body = hotl_provider_anthropic::wire_body(off[0]);
+        assert!(
+            !body.to_string().contains("cache_control"),
+            "a cache-off request must put no marker on the wire: {body:#}"
+        );
+        // Non-vacuous: the same run's session requests do mark.
+        assert!(
+            all.iter()
+                .any(|r| count_markers(&hotl_provider_anthropic::wire_body(r)) > 0),
+            "the fixture must also exercise the marking path"
+        );
+    }
+
+    /// A synthetic history long enough that the breakpoint planner has already
+    /// placed a rolling anchor before the scenario's own turn starts — 14
+    /// user/assistant pairs, so 28 wire blocks and a crossing at block 15.
+    ///
+    /// Case 9's byte-identity claim is only interesting where the two build
+    /// paths have anchors to disagree about, and it is strongest where the
+    /// speculated tail crosses the *next* stride boundary: the sample-2
+    /// request carries an anchor the sample-1 request did not.
+    ///
+    /// Seeded through `initial_items`, so it is a projection seed and never
+    /// reaches the log — normalized-transcript comparisons are unaffected.
+    fn anchored_history() -> Vec<Item> {
+        (0..14)
+            .flat_map(|i| {
+                vec![
+                    Item::User {
+                        text: format!("earlier request {i}"),
+                        synthetic: None,
+                    },
+                    Item::Assistant {
+                        blocks: vec![json!({"type": "text", "text": format!("earlier reply {i}")})],
+                    },
+                ]
+            })
+            .collect()
+    }
+
     /// A path-free tool round trip, so two runs in two tempdirs produce
     /// byte-identical histories (a path in a tool input would differ per
     /// run for reasons that have nothing to do with adoption).
+    ///
+    /// The batch is two calls wide on purpose: with a single `tool_result` the
+    /// batch's only block *is* the latest marker, and a stride crossing that
+    /// lands on it is deduped away — there would be no new anchor for the two
+    /// build paths to disagree about. See [`anchored_history`].
     async fn dawdle_then_reply(mode: hotl_engine::AckMode) -> Harness {
-        let mut h = Harness::with_registry(
+        let mut h = Harness::with_items_and_registry(
             vec![
-                ScriptedProvider::tool_call("t1", "dawdle", json!({})),
+                tool_batch(&[("t1", "dawdle", json!({})), ("t2", "dawdle", json!({}))]),
                 ScriptedProvider::text_reply("done"),
             ],
             cfg_with(mode),
+            anchored_history(),
             dawdle_registry(),
         );
         let outcome = h.prompt_and_wait("go").await;
@@ -1576,12 +2214,13 @@ mod tests {
     /// but the TodoGate never fires, so the script still needs exactly the two
     /// samples adoption is measured over.
     async fn dawdle_then_reply_with_todos(mode: hotl_engine::AckMode) -> Harness {
-        let mut h = Harness::with_registry(
+        let mut h = Harness::with_items_and_registry(
             vec![
-                ScriptedProvider::tool_call("t1", "dawdle", json!({})),
+                tool_batch(&[("t1", "dawdle", json!({})), ("t2", "dawdle", json!({}))]),
                 ScriptedProvider::text_reply("done"),
             ],
             cfg_with(mode),
+            anchored_history(),
             dawdle_registry(),
         );
         h.handle
@@ -1594,6 +2233,28 @@ mod tests {
         let outcome = h.prompt_and_wait("go").await;
         assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
         h
+    }
+
+    /// The anchor half of case 9's fixture, asserted rather than assumed: the
+    /// first request already carries a rolling anchor, and the turn's tool
+    /// batch crosses the next stride boundary, so the second request carries
+    /// an anchor the first did not. Without both, "the adopted request equals
+    /// the rebuild" is a claim about a history with no anchors in it.
+    fn assert_the_speculated_tail_crossed_an_anchor(requests: &[SamplingRequest]) {
+        let first = marker_positions(&durable_wire_body(&requests[0]));
+        let second = marker_positions(&durable_wire_body(&requests[1]));
+        // The last position is the LATEST marker; everything before it is an
+        // anchor.
+        let anchors = |m: &[usize]| m.len().saturating_sub(1);
+        assert!(
+            anchors(&first) >= 1,
+            "the seeded history must already have a rolling anchor: {first:?}"
+        );
+        assert!(
+            anchors(&second) > anchors(&first),
+            "the speculated tail must cross a stride boundary — a NEW anchor, \
+             not merely a new latest: {first:?} -> {second:?}"
+        );
     }
 
     /// commit-protocol.md test matrix case 9 (MANDATORY): "under leaf
@@ -1621,6 +2282,10 @@ mod tests {
             "the optimistic dispatch WAS adopted: a refusal would rebuild, making three"
         );
         assert_eq!(sequential.len(), 2, "Sync mode never speculates");
+        // Anchors are in play on both paths — see the helper for why that is
+        // what makes the byte-identity claim load-bearing rather than trivial.
+        assert_the_speculated_tail_crossed_an_anchor(&adopted);
+        assert_the_speculated_tail_crossed_an_anchor(&sequential);
 
         // Level 1: the request the engine hands the provider.
         assert_eq!(
@@ -1661,6 +2326,7 @@ mod tests {
         let sequential = sequential_run.provider.requests();
         assert_eq!(adopted.len(), 2, "the optimistic dispatch WAS adopted");
         assert_eq!(sequential.len(), 2, "Sync mode never speculates");
+        assert_the_speculated_tail_crossed_an_anchor(&adopted);
 
         // Non-vacuous: there really is an ephemeral tail on both paths.
         for req in [&adopted[1], &sequential[1]] {
@@ -1845,38 +2511,9 @@ mod tests {
 
     #[tokio::test]
     async fn compaction_folds_history_and_continues() {
-        // Window 1000 → trigger at 800, tail budget 300. A big first result,
-        // then a sample that "reports" 750 tokens: the next request estimate
-        // crosses 800, so the turn compacts. The plan folds the big early
-        // history and keeps the small recent exchange verbatim.
-        let cfg = EngineConfig {
-            context_window: 1000,
-            max_turns: 10,
-            ..Default::default()
-        };
-        let scripts = vec![
-            ScriptedProvider::tool_call(
-                "t1",
-                "bash",
-                json!({"command": format!("echo {}", "A".repeat(1100))}),
-            ),
-            tool_call_reporting(
-                "t2",
-                "bash",
-                json!({"command": format!("echo {}", "B".repeat(200))}),
-                750,
-            ),
-            ScriptedProvider::text_reply("GOAL: digest of earlier work"),
-            ScriptedProvider::text_reply("finished after compaction"),
-        ];
-        let mut h = Harness::new(scripts, cfg);
-        let outcome = h.prompt_and_wait("summarize both outputs").await;
-        assert_eq!(
-            outcome,
-            Outcome::Done {
-                text: "finished after compaction".into()
-            }
-        );
+        // The plan folds the big early history and keeps the small recent
+        // exchange verbatim — see `compacting_session` for the arithmetic.
+        let h = compacting_session().await;
         assert!(
             h.seen.iter().any(|e| e == "Compacted(false)"),
             "events: {:?}",
