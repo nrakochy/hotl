@@ -22,3 +22,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 tempfile = { workspace = true }
+
+[dev-dependencies]
+# Case 9's byte-identity assertion is stated over *provider-serialized*
+# request bytes, so the golden kit needs one real dialect to serialize with.
+hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.5.2" }

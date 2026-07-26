@@ -931,6 +931,7 @@ dependencies = [
  "hotl-engine",
  "hotl-platform",
  "hotl-provider",
+ "hotl-provider-anthropic",
  "hotl-store",
  "hotl-tools",
  "hotl-types",

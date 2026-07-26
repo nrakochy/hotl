@@ -838,17 +838,33 @@ mod tests {
             .collect();
         assert_eq!(steer_items.len(), 1);
 
-        // …and the SECOND sample's request actually contained it (rebase row
-        // of the conflict table: woven into the next sample, not the current).
+        // …and the sample that actually ran next contained it (rebase row of
+        // the conflict table: woven into the next sample, not the current).
+        //
+        // Three requests, not two: the steer lands exactly at the boundary
+        // where the turn optimistically dispatched the next sample, so the
+        // refreshed leaf is the steer's and the speculation is refused. That
+        // costs one cancelled request and nothing else (commit-protocol.md
+        // §Causal groups: "one cancelled request … with no other
+        // consequence") — the last request is the sequential rebuild.
         let requests = h.provider.requests();
-        assert_eq!(requests.len(), 2);
-        let saw_in_first = requests[0].items.iter().any(is_steer);
-        let saw_in_second = requests[1].items.iter().any(is_steer);
+        assert_eq!(
+            requests.len(),
+            3,
+            "sample 1, the mispredicted optimistic dispatch, and the rebuild"
+        );
         assert!(
-            !saw_in_first,
+            !requests[0].items.iter().any(is_steer),
             "steer must not appear in the sample that was already running"
         );
-        assert!(saw_in_second, "steer must be woven into the next sample");
+        assert!(
+            !requests[1].items.iter().any(is_steer),
+            "the speculative request was built before the steer landed"
+        );
+        assert!(
+            requests[2].items.iter().any(is_steer),
+            "steer must be woven into the sample that actually ran"
+        );
     }
 
     fn is_steer(i: &Item) -> bool {
@@ -1516,6 +1532,131 @@ mod tests {
             sync.transcript(),
             "the boundary group must not reorder anything"
         );
+    }
+
+    // --- Task 10 (S2c optimistic dispatch) ---------------------------
+
+    /// A request with its MOIM turn-context block replaced by a constant.
+    ///
+    /// MOIM is the **sanctioned ephemeral suffix** (commit-protocol.md
+    /// §Causal groups): it carries a wall-clock timestamp and the working
+    /// directory, is regenerated on both paths, rides after the cache marker
+    /// and never persists. Everything else is what byte-identity is claimed
+    /// over.
+    fn without_moim(req: &hotl_provider::SamplingRequest) -> hotl_provider::SamplingRequest {
+        hotl_provider::SamplingRequest {
+            turn_context: Some("<MOIM>".into()),
+            ..req.clone()
+        }
+    }
+
+    /// A path-free tool round trip, so two runs in two tempdirs produce
+    /// byte-identical histories (a path in a tool input would differ per
+    /// run for reasons that have nothing to do with adoption).
+    async fn dawdle_then_reply(mode: hotl_engine::AckMode) -> Harness {
+        let mut h = Harness::with_registry(
+            vec![
+                ScriptedProvider::tool_call("t1", "dawdle", json!({})),
+                ScriptedProvider::text_reply("done"),
+            ],
+            cfg_with(mode),
+            dawdle_registry(),
+        );
+        let outcome = h.prompt_and_wait("go").await;
+        assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+        h
+    }
+
+    /// commit-protocol.md test matrix case 9 (MANDATORY): "under leaf
+    /// equality, the adopted speculative request's bytes equal the
+    /// sequentially rebuilt request's, byte for byte".
+    ///
+    /// The two runs are the same scenario in the two ack modes: `Pipelined`
+    /// dispatches the second sample optimistically at the boundary and adopts
+    /// it (proved by the request count — a refusal would show up as a third,
+    /// rebuilt request), `Sync` issues no ticket and so never speculates,
+    /// which makes its second request the sequential rebuild by construction.
+    ///
+    /// Both levels the brief asks for: the `SamplingRequest` the engine
+    /// hands the provider, and the JSON body a real dialect puts on the wire.
+    #[tokio::test]
+    async fn an_adopted_request_is_byte_identical_to_the_sequential_rebuild() {
+        let adopted_run = dawdle_then_reply(hotl_engine::AckMode::Pipelined).await;
+        let sequential_run = dawdle_then_reply(hotl_engine::AckMode::Sync).await;
+
+        let adopted = adopted_run.provider.requests();
+        let sequential = sequential_run.provider.requests();
+        assert_eq!(
+            adopted.len(),
+            2,
+            "the optimistic dispatch WAS adopted: a refusal would rebuild, making three"
+        );
+        assert_eq!(sequential.len(), 2, "Sync mode never speculates");
+
+        // Level 1: the request the engine hands the provider.
+        assert_eq!(
+            format!("{:?}", without_moim(&adopted[1])),
+            format!("{:?}", without_moim(&sequential[1])),
+            "the adopted request must equal the sequential rebuild"
+        );
+
+        // Level 2: the provider-serialized body — the actual bytes.
+        assert_eq!(
+            hotl_provider_anthropic::wire_body(&without_moim(&adopted[1])).to_string(),
+            hotl_provider_anthropic::wire_body(&without_moim(&sequential[1])).to_string(),
+            "…and so must the wire body built from it"
+        );
+
+        // MOIM itself is regenerated on both paths and still numbers the
+        // sample it actually belongs to — the speculative build is one
+        // sample ahead of the sample it was built during.
+        for req in [&adopted[1], &sequential[1]] {
+            let moim = req.turn_context.as_deref().expect("MOIM attached");
+            assert!(moim.contains("sample=\"2\""), "was: {moim}");
+        }
+    }
+
+    /// The mispredict half of case 9: "the mispredict path (a steer at the
+    /// boundary) cancels without emitting an entry, without a `Failed`
+    /// outcome, and produces the same transcript as the sequential path."
+    #[tokio::test]
+    async fn a_mispredicted_speculation_cancels_without_a_trace() {
+        let mispredicted = steered_tool_turn(hotl_engine::AckMode::Pipelined).await;
+
+        assert_eq!(
+            mispredicted.provider.request_count(),
+            3,
+            "the mispredict costs exactly one cancelled request, and nothing else"
+        );
+        // Un-adopted deltas are ephemeral: they die before any proposal, so
+        // they never reach the surface. The scripted reply emits exactly one
+        // TextDelta — seeing two would mean the cancelled stream leaked.
+        let deltas = mispredicted
+            .seen
+            .iter()
+            .filter(|e| e.starts_with("TextDelta("))
+            .count();
+        assert_eq!(
+            deltas, 1,
+            "an un-adopted stream's deltas must never be forwarded: {:?}",
+            mispredicted.seen
+        );
+        // Cancelled ≠ Failed: cancelling an un-adopted stream is not a turn
+        // outcome and produces no entry — "not even a `cancelled` one".
+        assert!(
+            !mispredicted.kinds().iter().any(|k| k == "cancelled"),
+            "kinds: {:?}",
+            mispredicted.kinds()
+        );
+
+        // …and the transcript is the one a never-speculated run produces.
+        let sequential = steered_tool_turn(hotl_engine::AckMode::Sync).await;
+        assert_eq!(
+            sequential.provider.request_count(),
+            2,
+            "Sync mode never speculates, so it never mispredicts"
+        );
+        assert_eq!(mispredicted.transcript(), sequential.transcript());
     }
 
     /// A tool that reports how much of the session log was on disk at the

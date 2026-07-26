@@ -142,6 +142,11 @@ async fn a_writer_death_before_fsync_never_leaves_the_projection_ahead_of_the_lo
 /// The tool-results commit is the pipelined one (see `Turn::run_tool_batch`),
 /// so arming the fault while the tool is still running puts the writer death
 /// exactly between a ticket being issued and its bytes being synced.
+///
+/// It is also the sealed-log-during-speculation case: that same boundary
+/// optimistically dispatches the next sample, so the failing ticket has to
+/// cancel an un-adopted stream — and adoption must never be reached, since
+/// the refresh sits behind the drain that surfaced the seal.
 #[tokio::test]
 async fn a_writer_death_before_fsync_never_resolves_a_pipelined_ticket() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -180,10 +185,16 @@ async fn a_writer_death_before_fsync_never_resolves_a_pipelined_ticket() {
         other => panic!("an unresolved ticket must not report success, got {other:?}"),
     }
 
+    // The turn *dispatched* the next sample optimistically at the boundary
+    // (commit-protocol.md §Causal groups (b): speculation runs ahead of
+    // durability) — and then the ticket came back sealed, so that stream was
+    // cancelled un-adopted. A cancelled speculative stream is not a turn
+    // outcome and produces no entry: the log assertions below are what prove
+    // nothing from it survived.
     assert_eq!(
         provider.requests().len(),
-        1,
-        "a ticket for bytes that were never synced must not let the turn sample again"
+        2,
+        "one sample, plus the optimistic dispatch the sealed ticket then cancelled"
     );
     let replayed = hotl_store::replay(&log_path).expect("replay");
     assert!(replayed.warnings.is_empty(), "{:?}", replayed.warnings);

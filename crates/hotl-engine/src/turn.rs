@@ -5,8 +5,9 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::Arc;
 
+use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
-use hotl_provider::{retry, SamplingRequest, StreamEvent, ToolDef};
+use hotl_provider::{retry, ProviderError, SamplingRequest, StreamEvent, ToolDef};
 use hotl_tools::rules::Verdict;
 use hotl_tools::{Permission, ToolOutcome};
 use hotl_types::{
@@ -520,6 +521,92 @@ impl TicketPipeline {
     }
 }
 
+/// A next-sample request built and **sent before the boundary group it
+/// follows is durable** (commit-protocol.md §Causal groups (b)). The stream
+/// is held un-adopted: its events are buffered here and never forwarded, so
+/// nothing it produces can reach the transcript, the projection or the event
+/// channel until the refresh proves the leaf. A mispredict drops this whole
+/// value — which is the cancellation: the buffer dies with it (ephemeral by
+/// §Commit granularity, deltas that never reached a `BlockEnd` proposal) and
+/// the stream itself is closed.
+struct Speculation {
+    /// Id of the last entry of the turn's own committed group. The ticket
+    /// carried it eagerly, at issue — which is exactly what buys the early
+    /// build, and exactly what does NOT buy the adoption (§Causal groups:
+    /// "Knowing the id early buys the speculative build, never the
+    /// adoption").
+    expected_leaf: String,
+    request: SamplingRequest,
+    stream: SyncStream,
+    /// Events pulled while the boundary group was still committing — the
+    /// overlap this whole mechanism exists for.
+    buffered: Vec<Result<StreamEvent, ProviderError>>,
+    /// Set once a terminal event (`Completed`, an error, or end-of-stream)
+    /// has been buffered: there is nothing further to overlap.
+    terminal: bool,
+}
+
+/// A provider stream parked in a `Turn` field.
+///
+/// `BoxStream` is `Send` but not `Sync`, and a `Turn` must stay `Sync`: the
+/// spawned turn future holds `&self` across awaits in several places
+/// (`emit`, `gate`, `execute`), and `tokio::spawn` needs that future `Send`.
+/// The mutex is never contended — every access goes through `&mut self` —
+/// so it is only ever taken by `get_mut`/`into_inner`, which cannot block.
+struct SyncStream(std::sync::Mutex<BoxStream<'static, Result<StreamEvent, ProviderError>>>);
+
+impl SyncStream {
+    fn new(stream: BoxStream<'static, Result<StreamEvent, ProviderError>>) -> Self {
+        Self(std::sync::Mutex::new(stream))
+    }
+
+    fn get_mut(&mut self) -> &mut BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        self.0
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn into_inner(self) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        self.0
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Speculation {
+    /// Pull events into the buffer until the stream reaches its terminal
+    /// event. Cancel-safe: each event is buffered the moment it arrives, so
+    /// dropping this future (the refresh finished first, or the provider
+    /// stalled) keeps everything already pulled and leaves the rest in the
+    /// stream.
+    async fn fill(&mut self) {
+        while !self.terminal {
+            match self.stream.get_mut().next().await {
+                Some(event) => {
+                    self.terminal = matches!(event, Ok(StreamEvent::Completed { .. }) | Err(_));
+                    self.buffered.push(event);
+                }
+                None => self.terminal = true,
+            }
+        }
+    }
+
+    /// Adopt: the buffered prefix, then the rest of the same stream. The
+    /// consumer drives this to end-of-stream exactly as it would a fresh
+    /// one.
+    fn adopt(
+        self,
+    ) -> (
+        SamplingRequest,
+        BoxStream<'static, Result<StreamEvent, ProviderError>>,
+    ) {
+        (
+            self.request,
+            Box::pin(futures_util::stream::iter(self.buffered).chain(self.stream.into_inner())),
+        )
+    }
+}
+
 /// A sample's terminal result, or why it couldn't produce one.
 enum SampleEnd {
     Completed {
@@ -581,6 +668,15 @@ struct Turn {
     /// The read side of the actor's published head (§Read invariant): the
     /// sample-boundary refresh, and the only thing this turn ever reads.
     head: tokio::sync::watch::Receiver<Arc<crate::actor::ProjectionHead>>,
+    /// The un-adopted next sample, when this turn dispatched one
+    /// optimistically at the last boundary (§Causal groups (b)).
+    speculative: Option<Speculation>,
+    /// Items this turn committed since `last_snapshot` was granted, in
+    /// commit order — the tail a speculative build predicts the next head
+    /// will carry. Under leaf equality that prediction is exact, which is
+    /// what makes the adopted request byte-identical to the sequential
+    /// rebuild.
+    projected_tail: Vec<Item>,
 }
 
 impl Drop for Turn {
@@ -641,6 +737,8 @@ impl Turn {
             ledger: crate::ledger::LoopLedger::new(),
             pipeline: TicketPipeline::default(),
             head,
+            speculative: None,
+            projected_tail: Vec::new(),
         }
     }
 
@@ -817,32 +915,57 @@ impl Turn {
     async fn sample(&mut self) -> SampleEnd {
         self.ledger.start_sample();
         self.ledger.stamp(Phase::BoundaryStart);
-        // Barrier (b) (commit-protocol.md §Pipelined commits): the turn-read
-        // invariant — what the next sample is built from must be a projection
-        // that already contains everything this turn committed. The drain IS
-        // the barrier: a ticket is the only place a sealed log is reported,
-        // so waiting on the projection alone would wait forever on one.
-        let commit = self.pipeline.drain().await;
+        let (commit, head) = self.boundary().await;
         if !commit.ok() {
+            // The speculative stream (if any) is dropped with `self` at the
+            // end of the turn; it was never adopted, so it produced nothing.
+            self.speculative = None;
             return match commit {
                 Commit::Aborted => SampleEnd::Cancelled,
                 other => SampleEnd::Fatal(other.message().into()),
             };
         }
-        let Some(head) = self.refresh().await else {
+        let Some(head) = head else {
             return SampleEnd::Fatal("session closed".into());
         };
         let snapshot = head.snapshot();
         self.ledger.stamp(Phase::SnapshotReady);
         self.samples += 1;
-        let request = match self.build_request(&snapshot) {
-            Ok(request) => request,
-            Err(end) => return end,
+        // The adoption rule, in one line (commit-protocol.md §Causal groups):
+        // adopt iff the refreshed head's leaf equals `expected_leaf`. Leaf
+        // equality is the proof that nothing intervened — no steer, no queued
+        // prompt, no todo write, no compaction, no branch move. Anything else
+        // cancels (by dropping) and the turn rebuilds through the sequential
+        // path.
+        let adopted = self
+            .speculative
+            .take()
+            .filter(|spec| head.leaf() == Some(spec.expected_leaf.as_str()))
+            .map(Speculation::adopt);
+        let (request, stream) = match adopted {
+            Some(adopted) => {
+                // The adopted request was built (and its threshold checked)
+                // at the last boundary, so `build_request` never runs for
+                // this sample — but the fold's head start still has to.
+                let estimate = self.estimate_tokens(&snapshot);
+                self.maybe_speculate_digest(&snapshot, estimate);
+                adopted
+            }
+            None => {
+                let request = match self.build_request(&snapshot) {
+                    Ok(request) => request,
+                    Err(end) => return end,
+                };
+                let stream = self.shared.provider.stream(request.clone());
+                (request, stream)
+            }
         };
         self.ledger.stamp(Phase::RequestBuilt);
         self.last_snapshot = Some(snapshot.clone());
+        self.projected_tail.clear();
+        let _ = request;
 
-        let (stop, usage, blocks) = match self.collect_stream(request).await {
+        let (stop, usage, blocks) = match self.collect_stream(stream).await {
             Ok(completed) => completed,
             Err(end) => return end,
         };
@@ -864,6 +987,7 @@ impl Turn {
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
         };
+        self.projected_tail.push(assistant.clone());
         self.ledger.stamp(Phase::BatchProposed);
         // The `Completed` boundary is ONE causal event — the assistant item
         // and the usage it was billed at — so it commits as one `Group`:
@@ -1053,6 +1177,13 @@ impl Turn {
                 .into_iter()
                 .map(|item| EntryPayload::Item { item }),
         );
+        // The tail the next head will carry if nothing intervenes — recorded
+        // before `entries` moves into the proposal.
+        self.projected_tail
+            .extend(entries.iter().filter_map(|e| match e {
+                EntryPayload::Item { item } => Some(item.clone()),
+                _ => None,
+            }));
         // `restamp`, not `stamp`: this sample already proposed its own
         // assistant+usage entry in `sample()` — the tool-results commit here
         // is the sample's REAL final propose, so it must overwrite that
@@ -1067,7 +1198,15 @@ impl Turn {
         if cancelled {
             return Some(Outcome::Cancelled);
         }
-        budget_blown.map(|tool| Outcome::ToolFailureBudget { tool })
+        let outcome = budget_blown.map(|tool| Outcome::ToolFailureBudget { tool });
+        if outcome.is_none() {
+            // This is the sample boundary §Causal groups (b) names: the
+            // group carrying the blocks and results is forwarded, its id is
+            // in hand, and the next request can go out now — under no claim
+            // — while that group is still reaching the disk.
+            self.speculate();
+        }
+        outcome
     }
 
     /// The outcome-handling tail every concurrency wrapper in
@@ -1362,12 +1501,56 @@ impl Turn {
         if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
             return Err(SampleEnd::ContextFull);
         }
+        self.maybe_speculate_digest(snapshot, estimate);
+        Ok(self.compose_request(snapshot, estimate, self.samples))
+    }
+
+    /// Fire the speculative compaction digest once the estimate crosses
+    /// [`SPECULATE_TRIGGER`] (M2). Called once per sample on **both** paths:
+    /// an adopted optimistic dispatch never reaches `build_request`, and the
+    /// fold must still get its head start.
+    fn maybe_speculate_digest(&mut self, snapshot: &Arc<Vec<Item>>, estimate: u64) {
+        let window = self.shared.config.context_window.max(1);
         if self.speculation.is_none()
             && !self.shared.config.compaction_reset
             && estimate > (window as f64 * SPECULATE_TRIGGER) as u64
         {
             self.speculation = spawn_speculation(&self.shared, snapshot, &self.cancel);
         }
+    }
+
+    /// The speculative twin of [`Turn::build_request`]: the same compose,
+    /// against the *predicted* snapshot and the sample number that snapshot
+    /// will belong to. `None` when the predicted request would cross the
+    /// compaction trigger — the next sample is going to fold rather than
+    /// sample, and a speculative call there would be pure waste (and, being
+    /// a real billed call, waste of the kind §The side-effect ruling makes
+    /// us account for).
+    ///
+    /// Deliberately does NOT fire the speculative *compaction* digest: that
+    /// is `build_request`'s, once, on the sequential path.
+    fn speculative_request(&self, snapshot: &Arc<Vec<Item>>) -> Option<SamplingRequest> {
+        let window = self.shared.config.context_window.max(1);
+        let estimate = self.estimate_tokens(snapshot);
+        if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
+            return None;
+        }
+        Some(self.compose_request(snapshot, estimate, self.samples + 1))
+    }
+
+    /// Build the request itself. Everything here is a pure function of
+    /// `snapshot`, `estimate` and `sample_no` — which is what makes the
+    /// adopted request byte-identical to the sequential rebuild under leaf
+    /// equality (spec case 9). The one exception is the MOIM turn-context
+    /// block, whose timestamp is read at build time: it is the sanctioned
+    /// ephemeral suffix, regenerated on both paths and never persisted.
+    fn compose_request(
+        &self,
+        snapshot: &Arc<Vec<Item>>,
+        estimate: u64,
+        sample_no: u32,
+    ) -> SamplingRequest {
+        let window = self.shared.config.context_window.max(1);
         let used_pct = self
             .shared
             .config
@@ -1377,9 +1560,9 @@ impl Turn {
             self.shared.clock.now_ms(),
             &self.shared.cwd,
             used_pct,
-            self.samples,
+            sample_no,
         );
-        Ok(SamplingRequest {
+        SamplingRequest {
             model: self.models[self.model_idx].clone(),
             max_tokens: self.shared.config.max_tokens,
             system: Arc::clone(&self.shared.system),
@@ -1388,15 +1571,18 @@ impl Turn {
             thinking: self.shared.config.thinking,
             cache_static: self.shared.config.cache_static,
             turn_context: Some(turn_context),
-        })
+        }
     }
 
-    /// Drain the provider stream (cancel-biased), forwarding deltas.
+    /// Drain the provider stream (cancel-biased), forwarding deltas. Takes
+    /// the stream rather than the request because an adopted speculative
+    /// sample arrives as a stream that is already part-consumed — the
+    /// buffered prefix chained onto the rest (§Causal groups (b)).
     async fn collect_stream(
         &mut self,
-        request: SamplingRequest,
+        stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
     ) -> Result<(StopReason, TokenUsage, Vec<Value>), SampleEnd> {
-        let mut stream = self.shared.provider.stream(request);
+        let mut stream = stream;
         let mut completed = None;
         loop {
             tokio::select! {
@@ -1412,9 +1598,22 @@ impl Turn {
                             self.forward(event).await;
                         }
                     }
-                    Some(Err(e)) if retry::is_context_overflow(&e) => return Err(SampleEnd::ContextFull),
-                    Some(Err(e)) if retry::is_availability(&e) => return Err(SampleEnd::Unavailable(e.to_string())),
-                    Some(Err(e)) => return Err(SampleEnd::Fatal(e.to_string())),
+                    // An error event is terminal for the provider's own
+                    // generator, so draining to end-of-stream here costs one
+                    // more poll — and it is what tells a stream it was
+                    // consumed rather than abandoned mid-flight.
+                    Some(Err(e)) if retry::is_context_overflow(&e) => {
+                        drain_to_end(&mut stream).await;
+                        return Err(SampleEnd::ContextFull);
+                    }
+                    Some(Err(e)) if retry::is_availability(&e) => {
+                        drain_to_end(&mut stream).await;
+                        return Err(SampleEnd::Unavailable(e.to_string()));
+                    }
+                    Some(Err(e)) => {
+                        drain_to_end(&mut stream).await;
+                        return Err(SampleEnd::Fatal(e.to_string()));
+                    }
                     None => break,
                 }
             }
@@ -1520,32 +1719,112 @@ impl Turn {
         await_speculation(handle, &self.cancel, SPECULATION_WAIT).await
     }
 
-    /// The sample-boundary refresh (commit-protocol.md §Read invariant,
-    /// amendment 2): wait until the published head has applied everything
-    /// this turn committed, then read it. `my_ack_seq` is the `seq` the
-    /// turn's last ticket carried — known at issue time, and already
-    /// confirmed durable by barrier (b)'s drain, which runs *before* this
-    /// and never below it (a ticket is the only place a sealed log is
-    /// reported, so a watch-only wait would hang on one).
+    /// The sample boundary: barrier (b)'s ticket drain, then the refresh —
+    /// with an un-adopted speculative stream pulled **concurrently**. That
+    /// overlap is what §Causal groups (b) buys: the boundary group's fsync
+    /// and the next sample's first bytes are in flight at the same time.
     ///
-    /// The wait is normally already satisfied when it is reached: the actor
-    /// applies, publishes, and only then resolves the ticket the drain just
-    /// took. `None` means the session is gone (the actor dropped the
-    /// channel).
-    async fn refresh(&mut self) -> Option<Arc<crate::actor::ProjectionHead>> {
-        match self.pipeline.ack_seq() {
-            Some(my_ack_seq) => self
-                .head
-                .wait_for(|head| head.epoch() >= my_ack_seq)
-                .await
-                .ok()
-                .map(|head| Arc::clone(&head)),
-            // Nothing committed yet this turn (the first sample): whatever
-            // the actor last published already contains the prompt that
-            // spawned this turn — it was appended, applied and published
-            // before the spawn.
-            None => Some(Arc::clone(&self.head.borrow())),
+    /// The refresh is what the boundary waits on, never the stream: a
+    /// stalled provider must not wedge a turn, so filling the buffer only
+    /// ever gets the time the refresh takes.
+    async fn boundary(&mut self) -> (Commit, Option<Arc<crate::actor::ProjectionHead>>) {
+        // Disjoint field borrows, so the two futures below can run at once.
+        let Turn {
+            pipeline,
+            speculative,
+            head,
+            ..
+        } = self;
+        let refresh = async {
+            // Barrier (b) (commit-protocol.md §Pipelined commits): what the
+            // next sample is built from must be a projection that already
+            // contains everything this turn committed. The drain IS the
+            // barrier — a ticket is the only place a sealed log is reported,
+            // so waiting on the published head alone would wait forever on
+            // one — and the watch wait below FOLLOWS it, never replaces it.
+            let commit = pipeline.drain().await;
+            // The wait FOLLOWS the drain and never substitutes for it: on a
+            // sealed log the published head stops advancing at precisely the
+            // moment the news is sitting in an unread ticket, so a turn that
+            // waited here would wait forever (§Read invariant).
+            if !commit.ok() {
+                return (commit, None);
+            }
+            let head = match pipeline.ack_seq() {
+                Some(my_ack_seq) => head
+                    .wait_for(|head| head.epoch() >= my_ack_seq)
+                    .await
+                    .ok()
+                    .map(|head| Arc::clone(&head)),
+                // Nothing committed yet this turn (its first sample):
+                // whatever the actor last published already contains the
+                // prompt that spawned this turn — appended, applied and
+                // published before the spawn.
+                None => Some(Arc::clone(&head.borrow())),
+            };
+            (commit, head)
+        };
+        let mut refresh = std::pin::pin!(refresh);
+        match speculative.as_mut() {
+            Some(spec) => tokio::select! {
+                refreshed = &mut refresh => refreshed,
+                // The buffer filled first: stop overlapping and finish the
+                // refresh, which is the only thing adoption may be gated on.
+                _ = spec.fill() => refresh.await,
+            },
+            None => refresh.await,
         }
+    }
+
+    /// Optimistic next-sample dispatch (commit-protocol.md §Causal groups
+    /// (b)): the boundary group is forwarded and its id is already known, so
+    /// build the next request from the blocks and results in hand and send
+    /// it — un-adopted, under no claim at all. The refresh at the next
+    /// boundary decides whether it counts.
+    ///
+    /// Only ever called where the turn is about to sample again, and only
+    /// under `AckMode::Pipelined` (a `Sync` proposal issues no ticket, so
+    /// there is no `expected_leaf` to adopt against — which is also what
+    /// keeps the `Sync` comparison run speculation-free).
+    fn speculate(&mut self) {
+        if self.cancel.is_cancelled() || self.speculative.is_some() {
+            return;
+        }
+        let Some(expected_leaf) = self.pipeline.leaf().map(str::to_string) else {
+            return;
+        };
+        let Some(predicted) = self.predicted_snapshot() else {
+            return;
+        };
+        let Some(request) = self.speculative_request(&predicted) else {
+            return;
+        };
+        let stream = self.shared.provider.stream(request.clone());
+        self.speculative = Some(Speculation {
+            expected_leaf,
+            request,
+            stream: SyncStream::new(stream),
+            buffered: Vec::new(),
+            terminal: false,
+        });
+    }
+
+    /// What the next head will contain if nothing intervenes: the snapshot
+    /// this sample was built from, plus everything this turn committed since
+    /// — with the ephemeral todo reminder regenerated at the tail, exactly
+    /// where `ProjectionHead::snapshot` puts it. Under leaf equality this is
+    /// not a guess: no other entry can have landed, so it is the same list
+    /// the sequential rebuild would read.
+    fn predicted_snapshot(&self) -> Option<Arc<Vec<Item>>> {
+        let last = self.last_snapshot.as_deref()?;
+        let durable = durable_len(last);
+        let mut items = last[..durable].to_vec();
+        items.extend(self.projected_tail.iter().cloned());
+        // The reminder is regenerated per read and always last; todos can
+        // only have changed by way of a durable `Todos` entry, which would
+        // move the leaf and refuse the adoption.
+        items.extend(last[durable..].iter().cloned());
+        Some(Arc::new(items))
     }
 
     /// Serialize + mask every entry (commit-protocol.md §Proposal payloads)
@@ -1736,6 +2015,22 @@ impl Turn {
         self.emit(mapped).await;
     }
 }
+
+/// Poll a stream that has already reported its terminal error to its end,
+/// bounded so a misbehaving provider cannot turn "finish the stream" into a
+/// second unbounded await.
+pub(crate) async fn drain_to_end(
+    stream: &mut BoxStream<'static, Result<StreamEvent, ProviderError>>,
+) {
+    for _ in 0..DRAIN_MAX {
+        if stream.next().await.is_none() {
+            return;
+        }
+    }
+}
+
+/// Events [`drain_to_end`] will poll past a terminal error before giving up.
+const DRAIN_MAX: usize = 64;
 
 /// The durable prefix of a snapshot. `actor::snapshot_with_todos` appends an
 /// ephemeral todo reminder as the last item when the list is non-empty; that

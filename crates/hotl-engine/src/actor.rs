@@ -1604,6 +1604,12 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
                 Ok(_) => {}
                 Err(_) => {
                     text = None;
+                    // Finish the stream rather than abandoning it
+                    // mid-flight: an error event is terminal for the
+                    // provider's own generator, so this is one more poll,
+                    // and it is what marks the attempt as really consumed
+                    // rather than left in flight.
+                    crate::turn::drain_to_end(&mut stream).await;
                     break;
                 }
             }

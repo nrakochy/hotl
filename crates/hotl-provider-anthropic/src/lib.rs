@@ -154,6 +154,19 @@ impl AnthropicProvider {
     }
 }
 
+/// The exact JSON body this provider puts on the wire for `req`.
+///
+/// `#[doc(hidden)] pub` so a test can assert two `SamplingRequest`s
+/// serialize *identically at the wire level*, not merely structurally —
+/// commit-protocol.md case 9 requires the adopted speculative request to be
+/// proven equal to the sequential rebuild "against the provider-serialized
+/// body". Production code has no reason to call this; the streaming path
+/// builds its own body inline.
+#[doc(hidden)]
+pub fn wire_body(req: &SamplingRequest) -> Value {
+    AnthropicProvider::build_body(req)
+}
+
 fn tool_json(t: &ToolDef) -> Value {
     json!({"name": t.name, "description": t.description, "input_schema": t.input_schema})
 }

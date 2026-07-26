@@ -22,6 +22,19 @@ use std::time::Instant;
 /// otherwise right after `LastBlockEnd`. Every other phase is written
 /// exactly once by construction, so `stamp`'s first-wins rule is what
 /// applies to them.
+///
+/// **Declaration order is stamp order, not wall order** — and since S2c's
+/// optimistic dispatch those two genuinely diverge. A sample whose request
+/// was dispatched at the *previous* boundary already had bytes on the wire
+/// before this sample's `BoundaryStart`: its true first byte can precede the
+/// previous sample's `WatermarkDurable`, which is the overlap the mechanism
+/// exists for, not a measurement error. Every stamp is taken when the turn
+/// **observes** the event, so the recorded sequence stays monotone and the
+/// summary needs no special case; what a reader must not do is treat
+/// `RequestBuilt→FirstByte` on an adopted sample as a round-trip
+/// measurement. It is the time to *notice* a byte that was already there,
+/// and it is legitimately near zero. ([`width`] saturates either way, so an
+/// out-of-order pair reports `0` rather than wrapping.)
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Phase {

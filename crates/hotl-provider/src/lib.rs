@@ -103,7 +103,9 @@ pub enum StreamEvent {
     },
 }
 
-#[derive(Debug, thiserror::Error)]
+/// `Clone` so a scripted stream can hand its script back when it is
+/// abandoned (see [`ScriptedProvider`]); every variant is plain data.
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum ProviderError {
     #[error("authentication failed: {0}")]
     Auth(String),
@@ -129,15 +131,74 @@ pub trait Provider: Send + Sync {
 /// The honest "second impl" (D9): a scripted provider driving the real engine
 /// in tests. Each `stream()` call pops the next script.
 pub struct ScriptedProvider {
-    scripts: Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>,
+    /// `Arc` so a handed-out stream can give its script back on drop —
+    /// see [`ScriptedStream`].
+    scripts: ScriptQueue,
     /// Every request the engine made, for test assertions on what the model saw.
     requests: Mutex<Vec<SamplingRequest>>,
+}
+
+/// One sample's worth of scripted events.
+type Script = Vec<Result<StreamEvent, ProviderError>>;
+/// The scripts a [`ScriptedProvider`] has left to hand out, shared with
+/// every stream it hands out so an abandoned one can give its script back.
+type ScriptQueue = Arc<Mutex<VecDeque<Script>>>;
+
+/// One scripted sample, in flight.
+///
+/// **A stream abandoned before end-of-stream returns its script** to the
+/// front of the queue. That is what makes optimistic dispatch (S2c) testable:
+/// a speculative sample cancelled on a mispredict must not eat the reply the
+/// sequential rebuild is about to ask for. A stream the consumer drove to
+/// `None` restores nothing — that script was really consumed — so every
+/// ordinary scenario is unaffected, and an engine that abandons a stream
+/// mid-flight (a cancelled turn, a mispredict) leaves the queue exactly as
+/// it found it.
+struct ScriptedStream {
+    script: Script,
+    pos: usize,
+    /// Set when `poll_next` has answered `None`: the script is spent.
+    exhausted: bool,
+    scripts: ScriptQueue,
+}
+
+impl futures_util::Stream for ScriptedStream {
+    type Item = Result<StreamEvent, ProviderError>;
+
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.script.get(this.pos) {
+            Some(event) => {
+                this.pos += 1;
+                std::task::Poll::Ready(Some(event.clone()))
+            }
+            None => {
+                this.exhausted = true;
+                std::task::Poll::Ready(None)
+            }
+        }
+    }
+}
+
+impl Drop for ScriptedStream {
+    fn drop(&mut self) {
+        if self.exhausted {
+            return;
+        }
+        self.scripts
+            .lock()
+            .expect("scripted provider mutex")
+            .push_front(std::mem::take(&mut self.script));
+    }
 }
 
 impl ScriptedProvider {
     pub fn new(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Self {
         Self {
-            scripts: Mutex::new(scripts.into()),
+            scripts: Arc::new(Mutex::new(scripts.into())),
             requests: Mutex::new(Vec::new()),
         }
     }
@@ -238,7 +299,12 @@ impl Provider for ScriptedProvider {
                     "scripted provider exhausted".into(),
                 ))]
             });
-        Box::pin(futures_util::stream::iter(script))
+        Box::pin(ScriptedStream {
+            script,
+            pos: 0,
+            exhausted: false,
+            scripts: Arc::clone(&self.scripts),
+        })
     }
 }
 
