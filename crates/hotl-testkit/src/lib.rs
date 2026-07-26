@@ -1748,11 +1748,16 @@ mod tests {
     /// Claim 4 is the one a byte-identity test cannot make: it is a statement
     /// about two *different* requests, and it is what the original bug broke.
     ///
-    /// (4b) deliberately admits N+1's own shallower markers as anchors: cache
-    /// entries are **prefix-cumulative**, so a breakpoint that reaches back to
-    /// an entry written earlier *in the same request* is a hit, not a miss.
+    /// (4b) deliberately admits N+1's own shallower markers as chain links.
+    /// Not because a deeper breakpoint can *read* one — within a single
+    /// request the lookup runs against entries that already existed, and
+    /// nothing can read an entry this same request is still creating. The
+    /// reason is that the content between N+1's own markers is **new**: it has
+    /// to be written this request no matter where the markers sit, so there is
+    /// no miss to price. What matters is the state afterwards — entries now
+    /// exist at both positions, so the chain N+2 walks back through is intact.
     /// Requiring every marker to reach a marker of N alone would fail on
-    /// correct code — a request that adds an anchor deeper than anything the
+    /// correct code: a request that adds an anchor deeper than anything the
     /// previous request marked is exactly what a growing history is supposed
     /// to do.
     fn assert_stable_cache_prefix(requests: &[SamplingRequest]) {
@@ -2235,23 +2240,34 @@ mod tests {
         h
     }
 
+    /// Rolling anchors in a request's plan: every marker in the durable body
+    /// except the deepest, which is always `latest`.
+    fn anchor_count(req: &SamplingRequest) -> usize {
+        marker_positions(&durable_wire_body(req))
+            .len()
+            .saturating_sub(1)
+    }
+
     /// The anchor half of case 9's fixture, asserted rather than assumed: the
     /// first request already carries a rolling anchor, and the turn's tool
     /// batch crosses the next stride boundary, so the second request carries
     /// an anchor the first did not. Without both, "the adopted request equals
     /// the rebuild" is a claim about a history with no anchors in it.
+    ///
+    /// Only applies to fixtures whose batch is **at least two calls wide** —
+    /// see [`dawdle_then_reply`]. With a one-call batch the single
+    /// `tool_result` block is itself `latest`, a crossing landing on it is
+    /// deduped away, and no new anchor appears; assert
+    /// [`anchor_count`] directly on such a fixture instead.
     fn assert_the_speculated_tail_crossed_an_anchor(requests: &[SamplingRequest]) {
         let first = marker_positions(&durable_wire_body(&requests[0]));
         let second = marker_positions(&durable_wire_body(&requests[1]));
-        // The last position is the LATEST marker; everything before it is an
-        // anchor.
-        let anchors = |m: &[usize]| m.len().saturating_sub(1);
         assert!(
-            anchors(&first) >= 1,
+            anchor_count(&requests[0]) >= 1,
             "the seeded history must already have a rolling anchor: {first:?}"
         );
         assert!(
-            anchors(&second) > anchors(&first),
+            anchor_count(&requests[1]) > anchor_count(&requests[0]),
             "the speculated tail must cross a stride boundary — a NEW anchor, \
              not merely a new latest: {first:?} -> {second:?}"
         );
@@ -2393,12 +2409,40 @@ mod tests {
             mispredicted.kinds()
         );
 
+        // The mispredict path must be exercised WITH rolling anchors present,
+        // or it proves nothing about the planner. `steered_tool_turn`'s
+        // `anchored_history` seed is what supplies them, and nothing else in
+        // this test would fail if that seed shrank — so say it here.
+        //
+        // `assert_the_speculated_tail_crossed_an_anchor` does NOT fit this
+        // fixture: its batch is a single `dawdle` call, so the one
+        // `tool_result` block *is* `latest` and the crossing that lands on it
+        // is deduped away — both requests carry exactly one anchor, and the
+        // helper's "strictly more anchors" half would fail. The claim here is
+        // only that anchors exist at all.
+        let reqs = mispredicted.provider.requests();
+        for (label, req) in [
+            ("the cancelled speculation", &reqs[1]),
+            ("its sequential rebuild", &reqs[2]),
+        ] {
+            assert!(
+                anchor_count(req) >= 1,
+                "{label} must plan over a history that already has a rolling \
+                 anchor: {:?}",
+                marker_positions(&durable_wire_body(req))
+            );
+        }
+
         // …and the transcript is the one a never-speculated run produces.
         let sequential = steered_tool_turn(hotl_engine::AckMode::Sync).await;
         assert_eq!(
             sequential.provider.request_count(),
             2,
             "Sync mode never speculates, so it never mispredicts"
+        );
+        assert!(
+            anchor_count(&sequential.provider.requests()[1]) >= 1,
+            "the never-speculated rebuild plans over the same anchored history"
         );
         assert_eq!(mispredicted.transcript(), sequential.transcript());
     }

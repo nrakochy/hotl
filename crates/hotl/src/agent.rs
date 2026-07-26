@@ -702,7 +702,8 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
 /// drops the send/resolves to `NoHuman` — nobody is listening any more.
 /// What a top-level session's `spawn` tool needs, threaded in per-session
 /// (not baked into the shared `Scaffold.registry`) because `fork` needs a
-/// weak sender bound to *this* session's own actor — see `snapshot_provider`.
+/// reader of *this* session's own published head — see `snapshot_provider`,
+/// which holds a `HeadCell` (a `watch::Receiver`), not a sender of any kind.
 /// `None` for a child session (`HotlChildBuilder`): depth-1 is structural,
 /// children never get a `spawn` tool at all.
 struct SpawnRegistration {
