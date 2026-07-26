@@ -591,8 +591,10 @@ impl Turn {
         self.run_tool_batch(&uses).await
     }
 
-    /// Execute the batch with results paired in source order. The batch is
-    /// split into chunks: contiguous runs of parallel-safe calls (pure reads,
+    /// Execute the batch with results paired in source order. A single-tool
+    /// batch — the majority case — runs inline, skipping the chunking and
+    /// `join_all` machinery below (§S1 diet (1)). Everything else is split
+    /// into chunks: contiguous runs of parallel-safe calls (pure reads,
     /// isolated children) execute concurrently; everything else runs alone,
     /// in order. Gating stays serial — asks are one-at-a-time human moments.
     /// Mutating batches (anything beyond `read`) are bracketed by shadow
@@ -615,34 +617,45 @@ impl Turn {
         let mut results = Vec::with_capacity(uses.len());
         let mut budget_blown: Option<String> = None;
         self.ledger.stamp(Phase::ToolsSpawned);
-        for chunk in parallel_chunks(uses, &self.shared.registry) {
-            if self.cancel.is_cancelled() || budget_blown.is_some() {
-                for tu in chunk {
-                    results.push(pair(tu, "Not executed (turn stopped).", true));
+        if let [only] = uses {
+            // §S1 diet (1): a single-tool batch is the majority case — skip
+            // `parallel_chunks` and `join_all` entirely and run the one call
+            // inline. Same gate → execute → outcome-handling body the
+            // multi-tool branch below runs per call (via `finish_call`), same
+            // `self.cancel` race inside `gate`/`execute` — there is just
+            // nothing to wrap it in a concurrency combinator for.
+            if self.cancel.is_cancelled() {
+                results.push(pair(only, "Not executed (turn stopped).", true));
+            } else {
+                let gate = self.gate(only).await;
+                let executed = self.execute(only, gate).await;
+                results.push(self.finish_call(only, executed, &mut budget_blown).await);
+            }
+        } else {
+            for chunk in parallel_chunks(uses, &self.shared.registry) {
+                if self.cancel.is_cancelled() || budget_blown.is_some() {
+                    for tu in chunk {
+                        results.push(pair(tu, "Not executed (turn stopped).", true));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            let mut gates = Vec::with_capacity(chunk.len());
-            for tu in chunk {
-                gates.push(self.gate(tu).await);
-            }
-            // A chunk is one serial call or a run of parallel-safe calls that
-            // overlap; join_all returns outcomes in source order either way.
-            let outcomes = futures_util::future::join_all(
-                chunk
-                    .iter()
-                    .zip(gates)
-                    .map(|(tu, gate)| self.execute(tu, gate)),
-            )
-            .await;
-            for (tu, mut executed) in chunk.iter().zip(outcomes) {
-                self.maybe_evict(tu, &mut executed.outcome).await;
-                let (content, failed) = self.apply_failure_budget(tu, executed, &mut budget_blown);
-                results.push(ToolResultItem {
-                    tool_use_id: tu.id.clone(),
-                    content,
-                    is_error: failed,
-                });
+                let mut gates = Vec::with_capacity(chunk.len());
+                for tu in chunk {
+                    gates.push(self.gate(tu).await);
+                }
+                // A chunk is one serial call or a run of parallel-safe calls
+                // that overlap; join_all returns outcomes in source order
+                // either way.
+                let outcomes = futures_util::future::join_all(
+                    chunk
+                        .iter()
+                        .zip(gates)
+                        .map(|(tu, gate)| self.execute(tu, gate)),
+                )
+                .await;
+                for (tu, executed) in chunk.iter().zip(outcomes) {
+                    results.push(self.finish_call(tu, executed, &mut budget_blown).await);
+                }
             }
         }
         self.ledger.stamp(Phase::ToolsJoined);
@@ -675,6 +688,28 @@ impl Turn {
             return Some(Outcome::Cancelled);
         }
         budget_blown.map(|tool| Outcome::ToolFailureBudget { tool })
+    }
+
+    /// The outcome-handling tail every concurrency wrapper in
+    /// [`Turn::run_tool_batch`] runs once per already-executed call, in
+    /// source order: evict an oversized result, score it against the
+    /// failure budget, and build its `ToolResultItem`. Shared so the inline
+    /// single-tool path (diet 1) and a `join_all`'d multi-tool chunk commit
+    /// identical result shapes from identical `Executed` values — only how
+    /// `gate`+`execute` got run (one await vs. concurrently) differs.
+    async fn finish_call(
+        &mut self,
+        tu: &ToolUse,
+        mut executed: Executed,
+        budget_blown: &mut Option<String>,
+    ) -> ToolResultItem {
+        self.maybe_evict(tu, &mut executed.outcome).await;
+        let (content, failed) = self.apply_failure_budget(tu, executed, budget_blown);
+        ToolResultItem {
+            tool_use_id: tu.id.clone(),
+            content,
+            is_error: failed,
+        }
     }
 
     /// Track per-tool consecutive failures; attach `<retry attempts_left>`
