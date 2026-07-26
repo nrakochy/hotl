@@ -11,14 +11,23 @@
 
 mod sse;
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
-use hotl_provider::{Provider, ProviderError, SamplingRequest, StreamEvent, ToolDef};
+use hotl_provider::{
+    ArmGuard, Provider, ProviderError, SamplingRequest, StreamEvent, ToolDef, Warmable,
+};
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
+
+/// §S3.2: bounds the warm request end-to-end (connect + TLS + response),
+/// independent of (and shorter than) the client's own `connect_timeout` —
+/// arming is opportunistic, so a slow/unroutable origin must not hold a
+/// background task open for the client's full, much more generous, bound.
+const ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub const DEFAULT_MODEL: &str = "claude-opus-4-8";
 pub const DEFAULT_BASE_URL: &str = "https://api.anthropic.com/v1";
@@ -53,6 +62,12 @@ fn http_client(connect: std::time::Duration) -> reqwest::Client {
         .connect_timeout(connect)
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
+        // §S3.2: an HTTP/2 ping every 15s, even while the connection is
+        // otherwise idle, keeps a pooled connection alive across a human's
+        // multi-minute pause instead of it being reclaimed and re-paying
+        // DNS+TCP+TLS on the next sample.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+        .http2_keep_alive_while_idle(true)
         .build()
         .expect("reqwest client with timeouts (TLS backend unavailable?)")
 }
@@ -64,6 +79,15 @@ pub struct AnthropicProvider {
     no_credential: bool,
     headers_timeout: std::time::Duration,
     stream_idle_timeout: std::time::Duration,
+    /// §S3.2 idempotency: `0` when idle, else the generation token of the
+    /// in-flight warm request — so a re-arm while already armed is a no-op
+    /// instead of a duplicate handshake. A generation (not a plain bool) so
+    /// a guard whose own task already finished can never clobber a *later*
+    /// arm's state if it is dropped late: its cancel closure only clears
+    /// the flag if it still holds *its own* token (see `spawn_arm`). Shared
+    /// (not per-`ArmGuard`) because idempotency is a property of the
+    /// provider's pool, not of any one caller's guard.
+    armed: Arc<AtomicU64>,
 }
 
 impl AnthropicProvider {
@@ -75,6 +99,7 @@ impl AnthropicProvider {
             no_credential: false,
             headers_timeout: hotl_provider::timeouts::HEADERS,
             stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
+            armed: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -313,7 +338,65 @@ async fn handle_auth_fail(
     }
 }
 
+/// Process-wide source of `spawn_arm` generation tokens (§S3.2). Global
+/// rather than per-provider: uniqueness across the process's lifetime is all
+/// a token needs, and a single counter is simpler than threading a
+/// per-provider one through — see the field doc on `AnthropicProvider::armed`
+/// for why a token, not a plain bool, is load-bearing here.
+static NEXT_ARM_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// §S3.2: fire one lightweight, credential-free GET at `url` to populate
+/// `client`'s connection pool — the TCP+TLS handshake is the point; a 4xx
+/// response is a fine outcome and every error is swallowed (failure must be
+/// invisible: arming a session must never surface a warning, let alone fail
+/// it, over a background optimization). `armed` makes concurrent/back-to-back
+/// arms idempotent: a re-arm while a warm request is already in flight is a
+/// no-op rather than a second connection. Each real (non-noop) call claims a
+/// fresh generation token and only ever clears `armed` via a
+/// compare-exchange against *that* token, so a guard whose task already
+/// finished can't clobber a later, still-in-flight arm if it's dropped late.
+fn spawn_arm(client: reqwest::Client, url: String, armed: Arc<AtomicU64>) -> ArmGuard {
+    if armed.load(Ordering::Acquire) != 0 {
+        return ArmGuard::noop();
+    }
+    let token = NEXT_ARM_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if armed
+        .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // Lost a race to another concurrent arm() — that one owns arming now.
+        return ArmGuard::noop();
+    }
+    let task_flag = armed.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(ARM_TIMEOUT, client.get(&url).send()).await;
+        let _ = task_flag.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+    });
+    let cancel_flag = armed;
+    ArmGuard::new(move || {
+        handle.abort();
+        // A no-op if the task already cleared it (raced us to completion)
+        // or if a later arm() has already superseded this token — either
+        // way, this guard only ever clears state it still owns.
+        let _ = cancel_flag.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+    })
+}
+
+impl Warmable for AnthropicProvider {
+    fn arm(&self) -> ArmGuard {
+        spawn_arm(
+            self.client.clone(),
+            self.api_url.clone(),
+            self.armed.clone(),
+        )
+    }
+}
+
 impl Provider for AnthropicProvider {
+    fn arm(&self) -> ArmGuard {
+        <Self as Warmable>::arm(self)
+    }
+
     fn stream(
         &self,
         req: SamplingRequest,
@@ -581,6 +664,164 @@ mod tests {
             events.last(),
             Some(Ok(StreamEvent::Completed { .. }))
         ));
+    }
+
+    /// §S3.2: the HTTP/2 keep-alive knobs must ride the same builder as the
+    /// existing timeouts, not a separate client construction path a future
+    /// edit could drift out of sync with.
+    #[test]
+    fn the_client_enables_http2_keep_alive() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("http2_keep_alive_interval"));
+        assert!(src.contains("http2_keep_alive_while_idle"));
+    }
+
+    /// §S3.2 unit: dropping an armed guard resets "currently arming" state
+    /// synchronously — the RAII contract, tested directly against
+    /// `spawn_arm` rather than by racing a mock server's socket-close timing
+    /// (hyper's own cancel-to-close latency is an implementation detail,
+    /// not the contract this guard promises).
+    #[tokio::test]
+    async fn spawn_arm_drop_resets_the_armed_flag_immediately() {
+        let armed = Arc::new(AtomicU64::new(0));
+        // Never resolved before the test ends — irrelevant here, since the
+        // assertion is about `drop`'s synchronous effect, not the task's.
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            "http://192.0.2.1/".into(),
+            armed.clone(),
+        );
+        assert_ne!(
+            armed.load(Ordering::Acquire),
+            0,
+            "arm() must mark the provider as arming"
+        );
+        drop(guard);
+        assert_eq!(
+            armed.load(Ordering::Acquire),
+            0,
+            "drop must reset armed state immediately — not wait for the background \
+             task or its internal timeout"
+        );
+    }
+
+    /// §S3.2 unit: a second `arm()` while the first is still armed is a
+    /// no-op — dropping it must not disturb the still-live first guard's
+    /// state (only dropping *that one* resets `armed`).
+    #[tokio::test]
+    async fn spawn_arm_second_call_while_armed_is_a_noop() {
+        let armed = Arc::new(AtomicU64::new(0));
+        let client = http_client(std::time::Duration::from_secs(1));
+        let g1 = spawn_arm(client.clone(), "http://192.0.2.1/".into(), armed.clone());
+        let before = armed.load(Ordering::Acquire);
+        let g2 = spawn_arm(client, "http://192.0.2.1/".into(), armed.clone());
+        drop(g2);
+        assert_eq!(
+            armed.load(Ordering::Acquire),
+            before,
+            "a no-op re-arm's drop must not reset state owned by the still-live first guard"
+        );
+        drop(g1);
+        assert_eq!(armed.load(Ordering::Acquire), 0);
+    }
+
+    /// §S3.2 unit: arming against a target nothing is listening on (a
+    /// connection-refused failure — the fastest-failing "unroutable" shape
+    /// available offline) must not panic and must not leak its background
+    /// task: `armed` comes back down to idle on its own well within the arm
+    /// timeout.
+    #[tokio::test]
+    async fn spawn_arm_against_a_refused_target_does_not_leak_its_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // nothing listens on `addr` from here on: refused fast
+        let armed = Arc::new(AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            format!("http://{addr}/"),
+            armed.clone(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while armed.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a refused warm request must not leak its background task");
+        drop(guard); // already finished — a no-op abort, must not panic
+    }
+
+    /// §S3.2 unit: a target that never answers at all (no refusal, no
+    /// response — the genuinely "unroutable" case, RFC 5737 TEST-NET-1) must
+    /// still be bounded by the internal arm timeout rather than hanging
+    /// forever.
+    #[tokio::test]
+    async fn spawn_arm_against_a_black_holed_target_is_bounded_by_the_arm_timeout() {
+        let armed = Arc::new(AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            "http://192.0.2.1/".into(),
+            armed.clone(),
+        );
+        tokio::time::timeout(ARM_TIMEOUT + std::time::Duration::from_secs(3), async {
+            while armed.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a black-holed target must not hang past the internal arm timeout");
+        drop(guard);
+    }
+
+    /// §S3.2 unit: a guard whose own warm request already finished (on its
+    /// own, before the guard was dropped) must not clobber a *later,
+    /// still-in-flight* arm when it is finally dropped late. Without this,
+    /// "idempotent" would only hold while callers never hold a guard past
+    /// their task's own completion — a real usage pattern this API invites
+    /// (nothing stops a caller from holding a guard and re-arming later).
+    #[tokio::test]
+    async fn a_late_dropped_stale_guard_does_not_clobber_a_newer_arm() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener); // refused fast: g1's task finishes quickly, on its own
+        let armed = Arc::new(AtomicU64::new(0));
+        let client = http_client(std::time::Duration::from_secs(1));
+        let g1 = spawn_arm(client.clone(), format!("http://{addr}/"), armed.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while armed.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("g1's task must finish on its own before we proceed");
+        // A genuinely new, still-in-flight arm — legitimate, since g1 is done.
+        let g2 = spawn_arm(client, "http://192.0.2.1/".into(), armed.clone());
+        assert_ne!(armed.load(Ordering::Acquire), 0, "g2 must be in flight");
+        // g1 is stale (its own task is long finished) but still held — drop
+        // it now, late.
+        drop(g1);
+        assert_ne!(
+            armed.load(Ordering::Acquire),
+            0,
+            "dropping the stale g1 must not clobber g2's still-in-flight state"
+        );
+        drop(g2);
+        assert_eq!(armed.load(Ordering::Acquire), 0);
+    }
+
+    /// The public wiring: `Provider::arm` (the dyn-dispatchable entry point
+    /// every call site outside this crate uses) must reach the same
+    /// `Warmable` impl, not a stray default. A fast-refusing target keeps
+    /// this smoke test quick.
+    #[tokio::test]
+    async fn provider_arm_reaches_the_warmable_impl_without_panicking() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(None)))
+            .with_base_url(&format!("http://{addr}"));
+        let guard = Provider::arm(&p);
+        drop(guard); // must not panic
     }
 
     /// A 400 is terminal — no blind retry, and the message reaches the user.

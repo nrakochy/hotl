@@ -18,16 +18,25 @@
 //! - responses map back to canonical blocks (tool_calls → `tool_use` blocks),
 //!   so a session can cross dialects mid-conversation in either direction.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
-use hotl_provider::{Provider, ProviderError, SamplingRequest, SseAssembler, StreamEvent, ToolDef};
+use hotl_provider::{
+    ArmGuard, Provider, ProviderError, SamplingRequest, SseAssembler, StreamEvent, ToolDef,
+    Warmable,
+};
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// §S3.2: bounds the warm request end-to-end, independent of (and shorter
+/// than) the client's own `connect_timeout` — see the twin constant in
+/// `hotl-provider-anthropic` for the full rationale.
+const ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Marks a failed tool result in the chat-completions dialect.
 ///
@@ -52,6 +61,12 @@ fn http_client(connect: std::time::Duration) -> reqwest::Client {
         .connect_timeout(connect)
         .tcp_keepalive(std::time::Duration::from_secs(30))
         .pool_idle_timeout(std::time::Duration::from_secs(90))
+        // §S3.2: an HTTP/2 ping every 15s, even while the connection is
+        // otherwise idle, keeps a pooled connection alive across a human's
+        // multi-minute pause instead of it being reclaimed and re-paying
+        // DNS+TCP+TLS on the next sample.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+        .http2_keep_alive_while_idle(true)
         .build()
         .expect("reqwest client with timeouts (TLS backend unavailable?)")
 }
@@ -63,6 +78,10 @@ pub struct OpenAiCompatProvider {
     headers_timeout: std::time::Duration,
     stream_idle_timeout: std::time::Duration,
     legacy_max_tokens: bool,
+    /// §S3.2 idempotency: `0` when idle, else the generation token of the
+    /// in-flight warm request — see the twin field in
+    /// `hotl-provider-anthropic` for the full rationale.
+    armed: Arc<AtomicU64>,
 }
 
 impl OpenAiCompatProvider {
@@ -74,7 +93,15 @@ impl OpenAiCompatProvider {
             headers_timeout: hotl_provider::timeouts::HEADERS,
             stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
             legacy_max_tokens: false,
+            armed: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// The chat-completions endpoint for this provider's base URL. Shared by
+    /// `stream()` and the §S3.2 warm request so the two can never disagree
+    /// about where the connection pool's origin is.
+    fn completions_url(&self) -> String {
+        format!("{}/chat/completions", self.base_url.trim_end_matches('/'))
     }
 
     /// Override the defaults (a slow local endpoint, or a test that wants a
@@ -429,13 +456,59 @@ async fn send_attempt(
     }
 }
 
+/// Process-wide source of `spawn_arm` generation tokens (§S3.2) — see the
+/// twin static in `hotl-provider-anthropic` for the full rationale.
+static NEXT_ARM_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// §S3.2: fire one lightweight, credential-free GET at `url` to populate
+/// `client`'s connection pool. See the twin function in
+/// `hotl-provider-anthropic` for the full rationale — kept duplicated rather
+/// than shared, matching this pair of crates' existing convention (compare
+/// `http_client`, `classify_send`, `send_attempt` above).
+fn spawn_arm(client: reqwest::Client, url: String, armed: Arc<AtomicU64>) -> ArmGuard {
+    if armed.load(Ordering::Acquire) != 0 {
+        return ArmGuard::noop();
+    }
+    let token = NEXT_ARM_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if armed
+        .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return ArmGuard::noop();
+    }
+    let task_flag = armed.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(ARM_TIMEOUT, client.get(&url).send()).await;
+        let _ = task_flag.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+    });
+    let cancel_flag = armed;
+    ArmGuard::new(move || {
+        handle.abort();
+        let _ = cancel_flag.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+    })
+}
+
+impl Warmable for OpenAiCompatProvider {
+    fn arm(&self) -> ArmGuard {
+        spawn_arm(
+            self.client.clone(),
+            self.completions_url(),
+            self.armed.clone(),
+        )
+    }
+}
+
 impl Provider for OpenAiCompatProvider {
+    fn arm(&self) -> ArmGuard {
+        <Self as Warmable>::arm(self)
+    }
+
     fn stream(
         &self,
         req: SamplingRequest,
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let client = self.client.clone();
-        let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
+        let url = self.completions_url();
         let source = self.key_source.clone();
         let headers_timeout = self.headers_timeout;
         let stream_idle_timeout = self.stream_idle_timeout;
@@ -959,6 +1032,151 @@ mod tests {
             matches!(events.last(), Some(Ok(StreamEvent::Completed { .. }))),
             "the terminal event was dropped with the unterminated line: {events:?}"
         );
+    }
+
+    /// §S3.2: the HTTP/2 keep-alive knobs must ride the same builder as the
+    /// existing timeouts.
+    #[test]
+    fn the_client_enables_http2_keep_alive() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("http2_keep_alive_interval"));
+        assert!(src.contains("http2_keep_alive_while_idle"));
+    }
+
+    /// §S3.2 unit: dropping an armed guard resets "currently arming" state
+    /// synchronously.
+    #[tokio::test]
+    async fn spawn_arm_drop_resets_the_armed_flag_immediately() {
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            "http://192.0.2.1/".into(),
+            armed.clone(),
+        );
+        assert_ne!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "arm() must mark the provider as arming"
+        );
+        drop(guard);
+        assert_eq!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "drop must reset armed state immediately — not wait for the background \
+             task or its internal timeout"
+        );
+    }
+
+    /// §S3.2 unit: a second `arm()` while the first is still armed is a
+    /// no-op — dropping it must not disturb the still-live first guard's
+    /// state.
+    #[tokio::test]
+    async fn spawn_arm_second_call_while_armed_is_a_noop() {
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client = http_client(std::time::Duration::from_secs(1));
+        let g1 = spawn_arm(client.clone(), "http://192.0.2.1/".into(), armed.clone());
+        let before = armed.load(std::sync::atomic::Ordering::Acquire);
+        let g2 = spawn_arm(client, "http://192.0.2.1/".into(), armed.clone());
+        drop(g2);
+        assert_eq!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            before,
+            "a no-op re-arm's drop must not reset state owned by the still-live first guard"
+        );
+        drop(g1);
+        assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    /// §S3.2 unit: arming against a refused-connection target must not
+    /// panic and must not leak its background task.
+    #[tokio::test]
+    async fn spawn_arm_against_a_refused_target_does_not_leak_its_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            format!("http://{addr}/"),
+            armed.clone(),
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while armed.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a refused warm request must not leak its background task");
+        drop(guard);
+    }
+
+    /// §S3.2 unit: a target that never answers (RFC 5737 TEST-NET-1) must
+    /// still be bounded by the internal arm timeout.
+    #[tokio::test]
+    async fn spawn_arm_against_a_black_holed_target_is_bounded_by_the_arm_timeout() {
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            "http://192.0.2.1/".into(),
+            armed.clone(),
+        );
+        tokio::time::timeout(ARM_TIMEOUT + std::time::Duration::from_secs(3), async {
+            while armed.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a black-holed target must not hang past the internal arm timeout");
+        drop(guard);
+    }
+
+    /// §S3.2 unit: a guard whose own warm request already finished must not
+    /// clobber a later, still-in-flight arm when dropped late. See the twin
+    /// test in `hotl-provider-anthropic` for the full rationale.
+    #[tokio::test]
+    async fn a_late_dropped_stale_guard_does_not_clobber_a_newer_arm() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client = http_client(std::time::Duration::from_secs(1));
+        let g1 = spawn_arm(client.clone(), format!("http://{addr}/"), armed.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while armed.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("g1's task must finish on its own before we proceed");
+        let g2 = spawn_arm(client, "http://192.0.2.1/".into(), armed.clone());
+        assert_ne!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "g2 must be in flight"
+        );
+        drop(g1);
+        assert_ne!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "dropping the stale g1 must not clobber g2's still-in-flight state"
+        );
+        drop(g2);
+        assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    /// The public wiring: `Provider::arm` must reach the same `Warmable`
+    /// impl this crate defines.
+    #[tokio::test]
+    async fn provider_arm_reaches_the_warmable_impl_without_panicking() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let p = OpenAiCompatProvider::new(
+            format!("http://{addr}"),
+            Arc::new(hotl_provider::key::StaticKey(None)),
+        );
+        let guard = Provider::arm(&p);
+        drop(guard);
     }
 
     /// The explicit opt-in skips the probe entirely.

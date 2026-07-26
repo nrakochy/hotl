@@ -126,6 +126,121 @@ pub trait Provider: Send + Sync {
         &self,
         req: SamplingRequest,
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>>;
+
+    /// Pre-warm the connection pool ahead of the first real sample (§S3.2:
+    /// typing-time connection arming). No-op by default — only a provider
+    /// with a real pooled connection to warm overrides it (via
+    /// [`Warmable`]); a scripted/test provider has nothing to arm.
+    fn arm(&self) -> ArmGuard {
+        ArmGuard::noop()
+    }
+}
+
+/// A provider whose connection pool can be pre-warmed. Implemented by the
+/// HTTP dialect crates (`hotl-provider-anthropic`, `hotl-provider-openai`).
+/// `Provider::arm` is the dynamic-dispatch entry point call sites use
+/// (`Arc<dyn Provider>` erases the concrete type long before a trigger
+/// fires); this trait names the capability and lets each dialect crate
+/// implement it against its own `reqwest::Client` without this crate having
+/// to depend on `reqwest` itself (this crate stays wasm32-buildable — see
+/// the `tokio` dependency comment above).
+pub trait Warmable {
+    fn arm(&self) -> ArmGuard;
+}
+
+/// RAII handle for a connection warm-up. Dropping it cancels any warm
+/// request still in flight; [`ArmGuard::noop`] (nothing to warm, or a
+/// re-arm while already armed) holds and cancels nothing.
+///
+/// Deliberately generic over *any* cancel callback rather than naming
+/// `tokio::task::JoinHandle` directly: this crate has no `rt` feature and no
+/// `reqwest` dependency (wasm32-buildable), so the dialect crates hand in a
+/// closure that aborts their own real task.
+///
+/// `#[must_use]`: a bare `provider.arm();` statement drops the guard at the
+/// end of that statement, immediately cancelling the very request it just
+/// started — the opposite of the caller's intent. Bind it (even to `_name`)
+/// or call [`ArmGuard::detach`] explicitly.
+#[must_use]
+pub struct ArmGuard {
+    cancel: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl ArmGuard {
+    /// Nothing to warm — holds and cancels nothing on drop.
+    pub fn noop() -> Self {
+        Self { cancel: None }
+    }
+
+    /// Wrap a cancel callback: `drop` invokes it exactly once.
+    pub fn new(cancel: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            cancel: Some(Box::new(cancel)),
+        }
+    }
+
+    /// Let the warm task run to completion on its own: this guard no longer
+    /// cancels it on drop. For trigger sites with no session-scoped owner to
+    /// hold the guard across — safe because the underlying task is
+    /// short-lived by construction (bounded by its own internal timeout).
+    pub fn detach(mut self) {
+        self.cancel = None;
+    }
+}
+
+impl Drop for ArmGuard {
+    fn drop(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            cancel();
+        }
+    }
+}
+
+#[cfg(test)]
+mod arm_guard_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The core RAII contract: dropping an armed guard cancels it.
+    #[test]
+    fn drop_invokes_the_cancel_callback() {
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = called.clone();
+        let guard = ArmGuard::new(move || flag.store(true, Ordering::SeqCst));
+        assert!(!called.load(Ordering::SeqCst));
+        drop(guard);
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    /// Nothing to warm means nothing happens on drop — and, just as
+    /// important, dropping it must not panic.
+    #[test]
+    fn noop_cancels_nothing() {
+        drop(ArmGuard::noop());
+    }
+
+    /// `detach` is the escape hatch for call sites with no natural owner:
+    /// the task is left to finish (or hit its own timeout) rather than being
+    /// cancelled when the guard goes out of scope.
+    #[test]
+    fn detach_suppresses_the_cancel_callback() {
+        let called = Arc::new(AtomicBool::new(false));
+        let flag = called.clone();
+        let guard = ArmGuard::new(move || flag.store(true, Ordering::SeqCst));
+        guard.detach();
+        assert!(!called.load(Ordering::SeqCst));
+    }
+
+    /// `Provider::arm`'s default: a provider with nothing to warm (every
+    /// scripted/fake provider in the workspace) is armable without error —
+    /// callers never need to special-case "does this provider support
+    /// arming".
+    #[test]
+    fn provider_default_arm_is_a_noop() {
+        let provider = ScriptedProvider::new(vec![]);
+        // Must not panic; dropping immediately must not either.
+        drop(provider.arm());
+    }
 }
 
 /// The honest "second impl" (D9): a scripted provider driving the real engine

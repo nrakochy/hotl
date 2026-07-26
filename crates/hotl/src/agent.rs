@@ -192,6 +192,18 @@ pub(crate) async fn acp_factory(
         context_window: scaffold.config.context_window,
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
+        // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide
+        // and shared for the ACP connection's lifetime, so every
+        // session/new or session/load re-arms it. `Warmable`'s own
+        // in-flight guard makes this idempotent (a session switch shortly
+        // after another is a cheap no-op, not a duplicate handshake), and
+        // `detach` is correct here: no session-scoped value exists yet to
+        // hold the guard across (`SessionOpen` is built below and returned
+        // out of this closure), and the warm task is short-lived and
+        // bounded by its own internal timeout regardless. The true
+        // typing-time trigger (first composer keystroke) has no ACP signal
+        // to hang off today — see the task report for that deferral.
+        scaffold.provider.arm().detach();
         let (resumed, requested) = match spec {
             crate::acp::SessionSpec::New { name } => (None, name),
             crate::acp::SessionSpec::Load {
@@ -571,6 +583,15 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
             return 1;
         }
     };
+    // §S3.2: arm the connection pool now, concurrent with scaffold()'s
+    // registry/skill walk and SessionLog::create below — the handshake
+    // overlaps disk-bound setup instead of sitting in front of the first
+    // real sample (the client's pool is shared, so that sample just joins
+    // whatever the warm request already started). Held for the rest of this
+    // one-shot session so a still-in-flight warm request survives past
+    // `scaffold`; harmless to keep alive longer than needed since a
+    // finished warm task's guard is a no-op on drop.
+    let _wire_arm = provider.arm();
     let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(code) => return code,
@@ -2060,6 +2081,59 @@ pub(crate) fn sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §S3.2 (headless `-p`): the provider's connection pool must be armed
+    /// right after `select_provider` succeeds and before `scaffold(...)`
+    /// consumes `provider` — so the warm handshake overlaps `scaffold`'s
+    /// registry/skill walk and `SessionLog::create` instead of adding to the
+    /// first real sample's critical path. A source check because
+    /// `run_session` does real disk/env I/O (`select_provider` reads env
+    /// vars, `scaffold` walks the filesystem) and isn't practically
+    /// unit-testable with an injected fake provider without a DI seam this
+    /// task doesn't add.
+    #[test]
+    fn run_session_arms_the_provider_before_scaffolding() {
+        let src = include_str!("agent.rs");
+        let body = src
+            .split("async fn run_session(")
+            .nth(1)
+            .expect("run_session exists");
+        let before_scaffold = body
+            .split("let scaffold = match scaffold(provider")
+            .next()
+            .expect("run_session calls scaffold(provider, ...)");
+        assert!(
+            before_scaffold.contains(".arm()"),
+            "run_session must call provider.arm() before scaffold() consumes `provider`"
+        );
+    }
+
+    /// §S3.2 (TUI/ACP): every session open (`session/new`/`session/load`)
+    /// re-arms the shared process-wide provider — cheap and idempotent
+    /// (`Warmable`'s own in-flight guard coalesces back-to-back opens), and
+    /// the only "handshake" moment available to `acp_factory` without
+    /// threading the provider through `acp::serve`'s per-request path (see
+    /// the task report for the deferred typing-time/prompt-admission
+    /// trigger).
+    #[test]
+    fn acp_factory_arms_the_provider_on_every_session_open() {
+        let src = include_str!("agent.rs");
+        let body = src
+            .split("async fn acp_factory(")
+            .nth(1)
+            .expect("acp_factory exists")
+            .split("\npub async fn serve_main(")
+            .next()
+            .expect("acp_factory is followed by serve_main");
+        let factory_closure = body
+            .split("let factory: crate::acp::SessionFactory = Box::new(move |spec| {")
+            .nth(1)
+            .expect("acp_factory builds the SessionFactory closure");
+        assert!(
+            factory_closure.contains(".arm()"),
+            "the SessionFactory closure must arm the provider on every session open"
+        );
+    }
 
     /// Library code inside a TUI process must not write to stderr — it lands
     /// on the alternate screen (T3-23). Warnings are returned; exactly one
