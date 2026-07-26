@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
-use hotl_provider::{retry, ProviderError, SamplingRequest, StreamEvent, ToolDef};
+use hotl_provider::{
+    retry, CachePolicy, CacheTtl, ProviderError, SamplingRequest, StreamEvent, ToolDef,
+};
 use hotl_tools::rules::Verdict;
 use hotl_tools::{Permission, ToolOutcome};
 use hotl_types::{
@@ -634,7 +636,7 @@ struct Turn {
     /// Subdir hints already injected (per turn) + the latest snapshot for
     /// cross-turn dedup against the projection.
     injected_hints: HashSet<String>,
-    last_snapshot: Option<Arc<Vec<Item>>>,
+    last_snapshot: Option<crate::actor::Snapshot>,
     /// In-flight speculative compaction digest: fired once the estimate
     /// crosses [`SPECULATE_TRIGGER`], consumed when the turn ends in
     /// `Compact`, aborted otherwise.
@@ -843,8 +845,8 @@ impl Turn {
         self.turn_extensions < TODO_GATE_MAX.min(TURN_EXTENSION_MAX)
             && self
                 .last_snapshot
-                .as_deref()
-                .is_some_and(|s| unfinished_todos(s))
+                .as_ref()
+                .is_some_and(|s| unfinished_todos(&s.tail))
     }
 
     /// `Stop` hook veto (Task 4, tech-debt #10): consulted only when the
@@ -973,10 +975,11 @@ impl Turn {
             + usage.cache_creation_input_tokens
             + usage.output_tokens;
         // `+ 1` for the assistant item this sample produced, which `reported`
-        // already covers through `output_tokens`. Anchoring on *durable* length
-        // keeps the ephemeral todo reminder out of the position (T2-1); with no
-        // todos the two are equal and the value is byte-identical to before.
-        self.anchor = Some((reported, durable_len(&snapshot) + 1));
+        // already covers through `output_tokens`. The position indexes the
+        // *durable* projection, which is now the only list it could index —
+        // the ephemeral tail is a separate channel and can never slip into
+        // the count (T2-1).
+        self.anchor = Some((reported, snapshot.durable.len() + 1));
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
         };
@@ -1498,7 +1501,10 @@ impl Turn {
     /// Pre-flight: the compaction threshold check (M2), then the request with
     /// the MOIM turn-context attached. Past the speculation threshold the
     /// digest summarize starts here, overlapping the samples still to come.
-    fn build_request(&mut self, snapshot: &Arc<Vec<Item>>) -> Result<SamplingRequest, SampleEnd> {
+    fn build_request(
+        &mut self,
+        snapshot: &crate::actor::Snapshot,
+    ) -> Result<SamplingRequest, SampleEnd> {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
         if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
@@ -1512,13 +1518,18 @@ impl Turn {
     /// [`SPECULATE_TRIGGER`] (M2). Called once per sample on **both** paths:
     /// an adopted optimistic dispatch never reaches `build_request`, and the
     /// fold must still get its head start.
-    fn maybe_speculate_digest(&mut self, snapshot: &Arc<Vec<Item>>, estimate: u64) {
+    fn maybe_speculate_digest(&mut self, snapshot: &crate::actor::Snapshot, estimate: u64) {
         let window = self.shared.config.context_window.max(1);
         if self.speculation.is_none()
             && !self.shared.config.compaction_reset
             && estimate > (window as f64 * SPECULATE_TRIGGER) as u64
         {
-            self.speculation = spawn_speculation(&self.shared, snapshot, &self.cancel);
+            // Durable only, deliberately: `actor::compact` plans and applies
+            // against `head.items()`, so a speculative plan's `prefix_end` /
+            // `kept_from` are only the same indices if it was planned against
+            // the same list. (Before the split they were not — the reminder
+            // rode the snapshot and could itself be chosen as `kept_from`.)
+            self.speculation = spawn_speculation(&self.shared, &snapshot.durable, &self.cancel);
         }
     }
 
@@ -1532,7 +1543,7 @@ impl Turn {
     ///
     /// Deliberately does NOT fire the speculative *compaction* digest: that
     /// is `build_request`'s, once, on the sequential path.
-    fn speculative_request(&self, snapshot: &Arc<Vec<Item>>) -> Option<SamplingRequest> {
+    fn speculative_request(&self, snapshot: &crate::actor::Snapshot) -> Option<SamplingRequest> {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
         if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
@@ -1547,9 +1558,14 @@ impl Turn {
     /// equality (spec case 9). The one exception is the MOIM turn-context
     /// block, whose timestamp is read at build time: it is the sanctioned
     /// ephemeral suffix, regenerated on both paths and never persisted.
+    ///
+    /// The snapshot's two channels stay two channels all the way to the wire:
+    /// `durable` is the only thing a provider may mark, `tail` is serialized
+    /// after every marker. This is also where `EngineConfig::cache_static`
+    /// (still a bool this phase) becomes a [`CachePolicy`].
     fn compose_request(
         &self,
-        snapshot: &Arc<Vec<Item>>,
+        snapshot: &crate::actor::Snapshot,
         estimate: u64,
         sample_no: u32,
     ) -> SamplingRequest {
@@ -1569,10 +1585,17 @@ impl Turn {
             model: self.models[self.model_idx].clone(),
             max_tokens: self.shared.config.max_tokens,
             system: Arc::clone(&self.shared.system),
-            items: Arc::clone(snapshot),
+            items: Arc::clone(&snapshot.durable),
+            ephemeral_tail: Arc::clone(&snapshot.tail),
             tools: Arc::clone(&self.tool_defs),
             thinking: self.shared.config.thinking,
-            cache_static: self.shared.config.cache_static,
+            cache: if self.shared.config.cache_static {
+                CachePolicy::Static {
+                    prefix_ttl: CacheTtl::FiveMinutes,
+                }
+            } else {
+                CachePolicy::Off
+            },
             turn_context: Some(turn_context),
         }
     }
@@ -1626,9 +1649,16 @@ impl Turn {
 
     /// Anchored context estimate for the next request: the provider-reported
     /// cost of the last sample plus the (overcounting) estimate of everything
-    /// appended since. Falls back to a full estimate before the first sample.
-    fn estimate_tokens(&self, snapshot: &[Item]) -> u64 {
-        anchored_estimate(self.anchor, &self.shared.system, snapshot)
+    /// appended since, plus the ephemeral tail.
+    ///
+    /// The tail is a visible, named term rather than something riding inside
+    /// the anchored slice — but it is the *same* term: `estimate_items` is a
+    /// sum over items, so `durable[len..] ++ tail` and `durable[len..]` plus
+    /// `tail` are equal by construction. The totals are identical to what a
+    /// flat snapshot produced.
+    fn estimate_tokens(&self, snapshot: &crate::actor::Snapshot) -> u64 {
+        anchored_estimate(self.anchor, &self.shared.system, &snapshot.durable)
+            + hotl_context::tokens::estimate_items(&snapshot.tail)
     }
 
     /// Just-in-time nested AGENTS.md injection (M2), deduped per turn and
@@ -1657,7 +1687,9 @@ impl Turn {
         let Some(snapshot) = &self.last_snapshot else {
             return false;
         };
-        snapshot.iter().any(|i| {
+        // Durable only: a hint is deduped against what is actually committed,
+        // and nothing ephemeral is ever a `SubdirInstructions` item anyway.
+        snapshot.durable.iter().any(|i| {
             matches!(
                 i,
                 Item::User { text, synthetic: Some(hotl_types::SyntheticReason::SubdirInstructions) }
@@ -1817,22 +1849,26 @@ impl Turn {
         });
     }
 
-    /// What the next head will contain if nothing intervenes: the snapshot
-    /// this sample was built from, plus everything this turn committed since
-    /// — with the ephemeral todo reminder regenerated at the tail, exactly
-    /// where `ProjectionHead::snapshot` puts it. Under leaf equality this is
-    /// not a guess: no other entry can have landed, so it is the same list
-    /// the sequential rebuild would read.
-    fn predicted_snapshot(&self) -> Option<Arc<Vec<Item>>> {
-        let last = self.last_snapshot.as_deref()?;
-        let durable = durable_len(last);
-        let mut items = last[..durable].to_vec();
-        items.extend(self.projected_tail.iter().cloned());
-        // The reminder is regenerated per read and always last; todos can
-        // only have changed by way of a durable `Todos` entry, which would
-        // move the leaf and refuse the adoption.
-        items.extend(last[durable..].iter().cloned());
-        Some(Arc::new(items))
+    /// What the next head will contain if nothing intervenes: the durable
+    /// projection this sample was built from, plus everything this turn
+    /// committed since. Under leaf equality this is not a guess: no other
+    /// entry can have landed, so it is the same list the sequential rebuild
+    /// would read.
+    ///
+    /// The ephemeral tail is *carried*, not re-derived: todos can only have
+    /// changed by way of a durable `Todos` entry, which would move the leaf
+    /// and refuse the adoption. With the two channels separate there is no
+    /// splice to undo and redo — the prediction is an append, which is what
+    /// the projection is.
+    fn predicted_snapshot(&self) -> Option<crate::actor::Snapshot> {
+        let last = self.last_snapshot.as_ref()?;
+        let mut durable = Vec::with_capacity(last.durable.len() + self.projected_tail.len());
+        durable.extend(last.durable.iter().cloned());
+        durable.extend(self.projected_tail.iter().cloned());
+        Some(crate::actor::Snapshot {
+            durable: Arc::new(durable),
+            tail: Arc::clone(&last.tail),
+        })
     }
 
     /// Serialize + mask every entry (commit-protocol.md §Proposal payloads)
@@ -2071,34 +2107,21 @@ pub(crate) async fn drain_to_end(
 /// Events [`drain_to_end`] will poll past a terminal error before giving up.
 const DRAIN_MAX: usize = 64;
 
-/// The durable prefix of a snapshot. `actor::snapshot_with_todos` appends an
-/// ephemeral todo reminder as the last item when the list is non-empty; that
-/// item is regenerated on every snapshot and must never be counted as a durable
-/// position, or the anchor slips one item forward and the tool results
-/// committed after the sample are never counted at all (T2-1).
-fn durable_len(snapshot: &[Item]) -> usize {
-    match snapshot.last() {
-        Some(Item::User {
-            synthetic: Some(SyntheticReason::Todos),
-            ..
-        }) => snapshot.len() - 1,
-        _ => snapshot.len(),
-    }
-}
-
 /// Anchored context estimate for the next request: the provider-reported cost
 /// of the last sample plus the (overcounting) estimate of everything appended
-/// since. Falls back to a full estimate before the first sample.
+/// since. Falls back to a full estimate before the first sample. Takes the
+/// **durable** projection — the ephemeral tail is added by the one caller,
+/// [`Turn::estimate_tokens`], as its own term.
 /// INVARIANT: everything committed after the anchored sample is counted exactly
 /// once. Enforced by `the_anchor_counts_tool_results_even_with_todos_active` and
 /// `compaction_still_triggers_with_todos_active`.
-fn anchored_estimate(anchor: Option<(u64, usize)>, system: &str, snapshot: &[Item]) -> u64 {
+fn anchored_estimate(anchor: Option<(u64, usize)>, system: &str, durable: &[Item]) -> u64 {
     use hotl_context::tokens;
     match anchor {
-        Some((reported, len)) if snapshot.len() >= len => {
-            reported + tokens::estimate_items(&snapshot[len..])
+        Some((reported, len)) if durable.len() >= len => {
+            reported + tokens::estimate_items(&durable[len..])
         }
-        _ => tokens::estimate_text(system) + tokens::estimate_items(snapshot),
+        _ => tokens::estimate_text(system) + tokens::estimate_items(durable),
     }
 }
 
@@ -2122,14 +2145,15 @@ fn pair(tu: &ToolUse, message: &str, is_error: bool) -> ToolResultItem {
     }
 }
 
-/// Whether the todo reminder in a snapshot (appended as its last item, only
-/// when the list is non-empty — see `actor::snapshot_with_todos`) lists any
-/// `pending`/`in_progress` work. Reads the render text directly rather than
-/// round-tripping through `Vec<Todo>`: it's exactly what the model just
-/// sampled against, so the gate's read matches what produced the reply.
-fn unfinished_todos(snapshot: &[Item]) -> bool {
+/// Whether the todo reminder in a snapshot's **ephemeral tail** (see
+/// [`crate::actor::Snapshot`] — the tail holds the rendered reminder, and only
+/// when the list is non-empty) lists any `pending`/`in_progress` work. Reads
+/// the render text directly rather than round-tripping through `Vec<Todo>`:
+/// it's exactly what the model just sampled against, so the gate's read
+/// matches what produced the reply.
+fn unfinished_todos(tail: &[Item]) -> bool {
     matches!(
-        snapshot.last(),
+        tail.last(),
         Some(Item::User {
             text,
             synthetic: Some(SyntheticReason::Todos),
@@ -2410,36 +2434,17 @@ mod tests {
     }
 
     #[test]
-    fn durable_len_excludes_only_the_ephemeral_todo_reminder() {
-        let base = vec![Item::User {
-            text: "hi".into(),
-            synthetic: None,
-        }];
-        assert_eq!(durable_len(&base), 1);
-        let mut with_reminder = base.clone();
-        with_reminder.push(todos_item("<todos>\n[x] done\n</todos>"));
-        assert_eq!(durable_len(&with_reminder), 1);
-        // A *durable* user item that merely ends the projection is not ephemeral.
-        let mut trailing_user = base.clone();
-        trailing_user.push(Item::User {
-            text: "next".into(),
-            synthetic: None,
-        });
-        assert_eq!(durable_len(&trailing_user), 2);
-    }
-
-    #[test]
     fn the_anchor_counts_tool_results_even_with_todos_active() {
-        // D = 1 durable item at sample 1; the snapshot also carries the
-        // ephemeral reminder, so anchoring on snapshot.len() skips the tool
-        // results committed between the two samples (T2-1).
+        // D = 1 durable item at sample 1, with a todo list active. The anchor
+        // indexes the durable projection, which the ephemeral reminder is no
+        // longer part of — so the tool results committed between the two
+        // samples stay inside the anchored slice (T2-1).
         let prompt = Item::User {
             text: "go".into(),
             synthetic: None,
         };
-        let reminder = todos_item("<todos>\n[x] done\n</todos>");
-        let sample1 = vec![prompt.clone(), reminder.clone()];
-        let anchor = Some((500, durable_len(&sample1) + 1));
+        let sample1 = [prompt.clone()];
+        let anchor = Some((500, sample1.len() + 1));
 
         let big = "x".repeat(3_000);
         let sample2 = vec![
@@ -2448,13 +2453,38 @@ mod tests {
                 blocks: vec![json!({"type": "text", "text": "ok"})],
             },
             tool_results(&big),
-            reminder,
         ];
         let estimate = anchored_estimate(anchor, "sys", &sample2);
         assert!(
             estimate >= 500 + 1_000,
             "tool results must be inside the estimate, got {estimate}"
         );
+    }
+
+    /// The tail is a separate term, and it is the SAME term: splitting a flat
+    /// snapshot into durable + tail must not move the total by a token, on
+    /// either the anchored or the pre-first-sample path.
+    #[test]
+    fn splitting_the_tail_out_leaves_the_estimate_unchanged() {
+        use hotl_context::tokens;
+        let durable = vec![
+            Item::User {
+                text: "go".into(),
+                synthetic: None,
+            },
+            tool_results(&"x".repeat(600)),
+        ];
+        let reminder = todos_item("<todos>\n[~] wire the gate\n</todos>");
+        let flat: Vec<Item> = durable.iter().cloned().chain([reminder.clone()]).collect();
+        let tail = vec![reminder];
+
+        for anchor in [None, Some((500, 1)), Some((500, 2))] {
+            assert_eq!(
+                anchored_estimate(anchor, "sys", &durable) + tokens::estimate_items(&tail),
+                anchored_estimate(anchor, "sys", &flat),
+                "anchor {anchor:?}"
+            );
+        }
     }
 
     #[test]

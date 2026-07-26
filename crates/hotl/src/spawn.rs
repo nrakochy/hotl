@@ -51,6 +51,10 @@ pub trait ChildBuilder: Send + Sync {
 /// weak sender (mirrors `todo_write`/`ask_user`'s sink pattern — see
 /// `agent.rs::spawn_session_with_todos`): a *strong* sender here would be a
 /// reference cycle keeping the session's actor alive forever.
+///
+/// Yields the **durable** projection only — never the ephemeral per-sample
+/// tail (see `agent.rs::snapshot_provider`). A fork seed is committed into the
+/// child's own log, so an ephemeral item in it would stop being ephemeral.
 pub type SnapshotFn = Arc<dyn Fn() -> BoxFuture<'static, Option<Arc<Vec<Item>>>> + Send + Sync>;
 
 /// Process-wide mutating-child guard (index "guard parallel mutating

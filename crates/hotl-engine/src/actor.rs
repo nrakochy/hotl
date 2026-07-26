@@ -109,24 +109,50 @@ impl ProjectionHead {
         self.epoch
     }
 
-    /// The snapshot a turn task samples against: the durable projection,
-    /// plus the todo reminder appended as the last item when the list is
-    /// non-empty. The reminder rides *this* returned `Arc`, never `items`
-    /// itself, so it can never be committed, replayed, or double-counted
-    /// (each call starts fresh from the durable projection). The empty-list
-    /// path returns the same `Arc` the head already holds — no allocation on
-    /// the common case, which is what keeps "Vec with clone at grant" the
-    /// cost model §Read invariant priced.
-    pub fn snapshot(&self) -> Arc<Vec<Item>> {
-        match hotl_tools::todo::render_reminder(&self.todos) {
-            Some(reminder) => {
-                let mut with_reminder = (*self.items).clone();
-                with_reminder.push(reminder);
-                Arc::new(with_reminder)
-            }
-            None => Arc::clone(&self.items),
+    /// The snapshot a turn task samples against, as **two channels**: the
+    /// durable projection the head already holds, and the ephemeral suffix
+    /// regenerated per read. The reminder is never spliced into `items` — not
+    /// even into a copy of it — so it can never be committed, replayed,
+    /// double-counted, or (the point of the split) chosen as a cache
+    /// breakpoint by a serializer that only sees a flat list.
+    ///
+    /// Both fields hand back an `Arc` the head or the process already holds
+    /// whenever it can: the common no-todos read allocates nothing at all,
+    /// which is what keeps "Vec with clone at grant" the cost model §Read
+    /// invariant priced.
+    pub fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            durable: Arc::clone(&self.items),
+            tail: match hotl_tools::todo::render_reminder(&self.todos) {
+                Some(reminder) => Arc::new(vec![reminder]),
+                None => empty_tail(),
+            },
         }
     }
+}
+
+/// One read of the projection head, split by durability.
+///
+/// The split is the invariant: `durable` is byte-stable between supersede
+/// events (append-only projection), `tail` is regenerated every read. Every
+/// consumer that must not see ephemeral content — the fork seed, the cache
+/// breakpoint chooser — reads `durable` and structurally cannot reach `tail`.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    /// The durable projection — byte-stable between supersede events.
+    pub durable: Arc<Vec<Item>>,
+    /// Ephemeral per-sample suffix (todo reminder today), regenerated per
+    /// read, never committed, rendered after every cache marker.
+    pub tail: Arc<Vec<Item>>,
+}
+
+/// The one shared empty ephemeral tail. A `OnceLock` rather than
+/// `Arc::new(Vec::new())` per call so that a session with no todos — the
+/// common case, and the one on the sample-boundary hot path — allocates
+/// nothing to say "nothing ephemeral here".
+pub(crate) fn empty_tail() -> Arc<Vec<Item>> {
+    static EMPTY: std::sync::OnceLock<Arc<Vec<Item>>> = std::sync::OnceLock::new();
+    Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
 }
 
 /// The head channel, created before the actor so a `SessionHandle` can hand
@@ -1643,9 +1669,12 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
             text: compaction::summarize_prompt(folded),
             synthetic: None,
         }]),
+        // A summarize is a one-shot call against a prompt that is different
+        // every time: nothing to cache, and nothing ephemeral to append.
+        ephemeral_tail: empty_tail(),
         tools: Vec::new().into(),
         thinking: false,
-        cache_static: false,
+        cache: hotl_provider::CachePolicy::Off,
         turn_context: None,
     };
     for _ in 0..SUMMARIZE_ATTEMPTS {

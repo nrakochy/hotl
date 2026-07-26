@@ -54,16 +54,60 @@ pub struct SamplingRequest {
     pub max_tokens: u32,
     /// Byte-stable owner system prompt (L6 discipline).
     pub system: Arc<str>,
+    /// The **durable** projection only — exactly the items the session log
+    /// carries. Byte-stable between supersede events, which is what makes it
+    /// the one region a cache breakpoint may be placed in (L6 discipline).
     pub items: Arc<Vec<Item>>,
+    /// Ephemeral per-sample suffix (the `<todos>` reminder today): regenerated
+    /// on every read of the projection head, never committed, and serialized
+    /// AFTER every cache marker (and before MOIM). Splitting it from `items`
+    /// is what makes "a marker on ephemeral content" unrepresentable rather
+    /// than merely avoided — a serializer has no ephemeral item to pick.
+    pub ephemeral_tail: Arc<Vec<Item>>,
     pub tools: Arc<[ToolDef]>,
     /// Adaptive thinking on models that support it.
     pub thinking: bool,
-    /// M0 static cache placement: system block + latest user block
-    /// (explicit-cache providers).
-    pub cache_static: bool,
+    /// Cache-breakpoint placement for explicit-cache providers.
+    pub cache: CachePolicy,
     /// MOIM (M2): ephemeral per-turn context, sent as a trailing user block
-    /// after the cache marker. Never persisted — it exists only on the wire.
+    /// after the cache marker AND after [`Self::ephemeral_tail`] — always the
+    /// last thing on the wire. Never persisted; it exists only on the wire.
     pub turn_context: Option<String>,
+}
+
+/// How long a cache entry a breakpoint writes stays readable. Anthropic's two
+/// offered lifetimes; the wire spelling is the serializer's business.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheTtl {
+    FiveMinutes,
+    OneHour,
+}
+
+/// What a provider may do with cache breakpoints for this request.
+///
+/// A policy, not a hint: `Off` means a serializer emits no `cache_control` at
+/// all, and only the byte-stable prefix — never [`SamplingRequest::items`]'s
+/// ephemeral companion — is ever eligible under `Static`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    /// No explicit markers: implicit-caching providers (OpenAI), the
+    /// compaction summarize call, and fixtures.
+    Off,
+    /// Explicit marker placement. `prefix_ttl` is the lifetime the *prefix*
+    /// breakpoints ask for; it is consumed by the breakpoint planner in a
+    /// later phase — today every `Static` renders exactly the M0 three
+    /// markers (tools tail / system / latest durable user block) with no ttl
+    /// field on the wire.
+    Static { prefix_ttl: CacheTtl },
+}
+
+impl CachePolicy {
+    /// Whether this request wants explicit breakpoints at all. The one
+    /// question this phase's serializers ask; `prefix_ttl` stays unread until
+    /// the planner lands.
+    pub fn marks_breakpoints(self) -> bool {
+        matches!(self, Self::Static { .. })
+    }
 }
 
 /// The unified, channel-tagged, block-structured event enum.

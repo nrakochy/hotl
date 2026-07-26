@@ -20,7 +20,7 @@ use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{
     ArmGuard, Provider, ProviderError, SamplingRequest, StreamEvent, ToolDef, Warmable,
 };
-use hotl_types::{Item, StopReason, SyntheticReason, TokenUsage};
+use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
 
 /// §S3.2: bounds the warm request end-to-end (connect + TLS + response),
@@ -138,9 +138,16 @@ impl AnthropicProvider {
     }
 
     fn build_body(req: &SamplingRequest) -> Value {
-        let mut messages = build_messages(&req.items, req.cache_static);
-        // MOIM rides after the cache marker: it changes every sample without
-        // invalidating the cached prefix (suffix position).
+        let mark = req.cache.marks_breakpoints();
+        let mut messages = build_messages(&req.items, mark);
+        // The ephemeral suffix, in wire order: after every durable message and
+        // so after the deepest marker, before MOIM. `mark: false` is not a
+        // policy decision made here — these items are not in `req.items`, so
+        // the marker chooser above never saw them and could not have picked
+        // one. That is the whole point of the split.
+        messages.extend(build_messages(&req.ephemeral_tail, false));
+        // MOIM rides last of all, after the cache marker: it changes every
+        // sample without invalidating the cached prefix (suffix position).
         if let Some(tc) = &req.turn_context {
             messages.push(json!({"role": "user", "content": [{"type": "text", "text": tc}]}));
         }
@@ -152,7 +159,7 @@ impl AnthropicProvider {
         });
         if !req.system.is_empty() {
             let mut sys = json!({"type": "text", "text": req.system.as_ref()});
-            if req.cache_static {
+            if mark {
                 sys["cache_control"] = json!({"type": "ephemeral"});
             }
             body["system"] = json!([sys]);
@@ -162,7 +169,7 @@ impl AnthropicProvider {
             // Auto breakpoint on the last tool def (M2 cache policy): tools
             // render before system in the prefix, so this seals the whole
             // tool block. 3 markers total (tools/system/latest-user) ≤ 4.
-            if req.cache_static {
+            if mark {
                 if let Some(last) = tools.last_mut() {
                     last["cache_control"] = json!({"type": "ephemeral"});
                 }
@@ -196,21 +203,22 @@ fn tool_json(t: &ToolDef) -> Value {
     json!({"name": t.name, "description": t.description, "input_schema": t.input_schema})
 }
 
-fn build_messages(items: &[Item], cache_static: bool) -> Vec<Value> {
-    // The engine appends an ephemeral `<todos>` reminder as the last item of
-    // every snapshot while todos are active (`Item::User { synthetic:
-    // Some(SyntheticReason::Todos), .. }`). It changes on every todo edit, so
-    // if the marker landed there the cache entry would never be re-read and
-    // the whole prefix would re-bill at full price every sample. Skip it and
-    // let the marker fall on the last *durable* user-role item instead.
-    let last_user_idx = items.iter().rposition(|i| match i {
-        Item::User { synthetic, .. } => !matches!(synthetic, Some(SyntheticReason::Todos)),
-        Item::ToolResults { .. } => true,
-        _ => false,
-    });
+/// Render `items` as Anthropic messages, optionally placing the deepest cache
+/// breakpoint on the last user-role message.
+///
+/// `mark_last_user` is only ever true for a request's **durable** items: the
+/// ephemeral suffix is a separate list ([`SamplingRequest::ephemeral_tail`])
+/// rendered by a second, unmarked call, so there is no ephemeral item in
+/// scope here to mis-mark. Ephemerality is positional now, not a tag to test —
+/// a `Todos`-tagged item that really is durable (an old fork log seeded before
+/// the split committed one) is a legitimate marker candidate like any other.
+fn build_messages(items: &[Item], mark_last_user: bool) -> Vec<Value> {
+    let last_user_idx = items
+        .iter()
+        .rposition(|i| matches!(i, Item::User { .. } | Item::ToolResults { .. }));
     let mut out = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
-        let mark = cache_static && Some(idx) == last_user_idx;
+        let mark = mark_last_user && Some(idx) == last_user_idx;
         match item {
             // System items never reach the wire from here — the system prompt
             // travels in the request's `system` field (context assembly owns it).
@@ -527,7 +535,8 @@ pub(crate) fn merge_usage(into: &mut TokenUsage, v: &Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hotl_types::ToolResultItem;
+    use hotl_provider::{CachePolicy, CacheTtl};
+    use hotl_types::{SyntheticReason, ToolResultItem};
 
     use std::sync::{Arc, Mutex as StdMutex};
 
@@ -594,9 +603,10 @@ mod tests {
                 text: "hi".into(),
                 synthetic: None,
             }]),
+            ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
             thinking: false,
-            cache_static: false,
+            cache: CachePolicy::Off,
             turn_context: None,
         }
     }
@@ -958,6 +968,7 @@ mod tests {
                     }],
                 },
             ]),
+            ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: vec![ToolDef {
                 name: "read".into(),
                 description: "d".into(),
@@ -965,7 +976,9 @@ mod tests {
             }]
             .into(),
             thinking: true,
-            cache_static: true,
+            cache: CachePolicy::Static {
+                prefix_ttl: CacheTtl::FiveMinutes,
+            },
             turn_context: Some("<turn-context sample=\"1\"/>".into()),
         };
         let body = AnthropicProvider::build_body(&req);
@@ -996,17 +1009,21 @@ mod tests {
         assert!(msgs[0]["content"][0].get("cache_control").is_none());
     }
 
-    /// STOPGAP (live cache-billing bug): the engine appends an ephemeral
-    /// `<todos>` reminder as the last item of every snapshot while todos are
-    /// active (`Item::User { synthetic: Some(SyntheticReason::Todos), .. }`).
-    /// Its text changes on every todo edit, so if the cache marker landed
-    /// there the cache entry written there would never be read again and the
-    /// whole conversation history would re-bill at full price every sample.
-    /// The marker must skip it and land on the last durable user-role item.
+    /// The live cache-billing bug, closed structurally (Phase 1). The
+    /// `<todos>` reminder's text changes on every todo edit; a marker on it
+    /// would write a cache entry that is never read again and re-bill the
+    /// whole prefix at full price every sample. It now arrives in
+    /// `ephemeral_tail`, which the marker chooser never sees — so there is
+    /// nothing to skip and nothing to remember to skip.
+    ///
+    /// Asserts both halves: the tail carries no `cache_control`, and the
+    /// deepest marker sits on the last **durable** user-role item.
     #[test]
-    fn todo_reminder_is_never_the_cache_marker() {
+    fn todo_write_turns_never_mark_the_tail() {
         let mut req = sampling_req();
-        req.cache_static = true;
+        req.cache = CachePolicy::Static {
+            prefix_ttl: CacheTtl::FiveMinutes,
+        };
         req.items = std::sync::Arc::new(vec![
             Item::User {
                 text: "durable instructions".into(),
@@ -1019,16 +1036,18 @@ mod tests {
                     is_error: false,
                 }],
             },
-            Item::User {
-                text: "<todos>do the thing</todos>".into(),
-                synthetic: Some(SyntheticReason::Todos),
-            },
         ]);
+        req.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
+            text: "<todos>do the thing</todos>".into(),
+            synthetic: Some(SyntheticReason::Todos),
+        }]);
+        req.turn_context = Some("<turn-context/>".into());
+
         let body = wire_body(&req);
         let msgs = body["messages"].as_array().unwrap();
-        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs.len(), 4, "2 durable + tail + MOIM");
 
-        // The synthetic todos reminder is last but carries no cache marker.
+        // Wire order: durable items, then the tail, then MOIM last.
         let todos_msg = &msgs[2];
         assert_eq!(
             todos_msg["content"][0]["text"],
@@ -1036,10 +1055,12 @@ mod tests {
         );
         assert!(
             todos_msg["content"][0].get("cache_control").is_none(),
-            "the todos reminder must never be the cache marker"
+            "the ephemeral tail must never carry a cache marker"
         );
+        assert_eq!(msgs[3]["content"][0]["text"], "<turn-context/>");
+        assert!(msgs[3]["content"][0].get("cache_control").is_none());
 
-        // The last durable user-role item (the tool results) carries it instead.
+        // The deepest marker: the last durable user-role item (tool results).
         let last_durable = &msgs[1];
         assert_eq!(last_durable["role"], "user");
         assert_eq!(last_durable["content"][0]["type"], "tool_result");
@@ -1047,8 +1068,87 @@ mod tests {
             last_durable["content"][0]["cache_control"]["type"],
             "ephemeral"
         );
-
         // The earlier user message does NOT carry a marker.
         assert!(msgs[0]["content"][0].get("cache_control").is_none());
+    }
+
+    /// The two invariants the phase is judged on, as a differential test.
+    ///
+    /// (a) todos INACTIVE under `Static` is byte-identical to what
+    /// `cache_static: true` produced before the split — nothing about markers,
+    /// order or MOIM moved. (b) todos ACTIVE differs from (a) by exactly one
+    /// appended unmarked message, inserted before MOIM: every durable byte and
+    /// every marker is untouched.
+    #[test]
+    fn an_active_tail_changes_nothing_but_appends_one_unmarked_message() {
+        let base = SamplingRequest {
+            model: DEFAULT_MODEL.into(),
+            max_tokens: 1024,
+            system: "sys".into(),
+            items: std::sync::Arc::new(vec![
+                Item::User {
+                    text: "instructions".into(),
+                    synthetic: None,
+                },
+                Item::Assistant {
+                    blocks: vec![serde_json::json!({"type":"text","text":"ok"})],
+                },
+                Item::ToolResults {
+                    results: vec![ToolResultItem {
+                        tool_use_id: "t1".into(),
+                        content: "out".into(),
+                        is_error: false,
+                    }],
+                },
+            ]),
+            ephemeral_tail: std::sync::Arc::new(Vec::new()),
+            tools: vec![ToolDef {
+                name: "read".into(),
+                description: "d".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            }]
+            .into(),
+            thinking: false,
+            cache: CachePolicy::Static {
+                prefix_ttl: CacheTtl::FiveMinutes,
+            },
+            turn_context: Some("<turn-context/>".into()),
+        };
+        let mut active = base.clone();
+        active.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
+            text: "<todos>\n[~] a\n</todos>".into(),
+            synthetic: Some(SyntheticReason::Todos),
+        }]);
+
+        let inactive_body = wire_body(&base);
+        let active_body = wire_body(&active);
+
+        // Everything outside `messages` is untouched by the tail.
+        for key in ["system", "tools", "model", "max_tokens", "stream"] {
+            assert_eq!(inactive_body[key], active_body[key], "{key} moved");
+        }
+        let quiet = inactive_body["messages"].as_array().unwrap();
+        let loud = active_body["messages"].as_array().unwrap();
+        assert_eq!(loud.len(), quiet.len() + 1);
+
+        // The durable messages are byte-identical, and MOIM is still last.
+        let durable = quiet.len() - 1;
+        assert_eq!(quiet[..durable], loud[..durable], "durable bytes moved");
+        assert_eq!(quiet[durable], loud[durable + 1], "MOIM must stay last");
+
+        // The one new message is the tail — appended, unmarked.
+        assert_eq!(
+            loud[durable]["content"][0]["text"],
+            "<todos>\n[~] a\n</todos>"
+        );
+        assert!(loud[durable]["content"][0].get("cache_control").is_none());
+
+        // And `Off` means no markers anywhere (today's `cache_static: false`).
+        let mut off = base.clone();
+        off.cache = CachePolicy::Off;
+        assert!(
+            !wire_body(&off).to_string().contains("cache_control"),
+            "CachePolicy::Off must emit zero markers"
+        );
     }
 }

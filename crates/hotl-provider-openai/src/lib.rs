@@ -143,6 +143,14 @@ impl OpenAiCompatProvider {
         for item in req.items.iter() {
             convert_item(item, &mut messages);
         }
+        // The ephemeral suffix keeps its wire position in this dialect too:
+        // after every durable message, before MOIM. There is no marker to be
+        // after here — caching is implicit — but the ordering is what the
+        // engine's byte-identity claim is made over, so it is not this crate's
+        // to reorder.
+        for item in req.ephemeral_tail.iter() {
+            convert_item(item, &mut messages);
+        }
         if let Some(tc) = &req.turn_context {
             messages.push(json!({"role": "user", "content": tc}));
         }
@@ -160,8 +168,9 @@ impl OpenAiCompatProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools.iter().map(tool_json).collect::<Vec<_>>());
         }
-        // `thinking` / cache_static are Anthropic-surface knobs: reasoning
-        // models decide depth server-side here, and caching is implicit.
+        // `thinking` / `cache` are Anthropic-surface knobs: reasoning models
+        // decide depth server-side here, and caching is implicit — this
+        // dialect emits no breakpoints under ANY `CachePolicy`.
         body
     }
 }
@@ -650,9 +659,10 @@ mod tests {
                     },
                 ],
             }]),
+            ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
             thinking: false,
-            cache_static: false,
+            cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
         };
         let body = OpenAiCompatProvider::build_body(&req);
@@ -703,6 +713,10 @@ mod tests {
                     ],
                 },
             ]),
+            ephemeral_tail: std::sync::Arc::new(vec![Item::User {
+                text: "<todos>\n[~] a\n</todos>".into(),
+                synthetic: Some(hotl_types::SyntheticReason::Todos),
+            }]),
             tools: vec![ToolDef {
                 name: "read".into(),
                 description: "d".into(),
@@ -710,7 +724,9 @@ mod tests {
             }]
             .into(),
             thinking: true,
-            cache_static: true,
+            cache: hotl_provider::CachePolicy::Static {
+                prefix_ttl: hotl_provider::CacheTtl::FiveMinutes,
+            },
             turn_context: Some("<turn-context/>".into()),
         };
         let body = OpenAiCompatProvider::build_body(&req);
@@ -735,6 +751,13 @@ mod tests {
         assert_eq!(msgs[3]["role"], "tool");
         assert_eq!(msgs[3]["tool_call_id"], "toolu_1");
         assert_eq!(msgs[4]["role"], "tool");
+        // …then the ephemeral tail as a plain user message, THEN MOIM: the
+        // suffix keeps its position in this dialect even though nothing here
+        // is cached explicitly.
+        assert_eq!(msgs[5]["role"], "user");
+        assert_eq!(msgs[5]["content"], "<todos>\n[~] a\n</todos>");
+        assert_eq!(msgs[6]["content"], "<turn-context/>");
+        assert_eq!(msgs.len(), 7);
         assert_eq!(body["tools"][0]["function"]["name"], "read");
     }
 
@@ -1196,9 +1219,10 @@ mod tests {
                 text: "hi".into(),
                 synthetic: None,
             }]),
+            ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
             thinking: false,
-            cache_static: false,
+            cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
         }
     }

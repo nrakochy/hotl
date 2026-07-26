@@ -770,13 +770,20 @@ type HeadCell =
 /// `watch::Receiver` is held, so this is a reader and never a second
 /// publisher. `None` (the cell is still empty) degrades exactly as a dropped
 /// sender used to: `fork` reports it has no history to seed from.
+///
+/// **`durable` only.** A child is seeded by *committing* the history it
+/// inherits, so anything ephemeral in the seed would become durable in the
+/// child's own log — permanently, and stale the moment the parent's todo list
+/// moves. The reminder's own contract (`hotl_tools::todo::render_reminder`)
+/// says never committed; taking one half of the [`hotl_engine::Snapshot`] is
+/// what makes that structural here rather than a filter someone must remember.
 fn snapshot_provider(cell: HeadCell) -> crate::spawn::SnapshotFn {
     Arc::new(move || {
         let head = cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        Box::pin(async move { Some(head?.borrow().snapshot()) })
+        Box::pin(async move { Some(head?.borrow().snapshot().durable) })
     })
 }
 
@@ -2425,6 +2432,95 @@ mod tests {
         let items = seen.expect("todo_write should have reached this session's own actor");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].content, "wire it up");
+    }
+
+    /// A `fork` seeds its child by **committing** the history it inherits, so
+    /// anything ephemeral in that seed stops being ephemeral: it would land in
+    /// the child's own durable log, permanently, and stale the moment the
+    /// parent's todo list moved. `snapshot_provider` therefore takes the
+    /// durable half of the head's [`hotl_engine::Snapshot`] and nothing else.
+    ///
+    /// Drives the real production function against a real seeded head — with
+    /// todos active, proved non-vacuous by the tail assertion.
+    #[tokio::test]
+    async fn a_fork_seed_never_carries_the_ephemeral_todo_reminder() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig::default();
+        let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).unwrap();
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        let handle =
+            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+                provider,
+                registry,
+                rules: Arc::new(hotl_tools::rules::Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: dir.path().to_path_buf(),
+                snapshots: None,
+                hooks: None,
+                initial_items: vec![hotl_types::Item::User {
+                    text: "earlier parent context".into(),
+                    synthetic: None,
+                }],
+                initial_todos: vec![hotl_types::Todo {
+                    content: "wire the gate".into(),
+                    status: hotl_types::TodoStatus::InProgress,
+                    active_form: None,
+                }],
+                config,
+            });
+
+        // The actor publishes its seeded head at startup; wait for that rather
+        // than racing it.
+        let mut head = handle.head();
+        let published = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                let snapshot = head.borrow().snapshot();
+                if !snapshot.tail.is_empty() {
+                    break snapshot;
+                }
+                head.changed().await.expect("head channel open");
+            }
+        })
+        .await
+        .expect("the seeded head must publish");
+
+        // Non-vacuous: this head really does render a `<todos>` reminder…
+        assert!(
+            published.tail.iter().any(is_todo_reminder),
+            "fixture: the reminder must be live for this test to mean anything"
+        );
+
+        // …and the fork seed the production path hands `build_fork` has none.
+        let cell: HeadCell = Arc::new(std::sync::Mutex::new(Some(handle.head())));
+        let seed = snapshot_provider(cell)()
+            .await
+            .expect("a live head yields a seed");
+        assert!(
+            !seed.iter().any(is_todo_reminder),
+            "a fork seed must carry no ephemeral items: {seed:#?}"
+        );
+        assert!(
+            seed.iter().any(|i| matches!(
+                i,
+                hotl_types::Item::User { text, synthetic: None } if text == "earlier parent context"
+            )),
+            "…while still carrying the durable projection: {seed:#?}"
+        );
+    }
+
+    fn is_todo_reminder(item: &hotl_types::Item) -> bool {
+        matches!(
+            item,
+            hotl_types::Item::User {
+                synthetic: Some(hotl_types::SyntheticReason::Todos),
+                ..
+            }
+        )
     }
 
     /// Regression for the reference-cycle leak: before the fix, the

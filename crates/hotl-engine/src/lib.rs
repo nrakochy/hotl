@@ -51,6 +51,11 @@ pub use ledger::{LedgerSummary, Phase, PhaseDeltaSummary};
 /// only thing that may publish it.
 pub use actor::ProjectionHead;
 
+/// Re-exported alongside [`ProjectionHead`]: what a read of it yields, split
+/// into the durable projection and the ephemeral per-sample tail. Out-of-crate
+/// readers (`fork`'s history seed) name it to say which half they take.
+pub use actor::Snapshot;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model: String,

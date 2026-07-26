@@ -1571,6 +1571,31 @@ mod tests {
         h
     }
 
+    /// [`dawdle_then_reply`] with a live ephemeral tail. The todo is
+    /// **completed** on purpose: the reminder renders (the list is non-empty)
+    /// but the TodoGate never fires, so the script still needs exactly the two
+    /// samples adoption is measured over.
+    async fn dawdle_then_reply_with_todos(mode: hotl_engine::AckMode) -> Harness {
+        let mut h = Harness::with_registry(
+            vec![
+                ScriptedProvider::tool_call("t1", "dawdle", json!({})),
+                ScriptedProvider::text_reply("done"),
+            ],
+            cfg_with(mode),
+            dawdle_registry(),
+        );
+        h.handle
+            .set_todos(vec![hotl_types::Todo {
+                content: "already done".into(),
+                status: hotl_types::TodoStatus::Completed,
+                active_form: None,
+            }])
+            .await;
+        let outcome = h.prompt_and_wait("go").await;
+        assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+        h
+    }
+
     /// commit-protocol.md test matrix case 9 (MANDATORY): "under leaf
     /// equality, the adopted speculative request's bytes equal the
     /// sequentially rebuilt request's, byte for byte".
@@ -1618,6 +1643,55 @@ mod tests {
             let moim = req.turn_context.as_deref().expect("MOIM attached");
             assert!(moim.contains("sample=\"2\""), "was: {moim}");
         }
+    }
+
+    /// Case 9 again, now with a live ephemeral tail — the half the split adds.
+    ///
+    /// `Turn::predicted_snapshot` *carries* the tail rather than re-deriving
+    /// it; if that carry were wrong (dropped, duplicated, or folded back into
+    /// `items`) the adopted request would stop matching the sequential rebuild
+    /// here, and only here. Also pins the structural guarantee the later
+    /// breakpoint planner is built on: `items` is durable-only on BOTH paths.
+    #[tokio::test]
+    async fn an_adopted_request_with_an_ephemeral_tail_still_equals_the_rebuild() {
+        let adopted_run = dawdle_then_reply_with_todos(hotl_engine::AckMode::Pipelined).await;
+        let sequential_run = dawdle_then_reply_with_todos(hotl_engine::AckMode::Sync).await;
+
+        let adopted = adopted_run.provider.requests();
+        let sequential = sequential_run.provider.requests();
+        assert_eq!(adopted.len(), 2, "the optimistic dispatch WAS adopted");
+        assert_eq!(sequential.len(), 2, "Sync mode never speculates");
+
+        // Non-vacuous: there really is an ephemeral tail on both paths.
+        for req in [&adopted[1], &sequential[1]] {
+            assert_eq!(
+                req.ephemeral_tail.len(),
+                1,
+                "fixture: the todo reminder must be live"
+            );
+            assert!(
+                !req.items.iter().any(|i| matches!(
+                    i,
+                    Item::User {
+                        synthetic: Some(hotl_types::SyntheticReason::Todos),
+                        ..
+                    }
+                )),
+                "`items` must stay durable-only: {:#?}",
+                req.items
+            );
+        }
+
+        assert_eq!(
+            format!("{:?}", without_moim(&adopted[1])),
+            format!("{:?}", without_moim(&sequential[1])),
+            "the adopted request must equal the sequential rebuild"
+        );
+        assert_eq!(
+            hotl_provider_anthropic::wire_body(&without_moim(&adopted[1])).to_string(),
+            hotl_provider_anthropic::wire_body(&without_moim(&sequential[1])).to_string(),
+            "…and so must the wire body built from it"
+        );
     }
 
     /// The mispredict half of case 9: "the mispredict path (a steer at the

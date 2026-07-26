@@ -1,8 +1,8 @@
 //! `SessionCmd::SetTodos` appends a durable `todos` entry (mirrors
 //! `rename.rs`/`set_mode.rs`) and emits `TodosChanged`. The list itself is
-//! ephemeral session context: it rides the snapshot a turn samples against
-//! (like the MOIM turn-context block) but never lands in the durable
-//! projection replay reconstructs.
+//! ephemeral session context: it rides the snapshot's *ephemeral tail* (like
+//! the MOIM turn-context block) but never lands in the durable projection
+//! replay reconstructs — nor in the request's durable `items`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,6 +20,16 @@ fn todo(content: &str, status: TodoStatus) -> Todo {
         status,
         active_form: None,
     }
+}
+
+fn is_todos(item: &Item) -> bool {
+    matches!(
+        item,
+        Item::User {
+            synthetic: Some(SyntheticReason::Todos),
+            ..
+        }
+    )
 }
 
 #[tokio::test]
@@ -120,28 +130,32 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
         }
     }
 
-    // The model saw the reminder as the last item of its request...
+    // The model saw the reminder — on the request's EPHEMERAL channel, which
+    // is the only place it can appear...
     let request = provider.last_request().expect("one request");
-    let last = request.items.last().expect("non-empty snapshot");
+    let last = request
+        .ephemeral_tail
+        .last()
+        .expect("the reminder rides the tail");
     match last {
         Item::User { text, synthetic } => {
             assert_eq!(*synthetic, Some(SyntheticReason::Todos));
             assert!(text.contains("[~] wire the gate"), "text: {text}");
         }
-        other => panic!("expected the todo reminder last, got {other:?}"),
+        other => panic!("expected the todo reminder in the tail, got {other:?}"),
     }
+    // ...and never on the durable one the cache breakpoint planner reads.
+    assert!(
+        !request.items.iter().any(is_todos),
+        "`items` is durable-only: {:#?}",
+        request.items
+    );
 
     // ...but replay's projection (what the durable log actually holds)
     // carries no such item — the reminder never got committed.
     let replayed = hotl_store::replay(&log_path).expect("replay");
     assert!(
-        !replayed.items.iter().any(|i| matches!(
-            i,
-            Item::User {
-                synthetic: Some(SyntheticReason::Todos),
-                ..
-            }
-        )),
+        !replayed.items.iter().any(is_todos),
         "the todo reminder must never land in the durable projection"
     );
 }
@@ -218,14 +232,21 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
     // The seeded list reached `turn.rs`'s reminder injection, same as a live
     // `set_todos()` would — proving the actor's *starting* state carried it.
     let request = provider.last_request().expect("one request");
-    let last = request.items.last().expect("non-empty snapshot");
+    let last = request
+        .ephemeral_tail
+        .last()
+        .expect("the reminder rides the tail");
     match last {
         Item::User { text, synthetic } => {
             assert_eq!(*synthetic, Some(SyntheticReason::Todos));
             assert!(text.contains("[~] finish the gate"), "text: {text}");
         }
-        other => panic!("expected the todo reminder last, got {other:?}"),
+        other => panic!("expected the todo reminder in the tail, got {other:?}"),
     }
+    assert!(
+        !request.items.iter().any(is_todos),
+        "`items` is durable-only"
+    );
 
     // Seeding must not re-log: the resumed session's own log carries no
     // `Todos` entry of its own (it never called `SetTodos`).
