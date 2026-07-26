@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-07-25
+
 ### Fixed
 
 - **`sandboxed:` in an ask now means the sandbox was proven on this host**, not
