@@ -453,6 +453,13 @@ async fn await_speculation(
 #[derive(Default)]
 struct TicketPipeline {
     tickets: VecDeque<crate::CommitTicket>,
+    /// `(id, seq)` of the newest ticket this turn submitted — the identity
+    /// and commit order the actor assigned **eagerly**, before the write.
+    /// `id` is the `expected_leaf` an optimistic dispatch is adopted
+    /// against; `seq` is the `my_ack_seq` the refresh waits for. Kept after
+    /// a drain empties `tickets`: the refresh runs *after* barrier (b), so
+    /// the numbers have to outlive the tickets that carried them.
+    last: Option<(String, u64)>,
 }
 
 impl TicketPipeline {
@@ -464,6 +471,18 @@ impl TicketPipeline {
         self.tickets.len()
     }
 
+    /// The `seq` the sample-boundary refresh waits for, or `None` when this
+    /// turn has committed nothing yet.
+    fn ack_seq(&self) -> Option<u64> {
+        self.last.as_ref().map(|(_, seq)| *seq)
+    }
+
+    /// The id of this turn's newest committed unit — an optimistic
+    /// dispatch's `expected_leaf`.
+    fn leaf(&self) -> Option<&str> {
+        self.last.as_ref().map(|(id, _)| id.as_str())
+    }
+
     /// Push a ticket, waiting on the oldest first once the window is full —
     /// the backpressure half of the bound.
     async fn submit(&mut self, ticket: crate::CommitTicket) -> Commit {
@@ -471,6 +490,7 @@ impl TicketPipeline {
         while self.len() >= ACK_WINDOW {
             commit = commit.and(self.resolve_oldest().await);
         }
+        self.last = Some((ticket.id.clone(), ticket.seq));
         self.tickets.push_back(ticket);
         commit
     }
@@ -558,6 +578,9 @@ struct Turn {
     /// Deliberately NOT carried across a compaction respawn: barrier (c)
     /// empties it before the turn reports, so a continuation starts clean.
     pipeline: TicketPipeline,
+    /// The read side of the actor's published head (§Read invariant): the
+    /// sample-boundary refresh, and the only thing this turn ever reads.
+    head: tokio::sync::watch::Receiver<Arc<crate::actor::ProjectionHead>>,
 }
 
 impl Drop for Turn {
@@ -586,6 +609,7 @@ impl Turn {
         // config change between folds is still honored.
         let mut models = vec![shared.config.model.clone()];
         models.extend(shared.config.fallback_models.iter().cloned());
+        let head = shared.head();
         Self {
             tool_defs: shared.registry.defs().into(),
             shared,
@@ -616,6 +640,7 @@ impl Turn {
             // `Turn` task flushes its own report when it ends (see `run`).
             ledger: crate::ledger::LoopLedger::new(),
             pipeline: TicketPipeline::default(),
+            head,
         }
     }
 
@@ -804,9 +829,10 @@ impl Turn {
                 other => SampleEnd::Fatal(other.message().into()),
             };
         }
-        let Some(snapshot) = self.snapshot().await else {
+        let Some(head) = self.refresh().await else {
             return SampleEnd::Fatal("session closed".into());
         };
+        let snapshot = head.snapshot();
         self.ledger.stamp(Phase::SnapshotReady);
         self.samples += 1;
         let request = match self.build_request(&snapshot) {
@@ -839,8 +865,15 @@ impl Turn {
             blocks: blocks.clone(),
         };
         self.ledger.stamp(Phase::BatchProposed);
+        // The `Completed` boundary is ONE causal event — the assistant item
+        // and the usage it was billed at — so it commits as one `Group`:
+        // chained parent→child, one writer message, one `sync_data` (2→1),
+        // one ticket (commit-protocol.md §Causal groups). Pipelined, which
+        // is where S2b's structural win goes live: the tool phase that
+        // follows waits on this commit at barrier (a) instead of the turn
+        // blocking on its fsync here.
         let commit = self
-            .propose(vec![
+            .propose_pipelined(vec![
                 EntryPayload::Item { item: assistant },
                 EntryPayload::Usage { usage },
             ])
@@ -1487,13 +1520,32 @@ impl Turn {
         await_speculation(handle, &self.cancel, SPECULATION_WAIT).await
     }
 
-    async fn snapshot(&self) -> Option<Arc<Vec<Item>>> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SessionCmd::Snapshot { reply: tx })
-            .await
-            .ok()?;
-        rx.await.ok()
+    /// The sample-boundary refresh (commit-protocol.md §Read invariant,
+    /// amendment 2): wait until the published head has applied everything
+    /// this turn committed, then read it. `my_ack_seq` is the `seq` the
+    /// turn's last ticket carried — known at issue time, and already
+    /// confirmed durable by barrier (b)'s drain, which runs *before* this
+    /// and never below it (a ticket is the only place a sealed log is
+    /// reported, so a watch-only wait would hang on one).
+    ///
+    /// The wait is normally already satisfied when it is reached: the actor
+    /// applies, publishes, and only then resolves the ticket the drain just
+    /// took. `None` means the session is gone (the actor dropped the
+    /// channel).
+    async fn refresh(&mut self) -> Option<Arc<crate::actor::ProjectionHead>> {
+        match self.pipeline.ack_seq() {
+            Some(my_ack_seq) => self
+                .head
+                .wait_for(|head| head.epoch() >= my_ack_seq)
+                .await
+                .ok()
+                .map(|head| Arc::clone(&head)),
+            // Nothing committed yet this turn (the first sample): whatever
+            // the actor last published already contains the prompt that
+            // spawned this turn — it was appended, applied and published
+            // before the spawn.
+            None => Some(Arc::clone(&self.head.borrow())),
+        }
     }
 
     /// Serialize + mask every entry (commit-protocol.md §Proposal payloads)
@@ -1591,7 +1643,7 @@ impl Turn {
         if self
             .cmd_tx
             .send(SessionCmd::ProposePrepared {
-                entries: prepared,
+                proposal: crate::EntryProposal::of(prepared),
                 mode,
                 reply: tx,
             })

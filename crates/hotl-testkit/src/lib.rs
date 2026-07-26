@@ -13,7 +13,7 @@ use hotl_engine::{
     SessionHandle,
 };
 use hotl_platform::SystemClock;
-use hotl_provider::{ProviderError, ScriptedProvider, StreamEvent};
+use hotl_provider::{Provider, ProviderError, SamplingRequest, ScriptedProvider, StreamEvent};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, Registry};
 use hotl_types::{Entry, Item};
@@ -34,6 +34,11 @@ pub struct Harness {
     pub ask_reply: AskReply,
     /// One-shot steer to send when the next ToolStart is observed.
     pub steer_on_tool_start: Option<String>,
+    /// One-shot steer to send when the next stream delta is observed — i.e.
+    /// *inside* a sample window. Deterministic only with
+    /// [`Harness::with_paused_completion`], which holds the stream open long
+    /// enough for the steer to reach the actor before the sample closes.
+    pub steer_on_text_delta: Option<String>,
     /// Labels of every shadow snapshot the engine requested, in order.
     pub snapshots: Arc<std::sync::Mutex<Vec<String>>>,
     /// Every `EngineEvent::LedgerReport` seen, in order (§S1 instrument).
@@ -43,6 +48,37 @@ pub struct Harness {
     /// after the log itself has moved into the session.
     fsyncs: Arc<std::sync::atomic::AtomicU64>,
 }
+
+/// Wraps the scripted provider so every stream stalls for `pause` right
+/// before its terminal `Completed` event. That stall is the *sample window*:
+/// with the `Completed` pair committing as a pipelined causal group
+/// (commit-protocol.md §Causal groups), it is the only place a scenario can
+/// deterministically land a steer between "the request went out" and "the
+/// assistant item is durable" — the interleaving 72a6f1b is about.
+struct PausedCompletion {
+    inner: Arc<ScriptedProvider>,
+    pause: std::time::Duration,
+}
+
+impl Provider for PausedCompletion {
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> futures_util::stream::BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        use futures_util::StreamExt;
+        let pause = self.pause;
+        Box::pin(self.inner.stream(req).then(move |event| async move {
+            if matches!(event, Ok(StreamEvent::Completed { .. })) {
+                tokio::time::sleep(pause).await;
+            }
+            event
+        }))
+    }
+}
+
+/// A wrapper the harness installs between the engine and the scripted
+/// provider — see [`Harness::build_wrapped`].
+type ProviderWrap = Box<dyn FnOnce(Arc<ScriptedProvider>) -> Arc<dyn Provider>>;
 
 /// Records snapshot labels instead of running git.
 struct RecordingSnapshotter(Arc<std::sync::Mutex<Vec<String>>>);
@@ -145,6 +181,27 @@ impl Harness {
         Self::build_with(scripts, config, initial_items, hooks, Registry::builtin())
     }
 
+    /// Construct a harness whose every sample stalls before completing — see
+    /// [`PausedCompletion`]. Pair with [`Harness::steer_on_text_delta`].
+    pub fn with_paused_completion(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        pause: std::time::Duration,
+    ) -> Self {
+        Self::build_wrapped(
+            scripts,
+            config,
+            Vec::new(),
+            None,
+            Registry::builtin(),
+            Rules::default(),
+            false,
+            Some(Box::new(move |inner| {
+                Arc::new(PausedCompletion { inner, pause })
+            })),
+        )
+    }
+
     /// Construct a harness with custom permission rules (mode/deny/admin
     /// scenarios).
     pub fn with_rules(
@@ -190,6 +247,32 @@ impl Harness {
         rules: Rules,
         sync_noop: bool,
     ) -> Self {
+        Self::build_wrapped(
+            scripts,
+            config,
+            initial_items,
+            hooks,
+            registry,
+            rules,
+            sync_noop,
+            None,
+        )
+    }
+
+    /// `wrap`, when present, sits between the engine and the scripted
+    /// provider: the harness keeps the `ScriptedProvider` for `requests()`
+    /// and `push_script`, while the engine talks to the wrapper.
+    #[allow(clippy::too_many_arguments)]
+    fn build_wrapped(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+        hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+        registry: Registry,
+        rules: Rules,
+        sync_noop: bool,
+        wrap: Option<ProviderWrap>,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
             .expect("session log");
@@ -200,8 +283,12 @@ impl Harness {
         let log_path = log.path().to_path_buf();
         let provider = Arc::new(ScriptedProvider::new(scripts));
         let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let engine_provider: Arc<dyn Provider> = match wrap {
+            Some(wrap) => wrap(Arc::clone(&provider)),
+            None => provider.clone(),
+        };
         let deps = SessionDeps {
-            provider: provider.clone(),
+            provider: engine_provider,
             registry: Arc::new(registry),
             rules: Arc::new(rules),
             sandbox_enforced: false,
@@ -225,6 +312,7 @@ impl Harness {
             extra_dirs: Vec::new(),
             ask_reply: AskReply::Allow,
             steer_on_tool_start: None,
+            steer_on_text_delta: None,
             snapshots,
             ledger_reports: Vec::new(),
             fsyncs,
@@ -258,6 +346,11 @@ impl Harness {
                 }
                 EngineEvent::ToolStart { .. } => {
                     if let Some(steer) = self.steer_on_tool_start.take() {
+                        self.handle.steer(steer).await;
+                    }
+                }
+                EngineEvent::TextDelta(_) | EngineEvent::ThinkingDelta(_) => {
+                    if let Some(steer) = self.steer_on_text_delta.take() {
                         self.handle.steer(steer).await;
                     }
                 }
@@ -1342,6 +1435,86 @@ mod tests {
             syncs < sync_syncs,
             "group commit must beat the serial baseline: {syncs} syncs vs {sync_syncs} \
              for {entries} entries"
+        );
+    }
+
+    // --- Task 10 (S2c causal groups) ---------------------------------
+
+    /// commit-protocol.md §Causal groups (a), the revision's own counter
+    /// assertion: "the `Completed` boundary spends exactly one `sync_data`
+    /// (not two)". Both counts are deterministic — every commit here is one
+    /// writer message on an otherwise idle queue, so the only difference
+    /// between the modes is the boundary pair collapsing 2→1.
+    #[tokio::test]
+    async fn the_completed_boundary_spends_one_sync_instead_of_two() {
+        async fn run(mode: hotl_engine::AckMode) -> (u64, Vec<String>) {
+            let mut h = Harness::new(vec![ScriptedProvider::text_reply("hi")], cfg_with(mode));
+            let outcome = h.prompt_and_wait("say hi").await;
+            assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+            (h.fsync_count(), h.kinds())
+        }
+
+        let (sync_syncs, sync_kinds) = run(hotl_engine::AckMode::Sync).await;
+        assert_eq!(
+            sync_kinds,
+            ["header", "item", "item", "usage"],
+            "the scenario is header + prompt + the Completed pair"
+        );
+        assert_eq!(
+            sync_syncs, 4,
+            "entry at a time: header, prompt, assistant, usage — one sync each"
+        );
+
+        let (syncs, kinds) = run(hotl_engine::AckMode::Pipelined).await;
+        assert_eq!(kinds, sync_kinds, "the same session, the same log");
+        assert_eq!(
+            syncs, 3,
+            "the assistant item and its usage are ONE causal group: 2 syncs become 1"
+        );
+    }
+
+    /// commit-protocol.md test matrix case 6, extended to the boundary group:
+    /// a steer that arrives *inside* the sample window — after the request
+    /// went out, while the `Completed` group is still in flight — is held,
+    /// lands after the assistant item it could not have seen, and produces
+    /// the same normalized transcript as the same run in `Sync` mode.
+    ///
+    /// This is the interleaving the boundary group creates: before S2c the
+    /// pair committed synchronously, so there was no window between "the
+    /// group was forwarded" and "the group is durable" for a steer to land
+    /// in. The hold now ends at the *settle*, and the released steer joins
+    /// the same published head as the group it followed.
+    #[tokio::test]
+    async fn a_steer_inside_the_boundary_group_lands_after_the_assistant_item() {
+        async fn run(mode: hotl_engine::AckMode) -> Harness {
+            let mut h = Harness::with_paused_completion(
+                vec![ScriptedProvider::text_reply("the reply")],
+                cfg_with(mode),
+                std::time::Duration::from_millis(150),
+            );
+            h.steer_on_text_delta = Some("actually, do it differently".into());
+            let outcome = h.prompt_and_wait("go").await;
+            assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+            h
+        }
+
+        let pipelined = run(hotl_engine::AckMode::Pipelined).await;
+        let items = pipelined.items();
+        let assistant = items
+            .iter()
+            .position(|i| matches!(i, Item::Assistant { .. }))
+            .expect("the assistant item committed");
+        let steer = items.iter().position(is_steer).expect("the steer landed");
+        assert!(
+            steer > assistant,
+            "a steer must never precede the reply that could not have seen it: {items:#?}"
+        );
+
+        let sync = run(hotl_engine::AckMode::Sync).await;
+        assert_eq!(
+            pipelined.transcript(),
+            sync.transcript(),
+            "the boundary group must not reorder anything"
         );
     }
 

@@ -7,12 +7,13 @@
 
 use std::sync::Arc;
 
+use futures_util::stream::BoxStream;
 use hotl_engine::{
     event_channel, session_channel, spawn_session_with_channels, EngineConfig, PreparedEntry,
     ProposeReply, SessionCmd, SessionDeps,
 };
 use hotl_platform::SystemClock;
-use hotl_provider::ScriptedProvider;
+use hotl_provider::{Provider, ProviderError, SamplingRequest, StreamEvent};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, Registry};
 use hotl_types::{EntryPayload, Item, SyntheticReason};
@@ -20,7 +21,7 @@ use tokio::sync::oneshot;
 
 fn deps(dir: &std::path::Path, log: SessionLog, config: EngineConfig) -> SessionDeps {
     SessionDeps {
-        provider: Arc::new(ScriptedProvider::new(vec![])),
+        provider: Arc::new(NeverAnswers),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
         sandbox_enforced: false,
@@ -33,6 +34,18 @@ fn deps(dir: &std::path::Path, log: SessionLog, config: EngineConfig) -> Session
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
         config,
+    }
+}
+
+/// A provider whose sample never completes: the turn it belongs to stays
+/// live (and so the actor keeps holding steers) for the whole test, which is
+/// the window a real sample occupies. The turn itself proposes nothing —
+/// every commit below is sent by hand, which is the point.
+struct NeverAnswers;
+
+impl Provider for NeverAnswers {
+    fn stream(&self, _: SamplingRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        Box::pin(futures_util::stream::pending())
     }
 }
 
@@ -62,17 +75,11 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
         hotl_engine::hooks::NotificationDrain::new(),
     );
 
-    // Sample boundary: grants a snapshot, which starts the `sampling` hold a
-    // real `Turn` would be inside for the duration of its request build —
-    // exactly the window a steer must not jump ahead of.
-    let (tx, rx) = oneshot::channel();
-    cmd_tx
-        .send(SessionCmd::Snapshot { reply: tx })
-        .await
-        .expect("send snapshot");
-    rx.await.expect("snapshot reply");
-
-    // A steer arrives mid-sample: held, not appended (sampling=true).
+    // A live turn is the hold: its sample never completes, so from the
+    // actor's side this is exactly the window a real request build occupies
+    // — and a steer must not jump ahead of it.
+    handle.prompt("go".into()).await;
+    // A steer arrives mid-sample: held, not appended.
     handle.steer("hold me".into()).await;
 
     // The masking rules advance (test-only hook) — an entry already stamped
@@ -95,7 +102,7 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     let (tx, rx) = oneshot::channel();
     cmd_tx
         .send(SessionCmd::ProposePrepared {
-            entries: vec![stale_entry],
+            proposal: hotl_engine::EntryProposal::Single(stale_entry),
             mode: hotl_engine::AckMode::Sync,
             reply: tx,
         })
@@ -113,8 +120,8 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     let after_reject = std::fs::read_to_string(&log_path).expect("read log");
     assert_eq!(
         after_reject.lines().count(),
-        1,
-        "only the header must be on disk after a stale reject: {after_reject}"
+        2,
+        "only the header and the prompt must be on disk after a stale reject: {after_reject}"
     );
 
     // Retry, built at the now-current epoch 1: commits.
@@ -129,7 +136,7 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     let (tx, rx) = oneshot::channel();
     cmd_tx
         .send(SessionCmd::ProposePrepared {
-            entries: vec![fresh_entry],
+            proposal: hotl_engine::EntryProposal::Single(fresh_entry),
             mode: hotl_engine::AckMode::Sync,
             reply: tx,
         })
@@ -142,6 +149,7 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
 
     // The held steer must now have been released — but strictly AFTER the
     // assistant item, never before it (the transcript-inversion bug).
+    handle.interrupt(); // end the hanging turn so the actor can shut down
     drop(cmd_tx); // let the actor's command loop end cleanly
     handle.finish(std::time::Duration::from_millis(500)).await;
 
@@ -149,20 +157,20 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     assert_eq!(replayed.warnings, Vec::<String>::new(), "clean log");
     assert_eq!(
         replayed.items.len(),
-        2,
-        "assistant item then the released steer: {:?}",
+        3,
+        "prompt, assistant item, then the released steer: {:?}",
         replayed.items
     );
-    match &replayed.items[0] {
-        Item::Assistant { .. } => {}
-        other => panic!("item 0 must be the retried assistant item, got {other:?}"),
-    }
     match &replayed.items[1] {
+        Item::Assistant { .. } => {}
+        other => panic!("item 1 must be the retried assistant item, got {other:?}"),
+    }
+    match &replayed.items[2] {
         Item::User {
             synthetic: Some(SyntheticReason::Steer),
             text,
             ..
         } => assert_eq!(text, "hold me"),
-        other => panic!("item 1 must be the released steer, got {other:?}"),
+        other => panic!("item 2 must be the released steer, got {other:?}"),
     }
 }

@@ -47,17 +47,190 @@ const HELD_BYTES_MAX: usize = 64 * 1024;
 /// so repeated folding never stacks markers.
 const FOLD_MARK: &str = "\n[… later text truncated]";
 
-/// One entry the actor has minted and forwarded, waiting on the writer's ack
-/// (commit-protocol.md §Pipelined commits, "The actor's bookkeeping").
+/// One forwarded unit — a single entry, or a whole causal `Group` — waiting
+/// on the writer's ack (commit-protocol.md §Pipelined commits, "The actor's
+/// bookkeeping").
 struct PendingAck {
     ack: tokio::sync::oneshot::Receiver<std::io::Result<hotl_store::Ack>>,
-    /// The projection item this entry carries, if any. Applied when the ack
-    /// lands, in FIFO order — never on forward.
-    item: Option<Item>,
-    /// Resolved when this entry is the last of its proposal: one ticket per
-    /// proposal, bearing that proposal's last entry's id and seq. `None` for
-    /// interior entries and for every actor-originated append.
+    /// The projection items this unit carries, in commit order. Applied when
+    /// the ack lands, in FIFO order — never on forward. A `Group` applies
+    /// whole or not at all, which is what one ack for one writer message
+    /// gives.
+    items: Vec<Item>,
+    /// Id of this unit's **last** entry — the durable leaf once applied
+    /// (§Ordering authority), and what its ticket bears.
+    id: String,
+    /// That entry's `seq`: the epoch the published head reaches when this
+    /// unit is applied.
+    seq: u64,
+    /// Resolved when this unit is the last of its proposal: one ticket per
+    /// proposal. `None` for interior entries and for every actor-originated
+    /// append.
     ticket: Option<tokio::sync::oneshot::Sender<Result<crate::CommitAck, crate::CommitFailed>>>,
+}
+
+/// The projection head the actor publishes (commit-protocol.md §Read
+/// invariant, amendment 2): epoch-fenced, published **only post-ack**, and
+/// read by turn tasks through a `watch::Receiver` they cannot write. The
+/// actor is the sole publisher — the `watch::Sender` never leaves [`Head`],
+/// which only [`run`] owns.
+pub struct ProjectionHead {
+    /// The durable projection: exactly the items the log carries.
+    items: Arc<Vec<Item>>,
+    /// The `todo_write` checklist — ephemeral session context that is never
+    /// canon and never an entry in `items`. It rides the head rather than
+    /// being stitched into it, so the published value stays *the durable
+    /// projection*; the stitch happens per read, in [`Self::snapshot`], the
+    /// same "ephemeral, request-only" shape the MOIM turn-context block has.
+    /// A todo change is itself a durable `Todos` entry, so it moves
+    /// `leaf`/`epoch` like any other commit.
+    todos: Arc<Vec<Todo>>,
+    /// Id of the newest entry applied — the **durable leaf** (§Ordering
+    /// authority), and what an optimistic dispatch's `expected_leaf` is
+    /// compared against. `None` before anything is applied.
+    leaf: Option<String>,
+    /// `seq` of that entry: the session-global commit order, which is what
+    /// makes `wait_for(|p| p.epoch >= my_ack_seq)` well-formed.
+    epoch: u64,
+}
+
+impl ProjectionHead {
+    /// The durable leaf: id of the newest entry applied.
+    pub fn leaf(&self) -> Option<&str> {
+        self.leaf.as_deref()
+    }
+
+    /// `seq` of that entry — the session-global commit order.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    /// The snapshot a turn task samples against: the durable projection,
+    /// plus the todo reminder appended as the last item when the list is
+    /// non-empty. The reminder rides *this* returned `Arc`, never `items`
+    /// itself, so it can never be committed, replayed, or double-counted
+    /// (each call starts fresh from the durable projection). The empty-list
+    /// path returns the same `Arc` the head already holds — no allocation on
+    /// the common case, which is what keeps "Vec with clone at grant" the
+    /// cost model §Read invariant priced.
+    pub fn snapshot(&self) -> Arc<Vec<Item>> {
+        match hotl_tools::todo::render_reminder(&self.todos) {
+            Some(reminder) => {
+                let mut with_reminder = (*self.items).clone();
+                with_reminder.push(reminder);
+                Arc::new(with_reminder)
+            }
+            None => Arc::clone(&self.items),
+        }
+    }
+}
+
+/// The head channel, created before the actor so a `SessionHandle` can hand
+/// out readers immediately (see [`crate::SessionHandle::head`]). The
+/// `Sender` goes to the actor and never leaves it.
+pub(crate) fn head_channel() -> (
+    tokio::sync::watch::Sender<Arc<ProjectionHead>>,
+    tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
+) {
+    tokio::sync::watch::channel(Arc::new(ProjectionHead {
+        items: Arc::new(Vec::new()),
+        todos: Arc::new(Vec::new()),
+        leaf: None,
+        epoch: 0,
+    }))
+}
+
+/// The actor's side of the published head: the live projection plus the one
+/// `watch::Sender` in the process. Every projection advance goes through
+/// here, which is what makes "publishes only post-ack, in ack order" a
+/// property of one type rather than of every call site.
+struct Head {
+    tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
+    items: Arc<Vec<Item>>,
+    todos: Arc<Vec<Todo>>,
+    leaf: Option<String>,
+    epoch: u64,
+}
+
+impl Head {
+    /// Seed the head with the session's starting projection and publish it,
+    /// so the very first read (a resumed session's `Continue`, or `fork`)
+    /// never sees the empty placeholder [`head_channel`] created.
+    fn new(
+        tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
+        items: Vec<Item>,
+        todos: Vec<Todo>,
+    ) -> Self {
+        let mut head = Self {
+            tx,
+            items: Arc::new(items),
+            todos: Arc::new(todos),
+            leaf: None,
+            epoch: 0,
+        };
+        head.publish();
+        head
+    }
+
+    fn items(&self) -> &Arc<Vec<Item>> {
+        &self.items
+    }
+
+    fn todos(&self) -> &Arc<Vec<Todo>> {
+        &self.todos
+    }
+
+    /// Apply one acked item. Deliberately does NOT publish: a commit and the
+    /// steer released behind it must reach the head as one visible step (see
+    /// `release_steers`), or a turn's refresh could observe the commit
+    /// without the steer that overtook it.
+    fn apply(&mut self, item: Item) {
+        Arc::make_mut(&mut self.items).push(item);
+    }
+
+    /// Record the durable leaf and epoch an acked unit advanced the head to.
+    fn advance(&mut self, leaf: String, seq: u64) {
+        self.leaf = Some(leaf);
+        self.epoch = seq;
+    }
+
+    fn set_todos(&mut self, todos: Vec<Todo>) {
+        self.todos = Arc::new(todos);
+    }
+
+    /// Re-point the projection after a fold. The published head moves without
+    /// an epoch bump: the compaction entry's own commit already advanced
+    /// `leaf`/`epoch`, and this is that entry taking effect. Unobservable
+    /// mid-turn by construction — the actor terminates a turn *before*
+    /// committing a compaction (§Read invariant).
+    fn repoint(&mut self, items: Vec<Item>) {
+        self.items = Arc::new(items);
+        self.publish();
+    }
+
+    /// The one publish site. `watch::Sender::send` never fails here: the
+    /// actor holds a receiver for the whole session inside `SharedDeps`.
+    fn publish(&mut self) {
+        let _ = self.tx.send(Arc::new(ProjectionHead {
+            items: Arc::clone(&self.items),
+            todos: Arc::clone(&self.todos),
+            leaf: self.leaf.clone(),
+            epoch: self.epoch,
+        }));
+    }
+}
+
+/// Why a held steer may land right now. There is no third caller, and that
+/// is the whole of the protection the `ProposePrepared` handler's old
+/// `sampling` flip gave: a steer is only ever appended at a boundary the
+/// actor itself just created, so it can never precede an assistant item that
+/// could not have seen it (72a6f1b).
+#[derive(Clone, Copy, Debug)]
+enum Boundary {
+    /// A commit this turn made just landed and was applied to the head.
+    CommitSettled,
+    /// The turn is over; nothing will answer an open batch now.
+    TurnEnded,
 }
 
 /// How a drain settles the tickets it resolves.
@@ -131,7 +304,7 @@ impl Pipeline {
     /// an ack. Enforced by `the_pipeline_advances_the_projection_in_fifo_order`
     /// and, end to end, by
     /// `a_writer_death_before_fsync_never_resolves_a_pipelined_ticket`.
-    async fn drain(&mut self, items: &mut Arc<Vec<Item>>, resolution: Resolution) {
+    async fn drain(&mut self, head: &mut Head, resolution: Resolution) {
         while !self.is_empty() {
             // The borrow ends here, so the pop below is legal — and dropping
             // this future mid-await loses nothing: the receiver stays in the
@@ -141,7 +314,9 @@ impl Pipeline {
                 await_ack(&mut entry.ack).await
             };
             let entry = self.fifo.pop_front().expect("just checked non-empty");
-            settle(entry, acked, items, resolution);
+            let settled = apply_ack(entry, acked, head, resolution);
+            head.publish();
+            settled.resolve();
         }
     }
 }
@@ -174,21 +349,40 @@ async fn await_ack(
     }
 }
 
-/// Apply → publish → resolve, in that order (commit-protocol.md §Read
-/// invariant: "on each ack the actor applies the entry, publishes the new
-/// head, and only then resolves the ticket"). Today the published head *is*
-/// `items`; the epoch-fenced watch transport is S2c.
-fn settle(
+/// A ticket that has been decided but not yet told. Held between the *apply*
+/// and the *resolve* halves of commit-protocol.md §Read invariant's
+/// "apply → publish → resolve" so the publish can sit between them — and so
+/// a steer released at the same boundary joins the same published head.
+#[must_use = "a decided ticket must be resolved, or its proposer waits forever"]
+struct Settled {
+    ticket: Option<tokio::sync::oneshot::Sender<Result<crate::CommitAck, crate::CommitFailed>>>,
+    resolved: Result<crate::CommitAck, crate::CommitFailed>,
+}
+
+impl Settled {
+    fn resolve(self) {
+        if let Some(ticket) = self.ticket {
+            let _ = ticket.send(self.resolved);
+        }
+    }
+}
+
+/// The *apply* half: fold one acked unit (entry or whole `Group`) into the
+/// head. The caller publishes, then resolves — in that order, which is what
+/// makes the turn's `epoch >= my_ack_seq` predicate a gate rather than a
+/// race.
+fn apply_ack(
     entry: PendingAck,
     acked: std::io::Result<hotl_store::Ack>,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     resolution: Resolution,
-) {
+) -> Settled {
     let resolved = match acked {
         Ok(ack) => {
-            if let Some(item) = entry.item {
-                Arc::make_mut(items).push(item);
+            for item in entry.items {
+                head.apply(item);
             }
+            head.advance(entry.id, entry.seq);
             match resolution {
                 Resolution::Ack => Ok(crate::CommitAck { offset: ack.offset }),
                 Resolution::Abort => Err(crate::CommitFailed::Aborted),
@@ -198,8 +392,9 @@ fn settle(
         // leave the log ahead of the projection, never the reverse.
         Err(_) => Err(crate::CommitFailed::LogSealed),
     };
-    if let Some(ticket) = entry.ticket {
-        let _ = ticket.send(resolved);
+    Settled {
+        ticket: entry.ticket,
+        resolved,
     }
 }
 
@@ -249,6 +444,11 @@ pub(crate) struct SharedDeps {
     /// mid-session, so this is constant for the life of a `SharedDeps` — the
     /// guard is implemented anyway, ahead of whatever eventually bumps it.
     rules_epoch: std::sync::atomic::AtomicU32,
+    /// The read side of the published head (commit-protocol.md §Read
+    /// invariant): a turn's sample-boundary refresh. Only a `Receiver` is
+    /// shared — the `Sender` lives in [`run`]'s [`Head`], so the actor stays
+    /// the sole publisher by construction rather than by convention.
+    head_rx: tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
 }
 
 /// `PermissionMode` has no natural discriminant to lean on across an atomic
@@ -276,6 +476,7 @@ impl SharedDeps {
     fn new(
         deps: SessionDeps,
         notifications: crate::hooks::NotificationDrain,
+        head_rx: tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
     ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
         let hook_mask = deps
@@ -310,8 +511,16 @@ impl SharedDeps {
             notifications,
             masker,
             rules_epoch: std::sync::atomic::AtomicU32::new(0),
+            head_rx,
         };
         (shared, deps.log)
+    }
+
+    /// A turn's read side of the published head — see the `head_rx` field
+    /// doc. Cloned per turn task; `watch::Receiver` clones observe the same
+    /// value, so this grants no second source of truth.
+    pub(crate) fn head(&self) -> tokio::sync::watch::Receiver<Arc<ProjectionHead>> {
+        self.head_rx.clone()
     }
 
     /// The live §S1 mask [`crate::hooks::hook_gate!`] branches on — see the
@@ -355,16 +564,37 @@ impl SharedDeps {
     /// The pipeline is drained first, always: this entry's ack sits *behind*
     /// everything already forwarded, so projecting it before those would
     /// invert the ack order the whole design rests on.
+    ///
+    /// The payload is taken **by value** and its item (if any) applied here,
+    /// so the head advances — and publishes — in exactly one place per
+    /// commit path. A caller that appended and then pushed for itself could
+    /// leave the published head one entry behind the projection it names.
     async fn append(
         &self,
         log: &mut SessionLog,
         pipeline: &mut Pipeline,
-        items: &mut Arc<Vec<Item>>,
-        payload: &EntryPayload,
+        head: &mut Head,
+        payload: EntryPayload,
     ) -> bool {
-        pipeline.drain(items, Resolution::Ack).await;
-        pipeline.next_seq();
-        log.append_acked(payload, self.clock.now_ms()).await.is_ok()
+        pipeline.drain(head, Resolution::Ack).await;
+        let seq = pipeline.next_seq();
+        if log
+            .append_acked(&payload, self.clock.now_ms())
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        if let EntryPayload::Item { item } = payload {
+            head.apply(item);
+        }
+        // `append_acked` only advances the chain on a committed entry, so
+        // this is the id of the line that just landed.
+        if let Some(id) = log.last_id() {
+            head.advance(id.to_string(), seq);
+        }
+        head.publish();
+        true
     }
 
     /// The masker turn-side proposal build masks under
@@ -401,6 +631,17 @@ impl SharedDeps {
     ) -> std::io::Result<hotl_store::Forwarded> {
         log.forward_prepared(prepared, self.clock.now_ms())
     }
+
+    /// The `Group` half of the same (commit-protocol.md §Causal groups): one
+    /// writer message, one `sync_data`, one ack bearing the group's last
+    /// entry id.
+    fn forward_group(
+        &self,
+        log: &mut SessionLog,
+        group: Vec<hotl_store::PreparedPayload>,
+    ) -> std::io::Result<hotl_store::Forwarded> {
+        log.forward_group(group, self.clock.now_ms())
+    }
 }
 
 pub(crate) async fn run(
@@ -410,29 +651,29 @@ pub(crate) async fn run(
     events: mpsc::Sender<EngineEvent>,
     current_turn: Arc<Mutex<CancellationToken>>,
     notifications: crate::hooks::NotificationDrain,
+    head_tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
 ) {
     // Resumed history is repaired on the way in: a log written by a build that
     // let a steer land mid-batch would otherwise fail every request forever.
-    let mut items: Arc<Vec<Item>> =
-        Arc::new(pair_tool_results(std::mem::take(&mut deps.initial_items)));
+    //
+    // The `todo_write` checklist (M4/tier-1 gap #3) is actor-owned, ephemeral
+    // session context: it never lives in the durable projection — it is
+    // stitched onto a *read* of the head only (`ProjectionHead::snapshot`),
+    // the same "ephemeral, request-only" shape as the MOIM turn-context
+    // block. A resumed session seeds it from its replayed `Todos` entry
+    // (`SessionDeps::initial_todos`); a fresh session starts empty.
+    let head_rx = head_tx.subscribe();
+    let mut head = Head::new(
+        head_tx,
+        pair_tool_results(std::mem::take(&mut deps.initial_items)),
+        std::mem::take(&mut deps.initial_todos),
+    );
     let mut running = false;
     let mut queue: VecDeque<(String, Option<SyntheticReason>)> = VecDeque::new();
-    // The `todo_write` checklist (M4/tier-1 gap #3): actor-owned, ephemeral
-    // session context. It never lives in `items` — it's stitched onto the
-    // snapshot answer only, the same "ephemeral, request-only" shape as the
-    // MOIM turn-context block, so it never enters the durable projection.
-    // A resumed session seeds this from its replayed `Todos` entry
-    // (`SessionDeps::initial_todos`); a fresh session starts empty.
-    let mut todos: Vec<Todo> = std::mem::take(&mut deps.initial_todos);
-    // Steers that arrived while a tool batch was open, waiting for its results
-    // to close the pairing before they can be appended.
+    // Steers that arrived while a turn was live (or a tool batch open),
+    // waiting for a boundary before they can be appended.
     let mut held_steers: Vec<String> = Vec::new();
-    // True between granting a snapshot and the assistant item for that sample
-    // committing: the window where an appended steer would land AHEAD of the
-    // reply that could not possibly have seen it (T3-3). The tool-phase half of
-    // the same hold is `awaiting_tool_results`.
-    let mut sampling = false;
-    let (shared, mut log) = SharedDeps::new(deps, notifications);
+    let (shared, mut log) = SharedDeps::new(deps, notifications, head_rx);
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
@@ -456,18 +697,24 @@ pub(crate) async fn run(
         let cmd = match woke {
             Woke::Ack(acked) => {
                 let entry = front.expect("the ack arm only runs with a front entry");
-                settle(entry, acked, &mut items, Resolution::Ack);
-                // The projection just advanced: a steer held for a batch that
-                // has now closed can land.
+                let settled = apply_ack(entry, acked, &mut head, Resolution::Ack);
+                // A commit this turn made just landed: that is the boundary a
+                // held steer was waiting for. It is appended BEFORE the
+                // publish below, so a turn's refresh sees the commit and the
+                // steer as one step — which is what turns a steer at the
+                // boundary into a clean adoption miss instead of a race
+                // (commit-protocol.md §Causal groups, the adoption rule).
                 release_steers(
                     &shared,
                     &mut log,
-                    &mut items,
+                    &mut head,
                     &mut pipeline,
                     &mut held_steers,
-                    sampling,
+                    Boundary::CommitSettled,
                 )
                 .await;
+                head.publish();
+                settled.resolve();
                 continue;
             }
             Woke::Cmd(cmd) => {
@@ -485,7 +732,7 @@ pub(crate) async fn run(
                 running = admit_prompt(
                     &shared,
                     &mut log,
-                    &mut items,
+                    &mut head,
                     &mut pipeline,
                     &mut queue,
                     running,
@@ -501,7 +748,7 @@ pub(crate) async fn run(
                 running = admit_prompt(
                     &shared,
                     &mut log,
-                    &mut items,
+                    &mut head,
                     &mut pipeline,
                     &mut queue,
                     running,
@@ -514,7 +761,7 @@ pub(crate) async fn run(
                 .await;
             }
             SessionCmd::Continue => {
-                if !running && crate::needs_continuation(&items) {
+                if !running && crate::needs_continuation(head.items()) {
                     spawn_turn(&shared, &cmd_tx, &events, &current_turn);
                     running = true;
                 }
@@ -523,10 +770,10 @@ pub(crate) async fn run(
                 admit_steer(
                     &shared,
                     &mut log,
-                    &mut items,
+                    &mut head,
                     &mut pipeline,
                     &mut held_steers,
-                    sampling,
+                    running,
                     text,
                 )
                 .await
@@ -536,8 +783,8 @@ pub(crate) async fn run(
                     .append(
                         &mut log,
                         &mut pipeline,
-                        &mut items,
-                        &EntryPayload::Rename { name },
+                        &mut head,
+                        EntryPayload::Rename { name },
                     )
                     .await;
             }
@@ -553,107 +800,57 @@ pub(crate) async fn run(
                     .append(
                         &mut log,
                         &mut pipeline,
-                        &mut items,
-                        &EntryPayload::ModeSet {
+                        &mut head,
+                        EntryPayload::ModeSet {
                             mode: mode.as_str().into(),
                         },
                     )
                     .await;
             }
             SessionCmd::SetTodos(new_todos) => {
-                todos = new_todos;
+                head.set_todos(new_todos);
+                let items = (**head.todos()).clone();
                 let _ = shared
                     .append(
                         &mut log,
                         &mut pipeline,
-                        &mut items,
-                        &EntryPayload::Todos {
-                            items: todos.clone(),
+                        &mut head,
+                        EntryPayload::Todos {
+                            items: items.clone(),
                         },
                     )
                     .await;
-                let _ = events
-                    .send(EngineEvent::TodosChanged {
-                        items: todos.clone(),
-                    })
-                    .await;
-            }
-            SessionCmd::Snapshot { reply } => {
-                // A request is about to be built from this projection.
-                sampling = true;
-                let _ = reply.send(snapshot_with_todos(&items, &todos));
+                let _ = events.send(EngineEvent::TodosChanged { items }).await;
             }
             SessionCmd::Propose { entries, reply } => {
-                // Computed before `entries` moves into `commit`.
-                let closes_sample = entries.iter().any(|e| {
-                    matches!(
-                        e,
-                        EntryPayload::Item {
-                            item: Item::Assistant { .. }
-                        }
-                    )
-                });
-                let committed = commit(&shared, &mut log, &mut items, &mut pipeline, entries).await;
-                if closes_sample {
-                    sampling = false;
-                }
-                // The reply (or the results) a held steer was waiting on may
-                // have just landed.
-                release_steers(
-                    &shared,
-                    &mut log,
-                    &mut items,
-                    &mut pipeline,
-                    &mut held_steers,
-                    sampling,
-                )
-                .await;
+                let committed = commit(&shared, &mut log, &mut head, &mut pipeline, entries).await;
                 let _ = reply.send(committed);
             }
             SessionCmd::ProposePrepared {
-                entries,
+                proposal,
                 mode,
                 reply,
             } => {
-                // Same shape as `Propose` above, computed before `entries`
-                // moves into `commit_prepared`: `item` (not `payload`, which
-                // is now opaque bytes) carries whether this is the closing
-                // assistant item.
-                let closes_sample = entries
-                    .iter()
-                    .any(|e| matches!(e.item(), Some(Item::Assistant { .. })));
-                // The assistant item closes a sample, and `sampling` may
-                // only drop once that item is really in the projection — so
-                // a sample-closing proposal is never pipelined (the boundary
-                // `Group` of S2c changes this, together with the flip).
-                debug_assert!(
-                    !(closes_sample && mode == crate::AckMode::Pipelined),
-                    "a sample-closing proposal must be Sync: `sampling` drops on commit"
-                );
                 let result =
-                    commit_prepared(&shared, &mut log, &mut items, &mut pipeline, entries, mode)
+                    commit_prepared(&shared, &mut log, &mut head, &mut pipeline, proposal, mode)
                         .await;
-                // A stale-epoch reject commits nothing — the turn is about to
-                // re-mask and resend the SAME entries (commit-protocol.md
-                // §Proposal payloads). Treating it like a real commit here
-                // would flip `sampling` false and release any held steer
-                // immediately, landing that steer in the log BEFORE the
-                // retried assistant blocks it was held to avoid preceding —
-                // exactly the inversion the held-steer rule (72a6f1b) exists
-                // to prevent. Leave `sampling`/`held_steers` untouched, as if
-                // this proposal never arrived; the retry's own successful
-                // commit is what actually closes the sample.
-                if !matches!(result, crate::ProposeReply::StaleEpoch) {
-                    if closes_sample {
-                        sampling = false;
-                    }
+                // `Sync` applies inline, so the boundary a held steer waits
+                // for is *here*; `Pipelined` reaches it at the ack, in the
+                // loop's FIFO arm above. A stale-epoch reject is not a
+                // boundary at all — nothing was committed and the turn is
+                // about to resend the SAME entries, so releasing here would
+                // land the steer BEFORE the retried assistant blocks it was
+                // held to avoid preceding (72a6f1b).
+                if mode == crate::AckMode::Sync
+                    && !matches!(result, crate::ProposeReply::StaleEpoch)
+                {
                     release_steers(
                         &shared,
                         &mut log,
-                        &mut items,
+                        &mut head,
                         &mut pipeline,
                         &mut held_steers,
-                        sampling,
+                        Boundary::CommitSettled,
                     )
                     .await;
                 }
@@ -675,22 +872,21 @@ pub(crate) async fn run(
                 // Close it, then let held steers land before a queued prompt
                 // starts the next turn behind them.
                 // A turn that died mid-sample must not strand its steers.
-                sampling = false;
-                close_open_batch(&shared, &mut log, &mut items, &mut pipeline).await;
+                close_open_batch(&shared, &mut log, &mut head, &mut pipeline).await;
                 release_steers(
                     &shared,
                     &mut log,
-                    &mut items,
+                    &mut head,
                     &mut pipeline,
                     &mut held_steers,
-                    sampling,
+                    Boundary::TurnEnded,
                 )
                 .await;
                 on_turn_finished(
                     TurnFinishedCtx {
                         shared: &shared,
                         log: &mut log,
-                        items: &mut items,
+                        head: &mut head,
                         pipeline: &mut pipeline,
                         queue: &mut queue,
                         running: &mut running,
@@ -735,7 +931,7 @@ pub(crate) async fn run(
 struct TurnFinishedCtx<'a> {
     shared: &'a Arc<SharedDeps>,
     log: &'a mut SessionLog,
-    items: &'a mut Arc<Vec<Item>>,
+    head: &'a mut Head,
     pipeline: &'a mut Pipeline,
     queue: &'a mut VecDeque<(String, Option<SyntheticReason>)>,
     running: &'a mut bool,
@@ -757,7 +953,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
             try_compact(
                 ctx.shared,
                 ctx.log,
-                ctx.items,
+                ctx.head,
                 ctx.pipeline,
                 ctx.compact_streak,
                 spec,
@@ -776,7 +972,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
         *ctx.running = end_turn(
             ctx.shared,
             ctx.log,
-            ctx.items,
+            ctx.head,
             ctx.pipeline,
             ctx.queue,
             outcome,
@@ -796,7 +992,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
 async fn try_compact(
     shared: &Arc<SharedDeps>,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     compact_streak: &mut u32,
     spec: Option<crate::SpecDigest>,
@@ -828,7 +1024,7 @@ async fn try_compact(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Some(Outcome::Cancelled),
-            compacted = compact(shared, log, items, pipeline, spec) => compacted,
+            compacted = compact(shared, log, head, pipeline, spec) => compacted,
         }
     };
     match compacted {
@@ -850,7 +1046,7 @@ async fn try_compact(
 async fn end_turn(
     shared: &Arc<SharedDeps>,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
     outcome: Outcome,
@@ -859,7 +1055,7 @@ async fn end_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
-    annotate(shared, log, items, pipeline, &outcome).await;
+    annotate(shared, log, head, pipeline, &outcome).await;
     // Notification: the turn completed — fire-and-forget, computed before
     // `outcome` moves into the event below. §S1 HookRouter gate: masked-off
     // (or hook-less) skips even the `outcome_detail` computation.
@@ -883,7 +1079,7 @@ async fn end_turn(
             start_turn(
                 shared,
                 log,
-                items,
+                head,
                 pipeline,
                 next,
                 synthetic,
@@ -976,13 +1172,13 @@ fn awaiting_tool_results(items: &[Item]) -> bool {
 async fn admit_steer(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     held: &mut Vec<String>,
-    sampling: bool,
+    running: bool,
     text: String,
 ) {
-    if sampling || awaiting_tool_results(items) {
+    if running || awaiting_tool_results(head.items()) {
         // Past the byte cap, coalesce into the last held steer rather than grow
         // without bound — every entry is committed at once on release.
         let total: usize = held.iter().map(String::len).sum();
@@ -992,27 +1188,36 @@ async fn admit_steer(
         }
         return;
     }
-    append_steer(shared, log, items, pipeline, text).await;
+    append_steer(shared, log, head, pipeline, text).await;
 }
 
 async fn append_steer(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     text: String,
 ) {
-    let payload = EntryPayload::Item {
-        item: Item::User {
-            text,
-            synthetic: Some(SyntheticReason::Steer),
-        },
-    };
-    if shared.append(log, pipeline, items, &payload).await {
-        if let EntryPayload::Item { item } = payload {
-            Arc::make_mut(items).push(item);
-        }
-    }
+    // The other half of the held-steer rule, as a structural guard: a steer
+    // that split a tool batch would strand the results from the calls they
+    // answer, and every API rejects that history outright.
+    debug_assert!(
+        !awaiting_tool_results(head.items()),
+        "a steer must never land while a tool batch is open"
+    );
+    shared
+        .append(
+            log,
+            pipeline,
+            head,
+            EntryPayload::Item {
+                item: Item::User {
+                    text,
+                    synthetic: Some(SyntheticReason::Steer),
+                },
+            },
+        )
+        .await;
 }
 
 /// Append the steers that were waiting on a sample or a batch, oldest first,
@@ -1020,16 +1225,16 @@ async fn append_steer(
 async fn release_steers(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     held: &mut Vec<String>,
-    sampling: bool,
+    _at: Boundary,
 ) {
-    if sampling || held.is_empty() || awaiting_tool_results(items) {
+    if held.is_empty() || awaiting_tool_results(head.items()) {
         return;
     }
     for text in std::mem::take(held) {
-        append_steer(shared, log, items, pipeline, text).await;
+        append_steer(shared, log, head, pipeline, text).await;
     }
 }
 
@@ -1039,10 +1244,10 @@ async fn release_steers(
 async fn close_open_batch(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
 ) {
-    let Some(Item::Assistant { blocks }) = items.last() else {
+    let Some(Item::Assistant { blocks }) = head.items().last() else {
         return;
     };
     let uses = hotl_types::assistant_tool_uses(blocks);
@@ -1061,29 +1266,7 @@ async fn close_open_batch(
                 .collect(),
         },
     };
-    if shared.append(log, pipeline, items, &payload).await {
-        if let EntryPayload::Item { item } = payload {
-            Arc::make_mut(items).push(item);
-        }
-    }
-}
-
-/// The snapshot a turn task samples against: the durable projection, plus
-/// the todo reminder appended as the last item when the list is non-empty.
-/// This is where "ephemeral, request-only" actually happens — the reminder
-/// rides *this* returned `Arc`, never `items` itself, so it can never be
-/// committed, replayed, or double-counted on the next snapshot (each call
-/// starts fresh from the durable `items`). The empty-list path returns the
-/// same `Arc` the caller already holds — no allocation on the common case.
-fn snapshot_with_todos(items: &Arc<Vec<Item>>, todos: &[Todo]) -> Arc<Vec<Item>> {
-    match hotl_tools::todo::render_reminder(todos) {
-        Some(reminder) => {
-            let mut with_reminder = (**items).clone();
-            with_reminder.push(reminder);
-            Arc::new(with_reminder)
-        }
-        None => Arc::clone(items),
-    }
+    shared.append(log, pipeline, head, payload).await;
 }
 
 /// Restore tool_use/tool_result adjacency in history written before steers
@@ -1121,16 +1304,13 @@ pub(crate) fn pair_tool_results(items: Vec<Item>) -> Vec<Item> {
 async fn commit(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     entries: Vec<EntryPayload>,
 ) -> bool {
     for payload in entries {
-        if !shared.append(log, pipeline, items, &payload).await {
+        if !shared.append(log, pipeline, head, payload).await {
             return false;
-        }
-        if let EntryPayload::Item { item } = payload {
-            Arc::make_mut(items).push(item);
         }
     }
     true
@@ -1146,9 +1326,9 @@ async fn commit(
 async fn commit_prepared(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
-    entries: Vec<crate::PreparedEntry>,
+    proposal: crate::EntryProposal,
     mode: crate::AckMode,
 ) -> crate::ProposeReply {
     let current_epoch = shared.rules_epoch();
@@ -1157,75 +1337,128 @@ async fn commit_prepared(
     // so a proposal can never legitimately carry an epoch newer than the
     // actor's own — but an equal-or-newer stamp is never rejected either,
     // matching the spec's literal wording rather than a stricter `!=`.
-    if entries
+    if proposal
+        .entries()
         .iter()
         .any(|e| e.payload().rules_epoch() < current_epoch)
     {
         return crate::ProposeReply::StaleEpoch;
     }
-    if entries.is_empty() {
+    if proposal.is_empty() {
         return crate::ProposeReply::Committed;
     }
     match mode {
+        // The pre-revision path, entry at a time. It is the arm the
+        // revision's own counter assertions are measured against ("the same
+        // session driven through `Sync` and `Pipelined` modes produces the
+        // same normalized transcript", and the `Completed` boundary's 2→1
+        // fsync), so it deliberately does NOT collapse a group into one
+        // writer message — that collapse is exactly what is being measured.
         crate::AckMode::Sync => {
             // This proposal's acks sit behind everything already forwarded,
             // so those have to land (and project) first.
-            pipeline.drain(items, Resolution::Ack).await;
-            for entry in entries {
+            pipeline.drain(head, Resolution::Ack).await;
+            for entry in into_entries(proposal) {
                 let (payload, item) = entry.into_parts();
-                pipeline.next_seq();
+                let seq = pipeline.next_seq();
                 if !shared.append_prepared(log, payload).await {
                     return crate::ProposeReply::Sealed;
                 }
                 if let Some(item) = item {
-                    Arc::make_mut(items).push(item);
+                    head.apply(item);
                 }
+                if let Some(id) = log.last_id() {
+                    head.advance(id.to_string(), seq);
+                }
+                head.publish();
             }
             crate::ProposeReply::Committed
         }
         // Validate → mint → assign seq → forward → answer, with no await in
         // between (commit-protocol.md §Durability ordering: `Pipelined`
         // splits step 5). One ticket per proposal, bearing the last entry's
-        // id and seq — the interior entries carry no ticket, which is
-        // exactly the shape a `Group` keeps.
-        crate::AckMode::Pipelined => {
-            let last = entries.len() - 1;
-            let mut ticket = None;
-            for (i, entry) in entries.into_iter().enumerate() {
+        // id and seq.
+        crate::AckMode::Pipelined => match proposal {
+            crate::EntryProposal::Single(entry) => {
                 let (payload, item) = entry.into_parts();
                 let seq = pipeline.next_seq();
-                let forwarded = match shared.forward_prepared(log, payload) {
-                    Ok(forwarded) => forwarded,
-                    // Sealed before this entry was even minted. Anything
+                match shared.forward_prepared(log, payload) {
+                    Ok(forwarded) => crate::ProposeReply::Ticket(push_pending(
+                        pipeline,
+                        forwarded,
+                        item.into_iter().collect(),
+                        seq,
+                    )),
+                    // Sealed before the entry was even minted. Anything
                     // already forwarded is canon and still lands; the turn
                     // learns the log is gone from this reply.
-                    Err(_) => return crate::ProposeReply::Sealed,
-                };
-                let sender = (i == last).then(|| {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    ticket = Some(crate::CommitTicket {
-                        id: forwarded.id,
-                        seq,
-                        ack: rx,
-                    });
-                    tx
-                });
-                pipeline.fifo.push_back(PendingAck {
-                    ack: forwarded.ack,
-                    item,
-                    ticket: sender,
-                });
+                    Err(_) => crate::ProposeReply::Sealed,
+                }
             }
-            crate::ProposeReply::Ticket(ticket.expect("the last entry always mints the ticket"))
-        }
+            // One causal event: one writer message, one `sync_data`, one
+            // ack, one ticket (commit-protocol.md §Causal groups). `seq` is
+            // assigned per entry in group order, so the run stays contiguous
+            // and `seq` order still equals disk order; the ticket bears the
+            // last one, which is the epoch the head reaches when the group
+            // is applied.
+            crate::EntryProposal::Group(entries) => {
+                let mut payloads = Vec::with_capacity(entries.len());
+                let mut items = Vec::with_capacity(entries.len());
+                let mut seq = 0;
+                for entry in entries {
+                    let (payload, item) = entry.into_parts();
+                    seq = pipeline.next_seq();
+                    payloads.push(payload);
+                    items.extend(item);
+                }
+                match shared.forward_group(log, payloads) {
+                    Ok(forwarded) => {
+                        crate::ProposeReply::Ticket(push_pending(pipeline, forwarded, items, seq))
+                    }
+                    Err(_) => crate::ProposeReply::Sealed,
+                }
+            }
+        },
     }
+}
+
+/// Consume a proposal into its entries — the `Sync` arm's shared tail, which
+/// treats both shapes identically (see that arm's comment).
+fn into_entries(proposal: crate::EntryProposal) -> Vec<crate::PreparedEntry> {
+    match proposal {
+        crate::EntryProposal::Single(entry) => vec![entry],
+        crate::EntryProposal::Group(entries) => entries,
+    }
+}
+
+/// Record one forwarded unit in the actor's FIFO and mint its ticket.
+fn push_pending(
+    pipeline: &mut Pipeline,
+    forwarded: hotl_store::Forwarded,
+    items: Vec<Item>,
+    seq: u64,
+) -> crate::CommitTicket {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let ticket = crate::CommitTicket {
+        id: forwarded.id.clone(),
+        seq,
+        ack: rx,
+    };
+    pipeline.fifo.push_back(PendingAck {
+        ack: forwarded.ack,
+        items,
+        id: forwarded.id,
+        seq,
+        ticket: Some(tx),
+    });
+    ticket
 }
 
 /// Non-Done outcomes leave a durable annotation in the log.
 async fn annotate(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     outcome: &Outcome,
 ) {
@@ -1239,7 +1472,7 @@ async fn annotate(
     };
     if let Some(reason) = reason {
         shared
-            .append(log, pipeline, items, &EntryPayload::Cancelled { reason })
+            .append(log, pipeline, head, EntryPayload::Cancelled { reason })
             .await;
     }
 }
@@ -1254,7 +1487,7 @@ async fn annotate(
 async fn compact(
     shared: &SharedDeps,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     spec: Option<crate::SpecDigest>,
 ) -> Result<bool, String> {
@@ -1268,14 +1501,14 @@ async fn compact(
     // `items` read below therefore happens after this line, and the tickets
     // resolve `Aborted`: the bytes are canon, the turn's claim on them is
     // not.
-    pipeline.drain(items, Resolution::Abort).await;
+    pipeline.drain(head, Resolution::Abort).await;
     // Speculative hit: the digest was planned against this same projection
     // lineage (it only appends between folds), so its indices still name the
     // same items. Reset mode folds a wider span than the speculation covered,
     // so it never uses one; the turn doesn't speculate in reset mode.
     if !shared.config.compaction_reset {
         if let Some(spec) = spec {
-            if spec.prefix_end < spec.kept_from && spec.kept_from <= items.len() {
+            if spec.prefix_end < spec.kept_from && spec.kept_from <= head.items().len() {
                 let digest = vec![compaction::digest_item(&spec.text)];
                 let payload = EntryPayload::Compaction {
                     digest: digest.clone(),
@@ -1283,20 +1516,20 @@ async fn compact(
                     kept_from: spec.kept_from,
                     degraded: false,
                 };
-                if !shared.append(log, pipeline, items, &payload).await {
+                if !shared.append(log, pipeline, head, payload).await {
                     return Err("session log is sealed".into());
                 }
                 let plan = compaction::Plan {
                     prefix_end: spec.prefix_end,
                     kept_from: spec.kept_from,
                 };
-                *items = Arc::new(compaction::apply(items, &plan, &digest));
+                head.repoint(compaction::apply(head.items(), &plan, &digest));
                 return Ok(false);
             }
         }
     }
     let tail_budget = (shared.config.context_window as f64 * TAIL_RATIO) as u64;
-    let Some(plan) = compaction::plan(items, tail_budget) else {
+    let Some(plan) = compaction::plan(head.items(), tail_budget) else {
         return Err("context window exhausted — nothing left to compact".into());
     };
     // Reset mode (#9): fold *everything* after the preserved prefix into the
@@ -1305,12 +1538,13 @@ async fn compact(
     let plan = if shared.config.compaction_reset {
         compaction::Plan {
             prefix_end: plan.prefix_end,
-            kept_from: items.len(),
+            kept_from: head.items().len(),
         }
     } else {
         plan
     };
-    let folded = &items[plan.prefix_end..plan.kept_from];
+    let snapshot = Arc::clone(head.items());
+    let folded = &snapshot[plan.prefix_end..plan.kept_from];
     // Timeout or two failed attempts: the floor digest keeps the session moving
     // rather than ending the turn on housekeeping.
     let (digest, degraded) =
@@ -1324,10 +1558,10 @@ async fn compact(
         kept_from: plan.kept_from,
         degraded,
     };
-    if !shared.append(log, pipeline, items, &payload).await {
+    if !shared.append(log, pipeline, head, payload).await {
         return Err("session log is sealed".into());
     }
-    *items = Arc::new(compaction::apply(items, &plan, &digest));
+    head.repoint(compaction::apply(head.items(), &plan, &digest));
     Ok(degraded)
 }
 
@@ -1387,7 +1621,7 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
 async fn admit_prompt(
     shared: &Arc<SharedDeps>,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
     running: bool,
@@ -1415,7 +1649,7 @@ async fn admit_prompt(
     start_turn(
         shared,
         log,
-        items,
+        head,
         pipeline,
         text,
         synthetic,
@@ -1430,7 +1664,7 @@ async fn admit_prompt(
 async fn start_turn(
     shared: &Arc<SharedDeps>,
     log: &mut SessionLog,
-    items: &mut Arc<Vec<Item>>,
+    head: &mut Head,
     pipeline: &mut Pipeline,
     text: String,
     synthetic: Option<SyntheticReason>,
@@ -1444,7 +1678,7 @@ async fn start_turn(
     let payload = EntryPayload::Item {
         item: Item::User { text, synthetic },
     };
-    if !shared.append(log, pipeline, items, &payload).await {
+    if !shared.append(log, pipeline, head, payload).await {
         let _ = events
             .send(EngineEvent::TurnDone {
                 outcome: Outcome::Error {
@@ -1454,9 +1688,6 @@ async fn start_turn(
             })
             .await;
         return false;
-    }
-    if let EntryPayload::Item { item } = payload {
-        Arc::make_mut(items).push(item);
     }
     // UserPromptSubmit: a hook's `additionalContext` becomes one tagged
     // `SystemReminder` user item committed right after the prompt it answers
@@ -1477,11 +1708,7 @@ async fn start_turn(
                         synthetic: Some(SyntheticReason::SystemReminder),
                     },
                 };
-                if shared.append(log, pipeline, items, &reminder).await {
-                    if let EntryPayload::Item { item } = reminder {
-                        Arc::make_mut(items).push(item);
-                    }
-                }
+                shared.append(log, pipeline, head, reminder).await;
             }
         },
         else {}
@@ -1742,11 +1969,19 @@ mod tests {
         }
     }
 
-    fn test_shared(dir: &std::path::Path) -> (Arc<SharedDeps>, SessionLog) {
+    /// A `SharedDeps` + its log + a live `Head`. `commit_prepared`/`compact`
+    /// take the head, so the published projection is exercised by every test
+    /// below rather than simulated.
+    fn test_shared(dir: &std::path::Path) -> (Arc<SharedDeps>, SessionLog, super::Head) {
         let log = SessionLog::create(dir, "m", None, hotl_store::Masker::empty(), 0).expect("log");
-        let (shared, log) =
-            SharedDeps::new(test_deps(dir, log), crate::hooks::NotificationDrain::new());
-        (Arc::new(shared), log)
+        let (head_tx, head_rx) = super::head_channel();
+        let head = super::Head::new(head_tx, Vec::new(), Vec::new());
+        let (shared, log) = SharedDeps::new(
+            test_deps(dir, log),
+            crate::hooks::NotificationDrain::new(),
+            head_rx,
+        );
+        (Arc::new(shared), log, head)
     }
 
     /// commit-protocol.md §Proposal payloads' rules_epoch guard: "the actor
@@ -1756,8 +1991,7 @@ mod tests {
     #[tokio::test]
     async fn commit_prepared_rejects_an_entry_whose_epoch_predates_current_and_commits_nothing() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
         let before = std::fs::read_to_string(log.path()).unwrap();
 
         // A genuinely OLDER epoch, not merely a different one: bump the
@@ -1780,15 +2014,15 @@ mod tests {
         let result = commit_prepared(
             &shared,
             &mut log,
-            &mut items,
+            &mut head,
             &mut Pipeline::default(),
-            entries,
+            crate::EntryProposal::of(entries),
             crate::AckMode::Sync,
         )
         .await;
         assert!(matches!(result, crate::ProposeReply::StaleEpoch));
         assert!(
-            items.is_empty(),
+            head.items().is_empty(),
             "a stale proposal must not touch the projection"
         );
         let after = std::fs::read_to_string(log.path()).unwrap();
@@ -1803,8 +2037,7 @@ mod tests {
     #[tokio::test]
     async fn commit_prepared_accepts_an_entry_whose_epoch_is_not_older_than_current() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
 
         let newer_epoch = shared.rules_epoch() + 1;
         let payload = hotl_types::EntryPayload::Usage {
@@ -1818,9 +2051,9 @@ mod tests {
         let result = commit_prepared(
             &shared,
             &mut log,
-            &mut items,
+            &mut head,
             &mut Pipeline::default(),
-            entries,
+            crate::EntryProposal::of(entries),
             crate::AckMode::Sync,
         )
         .await;
@@ -1846,16 +2079,15 @@ mod tests {
     #[tokio::test]
     async fn a_pipelined_proposal_answers_with_a_ticket_before_the_projection_moves() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
         let mut pipeline = Pipeline::default();
 
         let reply = commit_prepared(
             &shared,
             &mut log,
-            &mut items,
+            &mut head,
             &mut pipeline,
-            vec![prepared(&shared, user("hi"))],
+            crate::EntryProposal::of(vec![prepared(&shared, user("hi"))]),
             crate::AckMode::Pipelined,
         )
         .await;
@@ -1865,12 +2097,12 @@ mod tests {
         assert_eq!(ticket.seq, 1, "seq is assigned at validation, eagerly");
         assert!(!ticket.id.is_empty(), "so is the ulid");
         assert!(
-            items.is_empty(),
+            head.items().is_empty(),
             "the projection advances only on ack, never on forward"
         );
 
-        pipeline.drain(&mut items, Resolution::Ack).await;
-        assert_eq!(items.len(), 1, "…and it advances when the ack lands");
+        pipeline.drain(&mut head, Resolution::Ack).await;
+        assert_eq!(head.items().len(), 1, "…and it advances when the ack lands");
         let ack = ticket
             .ack
             .await
@@ -1885,8 +2117,7 @@ mod tests {
     #[tokio::test]
     async fn the_pipeline_advances_the_projection_in_fifo_order() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
         let mut pipeline = Pipeline::default();
 
         let mut tickets = Vec::new();
@@ -1894,9 +2125,9 @@ mod tests {
             let reply = commit_prepared(
                 &shared,
                 &mut log,
-                &mut items,
+                &mut head,
                 &mut pipeline,
-                vec![prepared(&shared, user(text))],
+                crate::EntryProposal::of(vec![prepared(&shared, user(text))]),
                 crate::AckMode::Pipelined,
             )
             .await;
@@ -1905,11 +2136,11 @@ mod tests {
             };
             tickets.push(ticket);
         }
-        assert!(items.is_empty());
+        assert!(head.items().is_empty());
 
-        pipeline.drain(&mut items, Resolution::Ack).await;
+        pipeline.drain(&mut head, Resolution::Ack).await;
         assert_eq!(
-            items.as_slice(),
+            head.items().as_slice(),
             [user("one"), user("two"), user("three")].as_slice()
         );
         let mut last = 0;
@@ -1928,17 +2159,16 @@ mod tests {
     #[tokio::test]
     async fn an_unacked_pipelined_entry_never_advances_the_projection() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
         let mut pipeline = Pipeline::default();
         log.inject_fault(hotl_store::WriteFault::DropAckBeforeFsync);
 
         let reply = commit_prepared(
             &shared,
             &mut log,
-            &mut items,
+            &mut head,
             &mut pipeline,
-            vec![prepared(&shared, user("doomed"))],
+            crate::EntryProposal::of(vec![prepared(&shared, user("doomed"))]),
             crate::AckMode::Pipelined,
         )
         .await;
@@ -1946,9 +2176,9 @@ mod tests {
             panic!("expected a ticket")
         };
 
-        pipeline.drain(&mut items, Resolution::Ack).await;
+        pipeline.drain(&mut head, Resolution::Ack).await;
         assert!(
-            items.is_empty(),
+            head.items().is_empty(),
             "a crash may leave the log ahead of the projection, never the reverse"
         );
         assert_eq!(
@@ -1966,17 +2196,16 @@ mod tests {
     #[tokio::test]
     async fn seq_is_the_session_wide_commit_order_not_the_pipelined_subset() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
         let mut pipeline = Pipeline::default();
 
         // A Sync proposal…
         commit_prepared(
             &shared,
             &mut log,
-            &mut items,
+            &mut head,
             &mut pipeline,
-            vec![prepared(&shared, user("sync"))],
+            crate::EntryProposal::of(vec![prepared(&shared, user("sync"))]),
             crate::AckMode::Sync,
         )
         .await;
@@ -1986,8 +2215,8 @@ mod tests {
                 .append(
                     &mut log,
                     &mut pipeline,
-                    &mut items,
-                    &EntryPayload::Rename {
+                    &mut head,
+                    EntryPayload::Rename {
                         name: "inline".into()
                     },
                 )
@@ -1997,9 +2226,9 @@ mod tests {
         let reply = commit_prepared(
             &shared,
             &mut log,
-            &mut items,
+            &mut head,
             &mut pipeline,
-            vec![prepared(&shared, user("pipelined"))],
+            crate::EntryProposal::of(vec![prepared(&shared, user("pipelined"))]),
             crate::AckMode::Pipelined,
         )
         .await;
@@ -2022,8 +2251,7 @@ mod tests {
     #[tokio::test]
     async fn a_compaction_drains_the_pipeline_before_it_builds_and_mints() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
         let mut pipeline = Pipeline::default();
 
         let mut tickets = Vec::new();
@@ -2031,9 +2259,9 @@ mod tests {
             let reply = commit_prepared(
                 &shared,
                 &mut log,
-                &mut items,
+                &mut head,
                 &mut pipeline,
-                vec![prepared(&shared, user(text))],
+                crate::EntryProposal::of(vec![prepared(&shared, user(text))]),
                 crate::AckMode::Pipelined,
             )
             .await;
@@ -2043,7 +2271,7 @@ mod tests {
             tickets.push(ticket);
         }
         assert!(
-            items.is_empty(),
+            head.items().is_empty(),
             "two entries forwarded, none projected yet"
         );
 
@@ -2052,7 +2280,7 @@ mod tests {
             kept_from: 2,
             text: "folded".into(),
         };
-        let degraded = compact(&shared, &mut log, &mut items, &mut pipeline, Some(spec))
+        let degraded = compact(&shared, &mut log, &mut head, &mut pipeline, Some(spec))
             .await
             .expect("the fold must see the drained projection");
         assert!(!degraded);
@@ -2088,8 +2316,7 @@ mod tests {
     #[tokio::test]
     async fn commit_prepared_commits_a_fresh_entry_and_updates_the_projection() {
         let dir = tempfile::tempdir().unwrap();
-        let (shared, mut log) = test_shared(dir.path());
-        let mut items: Arc<Vec<Item>> = Arc::new(Vec::new());
+        let (shared, mut log, mut head) = test_shared(dir.path());
 
         let epoch = shared.rules_epoch();
         let payload = EntryPayload::Item { item: user("hi") };
@@ -2100,14 +2327,18 @@ mod tests {
         let result = commit_prepared(
             &shared,
             &mut log,
-            &mut items,
+            &mut head,
             &mut Pipeline::default(),
-            entries,
+            crate::EntryProposal::of(entries),
             crate::AckMode::Sync,
         )
         .await;
         assert!(matches!(result, crate::ProposeReply::Committed));
-        assert_eq!(items.len(), 1, "a fresh proposal must reach the projection");
+        assert_eq!(
+            head.items().len(),
+            1,
+            "a fresh proposal must reach the projection"
+        );
 
         let replayed = hotl_store::replay(log.path()).expect("replay");
         assert_eq!(

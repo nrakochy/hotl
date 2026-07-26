@@ -45,6 +45,12 @@ pub use hooks::NotificationKind;
 /// the rest of the engine's types) and independently unit-tested.
 pub use ledger::{LedgerSummary, Phase, PhaseDeltaSummary};
 
+/// Re-exported so `hotl_engine::ProjectionHead` names what
+/// [`SessionHandle::head`] hands out — the epoch-fenced published projection
+/// (commit-protocol.md §Read invariant). It lives in [`actor`], next to the
+/// only thing that may publish it.
+pub use actor::ProjectionHead;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model: String,
@@ -334,6 +340,44 @@ impl PreparedEntry {
     }
 }
 
+/// A batch of entries a turn task asks the actor to commit
+/// (commit-protocol.md §Vocabulary), in the two shapes the protocol names.
+/// Both answer with exactly one [`CommitTicket`] in [`AckMode::Pipelined`];
+/// they differ in what reaches the writer.
+pub enum EntryProposal {
+    Single(PreparedEntry),
+    /// Entries that are **one causal event** (§Causal groups): the actor
+    /// chains them parent→child inside the group and sends one writer
+    /// message, which does one `write_all`, one `sync_data` and resolves one
+    /// ticket. The projection applies the whole group or none of it.
+    Group(Vec<PreparedEntry>),
+}
+
+impl EntryProposal {
+    /// The shape `entries` calls for. A turn only ever proposes several
+    /// entries *together* when they are one causal event — the `Completed`
+    /// pair, or a tool-results batch with the subdir instructions that batch
+    /// uncovered — so the multi-entry case is always a `Group`.
+    pub fn of(mut entries: Vec<PreparedEntry>) -> Self {
+        if entries.len() == 1 {
+            Self::Single(entries.pop().expect("just checked len == 1"))
+        } else {
+            Self::Group(entries)
+        }
+    }
+
+    pub(crate) fn entries(&self) -> &[PreparedEntry] {
+        match self {
+            Self::Single(entry) => std::slice::from_ref(entry),
+            Self::Group(entries) => entries,
+        }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries().is_empty()
+    }
+}
+
 /// Whether the *proposer* waits for durability (commit-protocol.md
 /// §Vocabulary). Orthogonal to [`hotl_store::AckTier`], which is how durable
 /// the write must be before the writer acks: canon is `Durable` in both
@@ -430,10 +474,6 @@ pub enum SessionCmd {
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
     /// only ever forwards a validated `Vec<Todo>` here.
     SetTodos(Vec<Todo>),
-    /// Turn task → actor: sample-boundary snapshot refresh.
-    Snapshot {
-        reply: oneshot::Sender<Arc<Vec<Item>>>,
-    },
     /// Pre-actor proposal path (durable-ack before reply): the ONLY caller
     /// left is [`question_sink`]'s `PendingQuestion`/`QuestionResolved`
     /// entries, built and sent before the actor (and its masker) exist yet
@@ -456,7 +496,7 @@ pub enum SessionCmd {
     /// — the entries carry pre-serialized, pre-masked `PreparedPayload`
     /// bytes, never a raw `EntryPayload`.
     ProposePrepared {
-        entries: Vec<PreparedEntry>,
+        proposal: EntryProposal,
         /// Whether the proposer waits for durability (commit-protocol.md
         /// §Pipelined commits). `Pipelined` answers with a
         /// [`ProposeReply::Ticket`] the moment the entries are forwarded.
@@ -530,6 +570,9 @@ pub struct SessionHandle {
     /// the actor (and any `question_sink`) tracks detached `Notification`
     /// hook tasks in.
     notifications: hooks::NotificationDrain,
+    /// The read side of the actor's published head — see
+    /// [`SessionHandle::head`].
+    head: tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
     /// The actor task itself. Kept (rather than discarded, as before) so a
     /// one-shot CLI exit path can wait for the actor to fully shut down —
     /// including its now-synchronous `SessionEnd` hook call (Finding 1) —
@@ -539,6 +582,15 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    /// A read-only view of the actor's published projection head
+    /// (commit-protocol.md §Read invariant). Only a `watch::Receiver` is ever
+    /// handed out: the `Sender` never leaves the actor, so this grants a
+    /// reader, never a second publisher. Used by `fork`, which seeds a child
+    /// session from this one's history.
+    pub fn head(&self) -> tokio::sync::watch::Receiver<Arc<ProjectionHead>> {
+        self.head.clone()
+    }
+
     pub async fn prompt(&self, text: String) {
         let _ = self.cmd.send(SessionCmd::Prompt(text)).await;
     }
@@ -681,6 +733,10 @@ pub fn spawn_session_with_channels(
     notifications: hooks::NotificationDrain,
 ) -> SessionHandle {
     let current_turn = Arc::new(Mutex::new(CancellationToken::new()));
+    // The head's read side is created here rather than inside the actor so
+    // `SessionHandle::head` can hand it out immediately: the actor takes the
+    // `Sender` and never gives it up.
+    let (head_tx, head_rx) = actor::head_channel();
     // The actor gets only a weak sender: strong senders are the handle and
     // any in-flight turn task, so dropping the handle lets the command
     // channel close and the actor task exit instead of leaking.
@@ -691,12 +747,14 @@ pub fn spawn_session_with_channels(
         event_tx,
         current_turn.clone(),
         notifications.clone(),
+        head_tx,
     ));
     SessionHandle {
         cmd: cmd_tx,
         events: event_rx,
         current_turn,
         notifications,
+        head: head_rx,
         actor,
     }
 }

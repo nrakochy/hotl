@@ -671,6 +671,7 @@ struct SpawnRegistration {
     include_claude: bool,
 }
 
+#[allow(clippy::type_complexity)]
 fn spawn_session_with_todos(
     mut registry: Registry,
     spawn: Option<SpawnRegistration>,
@@ -687,6 +688,7 @@ fn spawn_session_with_todos(
     // this function, so there's no chicken-and-egg here despite the actor
     // not existing yet.
     let notifications = hotl_engine::hooks::NotificationDrain::new();
+    let head_cell: HeadCell = Arc::new(std::sync::Mutex::new(None));
     let weak = cmd_tx.downgrade();
     registry.register(Box::new(hotl_tools::TodoWriteTool::new(Arc::new(
         move |items| {
@@ -710,44 +712,50 @@ fn spawn_session_with_todos(
         include_claude,
     }) = spawn
     {
-        let snapshot = snapshot_provider(cmd_tx.downgrade());
+        let snapshot = snapshot_provider(Arc::clone(&head_cell));
         registry.register(Box::new(
             crate::spawn::SpawnTool::new(builder, config_dir, include_claude, concurrency)
                 .with_snapshot(snapshot),
         ));
     }
     let deps = build_deps(Arc::new(registry));
-    hotl_engine::spawn_session_with_channels(
+    let handle = hotl_engine::spawn_session_with_channels(
         deps,
         cmd_tx,
         cmd_rx,
         event_tx,
         event_rx,
         notifications,
-    )
+    );
+    // Filled the instant the session exists — and always before any turn
+    // (and so any `fork`) can run, since a turn only starts on a prompt.
+    *head_cell
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle.head());
+    handle
 }
 
-/// `fork`'s history seed: asks *this session's own actor* for its current
-/// projection, via the same `SessionCmd::Snapshot` round trip a turn task
-/// uses at sample boundaries (`hotl_engine::turn`'s own `self.snapshot()`) —
-/// just reached from a tool instead of from inside the engine, since the
-/// command channel is a plain `mpsc` either way. A *weak* clone, upgraded on
-/// each call, mirrors the todo/ask sinks above: a strong sender captured
-/// here would be a reference cycle keeping the actor's `cmd_rx.recv()` loop
-/// from ever seeing every sender drop, i.e. the actor would never exit.
-fn snapshot_provider(
-    weak: tokio::sync::mpsc::WeakSender<hotl_engine::SessionCmd>,
-) -> crate::spawn::SnapshotFn {
+/// Where `spawn_session_with_todos` parks this session's head reader for the
+/// `fork` tool, which has to be registered before the session it reads from
+/// exists.
+type HeadCell =
+    Arc<std::sync::Mutex<Option<tokio::sync::watch::Receiver<Arc<hotl_engine::ProjectionHead>>>>>;
+
+/// `fork`'s history seed: reads *this session's own* published projection
+/// head — the same epoch-fenced `watch` a turn task refreshes from at sample
+/// boundaries (commit-protocol.md §Read invariant), just reached from a tool
+/// instead of from inside the engine. A read, never a mailbox round trip, so
+/// a fork can no longer queue behind an 8MiB blob ack; and only a
+/// `watch::Receiver` is held, so this is a reader and never a second
+/// publisher. `None` (the cell is still empty) degrades exactly as a dropped
+/// sender used to: `fork` reports it has no history to seed from.
+fn snapshot_provider(cell: HeadCell) -> crate::spawn::SnapshotFn {
     Arc::new(move || {
-        let weak = weak.clone();
-        Box::pin(async move {
-            let tx = weak.upgrade()?;
-            let (reply, rx) = tokio::sync::oneshot::channel();
-            tx.send(hotl_engine::SessionCmd::Snapshot { reply })
-                .await
-                .ok()?;
-            rx.await.ok()
-        })
+        let head = cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        Box::pin(async move { Some(head?.borrow().snapshot()) })
     })
 }
 

@@ -809,6 +809,14 @@ impl SessionLog {
         sealed_error(reason)
     }
 
+    /// The **queued leaf**: the id of the last entry this handle minted
+    /// (commit-protocol.md §Ordering authority). For a `Sync` caller — the
+    /// only one that reads this — it is also the durable leaf, since the
+    /// chain only advances on a committed entry.
+    pub fn last_id(&self) -> Option<&str> {
+        self.last_id.as_deref()
+    }
+
     pub fn is_sealed(&self) -> bool {
         self.seal_reason().is_some()
     }
