@@ -362,6 +362,21 @@ pub struct Ack {
     pub offset: u64,
 }
 
+/// An entry minted, spliced and handed to the writer, whose durability is
+/// still outstanding (commit-protocol.md §Pipelined commits). `id` is known
+/// eagerly — the mint happens before the write — so a proposer knows its own
+/// identity without waiting for durability; `ack` is the one place that
+/// entry's fate is ever reported.
+///
+/// INVARIANT: nothing derived from this entry may advance a projection until
+/// `ack` resolves `Ok`. Enforced at the engine level by
+/// `a_writer_death_before_fsync_never_leaves_the_projection_ahead_of_the_log`
+/// and its pipelined twin.
+pub struct Forwarded {
+    pub id: String,
+    pub ack: tokio::sync::oneshot::Receiver<std::io::Result<Ack>>,
+}
+
 /// One-shot fault injection at the writer, so the crash cases in
 /// commit-protocol.md's test matrix are deterministic instead of aspirational.
 #[doc(hidden)]
@@ -722,10 +737,51 @@ impl SessionLog {
         prepared: PreparedPayload,
         now_ms: u64,
     ) -> std::io::Result<Ack> {
+        let previous = self.last_id.clone();
+        let forwarded = self.forward_prepared(prepared, now_ms)?;
+        let acked = match forwarded.ack.await {
+            Ok(result) => result,
+            Err(_) => Err(self.writer_gone()),
+        };
+        if acked.is_err() {
+            // The `Sync` caller's chain must not advance past a line the
+            // writer rolled back (T1-2b) — `forward_prepared` advanced it
+            // eagerly for the pipelined caller, who has no such choice.
+            self.last_id = previous;
+        }
+        acked
+    }
+
+    /// Mint, splice and forward WITHOUT awaiting the ack — the `Pipelined`
+    /// half of commit-protocol.md §Pipelined commits. The queued leaf
+    /// (`last_id`) advances at mint, not at ack: "the queued leaf is the id
+    /// of the last entry the actor has minted … and it is what the next mint
+    /// parents onto" (§Ordering authority). The caller owns the returned ack
+    /// channel and MUST NOT advance any projection before it resolves `Ok`.
+    pub fn forward_prepared(
+        &mut self,
+        prepared: PreparedPayload,
+        now_ms: u64,
+    ) -> std::io::Result<Forwarded> {
         if let Some(reason) = self.seal_reason() {
             return Err(sealed_error(&reason));
         }
         let (id, bytes) = self.splice_prepared(prepared.bytes(), now_ms)?;
+        self.forward_line(id, bytes)
+    }
+
+    /// [`SessionLog::forward_prepared`]'s twin for actor-built entries (the
+    /// inline serialize-and-mask path steer admissions, compaction digests
+    /// and todo snapshots keep — §Proposal payloads).
+    pub fn forward(&mut self, payload: &EntryPayload, now_ms: u64) -> std::io::Result<Forwarded> {
+        if let Some(reason) = self.seal_reason() {
+            return Err(sealed_error(&reason));
+        }
+        let (id, bytes) = self.build_line(payload, now_ms)?;
+        self.forward_line(id, bytes)
+    }
+
+    fn forward_line(&mut self, id: String, bytes: Vec<u8>) -> std::io::Result<Forwarded> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriterCmd::Append {
@@ -734,9 +790,8 @@ impl SessionLog {
                 ack: AckSink::Async(tx),
             })
             .map_err(|_| self.writer_gone())?;
-        let ack = rx.await.map_err(|_| self.writer_gone())??;
-        self.last_id = Some(id);
-        Ok(ack)
+        self.last_id = Some(id.clone());
+        Ok(Forwarded { id, ack: rx })
     }
 
     /// The writer thread is gone (it panicked, or it died mid-commit). Same
@@ -836,6 +891,40 @@ enum WriterCmd {
     },
 }
 
+/// An append the writer has taken but not yet committed — one member of a
+/// group commit's batch.
+struct QueuedAppend {
+    line: Vec<u8>,
+    tier: AckTier,
+    ack: AckSink<Ack>,
+}
+
+/// The writer thread's shared cells, bundled so [`commit_batch`] can be
+/// driven directly in tests (the batching itself is a race against a real
+/// thread; the group-commit *property* must not be).
+struct WriterCtx {
+    sealed: Arc<Mutex<Option<String>>>,
+    fsyncs: Arc<AtomicU64>,
+    fault: Arc<AtomicU8>,
+    sync_noop: Arc<AtomicBool>,
+}
+
+impl WriterCtx {
+    fn seal_now(&self, reason: String) {
+        *self
+            .sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    }
+
+    fn seal_reason(&self) -> Option<String> {
+        self.sealed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 fn fault_to_u8(f: WriteFault) -> u8 {
     match f {
         WriteFault::None => 0,
@@ -878,95 +967,166 @@ fn writer_loop(
     fault: Arc<AtomicU8>,
     sync_noop: Arc<AtomicBool>,
 ) {
-    let seal_now = |reason: String| {
-        *sealed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    let ctx = WriterCtx {
+        sealed,
+        fsyncs,
+        fault,
+        sync_noop,
     };
-    let is_sealed = || {
-        sealed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    };
+    let mut batch: Vec<QueuedAppend> = Vec::new();
     while let Ok(cmd) = rx.recv() {
-        match cmd {
-            WriterCmd::Append { line, tier, ack } => {
-                if let Some(reason) = is_sealed() {
-                    ack.send(Err(sealed_error(&reason)));
-                    continue;
+        // Windowless group commit (commit-protocol.md §Pipelined commits):
+        // after blocking on the first command, take everything that already
+        // arrived. No timer and no waiting for a batch to fill — an empty
+        // queue commits immediately, so this adds no loss window.
+        let mut queued = vec![cmd];
+        while let Ok(more) = rx.try_recv() {
+            queued.push(more);
+        }
+        for cmd in queued {
+            match cmd {
+                WriterCmd::Append { line, tier, ack } => {
+                    batch.push(QueuedAppend { line, tier, ack })
                 }
-                if tier == AckTier::Buffered {
-                    // Telemetry: ack on enqueue, write on a best-effort basis.
-                    // NEVER canon — nothing in the engine reaches this arm.
-                    ack.send(Ok(Ack {
-                        offset: offset + line.len() as u64,
-                    }));
-                    if file.write_all(&line).is_ok() {
-                        offset += line.len() as u64;
+                // Blobs ride the same thread as the log: a blob is durable
+                // before the entry that points at it can be, and the actor
+                // never pays a megabyte write on its own task. A blob is a
+                // different file, so it cannot join the group — the appends
+                // ahead of it commit first, keeping arrival order intact.
+                WriterCmd::Blob {
+                    dir,
+                    path,
+                    bytes,
+                    ack,
+                } => {
+                    if !commit_batch(&mut file, &mut offset, std::mem::take(&mut batch), &ctx) {
+                        return;
                     }
-                    continue;
+                    ack.send(write_blob_file(&dir, &path, &bytes, &ctx.sync_noop));
                 }
-                match take_fault(&fault) {
-                    WriteFault::FailBeforeWrite => {
-                        seal_and_truncate(&mut file, offset, &seal_now, "no space left on device");
-                        ack.send(Err(sealed_error("no space left on device")));
-                        continue;
-                    }
-                    WriteFault::TearThenFail => {
-                        let half = line.len() / 2;
-                        let _ = file.write_all(&line[..half]); // the torn line
-                        seal_and_truncate(&mut file, offset, &seal_now, "no space left on device");
-                        ack.send(Err(sealed_error("no space left on device")));
-                        continue;
-                    }
-                    WriteFault::DropAckBeforeFsync => {
-                        // "Kill -9 between writer receive and fsync": the bytes
-                        // may or may not have reached the platter, and the ack
-                        // never comes. Dropping `ack` here is the whole point.
-                        let _ = file.write_all(&line);
-                        drop(ack);
-                        return; // the writer is gone, exactly as after SIGKILL
-                    }
-                    WriteFault::None => {}
-                }
-                let result = file.write_all(&line).and_then(|()| {
-                    if tier == AckTier::Durable {
-                        if !sync_noop.load(Ordering::SeqCst) {
-                            file.sync_data()?; // T1-1: the actual fix
-                        }
-                        // A no-op'd sync is still a sync *point*: fsync_count()
-                        // counts points, not syscalls, so counter-based
-                        // assertions stay meaningful under the seam (see
-                        // `set_sync_noop`).
-                        fsyncs.fetch_add(1, Ordering::SeqCst);
-                    }
-                    Ok(())
-                });
-                match result {
-                    Ok(()) => {
-                        offset += line.len() as u64;
-                        ack.send(Ok(Ack { offset }));
-                    }
-                    Err(e) => {
-                        let reason = e.to_string();
-                        seal_and_truncate(&mut file, offset, &seal_now, &reason);
-                        ack.send(Err(sealed_error(&reason)));
-                    }
-                }
-            }
-            // Blobs ride the same thread as the log: a blob is durable before
-            // the entry that points at it can be, and the actor never pays a
-            // megabyte write on its own task.
-            WriterCmd::Blob {
-                dir,
-                path,
-                bytes,
-                ack,
-            } => {
-                ack.send(write_blob_file(&dir, &path, &bytes, &sync_noop));
             }
         }
+        if !commit_batch(&mut file, &mut offset, std::mem::take(&mut batch), &ctx) {
+            return;
+        }
+    }
+}
+
+/// Commit one group: `write_all` every line, `sync_data` **once**, then ack
+/// each entry with its own byte offset. One `sync_data` on the fd covers all
+/// previously written bytes, so every ack still strictly follows a sync
+/// covering its bytes (commit-protocol.md §Durability ordering) — the batch
+/// is whatever already arrived, never a window the writer waited out.
+///
+/// INVARIANT: nothing in a batch is acked unless the whole batch is on disk
+/// past one `sync_data`; a failure anywhere rolls the file back to the last
+/// *acked* offset and fails every entry in the batch. Enforced by
+/// `a_failed_write_in_a_batch_seals_and_fails_every_entry_in_it` and
+/// `a_writer_death_before_the_group_sync_acks_nothing_in_the_batch`.
+///
+/// Returns `false` when the writer must stop (the SIGKILL-equivalent fault).
+fn commit_batch(
+    file: &mut File,
+    offset: &mut u64,
+    batch: Vec<QueuedAppend>,
+    ctx: &WriterCtx,
+) -> bool {
+    if batch.is_empty() {
+        return true;
+    }
+    if let Some(reason) = ctx.seal_reason() {
+        for entry in batch {
+            entry.ack.send(Err(sealed_error(&reason)));
+        }
+        return true;
+    }
+    // One-shot, and read once per group: with a queue depth of 1 (every
+    // `Sync` caller) this is exactly the per-command check it replaces.
+    let fault = take_fault(&ctx.fault);
+    let mut durable = false;
+    let mut written = *offset;
+    // (ack sink, this entry's own end-of-line offset), filled as the lines go
+    // down — nothing is sent until the sync below succeeds.
+    let mut acks: Vec<(AckSink<Ack>, u64)> = Vec::with_capacity(batch.len());
+    let mut rest = batch.into_iter();
+    while let Some(QueuedAppend { line, tier, ack }) = rest.next() {
+        if tier == AckTier::Buffered {
+            // Telemetry: ack on enqueue, write on a best-effort basis.
+            // NEVER canon — nothing in the engine reaches this arm. It never
+            // moves the rollback point: only a synced group does.
+            ack.send(Ok(Ack {
+                offset: written + line.len() as u64,
+            }));
+            if file.write_all(&line).is_ok() {
+                written += line.len() as u64;
+            }
+            continue;
+        }
+        let failure = match fault {
+            WriteFault::FailBeforeWrite => Some("no space left on device".to_string()),
+            WriteFault::TearThenFail => {
+                let half = line.len() / 2;
+                let _ = file.write_all(&line[..half]); // the torn line
+                Some("no space left on device".to_string())
+            }
+            WriteFault::DropAckBeforeFsync => {
+                // "Kill -9 between writer receive and fsync": the bytes may or
+                // may not have reached the platter, and no ack ever comes —
+                // for this entry OR for the ones already written into the same
+                // unsynced group. Dropping every sink here is the whole point.
+                let _ = file.write_all(&line);
+                return false; // the writer is gone, exactly as after SIGKILL
+            }
+            WriteFault::None => file.write_all(&line).err().map(|e| e.to_string()),
+        };
+        if let Some(reason) = failure {
+            seal_and_truncate(file, *offset, &|r| ctx.seal_now(r), &reason);
+            fail_all(
+                acks,
+                std::iter::once(ack).chain(rest.map(|q| q.ack)),
+                &reason,
+            );
+            return true;
+        }
+        durable |= tier == AckTier::Durable;
+        written += line.len() as u64;
+        acks.push((ack, written));
+    }
+    if durable {
+        if !ctx.sync_noop.load(Ordering::SeqCst) {
+            if let Err(e) = file.sync_data() {
+                // T1-1: the sync is the commit. A group that cannot be synced
+                // is not durable, so nothing in it may ack.
+                let reason = e.to_string();
+                seal_and_truncate(file, *offset, &|r| ctx.seal_now(r), &reason);
+                fail_all(acks, std::iter::empty(), &reason);
+                return true;
+            }
+        }
+        // A no-op'd sync is still a sync *point*: fsync_count() counts points,
+        // not syscalls, so counter-based assertions stay meaningful under the
+        // seam (see `set_sync_noop`).
+        ctx.fsyncs.fetch_add(1, Ordering::SeqCst);
+    }
+    *offset = written;
+    for (ack, end) in acks {
+        ack.send(Ok(Ack { offset: end }));
+    }
+    true
+}
+
+/// Fail every entry of a group: the ones already written into it (never
+/// acked, so never committed) plus the ones that never got their turn.
+fn fail_all(
+    written: Vec<(AckSink<Ack>, u64)>,
+    unwritten: impl Iterator<Item = AckSink<Ack>>,
+    reason: &str,
+) {
+    for (ack, _) in written {
+        ack.send(Err(sealed_error(reason)));
+    }
+    for ack in unwritten {
+        ack.send(Err(sealed_error(reason)));
     }
 }
 
@@ -2789,5 +2949,189 @@ mod tests {
         let masker = Masker::empty();
         let masked = mask_json(&masker, "clean".to_string());
         assert_eq!(masked.as_bytes().as_ref(), b"clean");
+    }
+
+    // --- Task 9 (S2b windowless group commit) ------------------------
+
+    /// A writer scratch file plus fresh counters, so `commit_batch` can be
+    /// driven directly — the batching itself is a race against a real thread
+    /// when driven through the channel, and this is the property that must
+    /// be deterministic.
+    fn batch_fixture(dir: &Path) -> (File, WriterCtx) {
+        let file = OpenOptions::new()
+            .create_new(true)
+            .append(true)
+            .open(dir.join("batch.jsonl"))
+            .unwrap();
+        (
+            file,
+            WriterCtx {
+                sealed: Arc::new(Mutex::new(None)),
+                fsyncs: Arc::new(AtomicU64::new(0)),
+                fault: Arc::new(AtomicU8::new(0)),
+                sync_noop: Arc::new(AtomicBool::new(false)),
+            },
+        )
+    }
+
+    type Acked = std::io::Result<Ack>;
+
+    fn durable_batch(lines: &[&str]) -> (Vec<QueuedAppend>, Vec<mpsc::Receiver<Acked>>) {
+        let mut batch = Vec::new();
+        let mut acks = Vec::new();
+        for line in lines {
+            let (tx, rx) = mpsc::sync_channel(1);
+            batch.push(QueuedAppend {
+                line: line.as_bytes().to_vec(),
+                tier: AckTier::Durable,
+                ack: AckSink::Blocking(tx),
+            });
+            acks.push(rx);
+        }
+        (batch, acks)
+    }
+
+    /// commit-protocol.md §Pipelined commits, "Writer side: windowless group
+    /// commit": every queued line is written, `sync_data` runs ONCE, and each
+    /// entry still acks with its own exact byte offset.
+    #[test]
+    fn a_queued_batch_syncs_once_and_acks_every_entry_with_its_own_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut file, ctx) = batch_fixture(dir.path());
+        let (batch, acks) = durable_batch(&["a\n", "bb\n", "ccc\n"]);
+        let mut offset = 0;
+
+        assert!(commit_batch(&mut file, &mut offset, batch, &ctx));
+
+        assert_eq!(
+            ctx.fsyncs.load(Ordering::SeqCst),
+            1,
+            "one sync_data must cover the whole batch — three entries, one sync"
+        );
+        let offsets: Vec<u64> = acks
+            .into_iter()
+            .map(|rx| rx.recv().unwrap().unwrap().offset)
+            .collect();
+        assert_eq!(
+            offsets,
+            vec![2, 5, 9],
+            "per-entry offsets stay exact under grouping"
+        );
+        assert_eq!(offset, 9);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("batch.jsonl")).unwrap(),
+            "a\nbb\nccc\n"
+        );
+    }
+
+    /// "Kill -9 between enqueue and sync" with several entries queued: the
+    /// bytes may or may not be on the platter, so NOTHING in the batch is
+    /// acked and the writer is gone (commit-protocol.md test matrix case 8).
+    #[test]
+    fn a_writer_death_before_the_group_sync_acks_nothing_in_the_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut file, ctx) = batch_fixture(dir.path());
+        ctx.fault.store(
+            fault_to_u8(WriteFault::DropAckBeforeFsync),
+            Ordering::SeqCst,
+        );
+        let (batch, acks) = durable_batch(&["a\n", "bb\n", "ccc\n"]);
+        let mut offset = 0;
+
+        assert!(
+            !commit_batch(&mut file, &mut offset, batch, &ctx),
+            "the writer stops, exactly as after SIGKILL"
+        );
+        assert_eq!(ctx.fsyncs.load(Ordering::SeqCst), 0, "it died before fsync");
+        for rx in acks {
+            assert!(
+                rx.recv().is_err(),
+                "no ack may outlive the writer for bytes that were never synced"
+            );
+        }
+        assert_eq!(offset, 0, "the acked offset never advanced");
+    }
+
+    /// A failure anywhere in the batch rolls the file back to the last
+    /// *acked* offset and fails every entry in the batch: none of them was
+    /// acked, so none of them is committed (fsync-before-ack).
+    #[test]
+    fn a_failed_write_in_a_batch_seals_and_fails_every_entry_in_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut file, ctx) = batch_fixture(dir.path());
+        ctx.fault
+            .store(fault_to_u8(WriteFault::TearThenFail), Ordering::SeqCst);
+        let (batch, acks) = durable_batch(&["a\n", "bb\n", "ccc\n"]);
+        let mut offset = 0;
+
+        assert!(commit_batch(&mut file, &mut offset, batch, &ctx));
+
+        for rx in acks {
+            let err = rx.recv().unwrap().expect_err("nothing in the batch acked");
+            assert!(err.to_string().contains("sealed"), "{err}");
+        }
+        assert_eq!(offset, 0);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("batch.jsonl")).unwrap(),
+            "",
+            "the torn bytes are rolled back before any reader can see them"
+        );
+    }
+
+    /// The end-to-end shape: entries forwarded without awaiting their acks
+    /// pile up in the writer's queue and ride one sync. The first entry is
+    /// deliberately large so the writer is still inside its write+sync while
+    /// the rest are enqueued — the grouping itself is a real-thread race, and
+    /// this makes the margin milliseconds against microseconds.
+    #[tokio::test]
+    async fn forwarded_appends_share_syncs_and_stay_byte_exact() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let before = log.fsync_count();
+        let mut pending = Vec::new();
+
+        pending.push(
+            log.forward(
+                &EntryPayload::Rename {
+                    name: "x".repeat(4 * 1024 * 1024),
+                },
+                2,
+            )
+            .expect("forward"),
+        );
+        for i in 0..8 {
+            pending.push(
+                log.forward(
+                    &EntryPayload::Rename {
+                        name: format!("n{i}"),
+                    },
+                    3 + i,
+                )
+                .expect("forward"),
+            );
+        }
+        let n = pending.len() as u64;
+        let mut last = 0;
+        for forwarded in pending {
+            last = forwarded
+                .ack
+                .await
+                .expect("writer alive")
+                .expect("ack")
+                .offset;
+        }
+
+        assert!(
+            log.fsync_count() - before < n,
+            "group commit must spend fewer syncs than entries: {} syncs for {n} entries",
+            log.fsync_count() - before
+        );
+        assert_eq!(
+            last,
+            std::fs::metadata(log.path()).unwrap().len(),
+            "the last ack still names the exact end of the file"
+        );
+        let replayed = replay(log.path()).expect("replay");
+        assert!(replayed.warnings.is_empty(), "{:?}", replayed.warnings);
     }
 }
