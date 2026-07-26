@@ -701,29 +701,7 @@ impl SessionLog {
         payload_bytes: &Bytes,
         now_ms: u64,
     ) -> std::io::Result<(String, Vec<u8>)> {
-        #[derive(Serialize)]
-        struct PreparedEntryRef<'a> {
-            id: &'a str,
-            parent_id: Option<&'a str>,
-            ts_ms: u64,
-            payload: &'a RawValue,
-        }
-        let text = std::str::from_utf8(payload_bytes)
-            .map_err(|e| std::io::Error::other(format!("prepared payload is not utf8: {e}")))?;
-        let raw: &RawValue = serde_json::from_str(text).map_err(|e| {
-            std::io::Error::other(format!("prepared payload is not valid json: {e}"))
-        })?;
-        let id = new_ulid();
-        let entry = PreparedEntryRef {
-            id: &id,
-            parent_id: self.last_id.as_deref(),
-            ts_ms: now_ms,
-            payload: raw,
-        };
-        let mut bytes = serde_json::to_vec(&entry)
-            .map_err(|e| std::io::Error::other(format!("serialize entry: {e}")))?;
-        bytes.push(b'\n');
-        Ok((id, bytes))
+        splice_onto(self.last_id.as_deref(), payload_bytes, now_ms)
     }
 
     /// The actor's path for a proposal already serialized and masked by its
@@ -768,6 +746,43 @@ impl SessionLog {
         }
         let (id, bytes) = self.splice_prepared(prepared.bytes(), now_ms)?;
         self.forward_line(id, bytes)
+    }
+
+    /// Forward a **causal group** — several entries that are one causal event
+    /// (commit-protocol.md §Causal groups): the ids are minted and chained
+    /// parent→child *inside* the group, their lines are concatenated into
+    /// **one** writer message (so: one `write_all`, one `sync_data`, one
+    /// ack), and the returned [`Forwarded`] bears the group's **last** entry
+    /// id — the ticket a proposer holds. The projection applies the whole
+    /// group or none of it, which is exactly what one ack for one message
+    /// gives: a torn write rolls the whole run back (see
+    /// `a_failed_group_write_leaves_no_entry_of_it_on_disk`).
+    ///
+    /// An empty group is a caller bug, not a no-op commit: it would have to
+    /// return an ack for bytes that do not exist.
+    pub fn forward_group(
+        &mut self,
+        group: Vec<PreparedPayload>,
+        now_ms: u64,
+    ) -> std::io::Result<Forwarded> {
+        if group.is_empty() {
+            return Err(std::io::Error::other("an entry group cannot be empty"));
+        }
+        if let Some(reason) = self.seal_reason() {
+            return Err(sealed_error(&reason));
+        }
+        // The chain is built against a local parent and only committed to
+        // `last_id` by `forward_line` below, so a mid-group splice failure
+        // leaves the queued leaf exactly where it was.
+        let mut parent = self.last_id.clone();
+        let mut bytes = Vec::new();
+        for prepared in &group {
+            let (id, line) = splice_onto(parent.as_deref(), prepared.bytes(), now_ms)?;
+            bytes.extend_from_slice(&line);
+            parent = Some(id);
+        }
+        let last = parent.expect("a non-empty group always mints a last id");
+        self.forward_line(last, bytes)
     }
 
     fn forward_line(&mut self, id: String, bytes: Vec<u8>) -> std::io::Result<Forwarded> {
@@ -855,6 +870,39 @@ impl SessionLog {
     pub fn set_sync_noop(&self, enabled: bool) {
         self.sync_noop.store(enabled, Ordering::SeqCst);
     }
+}
+
+/// Mint one entry id and splice already-serialized-and-masked payload bytes
+/// into the entry envelope verbatim, parented onto `parent`. Free-standing
+/// (not `&mut self`) because a causal group chains several entries onto a
+/// parent the log has not adopted yet — see [`SessionLog::forward_group`].
+fn splice_onto(
+    parent: Option<&str>,
+    payload_bytes: &Bytes,
+    now_ms: u64,
+) -> std::io::Result<(String, Vec<u8>)> {
+    #[derive(Serialize)]
+    struct PreparedEntryRef<'a> {
+        id: &'a str,
+        parent_id: Option<&'a str>,
+        ts_ms: u64,
+        payload: &'a RawValue,
+    }
+    let text = std::str::from_utf8(payload_bytes)
+        .map_err(|e| std::io::Error::other(format!("prepared payload is not utf8: {e}")))?;
+    let raw: &RawValue = serde_json::from_str(text)
+        .map_err(|e| std::io::Error::other(format!("prepared payload is not valid json: {e}")))?;
+    let id = new_ulid();
+    let entry = PreparedEntryRef {
+        id: &id,
+        parent_id: parent,
+        ts_ms: now_ms,
+        payload: raw,
+    };
+    let mut bytes = serde_json::to_vec(&entry)
+        .map_err(|e| std::io::Error::other(format!("serialize entry: {e}")))?;
+    bytes.push(b'\n');
+    Ok((id, bytes))
 }
 
 impl Drop for SessionLog {
@@ -3139,5 +3187,96 @@ mod tests {
         );
         let replayed = replay(log.path()).expect("replay");
         assert!(replayed.warnings.is_empty(), "{:?}", replayed.warnings);
+    }
+
+    // --- Task 10 (S2c causal groups) ---------------------------------
+
+    /// commit-protocol.md §Causal groups (a): "the actor chains them
+    /// parent→child inside the group, sends **one** writer message, which
+    /// does one `write_all`, one `sync_data`, and resolves **one** ticket —
+    /// issued bearing the group's last entry id and seq". Deterministic
+    /// because it is one message: no race with the writer thread decides it.
+    #[tokio::test]
+    async fn a_forwarded_group_is_one_message_one_sync_and_a_parent_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let before = log.fsync_count();
+        let prepared = |name: &str| {
+            prepare_payload(
+                &EntryPayload::Rename { name: name.into() },
+                &Masker::empty(),
+                0,
+            )
+            .expect("prepare")
+        };
+
+        let forwarded = log
+            .forward_group(vec![prepared("first"), prepared("second")], 7)
+            .expect("forward");
+        let ack = forwarded.ack.await.expect("writer alive").expect("ack");
+
+        assert_eq!(
+            log.fsync_count() - before,
+            1,
+            "two entries in one causal group spend exactly one sync_data"
+        );
+        let entries: Vec<hotl_types::Entry> = std::fs::read_to_string(log.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("entry"))
+            .collect();
+        assert_eq!(entries.len(), 3, "header + the group's two entries");
+        assert_eq!(
+            entries[1].parent_id.as_deref(),
+            Some(entries[0].id.as_str()),
+            "the group chains onto the leaf it was minted against"
+        );
+        assert_eq!(
+            entries[2].parent_id.as_deref(),
+            Some(entries[1].id.as_str()),
+            "…and parent→child INSIDE the group"
+        );
+        assert_eq!(
+            forwarded.id, entries[2].id,
+            "one ticket, bearing the group's LAST entry id"
+        );
+        assert_eq!(
+            ack.offset,
+            std::fs::metadata(log.path()).unwrap().len(),
+            "the single ack names the end of the whole group"
+        );
+    }
+
+    /// All-or-nothing on failure: the group is one queued append, so a torn
+    /// write rolls the whole run back and acks none of it.
+    #[tokio::test]
+    async fn a_failed_group_write_leaves_no_entry_of_it_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let before = std::fs::read_to_string(log.path()).unwrap();
+        log.inject_fault(WriteFault::TearThenFail);
+        let prepared = |name: &str| {
+            prepare_payload(
+                &EntryPayload::Rename { name: name.into() },
+                &Masker::empty(),
+                0,
+            )
+            .expect("prepare")
+        };
+
+        let forwarded = log
+            .forward_group(vec![prepared("first"), prepared("second")], 7)
+            .expect("forward");
+        let err = forwarded
+            .ack
+            .await
+            .expect("writer alive")
+            .expect_err("a torn group acks nothing");
+        assert!(err.to_string().contains("sealed"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(log.path()).unwrap(),
+            before,
+            "no half-group survives the rollback"
+        );
     }
 }
