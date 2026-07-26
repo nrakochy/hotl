@@ -8,6 +8,7 @@
 //! result. Hook-visible payloads are byte-capped (pin #1) so a hook can't be
 //! used to amplify a huge tool result into the process.
 
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -370,10 +371,34 @@ pub trait Hooks: Send + Sync {
     /// external/unknown impl (a third-party lane, a test double) that hasn't
     /// overridden this stays correct: every event still reaches it exactly
     /// as it did before this method existed. `ShellHooks` overrides it from
-    /// its loaded specs, narrowing to the events actually configured.
+    /// its loaded specs, narrowing to the events actually configured. Used
+    /// only as the one-time fallback when [`Hooks::mask_handle`] is `None` —
+    /// an impl that provides a live handle is read through that instead.
     fn event_mask(&self) -> EventMask {
         EventMask::ALL
     }
+
+    /// A live, shareable cell backing this impl's mask, if it has one to
+    /// offer — the "Arc-swapped on registry change" mechanism (§S1)
+    /// resolved without a per-event hook table: the SAME `AtomicU8` the
+    /// impl narrows on eviction (`ShellHooks::refresh_mask_bit`) is what the
+    /// engine reads at every `hook_gate!` site, so a mid-session narrowing
+    /// is visible immediately — no second, disconnected snapshot to go
+    /// stale. Default: `None` — an impl with no live state to expose (an
+    /// external/unknown lane, anything built from [`InProcessHooks`]) keeps
+    /// working exactly as before: the engine falls back to a single
+    /// `event_mask()` snapshot taken once at session start.
+    fn mask_handle(&self) -> Option<Arc<AtomicU8>> {
+        None
+    }
+}
+
+/// Read the live §S1 mask through a handle — the one read discipline every
+/// holder of a mask atomic (`SharedDeps::hook_mask`, `question_sink`'s local
+/// copy, `ShellHooks::event_mask`) shares, so there is exactly one place
+/// that picks the `Ordering`.
+pub fn mask_of(handle: &AtomicU8) -> EventMask {
+    EventMask::from_bits(handle.load(Ordering::Relaxed))
 }
 
 /// §S1 HookRouter gate: the ONE macro every one of the six `Hooks` dispatch
@@ -384,15 +409,17 @@ pub trait Hooks: Send + Sync {
 /// bespoke `if let Some(hooks) = ...`.
 ///
 /// `$hooks_opt` is the `Option<Arc<dyn Hooks>>` to gate; `$mask` is the
-/// already-computed [`EventMask`] to test (a cached `u8` read, never a fresh
-/// `Hooks::event_mask` dyn call at this call site — see `SharedDeps::hook_mask`
-/// and `question_sink`'s own cached copy for where that single dyn call
-/// actually happens); `$bit` is this call site's event kind. When hooks are
-/// present AND the bit is set, `$hooks` is bound to the live `&Arc<dyn Hooks>`
-/// and `$body` runs — payload construction, the byte cap, deadline
-/// registration, cancel-race scaffolding, all inside it. Otherwise `$off`
-/// runs, doing none of that: a `None` session and a masked-off event are
-/// observationally identical, both taking this same skip branch.
+/// already-computed [`EventMask`] to test (an atomic read through
+/// [`mask_of`], never a fresh `Hooks::event_mask` dyn call at this call
+/// site — see `SharedDeps::hook_mask` and `question_sink`'s own handle for
+/// where the mask actually lives, and [`Hooks::mask_handle`] for how a
+/// mid-session narrowing reaches that same cell live); `$bit` is this call
+/// site's event kind. When hooks are present AND the bit is set, `$hooks` is
+/// bound to the live `&Arc<dyn Hooks>` and `$body` runs — payload
+/// construction, the byte cap, deadline registration, cancel-race
+/// scaffolding, all inside it. Otherwise `$off` runs, doing none of that: a
+/// `None` session and a masked-off event are observationally identical,
+/// both taking this same skip branch.
 macro_rules! hook_gate {
     ($hooks_opt:expr, $mask:expr, $bit:expr, |$hooks:ident| $body:expr, else $off:expr) => {
         match &$hooks_opt {

@@ -52,6 +52,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use hotl_engine::hooks::{
@@ -146,8 +147,11 @@ pub struct ShellHooks {
     /// narrowed in place by [`ShellHooks::refresh_mask_bit`] whenever a
     /// three-strike eviction silences the last live hook for an event —
     /// the "Arc-swapped on registry change" requirement, minus inventing a
-    /// registry: the impl just refreshes its own cheap holder.
-    mask: AtomicU8,
+    /// registry: the impl just refreshes its own cheap holder. `Arc`-wrapped
+    /// (reviewer finding 1) so [`Hooks::mask_handle`] can hand the engine the
+    /// SAME cell this narrows, rather than a copy that goes stale the moment
+    /// an eviction lands mid-session.
+    mask: Arc<AtomicU8>,
 }
 
 /// Parse shell hooks from a TOML string (the `[[hook]]` section of
@@ -215,7 +219,7 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
         stop,
         session_end,
         concurrency,
-        mask: AtomicU8::new(mask.bits()),
+        mask: Arc::new(AtomicU8::new(mask.bits())),
     })
 }
 
@@ -324,22 +328,30 @@ impl ShellHook {
 
 impl ShellHooks {
     /// Recompute `bit` from whether any hook in `event`'s list is still
-    /// live, and store the result. Called after every invocation of that
-    /// event's hooks (never on the masked-off fast path this whole
-    /// mechanism protects) so a three-strike eviction that just silenced the
-    /// last live hook for an event narrows the cached mask as soon as the
-    /// engine could observe it — an `O(hooks-for-this-event)` scan over a
-    /// handful of entries, not a fresh dyn call reconstructing the whole
-    /// union from scratch.
+    /// live, and fold the result into the shared mask. Called after every
+    /// invocation of that event's hooks (never on the masked-off fast path
+    /// this whole mechanism protects) so a three-strike eviction that just
+    /// silenced the last live hook for an event narrows the mask the engine
+    /// reads (live, via [`Hooks::mask_handle`]) as soon as it happens — an
+    /// `O(hooks-for-this-event)` scan over a handful of entries, not a fresh
+    /// dyn call reconstructing the whole union from scratch.
+    ///
+    /// Reviewer finding 2: this MUST be a single atomic read-modify-write
+    /// (`fetch_or`/`fetch_and`), never a separate load then store — two
+    /// calls narrowing DIFFERENT bits at once (e.g. `pre_tool` and
+    /// `post_tool` both invoked from an overlapping tool chunk, per
+    /// `turn.rs`'s `join_all`) would otherwise race: both read the mask
+    /// before either writes, and the second store silently clobbers the
+    /// first thread's bit. `fetch_or`/`fetch_and` touch only their own bits
+    /// as one atomic hardware operation, so concurrent refreshes of
+    /// different bits can never lose one another's update.
     fn refresh_mask_bit<'a>(&self, bit: EventMask, hooks: impl Iterator<Item = &'a ShellHook>) {
         let live = hooks.into_iter().any(ShellHook::is_live);
-        let current = EventMask::from_bits(self.mask.load(Ordering::Relaxed));
-        let updated = if live {
-            current.union(bit)
+        if live {
+            self.mask.fetch_or(bit.bits(), Ordering::Relaxed);
         } else {
-            current.difference(bit)
-        };
-        self.mask.store(updated.bits(), Ordering::Relaxed);
+            self.mask.fetch_and(!bit.bits(), Ordering::Relaxed);
+        }
     }
 }
 
@@ -498,7 +510,15 @@ impl Hooks for ShellHooks {
     }
 
     fn event_mask(&self) -> EventMask {
-        EventMask::from_bits(self.mask.load(Ordering::Relaxed))
+        hotl_engine::hooks::mask_of(&self.mask)
+    }
+
+    /// Reviewer finding 1: hand the engine the SAME `Arc<AtomicU8>`
+    /// `refresh_mask_bit` narrows, so a three-strike eviction is visible to
+    /// every `hook_gate!` call site the instant it happens — not just at the
+    /// next session, which a one-time `event_mask()` snapshot would mean.
+    fn mask_handle(&self) -> Option<Arc<AtomicU8>> {
+        Some(Arc::clone(&self.mask))
     }
 }
 
@@ -658,6 +678,41 @@ mod tests {
         assert!(!mask.contains(EventMask::USER_PROMPT));
         assert!(!mask.contains(EventMask::NOTIFICATION));
         assert!(!mask.contains(EventMask::SESSION_END));
+    }
+
+    /// Reviewer finding 2: `refresh_mask_bit` must be a true read-modify-write
+    /// on the shared atomic, not a load-then-store — two threads narrowing
+    /// DIFFERENT bits at once must not let one clobber the other's
+    /// concurrent update. Both hooks here stay live the whole time (their
+    /// strike counters never move), so every refresh should set-and-keep-set
+    /// both bits; a lost update would show up as one of them missing.
+    #[test]
+    fn refresh_mask_bit_does_not_lose_a_concurrent_update_to_a_different_bit() {
+        let hooks = load_str(
+            "[[hook]]\nevent = \"pre_tool\"\ncommand = \"exit 0\"\n\
+             [[hook]]\nevent = \"post_tool\"\ncommand = \"exit 0\"\n",
+            concurrency(),
+        )
+        .unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..200 {
+                scope.spawn(|| {
+                    hooks.refresh_mask_bit(EventMask::PRE_TOOL, hooks.pre.iter().map(|(_, h)| h));
+                });
+                scope.spawn(|| {
+                    hooks.refresh_mask_bit(EventMask::POST_TOOL, hooks.post.iter().map(|(_, h)| h));
+                });
+            }
+        });
+        let mask = hooks.event_mask();
+        assert!(
+            mask.contains(EventMask::PRE_TOOL),
+            "a concurrent POST_TOOL refresh must not clobber a concurrently-set PRE_TOOL bit"
+        );
+        assert!(
+            mask.contains(EventMask::POST_TOOL),
+            "a concurrent PRE_TOOL refresh must not clobber a concurrently-set POST_TOOL bit"
+        );
     }
 
     #[tokio::test]

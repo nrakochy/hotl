@@ -572,15 +572,24 @@ pub fn question_sink(
     hooks_handle: Option<Arc<dyn hooks::Hooks>>,
     notifications: hooks::NotificationDrain,
 ) -> hotl_tools::ask::QuestionSink {
-    // §S1 HookRouter gate: computed once here (sink-construction time, never
-    // per question) — the same "single dyn call at session start" shape
-    // `SharedDeps::hook_mask` uses — so `hook_gate!` below reads a plain
-    // cached value instead of a fresh `event_mask()` dyn call every time a
-    // tool asks a question.
-    let hook_mask = hooks_handle
+    // §S1 HookRouter gate: resolved once here (sink-construction time, never
+    // per question) — the same handle-first, snapshot-fallback shape
+    // `SharedDeps::hook_mask` uses, so a live handle's mid-session
+    // narrowing (e.g. a three-strike eviction) is visible to `hook_gate!`
+    // below immediately, not just at the next session.
+    let hook_mask: Arc<std::sync::atomic::AtomicU8> = hooks_handle
         .as_ref()
-        .map_or(hooks::EventMask::NONE, |h| h.event_mask());
+        .and_then(|h| h.mask_handle())
+        .unwrap_or_else(|| {
+            Arc::new(std::sync::atomic::AtomicU8::new(
+                hooks_handle
+                    .as_ref()
+                    .map_or(hooks::EventMask::NONE, |h| h.event_mask())
+                    .bits(),
+            ))
+        });
     std::sync::Arc::new(move |question, cancel| {
+        let hook_mask = Arc::clone(&hook_mask);
         let cmd_tx = cmd_tx.clone();
         let events_tx = events_tx.clone();
         let hooks_handle = hooks_handle.clone();
@@ -600,7 +609,7 @@ pub fn question_sink(
             // right before the question actually surfaces.
             crate::hooks::hook_gate!(
                 hooks_handle,
-                hook_mask,
+                crate::hooks::mask_of(&hook_mask),
                 crate::hooks::EventMask::NOTIFICATION,
                 |h| {
                     crate::hooks::notify(

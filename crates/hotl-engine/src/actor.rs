@@ -66,13 +66,17 @@ pub(crate) struct SharedDeps {
     pub snapshots: Option<Arc<dyn crate::Snapshotter>>,
     pub hooks: Option<Arc<dyn crate::hooks::Hooks>>,
     /// §S1 HookRouter gate (Task 5): the union of event kinds `hooks`
-    /// actually wants dispatched, cached once at session start so every
-    /// `hook_gate!` call site pays one atomic load — never a fresh
-    /// `Hooks::event_mask` dyn call — to decide whether to build ANY
-    /// per-event work. `NONE` when `hooks` is `None`. Seeded from a single
-    /// `event_mask()` call in [`SharedDeps::new`], the same "compute once at
-    /// session start" shape `mode` uses for `rules.mode()`.
-    hook_mask: AtomicU8,
+    /// actually wants dispatched, read by every `hook_gate!` call site as
+    /// one atomic load — never a fresh `Hooks::event_mask` dyn call — to
+    /// decide whether to build ANY per-event work. `NONE` when `hooks` is
+    /// `None`. Prefers `hooks.mask_handle()` — the SAME cell the impl
+    /// narrows on eviction, so a mid-session narrowing is visible here
+    /// immediately (reviewer finding: a one-time snapshot copy would go
+    /// stale the moment the impl's own state changed). Falls back to a
+    /// fresh `Arc` seeded from a single `event_mask()` call when the impl
+    /// has no live handle to offer (the trait's default `None`) — the same
+    /// "compute once at session start" shape `mode` uses for `rules.mode()`.
+    hook_mask: Arc<AtomicU8>,
     /// The session-scoped `notify` drain (Finding 1 fix) — shared with
     /// whatever built this session's `SessionHandle`, so the CLI's exit-time
     /// drain call reaches the exact same detached `Notification` hook tasks
@@ -107,12 +111,18 @@ impl SharedDeps {
         notifications: crate::hooks::NotificationDrain,
     ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
-        let hook_mask = AtomicU8::new(
-            deps.hooks
-                .as_ref()
-                .map_or(crate::hooks::EventMask::NONE, |h| h.event_mask())
-                .bits(),
-        );
+        let hook_mask = deps
+            .hooks
+            .as_ref()
+            .and_then(|h| h.mask_handle())
+            .unwrap_or_else(|| {
+                Arc::new(AtomicU8::new(
+                    deps.hooks
+                        .as_ref()
+                        .map_or(crate::hooks::EventMask::NONE, |h| h.event_mask())
+                        .bits(),
+                ))
+            });
         let shared = Self {
             provider: deps.provider,
             registry: deps.registry,
@@ -131,10 +141,10 @@ impl SharedDeps {
         (shared, deps.log)
     }
 
-    /// The cached §S1 mask [`crate::hooks::hook_gate!`] branches on — see the
+    /// The live §S1 mask [`crate::hooks::hook_gate!`] branches on — see the
     /// `hook_mask` field doc.
     pub(crate) fn hook_mask(&self) -> crate::hooks::EventMask {
-        crate::hooks::EventMask::from_bits(self.hook_mask.load(Ordering::Relaxed))
+        crate::hooks::mask_of(&self.hook_mask)
     }
 
     /// The mode `evaluate` should gate against right now — not necessarily

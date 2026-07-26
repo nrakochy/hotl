@@ -4,7 +4,7 @@
 //! event still fires normally. Proven here by a hooks impl that reports a
 //! narrow `event_mask()` and records every method it's actually called on.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -171,6 +171,71 @@ async fn only_the_registered_event_dispatches_the_rest_take_the_masked_branch() 
         hooks.session_end.load(Ordering::SeqCst),
         0,
         "session_end is masked off — it must never be called"
+    );
+}
+
+/// A `Hooks` impl that exposes a LIVE mask handle (the fix-1 mechanism) and
+/// narrows its own `PRE_TOOL` bit after its third call — mirroring what
+/// `ShellHooks::refresh_mask_bit` does internally after a real three-strike
+/// eviction, but from an impl the engine has no special knowledge of.
+struct SelfEvictingHooks {
+    mask: Arc<AtomicU8>,
+    pre_tool_calls: AtomicU32,
+}
+
+impl SelfEvictingHooks {
+    fn new() -> Self {
+        Self {
+            mask: Arc::new(AtomicU8::new(EventMask::PRE_TOOL.bits())),
+            pre_tool_calls: AtomicU32::new(0),
+        }
+    }
+}
+
+impl Hooks for SelfEvictingHooks {
+    fn pre_tool<'a>(&'a self, _n: &'a str, _i: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+        let n = self.pre_tool_calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if n == 3 {
+            self.mask
+                .fetch_and(!EventMask::PRE_TOOL.bits(), Ordering::SeqCst);
+        }
+        Box::pin(std::future::ready(PreToolDecision::Continue))
+    }
+    fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+        Box::pin(std::future::ready(None))
+    }
+    fn mask_handle(&self) -> Option<Arc<AtomicU8>> {
+        Some(Arc::clone(&self.mask))
+    }
+}
+
+/// Fix 1 (reviewer finding): the engine's gate must read the SAME atomic a
+/// live-handle-exposing impl narrows — not a disconnected snapshot taken
+/// once at session start. Four sequential `glob` calls (permission-free, so
+/// no `Ask` interrupts the sequence) in one turn; the third call narrows the
+/// impl's own mask, so the fourth must never reach `pre_tool` at all.
+#[tokio::test]
+async fn mid_session_narrowing_through_a_live_mask_handle_reaches_the_engine() {
+    let hooks = Arc::new(SelfEvictingHooks::new());
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "glob", json!({"pattern": "*"})),
+        ScriptedProvider::tool_call("t2", "glob", json!({"pattern": "*"})),
+        ScriptedProvider::tool_call("t3", "glob", json!({"pattern": "*"})),
+        ScriptedProvider::tool_call("t4", "glob", json!({"pattern": "*"})),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session(provider, hooks.clone());
+
+    s.handle.prompt("go".into()).await;
+    let outcome = run_to_done(&mut s).await;
+    assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
+
+    assert_eq!(
+        hooks.pre_tool_calls.load(Ordering::SeqCst),
+        3,
+        "the engine must stop calling pre_tool the instant the impl's own \
+         live mask handle narrows mid-session — a 4th call means the engine \
+         is reading a stale session-start snapshot instead of the shared handle"
     );
 }
 
