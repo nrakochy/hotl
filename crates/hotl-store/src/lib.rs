@@ -25,7 +25,7 @@ use std::fs::{DirBuilder, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use hotl_types::{new_ulid, Entry, EntryPayload, SessionHeader, FORMAT_VERSION};
@@ -229,6 +229,7 @@ pub struct SessionLog {
     sealed: Arc<Mutex<Option<String>>>,
     fsyncs: Arc<AtomicU64>,
     fault: Arc<AtomicU8>,
+    sync_noop: Arc<AtomicBool>,
     pub session_id: String,
 }
 
@@ -295,12 +296,17 @@ impl SessionLog {
         let sealed = Arc::new(Mutex::new(None));
         let fsyncs = Arc::new(AtomicU64::new(0));
         let fault = Arc::new(AtomicU8::new(0));
+        let sync_noop = Arc::new(AtomicBool::new(false));
         let writer = std::thread::Builder::new()
             .name(format!("hotl-log-{session_id}"))
             .spawn({
-                let (sealed, fsyncs, fault) =
-                    (Arc::clone(&sealed), Arc::clone(&fsyncs), Arc::clone(&fault));
-                move || writer_loop(file, offset, rx, sealed, fsyncs, fault)
+                let (sealed, fsyncs, fault, sync_noop) = (
+                    Arc::clone(&sealed),
+                    Arc::clone(&fsyncs),
+                    Arc::clone(&fault),
+                    Arc::clone(&sync_noop),
+                );
+                move || writer_loop(file, offset, rx, sealed, fsyncs, fault, sync_noop)
             })?;
         let mut log = Self {
             tx,
@@ -311,6 +317,7 @@ impl SessionLog {
             sealed,
             fsyncs,
             fault,
+            sync_noop,
             session_id: session_id.clone(),
         };
         log.append(
@@ -525,6 +532,21 @@ impl SessionLog {
     pub fn inject_fault(&self, fault: WriteFault) {
         self.fault.store(fault_to_u8(fault), Ordering::SeqCst);
     }
+
+    /// Test-only: skip the writer's `sync_data()` syscall (both the durable
+    /// append path and the blob path) while leaving everything else — the
+    /// write itself, the ack, and production control flow — byte-for-byte
+    /// unchanged. Isolates the §S1 loop-overhead gate from real disk sync
+    /// latency without making the gate meaningless: `fsync_count()` still
+    /// increments once per sync *point* even when it's a no-op, so
+    /// fsync-count assertions stay valid whether or not this is enabled.
+    /// Same discipline as `inject_fault`: runtime-injected via the handle,
+    /// not a cargo feature, hidden from the public API. Defaults off;
+    /// production code never calls this.
+    #[doc(hidden)]
+    pub fn set_sync_noop(&self, enabled: bool) {
+        self.sync_noop.store(enabled, Ordering::SeqCst);
+    }
 }
 
 impl Drop for SessionLog {
@@ -614,6 +636,7 @@ fn writer_loop(
     sealed: Arc<Mutex<Option<String>>>,
     fsyncs: Arc<AtomicU64>,
     fault: Arc<AtomicU8>,
+    sync_noop: Arc<AtomicBool>,
 ) {
     let seal_now = |reason: String| {
         *sealed
@@ -669,7 +692,13 @@ fn writer_loop(
                 }
                 let result = file.write_all(&line).and_then(|()| {
                     if tier == AckTier::Durable {
-                        file.sync_data()?; // T1-1: the actual fix
+                        if !sync_noop.load(Ordering::SeqCst) {
+                            file.sync_data()?; // T1-1: the actual fix
+                        }
+                        // A no-op'd sync is still a sync *point*: fsync_count()
+                        // counts points, not syscalls, so counter-based
+                        // assertions stay meaningful under the seam (see
+                        // `set_sync_noop`).
                         fsyncs.fetch_add(1, Ordering::SeqCst);
                     }
                     Ok(())
@@ -695,14 +724,19 @@ fn writer_loop(
                 bytes,
                 ack,
             } => {
-                ack.send(write_blob_file(&dir, &path, &bytes));
+                ack.send(write_blob_file(&dir, &path, &bytes, &sync_noop));
             }
         }
     }
 }
 
 /// The writer thread's half: all blob filesystem work in one place.
-fn write_blob_file(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<PathBuf> {
+fn write_blob_file(
+    dir: &Path,
+    path: &Path,
+    bytes: &[u8],
+    sync_noop: &AtomicBool,
+) -> std::io::Result<PathBuf> {
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     let mut f = OpenOptions::new()
         .create(true)
@@ -711,7 +745,9 @@ fn write_blob_file(dir: &Path, path: &Path, bytes: &[u8]) -> std::io::Result<Pat
         .mode(0o600)
         .open(path)?;
     f.write_all(bytes)?;
-    f.sync_data()?;
+    if !sync_noop.load(Ordering::SeqCst) {
+        f.sync_data()?;
+    }
     Ok(path.to_path_buf())
 }
 
@@ -1655,6 +1691,87 @@ mod tests {
             sync_log.fsync_count(),
             "the blocking append is Durable too"
         );
+    }
+
+    /// §S1 loop-overhead gate seam: with the sync no-op'd, `fsync_count()`
+    /// must still increment once per Durable append — the counter tracks
+    /// sync *points*, not completed syscalls, so a benchmark that disables
+    /// the real `sync_data()` call doesn't also quietly break every
+    /// fsync-count assertion (`buffered_tier_does_not_fsync_and_is_never_the_canon_default`
+    /// and friends).
+    #[tokio::test]
+    async fn sync_noop_still_increments_fsync_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.set_sync_noop(true);
+        let before = log.fsync_count();
+
+        let ack = log
+            .append_acked(&EntryPayload::Rename { name: "one".into() }, 2)
+            .await
+            .expect("append");
+        assert_eq!(
+            log.fsync_count(),
+            before + 1,
+            "a no-op'd sync must still count as one sync point"
+        );
+        // The write itself is unaffected — only the fsync syscall is skipped.
+        let on_disk = std::fs::metadata(log.path()).unwrap().len();
+        assert_eq!(ack.offset, on_disk);
+        assert!(std::fs::read_to_string(log.path())
+            .unwrap()
+            .contains("\"one\""));
+    }
+
+    /// The seam defaults off: a log that never calls `set_sync_noop` behaves
+    /// exactly as before (belt on top of every other fsync test, which all
+    /// construct logs without touching the seam).
+    #[tokio::test]
+    async fn sync_noop_defaults_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let before = log.fsync_count();
+        log.append_acked(&EntryPayload::Rename { name: "one".into() }, 2)
+            .await
+            .expect("append");
+        assert_eq!(
+            log.fsync_count(),
+            before + 1,
+            "an untouched log still fsyncs for real"
+        );
+    }
+
+    /// The seam also covers the blob path (brief: "blob sync at ~714") —
+    /// no-op'd or not, a blob write must still land the right masked bytes
+    /// at the right path.
+    #[tokio::test]
+    async fn sync_noop_applies_to_blob_writes_without_changing_their_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.set_sync_noop(true);
+        let path = log
+            .write_blob_acked("toolu_1", "blob body")
+            .await
+            .expect("blob write");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "blob body\n");
+    }
+
+    /// WriteFault behavior must be unaffected by the sync-noop seam: a
+    /// disk-full fault still seals the log the same way whether or not
+    /// `set_sync_noop` is enabled (the fault check in `writer_loop` runs
+    /// before the sync-noop branch, so the two must never interact).
+    #[tokio::test]
+    async fn write_fault_still_seals_the_log_with_sync_noop_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.set_sync_noop(true);
+        log.inject_fault(WriteFault::FailBeforeWrite);
+        let err = log
+            .append_acked(&EntryPayload::Rename { name: "x".into() }, 2)
+            .await
+            .expect_err("the fault must still fail the append");
+        assert!(err.to_string().contains("session log is sealed"));
+        assert!(log.is_sealed());
     }
 
     #[tokio::test]
