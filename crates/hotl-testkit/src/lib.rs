@@ -1330,15 +1330,19 @@ mod tests {
         );
     }
 
-    /// A held steer is released the moment the projection stops awaiting
-    /// tool results — which, under pipelining, is the instant the FIRST
-    /// entry of a multi-entry proposal acks, with its siblings still in the
-    /// writer's queue. The actor's own inline appends therefore drain the
-    /// pipeline first: otherwise the steer would be *projected* between
-    /// entries it is *logged* after, and the next request would disagree
-    /// with the canon it was built from.
+    /// A multi-entry proposal is **one causal group**: one writer message,
+    /// one ack, and its items applied to the head whole or not at all (S2c).
+    /// So a held steer released at that ack can only land after the entire
+    /// group — there is no longer an instant where the first entry is
+    /// projected and its siblings are still in the writer's queue.
+    ///
+    /// Task 9 wrote this against exactly that instant, which the group
+    /// closes structurally; it is kept, repurposed, because it still pins
+    /// the observable that instant used to break — the projection the next
+    /// request is built from agrees with the log, item for item, in the
+    /// log's order. That is the invariant, whichever mechanism holds it.
     #[tokio::test]
-    async fn a_steer_released_mid_proposal_lands_after_the_whole_proposal() {
+    async fn a_steer_lands_after_a_whole_group_and_the_next_request_agrees_with_the_log() {
         let mut h = Harness::new(vec![], cfg());
         for sub in ["web", "api"] {
             let dir = h.dir().join(sub);

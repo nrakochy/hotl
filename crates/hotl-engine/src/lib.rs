@@ -340,6 +340,35 @@ impl PreparedEntry {
     }
 }
 
+/// Whether the sample that produced a proposal had **closed** by the time
+/// the proposal was made — declared by the proposer, because only the turn
+/// knows. The actor never stores it as state and never routes on it; it
+/// exists so the held-steer release can *check* the argument it rests on
+/// instead of resting on a comment (commit-protocol.md §Read invariant, and
+/// the 72a6f1b held-steer rule).
+///
+/// The argument, stated: a steer held while a turn is live may land the
+/// moment one of that turn's commits settles, because a turn commits nothing
+/// between granting itself a snapshot and the `Completed` group that closes
+/// the sample — so every ack the actor handles is genuinely between samples.
+/// That is true of every proposal site today and it is exactly what
+/// [`SampleStage::InSample`] exists to catch when it stops being true.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleStage {
+    /// The sample that produced this commit had already closed (or none was
+    /// running). A held steer may land behind it: the model's reply is
+    /// already durable, so nothing can precede an assistant item that could
+    /// not have seen it.
+    AtBoundary,
+    /// The commit lands **while its own sample is still streaming**. No such
+    /// site exists today; §Commit granularity's intra-sample `BlockEnd`
+    /// pipelining would create the first, and on that day a steer released
+    /// behind one would land ahead of the assistant item the model is still
+    /// producing — the exact inversion 72a6f1b fixed. Declaring this is what
+    /// makes that a loud failure rather than a silent regression.
+    InSample,
+}
+
 /// A batch of entries a turn task asks the actor to commit
 /// (commit-protocol.md §Vocabulary), in the two shapes the protocol names.
 /// Both answer with exactly one [`CommitTicket`] in [`AckMode::Pipelined`];
@@ -497,6 +526,10 @@ pub enum SessionCmd {
     /// bytes, never a raw `EntryPayload`.
     ProposePrepared {
         proposal: EntryProposal,
+        /// The proposer's declaration of whether its sample had closed —
+        /// see [`SampleStage`]. Read once, by the held-steer release's
+        /// assertion, and dropped.
+        stage: SampleStage,
         /// Whether the proposer waits for durability (commit-protocol.md
         /// §Pipelined commits). `Pipelined` answers with a
         /// [`ProposeReply::Ticket`] the moment the entries are forwarded.

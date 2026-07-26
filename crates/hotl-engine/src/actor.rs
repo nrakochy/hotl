@@ -63,6 +63,10 @@ struct PendingAck {
     /// That entry's `seq`: the epoch the published head reaches when this
     /// unit is applied.
     seq: u64,
+    /// The proposer's declaration of whether its sample had closed. Not
+    /// state and not a decision input — the held-steer release's assertion
+    /// reads it once, at settle, and it dies with this entry.
+    stage: crate::SampleStage,
     /// Resolved when this unit is the last of its proposal: one ticket per
     /// proposal. `None` for interior entries and for every actor-originated
     /// append.
@@ -220,17 +224,32 @@ impl Head {
     }
 }
 
-/// Why a held steer may land right now. There is no third caller, and that
-/// is the whole of the protection the `ProposePrepared` handler's old
-/// `sampling` flip gave: a steer is only ever appended at a boundary the
-/// actor itself just created, so it can never precede an assistant item that
-/// could not have seen it (72a6f1b).
+/// Why a held steer may land right now — and, for the one case that needs
+/// it, the *proof*. There is no third variant, and between them they are the
+/// whole of the protection the `ProposePrepared` handler's old `sampling`
+/// flip gave: a steer is only ever appended at a boundary the actor itself
+/// just created, so it can never precede an assistant item that could not
+/// have seen it (72a6f1b).
 #[derive(Clone, Copy, Debug)]
 enum Boundary {
     /// A commit this turn made just landed and was applied to the head.
-    CommitSettled,
-    /// The turn is over; nothing will answer an open batch now.
+    /// `stage` is the proposer's own declaration that its sample had closed
+    /// — the mid-sample half of the old assert's protection, checked rather
+    /// than assumed (see [`crate::SampleStage`]).
+    CommitSettled { stage: crate::SampleStage },
+    /// The turn is over; nothing will answer an open batch now, so no sample
+    /// can be in flight by construction.
     TurnEnded,
+}
+
+impl Boundary {
+    /// Whether this really is a boundary a held steer may land at.
+    fn is_between_samples(self) -> bool {
+        match self {
+            Self::CommitSettled { stage } => stage == crate::SampleStage::AtBoundary,
+            Self::TurnEnded => true,
+        }
+    }
 }
 
 /// How a drain settles the tickets it resolves.
@@ -697,6 +716,7 @@ pub(crate) async fn run(
         let cmd = match woke {
             Woke::Ack(acked) => {
                 let entry = front.expect("the ack arm only runs with a front entry");
+                let stage = entry.stage;
                 let settled = apply_ack(entry, acked, &mut head, Resolution::Ack);
                 // A commit this turn made just landed: that is the boundary a
                 // held steer was waiting for. It is appended BEFORE the
@@ -710,7 +730,7 @@ pub(crate) async fn run(
                     &mut head,
                     &mut pipeline,
                     &mut held_steers,
-                    Boundary::CommitSettled,
+                    Boundary::CommitSettled { stage },
                 )
                 .await;
                 head.publish();
@@ -828,12 +848,20 @@ pub(crate) async fn run(
             }
             SessionCmd::ProposePrepared {
                 proposal,
+                stage,
                 mode,
                 reply,
             } => {
-                let result =
-                    commit_prepared(&shared, &mut log, &mut head, &mut pipeline, proposal, mode)
-                        .await;
+                let result = commit_prepared(
+                    &shared,
+                    &mut log,
+                    &mut head,
+                    &mut pipeline,
+                    proposal,
+                    mode,
+                    stage,
+                )
+                .await;
                 // `Sync` applies inline, so the boundary a held steer waits
                 // for is *here*; `Pipelined` reaches it at the ack, in the
                 // loop's FIFO arm above. A stale-epoch reject is not a
@@ -850,7 +878,7 @@ pub(crate) async fn run(
                         &mut head,
                         &mut pipeline,
                         &mut held_steers,
-                        Boundary::CommitSettled,
+                        Boundary::CommitSettled { stage },
                     )
                     .await;
                 }
@@ -1164,11 +1192,15 @@ fn awaiting_tool_results(items: &[Item]) -> bool {
 /// released once the results land. The model sees it at the same moment either
 /// way: the next sample happens after the batch closes.
 ///
-/// `sampling` is the same hold one step earlier: a steer that arrives while a
-/// request is in flight would otherwise commit *ahead* of the assistant item
-/// that request is about to produce.
+/// `running` is the same hold one step earlier, and one step wider: a steer
+/// that arrives while a request is in flight would otherwise commit *ahead*
+/// of the assistant item that request is about to produce. A live turn is
+/// always either mid-sample or mid-batch, so holding for its whole life
+/// costs nothing — [`release_steers`] runs at every boundary the actor
+/// creates, which is where the steer would have landed anyway.
 /// INVARIANT: a steer never precedes an assistant item that could not have seen
-/// it. Enforced by `a_mid_stream_steer_commits_after_the_reply_it_did_not_see`.
+/// it. Enforced by `a_mid_stream_steer_commits_after_the_reply_it_did_not_see`
+/// and `a_steer_inside_the_boundary_group_lands_after_the_assistant_item`.
 async fn admit_steer(
     shared: &SharedDeps,
     log: &mut SessionLog,
@@ -1222,14 +1254,31 @@ async fn append_steer(
 
 /// Append the steers that were waiting on a sample or a batch, oldest first,
 /// once the reply has landed and the pairing is closed.
+///
+/// `at` carries the two halves of the held-steer rule's proof, and both are
+/// checked here rather than argued in a comment:
+///
+/// - **mid-sample** — [`Boundary::is_between_samples`]: the commit that
+///   created this boundary closed its sample, so the model's reply is
+///   already durable. Assert-only, because no site can violate it today; it
+///   is aimed squarely at §Commit granularity's intra-sample `BlockEnd`
+///   pipelining, which would otherwise reintroduce 72a6f1b silently.
+/// - **mid-batch** — `awaiting_tool_results`: a steer that split an open
+///   tool batch would strand the results from the calls they answer.
 async fn release_steers(
     shared: &SharedDeps,
     log: &mut SessionLog,
     head: &mut Head,
     pipeline: &mut Pipeline,
     held: &mut Vec<String>,
-    _at: Boundary,
+    at: Boundary,
 ) {
+    debug_assert!(
+        at.is_between_samples(),
+        "a held steer may only land between samples: releasing behind an in-sample \
+         commit would put it ahead of the assistant item the model is still \
+         producing — the inversion 72a6f1b fixed ({at:?})"
+    );
     if held.is_empty() || awaiting_tool_results(head.items()) {
         return;
     }
@@ -1330,6 +1379,7 @@ async fn commit_prepared(
     pipeline: &mut Pipeline,
     proposal: crate::EntryProposal,
     mode: crate::AckMode,
+    stage: crate::SampleStage,
 ) -> crate::ProposeReply {
     let current_epoch = shared.rules_epoch();
     // "Predates" (commit-protocol.md §Proposal payloads), not merely
@@ -1388,6 +1438,7 @@ async fn commit_prepared(
                         forwarded,
                         item.into_iter().collect(),
                         seq,
+                        stage,
                     )),
                     // Sealed before the entry was even minted. Anything
                     // already forwarded is canon and still lands; the turn
@@ -1412,9 +1463,9 @@ async fn commit_prepared(
                     items.extend(item);
                 }
                 match shared.forward_group(log, payloads) {
-                    Ok(forwarded) => {
-                        crate::ProposeReply::Ticket(push_pending(pipeline, forwarded, items, seq))
-                    }
+                    Ok(forwarded) => crate::ProposeReply::Ticket(push_pending(
+                        pipeline, forwarded, items, seq, stage,
+                    )),
                     Err(_) => crate::ProposeReply::Sealed,
                 }
             }
@@ -1437,6 +1488,7 @@ fn push_pending(
     forwarded: hotl_store::Forwarded,
     items: Vec<Item>,
     seq: u64,
+    stage: crate::SampleStage,
 ) -> crate::CommitTicket {
     let (tx, rx) = tokio::sync::oneshot::channel();
     let ticket = crate::CommitTicket {
@@ -1449,6 +1501,7 @@ fn push_pending(
         items,
         id: forwarded.id,
         seq,
+        stage,
         ticket: Some(tx),
     });
     ticket
@@ -1798,7 +1851,7 @@ mod tests {
     use super::COMPACT_SUMMARIZE_TIMEOUT;
     use super::{
         awaiting_tool_results, commit_prepared, compact, fold_into, pair_tool_results,
-        summarize_bounded, Pipeline, Resolution, SharedDeps,
+        release_steers, summarize_bounded, Pipeline, Resolution, SharedDeps,
     };
     use hotl_store::SessionLog;
     use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
@@ -2024,6 +2077,7 @@ mod tests {
             &mut Pipeline::default(),
             crate::EntryProposal::of(entries),
             crate::AckMode::Sync,
+            crate::SampleStage::AtBoundary,
         )
         .await;
         assert!(matches!(result, crate::ProposeReply::StaleEpoch));
@@ -2061,6 +2115,7 @@ mod tests {
             &mut Pipeline::default(),
             crate::EntryProposal::of(entries),
             crate::AckMode::Sync,
+            crate::SampleStage::AtBoundary,
         )
         .await;
         assert!(matches!(result, crate::ProposeReply::Committed));
@@ -2095,6 +2150,7 @@ mod tests {
             &mut pipeline,
             crate::EntryProposal::of(vec![prepared(&shared, user("hi"))]),
             crate::AckMode::Pipelined,
+            crate::SampleStage::AtBoundary,
         )
         .await;
         let crate::ProposeReply::Ticket(ticket) = reply else {
@@ -2135,6 +2191,7 @@ mod tests {
                 &mut pipeline,
                 crate::EntryProposal::of(vec![prepared(&shared, user(text))]),
                 crate::AckMode::Pipelined,
+                crate::SampleStage::AtBoundary,
             )
             .await;
             let crate::ProposeReply::Ticket(ticket) = reply else {
@@ -2176,6 +2233,7 @@ mod tests {
             &mut pipeline,
             crate::EntryProposal::of(vec![prepared(&shared, user("doomed"))]),
             crate::AckMode::Pipelined,
+            crate::SampleStage::AtBoundary,
         )
         .await;
         let crate::ProposeReply::Ticket(ticket) = reply else {
@@ -2213,6 +2271,7 @@ mod tests {
             &mut pipeline,
             crate::EntryProposal::of(vec![prepared(&shared, user("sync"))]),
             crate::AckMode::Sync,
+            crate::SampleStage::AtBoundary,
         )
         .await;
         // …and an actor-originated inline append.
@@ -2236,6 +2295,7 @@ mod tests {
             &mut pipeline,
             crate::EntryProposal::of(vec![prepared(&shared, user("pipelined"))]),
             crate::AckMode::Pipelined,
+            crate::SampleStage::AtBoundary,
         )
         .await;
         let crate::ProposeReply::Ticket(ticket) = reply else {
@@ -2269,6 +2329,7 @@ mod tests {
                 &mut pipeline,
                 crate::EntryProposal::of(vec![prepared(&shared, user(text))]),
                 crate::AckMode::Pipelined,
+                crate::SampleStage::AtBoundary,
             )
             .await;
             let crate::ProposeReply::Ticket(ticket) = reply else {
@@ -2319,6 +2380,62 @@ mod tests {
         );
     }
 
+    // --- Task 10 (S2c held-steer boundary proof) ---------------------
+
+    /// The mid-sample half of the held-steer rule, as a *checked* argument.
+    ///
+    /// `release_steers` rests on the fact that a turn commits nothing
+    /// between granting itself a snapshot and the `Completed` group that
+    /// closes the sample — so every ack the actor settles is genuinely
+    /// between samples. No shipped site can violate that, which is exactly
+    /// why it needs an assertion rather than a comment: the spec's own
+    /// intra-sample `BlockEnd` pipelining (§Commit granularity) would create
+    /// the first violator, and a steer released behind one lands ahead of
+    /// the assistant item the model is still producing — 72a6f1b, silently
+    /// back.
+    ///
+    /// This drives the guard with the declaration such a site would have to
+    /// make.
+    #[tokio::test]
+    #[should_panic(expected = "a held steer may only land between samples")]
+    async fn an_in_sample_commit_is_not_a_boundary_a_held_steer_may_land_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, mut log, mut head) = test_shared(dir.path());
+        let mut held = vec!["hold me".to_string()];
+        release_steers(
+            &shared,
+            &mut log,
+            &mut head,
+            &mut Pipeline::default(),
+            &mut held,
+            super::Boundary::CommitSettled {
+                stage: crate::SampleStage::InSample,
+            },
+        )
+        .await;
+    }
+
+    /// …and the boundary every shipped site actually declares does release.
+    #[tokio::test]
+    async fn a_commit_that_closed_its_sample_releases_the_steer_it_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let (shared, mut log, mut head) = test_shared(dir.path());
+        let mut held = vec!["hold me".to_string()];
+        release_steers(
+            &shared,
+            &mut log,
+            &mut head,
+            &mut Pipeline::default(),
+            &mut held,
+            super::Boundary::CommitSettled {
+                stage: crate::SampleStage::AtBoundary,
+            },
+        )
+        .await;
+        assert!(held.is_empty(), "the steer must have landed");
+        assert_eq!(head.items().len(), 1, "…and reached the projection");
+    }
+
     #[tokio::test]
     async fn commit_prepared_commits_a_fresh_entry_and_updates_the_projection() {
         let dir = tempfile::tempdir().unwrap();
@@ -2337,6 +2454,7 @@ mod tests {
             &mut Pipeline::default(),
             crate::EntryProposal::of(entries),
             crate::AckMode::Sync,
+            crate::SampleStage::AtBoundary,
         )
         .await;
         assert!(matches!(result, crate::ProposeReply::Committed));

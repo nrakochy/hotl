@@ -103,6 +103,7 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     cmd_tx
         .send(SessionCmd::ProposePrepared {
             proposal: hotl_engine::EntryProposal::Single(stale_entry),
+            stage: hotl_engine::SampleStage::AtBoundary,
             mode: hotl_engine::AckMode::Sync,
             reply: tx,
         })
@@ -137,6 +138,7 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     cmd_tx
         .send(SessionCmd::ProposePrepared {
             proposal: hotl_engine::EntryProposal::Single(fresh_entry),
+            stage: hotl_engine::SampleStage::AtBoundary,
             mode: hotl_engine::AckMode::Sync,
             reply: tx,
         })

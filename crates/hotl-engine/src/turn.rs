@@ -536,7 +536,6 @@ struct Speculation {
     /// "Knowing the id early buys the speculative build, never the
     /// adoption").
     expected_leaf: String,
-    request: SamplingRequest,
     stream: SyncStream,
     /// Events pulled while the boundary group was still committing — the
     /// overlap this whole mechanism exists for.
@@ -593,17 +592,10 @@ impl Speculation {
 
     /// Adopt: the buffered prefix, then the rest of the same stream. The
     /// consumer drives this to end-of-stream exactly as it would a fresh
-    /// one.
-    fn adopt(
-        self,
-    ) -> (
-        SamplingRequest,
-        BoxStream<'static, Result<StreamEvent, ProviderError>>,
-    ) {
-        (
-            self.request,
-            Box::pin(futures_util::stream::iter(self.buffered).chain(self.stream.into_inner())),
-        )
+    /// one. The request itself is not carried out — it was handed to the
+    /// provider at dispatch and nothing downstream reads it again.
+    fn adopt(self) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        Box::pin(futures_util::stream::iter(self.buffered).chain(self.stream.into_inner()))
     }
 }
 
@@ -901,12 +893,15 @@ impl Turn {
             }
             body.push_str(&reason);
         }
-        self.propose_pipelined(vec![EntryPayload::Item {
-            item: Item::User {
-                text: format!("<system-reminder>{body}</system-reminder>"),
-                synthetic: Some(SyntheticReason::SystemReminder),
-            },
-        }])
+        self.propose_pipelined(
+            vec![EntryPayload::Item {
+                item: Item::User {
+                    text: format!("<system-reminder>{body}</system-reminder>"),
+                    synthetic: Some(SyntheticReason::SystemReminder),
+                },
+            }],
+            crate::SampleStage::AtBoundary,
+        )
         .await
     }
 
@@ -942,7 +937,7 @@ impl Turn {
             .take()
             .filter(|spec| head.leaf() == Some(spec.expected_leaf.as_str()))
             .map(Speculation::adopt);
-        let (request, stream) = match adopted {
+        let stream = match adopted {
             Some(adopted) => {
                 // The adopted request was built (and its threshold checked)
                 // at the last boundary, so `build_request` never runs for
@@ -956,14 +951,12 @@ impl Turn {
                     Ok(request) => request,
                     Err(end) => return end,
                 };
-                let stream = self.shared.provider.stream(request.clone());
-                (request, stream)
+                self.shared.provider.stream(request)
             }
         };
         self.ledger.stamp(Phase::RequestBuilt);
         self.last_snapshot = Some(snapshot.clone());
         self.projected_tail.clear();
-        let _ = request;
 
         let (stop, usage, blocks) = match self.collect_stream(stream).await {
             Ok(completed) => completed,
@@ -997,10 +990,15 @@ impl Turn {
         // follows waits on this commit at barrier (a) instead of the turn
         // blocking on its fsync here.
         let commit = self
-            .propose_pipelined(vec![
-                EntryPayload::Item { item: assistant },
-                EntryPayload::Usage { usage },
-            ])
+            .propose_pipelined(
+                vec![
+                    EntryPayload::Item { item: assistant },
+                    EntryPayload::Usage { usage },
+                ],
+                // This commit IS what closes the sample: the stream is
+                // drained and the blocks are final.
+                crate::SampleStage::AtBoundary,
+            )
             .await;
         self.ledger.stamp(Phase::WatermarkDurable);
         if !commit.ok() {
@@ -1190,7 +1188,9 @@ impl Turn {
         // earlier stamp rather than lose to first-stamp-wins (§S1 fix — see
         // `batch_proposed_and_watermark_durable_track_each_samples_own_final_commit`).
         self.ledger.restamp(Phase::BatchProposed);
-        let commit = self.propose_pipelined(entries).await;
+        let commit = self
+            .propose_pipelined(entries, crate::SampleStage::AtBoundary)
+            .await;
         self.ledger.restamp(Phase::WatermarkDurable);
         if !commit.ok() {
             return Some(commit.outcome());
@@ -1484,9 +1484,12 @@ impl Turn {
         // overwrite `sample()`'s earlier stamp via `restamp`.
         self.ledger.restamp(Phase::BatchProposed);
         let commit = self
-            .propose_pipelined(vec![EntryPayload::Item {
-                item: Item::ToolResults { results },
-            }])
+            .propose_pipelined(
+                vec![EntryPayload::Item {
+                    item: Item::ToolResults { results },
+                }],
+                crate::SampleStage::AtBoundary,
+            )
             .await;
         self.ledger.restamp(Phase::WatermarkDurable);
         commit
@@ -1787,7 +1790,13 @@ impl Turn {
     /// there is no `expected_leaf` to adopt against — which is also what
     /// keeps the `Sync` comparison run speculation-free).
     fn speculate(&mut self) {
-        if self.cancel.is_cancelled() || self.speculative.is_some() {
+        // A turn that has spent its step budget ends at the top of the next
+        // `drive` iteration without sampling, so a dispatch here would be a
+        // billed call for a sample that never happens. Mirrors `drive`'s own
+        // loop condition, negative = unlimited included.
+        let bound = self.shared.config.max_turns;
+        let will_sample_again = bound < 0 || self.spent < bound;
+        if self.cancel.is_cancelled() || self.speculative.is_some() || !will_sample_again {
             return;
         }
         let Some(expected_leaf) = self.pipeline.leaf().map(str::to_string) else {
@@ -1799,10 +1808,9 @@ impl Turn {
         let Some(request) = self.speculative_request(&predicted) else {
             return;
         };
-        let stream = self.shared.provider.stream(request.clone());
+        let stream = self.shared.provider.stream(request);
         self.speculative = Some(Speculation {
             expected_leaf,
-            request,
             stream: SyncStream::new(stream),
             buffered: Vec::new(),
             terminal: false,
@@ -1832,9 +1840,9 @@ impl Turn {
     /// single-serialization-site enforcement point (task 8 requirement 4):
     /// this is the ONLY place a `Turn` reaches the log, and it can only
     /// reach it with `PreparedPayload`, never a raw `EntryPayload`.
-    async fn propose(&self, entries: Vec<EntryPayload>) -> Commit {
+    async fn propose(&self, entries: Vec<EntryPayload>, stage: crate::SampleStage) -> Commit {
         let epoch = self.shared.rules_epoch();
-        let commit = self.propose_at_epoch(&entries, epoch).await;
+        let commit = self.propose_at_epoch(&entries, epoch, stage).await;
         if commit != Commit::StaleEpoch {
             return commit;
         }
@@ -1845,11 +1853,16 @@ impl Turn {
         // re-proposes ... rare, correct"). `entries` was only ever borrowed
         // by `propose_at_epoch`, so this costs nothing on the common path.
         let epoch = self.shared.rules_epoch();
-        self.propose_at_epoch(&entries, epoch).await
+        self.propose_at_epoch(&entries, epoch, stage).await
     }
 
-    async fn propose_at_epoch(&self, entries: &[EntryPayload], epoch: u32) -> Commit {
-        match self.send(entries, epoch, crate::AckMode::Sync).await {
+    async fn propose_at_epoch(
+        &self,
+        entries: &[EntryPayload],
+        epoch: u32,
+        stage: crate::SampleStage,
+    ) -> Commit {
+        match self.send(entries, epoch, crate::AckMode::Sync, stage).await {
             Ok(reply) => Commit::from_reply(Some(reply)),
             Err(commit) => commit,
         }
@@ -1862,27 +1875,43 @@ impl Turn {
     /// commits later.
     ///
     /// Only proposals the protocol lets run ahead reach here: the
-    /// tool-results batch entry (plus any subdir-instruction entries riding
-    /// with it) and the Done-branch gate nudge. The `Completed`-boundary
-    /// assistant+usage pair and the ask journal stay `Sync` — the first
-    /// because `sampling` may only drop once the item is really projected,
-    /// the second because §2b requires the ask to be durable *before* it
-    /// surfaces.
-    async fn propose_pipelined(&mut self, entries: Vec<EntryPayload>) -> Commit {
+    /// `Completed`-boundary assistant+usage `Group` (S2c), the tool-results
+    /// batch entry (plus any subdir-instruction entries riding with it) and
+    /// the Done-branch gate nudge. The ask journal stays `Sync`, because §2b
+    /// requires the ask to be durable *before* it surfaces.
+    ///
+    /// `stage` is the proposer's declaration that its sample had closed —
+    /// what the actor's held-steer release checks (see
+    /// [`crate::SampleStage`]). Every site here passes `AtBoundary` today;
+    /// a future intra-sample commit must pass `InSample` and will then trip
+    /// that assertion rather than silently invert a held steer.
+    async fn propose_pipelined(
+        &mut self,
+        entries: Vec<EntryPayload>,
+        stage: crate::SampleStage,
+    ) -> Commit {
         if self.shared.config.ack_mode == crate::AckMode::Sync {
-            return self.propose(entries).await;
+            return self.propose(entries, stage).await;
         }
         let epoch = self.shared.rules_epoch();
-        let commit = self.submit_pipelined(&entries, epoch).await;
+        let commit = self.submit_pipelined(&entries, epoch, stage).await;
         if commit != Commit::StaleEpoch {
             return commit;
         }
         let epoch = self.shared.rules_epoch();
-        self.submit_pipelined(&entries, epoch).await
+        self.submit_pipelined(&entries, epoch, stage).await
     }
 
-    async fn submit_pipelined(&mut self, entries: &[EntryPayload], epoch: u32) -> Commit {
-        match self.send(entries, epoch, crate::AckMode::Pipelined).await {
+    async fn submit_pipelined(
+        &mut self,
+        entries: &[EntryPayload],
+        epoch: u32,
+        stage: crate::SampleStage,
+    ) -> Commit {
+        match self
+            .send(entries, epoch, crate::AckMode::Pipelined, stage)
+            .await
+        {
             Ok(crate::ProposeReply::Ticket(ticket)) => self.pipeline.submit(ticket).await,
             Ok(other) => Commit::from_reply(Some(other)),
             Err(commit) => commit,
@@ -1896,6 +1925,7 @@ impl Turn {
         entries: &[EntryPayload],
         epoch: u32,
         mode: crate::AckMode,
+        stage: crate::SampleStage,
     ) -> Result<crate::ProposeReply, Commit> {
         let masker = self.shared.masker();
         let mut prepared = Vec::with_capacity(entries.len());
@@ -1923,6 +1953,7 @@ impl Turn {
             .cmd_tx
             .send(SessionCmd::ProposePrepared {
                 proposal: crate::EntryProposal::of(prepared),
+                stage,
                 mode,
                 reply: tx,
             })
@@ -1945,11 +1976,16 @@ impl Turn {
         // degrades the audit record, never the human moment. Enforced by
         // construction (both results are deliberately discarded).
         let _ = self
-            .propose(vec![EntryPayload::PendingAsk {
-                id: id.clone(),
-                summary: summary.clone(),
-                protected_why: why.clone(),
-            }])
+            .propose(
+                vec![EntryPayload::PendingAsk {
+                    id: id.clone(),
+                    summary: summary.clone(),
+                    protected_why: why.clone(),
+                }],
+                // An ask only ever fires from inside a tool phase, i.e.
+                // after the sample that requested the call has closed.
+                crate::SampleStage::AtBoundary,
+            )
             .await;
         // Notification (tier-1 gap #7, the `hotl watch`/desktop seam): the
         // agent is blocked on a human, right before the ask actually
@@ -1995,7 +2031,10 @@ impl Turn {
             AskReply::Allow | AskReply::AllowEdited { .. } | AskReply::Respond { .. }
         );
         let _ = self
-            .propose(vec![EntryPayload::AskResolved { id, allowed }])
+            .propose(
+                vec![EntryPayload::AskResolved { id, allowed }],
+                crate::SampleStage::AtBoundary,
+            )
             .await;
         reply
     }
