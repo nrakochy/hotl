@@ -132,6 +132,13 @@ pub struct ServerInfo {
     pub default_mode: String,
     /// Model context window in tokens — what a UI's fullness gauge divides by.
     pub context_window: u64,
+    /// The session's primary model — prices `turn_done`'s `usage.cost_usd`
+    /// (Task 5 cost telemetry). One process serves one model for its whole
+    /// lifetime (process-per-session), so this is fixed for every
+    /// `session/new` and `session/load` this connection sees; a fallback
+    /// model used mid-turn is still priced as this one (see
+    /// `wire::usage_frame`).
+    pub model: String,
 }
 
 /// Drive the protocol over one connection until the client hangs up.
@@ -299,6 +306,7 @@ async fn handle_request(
                         pending_questions.clone(),
                         pending_prompt.clone(),
                         next_id,
+                        info.model.clone(),
                     );
                     // Resume auto-continuation (M4/#8): a loaded projection
                     // that ends mid-turn (user prompt or unanswered tool
@@ -419,6 +427,7 @@ fn start_session(
     pending_questions: PendingQuestions,
     pending_prompt: PendingPrompt,
     next_id: &mut u64,
+    model: String,
 ) -> SessionState {
     let id = format!("acp-{}", *next_id);
     // Permission/question request ids for this session are disjoint from
@@ -435,6 +444,7 @@ fn start_session(
         pending_prompt,
         sid,
         req_id_seed,
+        model,
     ));
     SessionState { id, handle, drain }
 }
@@ -443,6 +453,7 @@ fn start_session(
 /// into `session/request_permission` requests, questions into
 /// `session/request_question` requests, and answer the pending prompt on
 /// TurnDone.
+#[allow(clippy::too_many_arguments)]
 async fn drain_events(
     mut events: mpsc::Receiver<EngineEvent>,
     writer: Writer,
@@ -451,6 +462,7 @@ async fn drain_events(
     pending_prompt: PendingPrompt,
     session_id: String,
     mut req_id: u64,
+    model: String,
 ) {
     while let Some(event) = events.recv().await {
         match event {
@@ -537,7 +549,7 @@ async fn drain_events(
                         json!({
                             "schemaVersion": UPDATE_SCHEMA_VERSION,
                             "outcome": outcome_tag(&outcome),
-                            "usage": crate::wire::usage_frame(&usage),
+                            "usage": crate::wire::usage_frame(&model, &usage),
                         }),
                     )
                     .await;

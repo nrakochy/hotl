@@ -16,6 +16,7 @@
 //! `tests/json_stream_schema.rs::every_frame_is_tagged_and_versioned`.
 
 use hotl_engine::{EngineEvent, Outcome};
+use hotl_provider::catalog;
 use hotl_types::TokenUsage;
 use serde_json::{json, Value};
 
@@ -89,15 +90,25 @@ pub fn outcome_frame(outcome: &Outcome) -> Value {
     }
 }
 
-/// A turn's usage as JSON, `hit_ratio` added on top when there was cache
-/// activity to report (§S1 cache telemetry). Single derivation site so
-/// headless `--json` and the ACP wire (`acp.rs`'s `TurnDone` handling) can't
-/// drift on the formula. Omitted, not `null`, when absent — a plain,
-/// uncached turn's usage bytes are unchanged from before this field existed.
-pub fn usage_frame(usage: &TokenUsage) -> Value {
+/// A turn's usage as JSON, `hit_ratio` and `cost_usd` added on top when there
+/// is something to report (§S1 cache telemetry; Task 5 cost telemetry).
+/// Single derivation site so headless `--json` and the ACP wire (`acp.rs`'s
+/// `TurnDone` handling) can't drift on either formula. Both are omitted, not
+/// `null`, when absent — a plain, uncached turn's usage bytes on an
+/// uncatalogued model are unchanged from before these fields existed.
+///
+/// `model` prices the whole turn at the session's PRIMARY model. A turn can
+/// aggregate samples served by a fallback model mid-turn (`FallbackModel`
+/// events) at a different rate — this is accepted imprecision, not a bug:
+/// the alternative (pricing per-sample) would need usage attribution this
+/// wire shape doesn't carry.
+pub fn usage_frame(model: &str, usage: &TokenUsage) -> Value {
     let mut v = json!(usage);
     if let Some(ratio) = usage.hit_ratio() {
         v["hit_ratio"] = json!(ratio);
+    }
+    if let Some(cost) = catalog::cost_usd(model, usage) {
+        v["cost_usd"] = json!(cost);
     }
     v
 }
@@ -109,14 +120,17 @@ pub fn usage_frame(usage: &TokenUsage) -> Value {
 /// that need side effects (`Ask` and `Question` must resolve their reply
 /// channels). Those side effects stay in `agent.rs::render_json`; only the
 /// shape lives here, which is what makes the whole stream pin-testable.
-pub fn json_frame(event: &EngineEvent) -> Value {
+///
+/// `model` is the session's primary model, needed only for the `TurnDone`
+/// arm's `cost_usd` — see `usage_frame`.
+pub fn json_frame(event: &EngineEvent, model: &str) -> Value {
     let mut v = match update_frame(event) {
         Some(v) => v,
         None => match event {
             EngineEvent::TurnDone { outcome, usage } => json!({
                 "type": "turn_done",
                 "outcome": outcome_frame(outcome),
-                "usage": usage_frame(usage),
+                "usage": usage_frame(model, usage),
             }),
             EngineEvent::Ask { summary, .. } => {
                 json!({"type": "ask_denied", "summary": summary})

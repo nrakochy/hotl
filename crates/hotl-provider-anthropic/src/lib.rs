@@ -587,6 +587,11 @@ pub fn stop_reason_from_wire(s: &str) -> StopReason {
 }
 
 /// Merge usage fields that may arrive on message_start and message_delta.
+///
+/// The per-TTL creation breakdown (`cache_creation.ephemeral_5m_input_tokens`
+/// / `.ephemeral_1h_input_tokens`) is a nested object the wire may or may not
+/// send alongside the flat `cache_creation_input_tokens` total — absent means
+/// the buckets stay at their default (0), never a guessed split.
 pub(crate) fn merge_usage(into: &mut TokenUsage, v: &Value) {
     if let Some(n) = v.get("input_tokens").and_then(Value::as_u64) {
         into.input_tokens = n;
@@ -599,6 +604,18 @@ pub(crate) fn merge_usage(into: &mut TokenUsage, v: &Value) {
     }
     if let Some(n) = v.get("cache_creation_input_tokens").and_then(Value::as_u64) {
         into.cache_creation_input_tokens = n;
+    }
+    if let Some(n) = v
+        .pointer("/cache_creation/ephemeral_5m_input_tokens")
+        .and_then(Value::as_u64)
+    {
+        into.cache_creation_5m_input_tokens = n;
+    }
+    if let Some(n) = v
+        .pointer("/cache_creation/ephemeral_1h_input_tokens")
+        .and_then(Value::as_u64)
+    {
+        into.cache_creation_1h_input_tokens = n;
     }
 }
 

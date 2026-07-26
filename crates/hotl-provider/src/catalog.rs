@@ -56,9 +56,13 @@ pub struct ModelInfo {
     pub cache_read_usd_per_mtok: f64,
     /// Cache writes at the default 5-minute TTL: ~1.25x input.
     pub cache_write_usd_per_mtok: f64,
+    /// Cache writes marked for the 1-hour TTL: 2x input (vs. 1.25x for the
+    /// 5-minute default) — the premium for the longer hold.
+    pub cache_write_1h_usd_per_mtok: f64,
     /// Shortest prefix the provider will actually cache. Marking a prefix
-    /// shorter than this is a no-op that still pays the write premium — the
-    /// request succeeds and `cache_creation_input_tokens` comes back `0`.
+    /// shorter than this is a no-op: the request succeeds, but the provider
+    /// does not create a cache entry, so `cache_creation_input_tokens` comes
+    /// back `0` and nothing is billed for the write.
     /// Not monotonic across generations, which is why it is data.
     pub min_cacheable_prefix: u64,
     /// ASCII characters per token, for the heuristic estimator
@@ -91,6 +95,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 50.00,
         cache_read_usd_per_mtok: 1.00,
         cache_write_usd_per_mtok: 12.50,
+        cache_write_1h_usd_per_mtok: 20.00,
         min_cacheable_prefix: 512,
         ascii_chars_per_token: 3.0,
         caps: FULL,
@@ -103,6 +108,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 25.00,
         cache_read_usd_per_mtok: 0.50,
         cache_write_usd_per_mtok: 6.25,
+        cache_write_1h_usd_per_mtok: 10.00,
         min_cacheable_prefix: 512,
         ascii_chars_per_token: 3.0,
         caps: FULL,
@@ -115,6 +121,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 25.00,
         cache_read_usd_per_mtok: 0.50,
         cache_write_usd_per_mtok: 6.25,
+        cache_write_1h_usd_per_mtok: 10.00,
         min_cacheable_prefix: 1024,
         ascii_chars_per_token: 3.0,
         caps: FULL,
@@ -127,6 +134,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 25.00,
         cache_read_usd_per_mtok: 0.50,
         cache_write_usd_per_mtok: 6.25,
+        cache_write_1h_usd_per_mtok: 10.00,
         min_cacheable_prefix: 2048,
         ascii_chars_per_token: 3.0,
         caps: FULL,
@@ -139,6 +147,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 25.00,
         cache_read_usd_per_mtok: 0.50,
         cache_write_usd_per_mtok: 6.25,
+        cache_write_1h_usd_per_mtok: 10.00,
         min_cacheable_prefix: 4096,
         ascii_chars_per_token: 3.5,
         caps: FULL,
@@ -151,6 +160,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 15.00,
         cache_read_usd_per_mtok: 0.30,
         cache_write_usd_per_mtok: 3.75,
+        cache_write_1h_usd_per_mtok: 6.00,
         min_cacheable_prefix: 1024,
         ascii_chars_per_token: 3.0,
         caps: FULL,
@@ -163,6 +173,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 15.00,
         cache_read_usd_per_mtok: 0.30,
         cache_write_usd_per_mtok: 3.75,
+        cache_write_1h_usd_per_mtok: 6.00,
         min_cacheable_prefix: 1024,
         ascii_chars_per_token: 3.5,
         caps: FULL,
@@ -175,6 +186,7 @@ pub const CATALOG: &[ModelInfo] = &[
         output_usd_per_mtok: 5.00,
         cache_read_usd_per_mtok: 0.10,
         cache_write_usd_per_mtok: 1.25,
+        cache_write_1h_usd_per_mtok: 2.00,
         min_cacheable_prefix: 4096,
         ascii_chars_per_token: 3.5,
         caps: NO_EFFORT,
@@ -232,19 +244,42 @@ pub fn max_output_tokens(model: &str) -> Option<u32> {
 /// are reported separately and are not included in it — so this sum is the
 /// whole request, not a partial one.
 ///
+/// Cache-write pricing depends on which TTL a write actually landed under:
+/// the wire may report a per-TTL breakdown
+/// (`cache_creation_5m_input_tokens` / `cache_creation_1h_input_tokens`), in
+/// which case each bucket is priced at its own rate (2x input for 1h, 1.25x
+/// for 5m). When the provider's response carries no such breakdown (both
+/// buckets zero) but `cache_creation_input_tokens` is nonzero, the whole
+/// total is priced at the 5m rate — a documented underestimate for any of
+/// that traffic actually written at the 1h TTL, chosen because it is the
+/// cheaper of the two rather than fabricating a split hotl was never told.
+///
 /// INVARIANT: caching a prefix is never more expensive than not caching the
 /// same traffic. Enforced by `cost_prices_each_usage_bucket_at_its_own_rate`.
 pub fn cost_usd(model: &str, usage: &TokenUsage) -> Option<f64> {
     let m = lookup(model)?;
     let per = |tokens: u64, rate: f64| (tokens as f64 / 1_000_000.0) * rate;
+    let no_breakdown =
+        usage.cache_creation_5m_input_tokens == 0 && usage.cache_creation_1h_input_tokens == 0;
+    let creation_cost = if no_breakdown {
+        per(
+            usage.cache_creation_input_tokens,
+            m.cache_write_usd_per_mtok,
+        )
+    } else {
+        per(
+            usage.cache_creation_5m_input_tokens,
+            m.cache_write_usd_per_mtok,
+        ) + per(
+            usage.cache_creation_1h_input_tokens,
+            m.cache_write_1h_usd_per_mtok,
+        )
+    };
     Some(
         per(usage.input_tokens, m.input_usd_per_mtok)
             + per(usage.output_tokens, m.output_usd_per_mtok)
             + per(usage.cache_read_input_tokens, m.cache_read_usd_per_mtok)
-            + per(
-                usage.cache_creation_input_tokens,
-                m.cache_write_usd_per_mtok,
-            ),
+            + creation_cost,
     )
 }
 
@@ -349,8 +384,10 @@ mod tests {
             output_tokens: 1_000_000,
             cache_read_input_tokens: 1_000_000,
             cache_creation_input_tokens: 1_000_000,
+            ..Default::default()
         };
-        // Opus 4.8: 5.00 + 25.00 + 0.50 + 6.25
+        // Opus 4.8: 5.00 + 25.00 + 0.50 + 6.25 (no per-TTL breakdown ⇒ the
+        // 1,000,000 creation tokens fall back to the 5m rate).
         let cost = cost_usd("claude-opus-4-8", &usage).unwrap();
         assert!((cost - 36.75).abs() < 1e-9, "was {cost}");
 
@@ -372,6 +409,34 @@ mod tests {
             cost_usd("claude-opus-4-8", &cached).unwrap()
                 < cost_usd("claude-opus-4-8", &uncached).unwrap()
         );
+    }
+
+    #[test]
+    fn cost_prices_the_1h_bucket_at_double_the_5m_bucket() {
+        // A per-TTL breakdown present: each bucket prices at its own rate,
+        // not the blended/fallback rate.
+        let usage = TokenUsage {
+            cache_creation_5m_input_tokens: 1_000_000,
+            cache_creation_1h_input_tokens: 1_000_000,
+            cache_creation_input_tokens: 2_000_000,
+            ..Default::default()
+        };
+        // Opus 4.8: 5m bucket at 6.25 + 1h bucket at 10.00 (2x input).
+        let cost = cost_usd("claude-opus-4-8", &usage).unwrap();
+        assert!((cost - 16.25).abs() < 1e-9, "was {cost}");
+    }
+
+    #[test]
+    fn cost_falls_back_to_the_5m_rate_when_the_ttl_breakdown_is_absent() {
+        // Total creation is nonzero but neither TTL bucket is populated (an
+        // older/partial provider response) — price everything at the cheaper
+        // 5m rate rather than guessing a split.
+        let usage = TokenUsage {
+            cache_creation_input_tokens: 1_000_000,
+            ..Default::default()
+        };
+        let cost = cost_usd("claude-opus-4-8", &usage).unwrap();
+        assert!((cost - 6.25).abs() < 1e-9, "was {cost}");
     }
 
     #[test]
@@ -415,6 +480,16 @@ mod tests {
             assert!(
                 m.cache_write_usd_per_mtok > m.input_usd_per_mtok,
                 "{}: cache write",
+                m.id
+            );
+            assert!(
+                (m.cache_write_1h_usd_per_mtok - m.input_usd_per_mtok * 2.0).abs() < 1e-9,
+                "{}: 1h cache write must be exactly 2x input",
+                m.id
+            );
+            assert!(
+                m.cache_write_1h_usd_per_mtok > m.cache_write_usd_per_mtok,
+                "{}: 1h write must cost more than the 5m default",
                 m.id
             );
             assert!(m.min_cacheable_prefix >= 512, "{}: cache prefix", m.id);

@@ -34,6 +34,10 @@ struct Shared {
     pending: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<hotl_engine::AskReply>, Value)>>,
     next_ask: AtomicU64,
     session_id: String,
+    /// The session's primary model — prices `turn_done.usage.cost_usd`
+    /// (Task 5). See `wire::usage_frame` for the fallback-model imprecision
+    /// this accepts.
+    model: String,
 }
 
 /// Directory holding one `<id>.sock` per live backgrounded session.
@@ -61,8 +65,14 @@ pub fn list_live() -> Vec<String> {
 }
 
 /// Run a detached session bound to `run_dir/<session_id>.sock`. `handle` is a
-/// freshly spawned engine session; `prompt` is an optional opening prompt.
-pub async fn serve(session_id: String, handle: SessionHandle, prompt: Option<String>) -> i32 {
+/// freshly spawned engine session; `prompt` is an optional opening prompt;
+/// `model` is the session's primary model (Task 5 cost telemetry).
+pub async fn serve(
+    session_id: String,
+    model: String,
+    handle: SessionHandle,
+    prompt: Option<String>,
+) -> i32 {
     let dir = run_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("hotl serve: cannot create {}: {e}", dir.display());
@@ -94,7 +104,7 @@ pub async fn serve(session_id: String, handle: SessionHandle, prompt: Option<Str
         }
     };
     let _guard = SockGuard::new(sock);
-    serve_on(listener, session_id, handle, prompt).await;
+    serve_on(listener, session_id, model, handle, prompt).await;
     0
 }
 
@@ -104,6 +114,7 @@ pub async fn serve(session_id: String, handle: SessionHandle, prompt: Option<Str
 pub async fn serve_on(
     listener: UnixListener,
     session_id: String,
+    model: String,
     mut handle: SessionHandle,
     prompt: Option<String>,
 ) {
@@ -114,6 +125,7 @@ pub async fn serve_on(
         pending: Mutex::new(HashMap::new()),
         next_ask: AtomicU64::new(1),
         session_id,
+        model,
     });
     tokio::spawn(drain_events(events, shared.clone()));
     if let Some(p) = prompt {
@@ -305,7 +317,7 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                         "t": "turn_done",
                         "schemaVersion": UPDATE_SCHEMA_VERSION,
                         "outcome": outcome_tag(&outcome),
-                        "usage": crate::wire::usage_frame(&usage),
+                        "usage": crate::wire::usage_frame(&shared.model, &usage),
                     }),
                 )
                 .await;
@@ -409,7 +421,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("s.sock");
         let listener = UnixListener::bind(&sock).unwrap();
-        tokio::spawn(serve_on(listener, "test".into(), scripted_session(), None));
+        tokio::spawn(serve_on(
+            listener,
+            "test".into(),
+            "m".into(),
+            scripted_session(),
+            None,
+        ));
 
         // Attach, prompt; the scripted bash call is gated → an `ask` frame.
         let (r, mut w) = UnixStream::connect(&sock).await.unwrap().into_split();

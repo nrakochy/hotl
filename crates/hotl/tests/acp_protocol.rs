@@ -35,6 +35,10 @@ fn server_info() -> acp::ServerInfo {
         skills: Vec::new(),
         default_mode: "ask".into(),
         context_window: 200_000,
+        // Uncatalogued deliberately: matches `scripted_factory`'s session log
+        // model ("m"), and keeps `cost_usd` absent for scenarios that don't
+        // test pricing.
+        model: "m".into(),
     }
 }
 
@@ -662,6 +666,7 @@ async fn the_session_reports_its_effective_mode() {
             skills: Vec::new(),
             default_mode: "auto".into(),
             context_window: 1_000_000,
+            model: "m".into(),
         },
     ));
     let (cread, mut cwrite) = tokio::io::split(client);

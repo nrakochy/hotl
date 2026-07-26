@@ -199,6 +199,7 @@ pub(crate) async fn acp_factory(
         skills,
         default_mode: scaffold.rules.mode().as_str().to_string(),
         context_window: scaffold.config.context_window,
+        model: model.clone(),
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide
@@ -377,7 +378,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
             deps
         },
     );
-    crate::session_server::serve(id, handle, prompt).await
+    crate::session_server::serve(id, scaffold.model.clone(), handle, prompt).await
 }
 
 /// The deps every session shares (provider, registry-with-spawn, rules, hooks,
@@ -647,7 +648,12 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
         },
     );
 
-    let mut surface = Surface::new(handle, json_events, scaffold.config.max_turns);
+    let mut surface = Surface::new(
+        handle,
+        json_events,
+        scaffold.config.max_turns,
+        scaffold.model.clone(),
+    );
     surface
         .handle
         .prompt(crate::setup::expand_file_refs(&prompt))
@@ -1338,19 +1344,24 @@ struct Surface {
     /// Carried only to name the budget in the `TurnLimit` notice — the stop is
     /// otherwise unexplained, and the knob that fixes it isn't guessable.
     max_turns: i64,
+    /// The session's primary model — prices `turn_done.usage.cost_usd` in the
+    /// `--json` stream (Task 5). A fallback model used mid-turn is priced as
+    /// this one anyway; see `wire::usage_frame`.
+    model: String,
     /// One SIGINT stream for the surface's lifetime — registered once, not
     /// per select iteration.
     sigint: tokio::signal::unix::Signal,
 }
 
 impl Surface {
-    fn new(handle: SessionHandle, json: bool, max_turns: i64) -> Self {
+    fn new(handle: SessionHandle, json: bool, max_turns: i64, model: String) -> Self {
         Self {
             handle,
             json,
             turn_running: false,
             saw_text: false,
             max_turns,
+            model,
             sigint: signal(SignalKind::interrupt()).expect("SIGINT handler"),
         }
     }
@@ -1515,7 +1526,7 @@ impl Surface {
             }
             other => other,
         };
-        println!("{}", crate::wire::json_frame(&event));
+        println!("{}", crate::wire::json_frame(&event, &self.model));
     }
 }
 
@@ -3167,7 +3178,12 @@ mod tests {
                     config,
                 },
             );
-            let mut surface = Surface::new(handle, true, EngineConfig::default().max_turns);
+            let mut surface = Surface::new(
+                handle,
+                true,
+                EngineConfig::default().max_turns,
+                EngineConfig::default().model,
+            );
             surface.handle.prompt("go".into()).await;
             let code = surface.run_until_idle().await;
             // The exact same "exit-time drain" `run_session` performs

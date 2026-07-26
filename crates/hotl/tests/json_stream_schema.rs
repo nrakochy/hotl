@@ -50,7 +50,7 @@ fn every_frame_is_tagged_and_versioned() {
         },
     ];
     for e in events {
-        let f = wire::json_frame(&e);
+        let f = wire::json_frame(&e, "test-model");
         assert!(f["type"].is_string(), "untagged frame: {f}");
         assert_eq!(f["schema_version"], json!(wire::JSON_STREAM_SCHEMA_VERSION));
         // No frame value may be a Rust Debug rendering.
@@ -61,12 +61,15 @@ fn every_frame_is_tagged_and_versioned() {
 
 #[test]
 fn turn_done_carries_a_structured_outcome() {
-    let f = wire::json_frame(&EngineEvent::TurnDone {
-        outcome: Outcome::DoomLoop {
-            pattern: "read ./x".into(),
+    let f = wire::json_frame(
+        &EngineEvent::TurnDone {
+            outcome: Outcome::DoomLoop {
+                pattern: "read ./x".into(),
+            },
+            usage: TokenUsage::default(),
         },
-        usage: TokenUsage::default(),
-    });
+        "test-model",
+    );
     assert_eq!(f["type"], "turn_done");
     assert_eq!(f["outcome"]["kind"], "doom_loop");
     assert_eq!(f["outcome"]["pattern"], "read ./x");
@@ -121,7 +124,10 @@ fn every_outcome_variant_is_tagged_and_carries_its_payload() {
 fn thinking_deltas_carry_their_text() {
     // T3-15: the payload had no `text` field, so a consumer could not render
     // reasoning it is being billed for.
-    let f = wire::json_frame(&EngineEvent::ThinkingDelta("reasoning".into()));
+    let f = wire::json_frame(
+        &EngineEvent::ThinkingDelta("reasoning".into()),
+        "test-model",
+    );
     assert_eq!(f["type"], "thinking_delta");
     assert_eq!(f["text"], "reasoning");
 }
@@ -133,11 +139,15 @@ fn turn_done_usage_carries_hit_ratio_when_cache_activity_is_present() {
         output_tokens: 5,
         cache_read_input_tokens: 50,
         cache_creation_input_tokens: 25,
+        ..Default::default()
     };
-    let f = wire::json_frame(&EngineEvent::TurnDone {
-        outcome: Outcome::Done { text: "ok".into() },
-        usage,
-    });
+    let f = wire::json_frame(
+        &EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "ok".into() },
+            usage,
+        },
+        "test-model",
+    );
     assert_eq!(f["usage"]["hit_ratio"], json!(0.5));
 }
 
@@ -146,13 +156,61 @@ fn turn_done_usage_omits_hit_ratio_without_cache_activity() {
     // Today's exact bytes for a plain, uncached scripted scenario: no
     // `hit_ratio` key at all, not `null` — the golden-transcript byte
     // stability rule extended to this new derived field.
-    let f = wire::json_frame(&EngineEvent::TurnDone {
-        outcome: Outcome::Done { text: "ok".into() },
-        usage: TokenUsage::default(),
-    });
+    let f = wire::json_frame(
+        &EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "ok".into() },
+            usage: TokenUsage::default(),
+        },
+        "test-model",
+    );
     assert!(
         f["usage"].get("hit_ratio").is_none(),
         "no cache activity must mean no hit_ratio key: {f}"
+    );
+}
+
+/// Task 5: `cost_usd` rides the same `usage` object once the frame's model is
+/// catalogued — it is `catalog::cost_usd` computed at the frame site, not a
+/// UI estimate.
+#[test]
+fn turn_done_usage_carries_cost_usd_for_a_catalogued_model() {
+    let usage = TokenUsage {
+        input_tokens: 1_000_000,
+        output_tokens: 1_000_000,
+        ..Default::default()
+    };
+    let f = wire::json_frame(
+        &EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "ok".into() },
+            usage,
+        },
+        "claude-opus-4-8",
+    );
+    // Opus 4.8: 5.00 input + 25.00 output per million tokens.
+    let cost = f["usage"]["cost_usd"]
+        .as_f64()
+        .expect("a catalogued model must carry cost_usd");
+    assert!((cost - 30.0).abs() < 1e-9, "was {cost}");
+}
+
+/// The acceptance instrument's other half: an uncatalogued model must never
+/// fabricate a price — the key is absent entirely, not `null` and not `0`.
+#[test]
+fn turn_done_usage_omits_cost_usd_for_an_uncatalogued_model() {
+    let usage = TokenUsage {
+        input_tokens: 10,
+        ..Default::default()
+    };
+    let f = wire::json_frame(
+        &EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "ok".into() },
+            usage,
+        },
+        "totally-unheard-of-model",
+    );
+    assert!(
+        f["usage"].get("cost_usd").is_none(),
+        "an uncatalogued model must omit cost_usd, not guess: {f}"
     );
 }
 
@@ -160,7 +218,7 @@ fn turn_done_usage_omits_hit_ratio_without_cache_activity() {
 fn the_schema_version_reflects_the_breaking_outcome_change() {
     // Read off a real frame rather than the constant: what a consumer pins to
     // is the stamped value, and this way the stamping itself is under test.
-    let stamped = wire::json_frame(&EngineEvent::PromptQueued)["schema_version"]
+    let stamped = wire::json_frame(&EngineEvent::PromptQueued, "test-model")["schema_version"]
         .as_u64()
         .expect("every frame carries a numeric schema_version");
     assert!(

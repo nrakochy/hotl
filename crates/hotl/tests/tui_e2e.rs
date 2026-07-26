@@ -149,6 +149,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             skills: Vec::new(),
             default_mode: "ask".into(),
             context_window: 200_000,
+            model: "m".into(),
         },
     ));
     let (cread, cwrite) = tokio::io::split(client_io);

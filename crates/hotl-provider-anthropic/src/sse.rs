@@ -409,4 +409,55 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, 150);
         assert_eq!(usage.output_tokens, 9);
     }
+
+    /// The wire's per-TTL creation breakdown (Task 5): when `cache_creation`
+    /// carries the ephemeral 5m/1h fields, both buckets land distinctly from
+    /// the flat `cache_creation_input_tokens` total.
+    #[test]
+    fn message_start_usage_carries_the_per_ttl_cache_creation_breakdown() {
+        let mut a = Assembler::default();
+        a.handle(
+            r#"{"type":"message_start","message":{"usage":{
+                "input_tokens":20,"cache_read_input_tokens":300,
+                "cache_creation_input_tokens":450,
+                "cache_creation":{
+                    "ephemeral_5m_input_tokens":150,
+                    "ephemeral_1h_input_tokens":300
+                }
+            }}}"#,
+        )
+        .unwrap();
+        a.handle(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#)
+            .unwrap();
+        a.handle(r#"{"type":"message_stop"}"#).unwrap();
+        let StreamEvent::Completed { usage, .. } = a.finish().expect("completed") else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(usage.cache_creation_input_tokens, 450);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 150);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 300);
+    }
+
+    /// The common case today: no `cache_creation` object at all. The buckets
+    /// must stay zero (never guessed) while the flat total is unaffected —
+    /// `catalog::cost_usd`'s fallback path depends on exactly this shape.
+    #[test]
+    fn message_start_usage_without_a_breakdown_leaves_ttl_buckets_zero() {
+        let mut a = Assembler::default();
+        a.handle(
+            r#"{"type":"message_start","message":{"usage":{
+                "input_tokens":20,"cache_creation_input_tokens":450
+            }}}"#,
+        )
+        .unwrap();
+        a.handle(r#"{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}"#)
+            .unwrap();
+        a.handle(r#"{"type":"message_stop"}"#).unwrap();
+        let StreamEvent::Completed { usage, .. } = a.finish().expect("completed") else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(usage.cache_creation_input_tokens, 450);
+        assert_eq!(usage.cache_creation_5m_input_tokens, 0);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 0);
+    }
 }

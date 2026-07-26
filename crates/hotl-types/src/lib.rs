@@ -139,6 +139,12 @@ pub enum StopReason {
     Other,
 }
 
+/// `serde(skip_serializing_if)` needs a named function, not an inline
+/// closure — this is the zero-check every new `TokenUsage` bucket shares.
+fn is_zero_u64(n: &u64) -> bool {
+    *n == 0
+}
+
 /// Normalized usage; fields absent from a provider response default to zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
@@ -150,6 +156,19 @@ pub struct TokenUsage {
     pub cache_read_input_tokens: u64,
     #[serde(default)]
     pub cache_creation_input_tokens: u64,
+    /// Cache-write tokens billed at the 5-minute TTL rate — a refinement of
+    /// `cache_creation_input_tokens` (which stays the authoritative total),
+    /// not a replacement for it. `skip_serializing_if` keeps a payload with
+    /// no per-TTL breakdown byte-identical to one from before this field
+    /// existed: this struct is persisted in the session log and serialized
+    /// into `--json`/ACP frames, so a zero bucket must stay invisible on
+    /// the wire.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_creation_5m_input_tokens: u64,
+    /// Cache-write tokens billed at the 1-hour TTL rate (2x input, vs. 1.25x
+    /// for the 5-minute default). See `cache_creation_5m_input_tokens`.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub cache_creation_1h_input_tokens: u64,
 }
 
 impl std::ops::AddAssign for TokenUsage {
@@ -158,6 +177,8 @@ impl std::ops::AddAssign for TokenUsage {
         self.output_tokens += rhs.output_tokens;
         self.cache_read_input_tokens += rhs.cache_read_input_tokens;
         self.cache_creation_input_tokens += rhs.cache_creation_input_tokens;
+        self.cache_creation_5m_input_tokens += rhs.cache_creation_5m_input_tokens;
+        self.cache_creation_1h_input_tokens += rhs.cache_creation_1h_input_tokens;
     }
 }
 
@@ -539,6 +560,7 @@ mod tests {
             output_tokens: 10,
             cache_read_input_tokens: 50,
             cache_creation_input_tokens: 25,
+            ..Default::default()
         };
         assert_eq!(usage.hit_ratio(), Some(0.5));
     }
@@ -552,6 +574,7 @@ mod tests {
             output_tokens: 0,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 100,
+            ..Default::default()
         };
         assert_eq!(usage.hit_ratio(), Some(0.0));
     }
@@ -559,6 +582,58 @@ mod tests {
     #[test]
     fn hit_ratio_never_divides_by_zero() {
         assert_eq!(TokenUsage::default().hit_ratio(), None);
+    }
+
+    #[test]
+    fn token_usage_with_zero_ttl_buckets_serializes_byte_identical_to_before() {
+        // The pre-change struct's exact JSON shape for this usage value —
+        // pinned literally so a future edit that starts emitting the new
+        // bucket keys at zero is caught here, not downstream in a session
+        // log or a --json consumer.
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_input_tokens: 5,
+            cache_creation_input_tokens: 7,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert_eq!(
+            json,
+            "{\"input_tokens\":10,\"output_tokens\":20,\"cache_read_input_tokens\":5,\
+             \"cache_creation_input_tokens\":7}"
+        );
+        assert!(!json.contains("cache_creation_5m_input_tokens"));
+        assert!(!json.contains("cache_creation_1h_input_tokens"));
+        let back: TokenUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn token_usage_with_nonzero_ttl_buckets_round_trips() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            cache_creation_input_tokens: 300,
+            cache_creation_5m_input_tokens: 100,
+            cache_creation_1h_input_tokens: 200,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        assert!(json.contains("\"cache_creation_5m_input_tokens\":100"));
+        assert!(json.contains("\"cache_creation_1h_input_tokens\":200"));
+        let back: TokenUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, usage);
+    }
+
+    #[test]
+    fn token_usage_deserializes_old_bytes_with_no_ttl_buckets() {
+        // A pre-existing session-log entry / --json frame with none of the
+        // new keys must still parse, with both buckets defaulting to zero.
+        let old = r#"{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":4}"#;
+        let usage: TokenUsage = serde_json::from_str(old).unwrap();
+        assert_eq!(usage.cache_creation_5m_input_tokens, 0);
+        assert_eq!(usage.cache_creation_1h_input_tokens, 0);
+        assert_eq!(usage.cache_creation_input_tokens, 4);
     }
 
     #[test]
