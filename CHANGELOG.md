@@ -6,6 +6,60 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **Loop overhead is now a measured, CI-gated number.** A `LoopLedger` stamps
+  ten fixed phases per sample and flushes one telemetry report per turn (never
+  a transcript entry), including max-RSS; a testkit gate compares the loop's
+  own overhead — everything that is not the provider round-trip or the tools'
+  work — against a committed baseline with tolerance bands, and a permanent
+  teeth-check proves the gate still catches a real regression. Measured on the
+  reference machine the steady-state loop reads p50 ≈ 175µs per sample, inside
+  the design budget.
+- **Cache telemetry is visible everywhere usage is.** Prompt-cache read and
+  creation tokens now surface with a hit-ratio percentage in the TUI, `--json`
+  stream, and ACP wire, derived at one shared site instead of three renderers.
+
+### Changed
+
+- **The committer no longer serializes or masks anything a turn can prepare.**
+  Turn-originated entries arrive at the actor pre-serialized and pre-masked
+  (`MaskedBytes` — unmaskable bytes are unrepresentable by construction); the
+  actor validates, mints the id, splices the envelope through the same serde
+  path, and forwards. A 60KB tool result no longer stalls every other session
+  command behind the sole committer, and log bytes are provably unchanged.
+- **The stream no longer waits on the disk per entry.** Intra-turn commits are
+  pipelined behind a bounded ack window with three hard barriers (before any
+  tool runs, before the sample-boundary refresh, at turn end), and the writer
+  drains its queue into one `write_all` + one `sync_data` — windowless group
+  commit, no timer, no new loss window. fsync-before-ack and
+  projection-advances-only-on-ack hold verbatim; kill-between-enqueue-and-sync
+  is a golden scenario.
+- **A sample boundary costs one fsync, not two.** The Completed pair
+  (assistant item + usage) commits as one causally-atomic group — one writer
+  message, one sync, one ack.
+- **The next request is built and sent while the boundary settles.** At each
+  sample boundary the commit, the snapshot refresh, and the next provider
+  request fire concurrently; the in-flight stream is adopted only if the
+  refreshed head proves nothing intervened, else it is cancelled and rebuilt
+  sequentially — transcripts are byte-identical either way. A mispredict
+  (e.g. a steer landing at that exact boundary) costs one cancelled request;
+  its billed usage is currently *not* folded into reported usage — a recorded
+  follow-up. Snapshot delivery itself moved from a mailbox round-trip to an
+  epoch-fenced watch channel published by the actor only after durability.
+- **Connections are warm before the first token needs them.** The HTTP client
+  now negotiates HTTP/2 with keep-alives (the workspace was HTTP/1.1-only),
+  and the pool is armed — one lightweight, credential-free handshake request —
+  at `hotl -p` startup and TUI session open, moving DNS+TCP+TLS off the
+  critical path after every idle window. Arming is failure-invisible and
+  RAII-scoped; idle sessions hold nothing.
+- **Small loop diets.** Single-tool batches (the majority case) execute inline
+  in the turn task instead of through the parallel-chunk machinery; doom-loop
+  signatures fold as results arrive instead of in a batch pass; the builtin
+  tool registry is memoized instead of rebuilt per spawn-gate check; and hook
+  dispatch is gated on a live per-event mask, so a session with no hook for an
+  event pays one atomic load instead of payload construction and cap copies.
+
 ## [0.5.2] - 2026-07-25
 
 ### Fixed
