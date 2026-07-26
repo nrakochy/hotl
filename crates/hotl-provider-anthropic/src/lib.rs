@@ -9,6 +9,7 @@
 //! honoring `retry-after` (a stream that dies mid-flight is surfaced, not
 //! retried — replaying half a stream is M1 recovery work).
 
+mod cache_plan;
 mod sse;
 
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -139,13 +140,16 @@ impl AnthropicProvider {
 
     fn build_body(req: &SamplingRequest) -> Value {
         let mark = req.cache.marks_breakpoints();
-        let mut messages = build_messages(&req.items, mark);
+        // One plan per body, from the durable items alone — see `cache_plan`
+        // for why the planner may not remember anything.
+        let plan = mark.then(|| cache_plan::plan(&req.items));
+        let mut messages = build_messages(&req.items, plan.as_ref());
         // The ephemeral suffix, in wire order: after every durable message and
-        // so after the deepest marker, before MOIM. `mark: false` is not a
+        // so after the deepest marker, before MOIM. Passing no plan is not a
         // policy decision made here — these items are not in `req.items`, so
-        // the marker chooser above never saw them and could not have picked
-        // one. That is the whole point of the split.
-        messages.extend(build_messages(&req.ephemeral_tail, false));
+        // the planner above never saw them and could not have picked one. That
+        // is the whole point of the split.
+        messages.extend(build_messages(&req.ephemeral_tail, None));
         // MOIM rides last of all, after the cache marker: it changes every
         // sample without invalidating the cached prefix (suffix position).
         if let Some(tc) = &req.turn_context {
@@ -157,6 +161,12 @@ impl AnthropicProvider {
             "stream": true,
             "messages": messages,
         });
+        // ONE prefix marker, not two. Render order is tools → system, so a
+        // marker on the last system block already seals tools *and* system as
+        // a single cached segment; the second marker the old code spent on the
+        // tool tail bought nothing and cost a quarter of the budget the
+        // rolling anchors now need. The tools marker survives only as the
+        // fallback for a request with no system prompt at all.
         if !req.system.is_empty() {
             let mut sys = json!({"type": "text", "text": req.system.as_ref()});
             if mark {
@@ -166,10 +176,7 @@ impl AnthropicProvider {
         }
         if !req.tools.is_empty() {
             let mut tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
-            // Auto breakpoint on the last tool def (M2 cache policy): tools
-            // render before system in the prefix, so this seals the whole
-            // tool block. 3 markers total (tools/system/latest-user) ≤ 4.
-            if mark {
+            if mark && req.system.is_empty() {
                 if let Some(last) = tools.last_mut() {
                     last["cache_control"] = json!({"type": "ephemeral"});
                 }
@@ -182,6 +189,16 @@ impl AnthropicProvider {
             // `thinking_delta` arrives empty (T3-15).
             body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
         }
+        // The API rejects a fifth `cache_control`, and the budget is spent by
+        // two independent pieces of code (the prefix marker here, the plan in
+        // `cache_plan`). Count the built body rather than trusting the
+        // arithmetic that was supposed to keep them in their lanes.
+        debug_assert!(
+            count_markers(&body) <= cache_plan::MAX_BREAKPOINTS,
+            "{} cache_control markers exceeds the API budget of {}",
+            count_markers(&body),
+            cache_plan::MAX_BREAKPOINTS
+        );
         body
     }
 }
@@ -203,40 +220,45 @@ fn tool_json(t: &ToolDef) -> Value {
     json!({"name": t.name, "description": t.description, "input_schema": t.input_schema})
 }
 
-/// Render `items` as Anthropic messages, optionally placing the deepest cache
-/// breakpoint on the last user-role message.
+/// Render `items` as Anthropic messages, placing a cache breakpoint on every
+/// block `plan` names.
 ///
-/// `mark_last_user` is only ever true for a request's **durable** items: the
-/// ephemeral suffix is a separate list ([`SamplingRequest::ephemeral_tail`])
-/// rendered by a second, unmarked call, so there is no ephemeral item in
-/// scope here to mis-mark. Ephemerality is positional now, not a tag to test —
-/// a `Todos`-tagged item that really is durable (an old fork log seeded before
+/// `plan` is only ever `Some` for a request's **durable** items: the ephemeral
+/// suffix is a separate list ([`SamplingRequest::ephemeral_tail`]) rendered by
+/// a second, planless call, so there is no ephemeral item in scope here to
+/// mis-mark. Ephemerality is positional now, not a tag to test — a
+/// `Todos`-tagged item that really is durable (an old fork log seeded before
 /// the split committed one) is a legitimate marker candidate like any other.
-fn build_messages(items: &[Item], mark_last_user: bool) -> Vec<Value> {
-    let last_user_idx = items
-        .iter()
-        .rposition(|i| matches!(i, Item::User { .. } | Item::ToolResults { .. }));
+///
+/// The plan's item indices index `items` (skipped items included), so this
+/// loop and [`cache_plan::plan`] must walk the list the same way — that shared
+/// walk is why `cache_plan::item_blocks` is required to mirror the match arms
+/// below.
+fn build_messages(items: &[Item], plan: Option<&cache_plan::Plan>) -> Vec<Value> {
+    let marks = |idx: usize, block: usize| plan.is_some_and(|p| p.marks(idx, block));
     let mut out = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
-        let mark = mark_last_user && Some(idx) == last_user_idx;
         match item {
             // System items never reach the wire from here — the system prompt
             // travels in the request's `system` field (context assembly owns it).
             Item::System { .. } | Item::Unknown => continue,
             Item::User { text, .. } => {
                 let mut block = json!({"type": "text", "text": text});
-                if mark {
+                if marks(idx, 0) {
                     block["cache_control"] = json!({"type": "ephemeral"});
                 }
                 out.push(json!({"role": "user", "content": [block]}));
             }
+            // Echoed verbatim, never marked: these blocks carry thinking
+            // signatures the API validates byte for byte.
             Item::Assistant { blocks } => {
                 out.push(json!({"role": "assistant", "content": blocks}));
             }
             Item::ToolResults { results } => {
-                let mut content: Vec<Value> = results
+                let content: Vec<Value> = results
                     .iter()
-                    .map(|r| {
+                    .enumerate()
+                    .map(|(block, r)| {
                         let mut v = json!({
                             "type": "tool_result",
                             "tool_use_id": r.tool_use_id,
@@ -245,19 +267,32 @@ fn build_messages(items: &[Item], mark_last_user: bool) -> Vec<Value> {
                         if r.is_error {
                             v["is_error"] = json!(true);
                         }
+                        // Interior positions are markable: an anchor inside a
+                        // wide batch is what keeps the next marker within the
+                        // API's lookback.
+                        if marks(idx, block) {
+                            v["cache_control"] = json!({"type": "ephemeral"});
+                        }
                         v
                     })
                     .collect();
-                if mark {
-                    if let Some(last) = content.last_mut() {
-                        last["cache_control"] = json!({"type": "ephemeral"});
-                    }
-                }
                 out.push(json!({"role": "user", "content": content}));
             }
         }
     }
     out
+}
+
+/// Every `cache_control` in a built body, counted structurally.
+fn count_markers(v: &Value) -> usize {
+    match v {
+        Value::Object(map) => {
+            usize::from(map.contains_key("cache_control"))
+                + map.values().map(count_markers).sum::<usize>()
+        }
+        Value::Array(items) => items.iter().map(count_markers).sum(),
+        _ => 0,
+    }
 }
 
 /// One send attempt, classified. Keeps the stream generator small while
@@ -985,9 +1020,14 @@ mod tests {
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
-        // system block carries a cache marker; so does the last tool def
+        // ONE prefix marker: the system block. Tools render before system, so
+        // the system marker already seals them — a second marker on the tool
+        // tail would spend budget the rolling anchors need.
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "a non-empty system prompt owns the prefix marker"
+        );
         let msgs = body["messages"].as_array().unwrap();
         // 3 items + the ephemeral MOIM block at the end
         assert_eq!(msgs.len(), 4);
@@ -1150,5 +1190,276 @@ mod tests {
             !wire_body(&off).to_string().contains("cache_control"),
             "CachePolicy::Off must emit zero markers"
         );
+    }
+
+    fn tool_results(n: usize) -> Item {
+        Item::ToolResults {
+            results: (0..n)
+                .map(|i| ToolResultItem {
+                    tool_use_id: format!("t{i}"),
+                    content: "out".into(),
+                    is_error: false,
+                })
+                .collect(),
+        }
+    }
+
+    fn assistant(blocks: usize) -> Item {
+        Item::Assistant {
+            blocks: (0..blocks)
+                .map(|i| serde_json::json!({"type": "text", "text": format!("b{i}")}))
+                .collect(),
+        }
+    }
+
+    fn static_req(system: &str, items: Vec<Item>) -> SamplingRequest {
+        SamplingRequest {
+            system: system.into(),
+            items: std::sync::Arc::new(items),
+            cache: CachePolicy::Static {
+                prefix_ttl: CacheTtl::FiveMinutes,
+            },
+            ..sampling_req()
+        }
+    }
+
+    /// 1-based wire block indices (across the whole `messages` array) that
+    /// carry a marker — the coordinate space the API's lookback counts in.
+    fn marked_block_indices(body: &Value) -> Vec<usize> {
+        let mut idx = 0usize;
+        let mut out = Vec::new();
+        for msg in body["messages"].as_array().unwrap() {
+            for block in msg["content"].as_array().unwrap() {
+                idx += 1;
+                if block.get("cache_control").is_some() {
+                    out.push(idx);
+                }
+            }
+        }
+        out
+    }
+
+    /// The prefix marker's fallback. With no system prompt there is no system
+    /// block to seal tools with, so the marker goes back on the last tool def
+    /// — otherwise the tool schemas (often thousands of tokens) sit outside
+    /// every cached segment.
+    #[test]
+    fn an_empty_system_prompt_moves_the_prefix_marker_to_the_last_tool_def() {
+        let mut req = static_req(
+            "",
+            vec![Item::User {
+                text: "hi".into(),
+                synthetic: None,
+            }],
+        );
+        req.tools = vec![
+            ToolDef {
+                name: "read".into(),
+                description: "d".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+            ToolDef {
+                name: "write".into(),
+                description: "d".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+        ]
+        .into();
+        let body = wire_body(&req);
+        assert!(body.get("system").is_none(), "no system prompt was set");
+        assert!(
+            body["tools"][0].get("cache_control").is_none(),
+            "only the LAST tool def seals the block"
+        );
+        assert_eq!(body["tools"][1]["cache_control"]["type"], "ephemeral");
+        // Prefix marker + latest, and nothing else.
+        assert_eq!(count_markers(&body), 2);
+    }
+
+    /// The one sanctioned byte change for small histories: a `Static` request
+    /// with no ephemeral tail and too few blocks to cross a stride serializes
+    /// exactly the system marker plus the latest marker — no tools marker, no
+    /// anchors.
+    #[test]
+    fn a_short_static_history_serializes_exactly_two_markers() {
+        let mut req = static_req(
+            "sys",
+            vec![
+                Item::User {
+                    text: "instructions".into(),
+                    synthetic: None,
+                },
+                assistant(1),
+                tool_results(2),
+            ],
+        );
+        req.tools = vec![ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+        }]
+        .into();
+        let body = wire_body(&req);
+        assert_eq!(count_markers(&body), 2, "{body:#}");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        // The one message marker is the last tool_result block.
+        assert_eq!(marked_block_indices(&body), vec![4]);
+    }
+
+    /// The bug this phase exists to close. A 40-result batch is far wider than
+    /// the API's ~20-block cache lookback: with only the latest block marked,
+    /// the new marker cannot see the entry the previous sample wrote and the
+    /// whole history re-bills at write price. Anchors keep every consecutive
+    /// pair of markers inside the lookback.
+    #[test]
+    fn a_wide_tool_batch_keeps_every_marker_within_the_lookback() {
+        let req = static_req(
+            "sys",
+            vec![
+                Item::User {
+                    text: "go".into(),
+                    synthetic: None,
+                },
+                assistant(1),
+                tool_results(40),
+            ],
+        );
+        let body = wire_body(&req);
+        // 1 prefix + 2 anchors + 1 latest, the full budget and not one more.
+        assert_eq!(
+            count_markers(&body),
+            cache_plan::MAX_BREAKPOINTS,
+            "{body:#}"
+        );
+        // user@1, assistant@2, tool_result j@3+j → crossings at 15 and 30,
+        // latest at 42.
+        let marked = marked_block_indices(&body);
+        assert_eq!(marked, vec![15, 30, 42]);
+        for pair in marked.windows(2) {
+            assert!(
+                pair[1] - pair[0] <= 20,
+                "markers {pair:?} straddle the lookback"
+            );
+        }
+        // Two of the three sit *inside* the batch's message, which is the
+        // whole trick — a per-item scheme could not place them.
+        let batch = &body["messages"].as_array().unwrap()[2];
+        let inside = batch["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|b| b.get("cache_control").is_some())
+            .count();
+        assert_eq!(inside, 3, "two anchors and the latest, all interior");
+    }
+
+    /// The budget assertion is a `debug_assert` in `build_body`; this is the
+    /// same claim held over shapes chosen to stress it, so a regression fails
+    /// as a test rather than as a 400 from the API.
+    #[test]
+    fn no_request_shape_exceeds_the_marker_budget() {
+        let shapes: Vec<Vec<Item>> = vec![
+            vec![],
+            vec![tool_results(0)],
+            vec![tool_results(15)],
+            vec![tool_results(200)],
+            vec![assistant(50), tool_results(50)],
+            (0..30)
+                .flat_map(|i| {
+                    vec![
+                        Item::User {
+                            text: format!("u{i}"),
+                            synthetic: None,
+                        },
+                        assistant(1 + i % 4),
+                        tool_results(1 + (i * 3) % 11),
+                    ]
+                })
+                .collect(),
+        ];
+        for (n, items) in shapes.into_iter().enumerate() {
+            for system in ["", "sys"] {
+                let mut req = static_req(system, items.clone());
+                req.tools = vec![ToolDef {
+                    name: "read".into(),
+                    description: "d".into(),
+                    input_schema: serde_json::json!({"type":"object"}),
+                }]
+                .into();
+                req.turn_context = Some("<turn-context/>".into());
+                req.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
+                    text: "<todos/>".into(),
+                    synthetic: Some(SyntheticReason::Todos),
+                }]);
+                let body = wire_body(&req);
+                let markers = count_markers(&body);
+                assert!(
+                    markers <= cache_plan::MAX_BREAKPOINTS,
+                    "shape {n} / system {system:?}: {markers} markers"
+                );
+                // The tail and MOIM ride after every marker, always.
+                let msgs = body["messages"].as_array().unwrap();
+                for msg in &msgs[msgs.len() - 2..] {
+                    for block in msg["content"].as_array().unwrap() {
+                        assert!(block.get("cache_control").is_none(), "{block:#}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Plan coordinates index `items`, but `build_messages` *skips* System and
+    /// Unknown items. If the two walks ever disagreed the markers would land
+    /// on the wrong blocks; this pins that they agree.
+    #[test]
+    fn skipped_items_do_not_displace_the_wire_markers() {
+        let core = vec![
+            Item::User {
+                text: "go".into(),
+                synthetic: None,
+            },
+            assistant(1),
+            tool_results(40),
+        ];
+        let mut padded = vec![Item::System {
+            text: "not on the wire".into(),
+        }];
+        padded.extend(core.iter().cloned());
+        padded.insert(2, Item::Unknown);
+
+        let plain = wire_body(&static_req("sys", core));
+        let interleaved = wire_body(&static_req("sys", padded));
+        assert_eq!(
+            marked_block_indices(&plain),
+            marked_block_indices(&interleaved)
+        );
+        assert_eq!(plain["messages"], interleaved["messages"]);
+    }
+
+    /// The planner is a pure function of the item list, which is what lets the
+    /// speculative rebuild stay byte-identical to the sequential one. Two
+    /// independently constructed requests with equal items must serialize to
+    /// the same bytes, markers included.
+    #[test]
+    fn equal_item_lists_serialize_to_equal_bytes() {
+        let items = || {
+            (0..12)
+                .flat_map(|i| {
+                    vec![
+                        Item::User {
+                            text: format!("u{i}"),
+                            synthetic: None,
+                        },
+                        assistant(2),
+                        tool_results(1 + (i * 7) % 13),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = wire_body(&static_req("sys", items()));
+        let b = wire_body(&static_req("sys", items()));
+        assert_eq!(a.to_string(), b.to_string());
+        assert!(count_markers(&a) > 2, "fixture must produce anchors");
     }
 }
