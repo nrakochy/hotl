@@ -984,6 +984,66 @@ mod tests {
         }
     }
 
+    /// §S1 fix: `BatchProposed`/`WatermarkDurable` must land on the sample's
+    /// REAL final propose — the tool-results commit when a tool phase runs,
+    /// the model's own assistant+usage commit otherwise. Before the fix both
+    /// phases were first-stamp-wins like every other phase, so the
+    /// tool-results propose in `run_tool_batch` was always a silent no-op:
+    /// the (ToolsJoined→BatchProposed) delta was provably always zero, and
+    /// the tool-results commit's own latency was never measured at all
+    /// (absorbed into WatermarkDurable→BoundaryEnd instead).
+    #[tokio::test]
+    async fn batch_proposed_and_watermark_durable_track_each_samples_own_final_commit() {
+        let mut h = Harness::new(
+            vec![
+                ScriptedProvider::tool_call("t1", "read", json!({"path": "x"})),
+                ScriptedProvider::text_reply("done"),
+            ],
+            cfg(),
+        );
+        h.prompt_and_wait("read x then answer").await;
+        let report = &h.ledger_reports[0];
+        assert_eq!(report.sample_count, 2);
+
+        // Sample 0 ran a tool phase: ToolsJoined must be stamped, and the
+        // sample's final commit (BatchProposed/WatermarkDurable) must land
+        // AT OR AFTER it — never before, which is what the bug produced
+        // (both stuck at the model's own, earlier, assistant+usage commit).
+        let tool_sample = &report.samples[0];
+        let tools_joined = tool_sample[hotl_engine::Phase::ToolsJoined as usize];
+        let batch_proposed = tool_sample[hotl_engine::Phase::BatchProposed as usize];
+        let watermark_durable = tool_sample[hotl_engine::Phase::WatermarkDurable as usize];
+        assert_ne!(tools_joined, 0, "sample 0 must have run a tool phase");
+        assert_ne!(batch_proposed, 0);
+        assert_ne!(watermark_durable, 0);
+        assert!(
+            batch_proposed >= tools_joined,
+            "BatchProposed ({batch_proposed}) must be >= ToolsJoined ({tools_joined}) — \
+             it must track the tool-results commit, not the earlier model commit"
+        );
+        assert!(
+            watermark_durable >= batch_proposed,
+            "WatermarkDurable ({watermark_durable}) must be >= BatchProposed ({batch_proposed})"
+        );
+
+        // Sample 1 had no tool phase: ToolsSpawned/ToolsJoined stay absent,
+        // but BatchProposed/WatermarkDurable must still be present — the
+        // model's own assistant+usage commit is that sample's only (and so
+        // its final) propose.
+        let text_sample = &report.samples[1];
+        assert_eq!(text_sample[hotl_engine::Phase::ToolsSpawned as usize], 0);
+        assert_eq!(text_sample[hotl_engine::Phase::ToolsJoined as usize], 0);
+        assert_ne!(
+            text_sample[hotl_engine::Phase::BatchProposed as usize],
+            0,
+            "a no-tool sample's own commit must still be captured"
+        );
+        assert_ne!(
+            text_sample[hotl_engine::Phase::WatermarkDurable as usize],
+            0
+        );
+    }
+
     #[tokio::test]
     async fn transcript_normalization_is_deterministic() {
         let make = || async {

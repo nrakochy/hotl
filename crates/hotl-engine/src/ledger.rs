@@ -12,6 +12,16 @@ use std::time::Instant;
 /// (`SnapshotReady−BoundaryStart` prices the snapshot transport, etc.) — see
 /// [`DELTA_PAIRS`]. A doom-loop abort or a failed sample can legitimately
 /// skip phases past the point of failure; see [`LoopLedger::stamp`].
+///
+/// `BatchProposed`/`WatermarkDurable` are the one place the critical path
+/// forks: a sample proposes once (the model's own assistant+usage entry) or
+/// twice (that entry, then — only when a tool phase runs — the tool-results
+/// entry). These two phases use [`LoopLedger::restamp`] (last-wins, not
+/// `stamp`'s first-wins), so their recorded position always tracks the
+/// sample's REAL final commit — after `ToolsJoined` when a tool phase ran,
+/// otherwise right after `LastBlockEnd`. Every other phase is written
+/// exactly once by construction, so `stamp`'s first-wins rule is what
+/// applies to them.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub enum Phase {
@@ -35,7 +45,13 @@ pub const PHASE_COUNT: usize = 10;
 const CAPACITY: usize = 64;
 
 /// Consecutive phase pairs along the critical path, in declaration order —
-/// each pairing is one attributable stage of the loop.
+/// each pairing is one attributable stage of the loop. `(ToolsJoined,
+/// BatchProposed)` is zero-width for a sample with no tool phase (both
+/// `ToolsSpawned`/`ToolsJoined` are legitimately absent) — that is the
+/// zero-width-when-absent rule in [`width`], not a measurement gap. For a
+/// sample that DID run a tool phase, `restamp`'s last-wins semantics on
+/// `BatchProposed` (see [`Phase`]) guarantee this pairing prices real time:
+/// the gap between the tools finishing and the tool-results propose call.
 const DELTA_PAIRS: [(Phase, Phase); PHASE_COUNT - 1] = [
     (Phase::BoundaryStart, Phase::SnapshotReady),
     (Phase::SnapshotReady, Phase::RequestBuilt),
@@ -180,6 +196,24 @@ impl LoopLedger {
         if *slot == 0 {
             *slot = now_nanos();
         }
+    }
+
+    /// Record `phase` into the current slot, always overwriting — the "last
+    /// wins" counterpart to [`stamp`](Self::stamp). `BatchProposed`/
+    /// `WatermarkDurable` are the only phases that use this: a sample can
+    /// legitimately propose twice (the model's own assistant+usage entry,
+    /// then — only when a tool phase runs — the tool-results entry), and the
+    /// *last* commit is the one actually on the sample's critical path, not
+    /// the first. Every other phase is stamped once by construction, so
+    /// `stamp`'s first-wins rule is a no-op difference for them; this method
+    /// exists so the two propose-adjacent phases don't have to lie about
+    /// which commit they priced. A no-op before the first `start_sample()`
+    /// call or past the capacity cap.
+    pub fn restamp(&mut self, phase: Phase) {
+        if self.current >= CAPACITY {
+            return;
+        }
+        self.samples[self.current][phase as usize] = now_nanos();
     }
 
     /// Compute the flushable summary. `max_rss_bytes` is threaded in rather
@@ -338,6 +372,34 @@ mod tests {
             first, second,
             "the second stamp must not overwrite the first"
         );
+    }
+
+    #[test]
+    fn restamp_overwrites_with_the_latest_value() {
+        // `BatchProposed`/`WatermarkDurable` (turn.rs) can legitimately be
+        // proposed twice in one sample — the model's own assistant+usage
+        // entry, then (when a tool phase runs) the tool-results entry. The
+        // *last* commit is the one on the sample's real critical path, so
+        // `restamp` — unlike `stamp` — always overwrites.
+        let mut ledger = LoopLedger::new();
+        ledger.start_sample();
+        ledger.stamp(Phase::BatchProposed);
+        let first = ledger.summary(0).samples[0][Phase::BatchProposed as usize];
+        std::thread::sleep(std::time::Duration::from_micros(50));
+        ledger.restamp(Phase::BatchProposed);
+        let second = ledger.summary(0).samples[0][Phase::BatchProposed as usize];
+        assert!(
+            second > first,
+            "restamp must overwrite with a later value, got first={first} second={second}"
+        );
+    }
+
+    #[test]
+    fn restamp_before_any_start_sample_is_a_noop() {
+        let mut ledger = LoopLedger::new();
+        ledger.restamp(Phase::BatchProposed); // no start_sample() yet
+        let report = ledger.summary(0);
+        assert_eq!(report.sample_count, 0, "no sample was ever started");
     }
 
     #[test]

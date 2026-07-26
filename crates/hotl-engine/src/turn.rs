@@ -658,9 +658,14 @@ impl Turn {
                 .into_iter()
                 .map(|item| EntryPayload::Item { item }),
         );
-        self.ledger.stamp(Phase::BatchProposed);
+        // `restamp`, not `stamp`: this sample already proposed its own
+        // assistant+usage entry in `sample()` — the tool-results commit here
+        // is the sample's REAL final propose, so it must overwrite that
+        // earlier stamp rather than lose to first-stamp-wins (§S1 fix — see
+        // `batch_proposed_and_watermark_durable_track_each_samples_own_final_commit`).
+        self.ledger.restamp(Phase::BatchProposed);
         let commit = self.propose(entries).await;
-        self.ledger.stamp(Phase::WatermarkDurable);
+        self.ledger.restamp(Phase::WatermarkDurable);
         if !commit.ok() {
             return Some(Outcome::Error {
                 message: commit.message().into(),
@@ -900,10 +905,17 @@ impl Turn {
     /// Complete protocol pairing for a batch that will not execute.
     async fn abort_batch(&mut self, uses: &[ToolUse], message: &str) -> Commit {
         let results = uses.iter().map(|tu| pair(tu, message, true)).collect();
-        self.propose(vec![EntryPayload::Item {
-            item: Item::ToolResults { results },
-        }])
-        .await
+        // Same reasoning as `run_tool_batch`'s propose (§S1 fix): this is
+        // the doom-loop-terminated sample's real final commit, so it must
+        // overwrite `sample()`'s earlier stamp via `restamp`.
+        self.ledger.restamp(Phase::BatchProposed);
+        let commit = self
+            .propose(vec![EntryPayload::Item {
+                item: Item::ToolResults { results },
+            }])
+            .await;
+        self.ledger.restamp(Phase::WatermarkDurable);
+        commit
     }
 
     /// Pre-flight: the compaction threshold check (M2), then the request with
