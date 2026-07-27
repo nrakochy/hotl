@@ -81,10 +81,26 @@ it on most emulators, or set `HOTL_MOUSE=0` to leave the mouse alone entirely.
 
 ### Pasting
 
-Multi-line paste works: the terminal hands the whole payload over at once and it
-lands in the input as text. It does not submit — press `Enter` when you are
-ready. (Before bracketed paste, a ten-line paste arrived as ten `Enter`
-presses and fired ten turns.)
+Multi-line paste works: the terminal hands the whole payload over at once. It
+does not submit — press `Enter` when you are ready. (Before bracketed paste, a
+ten-line paste arrived as ten `Enter` presses and fired ten turns.)
+
+A paste of three or more lines compacts to a `[Pasted text #1 +N lines]` token
+instead of flooding the input box; the full text is held aside and reaches the
+model verbatim when you submit. The transcript keeps the token — what you see
+is what you typed, not a wall of paste.
+
+Drag an image file onto the terminal and the pasted path becomes an
+`[Image #1]` token the same way. On submit, hotl reads the file and sends it
+to the model as a real image (png, jpg/jpeg, gif, webp — case-insensitive;
+5MB per image, 8 images per prompt). A path the file no longer resolves to
+degrades to an inline note, never an error. Models whose catalog entry cannot
+take images get the text with a one-line omission note instead.
+
+Tokens are ordinary text: `Backspace` right after one deletes it whole, and
+editing inside one turns it back into literal text (its held content is
+dropped at submit). Prompt history stores the expanded text — recalled
+entries are self-contained, exactly the bytes the old behavior wrote.
 
 ### Model thinking
 

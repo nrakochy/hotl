@@ -320,6 +320,37 @@ async fn prompt_stream_ask_allow_done_golden() {
     );
 }
 
+/// A dropped image path compacts to `[Image #1]` in the composer and echoes
+/// as the same token in the transcript after submit — the display/wire fork
+/// through the REAL dispatch (the harness runs without the runtime seam, so
+/// the wire frame is text-only, exactly as it already skips `@[file]`
+/// expansion; the JSON image shape is pinned in client.rs unit tests).
+#[tokio::test]
+async fn dropped_image_paste_compacts_and_echoes_golden() {
+    let (mut client, _reader) = start().await;
+    let mut state = State::new(true, "m".into());
+    let mut prompt_ids = VecDeque::new();
+
+    update(&mut state, Msg::Paste("/tmp/shot.png ".into()));
+    for c in " what is this?".chars() {
+        press(&mut state, KeyCode::Char(c));
+    }
+    let rows = draw(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("[Image #1] what is this?")),
+        "composer shows the token"
+    );
+
+    let cmds = press(&mut state, KeyCode::Enter);
+    exec(cmds, &mut client, &mut prompt_ids).await;
+    let rows = draw(&state);
+    assert!(
+        rows.iter().any(|r| r.contains("❯ [Image #1] what is this?")),
+        "transcript echoes the token, not the path"
+    );
+    assert!(matches!(state.phase, Phase::Sampling { .. }));
+}
+
 /// `ask_user` end to end through the real TUI stack: the modal shows the
 /// numbered options, a digit picks one, and the model's next turn (fed the
 /// selected label as the tool result) completes normally. Also proves the

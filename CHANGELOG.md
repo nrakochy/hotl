@@ -6,6 +6,26 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **Image input.** Drag an image onto the console and the pasted path
+  compacts to an `[Image #1]` token; on submit hotl reads the file and sends
+  it to the model as a real image content block — provider-neutral
+  (Anthropic base64 source blocks, OpenAI-compatible `image_url` data URLs),
+  gated per model by the catalog's `images` capability, and persisted inline
+  in the session log so resume and speculation byte-identity hold. png,
+  jpg/jpeg, gif, webp; 5MB per image, 8 per prompt, validated at the wire
+  before anything durable is written. `session/prompt` and `session/steer`
+  accept an optional `images` array; the open result advertises
+  `"images": true` for feature detection. Steers carry images too.
+
+- **Long pastes compact.** A paste of three or more lines becomes a
+  `[Pasted text #1 +N lines]` token in the composer instead of flooding it;
+  the full text reaches the model on submit and the transcript keeps the
+  token. `Backspace` right after a token deletes it whole; editing inside
+  one turns it back into literal text. Prompt history stores the expanded
+  bytes, so recalled entries stay self-contained.
+
 ## [0.7.1] - 2026-07-27
 
 ### Fixed
