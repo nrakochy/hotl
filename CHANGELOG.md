@@ -6,6 +6,17 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A crashed MCP server's stderr now reaches the error on every disconnect
+  path.** When the server process died before a request could be written to
+  it, the failure surfaced as a bare `server pipe closed: Broken pipe` — the
+  EPIPE write path skipped the grace-and-compose step the EOF read path
+  already had, so the server's own diagnostics (usually the one line that
+  explains the crash) were dropped. Both paths now append the stderr tail.
+  This race is also what intermittently failed the release test gate from
+  v0.5.2 on.
+
 ## [0.7.0] - 2026-07-27
 
 ### Added

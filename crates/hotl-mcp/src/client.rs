@@ -262,8 +262,12 @@ impl Client {
         {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => {
+                // A write failure is the EPIPE flavor of a server crash: the
+                // process died before this request reached it. Its stderr is
+                // the diagnostic that matters, so compose the error the same
+                // way the EOF path does — with the tail, after its grace.
                 self.die(e.clone());
-                Err(e)
+                Err(self.death_note(&e).await)
             }
             Err(_) => {
                 // The write may have partially landed, so the stream is
@@ -746,5 +750,32 @@ mod tests {
             err.contains("config.json not found"),
             "stderr tail must be included: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_still_carries_the_stderr_tail() {
+        // The other way a crashed server surfaces: its stdin is already gone
+        // when the request is written, so the failure is EPIPE on the write,
+        // not EOF on the read. The tail must reach that error too — on a slow
+        // machine the test above lands on this path, which is what failed the
+        // v0.5.2 and v0.7.0 release gates.
+        let (reader, _held_open) = tokio::io::duplex(64);
+        let (writer, closed) = tokio::io::duplex(64);
+        drop(closed); // every write now fails with BrokenPipe
+        let client = Client::from_streams(reader, writer);
+        client
+            .stderr
+            .lock()
+            .unwrap()
+            .push("FATAL: config.json not found".into());
+        let err = client
+            .request("ping", json!({}))
+            .await
+            .expect_err("the write must fail");
+        assert!(
+            err.contains("config.json not found"),
+            "stderr tail must be included: {err}"
+        );
+        assert!(client.is_dead());
     }
 }
