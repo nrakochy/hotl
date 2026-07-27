@@ -495,9 +495,15 @@ pub enum ProposeReply {
 #[allow(clippy::manual_non_exhaustive)]
 pub enum SessionCmd {
     /// A user prompt. Starts a turn, or queues (one-at-a-time promotion).
-    Prompt(String),
+    /// `images` are the prompt's attachments, already validated and
+    /// base64-encoded at the wire entry point (`hotl::images::parse_images`).
+    Prompt {
+        text: String,
+        images: Vec<hotl_types::UserImage>,
+    },
     /// A prompt whose committed item carries a provenance tag (T2: schema
     /// contract + validation-retry feedback ride in as tagged user items).
+    /// Engine-internal injections never carry images.
     PromptTagged {
         text: String,
         synthetic: hotl_types::SyntheticReason,
@@ -507,7 +513,10 @@ pub enum SessionCmd {
     /// is a user/tool turn the model never answered. No-op if already running.
     Continue,
     /// Mid-turn guidance: admitted durably now, woven into the next sample.
-    Steer(String),
+    Steer {
+        text: String,
+        images: Vec<hotl_types::UserImage>,
+    },
     /// Set the session's display name (durable: appended to the log).
     Rename(String),
     /// Set the session's effective permission mode (durable: appended to the
@@ -640,7 +649,12 @@ impl SessionHandle {
     }
 
     pub async fn prompt(&self, text: String) {
-        let _ = self.cmd.send(SessionCmd::Prompt(text)).await;
+        self.prompt_with(text, Vec::new()).await;
+    }
+    /// A prompt carrying attached images (already validated and
+    /// base64-encoded at the wire entry point).
+    pub async fn prompt_with(&self, text: String, images: Vec<hotl_types::UserImage>) {
+        let _ = self.cmd.send(SessionCmd::Prompt { text, images }).await;
     }
     /// A prompt whose committed user item carries a provenance tag (T2).
     pub async fn prompt_tagged(&self, text: String, synthetic: hotl_types::SyntheticReason) {
@@ -650,7 +664,11 @@ impl SessionHandle {
             .await;
     }
     pub async fn steer(&self, text: String) {
-        let _ = self.cmd.send(SessionCmd::Steer(text)).await;
+        self.steer_with(text, Vec::new()).await;
+    }
+    /// A steer carrying attached images — same plumbing as [`Self::steer`].
+    pub async fn steer_with(&self, text: String, images: Vec<hotl_types::UserImage>) {
+        let _ = self.cmd.send(SessionCmd::Steer { text, images }).await;
     }
     /// Name the session durably (a `rename` log entry; last one wins).
     pub async fn rename(&self, name: String) {

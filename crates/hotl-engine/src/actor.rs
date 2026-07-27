@@ -714,10 +714,10 @@ pub(crate) async fn run(
         std::mem::take(&mut deps.initial_todos),
     );
     let mut running = false;
-    let mut queue: VecDeque<(String, Option<SyntheticReason>)> = VecDeque::new();
+    let mut queue: VecDeque<QueuedPrompt> = VecDeque::new();
     // Steers that arrived while a turn was live (or a tool batch open),
     // waiting for a boundary before they can be appended.
-    let mut held_steers: Vec<String> = Vec::new();
+    let mut held_steers: Vec<HeldSteer> = Vec::new();
     let (shared, mut log) = SharedDeps::new(deps, notifications, head_rx);
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
@@ -774,7 +774,7 @@ pub(crate) async fn run(
             }
         };
         match cmd {
-            SessionCmd::Prompt(text) => {
+            SessionCmd::Prompt { text, images } => {
                 running = admit_prompt(
                     &shared,
                     &mut log,
@@ -782,8 +782,11 @@ pub(crate) async fn run(
                     &mut pipeline,
                     &mut queue,
                     running,
-                    text,
-                    None,
+                    QueuedPrompt {
+                        text,
+                        images,
+                        synthetic: None,
+                    },
                     &cmd_tx,
                     &events,
                     &current_turn,
@@ -798,8 +801,11 @@ pub(crate) async fn run(
                     &mut pipeline,
                     &mut queue,
                     running,
-                    text,
-                    Some(synthetic),
+                    QueuedPrompt {
+                        text,
+                        images: Vec::new(),
+                        synthetic: Some(synthetic),
+                    },
                     &cmd_tx,
                     &events,
                     &current_turn,
@@ -812,7 +818,7 @@ pub(crate) async fn run(
                     running = true;
                 }
             }
-            SessionCmd::Steer(text) => {
+            SessionCmd::Steer { text, images } => {
                 admit_steer(
                     &shared,
                     &mut log,
@@ -820,7 +826,7 @@ pub(crate) async fn run(
                     &mut pipeline,
                     &mut held_steers,
                     running,
-                    text,
+                    HeldSteer { text, images },
                 )
                 .await
             }
@@ -987,7 +993,7 @@ struct TurnFinishedCtx<'a> {
     log: &'a mut SessionLog,
     head: &'a mut Head,
     pipeline: &'a mut Pipeline,
-    queue: &'a mut VecDeque<(String, Option<SyntheticReason>)>,
+    queue: &'a mut VecDeque<QueuedPrompt>,
     running: &'a mut bool,
     carry_usage: &'a mut TokenUsage,
     compact_streak: &'a mut u32,
@@ -1102,7 +1108,7 @@ async fn end_turn(
     log: &mut SessionLog,
     head: &mut Head,
     pipeline: &mut Pipeline,
-    queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
+    queue: &mut VecDeque<QueuedPrompt>,
     outcome: Outcome,
     usage: TokenUsage,
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
@@ -1129,14 +1135,13 @@ async fn end_turn(
     );
     let _ = events.send(EngineEvent::TurnDone { outcome, usage }).await;
     match queue.pop_front() {
-        Some((next, synthetic)) => {
+        Some(next) => {
             start_turn(
                 shared,
                 log,
                 head,
                 pipeline,
                 next,
-                synthetic,
                 cmd_tx,
                 events,
                 current_turn,
@@ -1232,21 +1237,32 @@ async fn admit_steer(
     log: &mut SessionLog,
     head: &mut Head,
     pipeline: &mut Pipeline,
-    held: &mut Vec<String>,
+    held: &mut Vec<HeldSteer>,
     running: bool,
-    text: String,
+    steer: HeldSteer,
 ) {
     if running || awaiting_tool_results(head.items()) {
         // Past the byte cap, coalesce into the last held steer rather than grow
-        // without bound — every entry is committed at once on release.
-        let total: usize = held.iter().map(String::len).sum();
+        // without bound — every entry is committed at once on release. Folded
+        // images ride along (same marker-numbering caveat as the prompt fold).
+        let total: usize = held.iter().map(|s| s.text.len()).sum();
         match held.last_mut() {
-            Some(last) if total >= HELD_BYTES_MAX => fold_into(last, &text, HELD_BYTES_MAX),
-            _ => held.push(text),
+            Some(last) if total >= HELD_BYTES_MAX => {
+                fold_into(&mut last.text, &steer.text, HELD_BYTES_MAX);
+                last.images.extend(steer.images);
+            }
+            _ => held.push(steer),
         }
         return;
     }
-    append_steer(shared, log, head, pipeline, text).await;
+    append_steer(shared, log, head, pipeline, steer).await;
+}
+
+/// A steer waiting for a between-samples boundary, with the images its
+/// committed `Item::User` will carry.
+struct HeldSteer {
+    text: String,
+    images: Vec<hotl_types::UserImage>,
 }
 
 async fn append_steer(
@@ -1254,7 +1270,7 @@ async fn append_steer(
     log: &mut SessionLog,
     head: &mut Head,
     pipeline: &mut Pipeline,
-    text: String,
+    steer: HeldSteer,
 ) {
     // The other half of the held-steer rule, as a structural guard: a steer
     // that split a tool batch would strand the results from the calls they
@@ -1270,9 +1286,9 @@ async fn append_steer(
             head,
             EntryPayload::Item {
                 item: Item::User {
-                    text,
+                    text: steer.text,
                     synthetic: Some(SyntheticReason::Steer),
-                    images: Vec::new(),
+                    images: steer.images,
                 },
             },
         )
@@ -1297,7 +1313,7 @@ async fn release_steers(
     log: &mut SessionLog,
     head: &mut Head,
     pipeline: &mut Pipeline,
-    held: &mut Vec<String>,
+    held: &mut Vec<HeldSteer>,
     at: Boundary,
 ) {
     debug_assert!(
@@ -1309,8 +1325,8 @@ async fn release_steers(
     if held.is_empty() || awaiting_tool_results(head.items()) {
         return;
     }
-    for text in std::mem::take(held) {
-        append_steer(shared, log, head, pipeline, text).await;
+    for steer in std::mem::take(held) {
+        append_steer(shared, log, head, pipeline, steer).await;
     }
 }
 
@@ -1705,6 +1721,14 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
     None
 }
 
+/// A prompt waiting its turn (one-at-a-time promotion), with everything the
+/// committed `Item::User` will carry.
+struct QueuedPrompt {
+    text: String,
+    images: Vec<hotl_types::UserImage>,
+    synthetic: Option<SyntheticReason>,
+}
+
 /// Start a turn now, or queue the prompt if one is running (one-at-a-time
 /// promotion). Carries an optional provenance tag (T2).
 #[allow(clippy::too_many_arguments)]
@@ -1713,10 +1737,9 @@ async fn admit_prompt(
     log: &mut SessionLog,
     head: &mut Head,
     pipeline: &mut Pipeline,
-    queue: &mut VecDeque<(String, Option<SyntheticReason>)>,
+    queue: &mut VecDeque<QueuedPrompt>,
     running: bool,
-    text: String,
-    synthetic: Option<SyntheticReason>,
+    prompt: QueuedPrompt,
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
@@ -1729,9 +1752,16 @@ async fn admit_prompt(
             // without the model being told. It *was* absorbed, so the event is
             // still `PromptQueued`. A folded prompt inherits the tag of the
             // entry it joins — only reachable past QUEUE_MAX pending prompts,
-            // where provenance has already stopped being per-prompt.
-            Some(last) if full => fold_into(&mut last.0, &text, HELD_BYTES_MAX),
-            _ => queue.push_back((text, synthetic)),
+            // where provenance has already stopped being per-prompt. Its
+            // images ride along; two folded prompts may then both say
+            // `[Image #1]`, and renumbering would mean parsing message text,
+            // which types-layer policy forbids — accepted on this
+            // pathological path (text folding already truncates far worse).
+            Some(last) if full => {
+                fold_into(&mut last.text, &prompt.text, HELD_BYTES_MAX);
+                last.images.extend(prompt.images);
+            }
+            _ => queue.push_back(prompt),
         }
         let _ = events.send(EngineEvent::PromptQueued).await;
         return true;
@@ -1741,8 +1771,7 @@ async fn admit_prompt(
         log,
         head,
         pipeline,
-        text,
-        synthetic,
+        prompt,
         cmd_tx,
         events,
         current_turn,
@@ -1756,20 +1785,21 @@ async fn start_turn(
     log: &mut SessionLog,
     head: &mut Head,
     pipeline: &mut Pipeline,
-    text: String,
-    synthetic: Option<SyntheticReason>,
+    prompt: QueuedPrompt,
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
 ) -> bool {
     // Captured before `text` moves into the committed item — `UserPromptSubmit`
-    // hooks (tier-1 gap #7) see the prompt exactly as submitted.
-    let prompt_for_hooks = text.clone();
+    // hooks (tier-1 gap #7) see the prompt exactly as submitted. Text only:
+    // images are not exposed to hooks (v1) — the inline `[Image #N]` markers
+    // still tell a hook one was attached.
+    let prompt_for_hooks = prompt.text.clone();
     let payload = EntryPayload::Item {
         item: Item::User {
-            text,
-            synthetic,
-            images: Vec::new(),
+            text: prompt.text,
+            synthetic: prompt.synthetic,
+            images: prompt.images,
         },
     };
     if !shared.append(log, pipeline, head, payload).await {
@@ -2441,7 +2471,10 @@ mod tests {
     async fn an_in_sample_commit_is_not_a_boundary_a_held_steer_may_land_at() {
         let dir = tempfile::tempdir().unwrap();
         let (shared, mut log, mut head) = test_shared(dir.path());
-        let mut held = vec!["hold me".to_string()];
+        let mut held = vec![super::HeldSteer {
+            text: "hold me".to_string(),
+            images: Vec::new(),
+        }];
         release_steers(
             &shared,
             &mut log,
@@ -2460,7 +2493,10 @@ mod tests {
     async fn a_commit_that_closed_its_sample_releases_the_steer_it_held() {
         let dir = tempfile::tempdir().unwrap();
         let (shared, mut log, mut head) = test_shared(dir.path());
-        let mut held = vec!["hold me".to_string()];
+        let mut held = vec![super::HeldSteer {
+            text: "hold me".to_string(),
+            images: Vec::new(),
+        }];
         release_steers(
             &shared,
             &mut log,
