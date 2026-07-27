@@ -345,7 +345,8 @@ async fn dropped_image_paste_compacts_and_echoes_golden() {
     exec(cmds, &mut client, &mut prompt_ids).await;
     let rows = draw(&state);
     assert!(
-        rows.iter().any(|r| r.contains("❯ [Image #1] what is this?")),
+        rows.iter()
+            .any(|r| r.contains("❯ [Image #1] what is this?")),
         "transcript echoes the token, not the path"
     );
     assert!(matches!(state.phase, Phase::Sampling { .. }));

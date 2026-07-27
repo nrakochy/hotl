@@ -89,7 +89,7 @@ fn decoded_len(data: &str) -> Result<usize, String> {
     if data.starts_with("data:") {
         return Err("data must be bare base64, not a data: URL".into());
     }
-    if data.is_empty() || data.len() % 4 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
         return Err("data must be non-empty base64 with padding (length % 4 == 0)".into());
     }
     let bytes = data.as_bytes();

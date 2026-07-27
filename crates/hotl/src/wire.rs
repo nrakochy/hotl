@@ -26,6 +26,10 @@ use serde_json::{json, Value};
 /// **v2** — `turn_done.outcome` changed from a Rust `Debug` string
 /// (`"Done { text: \"…\" }"`) to the tagged object `{"kind": …, …}`, and
 /// `thinking_delta` gained `text`. Pinned by `tests/json_stream_schema.rs`.
+///
+/// Image-bearing user prompts (`Item::User { images }`) were assessed and
+/// need no bump: prompts are inputs, never stream frames — no `EngineEvent`
+/// carries an `Item`, so nothing in this vocabulary changed.
 pub const JSON_STREAM_SCHEMA_VERSION: u32 = 2;
 
 /// Streamable events, as clients see them. `None` = not a stream frame
