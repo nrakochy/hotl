@@ -35,7 +35,9 @@ approve a plan), and `dontask` (never wait for input; deny anything not
 pre-approved — the `-p`/CI posture). An unrecognized mode fails closed to
 `ask`. Underneath, regardless of mode: `bash` (and hooks, and diagnostics)
 runs confined by the kernel — Seatbelt on macOS, Landlock on Linux ≥ 6.2
-including WSL2 — with writes limited to the working directory and temp;
+including WSL2 — with writes limited to the working directory, temp, and any
+`[sandbox].writable` directories the owner listed (never widenable from
+inside: entries exposing hotl's own config are refused);
 writes to execute-later and credential paths (git hooks, shell rc, Makefiles,
 `.ssh/`, credential stores, agent-instruction files) always prompt, and are
 checked *before* allow-rules; and every silenced prompt stays visible in the

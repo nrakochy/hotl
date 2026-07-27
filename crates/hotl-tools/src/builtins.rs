@@ -79,14 +79,55 @@ fn guarded_search_root(
     fsguard::resolve_beneath(root, &rel).map_err(|e| ToolOutcome::err(e.prompt(tool, given)))
 }
 
+/// The extra write roots granted to `tool` by `[sandbox].file_tools` —
+/// empty unless the owner opted the mutating file tools into the
+/// `[sandbox].writable` set (`file_tools = "writable"`).
+fn granted_extras() -> &'static [std::path::PathBuf] {
+    match sandbox::file_tools_mode() {
+        sandbox::FileToolsMode::Writable => sandbox::extra_writable(),
+        sandbox::FileToolsMode::Workspace => &[],
+    }
+}
+
+/// Where a mutating file tool's path lands, for both the permission pick and
+/// the run-time door — one classification, so the two can never disagree.
+enum WriteTarget {
+    /// Workspace-relative: the fd descent from the workspace root.
+    Workspace(std::path::PathBuf),
+    /// Under a granted `[sandbox].writable` root: the same fd descent,
+    /// anchored at that root.
+    Extra(std::path::PathBuf, std::path::PathBuf),
+    /// Outside every boundary: the human approved this literal path in the
+    /// protected ask, so it is opened plainly — following links is what they
+    /// agreed to.
+    OutsideApproved,
+}
+
+fn write_target(root: &std::path::Path, extras: &[std::path::PathBuf], path: &str) -> WriteTarget {
+    match fsguard::classify(root, path) {
+        fsguard::Placement::Inside(rel) => WriteTarget::Workspace(rel),
+        fsguard::Placement::Outside(_) => match fsguard::extra_root_for(path, extras) {
+            Some((eroot, rel)) => WriteTarget::Extra(eroot, rel),
+            None => WriteTarget::OutsideApproved,
+        },
+    }
+}
+
 /// Permission for a mutating file tool: protected paths escalate.
 ///
 /// INVARIANT: the execute-later classification runs on the *resolved* target
 /// as well as the literal path, so an innocent-looking name that is a symlink
 /// to `~/.zshrc` still gets the escalated ask — a symlink cannot launder a
 /// protected write into an ordinary one. Enforced by
-/// `file_permission_classifies_the_resolved_target`.
+/// `file_permission_classifies_the_resolved_target`. That escalation is
+/// checked before the extra-root grant, so a granted directory never
+/// downgrades a protected filename — enforced by
+/// `file_permission_downgrades_extra_paths_only_when_granted`.
 fn file_permission(verb: &str, input: &Value) -> Permission {
+    file_permission_with(verb, input, granted_extras())
+}
+
+fn file_permission_with(verb: &str, input: &Value, extras: &[std::path::PathBuf]) -> Permission {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
     let summary = format!("{verb} {path}");
     let resolved = std::fs::canonicalize(path).ok();
@@ -95,22 +136,18 @@ fn file_permission(verb: &str, input: &Value) -> Permission {
             .as_deref()
             .and_then(|r| execute_later_reason(&r.to_string_lossy()))
     });
-    let outside = matches!(
-        fsguard::classify(fsguard::workspace_root(), path),
-        fsguard::Placement::Outside(_)
-    );
-    match (reason, outside) {
+    let target = write_target(fsguard::workspace_root(), extras, path);
+    match (reason, target) {
         (Some(why), _) => Permission::AskProtected {
             summary,
             why: why.into(),
         },
-        (None, true) => Permission::AskProtected {
+        (None, WriteTarget::OutsideApproved) => Permission::AskProtected {
             summary,
-            why: "outside the working directory: not covered by the sandbox write-confinement \
-                  floor"
+            why: "outside the working directory: not covered by this tool's workspace boundary"
                 .into(),
         },
-        (None, false) => Permission::Ask { summary },
+        (None, WriteTarget::Workspace(_) | WriteTarget::Extra(..)) => Permission::Ask { summary },
     }
 }
 
@@ -370,30 +407,31 @@ impl Tool for WriteTool {
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
             let root = fsguard::workspace_root();
-            with_diagnostics(&self.diag, &input, write_in(root, &input).await).await
+            let result = write_in(root, granted_extras(), &input).await;
+            with_diagnostics(&self.diag, &input, result).await
         })
     }
 }
 
-/// INVARIANT: a write inside the workspace goes through the guarded create,
-/// so no component of the path — including the final one — is ever a symlink
-/// that would redirect the bytes somewhere else. A path outside the workspace
+/// INVARIANT: a write inside the workspace — or under a granted
+/// `[sandbox].writable` root — goes through the guarded create, so no
+/// component of the path, including the final one, is ever a symlink that
+/// would redirect the bytes somewhere else. A path outside every boundary
 /// was approved explicitly by the human, who saw the resolved target in the
 /// ask, so it is written plainly. Enforced by
-/// `write_through_a_symlink_does_not_touch_the_target`.
-async fn write_in(root: &std::path::Path, input: &Value) -> ToolResult {
+/// `write_through_a_symlink_does_not_touch_the_target` and
+/// `write_into_an_extra_root_goes_through_the_guard`.
+async fn write_in(
+    root: &std::path::Path,
+    extras: &[std::path::PathBuf],
+    input: &Value,
+) -> ToolResult {
     let path = str_arg(input, "path")?;
     let content = str_arg(input, "content")?;
-    match fsguard::classify(root, path) {
-        fsguard::Placement::Inside(rel) => {
-            use std::io::Write;
-            let mut f = fsguard::create_beneath(root, &rel, true)
-                .map_err(|e| ToolOutcome::err(e.prompt("write", path)))?;
-            f.write_all(content.as_bytes())
-                .and_then(|()| f.sync_all())
-                .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))?;
-        }
-        fsguard::Placement::Outside(_) => {
+    match write_target(root, extras, path) {
+        WriteTarget::Workspace(rel) => guarded_write_bytes(root, &rel, path, content)?,
+        WriteTarget::Extra(eroot, rel) => guarded_write_bytes(&eroot, &rel, path, content)?,
+        WriteTarget::OutsideApproved => {
             if let Some(parent) = std::path::Path::new(path).parent() {
                 if !parent.as_os_str().is_empty() {
                     tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -412,6 +450,21 @@ async fn write_in(root: &std::path::Path, input: &Value) -> ToolResult {
         "Wrote {} bytes to {path}.",
         content.len()
     )))
+}
+
+/// The guarded create-and-write, shared by the workspace and extra-root arms.
+fn guarded_write_bytes(
+    root: &std::path::Path,
+    rel: &std::path::Path,
+    path: &str,
+    content: &str,
+) -> Result<(), ToolOutcome> {
+    use std::io::Write;
+    let mut f = fsguard::create_beneath(root, rel, true)
+        .map_err(|e| ToolOutcome::err(e.prompt("write", path)))?;
+    f.write_all(content.as_bytes())
+        .and_then(|()| f.sync_all())
+        .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))
 }
 
 #[derive(Default)]
@@ -443,7 +496,8 @@ impl Tool for EditTool {
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
             let root = fsguard::workspace_root();
-            with_diagnostics(&self.diag, &input, edit_in(root, &input).await).await
+            let result = edit_in(root, granted_extras(), &input).await;
+            with_diagnostics(&self.diag, &input, result).await
         })
     }
 }
@@ -469,8 +523,12 @@ async fn with_diagnostics(
 /// write that applies it — go through the guard, so an in-workspace name that
 /// is a symlink out of the tree is refused rather than silently rewriting the
 /// link's target. Enforced by `edit_through_a_symlink_does_not_touch_the_target`.
-async fn edit_in(root: &std::path::Path, input: &Value) -> ToolResult {
-    edit_with_hook(root, input, || {}).await
+async fn edit_in(
+    root: &std::path::Path,
+    extras: &[std::path::PathBuf],
+    input: &Value,
+) -> ToolResult {
+    edit_with_hook(root, extras, input, || {}).await
 }
 
 /// `between` runs after the match and before the write-back — the window an
@@ -478,6 +536,7 @@ async fn edit_in(root: &std::path::Path, input: &Value) -> ToolResult {
 /// passes a real mutation.
 async fn edit_with_hook(
     root: &std::path::Path,
+    extras: &[std::path::PathBuf],
     input: &Value,
     between: impl FnOnce(),
 ) -> ToolResult {
@@ -489,8 +548,8 @@ async fn edit_with_hook(
             "`old_string` is empty. Use `write` to create a file, or provide the exact text to replace.",
         ));
     }
-    let placement = fsguard::classify(root, path);
-    let content = read_guarded_to_string(root, &placement, path)?;
+    let target = write_target(root, extras, path);
+    let content = read_guarded_to_string(root, &target, path)?;
     match crate::matcher::find(&content, old) {
         crate::matcher::Match::None => Err(ToolOutcome::err(format!(
             "`old_string` was not found in `{path}` (even with whitespace-tolerant matching). \
@@ -528,7 +587,7 @@ async fn edit_with_hook(
             // advisory lock (not portable enough to rely on, and no other
             // process in the workspace takes one) or edit-after-read staleness
             // tracking in the engine — tracked in the tech-debt tracker.
-            let now = read_guarded_to_string(root, &placement, path)?;
+            let now = read_guarded_to_string(root, &target, path)?;
             if now != content {
                 return Err(ToolOutcome::err(format!(
                     "`{path}` changed on disk between the match and the write, so the edit was \
@@ -536,7 +595,7 @@ async fn edit_with_hook(
                      against the current text."
                 )));
             }
-            write_guarded(root, &placement, path, updated.as_bytes())?;
+            write_guarded(root, &target, path, updated.as_bytes())?;
             let note = if exact {
                 ""
             } else {
@@ -547,12 +606,12 @@ async fn edit_with_hook(
     }
 }
 
-/// Read a file for editing through whichever door its `Placement` opened:
-/// the fd descent inside the workspace, a plain open outside it (which the
-/// human approved by path).
+/// Read a file for editing through whichever door its `WriteTarget` opened:
+/// the fd descent inside the workspace or a granted extra root, a plain open
+/// outside every boundary (which the human approved by path).
 fn read_guarded_to_string(
     root: &std::path::Path,
-    placement: &fsguard::Placement,
+    target: &WriteTarget,
     path: &str,
 ) -> Result<String, ToolOutcome> {
     let not_read = |e: std::io::Error| {
@@ -560,32 +619,37 @@ fn read_guarded_to_string(
             "Could not read `{path}`: {e}. Read the file first to confirm the path."
         ))
     };
-    match placement {
-        fsguard::Placement::Inside(rel) => {
-            use std::io::Read;
-            let mut f = fsguard::open_beneath(root, rel)
-                .map_err(|e| ToolOutcome::err(e.prompt("edit", path)))?;
-            let mut s = String::new();
-            f.read_to_string(&mut s).map_err(not_read)?;
-            Ok(s)
-        }
-        fsguard::Placement::Outside(_) => std::fs::read_to_string(path).map_err(not_read),
+    let guarded_read = |root: &std::path::Path, rel: &std::path::Path| {
+        use std::io::Read;
+        let mut f = fsguard::open_beneath(root, rel)
+            .map_err(|e| ToolOutcome::err(e.prompt("edit", path)))?;
+        let mut s = String::new();
+        f.read_to_string(&mut s).map_err(not_read)?;
+        Ok(s)
+    };
+    match target {
+        WriteTarget::Workspace(rel) => guarded_read(root, rel),
+        WriteTarget::Extra(eroot, rel) => guarded_read(eroot, rel),
+        WriteTarget::OutsideApproved => std::fs::read_to_string(path).map_err(not_read),
     }
 }
 
-/// The write-back half of `read_guarded_to_string`. Inside the workspace this
-/// is the atomic replace (temp sibling, fsync, `renameat`, parent fsync);
-/// outside it, a plain whole-file write.
+/// The write-back half of `read_guarded_to_string`. Inside the workspace or a
+/// granted extra root this is the atomic replace (temp sibling, fsync,
+/// `renameat`, parent fsync); outside every boundary, a plain whole-file
+/// write.
 fn write_guarded(
     root: &std::path::Path,
-    placement: &fsguard::Placement,
+    target: &WriteTarget,
     path: &str,
     bytes: &[u8],
 ) -> Result<(), ToolOutcome> {
-    match placement {
-        fsguard::Placement::Inside(rel) => fsguard::replace_beneath(root, rel, bytes)
+    match target {
+        WriteTarget::Workspace(rel) => fsguard::replace_beneath(root, rel, bytes)
             .map_err(|e| ToolOutcome::err(e.prompt("edit", path))),
-        fsguard::Placement::Outside(_) => std::fs::write(path, bytes)
+        WriteTarget::Extra(eroot, rel) => fsguard::replace_beneath(eroot, rel, bytes)
+            .map_err(|e| ToolOutcome::err(e.prompt("edit", path))),
+        WriteTarget::OutsideApproved => std::fs::write(path, bytes)
             .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}."))),
     }
 }
@@ -1323,7 +1387,14 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::os::unix::fs::symlink(&target, root.join("docs/notes.md")).unwrap();
 
-        let out = done(write_in(&root, &json!({"path": "docs/notes.md", "content": "evil"})).await);
+        let out = done(
+            write_in(
+                &root,
+                &[],
+                &json!({"path": "docs/notes.md", "content": "evil"}),
+            )
+            .await,
+        );
         assert!(out.is_error, "{}", out.content);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "# original\n");
         assert!(out.content.contains("symlink"), "{}", out.content);
@@ -1347,15 +1418,105 @@ mod tests {
         }
     }
 
+    #[test]
+    fn file_permission_downgrades_extra_paths_only_when_granted() {
+        let (_o, _root, home) = fsguard::tests::fixture();
+        let extra = home.join("cache");
+        std::fs::create_dir_all(&extra).unwrap();
+        let extras = vec![extra.clone()];
+        let input = json!({"path": extra.join("blob.bin").to_str().unwrap()});
+        // Granted: an ordinary ask, the same tier as an in-workspace write
+        // (auto-approved under mode=auto — that is the point of the grant).
+        assert!(matches!(
+            file_permission_with("write", &input, &extras),
+            Permission::Ask { .. }
+        ));
+        // Not granted: the protected ask, exactly as before.
+        assert!(matches!(
+            file_permission_with("write", &input, &[]),
+            Permission::AskProtected { .. }
+        ));
+        // A protected filename under a granted extra still escalates — the
+        // execute-later class outranks the grant.
+        let protected = json!({"path": extra.join("Makefile").to_str().unwrap()});
+        match file_permission_with("write", &protected, &extras) {
+            Permission::AskProtected { why, .. } => {
+                assert!(why.contains("build entrypoint"), "{why}")
+            }
+            other => panic!("protected name must stay escalated, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_into_an_extra_root_goes_through_the_guard() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        let extra = home.join("cache");
+        std::fs::create_dir_all(&extra).unwrap();
+        let extras = vec![extra.clone()];
+
+        // The write lands, parents created, through the fd descent.
+        let p = extra.join("a/b.txt");
+        let ok = done(
+            write_in(
+                &root,
+                &extras,
+                &json!({"path": p.to_str().unwrap(), "content": "x"}),
+            )
+            .await,
+        );
+        assert!(!ok.is_error, "{}", ok.content);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "x");
+
+        // A symlink under the extra pointing out of it is refused — the
+        // grant is not a plain-write door, the guard still descends.
+        let victim = home.join(".zshrc");
+        std::fs::write(&victim, "# original\n").unwrap();
+        std::os::unix::fs::symlink(&victim, extra.join("innocent.txt")).unwrap();
+        let out = done(
+            write_in(
+                &root,
+                &extras,
+                &json!({"path": extra.join("innocent.txt").to_str().unwrap(), "content": "evil"}),
+            )
+            .await,
+        );
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("symlink"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "# original\n");
+    }
+
+    #[tokio::test]
+    async fn edit_in_an_extra_root_round_trips() {
+        let (_o, root, home) = fsguard::tests::fixture();
+        let extra = home.join("cache");
+        std::fs::create_dir_all(&extra).unwrap();
+        let p = extra.join("conf.txt");
+        std::fs::write(&p, "value = 1\n").unwrap();
+        let ok = done(
+            edit_in(
+                &root,
+                std::slice::from_ref(&extra),
+                &json!({
+                    "path": p.to_str().unwrap(),
+                    "old_string": "value = 1",
+                    "new_string": "value = 2",
+                }),
+            )
+            .await,
+        );
+        assert!(!ok.is_error, "{}", ok.content);
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "value = 2\n");
+    }
+
     #[tokio::test]
     async fn write_creates_parents_but_never_through_a_link() {
         let (_o, root, home) = fsguard::tests::fixture();
         std::os::unix::fs::symlink(&home, root.join("out")).unwrap();
-        let out = done(write_in(&root, &json!({"path": "out/a/b.txt", "content": "x"})).await);
+        let out = done(write_in(&root, &[], &json!({"path": "out/a/b.txt", "content": "x"})).await);
         assert!(out.is_error, "{}", out.content);
         assert!(!home.join("a/b.txt").exists(), "created through the link");
         // The ordinary case still works.
-        let ok = done(write_in(&root, &json!({"path": "a/b/c.txt", "content": "x"})).await);
+        let ok = done(write_in(&root, &[], &json!({"path": "a/b/c.txt", "content": "x"})).await);
         assert!(!ok.is_error, "{}", ok.content);
         assert_eq!(
             std::fs::read_to_string(root.join("a/b/c.txt")).unwrap(),
@@ -1372,6 +1533,7 @@ mod tests {
         let out = done(
             edit_in(
                 &root,
+                &[],
                 &json!({"path": "notes.md", "old_string": "/usr/bin", "new_string": "/evil"}),
             )
             .await,
@@ -1394,6 +1556,7 @@ mod tests {
         let out = done(
             edit_with_hook(
                 &root,
+                &[],
                 &json!({"path": "f.txt", "old_string": "bbb", "new_string": "BBB"}),
                 || std::fs::write(&p, external).unwrap(),
             )
@@ -1417,6 +1580,7 @@ mod tests {
         let ok = done(
             edit_in(
                 &root,
+                &[],
                 &json!({
                     "path": "f.rs",
                     "old_string": "    if x {\n        a();\n    }",
@@ -1450,6 +1614,7 @@ mod tests {
         let out = done(
             edit_in(
                 &root,
+                &[],
                 &json!({"path": "run.sh", "old_string": "echo old", "new_string": "echo new"}),
             )
             .await,

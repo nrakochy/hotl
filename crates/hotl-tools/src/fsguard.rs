@@ -35,11 +35,15 @@ use std::sync::OnceLock;
 
 /// The workspace root, canonicalized once.
 ///
-/// INVARIANT: this is the same directory the kernel sandbox floor confines
-/// writes to — `sandbox.rs:180` (seatbelt) and `sandbox.rs:270` (landlock)
-/// both canonicalize `current_dir()`. The tool boundary and the kernel
-/// boundary must name the same directory or one of them is decorative.
-/// Enforced by `guard_root_matches_sandbox_root`.
+/// INVARIANT: the guard's root set — this directory, plus any
+/// `[sandbox].writable` extras a tool was granted via `[sandbox].file_tools`
+/// — is a subset of the kernel write set (`sandbox::write_roots()`).
+/// The workspace half holds because `sandbox.rs:180` (seatbelt) and
+/// `sandbox.rs:270` (landlock) canonicalize `current_dir()` exactly like
+/// this function (enforced by `guard_root_matches_sandbox_root`); the extras
+/// half holds by construction — both sides read the same set-once
+/// `sandbox::EXTRAS`. If either boundary named a directory the other does
+/// not, one of them would be decorative.
 pub(crate) fn workspace_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -47,6 +51,46 @@ pub(crate) fn workspace_root() -> &'static Path {
             .and_then(|p| p.canonicalize())
             .unwrap_or_else(|_| PathBuf::from("."))
     })
+}
+
+/// Which granted extra root (if any) an **absolute** path lands under, and
+/// where under it. Purely lexical — `.`/`..` are normalized first, and the
+/// caller then descends from the (canonical) root fd with `O_NOFOLLOW`, so
+/// the normalized name is the object actually opened. Nested roots: the
+/// deepest match wins, so `rel` is computed against the root the descent
+/// starts from. The root itself maps to `.` (which no write path accepts —
+/// `split_parent` refuses a bare `.`).
+pub(crate) fn extra_root_for(path: &str, extras: &[PathBuf]) -> Option<(PathBuf, PathBuf)> {
+    let given = Path::new(path);
+    if !given.is_absolute() {
+        return None;
+    }
+    let mut norm = PathBuf::new();
+    for c in given.components() {
+        match c {
+            Component::RootDir | Component::Prefix(_) => norm.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !norm.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(s) => norm.push(s),
+        }
+    }
+    let root = extras
+        .iter()
+        .filter(|root| norm.starts_with(root))
+        .max_by_key(|root| root.components().count())?;
+    let rel = norm.strip_prefix(root).ok()?;
+    Some((
+        root.clone(),
+        if rel.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            rel.to_path_buf()
+        },
+    ))
 }
 
 /// Where a model-supplied path lands, **by lexical inspection alone**.
@@ -814,6 +858,38 @@ pub(crate) mod tests {
         // different directory, one of the two would be decorative.
         let sandbox_root = std::env::current_dir().unwrap().canonicalize().unwrap();
         assert_eq!(workspace_root(), sandbox_root.as_path());
+    }
+
+    #[test]
+    fn extra_root_for_matches_absolute_paths_by_longest_prefix() {
+        let outer = PathBuf::from("/srv/cache");
+        let inner = PathBuf::from("/srv/cache/deep");
+        let extras = vec![outer.clone(), inner.clone()];
+
+        // Under one root: (root, rel).
+        let (root, rel) = extra_root_for("/srv/cache/a/b.txt", &extras).unwrap();
+        assert_eq!((root, rel), (outer.clone(), PathBuf::from("a/b.txt")));
+        // Nested roots: the deepest match wins, so `rel` is right for it.
+        let (root, rel) = extra_root_for("/srv/cache/deep/x", &extras).unwrap();
+        assert_eq!((root, rel), (inner.clone(), PathBuf::from("x")));
+        // The root itself: `.` (a later write to `.` is refused downstream).
+        let (root, rel) = extra_root_for("/srv/cache/deep", &extras).unwrap();
+        assert_eq!((root, rel), (inner, PathBuf::from(".")));
+        // Lexical `.`/`..` are normalized before matching (the descent then
+        // runs from the root fd, so the normalized name is the one opened —
+        // a `..` detour cannot smuggle a different object in).
+        let (_, rel) = extra_root_for("/srv/cache/./a/../b", &extras).unwrap();
+        assert_eq!(rel, PathBuf::from("b"));
+        let (_, rel) = extra_root_for("/srv/cache/../cache/x", &extras).unwrap();
+        assert_eq!(rel, PathBuf::from("x"));
+        // A normalization that lands outside stays outside.
+        assert!(extra_root_for("/srv/cache/../other/x", &extras).is_none());
+        // Outside every root, relative paths, and prefix-of-a-component
+        // near-misses all miss.
+        assert!(extra_root_for("/srv/other/x", &extras).is_none());
+        assert!(extra_root_for("cache/x", &extras).is_none());
+        assert!(extra_root_for("/srv/cachette/x", &extras).is_none());
+        assert!(extra_root_for("/srv/cache/a", &[]).is_none());
     }
 
     #[test]

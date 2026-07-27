@@ -64,7 +64,7 @@ Within one model turn the agent often issues several tool calls at once. hotl ru
 
 ## The sandbox floor: write-confinement, *not* a security wall
 
-When you approve a `bash` command, it runs inside a kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines **writes** to your working directory, the temp dir, and `/dev`. A command can't scribble over files elsewhere on disk.
+When you approve a `bash` command, it runs inside a kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines **writes** to your working directory, the temp dir, `/dev`, and any extra directories you list in [`[sandbox].writable`](../configuration/#sandbox-write-floor-sandbox). A command can't scribble over files elsewhere on disk.
 
 Read this part carefully, because it is the most misunderstood thing about hotl:
 
@@ -80,7 +80,13 @@ On hosts with no sandbox mechanism (older Linux kernels, or `HOTL_SANDBOX=off`),
 
 At startup hotl spawns one throwaway sandboxed process that tries to write a file outside the confinement, and only reports the floor as enforced if that write **fails**. Until this check existed, "enforced" meant "the sandbox binary is on disk" — and since that single answer is what lets `bash` allow-rules auto-approve without asking you, a profile that failed to apply for any reason meant *unconfined* commands being auto-approved silently. Now a host that can't demonstrate confinement degrades loudly instead of claiming it.
 
-It costs one process spawn per session, capped at two seconds. The probe file is uniquely named and deleted on every path, including the one where it leaks. If neither `/var/tmp` nor `$HOME` is writable, point `HOTL_SANDBOX_PROBE_DIR` at somewhere that is — outside your working directory and outside `TMPDIR`, or it proves nothing.
+It costs one process spawn per session, capped at two seconds. The probe file is uniquely named and deleted on every path, including the one where it leaks. If neither `/var/tmp` nor `$HOME` is writable, point `HOTL_SANDBOX_PROBE_DIR` at somewhere that is — outside your working directory, outside `TMPDIR`, and outside every `[sandbox].writable` entry, or it proves nothing.
+
+### Widening the floor deliberately (`[sandbox].writable`)
+
+Some tools keep their caches outside the workspace — bazel writes `~/Library/Caches/bazel` and `~/.bazel_disk_cache`, ccache has `~/.ccache` — and the default floor refuses those writes. `[sandbox].writable` in `config.toml` re-allows the directories you name, for everything that runs under the floor: `bash`, `grep`, post-edit diagnostics, and shell hooks. Full syntax and validation rules: [configuration.md](../configuration/#sandbox-write-floor-sandbox).
+
+The widening cannot be turned against hotl itself: an entry that would expose hotl's own config dir (allow-rules, hooks, the `api_key_helper` command) or data dir (session logs, snapshots) is refused with a warning — which is also why `~` and `/` can never be made writable, since they contain the config dir. Refusal is per-entry; the rest of the list still applies. The startup probe picks its target outside the widened set, so `sandboxed:` still means *proven* — including your extra directories. By default the widening applies only to spawned processes; the `write`/`edit` file tools follow it only if you additionally set `file_tools = "writable"` (next section).
 
 ### What each platform can and can't confine
 
@@ -165,6 +171,20 @@ from "points outside" would mean resolving a name and comparing the result,
 which is precisely the name-based check this design exists to remove. The
 refusal tells the model to re-issue with the absolute path and take the ask,
 so nothing is unreachable — only gated.
+
+**Opting `write`/`edit` into the widened floor.** By default the workspace
+boundary above ignores `[sandbox].writable` — those directories are writable
+to *bash*, not to the file tools. `file_tools = "writable"` in `[sandbox]`
+is the deliberate, documented step that extends the boundary: a `write` or
+`edit` whose path lands under a listed directory becomes an **ordinary** ask
+(the same tier as an in-workspace write, so `mode = "auto"` approves it)
+instead of a protected one, and runs through the same fd-descent,
+symlink-refusing guard as workspace writes — anchored at that directory. Two
+things never change: a path outside both the workspace and the listed
+directories stays a protected ask, and a protected filename (a `Makefile`,
+a `.zshrc`) under a listed directory still escalates — the grant widens
+*where* the tools may write, never *what kind* of write gets waved through.
+An unknown `file_tools` value falls back to `"workspace"` with a warning.
 
 ## Protected paths: some writes are more dangerous than they look
 

@@ -442,6 +442,14 @@ async fn scaffold(
     }
     let system = load_system_prompt(&config_dir);
     let rules = load_rules(&cfg);
+    // [sandbox] extras — installed process-wide (set-once) BEFORE the probe,
+    // so the certified floor is the widened floor children actually get, and
+    // the probe's outside-the-floor target avoids the configured roots.
+    let (sandbox_extras, sandbox_warnings) = cfg.sandbox.resolve(&config_dir, &data_dir());
+    for w in &sandbox_warnings {
+        eprintln!("hotl: WARNING — {w}");
+    }
+    hotl_tools::sandbox::init_extras(sandbox_extras);
     let sandbox_status = sandbox::probe();
     // [network] egress policy — installed process-wide (set-once) before any
     // command can run; child sessions inherit it via the global, and nothing

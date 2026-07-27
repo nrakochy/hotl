@@ -64,6 +64,10 @@ mode = "auto"   # "auto" | "ask" | "plan" | "dontask"
 egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
 allow = ["github.com", "*.crates.io"]   # hosts reachable in allowlist mode
 
+[sandbox]                  # widen the kernel write floor (see below)
+writable = ["~/Library/Caches/bazel", "~/.bazel_disk_cache"]
+file_tools = "workspace"   # "workspace" | "writable" — how far write/edit follow those dirs
+
 [web.search]                # optional: enables web_search (absent by default)
 url = "https://s.example/api"   # a JSON search API you run/subscribe to
 api_key_env = "SEARCH_KEY"      # name of an env var holding the key (never the key itself)
@@ -201,7 +205,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. `best-effort` accepts a *partial* Linux floor on kernels 5.13–6.1 (no truncate right); every ask is then labeled `sandboxed:landlock(partial)`. Unset is the hardened default. |
-| `HOTL_SANDBOX_PROBE_DIR` | — | Where the startup smoke test writes its probe file. Must be writable, outside the working directory, and outside `TMPDIR`. Only needed on hosts where neither `/var/tmp` nor `$HOME` qualifies — otherwise the sandbox reports itself unavailable rather than unproven. |
+| `HOTL_SANDBOX_PROBE_DIR` | — | Where the startup smoke test writes its probe file. Must be writable and outside the whole write set — the working directory, `TMPDIR`, and any `[sandbox].writable` entry. Only needed on hosts where neither `/var/tmp` nor `$HOME` qualifies — otherwise the sandbox reports itself unavailable rather than unproven. |
 | `HOTL_UNIX_SOCKETS` | — | `open` lifts the macOS deny on the container/orchestrator daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) for docker-in-the-loop workflows. Marks every ask `unix:open`. No effect on Linux, where the deny is not expressible. |
 | `HOTL_MACOS_AUTOMATION` | — | `allow` lifts the macOS Apple Events deny, for Xcode/Simulator/Instruments flows driven by AppleScript. Marks every ask `automation:allow`. |
 | `HOTL_SCRUB_ENV` | — | Comma-separated extra variable names to strip from every child process's environment, on top of the provider keys stripped by default. |
@@ -249,6 +253,26 @@ Declare external tool servers. Each is exposed to the model through one `mcp` to
 ### Network egress (`[network]`)
 
 Restricts what `bash` commands (and diagnostics/hooks, which run under the same floor) may reach over the network. `egress` is one of `open` (default; unrestricted), `off` (loopback and unix-domain sockets only), or `allowlist` (loopback plus the hosts in `allow`, reached through a local filtering proxy). `allow` entries are hostnames or `*.domain` wildcards — a wildcard matches the apex and any subdomain depth; no ports; matching is case-insensitive; an empty list allows nothing. An unknown `egress` value fails closed to `off` with a startup warning. While a restriction is configured, the bash ask label carries `net:off` / `net:allow(N)` — or `NET:UNENFORCED(reason)` on hosts where the kernel cannot back it (Linux needs kernel ≥ 6.7 for Landlock net; `HOTL_SANDBOX=off` also unenforces it), in which case `bash` allow-rules stop auto-approving. A denied fetch returns `hotl egress: "HOST" is not in [network].allow`. Why and limits: [permissions-and-sandbox.md](../permissions-and-sandbox/#opting-out-of-open-egress).
+
+### Sandbox write floor (`[sandbox]`)
+
+Widens the kernel write floor — the "deny all file writes, then re-allow the working directory, temp, and `/dev`" confinement every sandboxed command runs under — with directories you name. This is for tools that keep their caches outside the workspace: bazel, ccache, sccache, and friends fail under the default floor because their first write lands in `~/.cache`-style paths.
+
+```toml
+[sandbox]
+writable = ["~/Library/Caches/bazel", "~/.bazel_disk_cache"]
+file_tools = "workspace"   # optional; see below
+```
+
+`writable` entries are absolute paths (`~/` expands). Each is created if missing (Landlock can only grant access to a directory that exists when the sandbox is built), canonicalized (symlinks resolved), and validated:
+
+- **Refused — hotl's own directories.** An entry that is, contains, or sits inside the config dir (`~/.config/hotl`) or data dir (`~/.local/share/hotl`) is dropped with a warning, and the rest are honored. A writable config dir would let a sandboxed command rewrite the allow-rules, hooks, and `api_key_helper` that govern it — self-granted privilege escalation. This is also why `~` and `/` can never be listed: they contain the config dir.
+- **Warned but honored — system roots.** `/etc`, `/usr`, `/bin`, `/opt`, `/Library`, and similar are accepted with a loud warning: binaries and configuration living there become writable to every sandboxed command.
+- **Skipped** — relative paths, entries that are files, entries that cannot be created or resolved. Each with its own warning; a bad entry never takes the rest down.
+
+The startup probe that certifies the sandbox stays honest: its outside-the-floor target is chosen outside the *widened* set, so an `Enforced` verdict always describes the floor your commands actually get. `hotl doctor` prints the resolved list and every validation warning.
+
+`file_tools` is a separate, deliberate step. By default (`"workspace"`) the `write`/`edit` file tools stay confined to the working directory — `writable` only widens what *spawned processes* (bash, grep, diagnostics, hooks) may write. Set `file_tools = "writable"` to let `write`/`edit` operate under the `writable` roots too: those writes become ordinary asks (the same tier as an in-workspace write, so `mode = "auto"` approves them), they go through the same symlink-refusing descent as workspace writes, and protected filenames ([protected paths](../permissions-and-sandbox/#protected-paths)) still escalate. An unknown value falls back to `"workspace"` with a warning.
 
 ### Web tools (`web_fetch` / `web_search`, `[web]`)
 

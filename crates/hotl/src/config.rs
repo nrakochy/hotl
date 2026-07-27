@@ -38,6 +38,8 @@ pub struct Config {
     pub agents: AgentsCfg,
     #[serde(default)]
     pub concurrency: ConcurrencyCfg,
+    #[serde(default)]
+    pub sandbox: SandboxCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
     raw: Option<toml::Value>,
@@ -368,6 +370,166 @@ impl NetworkCfg {
     }
 }
 
+/// `[sandbox]` — owner-configured widening of the kernel write floor.
+#[derive(Debug, Default, Deserialize)]
+pub struct SandboxCfg {
+    /// Extra directories sandboxed commands may write to, on top of the
+    /// working directory, temp, and `/dev`. `~/` expands; missing dirs are
+    /// created at startup; hotl's own config/data dirs can never be listed.
+    #[serde(default)]
+    pub writable: Vec<String>,
+    /// `"workspace"` (default) | `"writable"` — how far the mutating file
+    /// tools (`write`, `edit`) follow the `writable` roots.
+    pub file_tools: Option<String>,
+}
+
+impl SandboxCfg {
+    /// Resolve `[sandbox]` to the extras `hotl_tools::sandbox::init_extras`
+    /// installs. Fail-closed, entry by entry: a bad entry is dropped with a
+    /// warning and never takes the rest down.
+    ///
+    /// Refusal wins over every other rule: an entry that is, contains, or is
+    /// inside the config or data dir would let a sandboxed command rewrite
+    /// hotl's own allow-rules/hooks (config) or tamper with session state
+    /// (data) — self-granted privilege escalation. That refusal is what makes
+    /// `~` and `/` impossible to list. All comparisons run on canonicalized
+    /// forms so a symlink cannot smuggle a protected dir in; the one residue
+    /// (documented wart) is that a symlinked *ancestor* can leave a freshly
+    /// created empty dir behind before the canonical check refuses the entry.
+    pub fn resolve(
+        &self,
+        config_dir: &Path,
+        data_dir: &Path,
+    ) -> (hotl_tools::sandbox::SandboxExtras, Vec<String>) {
+        use hotl_tools::sandbox::FileToolsMode;
+        let mut warnings = Vec::new();
+        let mut writable: Vec<std::path::PathBuf> = Vec::new();
+        let protected = [canon_or(config_dir), canon_or(data_dir)];
+        let refusal = |entry: &str| {
+            format!(
+                "[sandbox].writable `{entry}` would expose hotl's own config/state \
+                 (allow-rules, hooks, session logs) to sandboxed commands — entry refused"
+            )
+        };
+        for entry in &self.writable {
+            let expanded = expand_home(entry);
+            if !expanded.is_absolute() {
+                warnings.push(format!(
+                    "[sandbox].writable `{entry}` is not an absolute path — entry ignored"
+                ));
+                continue;
+            }
+            // Lexical pre-check before any mkdir side effect.
+            if protected.iter().any(|p| overlaps(&expanded, p))
+                || overlaps(&expanded, config_dir)
+                || overlaps(&expanded, data_dir)
+            {
+                warnings.push(refusal(entry));
+                continue;
+            }
+            if !expanded.exists() {
+                if let Err(e) = std::fs::create_dir_all(&expanded) {
+                    warnings.push(format!(
+                        "[sandbox].writable `{entry}` cannot be created: {e} — entry ignored"
+                    ));
+                    continue;
+                }
+            }
+            let resolved = match expanded.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    warnings.push(format!(
+                        "[sandbox].writable `{entry}` cannot be resolved: {e} — entry ignored"
+                    ));
+                    continue;
+                }
+            };
+            if !resolved.is_dir() {
+                warnings.push(format!(
+                    "[sandbox].writable `{entry}` is not a directory — entry ignored"
+                ));
+                continue;
+            }
+            // The canonical refusal check — symlinks resolved on both sides.
+            if protected.iter().any(|p| overlaps(&resolved, p)) {
+                warnings.push(refusal(entry));
+                continue;
+            }
+            if let Some(root) = risky_root(&resolved) {
+                warnings.push(format!(
+                    "[sandbox].writable `{entry}` grants writes under the system root \
+                     {root} — honored, but binaries and configuration living there \
+                     become writable to every sandboxed command"
+                ));
+            }
+            if !writable.contains(&resolved) {
+                writable.push(resolved);
+            }
+        }
+        let file_tools = match self.file_tools.as_deref() {
+            None | Some("workspace") => FileToolsMode::Workspace,
+            Some("writable") => FileToolsMode::Writable,
+            Some(other) => {
+                warnings.push(format!(
+                    "config.toml [sandbox].file_tools = \"{other}\" is not a mode \
+                     (workspace | writable) — failing closed to \"workspace\""
+                ));
+                FileToolsMode::Workspace
+            }
+        };
+        if file_tools == FileToolsMode::Writable && writable.is_empty() {
+            warnings.push(
+                "[sandbox].file_tools = \"writable\" has no effect: `writable` is empty \
+                 (or every entry was refused)"
+                    .to_string(),
+            );
+        }
+        (
+            hotl_tools::sandbox::SandboxExtras {
+                writable,
+                file_tools,
+            },
+            warnings,
+        )
+    }
+}
+
+/// Canonical when possible, lexical when the path does not exist (a fresh
+/// config dir before `hotl setup`).
+fn canon_or(p: &Path) -> std::path::PathBuf {
+    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// Equal, ancestor, or descendant — any of the three lets writes cross into
+/// the other's subtree.
+fn overlaps(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
+/// System roots that are honored with a loud warning: making them writable
+/// hands every sandboxed command the binaries/configuration living there.
+/// `/var` is deliberately absent — macOS keeps the user temp tree under
+/// `/var/folders` (already inside the floor), so warning on it would tag
+/// every temp-adjacent path while carrying little signal of its own.
+fn risky_root(p: &Path) -> Option<&'static str> {
+    const RISKY: &[&str] = &[
+        "/etc",
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/boot",
+        "/opt",
+        "/System",
+        "/Library",
+        "/Applications",
+    ];
+    RISKY
+        .iter()
+        .find(|root| overlaps(p, &canon_or(Path::new(root))))
+        .copied()
+}
+
 impl Config {
     /// Load `config.toml`; a malformed file warns and yields defaults
     /// (fail-closed: a typo never silently changes a setting).
@@ -688,6 +850,166 @@ mod tests {
             .egress_policy();
         assert_eq!(policy, EgressPolicy::Off);
         assert!(warning.unwrap().contains("opne"));
+    }
+
+    /// Shared harness for `[sandbox]` resolve tests: a scratch area holding a
+    /// pretend config dir, data dir, and room for writable entries.
+    fn sandbox_dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let scratch = tempfile::tempdir().unwrap();
+        let config_dir = scratch.path().join("config-hotl");
+        let data_dir = scratch.path().join("data-hotl");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        (scratch, config_dir, data_dir)
+    }
+
+    #[test]
+    fn sandbox_section_parses_and_empty_resolves_to_nothing() {
+        use hotl_tools::sandbox::FileToolsMode;
+        let cfg = cfg_with("[sandbox]\nwritable = [\"/x\"]\nfile_tools = \"writable\"\n");
+        assert_eq!(cfg.sandbox.writable, vec!["/x".to_string()]);
+        assert_eq!(cfg.sandbox.file_tools.as_deref(), Some("writable"));
+
+        // Absent section: exactly nothing — the floor is byte-identical to
+        // an unconfigured hotl, and no warning rides every startup.
+        let (_scratch, config_dir, data_dir) = sandbox_dirs();
+        let (extras, warnings) = cfg_with("").sandbox.resolve(&config_dir, &data_dir);
+        assert!(extras.writable.is_empty());
+        assert_eq!(extras.file_tools, FileToolsMode::Workspace);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn sandbox_writable_creates_missing_dirs_and_canonicalizes() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let missing = scratch.path().join("bazel-cache").join("disk");
+        let real = scratch.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = scratch.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let cfg = SandboxCfg {
+            writable: vec![
+                format!("{}/", missing.display()),        // trailing slash
+                link.join("inner").display().to_string(), // via a symlink
+            ],
+            file_tools: None,
+        };
+        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(missing.is_dir(), "missing entries are created at startup");
+        assert_eq!(extras.writable.len(), 2);
+        assert_eq!(extras.writable[0], missing.canonicalize().unwrap());
+        // The symlink is resolved: the grant lands on the target, so the
+        // kernel and the tool boundary agree on one canonical name.
+        assert_eq!(
+            extras.writable[1],
+            real.join("inner").canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn sandbox_writable_refuses_config_and_data_dirs() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let good = scratch.path().join("cache");
+        let link_to_config = scratch.path().join("innocent");
+        std::os::unix::fs::symlink(&config_dir, &link_to_config).unwrap();
+        let cfg = SandboxCfg {
+            writable: vec![
+                config_dir.display().to_string(),             // is the config dir
+                config_dir.join("sub").display().to_string(), // inside it
+                scratch.path().display().to_string(),         // contains it
+                data_dir.display().to_string(),               // the data dir
+                link_to_config.display().to_string(),         // symlink-smuggled
+                good.display().to_string(),                   // the survivor
+            ],
+            file_tools: None,
+        };
+        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        // Refusal wins, entry by entry — the good sibling still lands.
+        assert_eq!(extras.writable, vec![good.canonicalize().unwrap()]);
+        assert_eq!(warnings.len(), 5, "{warnings:?}");
+        for w in &warnings {
+            assert!(w.contains("refused"), "{w}");
+        }
+        // Nothing was created inside the config dir on the way.
+        assert!(!config_dir.join("sub").exists());
+    }
+
+    #[test]
+    fn sandbox_writable_warns_but_honors_risky_roots() {
+        let (_scratch, config_dir, data_dir) = sandbox_dirs();
+        let cfg = SandboxCfg {
+            writable: vec!["/etc".to_string()],
+            file_tools: None,
+        };
+        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        assert_eq!(
+            extras.writable,
+            vec![std::path::Path::new("/etc").canonicalize().unwrap()]
+        );
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("/etc"), "{}", warnings[0]);
+        assert!(!warnings[0].contains("refused"), "{}", warnings[0]);
+    }
+
+    #[test]
+    fn sandbox_writable_skips_files_and_relative_entries() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let file = scratch.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let cfg = SandboxCfg {
+            writable: vec![
+                file.display().to_string(),
+                "relative/cache".to_string(),
+                "~".to_string(), // bare ~ is not expanded — stays relative
+            ],
+            file_tools: None,
+        };
+        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        assert!(extras.writable.is_empty());
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings[0].contains("not a directory"), "{}", warnings[0]);
+        assert!(warnings[1].contains("absolute"), "{}", warnings[1]);
+        assert!(warnings[2].contains("absolute"), "{}", warnings[2]);
+    }
+
+    #[test]
+    fn sandbox_file_tools_parses_and_unknown_fails_closed() {
+        use hotl_tools::sandbox::FileToolsMode;
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let cache = scratch.path().join("cache");
+        let with_mode = |mode: Option<&str>, writable: Vec<String>| {
+            SandboxCfg {
+                writable,
+                file_tools: mode.map(String::from),
+            }
+            .resolve(&config_dir, &data_dir)
+        };
+        let entry = vec![cache.display().to_string()];
+
+        let (extras, w) = with_mode(Some("workspace"), entry.clone());
+        assert_eq!(extras.file_tools, FileToolsMode::Workspace);
+        assert!(w.is_empty(), "{w:?}");
+
+        let (extras, w) = with_mode(Some("writable"), entry.clone());
+        assert_eq!(extras.file_tools, FileToolsMode::Writable);
+        assert!(w.is_empty(), "{w:?}");
+
+        // Unknown mode fails closed to workspace, naming the accepted values.
+        let (extras, w) = with_mode(Some("writeable"), entry);
+        assert_eq!(extras.file_tools, FileToolsMode::Workspace);
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("writeable") && w[0].contains("workspace | writable"),
+            "{}",
+            w[0]
+        );
+
+        // "writable" with nothing writable is a no-op worth saying out loud.
+        let (extras, w) = with_mode(Some("writable"), vec![]);
+        assert_eq!(extras.file_tools, FileToolsMode::Writable);
+        assert_eq!(w.len(), 1);
+        assert!(w[0].contains("no effect"), "{}", w[0]);
     }
 
     #[test]

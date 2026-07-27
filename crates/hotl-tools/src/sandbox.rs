@@ -91,6 +91,70 @@ fn canon(p: PathBuf) -> PathBuf {
     p.canonicalize().unwrap_or(p)
 }
 
+/// How far the *tool-level* boundary of the mutating file tools (`write`,
+/// `edit`) extends. `[sandbox].file_tools` in config.toml selects the mode
+/// from the well-known values `"workspace"` (default) and `"writable"`;
+/// unknown values fail closed to `Workspace` at parse time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileToolsMode {
+    /// `write`/`edit` stay confined to the workspace root (default).
+    #[default]
+    Workspace,
+    /// `write`/`edit` may also write under the `[sandbox].writable` roots.
+    Writable,
+}
+
+/// The owner-configured widening of the floor — `[sandbox]` in config.toml,
+/// resolved and validated by the config layer before it reaches this module
+/// (paths are canonical and never hotl's own config or data dir).
+#[derive(Debug, Default)]
+pub struct SandboxExtras {
+    /// Extra write roots appended to the kernel write set for every
+    /// sandboxed spawn.
+    pub writable: Vec<PathBuf>,
+    /// Whether the mutating file tools also honor `writable`.
+    pub file_tools: FileToolsMode,
+}
+
+static EXTRAS: std::sync::OnceLock<SandboxExtras> = std::sync::OnceLock::new();
+
+/// Install the configured extras, process-wide and set-once (the `net::init`
+/// convention — nothing downstream can widen or replace the set afterwards).
+///
+/// INVARIANT: must run before the first `probe()` call. The probe picks its
+/// outside-the-floor target from `write_roots()`, and its memoized verdict
+/// must describe the floor the children actually get. An un-inited process
+/// falls back to the empty set — narrower than configured, never wider.
+pub fn init_extras(extras: SandboxExtras) {
+    let _ = EXTRAS.set(extras);
+}
+
+pub(crate) fn extra_writable() -> &'static [PathBuf] {
+    EXTRAS.get().map(|e| e.writable.as_slice()).unwrap_or(&[])
+}
+
+pub(crate) fn file_tools_mode() -> FileToolsMode {
+    EXTRAS.get().map(|e| e.file_tools).unwrap_or_default()
+}
+
+/// The complete kernel write set — the single source of truth, consumed by
+/// the Seatbelt profile, the Landlock ruleset, and `probe_dir` alike, so the
+/// enforcement and its confinement proof can never disagree.
+pub(crate) fn write_roots() -> Vec<PathBuf> {
+    write_roots_with(extra_writable())
+}
+
+fn write_roots_with(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = vec![
+        canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        canon(std::env::temp_dir()),
+        PathBuf::from("/private/tmp"),
+        PathBuf::from("/dev"),
+    ];
+    roots.extend(extra.iter().cloned());
+    roots
+}
+
 /// Hard ceiling on the smoke test. A wedged `sandbox-exec` must never wedge
 /// startup; on expiry the child is killed and the verdict is Unavailable
 /// (fail-closed).
@@ -204,7 +268,8 @@ fn linux_mechanism() -> Result<&'static str, String> {
 }
 
 /// A directory we can really write to that is **outside** everything the
-/// floor re-allows (cwd, `TMPDIR`, `/private/tmp`, `/dev`). Returning it is a
+/// floor re-allows (`write_roots()`: cwd, `TMPDIR`, `/private/tmp`, `/dev`,
+/// and any configured `[sandbox].writable` entry). Returning it is a
 /// positive control: the parent creates and deletes a file here first, so a
 /// later "the file does not exist" assertion cannot pass merely because the
 /// path was unwritable anyway (the vacuous-negative trap).
@@ -212,16 +277,17 @@ pub fn probe_dir() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("HOTL_SANDBOX_PROBE_DIR") {
         return writable(&canon(PathBuf::from(dir)));
     }
-    let allowed: Vec<PathBuf> = vec![
-        canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
-        canon(std::env::temp_dir()),
-        PathBuf::from("/private/tmp"),
-        PathBuf::from("/dev"),
-    ];
     let mut candidates: Vec<PathBuf> = vec![PathBuf::from("/var/tmp")];
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(PathBuf::from(home));
     }
+    probe_dir_from(&write_roots(), candidates)
+}
+
+/// The pure search: first candidate that is outside every `allowed` root and
+/// really writable. `allowed` must be canonical; candidates are canonicalized
+/// here.
+fn probe_dir_from(allowed: &[PathBuf], candidates: Vec<PathBuf>) -> Result<PathBuf, String> {
     let mut last = "no candidate directory outside the confinement".to_string();
     for cand in candidates {
         let cand = canon(cand);
@@ -235,7 +301,7 @@ pub fn probe_dir() -> Result<PathBuf, String> {
     }
     Err(format!(
         "cannot verify the sandbox: {last}. Set HOTL_SANDBOX_PROBE_DIR to a writable \
-         directory outside the working directory and outside TMPDIR."
+         directory outside the working directory, TMPDIR, and any [sandbox].writable entry."
     ))
 }
 
@@ -478,15 +544,21 @@ fn apply_proxy_env(
 }
 
 /// The Seatbelt profile, pure (unit-tested against drift). Write-deny by
-/// default with the working tree, temp, and /dev re-allowed; when
-/// `confine_network`, deny all network and re-allow unix-domain sockets and
-/// loopback (the mDNSResponder unix socket means DNS resolution still works —
-/// documented in SECURITY.md as a resolution, not exfil-confinement, limit).
+/// default with the working tree, temp, /dev, and any configured
+/// `[sandbox].writable` roots re-allowed; when `confine_network`, deny all
+/// network and re-allow unix-domain sockets and loopback (the mDNSResponder
+/// unix socket means DNS resolution still works — documented in SECURITY.md
+/// as a resolution, not exfil-confinement, limit).
+///
+/// The extras ride `-D EXTRA_i=` parameters like CWD/TMP do — a literal path
+/// spliced into the profile text would need Seatbelt-string escaping and is a
+/// quoting hazard; a parameter is opaque to the profile language.
 #[cfg(target_os = "macos")]
 fn seatbelt_profile(
     confine_network: bool,
     unix_sockets: UnixSockets,
     automation: Automation,
+    extra_count: usize,
 ) -> String {
     let mut profile = String::from(
         r#"(version 1)
@@ -496,9 +568,12 @@ fn seatbelt_profile(
   (subpath (param "CWD"))
   (subpath (param "TMP"))
   (subpath "/private/tmp")
-  (subpath "/dev"))
-"#,
+  (subpath "/dev")"#,
     );
+    for i in 0..extra_count {
+        profile.push_str(&format!("\n  (subpath (param \"EXTRA_{i}\"))"));
+    }
+    profile.push_str(")\n");
     if confine_network {
         profile.push_str(
             r#"(deny network*)
@@ -553,6 +628,13 @@ fn seatbelt_profile(
 /// shared by the `sh -c` and direct-argv exec shapes.
 #[cfg(target_os = "macos")]
 fn seatbelt_base(egress: &EgressState) -> tokio::process::Command {
+    seatbelt_base_with(egress, extra_writable())
+}
+
+/// The extras-explicit seam — behavioral tests drive configured write roots
+/// through here without touching the process-global `EXTRAS`.
+#[cfg(target_os = "macos")]
+fn seatbelt_base_with(egress: &EgressState, extras: &[PathBuf]) -> tokio::process::Command {
     let confine_network = matches!(egress, EgressState::Off | EgressState::Proxy(_));
     let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let tmp = canon(std::env::temp_dir());
@@ -562,11 +644,19 @@ fn seatbelt_base(egress: &EgressState) -> tokio::process::Command {
             confine_network,
             unix_socket_policy(),
             automation_policy(),
+            extras.len(),
         ))
         .arg("-D")
         .arg(format!("CWD={}", cwd.display()))
         .arg("-D")
         .arg(format!("TMP={}", tmp.display()));
+    for (i, p) in extras.iter().enumerate() {
+        // OsString concatenation, not format!: a non-UTF-8 path must reach
+        // sandbox-exec byte-exact, never lossily rendered.
+        let mut d = std::ffi::OsString::from(format!("EXTRA_{i}="));
+        d.push(p.as_os_str());
+        cmd.arg("-D").arg(d);
+    }
     cmd
 }
 
@@ -642,6 +732,16 @@ pub(crate) fn landlock_net_supported() -> Result<(), String> {
 /// way). Shared by `landlock_command` and `landlock_argv`.
 #[cfg(target_os = "linux")]
 fn build_landlock_ruleset(egress: &EgressState) -> Option<std::os::unix::io::OwnedFd> {
+    build_landlock_ruleset_with(egress, extra_writable())
+}
+
+/// The extras-explicit seam — behavioral tests drive configured write roots
+/// through here without touching the process-global `EXTRAS`.
+#[cfg(target_os = "linux")]
+fn build_landlock_ruleset_with(
+    egress: &EgressState,
+    extras: &[PathBuf],
+) -> Option<std::os::unix::io::OwnedFd> {
     use landlock::{
         Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathFd, Ruleset,
         RulesetAttr, RulesetCreatedAttr, ABI,
@@ -682,8 +782,15 @@ fn build_landlock_ruleset(egress: &EgressState) -> Option<std::os::unix::io::Own
             AccessFs::from_read(abi),
         ))
         .ok()?;
-    // Full access under cwd, tmp, /dev.
-    for p in [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")] {
+    // Full access under cwd, tmp, /dev, and any configured extra root. A
+    // since-deleted extra fails `PathFd::new` and is skipped — writes there
+    // simply stay denied (fail closed), matching the /dev handling.
+    let base = [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")];
+    for p in base
+        .iter()
+        .copied()
+        .chain(extras.iter().map(PathBuf::as_path))
+    {
         if let Ok(fd) = PathFd::new(p) {
             ruleset = ruleset
                 .add_rule(landlock::PathBeneath::new(fd, AccessFs::from_all(abi)))
@@ -707,9 +814,15 @@ fn build_landlock_ruleset(egress: &EgressState) -> Option<std::os::unix::io::Own
 /// `landlock_command`/`landlock_argv` — only how `cmd` is constructed
 /// (`sh -c` vs direct argv) differs between the two.
 #[cfg(target_os = "linux")]
-fn apply_landlock(
+fn apply_landlock(cmd: tokio::process::Command, egress: &EgressState) -> tokio::process::Command {
+    apply_landlock_with(cmd, egress, extra_writable())
+}
+
+#[cfg(target_os = "linux")]
+fn apply_landlock_with(
     mut cmd: tokio::process::Command,
     egress: &EgressState,
+    extras: &[PathBuf],
 ) -> tokio::process::Command {
     use std::os::unix::io::{AsRawFd, OwnedFd};
 
@@ -717,7 +830,7 @@ fn apply_landlock(
     // spawn of this Command (pre_exec runs after fork, before exec — a
     // parent-owned fd is still open in the child there). Fail-closed: with
     // no usable fd the child refuses to exec rather than run unconfined.
-    let ruleset_fd: Option<OwnedFd> = build_landlock_ruleset(egress);
+    let ruleset_fd: Option<OwnedFd> = build_landlock_ruleset_with(egress, extras);
     let apply = move || {
         // Async-signal-safe only from here: raw syscalls, no allocation.
         let Some(fd) = ruleset_fd.as_ref().map(|f| f.as_raw_fd()) else {
@@ -927,6 +1040,48 @@ mod env_tests {
     }
 }
 
+#[cfg(test)]
+mod write_set_tests {
+    use super::*;
+
+    #[test]
+    fn write_roots_with_appends_extras_after_the_base_set() {
+        let extra = PathBuf::from("/somewhere/cache");
+        let base = write_roots_with(&[]);
+        let roots = write_roots_with(std::slice::from_ref(&extra));
+        assert_eq!(roots.len(), base.len() + 1);
+        assert_eq!(roots[..base.len()], base[..]);
+        assert_eq!(roots.last(), Some(&extra));
+        // The base set is exactly today's floor.
+        assert!(base.contains(&PathBuf::from("/dev")));
+        assert!(base.contains(&PathBuf::from("/private/tmp")));
+    }
+
+    #[test]
+    fn probe_dir_from_skips_candidates_inside_any_allowed_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = vec![canon(dir.path().to_path_buf())];
+        let inside = dir.path().join("sub");
+        std::fs::create_dir_all(&inside).unwrap();
+        // The only candidate sits inside an allowed root — writing there
+        // proves nothing, so the search must fail and name the escape hatch.
+        let err = probe_dir_from(&allowed, vec![inside]).unwrap_err();
+        assert!(err.contains("HOTL_SANDBOX_PROBE_DIR"), "{err}");
+    }
+
+    #[test]
+    fn probe_dir_from_accepts_a_writable_candidate_outside_the_set() {
+        let allowed_dir = tempfile::tempdir().unwrap();
+        let candidate = tempfile::tempdir().unwrap();
+        let got = probe_dir_from(
+            &[canon(allowed_dir.path().to_path_buf())],
+            vec![candidate.path().to_path_buf()],
+        )
+        .unwrap();
+        assert_eq!(got, canon(candidate.path().to_path_buf()));
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -955,7 +1110,7 @@ mod tests {
     /// behavioral tests below and `seatbelt_confines_writes` prove enforcement.
     #[test]
     fn seatbelt_profile_carries_every_required_clause() {
-        let open = seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Deny);
+        let open = seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Deny, 0);
         for clause in [
             "(deny file-write*)",
             "(subpath (param \"CWD\"))",
@@ -965,12 +1120,14 @@ mod tests {
         ] {
             assert!(open.contains(clause), "profile lost `{clause}`:\n{open}");
         }
+        // No configured extras → byte-identical to today's profile shape.
+        assert!(!open.contains("EXTRA"), "no EXTRA params without extras");
         // Both opt-outs really opt out.
         assert!(
-            !seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Allow)
+            !seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Allow, 0)
                 .contains("appleevent-send")
         );
-        let confined = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny);
+        let confined = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny, 0);
         for clause in [
             "(deny network*)",
             "(allow network* (local unix) (remote unix))",
@@ -985,9 +1142,62 @@ mod tests {
     }
 
     #[test]
+    fn seatbelt_profile_re_allows_each_configured_extra_via_params() {
+        let p = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny, 2);
+        for clause in [
+            "(subpath (param \"EXTRA_0\"))",
+            "(subpath (param \"EXTRA_1\"))",
+        ] {
+            assert!(p.contains(clause), "profile lost `{clause}`:\n{p}");
+        }
+        // The extras join the file-write re-allow block, never the tail: the
+        // container-daemon denies stay terminal so nothing widens them back.
+        let deny = p.find("(deny network-outbound").expect("daemon deny");
+        assert!(p.find("EXTRA_1").unwrap() < deny);
+    }
+
+    #[tokio::test]
+    async fn seatbelt_allows_writes_under_a_configured_extra_dir() {
+        // The extra must live *outside* the default floor or the test is
+        // vacuous (a tempdir sits under TMPDIR, which is already writable) —
+        // so carve it out of the probe dir. Driven through the
+        // `seatbelt_base_with` seam, never the process-global EXTRAS.
+        let base = probe_dir().expect("a dir outside the floor");
+        let extra = base.join(format!("hotl-sbx-extra-{}", std::process::id()));
+        std::fs::create_dir_all(&extra).unwrap();
+        let target = extra.join("cache-file");
+        let script = format!("echo x > {}", target.display());
+
+        // Control: without the extra configured, the floor denies the write.
+        let denied = run(&script).await;
+        assert!(
+            !denied.status.success(),
+            "control write outside the floor must be denied"
+        );
+
+        // Same write with the extra configured: allowed.
+        let mut cmd = seatbelt_base_with(&EgressState::Open, std::slice::from_ref(&extra));
+        cmd.arg("sh").arg("-c").arg(&script);
+        let ok = cmd
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .expect("spawn");
+        let content = std::fs::read_to_string(&target).unwrap_or_default();
+        std::fs::remove_dir_all(&extra).ok();
+        assert!(
+            ok.status.success(),
+            "write under a configured extra must be allowed: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert_eq!(content.trim(), "x");
+    }
+
+    #[test]
     fn seatbelt_denies_the_container_daemon_socket_class_in_both_network_modes() {
         for confined in [false, true] {
-            let p = seatbelt_profile(confined, UnixSockets::DenyDaemons, Automation::Deny);
+            let p = seatbelt_profile(confined, UnixSockets::DenyDaemons, Automation::Deny, 0);
             // The first *deny* on network-outbound: the `(allow
             // network-outbound (remote ip …))` of the confined profile also
             // contains the operation name, so match on the deny itself.
@@ -1010,7 +1220,9 @@ mod tests {
             }
         }
         // The opt-out really opts out.
-        assert!(!seatbelt_profile(false, UnixSockets::Open, Automation::Deny).contains("docker"));
+        assert!(
+            !seatbelt_profile(false, UnixSockets::Open, Automation::Deny, 0).contains("docker")
+        );
     }
 
     #[tokio::test]
@@ -1196,6 +1408,45 @@ mod linux_tests {
 
         // Reads outside stay allowed (the floor is write-confinement).
         assert!(run("ls / > /dev/null").await.status.success());
+    }
+
+    /// The Linux twin of `seatbelt_allows_writes_under_a_configured_extra_dir`.
+    #[tokio::test]
+    async fn landlock_allows_writes_under_a_configured_extra_dir() {
+        // The extra must live *outside* the default floor or the test is
+        // vacuous (a tempdir sits under TMPDIR, which is already writable) —
+        // so carve it out of the probe dir. Driven through the
+        // `apply_landlock_with` seam, never the process-global EXTRAS.
+        let base = probe_dir().expect("a dir outside the floor");
+        let extra = base.join(format!("hotl-ll-extra-{}", std::process::id()));
+        std::fs::create_dir_all(&extra).unwrap();
+        let target = extra.join("cache-file");
+        let script = format!("echo x > {}", target.display());
+
+        // Control: without the extra configured, the floor denies the write.
+        let denied = run(&script).await;
+        assert!(
+            !denied.status.success(),
+            "control write outside the floor must be denied"
+        );
+
+        // Same write with the extra configured: allowed.
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(&script);
+        let ok = apply_landlock_with(cmd, &EgressState::Open, std::slice::from_ref(&extra))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output()
+            .await
+            .expect("spawn");
+        let content = std::fs::read_to_string(&target).unwrap_or_default();
+        std::fs::remove_dir_all(&extra).ok();
+        assert!(
+            ok.status.success(),
+            "write under a configured extra must be allowed: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert_eq!(content.trim(), "x");
     }
 
     /// A shell word that calls `truncate(2)` **by path** on `victim`.

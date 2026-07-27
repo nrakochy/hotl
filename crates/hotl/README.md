@@ -56,8 +56,11 @@ Check the setup, then run it:
 
 **The safety floor never turns off.** `bash` executes under a kernel sandbox
 (Seatbelt on macOS, Landlock on Linux) confining writes to the working
-directory. Writes to execute-later paths — git hooks, shell rc, Makefiles,
-agent-instruction files — always stop and ask, in every mode. By default the
+directory — plus any out-of-workspace cache directories you list in
+`[sandbox].writable` (bazel, ccache); only you can widen the floor, and
+entries that would expose hotl's own config are refused. Writes to
+execute-later paths — git hooks, shell rc, Makefiles, agent-instruction
+files — always stop and ask, in every mode. By default the
 agent otherwise runs uninterrupted; prefer a y/n prompt on every mutating
 call? Set `[permissions] mode = "ask"`. Need prompting guaranteed? A build
 with `--features security-enforced` cannot disable it by any config. What
@@ -131,6 +134,10 @@ Optional `~/.config/hotl/config.toml` (absent → sensible defaults):
 
     [permissions]
     mode = "auto"                  # agent: "ask" = y/n on every mutating call
+
+    [sandbox]
+    writable = ["~/.bazel_disk_cache"]   # agent: extra dirs sandboxed commands
+                                         # may write (out-of-workspace caches)
 
     [settings.theme]
     preset  = "tokyo-night"        # themes both the agent console and watch

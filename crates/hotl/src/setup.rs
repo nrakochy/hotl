@@ -58,6 +58,24 @@ mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.
 # egress = \"open\"
 # allow = [\"github.com\", \"*.crates.io\"]
 
+[sandbox]
+# Extra directories sandboxed commands (bash, grep, diagnostics, hooks) may
+# write to, on top of the working directory, temp, and /dev — for tools that
+# keep caches outside the workspace (bazel, ccache, …). `~/` expands; missing
+# dirs are created at startup. hotl's own config (~/.config/hotl) and state
+# (~/.local/share/hotl) are refused, so `~` and `/` can never be listed;
+# system roots like /etc or /usr are honored with a loud warning.
+# writable = [\"~/Library/Caches/bazel\", \"~/.bazel_disk_cache\"]
+#
+# How far the write/edit *file tools* follow those dirs:
+#   \"workspace\" (default) — file tools stay confined to the working
+#                            directory; writable only widens bash & friends.
+#   \"writable\"            — write/edit may also touch the writable dirs
+#                            (ordinary ask, same tier as in-workspace writes;
+#                            protected filenames still escalate).
+# Unknown values fall back to \"workspace\" with a warning.
+# file_tools = \"workspace\"
+
 [retention]
 # Prune old sessions/shadows/blobs (run `hotl gc`, or auto at startup once set).
 # max_age_days = 30

@@ -1,6 +1,8 @@
 //! `hotl doctor` (MD): report what this machine's setup will actually do —
 //! provider selection, sandbox floor, config, store health — before the user
-//! burns a prompt finding out. Checks never mutate state.
+//! burns a prompt finding out. Checks never mutate state, with one deliberate
+//! exception: missing `[sandbox].writable` dirs are created exactly as agent
+//! startup would create them, so a creation failure is diagnosable here.
 
 use std::path::Path;
 
@@ -49,9 +51,9 @@ pub fn doctor_main() -> i32 {
         .expect("failed to build doctor's single-threaded runtime");
     let key_helper = key_helper_check(&rt);
     let gateway = gateway_check(&rt);
-    let checks = [
-        provider_check(),
-        sandbox_check(),
+    let mut checks = vec![provider_check()];
+    checks.extend(sandbox_check(&config_dir));
+    checks.extend([
         config_check(&config_dir),
         permissions_check(&config_dir),
         rules_check(&config_dir),
@@ -61,7 +63,7 @@ pub fn doctor_main() -> i32 {
         undo_check(),
         key_helper,
         gateway,
-    ];
+    ]);
     println!("hotl {} — doctor", env!("CARGO_PKG_VERSION"));
     let mut failed = false;
     for check in &checks {
@@ -203,16 +205,40 @@ fn gateway_probe(
     })
 }
 
-fn sandbox_check() -> Check {
-    match sandbox::probe() {
-        sandbox::SandboxStatus::Enforced(m) => ok(format!("sandbox: enforced ({m})")),
+/// Resolves and *installs* the `[sandbox]` extras (set-once) before probing —
+/// the same order agent startup uses — so the verdict certifies the widened
+/// floor, and each refused/dubious entry gets its own warn line.
+fn sandbox_check(config_dir: &Path) -> Vec<Check> {
+    let cfg = crate::config::Config::load(config_dir);
+    let (extras, warnings) = cfg.sandbox.resolve(config_dir, &crate::agent::data_dir());
+    let mut checks: Vec<Check> = warnings
+        .into_iter()
+        .map(|w| warn(format!("sandbox: {w}")))
+        .collect();
+    let extra_note = if extras.writable.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " · [sandbox].writable: {}",
+            extras
+                .writable
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+    hotl_tools::sandbox::init_extras(extras);
+    checks.push(match sandbox::probe() {
+        sandbox::SandboxStatus::Enforced(m) => ok(format!("sandbox: enforced ({m}){extra_note}")),
         sandbox::SandboxStatus::Disabled => {
             warn("sandbox: disabled via HOTL_SANDBOX=off — every exec is individually gated".into())
         }
         sandbox::SandboxStatus::Unavailable(reason) => warn(format!(
             "sandbox: unavailable ({reason}) — every exec is individually gated"
         )),
-    }
+    });
+    checks
 }
 
 fn config_check(config_dir: &Path) -> Check {
