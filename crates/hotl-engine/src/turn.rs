@@ -2778,6 +2778,10 @@ mod tests {
     /// the actor branches on `AckMode` — so the guard is what keeps it that
     /// way through S2c, which rewrites exactly this routing.
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "drives a debug_assert, which release builds compile out"
+    )]
     #[should_panic(expected = "a ticket is not a commit")]
     fn from_reply_refuses_to_treat_a_ticket_as_a_durable_commit() {
         let (_tx, rx) = oneshot::channel();

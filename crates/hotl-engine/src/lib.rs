@@ -955,6 +955,10 @@ mod tests {
     /// catches a mismatched pair — the bug class the reviewer flagged
     /// (bytes and item as two unchecked sources of truth).
     #[test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "drives a debug_assert, which release builds compile out"
+    )]
     #[should_panic(expected = "item's presence must match payload.kind()")]
     fn prepared_entry_new_rejects_a_mismatched_item_and_kind() {
         let masker = hotl_store::Masker::empty();

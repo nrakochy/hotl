@@ -2426,6 +2426,10 @@ mod tests {
     /// This drives the guard with the declaration such a site would have to
     /// make.
     #[tokio::test]
+    #[cfg_attr(
+        not(debug_assertions),
+        ignore = "drives a debug_assert, which release builds compile out"
+    )]
     #[should_panic(expected = "a held steer may only land between samples")]
     async fn an_in_sample_commit_is_not_a_boundary_a_held_steer_may_land_at() {
         let dir = tempfile::tempdir().unwrap();
