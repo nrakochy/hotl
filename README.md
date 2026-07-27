@@ -146,7 +146,7 @@ Exit codes: `0` turn completed · `130` interrupted · `1` any other outcome
 
 | Extension point | Shape | Docs |
 |---|---|---|
-| **Skills** | `skills/*.md` procedures plus `hotl skills` marketplaces. Indexed, never preloaded — the agent sees a grouped index and pulls a skill's text only when it loads one | [skills via configuration](https://nrakochy.github.io/hotl/configuration/) |
+| **Skills** | `skills/*.md` procedures plus `hotl skills` marketplaces. Indexed, never preloaded — the agent sees a grouped index and pulls a skill's text only when it loads one | [skills](https://nrakochy.github.io/hotl/skills/) |
 | **Sub-agents** | `spawn` with built-in types (`general-purpose`, `explore`, `plan`) or your own `agents/*.md`; plus `fork` | [agents](https://nrakochy.github.io/hotl/agents/) |
 | **MCP servers** | `[[mcp]]`, stdio transport | [mcp](https://nrakochy.github.io/hotl/mcp/) |
 | **Retrieval** | `[[retrieval]]` backends behind one `recall` tool; nothing configured by default, no built-in backend touches the network | [retrieval](https://nrakochy.github.io/hotl/retrieval/) |

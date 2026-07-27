@@ -20,6 +20,7 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
 | `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, memory, secrets audit, undo/git. Exit 1 if any check FAILs. |
 | `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
+| `hotl skills [add\|update\|remove]` | List every discovered skill with its source; manage skill marketplaces. See [skills.md](../skills/). |
 | `hotl watch` | The tmux dashboard (separate capability; [crates/hotl/README.md](https://github.com/nrakochy/hotl/blob/master/crates/hotl/README.md)). |
 | `hotl update [ver]` | Print the version + how to update (compares against `ver` if given). |
 | `hotl fleet` | Reserved (orchestrate); not built — exits 2. |
@@ -67,6 +68,13 @@ allow = ["github.com", "*.crates.io"]   # hosts reachable in allowlist mode
 url = "https://s.example/api"   # a JSON search API you run/subscribe to
 api_key_env = "SEARCH_KEY"      # name of an env var holding the key (never the key itself)
 result_cap = 8                  # max results per search (default 8)
+
+[skills]                    # skill roots (see skills.md)
+claude = true               # false: skip ~/.claude/skills and Claude plugin skills
+
+[skills.marketplaces]       # extra skill sources — managed by `hotl skills`
+acme = "https://github.com/acme/skills.git"   # managed checkout
+team = "~/work/team-skills"                    # local, read in place
 
 [concurrency]               # Layer-B budgets; every field optional, safe defaults
 requests = 4                # concurrent web_fetch/web_search HTTP requests
@@ -130,78 +138,20 @@ feel; it's opt-in, the default stays `tokyo-night`.
 |---|---|
 | `system-prompt.md` | Replaces the built-in agent instructions (prose). |
 | `memory/MEMORY.md` | Loaded into every session's starting context (capped at 16 KB), enveloped. |
-| `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. |
+| `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. See [skills.md](../skills/). |
 | `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort` frontmatter, body = system prompt. See [agents.md](../agents/). |
-
-**Claude Code skills load too.** If you have skills in the Claude format —
-`~/.claude/skills/<name>/SKILL.md`, or plugin skills under
-`~/.claude/plugins/cache/` (highest installed version per plugin) — the
-`skill` tool reads them in place: the body loads on demand prefixed with its
-base directory so `references/` and `scripts/` paths resolve (scripts still
-run through the normal bash gate and sandbox). Bare names prefer hotl's own
-skills, then your marketplaces, then your Claude skills, then plugins; a
-plugin skill is always also reachable as `plugin:skill`. Opt out with:
-
-    [skills]
-    claude = false
-
-#### How the agent finds a skill
-
-Skills stay out of the context until they are used. What the model is shown
-on every request is a grouped index — one line per source, with descriptions
-left out entirely, and any source over 12 skills collapsed to a few names
-plus a count:
-
-    hotl: deploy, release
-    claude: auth, go-service, system-shape, vps-cluster
-    claude:superpowers (14): brainstorming, executing-plans, writing-plans, +11 more
-
-On a 24-skill roster that index measures about 150 tokens where the old full
-roster took 980 — and it grows per *source*, so registering a 300-skill
-marketplace adds one line, not 300 names. From there the agent has three
-moves:
-
-| Call | What it does |
-|---|---|
-| `{"name": "deploy"}` | Loads that skill. The usual call. |
-| `{"query": "review a pull request"}` | Searches every skill's full description — **including collapsed ones** — and returns the best 8. |
-| `{"source": "superpowers"}` | Lists one source in full. |
-
-Calling it with no arguments still lists everything.
-
-A collapsed skill is hidden, not unreachable: search covers the whole roster,
-so `query` finds skills the index never named. `hotl skills` always prints
-every skill with its full description — the human view never collapses.
-
-**Forcing one yourself.** In the console TUI, type `/` and the skill name:
-
-    /brainstorming redesign the skill system
-
-Built-in commands (`/rename`) win the name; anything else is looked up as a
-skill, with the rest of the line passed along as arguments. An unrecognised
-name stays an unknown-command notice and never reaches the model. This is the
-manual override for the times the agent doesn't think to search.
 | `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
 
-### Skill marketplaces
+### Skills (`[skills]`)
 
-Register extra skill sources — any git repo or local directory containing
-`SKILL.md` skills:
+Two keys. Everything else about skills — the grouped index the agent sees,
+search over collapsed sources, bodies read on demand, marketplaces, and the
+`/` dispatch — lives in [skills.md](../skills/).
 
-```toml
-[skills.marketplaces]
-acme = "https://github.com/acme/skills.git"   # managed checkout
-team = "~/work/team-skills"                   # local, read in place
-```
-
-Git sources are cloned by `hotl skills add acme <url>` (or `hotl skills
-update` for an entry added by hand) into `~/.config/hotl/marketplaces/<name>`
-and refreshed only by `hotl skills update` — never at startup. `hotl skills`
-lists every discovered skill with its source; `hotl skills remove <name>`
-unregisters one. Skills are discovered up to four directory levels below
-the root, so flat (`<skill>/SKILL.md`) and plugin-repo
-(`plugins/<p>/skills/<s>/SKILL.md`) layouts both work. A skill whose bare
-name is taken stays addressable as `<marketplace>:<skill>`.
+| Key | Effect |
+|---|---|
+| `claude` | `false` stops reading `~/.claude/skills` and Claude plugin skills (default `true`). |
+| `[skills.marketplaces]` | One `name = "<git url or local path>"` per extra skill source; managed by `hotl skills add` / `update` / `remove`. |
 
 ### Built-in tools
 
