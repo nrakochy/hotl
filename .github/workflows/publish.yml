@@ -60,6 +60,13 @@ jobs:
             exit 1
           fi
 
+      # Same reason as ci.yml: the grep tool spawns `rg`, which the runner
+      # image does not ship, and the grep test dies at spawn without it. This
+      # step was missing here while ci.yml had it, so every tag from v0.5.0
+      # on built green in CI and then failed the release.
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Build and test
         run: cargo test --workspace --locked
 
