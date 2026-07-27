@@ -729,14 +729,11 @@ pub(crate) fn landlock_net_supported() -> Result<(), String> {
 /// DNS and DNS-tunnel exfiltration — is not confined) and **port-scoped, not
 /// address-scoped** (the proxy port number is connectable on any host, and
 /// Off blocks loopback TCP too; unix-domain sockets are untouched either
-/// way). Shared by `landlock_command` and `landlock_argv`.
-#[cfg(target_os = "linux")]
-fn build_landlock_ruleset(egress: &EgressState) -> Option<std::os::unix::io::OwnedFd> {
-    build_landlock_ruleset_with(egress, extra_writable())
-}
-
-/// The extras-explicit seam — behavioral tests drive configured write roots
-/// through here without touching the process-global `EXTRAS`.
+/// way). Shared by `landlock_command` and `landlock_argv`, via
+/// `apply_landlock_with`.
+///
+/// `extras` is an explicit seam — behavioral tests drive configured write
+/// roots through here without touching the process-global `EXTRAS`.
 #[cfg(target_os = "linux")]
 fn build_landlock_ruleset_with(
     egress: &EgressState,
@@ -766,8 +763,8 @@ fn build_landlock_ruleset_with(
         .ok()?;
     if confine_network {
         // HardRequirement: on a kernel without the net ABI this fails,
-        // build_landlock_ruleset returns None, and the child refuses to exec
-        // (fail-closed) rather than run with open egress.
+        // build_landlock_ruleset_with returns None, and the child refuses to
+        // exec (fail-closed) rather than run with open egress.
         attr = attr
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(AccessNet::ConnectTcp)
