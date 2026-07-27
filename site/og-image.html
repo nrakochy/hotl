@@ -1,0 +1,139 @@
+<!--
+  Source for public/og.png (the link-preview card). To regenerate after editing:
+
+    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" --headless --disable-gpu \
+      --hide-scrollbars --force-device-scale-factor=2 --window-size=1200,630 \
+      --screenshot=og-render.png "file://$PWD/og-image.html"
+    sips -z 630 1200 og-render.png --out public/og.png
+
+  Any Chromium-based browser binary works. Renders at 2x, downscaled to the
+  1200x630 OG standard.
+-->
+<meta charset="utf-8">
+<style>
+  :root {
+    --ink: #0A0E14;
+    --panel: #10161F;
+    --border: #1C2430;
+    --ring: #35506B;
+    --machine: #6FC3F0;
+    --human: #FFB454;
+    --text: #E8EDF2;
+    --dim: #66768A;
+    --sep: #333F4F;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 1200px; height: 630px; overflow: hidden; }
+  body {
+    background: var(--ink);
+    font-family: "SF Mono", ui-monospace, Menlo, monospace;
+    position: relative;
+  }
+  .content {
+    position: absolute;
+    inset: 0 0 60px 0;
+    display: flex;
+    align-items: center;
+    padding: 0 48px 0 72px;
+  }
+  .words { flex: 1; }
+  .wordmark {
+    font-size: 168px;
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    color: var(--text);
+    line-height: 1;
+  }
+  .cursor {
+    display: inline-block;
+    width: 0.42em;
+    height: 0.7em;
+    background: var(--human);
+    margin-left: 18px;
+  }
+  .tagline {
+    margin-top: 34px;
+    font-size: 45px;
+    color: var(--text);
+    letter-spacing: -0.01em;
+  }
+  .tagline .on { color: var(--human); font-weight: 700; }
+  .sub {
+    margin-top: 18px;
+    font-size: 29px;
+    color: var(--dim);
+  }
+  .diagram { flex: none; width: 470px; }
+  .statusline {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 60px;
+    background: var(--panel);
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    padding: 0 72px;
+    font-size: 21px;
+    color: var(--dim);
+    gap: 22px;
+    white-space: nowrap;
+  }
+  .statusline .s { color: var(--sep); }
+</style>
+
+<div class="content">
+  <div class="words">
+    <div class="wordmark">hotl<span class="cursor"></span></div>
+    <div class="tagline">human <span class="on">on</span> the loop</div>
+    <div class="sub">terminal AI agent</div>
+  </div>
+  <div class="diagram">
+    <svg width="470" height="470" viewBox="0 0 470 470" font-family="SF Mono, ui-monospace, Menlo, monospace">
+      <defs>
+        <radialGradient id="gateGlow">
+          <stop offset="0%" stop-color="#FFB454" stop-opacity="0.28"/>
+          <stop offset="100%" stop-color="#FFB454" stop-opacity="0"/>
+        </radialGradient>
+      </defs>
+      <!-- ring: center 235,235 r 165, dashed, clockwise flow -->
+      <circle cx="235" cy="235" r="165" fill="none" stroke="#35506B" stroke-width="3" stroke-dasharray="10 12"/>
+      <!-- arrowheads at 45/135/225/315 deg (clockwise from 12) -->
+      <g fill="#6FC3F0">
+        <polygon points="9,0 -7,-7 -7,7" transform="translate(351.7,118.3) rotate(45)"/>
+        <polygon points="9,0 -7,-7 -7,7" transform="translate(351.7,351.7) rotate(135)"/>
+        <polygon points="9,0 -7,-7 -7,7" transform="translate(118.3,351.7) rotate(225)"/>
+        <polygon points="9,0 -7,-7 -7,7" transform="translate(118.3,118.3) rotate(315)"/>
+      </g>
+      <!-- masks to lift nodes off the ring -->
+      <g fill="#0A0E14">
+        <circle cx="235" cy="70" r="18"/>
+        <circle cx="400" cy="235" r="18"/>
+        <circle cx="235" cy="400" r="18"/>
+        <circle cx="70" cy="235" r="34"/>
+      </g>
+      <!-- machine nodes: plan (12), run (3), log (6) -->
+      <g fill="none" stroke="#6FC3F0" stroke-width="3">
+        <circle cx="235" cy="70" r="9"/>
+        <circle cx="400" cy="235" r="9"/>
+        <circle cx="235" cy="400" r="9"/>
+      </g>
+      <g fill="#8FA3B8" font-size="21">
+        <text x="235" y="38" text-anchor="middle">plan</text>
+        <text x="400" y="278" text-anchor="middle">run</text>
+        <text x="235" y="444" text-anchor="middle">log</text>
+      </g>
+      <!-- human gate: amber diamond at 9 o'clock -->
+      <circle cx="70" cy="235" r="80" fill="url(#gateGlow)"/>
+      <rect x="48" y="213" width="44" height="44" fill="#FFB454" transform="rotate(45 70 235)"/>
+      <text x="70" y="300" text-anchor="middle" fill="#FFB454" font-size="23" font-weight="700">you</text>
+    </svg>
+  </div>
+</div>
+
+<div class="statusline">
+  <span>fast</span><span class="s">·</span>
+  <span>slim</span><span class="s">·</span>
+  <span>secure</span><span class="s">·</span>
+  <span>extensible</span><span class="s">+</span>
+  <span>tmux dashboard for every agent you run</span>
+</div>

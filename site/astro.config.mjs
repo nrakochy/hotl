@@ -13,14 +13,34 @@ const hotlVersion = readFileSync(new URL('../Cargo.toml', import.meta.url), 'utf
 
 // Host-specific values (GitHub Pages). On the Cloudflare Pages + custom domain
 // migration, point `site` at the domain and drop `base`.
+const site = 'https://nrakochy.github.io';
+const base = '/hotl';
+
+// Link-preview image (source: og-image.html). Scrapers don't resolve relative
+// paths, so this must be an absolute URL.
+const ogImageUrl = `${site}${base}/og.png`;
+
 export default defineConfig({
-	site: 'https://nrakochy.github.io',
-	base: '/hotl',
+	site,
+	base,
 	integrations: [
 		starlight({
 			title: 'hotl',
 			description:
-				'A human-on-the-loop terminal AI agent: gated tools under a kernel sandbox floor, an append-only session log with resume and undo, MCP/ACP, any Anthropic or OpenAI-compatible model.',
+				'A human-on-the-loop agent harness in one binary — fast, slim, secure, and extensible: a coding agent behind a permission gate with a kernel sandbox floor, an append-only session log with resume and undo, and a tmux dashboard for every agent you run.',
+			head: [
+				{ tag: 'meta', attrs: { property: 'og:image', content: ogImageUrl } },
+				{ tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },
+				{ tag: 'meta', attrs: { property: 'og:image:height', content: '630' } },
+				{
+					tag: 'meta',
+					attrs: {
+						property: 'og:image:alt',
+						content: 'hotl — human on the loop: a terminal AI agent whose loop of plan, run, log is gated by you.',
+					},
+				},
+				{ tag: 'meta', attrs: { name: 'twitter:image', content: ogImageUrl } },
+			],
 			social: [
 				{ icon: 'github', label: 'GitHub', href: 'https://github.com/nrakochy/hotl' },
 				{
