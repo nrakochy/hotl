@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-27
+
 ### Fixed
 
 - **A second Esc takes control back; Ctrl-C escalates to quit.** The two keys
