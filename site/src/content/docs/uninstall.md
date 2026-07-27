@@ -10,6 +10,7 @@ Remove the `hotl` agent and its data. `destructive:` the data steps delete sessi
 - Installed with `cargo install`: `cargo uninstall hotl`.
 - Installed from a source build: delete the binary you built (`~/sources/hotl/target/release/hotl`) or the copy you put on your `PATH`.
 - Installed via the shell installer: remove the binary from the install dir it named (typically `~/.local/bin/hotl` or `~/.cargo/bin/hotl`).
+- Installed with `nix profile install`: `nix profile remove hotl` (if the name is ambiguous, `nix profile list` shows the entry to remove).
 
 ## 2. Remove the zsh plugin (if you added it)
 

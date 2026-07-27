@@ -21,6 +21,8 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/
 
 (Or, with a Rust toolchain ≥ 1.88: `cargo install hotl`. Building from a checkout — `cargo build --release -p hotl` — works too; then substitute your `target/release/hotl` path for `hotl` below.)
 
+(Or with Nix, flakes enabled: `nix profile install github:nrakochy/hotl` installs it, or `nix run github:nrakochy/hotl` runs it without installing — then substitute `nix run github:nrakochy/hotl --` for `hotl` below. Nix builds from source, so the first build compiles the whole dependency tree; the prebuilt installer above is the fast path.)
+
 Expected: the installer reports where it put `hotl` (usually `~/.cargo/bin`). Open a fresh shell if needed, then confirm:
 
 ```
