@@ -6,6 +6,40 @@ semver promise of their own.
 
 ## [Unreleased]
 
+First release to reach crates.io since 0.4.1. v0.5.0 through v0.6.1 were
+tagged and pushed but never published; those versions are skipped rather than
+backfilled, so 0.4.1 upgrades straight to this one. The `hotl subscribe`
+webhook bridge is deliberately not in this release — it stays unreleased on
+master.
+
+### Fixed
+
+- **Releases reach crates.io again.** The publish workflow ran the test suite
+  without installing ripgrep, while `ci.yml` has installed it since the `grep`
+  tool landed. `grep` spawns `rg`, and its test asserts real ripgrep exit-code
+  semantics rather than skipping when the binary is absent — so every tag from
+  v0.5.0 on went green in CI and then died in its release job, one step before
+  publishing. Only the release path was affected; a missing `rg` at runtime has
+  always degraded to a tool error telling the agent to fall back to `bash`.
+- **`hotl watch` no longer lists hotl's own utility processes as agents.** Pane
+  discovery skips the non-agent subcommands, so a `watch`, `gc` or `doctor`
+  pane stops appearing in the dashboard as something you could steer.
+
+### Added
+
+- **`hotl watch` shows what a blocked agent is waiting on.** A pane in the
+  Blocked state carries its pending question through to the dashboard instead
+  of only reporting that it is blocked, so the list says what the agent needs
+  rather than just that it needs something. Observations also carry the
+  originating prompt and the raw pane tail.
+
+### Changed
+
+- **Skills get a dedicated docs page**, covering the grouped index, search over
+  collapsed sources, and why there is deliberately no index database. The
+  landing page now leads with how the context window is spent — including that
+  skills are indexed and lazily loaded rather than preloaded.
+
 ## [0.6.1] - 2026-07-26
 
 ### Fixed
