@@ -72,6 +72,12 @@ if grep -q "^## \[$new\]" CHANGELOG.md; then
   exit 1
 fi
 
+# Run the same gate the publish workflow will: a test failure found here costs
+# seconds; found after the push it strands the release half-out (GitHub release
+# and Nix tag built, crates.io refused — v0.5.0 through v0.7.0 all did this).
+echo "running the workspace tests (the publish workflow's gate) ..."
+cargo test --workspace --locked --quiet
+
 echo "releasing $current -> $new"
 
 # Bump the first bare `version = "..."` line — the [workspace.package] one,
