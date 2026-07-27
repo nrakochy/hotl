@@ -898,6 +898,7 @@ impl Turn {
                 item: Item::User {
                     text: format!("<system-reminder>{body}</system-reminder>"),
                     synthetic: Some(SyntheticReason::SystemReminder),
+                    images: Vec::new(),
                 },
             }],
             crate::SampleStage::AtBoundary,
@@ -1692,7 +1693,7 @@ impl Turn {
         snapshot.durable.iter().any(|i| {
             matches!(
                 i,
-                Item::User { text, synthetic: Some(hotl_types::SyntheticReason::SubdirInstructions) }
+                Item::User { text, synthetic: Some(hotl_types::SyntheticReason::SubdirInstructions), .. }
                     if text.contains(marker)
             )
         })
@@ -2157,6 +2158,7 @@ fn unfinished_todos(tail: &[Item]) -> bool {
         Some(Item::User {
             text,
             synthetic: Some(SyntheticReason::Todos),
+            ..
         }) if text.contains("[ ]") || text.contains("[~]")
     )
 }
@@ -2400,6 +2402,7 @@ mod tests {
         Item::User {
             text: text.into(),
             synthetic: Some(SyntheticReason::Todos),
+            images: Vec::new(),
         }
     }
 
@@ -2442,6 +2445,7 @@ mod tests {
         let prompt = Item::User {
             text: "go".into(),
             synthetic: None,
+            images: Vec::new(),
         };
         let sample1 = [prompt.clone()];
         let anchor = Some((500, sample1.len() + 1));
@@ -2471,6 +2475,7 @@ mod tests {
             Item::User {
                 text: "go".into(),
                 synthetic: None,
+                images: Vec::new(),
             },
             tool_results(&"x".repeat(600)),
         ];
@@ -2495,6 +2500,7 @@ mod tests {
         assert!(!unfinished_todos(&[Item::User {
             text: "[ ] not a todo reminder".into(),
             synthetic: None,
+            images: Vec::new()
         }]));
         assert!(unfinished_todos(&[todos_item("<todos>\n[ ] a\n</todos>")]));
         assert!(unfinished_todos(&[todos_item("<todos>\n[~] a\n</todos>")]));
@@ -2511,6 +2517,7 @@ mod tests {
             item: Item::User {
                 text: "key: sk-super-secret-turntest-1".into(),
                 synthetic: None,
+                images: Vec::new(),
             },
         };
         let prepared = prepare_entry(&payload, &masker, 7).await.expect("prepare");
@@ -2558,6 +2565,7 @@ mod tests {
             item: Item::User {
                 text: "token present-secret-value-67890 here".into(),
                 synthetic: None,
+                images: Vec::new(),
             },
         };
         let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
@@ -2576,6 +2584,7 @@ mod tests {
             item: Item::User {
                 text: big_text,
                 synthetic: None,
+                images: Vec::new(),
             },
         };
         let raw = hotl_store::serialize_payload(&payload).unwrap();

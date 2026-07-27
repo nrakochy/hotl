@@ -976,6 +976,7 @@ mod tests {
             Some(Item::User {
                 text: "x".into(),
                 synthetic: None,
+                images: Vec::new(),
             }),
         );
     }
@@ -986,6 +987,7 @@ mod tests {
         let item = Item::User {
             text: "x".into(),
             synthetic: None,
+            images: Vec::new(),
         };
         let payload =
             hotl_store::prepare_payload(&EntryPayload::Item { item: item.clone() }, &masker, 0)

@@ -45,6 +45,7 @@ pub fn project_instructions(cwd: &Path) -> Option<Item> {
             return Some(Item::User {
                 text: envelope(name, &content),
                 synthetic: Some(SyntheticReason::ProjectInstructions),
+                images: Vec::new(),
             });
         }
     }
@@ -66,6 +67,7 @@ pub fn load_memory(config_dir: &Path) -> Option<Item> {
     Some(Item::User {
         text: envelope("memory/MEMORY.md", capped),
         synthetic: Some(SyntheticReason::Memory),
+        images: Vec::new(),
     })
 }
 
@@ -104,6 +106,7 @@ pub fn nested_instructions(cwd: &Path, touched: &Path) -> Option<(String, Item)>
                 let item = Item::User {
                     text: envelope(&source, &content),
                     synthetic: Some(SyntheticReason::SubdirInstructions),
+                    images: Vec::new(),
                 };
                 return Some((marker, item));
             }
@@ -162,7 +165,10 @@ mod tests {
         let dir = tempfile_dir("wrap");
         std::fs::write(dir.join("AGENTS.md"), "# Repo rules\nAlways run tests.").unwrap();
         let item = project_instructions(&dir).expect("found");
-        let Item::User { text, synthetic } = &item else {
+        let Item::User {
+            text, synthetic, ..
+        } = &item
+        else {
             panic!()
         };
         assert_eq!(*synthetic, Some(SyntheticReason::ProjectInstructions));
@@ -202,7 +208,10 @@ mod tests {
             "x".repeat(MEMORY_BUDGET_BYTES * 2),
         )
         .unwrap();
-        let Item::User { text, synthetic } = load_memory(&dir).expect("memory") else {
+        let Item::User {
+            text, synthetic, ..
+        } = load_memory(&dir).expect("memory")
+        else {
             panic!()
         };
         assert_eq!(synthetic, Some(SyntheticReason::Memory));
@@ -223,7 +232,10 @@ mod tests {
 
         let (marker, item) = nested_instructions(&cwd, &sub.join("page.tsx")).expect("hint");
         assert!(marker.contains("web/AGENTS.md"), "marker was {marker}");
-        let Item::User { text, synthetic } = item else {
+        let Item::User {
+            text, synthetic, ..
+        } = item
+        else {
             panic!()
         };
         assert_eq!(synthetic, Some(SyntheticReason::SubdirInstructions));

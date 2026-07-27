@@ -60,7 +60,7 @@ async fn user_prompt_hook_injects_additional_context_after_the_prompt() {
     let prompt_idx = replayed
         .items
         .iter()
-        .position(|i| matches!(i, Item::User { text, synthetic: None } if text == "go"))
+        .position(|i| matches!(i, Item::User { text, synthetic: None, .. } if text == "go"))
         .expect("the prompt itself must be in the projection");
     let reminder_idx = replayed
         .items
@@ -71,6 +71,7 @@ async fn user_prompt_hook_injects_additional_context_after_the_prompt() {
                 Item::User {
                     synthetic: Some(SyntheticReason::SystemReminder),
                     text,
+                    ..
                 } if text.contains("remember: use pnpm")
             )
         })

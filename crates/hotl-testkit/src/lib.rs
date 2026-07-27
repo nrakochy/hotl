@@ -2193,6 +2193,7 @@ mod tests {
                     Item::User {
                         text: format!("earlier request {i}"),
                         synthetic: None,
+                        images: Vec::new(),
                     },
                     Item::Assistant {
                         blocks: vec![json!({"type": "text", "text": format!("earlier reply {i}")})],
@@ -2585,7 +2586,7 @@ mod tests {
         let continuation = &requests[3];
         assert!(matches!(
             &continuation.items[0],
-            Item::User { synthetic: Some(SyntheticReason::CompactionSummary), text }
+            Item::User { synthetic: Some(SyntheticReason::CompactionSummary), text, .. }
                 if text.contains("GOAL: digest of earlier work")
         ));
         let flat = format!("{:?}", continuation.items);
@@ -2735,6 +2736,7 @@ mod tests {
         let seeded = vec![Item::User {
             text: "half-finished request".into(),
             synthetic: None,
+            images: Vec::new(),
         }];
         let mut h = Harness::with_items(
             vec![ScriptedProvider::text_reply(
@@ -2777,6 +2779,7 @@ mod tests {
             Item::User {
                 text: "q".into(),
                 synthetic: None,
+                images: Vec::new(),
             },
             Item::Assistant {
                 blocks: vec![json!({"type":"text","text":"a"})],

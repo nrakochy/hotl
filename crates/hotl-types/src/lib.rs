@@ -48,6 +48,12 @@ pub enum Item {
         text: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         synthetic: Option<SyntheticReason>,
+        /// Attached images. Empty for every synthetic item and for old logs
+        /// (`skip_serializing_if` keeps imageless entries byte-identical to
+        /// the pre-image shape; old binaries ignore the unknown key and keep
+        /// the text, inline `[Image #N]` markers included).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<UserImage>,
     },
     /// Verbatim provider content blocks (text / tool_use / thinking / ...).
     Assistant {
@@ -68,6 +74,21 @@ pub struct ToolResultItem {
     pub content: String,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_error: bool,
+}
+
+/// One user-attached image, stored inline (base64) in the log entry.
+///
+/// Inline — not a blob-sidecar path — is load-bearing: the speculation
+/// protocol proves wire bodies byte-identical across two build paths, and a
+/// serializer that read files at build time could not make that promise;
+/// retention also prunes `.blobs`, which would leave replayed sessions with
+/// dangling image references.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UserImage {
+    /// IANA media type: image/png | image/jpeg | image/gif | image/webp.
+    pub media_type: String,
+    /// Base64 (standard alphabet, padded), no data-URL prefix.
+    pub data: String,
 }
 
 /// A session checklist item (`todo_write`, M4/tier-1 gap #3). Full-state
@@ -389,10 +410,12 @@ mod tests {
             Item::User {
                 text: "hi".into(),
                 synthetic: None,
+                images: Vec::new(),
             },
             Item::User {
                 text: "<project-instructions>...</project-instructions>".into(),
                 synthetic: Some(SyntheticReason::ProjectInstructions),
+                images: Vec::new(),
             },
             Item::Assistant {
                 blocks: vec![
@@ -412,6 +435,50 @@ mod tests {
         for item in &items {
             roundtrip(item);
         }
+    }
+
+    /// The wire/log shape of an imageless user item is pinned to the exact
+    /// pre-`images` bytes: this struct is persisted in session logs and
+    /// serialized into provider requests, so an empty vec must stay invisible.
+    #[test]
+    fn imageless_user_item_serializes_byte_identical_to_before() {
+        let plain = Item::User {
+            text: "hi".into(),
+            synthetic: None,
+            images: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"type":"user","text":"hi"}"#
+        );
+        let tagged = Item::User {
+            text: "x".into(),
+            synthetic: Some(SyntheticReason::Steer),
+            images: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_string(&tagged).unwrap(),
+            r#"{"type":"user","text":"x","synthetic":"steer"}"#
+        );
+        // Old bytes (no `images` key) deserialize to an empty vec.
+        let old: Item = serde_json::from_str(r#"{"type":"user","text":"hi"}"#).unwrap();
+        assert_eq!(old, plain);
+    }
+
+    #[test]
+    fn user_item_with_images_round_trips() {
+        let item = Item::User {
+            text: "look: [Image #1]".into(),
+            synthetic: None,
+            images: vec![UserImage {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            }],
+        };
+        let json = roundtrip(&item);
+        assert!(json.contains(r#""images":[{"media_type":"image/png""#));
+        let back: Item = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, item);
     }
 
     #[test]
@@ -462,6 +529,7 @@ mod tests {
                 item: Item::User {
                     text: "x".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
             },
         };

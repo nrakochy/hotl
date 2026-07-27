@@ -138,7 +138,9 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
         .last()
         .expect("the reminder rides the tail");
     match last {
-        Item::User { text, synthetic } => {
+        Item::User {
+            text, synthetic, ..
+        } => {
             assert_eq!(*synthetic, Some(SyntheticReason::Todos));
             assert!(text.contains("[~] wire the gate"), "text: {text}");
         }
@@ -237,7 +239,9 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
         .last()
         .expect("the reminder rides the tail");
     match last {
-        Item::User { text, synthetic } => {
+        Item::User {
+            text, synthetic, ..
+        } => {
             assert_eq!(*synthetic, Some(SyntheticReason::Todos));
             assert!(text.contains("[~] finish the gate"), "text: {text}");
         }

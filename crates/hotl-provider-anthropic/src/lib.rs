@@ -690,6 +690,7 @@ mod tests {
             items: std::sync::Arc::new(vec![Item::User {
                 text: "hi".into(),
                 synthetic: None,
+                images: Vec::new(),
             }]),
             ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
@@ -1044,6 +1045,7 @@ mod tests {
                 Item::User {
                     text: "instructions".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
                 Item::Assistant {
                     blocks: vec![serde_json::json!({"type":"text","text":"ok"})],
@@ -1121,6 +1123,7 @@ mod tests {
             Item::User {
                 text: "durable instructions".into(),
                 synthetic: None,
+                images: Vec::new(),
             },
             Item::ToolResults {
                 results: vec![ToolResultItem {
@@ -1133,6 +1136,7 @@ mod tests {
         req.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
             text: "<todos>do the thing</todos>".into(),
             synthetic: Some(SyntheticReason::Todos),
+            images: Vec::new(),
         }]);
         req.turn_context = Some("<turn-context/>".into());
 
@@ -1187,6 +1191,7 @@ mod tests {
                 Item::User {
                     text: "instructions".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
                 Item::Assistant {
                     blocks: vec![serde_json::json!({"type":"text","text":"ok"})],
@@ -1216,6 +1221,7 @@ mod tests {
         active.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
             text: "<todos>\n[~] a\n</todos>".into(),
             synthetic: Some(SyntheticReason::Todos),
+            images: Vec::new(),
         }]);
 
         let inactive_body = wire_body(&base);
@@ -1323,6 +1329,7 @@ mod tests {
             vec![Item::User {
                 text: "hi".into(),
                 synthetic: None,
+                images: Vec::new(),
             }],
         );
         req.tools = vec![
@@ -1362,6 +1369,7 @@ mod tests {
             vec![Item::User {
                 text: "hi".into(),
                 synthetic: None,
+                images: Vec::new(),
             }],
         );
         req.cache = CachePolicy::Static {
@@ -1413,6 +1421,7 @@ mod tests {
                 Item::User {
                     text: "instructions".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
                 assistant(1),
                 tool_results(2),
@@ -1445,6 +1454,7 @@ mod tests {
                 Item::User {
                     text: "go".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
                 assistant(1),
                 tool_results(40),
@@ -1492,6 +1502,7 @@ mod tests {
                 Item::User {
                     text: "go".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
                 assistant(1),
                 tool_results(40),
@@ -1536,6 +1547,7 @@ mod tests {
                 Item::User {
                     text: "go".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
                 assistant(1),
                 tool_results(40),
@@ -1599,6 +1611,7 @@ mod tests {
                         Item::User {
                             text: format!("u{i}"),
                             synthetic: None,
+                            images: Vec::new(),
                         },
                         assistant(1 + i % 4),
                         tool_results(1 + (i * 3) % 11),
@@ -1619,6 +1632,7 @@ mod tests {
                 req.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
                     text: "<todos/>".into(),
                     synthetic: Some(SyntheticReason::Todos),
+                    images: Vec::new(),
                 }]);
                 let body = wire_body(&req);
                 let markers = count_markers(&body);
@@ -1646,6 +1660,7 @@ mod tests {
             Item::User {
                 text: "go".into(),
                 synthetic: None,
+                images: Vec::new(),
             },
             assistant(1),
             tool_results(40),
@@ -1678,6 +1693,7 @@ mod tests {
                         Item::User {
                             text: format!("u{i}"),
                             synthetic: None,
+                            images: Vec::new(),
                         },
                         assistant(2),
                         tool_results(1 + (i * 7) % 13),

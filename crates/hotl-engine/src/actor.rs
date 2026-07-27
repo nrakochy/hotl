@@ -1272,6 +1272,7 @@ async fn append_steer(
                 item: Item::User {
                     text,
                     synthetic: Some(SyntheticReason::Steer),
+                    images: Vec::new(),
                 },
             },
         )
@@ -1668,6 +1669,7 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
         items: Arc::new(vec![Item::User {
             text: compaction::summarize_prompt(folded),
             synthetic: None,
+            images: Vec::new(),
         }]),
         // A summarize is a one-shot call against a prompt that is different
         // every time: nothing to cache, and nothing ephemeral to append.
@@ -1764,7 +1766,11 @@ async fn start_turn(
     // hooks (tier-1 gap #7) see the prompt exactly as submitted.
     let prompt_for_hooks = text.clone();
     let payload = EntryPayload::Item {
-        item: Item::User { text, synthetic },
+        item: Item::User {
+            text,
+            synthetic,
+            images: Vec::new(),
+        },
     };
     if !shared.append(log, pipeline, head, payload).await {
         let _ = events
@@ -1793,7 +1799,7 @@ async fn start_turn(
                 let reminder = EntryPayload::Item {
                     item: Item::User {
                         text: format!("<system-reminder>{context}</system-reminder>"),
-                        synthetic: Some(SyntheticReason::SystemReminder),
+                        synthetic: Some(SyntheticReason::SystemReminder), images: Vec::new()
                     },
                 };
                 shared.append(log, pipeline, head, reminder).await;
@@ -1915,6 +1921,7 @@ mod tests {
         Item::User {
             text: text.into(),
             synthetic: Some(SyntheticReason::Steer),
+            images: Vec::new(),
         }
     }
 

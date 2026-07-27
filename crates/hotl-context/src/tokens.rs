@@ -162,6 +162,7 @@ mod tests {
             Item::User {
                 text: text.clone(),
                 synthetic: None,
+                images: Vec::new(),
             },
             Item::Assistant {
                 blocks: vec![serde_json::json!({"type":"text","text":text})],
@@ -198,6 +199,7 @@ mod tests {
         let empty = Item::User {
             text: String::new(),
             synthetic: None,
+            images: Vec::new(),
         };
         assert_eq!(estimate_item(&empty), ITEM_OVERHEAD);
         assert_eq!(estimate_items(&[]), 0);

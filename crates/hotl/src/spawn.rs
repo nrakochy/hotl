@@ -372,6 +372,7 @@ mod tests {
             let initial_items = vec![Item::User {
                 text: brief.to_string(),
                 synthetic: None,
+                images: Vec::new(),
             }];
             Ok(spawn_session(SessionDeps {
                 provider,
@@ -505,6 +506,7 @@ mod tests {
         let history = vec![Item::User {
             text: "earlier parent context".into(),
             synthetic: None,
+            images: Vec::new(),
         }];
         let snapshot: SnapshotFn = {
             let history = history.clone();

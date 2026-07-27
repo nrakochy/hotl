@@ -54,6 +54,7 @@ pub fn contract_item(schema: &Value) -> Item {
              and nothing else:\n{schema}\n</output-contract>"
         ),
         synthetic: Some(SyntheticReason::SystemReminder),
+        images: Vec::new(),
     }
 }
 
@@ -137,7 +138,10 @@ mod tests {
     #[test]
     fn contract_item_is_tagged() {
         let item = contract_item(&json!({"type":"object"}));
-        let Item::User { text, synthetic } = item else {
+        let Item::User {
+            text, synthetic, ..
+        } = item
+        else {
             panic!()
         };
         assert_eq!(synthetic, Some(SyntheticReason::SystemReminder));

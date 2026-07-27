@@ -689,6 +689,7 @@ mod tests {
                 Item::User {
                     text: "hi".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
                 Item::Assistant {
                     blocks: vec![
@@ -716,6 +717,7 @@ mod tests {
             ephemeral_tail: std::sync::Arc::new(vec![Item::User {
                 text: "<todos>\n[~] a\n</todos>".into(),
                 synthetic: Some(hotl_types::SyntheticReason::Todos),
+                images: Vec::new(),
             }]),
             tools: vec![ToolDef {
                 name: "read".into(),
@@ -1218,6 +1220,7 @@ mod tests {
             items: std::sync::Arc::new(vec![Item::User {
                 text: "hi".into(),
                 synthetic: None,
+                images: Vec::new(),
             }]),
             ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),

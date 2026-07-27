@@ -101,6 +101,7 @@ pub fn render_reminder(items: &[Todo]) -> Option<Item> {
     Some(Item::User {
         text: body,
         synthetic: Some(SyntheticReason::Todos),
+        images: Vec::new(),
     })
 }
 
@@ -203,7 +204,9 @@ mod tests {
         }])
         .unwrap();
         match item {
-            hotl_types::Item::User { text, synthetic } => {
+            hotl_types::Item::User {
+                text, synthetic, ..
+            } => {
                 assert_eq!(synthetic, Some(hotl_types::SyntheticReason::Todos));
                 assert!(text.contains("<todos") && text.contains("[ ] a"));
             }

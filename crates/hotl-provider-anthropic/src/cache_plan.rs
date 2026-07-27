@@ -226,6 +226,7 @@ mod tests {
         Item::User {
             text: text.into(),
             synthetic: None,
+            images: Vec::new(),
         }
     }
 

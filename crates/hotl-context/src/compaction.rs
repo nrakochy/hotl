@@ -103,7 +103,9 @@ pub fn summarize_prompt(folded: &[Item]) -> String {
     for item in folded {
         match item {
             Item::System { .. } | Item::Unknown => {}
-            Item::User { text, synthetic } => {
+            Item::User {
+                text, synthetic, ..
+            } => {
                 let label = if synthetic.is_some() {
                     "user (injected)"
                 } else {
@@ -151,6 +153,7 @@ pub fn digest_item(summary: &str) -> Item {
              the messages that follow it are verbatim."
         ),
         synthetic: Some(SyntheticReason::CompactionSummary),
+        images: Vec::new(),
     }
 }
 
@@ -165,6 +168,7 @@ pub fn floor_digest() -> Item {
                </compaction-summary>"
             .into(),
         synthetic: Some(SyntheticReason::CompactionSummary),
+        images: Vec::new(),
     }
 }
 
@@ -178,6 +182,7 @@ mod tests {
         Item::User {
             text: text.into(),
             synthetic: None,
+            images: Vec::new(),
         }
     }
     fn assistant(text: &str) -> Item {
@@ -246,6 +251,7 @@ mod tests {
             Item::User {
                 text: "<project-instructions>…</project-instructions>".into(),
                 synthetic: Some(SyntheticReason::ProjectInstructions),
+                images: Vec::new(),
             },
             user("only prompt"),
         ];

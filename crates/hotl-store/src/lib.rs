@@ -1695,6 +1695,7 @@ mod tests {
                 item: Item::User {
                     text: "here is the key: sk-super-secret-12345".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
             },
             1001,
@@ -1748,6 +1749,7 @@ mod tests {
                 item: Item::User {
                     text: r#"key is p@ss"w0rd\x"#.into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
             },
             2,
@@ -1770,6 +1772,7 @@ mod tests {
         let user = |t: &str| Item::User {
             text: t.into(),
             synthetic: None,
+            images: Vec::new(),
         };
         for text in ["one", "two", "three", "four"] {
             log.append(&EntryPayload::Item { item: user(text) }, 2)
@@ -1824,6 +1827,7 @@ mod tests {
                 item: Item::User {
                     text: "go".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
             },
             2,
@@ -2482,6 +2486,7 @@ mod tests {
                 item: Item::User {
                     text: "please rename the file".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
             },
             2,
@@ -2498,6 +2503,7 @@ mod tests {
         let user = |t: &str| Item::User {
             text: t.into(),
             synthetic: None,
+            images: Vec::new(),
         };
         for text in ["one", "two", "three"] {
             log.append(&EntryPayload::Item { item: user(text) }, 2)
@@ -2557,6 +2563,7 @@ mod tests {
                     item: Item::User {
                         text: "from-parent".into(),
                         synthetic: None,
+                        images: Vec::new(),
                     },
                 },
                 2,
@@ -2718,6 +2725,7 @@ mod tests {
                     item: Item::User {
                         text: "old".into(),
                         synthetic: None,
+                        images: Vec::new(),
                     },
                 },
                 2,
@@ -2735,6 +2743,7 @@ mod tests {
                     item: Item::User {
                         text: "current".into(),
                         synthetic: None,
+                        images: Vec::new(),
                     },
                 },
                 4,
@@ -2812,6 +2821,7 @@ mod tests {
                     item: Item::User {
                         text: filler.clone(),
                         synthetic: None,
+                        images: Vec::new(),
                     },
                 },
                 3,
@@ -2849,6 +2859,7 @@ mod tests {
                     item: Item::User {
                         text: filler.clone(),
                         synthetic: None,
+                        images: Vec::new(),
                     },
                 },
                 3,
@@ -2935,6 +2946,7 @@ mod tests {
                 item: Item::User {
                     text: "plain text, nothing to mask".into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
             },
             Masker::empty(),
@@ -2953,6 +2965,7 @@ mod tests {
                            esc\"ape\\d-secret-9999"
                         .into(),
                     synthetic: None,
+                    images: Vec::new(),
                 },
             },
             masker,
@@ -2989,7 +3002,8 @@ mod tests {
             EntryKind::from(&EntryPayload::Item {
                 item: Item::User {
                     text: "x".into(),
-                    synthetic: None
+                    synthetic: None,
+                    images: Vec::new()
                 }
             }),
             EntryKind::Item

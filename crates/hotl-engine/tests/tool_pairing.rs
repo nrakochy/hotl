@@ -135,11 +135,13 @@ async fn resumed_history_repairs_results_stranded_by_an_older_build() {
         Item::User {
             text: "start".into(),
             synthetic: None,
+            images: Vec::new(),
         },
         assistant("t1"),
         Item::User {
             text: "a steer that landed in the gap".into(),
             synthetic: Some(hotl_types::SyntheticReason::Steer),
+            images: Vec::new(),
         },
         results("t1"),
     ];
