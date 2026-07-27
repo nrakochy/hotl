@@ -241,6 +241,32 @@ fn bullet(raw: &str) -> Option<(&str, &str)> {
     None
 }
 
+/// One visual row with well-formed paste/image tokens styled as chips.
+/// Grammar-only (`paste::token_ranges` — no side table consulted): a stale
+/// token still styles, which is honest — it will also submit literally. A
+/// token split across a wrap row renders unstyled; cosmetic only, the
+/// submit-time expansion never sees rows. Widths are unchanged, so the
+/// cursor math in `input_rows` is untouched.
+fn token_line<'a>(row: String, base: Style, token: Style) -> Line<'a> {
+    let ranges = crate::paste::token_ranges(&row);
+    if ranges.is_empty() {
+        return Line::styled(row, base);
+    }
+    let mut spans = Vec::with_capacity(ranges.len() * 2 + 1);
+    let mut at = 0;
+    for r in ranges {
+        if r.start > at {
+            spans.push(Span::styled(row[at..r.start].to_string(), base));
+        }
+        spans.push(Span::styled(row[r.clone()].to_string(), token));
+        at = r.end;
+    }
+    if at < row.len() {
+        spans.push(Span::styled(row[at..].to_string(), base));
+    }
+    Line::from(spans)
+}
+
 /// The spine and the content spans for one item — the content no longer
 /// carries its own marker prefix; the spine owns that column now.
 fn item_block<'a>(
@@ -258,7 +284,13 @@ fn item_block<'a>(
                 cont_style: Style::new(),
             },
             text.split('\n')
-                .map(|l| Line::styled(l.to_string(), Style::new().fg(p.ink).bold()))
+                .map(|l| {
+                    token_line(
+                        l.to_string(),
+                        Style::new().fg(p.ink).bold(),
+                        Style::new().fg(p.accent).bold(),
+                    )
+                })
                 .collect(),
         ),
         TranscriptItem::Assistant { text } => (
@@ -279,9 +311,10 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.muted),
                 cont_style: Style::new(),
             },
-            vec![Line::styled(
+            vec![token_line(
                 format!("{text} — steer queued, applies at next step"),
                 Style::new().fg(p.muted),
+                Style::new().fg(p.accent),
             )],
         ),
         TranscriptItem::Steer {
@@ -294,7 +327,11 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.accent),
                 cont_style: Style::new(),
             },
-            vec![Line::styled(text.to_string(), Style::new().fg(p.accent))],
+            vec![token_line(
+                text.to_string(),
+                Style::new().fg(p.accent),
+                Style::new().fg(p.accent).bold(),
+            )],
         ),
         TranscriptItem::Tool {
             name,
@@ -553,7 +590,7 @@ fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         .into_iter()
         .skip(top)
         .take(height)
-        .map(Line::raw)
+        .map(|r| token_line(r, Style::new(), Style::new().fg(p.accent)))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
     let x = inner.x + (col as u16).min(inner.width - 1);

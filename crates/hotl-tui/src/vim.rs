@@ -256,6 +256,19 @@ impl Editor {
                 self.end_recall();
                 let (row, col) = self.cursor;
                 if col > 0 {
+                    // A full paste/image token right before the cursor
+                    // deletes as one unit — its content lives in a side
+                    // table, so char-by-char deletion of the token text is
+                    // never what the human means. Backspacing *inside* a
+                    // token stays per-char: mangling is the documented
+                    // escape hatch (the orphaned entry drops at submit).
+                    // Normal-mode `x`/`dw` keep character semantics.
+                    let prefix = char_slice(&self.lines[row], 0, col);
+                    if let Some(len) = crate::paste::token_suffix_chars(&prefix) {
+                        char_remove_range(&mut self.lines[row], col - len, col);
+                        self.cursor.1 = col - len;
+                        return EditorEvent::None;
+                    }
                     char_remove(&mut self.lines[row], col - 1);
                     self.cursor.1 -= 1;
                 } else if row > 0 {
@@ -768,6 +781,29 @@ mod tests {
         e.cursor_to((0, 1));
         e.insert_text("X\r\nY\rZ");
         assert_eq!(e.text(), "aX\nY\nZb");
+    }
+
+    #[test]
+    fn backspace_after_a_token_swallows_it_whole() {
+        let mut e = Editor::new(false);
+        e.set_text("say [Image #1]");
+        e.handle(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(e.text(), "say ");
+        assert_eq!(e.cursor(), (0, 4));
+
+        let mut e = Editor::new(false);
+        e.set_text("[Pasted text #2 +10 lines]");
+        e.handle(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn backspace_inside_a_token_deletes_one_char() {
+        let mut e = Editor::new(false);
+        e.set_text("[Image #1]");
+        e.cursor_to((0, 9)); // just before the closing bracket
+        e.handle(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(e.text(), "[Image #]");
     }
 
     #[test]

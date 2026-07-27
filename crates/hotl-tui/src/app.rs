@@ -1518,14 +1518,15 @@ mod tests {
     fn a_mangled_token_submits_literally_and_drops_the_orphan() {
         let mut s = State::new(false, "m".into());
         update(&mut s, Msg::Paste("/a/b.png".into()));
-        // The human backspaces the token's closing bracket.
+        // The human deletes a char INSIDE the token (backspace at its end
+        // would swallow it whole — that path has its own vim.rs test).
+        s.editor.cursor_to((0, 9));
         press(&mut s, KeyCode::Backspace);
-        type_str(&mut s, "?");
         let cmds = press(&mut s, KeyCode::Enter);
         let Some(Cmd::SendPrompt(p)) = cmds.iter().find(|c| matches!(c, Cmd::SendPrompt(_))) else {
             panic!("expected a prompt: {cmds:?}");
         };
-        assert_eq!(p.text, "[Image #1?");
+        assert_eq!(p.text, "[Image #]");
         assert!(p.images.is_empty(), "the orphan must not ship");
     }
 
