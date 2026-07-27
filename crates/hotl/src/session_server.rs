@@ -231,8 +231,41 @@ async fn handle_frame(line: &str, shared: &Arc<Shared>) -> ClientAction {
         return ClientAction::Continue;
     };
     match msg.get("t").and_then(Value::as_str).unwrap_or("") {
-        "prompt" => shared.handle.prompt(str_field(&msg, "text")).await,
-        "steer" => shared.handle.steer(str_field(&msg, "text")).await,
+        // Attach-protocol parity: images ride at the frame's top level, same
+        // {media_type, data} objects and the same validation as ACP. A frame
+        // that fails validation is dropped whole — committing its text while
+        // discarding its attachments would silently change what the human
+        // said — and the client is told why.
+        "prompt" => match crate::images::parse_images(&msg) {
+            Ok(images) => {
+                shared
+                    .handle
+                    .prompt_with(str_field(&msg, "text"), images)
+                    .await
+            }
+            Err(e) => {
+                send(
+                    shared,
+                    &json!({"t": "error", "message": format!("prompt: {e}")}),
+                )
+                .await
+            }
+        },
+        "steer" => match crate::images::parse_images(&msg) {
+            Ok(images) => {
+                shared
+                    .handle
+                    .steer_with(str_field(&msg, "text"), images)
+                    .await
+            }
+            Err(e) => {
+                send(
+                    shared,
+                    &json!({"t": "error", "message": format!("steer: {e}")}),
+                )
+                .await
+            }
+        },
         "continue" => shared.handle.continue_turn().await,
         "cancel" => shared.handle.interrupt(),
         "ask_reply" => {

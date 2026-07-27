@@ -21,6 +21,10 @@ use serde_json::{json, Value};
 use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
 
 // The server module lives in the binary crate; pull it in directly.
+#[path = "../src/images.rs"]
+#[allow(dead_code)]
+mod images;
+
 #[path = "../src/acp.rs"]
 #[allow(dead_code)]
 mod acp;

@@ -321,10 +321,13 @@ async fn handle_request(
                     // a client's handshake runs before it takes the screen and
                     // wants the seed synchronously, rather than waiting for a
                     // notification that only fires on a *change*.
+                    // `images: true` is the client's feature detection: an
+                    // old server simply never sends the key, so a client can
+                    // tell "images accepted" from "images silently ignored".
                     reply_ok(
                         writer,
                         id,
-                        json!({"sessionId": sid, "name": open.name, "mode": mode}),
+                        json!({"sessionId": sid, "name": open.name, "mode": mode, "images": true}),
                     )
                     .await;
                 }
@@ -338,13 +341,21 @@ async fn handle_request(
             let Some(text) = msg.pointer("/params/text").and_then(Value::as_str) else {
                 return reply_err(writer, id, "session/prompt requires params.text").await;
             };
+            // Images are validated HERE, before the log: a poisoned base64
+            // item would be durable and 400 every later sample (see
+            // `crate::images`). A rejected prompt commits nothing.
+            let images =
+                match crate::images::parse_images(msg.pointer("/params").unwrap_or(&Value::Null)) {
+                    Ok(v) => v,
+                    Err(e) => return reply_err(writer, id, &format!("session/prompt: {e}")).await,
+                };
             // Stash the id; the drain task answers it on TurnDone so the read
             // loop stays free to service permission responses meanwhile.
             pending_prompt
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push_back(id);
-            state.handle.prompt(text.to_string()).await;
+            state.handle.prompt_with(text.to_string(), images).await;
         }
         "session/rename" => {
             let Some(state) = session.as_ref() else {
@@ -406,7 +417,12 @@ async fn handle_request(
             let Some(text) = msg.pointer("/params/text").and_then(Value::as_str) else {
                 return reply_err(writer, id, "session/steer requires params.text").await;
             };
-            state.handle.steer(text.to_string()).await;
+            let images =
+                match crate::images::parse_images(msg.pointer("/params").unwrap_or(&Value::Null)) {
+                    Ok(v) => v,
+                    Err(e) => return reply_err(writer, id, &format!("session/steer: {e}")).await,
+                };
+            state.handle.steer_with(text.to_string(), images).await;
             reply_ok(writer, id, json!({"queued": true})).await;
         }
         "session/cancel" => {

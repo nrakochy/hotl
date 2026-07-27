@@ -13,6 +13,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 // The server module lives in the binary crate; pull it in directly. Some
 // items are only exercised by the real factory in the binary, not this test.
+#[path = "../src/images.rs"]
+#[allow(dead_code)]
+mod images;
+
 #[path = "../src/acp.rs"]
 #[allow(dead_code)]
 mod acp;
@@ -410,6 +414,102 @@ async fn steer_is_acknowledged_and_reaches_engine() {
     .await;
     let err = read_until_id(&mut lines, 4).await;
     assert!(err["error"]["message"].as_str().unwrap().contains("text"));
+}
+
+/// Images ride `session/prompt`/`session/steer` params and are validated at
+/// the wire — a poisoned payload is rejected before anything is committed —
+/// and the open result advertises `images: true` for feature detection.
+#[tokio::test]
+async fn prompt_images_are_validated_at_the_wire() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    // A text-only script: no tool call, so the accepted prompt's turn
+    // completes without this test also having to answer a permission ask.
+    let factory: acp::SessionFactory = Box::new(move |spec| {
+        let name = match spec {
+            acp::SessionSpec::New { name } => name,
+            acp::SessionSpec::Load { name, .. } => name,
+        };
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        std::mem::forget(dir);
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                provider: Arc::new(ScriptedProvider::new(vec![
+                    ScriptedProvider::text_reply("saw it"),
+                    ScriptedProvider::text_reply("saw that too"),
+                ])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                config: EngineConfig::default(),
+            }),
+            name,
+            mode: "ask".into(),
+        })
+    });
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info()));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 1).await;
+    assert_eq!(opened["result"]["images"], json!(true));
+
+    // Bad base64 is rejected with a reason, before the log ever sees it.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/prompt","params":{
+            "text":"look: [Image #1]",
+            "images":[{"media_type":"image/png","data":"not base64!!"}]}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 2).await;
+    assert!(
+        err["error"]["message"].as_str().unwrap().contains("base64"),
+        "{err}"
+    );
+
+    // A valid image is accepted; the turn runs to completion.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{
+            "text":"look: [Image #1]",
+            "images":[{"media_type":"image/png","data":"aW1nMQ=="}]}}),
+    )
+    .await;
+    let done = read_until_id(&mut lines, 3).await;
+    assert!(done.get("result").is_some(), "{done}");
+
+    // Steer takes the same shape and the same validation.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/steer","params":{
+            "text":"and this",
+            "images":[{"media_type":"image/bmp","data":"aW1n"}]}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 4).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("media_type"),
+        "{err}"
+    );
 }
 
 async fn read_until_id(

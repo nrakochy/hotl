@@ -30,6 +30,7 @@ mod diffgen;
 mod doctor;
 mod gc;
 mod history;
+mod images;
 mod keysource;
 mod session_server;
 mod setup;
