@@ -1378,6 +1378,7 @@ impl Surface {
     /// Headless: drain events until the (single) turn completes.
     async fn run_until_idle(&mut self) -> i32 {
         self.turn_running = true;
+        let mut interrupt_pending = false;
         loop {
             tokio::select! {
                 maybe_event = self.handle.events.recv() => {
@@ -1392,7 +1393,15 @@ impl Surface {
                         return code;
                     }
                 }
-                _ = self.sigint.recv() => self.handle.interrupt(),
+                _ = self.sigint.recv() => {
+                    if let Some(code) = sigint_escalation(interrupt_pending) {
+                        eprintln!("\nhotl: force quit — not waiting on the interrupted turn");
+                        return code;
+                    }
+                    interrupt_pending = true;
+                    eprintln!("\n(interrupting — ctrl-c again force-quits)");
+                    self.handle.interrupt();
+                }
             }
         }
     }
@@ -1820,6 +1829,15 @@ fn exit_code(outcome: &Outcome) -> i32 {
     }
 }
 
+/// The headless SIGINT ladder: `None` = interrupt the turn and keep
+/// draining; `Some(code)` = the previous interrupt hasn't ended the turn, so
+/// stop waiting for it. Registering a tokio SIGINT stream replaces the
+/// default die-on-Ctrl-C disposition — without this second rung a turn that
+/// ignores its cancel would leave the process unkillable from the keyboard.
+fn sigint_escalation(interrupt_pending: bool) -> Option<i32> {
+    interrupt_pending.then(|| exit_code(&Outcome::Cancelled))
+}
+
 /// Helper-wins precedence: a configured api-key-helper (env > config.toml)
 /// beats static key env vars. `fallback_key` is the provider's static env key.
 fn key_source_for(
@@ -2133,6 +2151,16 @@ pub(crate) fn sessions_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The headless SIGINT ladder (mirror of the TUI's Ctrl-C): the first
+    /// Ctrl-C interrupts the turn and keeps draining; the second stops
+    /// waiting and exits with the interrupt code — a hung turn must never
+    /// hold the process hostage.
+    #[test]
+    fn a_second_sigint_stops_waiting_with_the_interrupt_exit_code() {
+        assert_eq!(sigint_escalation(false), None, "first ctrl-c interrupts");
+        assert_eq!(sigint_escalation(true), Some(130), "second ctrl-c exits");
+    }
 
     /// §S3.2 (headless `-p`): the provider's connection pool must be armed
     /// right after `select_provider` succeeds and before `scaffold(...)`

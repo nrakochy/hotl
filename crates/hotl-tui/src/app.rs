@@ -179,6 +179,11 @@ pub struct State {
     pub help_open: bool,
     /// First Esc sent a cancel; suppresses duplicate notices until the result.
     pub interrupt_sent: bool,
+    /// Turns the user detached from (second Esc) whose prompt results are
+    /// still in flight. Everything a detached turn emits is absorbed until
+    /// its result arrives and decrements this — the phase belongs to the
+    /// user now, and nothing the dead turn says may take it back.
+    pub detached_turns: u32,
     /// `tool_auto_allowed` arrives before its `tool_start`; the rule parks
     /// here until the card exists.
     pub pending_auto_rule: Option<String>,
@@ -232,6 +237,7 @@ impl State {
             session_usage: SessionUsage::default(),
             help_open: false,
             interrupt_sent: false,
+            detached_turns: 0,
             pending_auto_rule: None,
             session_name: None,
             mode: "ask".into(),
@@ -327,6 +333,29 @@ fn title(state: &State, suffix: &str) -> String {
 }
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
+    // A detached turn (second Esc) is dead to the UI but alive on the wire
+    // until its prompt result arrives. The wire is FIFO, so everything it
+    // emits lands before that result: absorb it all here — except durable
+    // session state — so nothing a dead turn says can reclaim the phase the
+    // user took back. Its asks go unanswered on purpose: their reply channels
+    // die with the cancelled turn and the server prunes them.
+    if state.detached_turns > 0 {
+        match &msg {
+            Msg::Update(v) => {
+                let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+                if !matches!(kind, "mode_changed" | "todos_changed") {
+                    return Vec::new();
+                }
+            }
+            Msg::PermissionRequest { .. } | Msg::QuestionRequest { .. } => return Vec::new(),
+            Msg::PromptResult { usage, .. } => {
+                state.detached_turns -= 1;
+                state.session_usage.add(usage);
+                return Vec::new();
+            }
+            _ => {}
+        }
+    }
     match msg {
         Msg::Update(v) => on_update(state, &v),
         Msg::PermissionRequest {
@@ -649,15 +678,22 @@ fn accept_selected(state: &mut State) {
 }
 
 fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
+    // Ctrl-C outranks every transient owner of the keyboard (help overlay,
+    // popup, modals): idle it quits, busy it interrupts, and once an
+    // interrupt is pending — from either key — it quits outright, so two
+    // presses always suffice to leave.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        state.help_open = false;
+        if state.phase == Phase::Idle || state.interrupt_sent {
+            return vec![Cmd::Quit];
+        }
+        state.interrupt_sent = true;
+        notice(state, "interrupting — ctrl-c again quits".into());
+        return vec![Cmd::Cancel];
+    }
     if state.help_open {
         state.help_open = false;
         return Vec::new();
-    }
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-        return match state.phase {
-            Phase::Idle => vec![Cmd::Quit],
-            _ => vec![Cmd::Cancel],
-        };
     }
     // Ctrl-T expands model reasoning. Above the editor for the same reason as
     // the scroll keys: `Editor::handle` swallows every Ctrl chord it does not
@@ -694,11 +730,7 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         return Vec::new();
     }
     if key.code == KeyCode::Esc && state.phase != Phase::Idle && state.editor.is_empty() {
-        if !state.interrupt_sent {
-            state.interrupt_sent = true;
-            notice(state, "interrupting — esc again to insist".into());
-        }
-        return vec![Cmd::Cancel];
+        return interrupt_or_detach(state);
     }
     if key.code == KeyCode::Char('?') && state.editor.is_empty() {
         state.help_open = true;
@@ -766,6 +798,27 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         }
         EditorEvent::None => Vec::new(),
     }
+}
+
+/// The Esc ladder: the first press asks the engine to cancel; the second
+/// stops waiting for the answer. Control returns unconditionally — the
+/// client must never depend on the server to hand the prompt line back.
+fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
+    if !state.interrupt_sent {
+        state.interrupt_sent = true;
+        notice(state, "interrupting — esc again takes control back".into());
+        return vec![Cmd::Cancel];
+    }
+    state.detached_turns += 1;
+    state.phase = Phase::Idle;
+    state.interrupt_sent = false;
+    notice(
+        state,
+        "control is yours — the interrupted turn is abandoned".into(),
+    );
+    // One more cancel for the road: harmless if the turn is already dead,
+    // decisive if the first one raced the wire.
+    vec![Cmd::Cancel, Cmd::SetTitle(title(state, ""))]
 }
 
 fn submit(state: &mut State, text: String) -> Vec<Cmd> {
@@ -940,6 +993,9 @@ fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             *denying = true;
             Vec::new()
         }
+        // The modal is the model waiting on you; wanting out of it is
+        // wanting the turn gone. Same ladder as the plain-editor Esc.
+        KeyCode::Esc => interrupt_or_detach(state),
         _ => Vec::new(),
     }
 }
@@ -985,6 +1041,9 @@ fn on_question_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             }
         }
         KeyCode::Char(c) => input.push(c),
+        // Same ladder as the ask picker: Esc with nothing typed is "I want
+        // the turn gone", not a dead key.
+        KeyCode::Esc => return interrupt_or_detach(state),
         _ => {}
     }
     Vec::new()
@@ -1596,7 +1655,7 @@ mod tests {
     }
 
     #[test]
-    fn esc_interrupts_then_second_esc_cancels() {
+    fn esc_interrupts_then_second_esc_takes_control_back() {
         let mut s = State::test_default();
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
         let cmds = press(&mut s, KeyCode::Esc);
@@ -1607,19 +1666,131 @@ mod tests {
             "state notes the interrupt"
         );
         let cmds = press(&mut s, KeyCode::Esc);
-        assert!(matches!(cmds[..], [Cmd::Cancel]));
+        assert_eq!(s.phase, Phase::Idle, "the second esc hands the prompt back");
+        assert!(!s.interrupt_sent);
+        assert_eq!(s.detached_turns, 1);
+        assert!(cmds.contains(&Cmd::Cancel), "the dying turn is still told");
+        assert!(
+            matches!(cmds.last(), Some(Cmd::SetTitle(t)) if t == "hotl"),
+            "the working suffix is dropped: {cmds:?}"
+        );
+    }
+
+    /// The wire is FIFO, so everything a detached turn emits arrives before
+    /// its prompt result. None of it may touch the phase the user took back —
+    /// only durable session state (mode, todos) still lands.
+    #[test]
+    fn a_detached_turns_updates_and_asks_cannot_reclaim_the_screen() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Esc);
+        let items = s.transcript.len();
+        upd(&mut s, json!({"type":"text_delta","text":"zombie"}));
+        assert_eq!(
+            s.phase,
+            Phase::Idle,
+            "a dead turn's delta restarted the spinner"
+        );
+        assert_eq!(s.transcript.len(), items);
         update(
             &mut s,
-            Msg::PromptResult {
-                outcome_kind: "cancelled".into(),
-                outcome_text: None,
-                usage: json!({}),
+            Msg::PermissionRequest {
+                req_id: 9,
+                summary: "write ./x".into(),
+                protected_why: None,
+                diff: Vec::new(),
             },
         );
-        assert!(s
-            .transcript
-            .iter()
-            .any(|i| matches!(i, TranscriptItem::Notice { text } if text.contains("cancel"))));
+        assert_eq!(s.phase, Phase::Idle, "a dead turn's ask opened a modal");
+        upd(&mut s, json!({"type":"mode_changed","mode":"plan"}));
+        assert_eq!(s.mode, "plan", "durable session state still lands");
+    }
+
+    /// After a detach the old turn's result must be absorbed — usage folds
+    /// into the session totals (those tokens were billed) but the phase
+    /// belongs to whatever the user is doing now.
+    #[test]
+    fn a_detached_turns_late_result_is_absorbed_without_clobbering_a_new_turn() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Esc);
+        type_str(&mut s, "hi");
+        press(&mut s, KeyCode::Enter);
+        assert!(matches!(s.phase, Phase::Sampling { .. }));
+        let cmds = on_result(&mut s, "cancelled", None, &json!({"input_tokens": 7}));
+        assert!(
+            matches!(s.phase, Phase::Sampling { .. }),
+            "the dead turn's result yanked the new turn back to idle"
+        );
+        assert_eq!(s.detached_turns, 0);
+        assert_eq!(s.session_usage.input, 7, "billed tokens still count");
+        assert!(
+            cmds.is_empty(),
+            "no title/notice churn for an abandoned turn"
+        );
+        // The next result is the live turn's and lands normally.
+        on_result(&mut s, "done", None, &json!({}));
+        assert_eq!(s.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn ctrl_c_escalates_to_quit_on_the_second_press() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Cancel]));
+        assert!(s.interrupt_sent, "the first ctrl-c is an interrupt");
+        assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Quit]));
+    }
+
+    #[test]
+    fn ctrl_c_after_an_esc_interrupt_quits() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        press(&mut s, KeyCode::Esc);
+        assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Quit]));
+    }
+
+    #[test]
+    fn ctrl_c_is_never_swallowed_by_the_help_overlay() {
+        let mut s = State::test_default();
+        s.help_open = true;
+        assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Quit]));
+        assert!(!s.help_open);
+    }
+
+    /// Esc in the ask picker joins the same ladder: the modal is the model
+    /// waiting on you, and wanting out of it is wanting the turn gone.
+    #[test]
+    fn esc_interrupts_from_the_ask_picker_and_detaches_on_the_second_press() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        ask(&mut s);
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert!(matches!(cmds[..], [Cmd::Cancel]));
+        press(&mut s, KeyCode::Esc);
+        assert_eq!(s.phase, Phase::Idle, "the second esc closes the modal too");
+    }
+
+    #[test]
+    fn esc_interrupts_from_the_question_picker() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::QuestionRequest {
+                req_id: 3,
+                question: Question {
+                    header: "Pick".into(),
+                    prompt: "which?".into(),
+                    options: vec![],
+                    multi: false,
+                },
+            },
+        );
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert!(matches!(cmds[..], [Cmd::Cancel]));
+        assert!(s.interrupt_sent);
     }
 
     #[test]

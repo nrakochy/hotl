@@ -572,10 +572,10 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // `an_ask_during_a_search_shows_the_ask_hint`.
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
         (Phase::WaitingAsk { .. }, ..) => {
-            "y allow · n deny · type a reason after n · ctrl-c cancel"
+            "y allow · n deny · type a reason after n · esc interrupt · ctrl-c"
         }
         (Phase::WaitingQuestion { .. }, ..) => {
-            "1-9 pick an option · type for free text · enter submit · esc clear"
+            "1-9 pick an option · type for free text · enter submit · esc clear/interrupt"
         }
         _ if state.editor.search_prompt().is_some() => {
             "type to search · ctrl-r older · enter accept · esc cancel"
@@ -707,7 +707,7 @@ fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
 fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
     let lines: Vec<Line> = [
         "enter send · shift/alt-enter newline",
-        "esc normal mode · esc (empty) interrupt turn",
+        "esc normal mode · esc (empty) interrupt · esc again take control back",
         "i a I A o O insert · h l 0 $ w b e motions (+counts)",
         "d c y operators · dd cc yy x p u",
         "j k scroll transcript when input is empty",
@@ -716,7 +716,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "/help /status /cost /clear /quit · /rename /plan /mode",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
-        "ctrl-e or :e open $EDITOR · ctrl-c quit/cancel",
+        "ctrl-e or :e open $EDITOR · ctrl-c quit (busy: cancel, again quit)",
         "any key closes this help",
     ]
     .into_iter()
