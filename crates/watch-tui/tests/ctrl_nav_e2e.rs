@@ -14,6 +14,8 @@ fn obs(pane: &str) -> AgentObservation {
         cwd: format!("/tmp/{pane}"),
         status: Status::Idle,
         status_line: None,
+        prompt: None,
+        tail: vec![],
         location: Location {
             group: "g".into(),
             sub_group: None,

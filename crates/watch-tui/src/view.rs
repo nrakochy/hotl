@@ -202,6 +202,8 @@ mod tests {
             cwd: cwd.into(),
             status,
             status_line: None,
+            prompt: None,
+            tail: vec![],
             location: Location {
                 group: group.into(),
                 sub_group: Some(sub.into()),
