@@ -276,15 +276,11 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
     prompt_ids: &mut VecDeque<u64>,
 ) -> Option<Cmd> {
     match cmd {
-        Cmd::SendPrompt(text) => {
-            prompt_ids.push_back(
-                client
-                    .request("session/prompt", json!({"text": text}))
-                    .await,
-            );
+        Cmd::SendPrompt(p) => {
+            prompt_ids.push_back(client.request("session/prompt", prompt_params(&p)).await);
         }
-        Cmd::SendSteer(text) => {
-            client.request("session/steer", json!({"text": text})).await;
+        Cmd::SendSteer(p) => {
+            client.request("session/steer", prompt_params(&p)).await;
         }
         Cmd::Cancel => {
             client.request("session/cancel", Value::Null).await;
@@ -315,6 +311,30 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         other => return Some(other),
     }
     None
+}
+
+/// `session/prompt` / `session/steer` params. `images` carries only entries
+/// the runtime seam encoded (`data: Some`) and is omitted entirely when
+/// empty, so a text-only frame stays byte-identical to the pre-image
+/// protocol — an older server never sees a key it does not know. Unencoded
+/// entries are dropped, not asserted: the e2e harness legitimately drives
+/// this without the runtime seam, exactly as it already skips `@[file]`
+/// expansion.
+fn prompt_params(p: &crate::paste::PromptPayload) -> Value {
+    let mut params = json!({"text": p.text});
+    let images: Vec<Value> = p
+        .images
+        .iter()
+        .filter_map(|i| {
+            i.data
+                .as_ref()
+                .map(|d| json!({"media_type": i.media_type, "data": d}))
+        })
+        .collect();
+    if !images.is_empty() {
+        params["images"] = json!(images);
+    }
+    params
 }
 
 #[cfg(test)]
@@ -565,6 +585,39 @@ mod tests {
         assert_eq!(
             lines[1],
             json!({"jsonrpc": "2.0", "id": 8, "result": {"allow": false, "message": "wrong dir"}})
+        );
+    }
+
+    /// The wire-compat pin: a text-only payload serializes byte-identically
+    /// to the pre-image protocol (no `images` key at all), encoded entries
+    /// ride, unencoded entries (harness runs without the runtime seam) drop.
+    #[test]
+    fn prompt_params_omit_images_when_empty_and_serialize_encoded_ones() {
+        use crate::paste::{ImageAttachment, PromptPayload};
+        let text_only = PromptPayload::text_only("hi".into());
+        assert_eq!(prompt_params(&text_only).to_string(), r#"{"text":"hi"}"#);
+
+        let mixed = PromptPayload {
+            text: "see [Image #1] and [Image #2]".into(),
+            images: vec![
+                ImageAttachment {
+                    marker: "[Image #1]".into(),
+                    path: "/a/1.png".into(),
+                    media_type: "image/png".into(),
+                    data: Some("aW1n".into()),
+                },
+                ImageAttachment {
+                    marker: "[Image #2]".into(),
+                    path: "/a/2.png".into(),
+                    media_type: "image/png".into(),
+                    data: None,
+                },
+            ],
+        };
+        let params = prompt_params(&mixed);
+        assert_eq!(
+            params["images"],
+            json!([{"media_type": "image/png", "data": "aW1n"}])
         );
     }
 }

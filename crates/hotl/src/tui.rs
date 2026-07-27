@@ -270,10 +270,10 @@ async fn run_loop(
         while let Some(cmd) = queue.pop_front() {
             // The wire-bound half is shared with the e2e harness; what comes
             // back is the terminal-bound remainder this loop owns.
-            // `@[file]` expands on the way out only.
+            // `@[file]` refs and image paths expand on the way out only.
             let cmd = match cmd {
-                Cmd::SendPrompt(text) => Cmd::SendPrompt(outbound(&text)),
-                Cmd::SendSteer(text) => Cmd::SendSteer(outbound(&text)),
+                Cmd::SendPrompt(p) => Cmd::SendPrompt(outbound(p)),
+                Cmd::SendSteer(p) => Cmd::SendSteer(outbound(p)),
                 other => other,
             };
             let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids).await else {
@@ -297,12 +297,71 @@ async fn run_loop(
 }
 
 /// What actually leaves for the model: `@[path]` references expanded to file
-/// contents. Expansion happens here, not in `hotl-tui`, because it reads the
-/// filesystem and the core crate must stay pure. The consequence is the right
-/// one: the transcript shows what the human typed, the model receives the
-/// expansion — matching how `-p` already behaves.
-fn outbound(text: &str) -> String {
-    crate::setup::expand_file_refs(text)
+/// contents, dropped image paths read and base64-encoded. Both happen here,
+/// not in `hotl-tui`, because they touch the filesystem and the core crate
+/// must stay pure. The consequence is the right one: the transcript shows
+/// what the human typed, the model receives the expansion — matching how
+/// `-p` already behaves.
+///
+/// A failed or over-cap read degrades exactly like `expand_file_refs`: the
+/// `[Image #N]` token is annotated in place in the text and the entry
+/// dropped — never a hard error. The caps are the server's own
+/// (`crate::images`), so a well-behaved client never sends what the server
+/// would reject.
+fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload {
+    let mut text = crate::setup::expand_file_refs(&p.text);
+    let mut images = Vec::new();
+    for img in p.images {
+        if images.len() >= crate::images::MAX_IMAGES_PER_PROMPT {
+            let note = format!(
+                "{} (image {} not attached: at most {} images per prompt)",
+                img.marker,
+                img.path,
+                crate::images::MAX_IMAGES_PER_PROMPT
+            );
+            text = text.replace(&img.marker, &note);
+            continue;
+        }
+        match load_image(&img.path, crate::images::MAX_IMAGE_DECODED_BYTES as u64) {
+            Ok(data) => images.push(hotl_tui::paste::ImageAttachment {
+                data: Some(data),
+                ..img
+            }),
+            Err(why) => {
+                let note = format!(
+                    "{} (image {} could not be attached: {why})",
+                    img.marker, img.path
+                );
+                text = text.replace(&img.marker, &note);
+            }
+        }
+    }
+    hotl_tui::paste::PromptPayload { text, images }
+}
+
+/// Read + base64-encode one dropped image. Metadata first, so an over-cap
+/// file is refused without reading it. `~` expands to `$HOME` — terminals
+/// hand us the path exactly as dropped. Blocking on the loop thread is
+/// accepted precedent at this seam: `history.append` already does blocking
+/// fs here, and `$EDITOR` suspends the loop outright.
+fn load_image(path: &str, cap: u64) -> Result<String, String> {
+    let expanded = match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => std::path::PathBuf::from(home).join(rest),
+            None => std::path::PathBuf::from(path),
+        },
+        None => std::path::PathBuf::from(path),
+    };
+    let meta = std::fs::metadata(&expanded).map_err(|e| e.to_string())?;
+    if meta.len() > cap {
+        return Err(format!(
+            "{:.1}MB exceeds the {}MB per-image cap",
+            meta.len() as f64 / (1024.0 * 1024.0),
+            cap / (1024 * 1024)
+        ));
+    }
+    let bytes = std::fs::read(&expanded).map_err(|e| e.to_string())?;
+    Ok(hotl_tools::b64::encode(&bytes))
 }
 
 /// Transcript items per wheel notch — a third of a page (`scroll::PAGE`).
@@ -560,14 +619,67 @@ mod tests {
     use serde_json::json;
     use std::time::SystemTime;
 
+    use hotl_tui::paste::{ImageAttachment, PromptPayload};
+
+    fn payload(text: &str, images: Vec<ImageAttachment>) -> PromptPayload {
+        PromptPayload {
+            text: text.into(),
+            images,
+        }
+    }
+
+    fn attachment(marker: &str, path: &str) -> ImageAttachment {
+        ImageAttachment {
+            marker: marker.into(),
+            path: path.into(),
+            media_type: "image/png".into(),
+            data: None,
+        }
+    }
+
     #[test]
     fn file_refs_expand_on_the_way_out_not_in_the_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("note.txt");
         std::fs::write(&p, "CONTENTS").unwrap();
         let typed = format!("look at @[{}]", p.display());
-        assert!(super::outbound(&typed).contains("CONTENTS"));
-        assert_eq!(super::outbound("plain"), "plain");
+        assert!(super::outbound(payload(&typed, Vec::new()))
+            .text
+            .contains("CONTENTS"));
+        assert_eq!(super::outbound(payload("plain", Vec::new())).text, "plain");
+    }
+
+    #[test]
+    fn outbound_encodes_a_readable_image_and_annotates_a_missing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, b"fake png bytes").unwrap();
+        let good = attachment("[Image #1]", &img.display().to_string());
+        let gone = attachment("[Image #2]", "/definitely/not/here.png");
+        let out = super::outbound(payload("see [Image #1] and [Image #2]", vec![good, gone]));
+        // The readable one is encoded in place…
+        assert_eq!(out.images.len(), 1);
+        assert_eq!(
+            out.images[0].data.as_deref(),
+            Some(hotl_tools::b64::encode(b"fake png bytes").as_str())
+        );
+        // …and the missing one degrades to an inline note, never an error.
+        assert!(out.text.contains("[Image #1]"), "{}", out.text);
+        assert!(
+            out.text
+                .contains("[Image #2] (image /definitely/not/here.png could not be attached"),
+            "{}",
+            out.text
+        );
+    }
+
+    #[test]
+    fn load_image_refuses_an_over_cap_file_without_reading_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("big.png");
+        std::fs::write(&img, vec![0u8; 64]).unwrap();
+        let err = super::load_image(&img.display().to_string(), 16).unwrap_err();
+        assert!(err.contains("per-image cap"), "{err}");
     }
 
     #[test]

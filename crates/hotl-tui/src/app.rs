@@ -7,6 +7,7 @@ use hotl_tools::ask::{Question, QuestionOption};
 use serde_json::Value;
 
 use crate::complete::{self, Completion};
+use crate::paste;
 use crate::vim::{Editor, EditorEvent};
 
 /// What the agent is doing right now. `ticks` count time *in this phase*
@@ -222,6 +223,13 @@ pub struct State {
     /// Reasoning is context for a decision, not the decision — collapsed is
     /// the default posture.
     pub thinking_expanded: bool,
+    /// Compacted pastes riding the current draft (`paste::Attachment`),
+    /// keyed positionally to their `[Image #N]` / `[Pasted text #N …]`
+    /// tokens. Lives here rather than in `Editor` so `$EDITOR` round-trips
+    /// and history recall (both replace the buffer via `set_text`) cannot
+    /// orphan valid tokens. Cleared on every submit; a mangled token's
+    /// entry is silently dropped at expansion (the orphan rule).
+    pub attachments: Vec<paste::Attachment>,
 }
 
 impl State {
@@ -249,6 +257,7 @@ impl State {
             completion: None,
             dismissed: false,
             thinking_expanded: false,
+            attachments: Vec::new(),
         }
     }
 
@@ -294,8 +303,11 @@ pub enum Msg {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cmd {
-    SendPrompt(String),
-    SendSteer(String),
+    /// The wire-bound draft: paste tokens already expanded, `[Image #N]`
+    /// tokens inline, image paths riding with `data: None` until the
+    /// runtime seam reads and encodes the files.
+    SendPrompt(paste::PromptPayload),
+    SendSteer(paste::PromptPayload),
     /// Send `session/rename` (fire-and-forget; the ack is noise).
     Rename(String),
     /// Send `session/set_mode` (fire-and-forget; the ack is noise). Payload
@@ -400,7 +412,36 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage),
         Msg::Key(key) => on_key(state, key),
         Msg::Paste(text) => {
-            state.editor.insert_text(&text);
+            // A dropped image path or a 3+-line paste compacts to a token;
+            // the content parks in the side table until submit. Numbering is
+            // per-kind and per-draft. Everything else inserts literally —
+            // `insert_text`'s never-submits invariant carries over either
+            // way (tokens contain no newline).
+            match paste::classify(&text) {
+                paste::PasteKind::Image { path, media_type } => {
+                    let n = 1 + state
+                        .attachments
+                        .iter()
+                        .filter(|a| matches!(a, paste::Attachment::Image { .. }))
+                        .count();
+                    state.editor.insert_text(&paste::image_marker(n));
+                    state
+                        .attachments
+                        .push(paste::Attachment::Image { path, media_type });
+                }
+                paste::PasteKind::Text { text, lines } => {
+                    let n = 1 + state
+                        .attachments
+                        .iter()
+                        .filter(|a| matches!(a, paste::Attachment::Paste { .. }))
+                        .count();
+                    state.editor.insert_text(&paste::paste_marker(n, lines));
+                    state
+                        .attachments
+                        .push(paste::Attachment::Paste { text, lines });
+                }
+                paste::PasteKind::Literal => state.editor.insert_text(&text),
+            }
             refresh(state);
             Vec::new()
         }
@@ -770,9 +811,21 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     let event = state.editor.handle(key);
     refresh(state);
     match event {
-        EditorEvent::Submit(text) if text.trim().is_empty() => Vec::new(),
+        EditorEvent::Submit(text) if text.trim().is_empty() => {
+            // The editor already reset its buffer; stale attachments must
+            // not leak their numbering into the next draft.
+            state.attachments.clear();
+            Vec::new()
+        }
         EditorEvent::Submit(text) => {
-            let cmds = submit(state, text.clone());
+            // Expand while the side table is alive — it dies with this
+            // draft. The wire gets paste content + image paths; disk history
+            // gets the fully-expanded text (exactly the bytes pre-compaction
+            // behavior wrote, so a recalled entry is self-contained).
+            let history_text = paste::expand_for_history(&text, &state.attachments);
+            let payload = paste::expand_for_wire(&text, &state.attachments);
+            state.attachments.clear();
+            let cmds = submit(state, text.clone(), payload);
             // Persist only prompt-starting submissions (they emit SendPrompt),
             // and only when the literal text wasn't a slash command — a skill
             // invocation desugars to a prompt but shouldn't leave its `/name`
@@ -780,7 +833,7 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             // everything via the editor's own ring.
             let starts_turn = cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_)));
             if starts_turn && !text.trim_start().starts_with('/') {
-                let mut out = vec![Cmd::AppendHistory(text)];
+                let mut out = vec![Cmd::AppendHistory(history_text)];
                 out.extend(cmds);
                 out
             } else {
@@ -821,26 +874,27 @@ fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
     vec![Cmd::Cancel, Cmd::SetTitle(title(state, ""))]
 }
 
-fn submit(state: &mut State, text: String) -> Vec<Cmd> {
+/// The display/wire fork: the transcript keeps `text` (tokens and all — what
+/// the human typed), the wire gets `payload` (tokens expanded, image paths
+/// riding). A slash command drops the payload; the skill desugar re-enters
+/// with a synthesized text-only one.
+fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec<Cmd> {
     if let Some(rest) = text.trim().strip_prefix('/') {
         return slash_command(state, rest);
     }
     if state.phase == Phase::Idle {
-        state
-            .transcript
-            .push(TranscriptItem::User { text: text.clone() });
+        state.transcript.push(TranscriptItem::User { text });
         state.phase = Phase::Sampling { ticks: 0 };
         state.scroll = Scroll::Follow;
         vec![
-            Cmd::SendPrompt(text),
+            Cmd::SendPrompt(payload),
             Cmd::SetTitle(title(state, " — working")),
         ]
     } else {
-        state.transcript.push(TranscriptItem::Steer {
-            text: text.clone(),
-            queued: true,
-        });
-        vec![Cmd::SendSteer(text)]
+        state
+            .transcript
+            .push(TranscriptItem::Steer { text, queued: true });
+        vec![Cmd::SendSteer(payload)]
     }
 }
 
@@ -949,7 +1003,8 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
             if !arg.is_empty() {
                 text.push_str(&format!("\n\nARGUMENTS: {arg}"));
             }
-            submit(state, text)
+            let payload = paste::PromptPayload::text_only(text.clone());
+            submit(state, text, payload)
         }
         other => {
             notice(state, format!("unknown command: /{other}"));
@@ -1379,9 +1434,144 @@ mod tests {
         let mut s = State::new(false, "m".into());
         let cmds = update(&mut s, Msg::Paste("a\nb\nc\nd".into()));
         assert!(cmds.is_empty(), "paste must not emit SendPrompt: {cmds:?}");
-        assert_eq!(s.editor.text(), "a\nb\nc\nd");
+        // 3+ lines compact to a token; the content parks in the side table.
+        assert_eq!(s.editor.text(), "[Pasted text #1 +4 lines]");
+        assert_eq!(
+            s.attachments,
+            vec![paste::Attachment::Paste {
+                text: "a\nb\nc\nd".into(),
+                lines: 4
+            }]
+        );
         assert_eq!(s.phase, Phase::Idle);
         assert!(s.transcript.is_empty());
+    }
+
+    #[test]
+    fn a_two_line_paste_stays_literal() {
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("a\nb".into()));
+        assert_eq!(s.editor.text(), "a\nb");
+        assert!(s.attachments.is_empty());
+    }
+
+    #[test]
+    fn an_image_path_paste_compacts_to_a_token() {
+        let mut s = State::new(false, "m".into());
+        // The dropped form: escaped space, trailing space — one smoke case;
+        // the full form table lives in paste.rs.
+        update(&mut s, Msg::Paste("/tmp/My\\ Shot.png ".into()));
+        assert_eq!(s.editor.text(), "[Image #1]");
+        assert_eq!(
+            s.attachments,
+            vec![paste::Attachment::Image {
+                path: "/tmp/My Shot.png".into(),
+                media_type: "image/png".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn submit_expands_pastes_ships_image_paths_and_clears_the_table() {
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/tmp/shot.png".into()));
+        type_str(&mut s, " and ");
+        update(&mut s, Msg::Paste("x\ny\nz".into()));
+        let cmds = press(&mut s, KeyCode::Enter);
+        // Transcript shows what the human typed, tokens and all.
+        assert!(matches!(
+            s.transcript.last(),
+            Some(TranscriptItem::User { text })
+                if text == "[Image #1] and [Pasted text #1 +3 lines]"
+        ));
+        // History gets the fully-expanded bytes; the wire gets paste content
+        // plus the image path with data unfilled (the runtime seam's job).
+        let [Cmd::AppendHistory(h), Cmd::SendPrompt(p), Cmd::SetTitle(_)] = &cmds[..] else {
+            panic!("unexpected cmds: {cmds:?}");
+        };
+        assert_eq!(h, "/tmp/shot.png and x\ny\nz");
+        assert_eq!(p.text, "[Image #1] and x\ny\nz");
+        assert_eq!(p.images.len(), 1);
+        assert_eq!(p.images[0].path, "/tmp/shot.png");
+        assert_eq!(p.images[0].data, None);
+        assert!(s.attachments.is_empty(), "the table dies with the draft");
+    }
+
+    #[test]
+    fn markers_number_per_kind_and_reset_after_submit() {
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/a/1.png".into()));
+        update(&mut s, Msg::Paste("l1\nl2\nl3".into()));
+        update(&mut s, Msg::Paste("/a/2.png".into()));
+        assert_eq!(
+            s.editor.text(),
+            "[Image #1][Pasted text #1 +3 lines][Image #2]"
+        );
+        press(&mut s, KeyCode::Enter);
+        // A fresh draft numbers from #1 again.
+        update(&mut s, Msg::Paste("/a/3.png".into()));
+        assert_eq!(s.editor.text(), "[Image #1]");
+        assert_eq!(s.attachments.len(), 1);
+    }
+
+    #[test]
+    fn a_mangled_token_submits_literally_and_drops_the_orphan() {
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/a/b.png".into()));
+        // The human backspaces the token's closing bracket.
+        press(&mut s, KeyCode::Backspace);
+        type_str(&mut s, "?");
+        let cmds = press(&mut s, KeyCode::Enter);
+        let Some(Cmd::SendPrompt(p)) = cmds.iter().find(|c| matches!(c, Cmd::SendPrompt(_))) else {
+            panic!("expected a prompt: {cmds:?}");
+        };
+        assert_eq!(p.text, "[Image #1?");
+        assert!(p.images.is_empty(), "the orphan must not ship");
+    }
+
+    #[test]
+    fn a_steer_carries_images_identically() {
+        let mut s = State::new(false, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        update(&mut s, Msg::Paste("/a/b.png".into()));
+        let cmds = press(&mut s, KeyCode::Enter);
+        let [Cmd::SendSteer(p)] = &cmds[..] else {
+            panic!("expected a steer: {cmds:?}");
+        };
+        assert_eq!(p.text, "[Image #1]");
+        assert_eq!(p.images[0].path, "/a/b.png");
+    }
+
+    #[test]
+    fn an_empty_submit_clears_stale_attachments() {
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/a/b.png".into()));
+        // Delete the whole token, then submit the empty buffer.
+        for _ in 0.."[Image #1]".len() {
+            press(&mut s, KeyCode::Backspace);
+        }
+        press(&mut s, KeyCode::Enter);
+        assert!(s.attachments.is_empty());
+    }
+
+    #[test]
+    fn editor_roundtrip_keeps_attachments() {
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/a/b.png".into()));
+        // `$EDITOR` replaces the whole buffer via set_text; the token
+        // survives textually and the side table lives in State, so the
+        // attachment still ships at submit.
+        let cmds = update(
+            &mut s,
+            Msg::EditorDone(Some("look: [Image #1] please".into())),
+        );
+        assert!(cmds.is_empty(), "{cmds:?}");
+        let cmds = press(&mut s, KeyCode::Enter);
+        let Some(Cmd::SendPrompt(p)) = cmds.iter().find(|c| matches!(c, Cmd::SendPrompt(_))) else {
+            panic!("expected a prompt: {cmds:?}");
+        };
+        assert_eq!(p.images.len(), 1);
+        assert_eq!(p.images[0].path, "/a/b.png");
     }
 
     #[test]
@@ -1642,7 +1832,7 @@ mod tests {
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
         type_str(&mut s, "wait");
         let cmds = press(&mut s, KeyCode::Enter);
-        assert!(matches!(&cmds[..], [Cmd::SendSteer(t)] if t == "wait"));
+        assert!(matches!(&cmds[..], [Cmd::SendSteer(t)] if t.text == "wait"));
         assert!(matches!(
             s.transcript.last(),
             Some(TranscriptItem::Steer { queued: true, .. })
@@ -1955,12 +2145,13 @@ mod tests {
         type_str(&mut s, "/rev");
         assert_eq!(selected(&s), "review", "the skill is the highlighted match");
         let cmds = press(&mut s, KeyCode::Enter);
-        let Some(Cmd::SendPrompt(text)) = cmds.first() else {
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
             panic!("expected a prompt, got {cmds:?}");
         };
         assert!(
-            text.contains("Load the skill `review`"),
-            "the popup selection must dispatch the skill, not the literal typed word: {text}"
+            p.text.contains("Load the skill `review`"),
+            "the popup selection must dispatch the skill, not the literal typed word: {}",
+            p.text
         );
     }
 
@@ -2069,7 +2260,7 @@ mod tests {
             matches!(
                 &cmds[..],
                 [Cmd::AppendHistory(h), Cmd::SendPrompt(p), Cmd::SetTitle(_)]
-                    if h == "explain the bug" && p == "explain the bug"
+                    if h == "explain the bug" && p.text == "explain the bug"
             ),
             "the editor's real content must reach the model unchanged, got {cmds:?}"
         );
@@ -2274,13 +2465,14 @@ mod tests {
         s.skills = vec!["brainstorming".into(), "superpowers:brainstorming".into()];
 
         let cmds = type_and_submit(&mut s, "/brainstorming redesign the skill system");
-        let Some(Cmd::SendPrompt(text)) = cmds.first() else {
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
             panic!("expected a prompt, got {cmds:?}");
         };
-        assert!(text.contains("`brainstorming`"), "{text}");
+        assert!(p.text.contains("`brainstorming`"), "{}", p.text);
         assert!(
-            text.contains("ARGUMENTS: redesign the skill system"),
-            "the argument rides along: {text}"
+            p.text.contains("ARGUMENTS: redesign the skill system"),
+            "the argument rides along: {}",
+            p.text
         );
         assert_eq!(s.phase, Phase::Sampling { ticks: 0 });
 
@@ -2288,10 +2480,10 @@ mod tests {
         let mut s = State::test_default();
         s.skills = vec!["superpowers:brainstorming".into()];
         let cmds = type_and_submit(&mut s, "/superpowers:brainstorming");
-        let Some(Cmd::SendPrompt(text)) = cmds.first() else {
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
             panic!("expected a prompt, got {cmds:?}");
         };
-        assert!(!text.contains("ARGUMENTS"), "{text}");
+        assert!(!p.text.contains("ARGUMENTS"), "{}", p.text);
     }
 
     #[test]
