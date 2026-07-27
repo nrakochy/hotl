@@ -104,10 +104,18 @@
           # cannot silently grow to cover a future test that fails for an
           # unrelated reason.
           #
-          # Linux keeps the whole suite minus the perf gates — Landlock
-          # rulesets stack, so the floor applies normally inside the nix
-          # builder. Stated as reasoning, not measurement: this was resolved
-          # on aarch64-darwin only.
+          # Linux was "keeps the whole suite" by reasoning, not measurement —
+          # and the ubuntu builder never actually reached hotl-tools until
+          # 0.7.0 peeled the failures ahead of it. Measured 2026-07-27:
+          # Landlock itself works in the builder (bash runs confined), but the
+          # probe's outside-the-floor witness dir cannot exist there — the
+          # default /var/tmp is absent, and every writable path sits under
+          # TMPDIR, which the floor covers by construction. The eight
+          # linux-skipped tests below need that witness, directly or by
+          # asserting a confinement verdict; the verdict-agnostic probe tests
+          # (memoization, verdict-matches-host) still run. Real Linux
+          # enforcement coverage lives in ci.yml's harness job on the raw
+          # runner.
           checkFlags =
             # The loop-overhead perf gates (hotl-testkit tests/loop_overhead.rs)
             # compare against a baseline committed from real hardware, and the
@@ -154,6 +162,23 @@
                 "configured_extras_widen_the_floor_and_keep_the_probe_sound"
                 # hotl-testkit
                 "tests::negative_max_turns_never_caps"
+              ]
+            )
+            ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+              map (t: "--skip=${t}") [
+                # hotl-tools lib — each asserts real confinement, which starts
+                # at the probe's outside-the-floor witness write
+                "diagnostics::tests::a_diagnostic_is_confined_and_we_can_tell_it_actually_ran"
+                "sandbox::linux_tests::abi_below_v3_is_not_silently_certified"
+                "sandbox::linux_tests::landlock_allows_writes_under_a_configured_extra_dir"
+                "sandbox::linux_tests::landlock_confines_truncate_by_path"
+                "sandbox::linux_tests::landlock_confines_writes"
+                # hotl-tools tests/ — same witness. Unreached in the failing
+                # log (cargo stops at the lib target); classified by reading
+                # their probe_dir()/verify_confinement_with call paths.
+                "configured_extras_widen_the_floor_and_keep_the_probe_sound"
+                "probe_refuses_a_mechanism_that_does_not_confine"
+                "probe_leaves_no_file_behind_when_the_write_escapes"
               ]
             );
 
