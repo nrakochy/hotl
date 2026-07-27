@@ -149,16 +149,21 @@ impl AnthropicProvider {
             CachePolicy::Static { prefix_ttl } => prefix_ttl,
             CachePolicy::Off => CacheTtl::FiveMinutes,
         };
+        // Derived ONCE and handed to both the planner and both render calls:
+        // the plan's block arithmetic and the rendered block layout must
+        // agree on whether image blocks exist, or markers land on the wrong
+        // blocks and every sample re-bills its history at write price.
+        let send_images = hotl_provider::catalog::supports_images(&req.model);
         // One plan per body, from the durable items alone — see `cache_plan`
         // for why the planner may not remember anything.
-        let plan = mark.then(|| cache_plan::plan(&req.items));
-        let mut messages = build_messages(&req.items, plan.as_ref(), ttl);
+        let plan = mark.then(|| cache_plan::plan(&req.items, send_images));
+        let mut messages = build_messages(&req.items, plan.as_ref(), ttl, send_images);
         // The ephemeral suffix, in wire order: after every durable message and
         // so after the deepest marker, before MOIM. Passing no plan is not a
         // policy decision made here — these items are not in `req.items`, so
         // the planner above never saw them and could not have picked one. That
         // is the whole point of the split.
-        messages.extend(build_messages(&req.ephemeral_tail, None, ttl));
+        messages.extend(build_messages(&req.ephemeral_tail, None, ttl, send_images));
         // MOIM rides last of all, after the cache marker: it changes every
         // sample without invalidating the cached prefix (suffix position).
         if let Some(tc) = &req.turn_context {
@@ -254,14 +259,20 @@ fn ttl_marker(ttl: CacheTtl) -> Value {
 /// The plan's item indices index `items` (skipped items included), so this
 /// loop and [`cache_plan::plan`] must walk the list the same way — that shared
 /// walk is why `cache_plan::item_blocks` is required to mirror the match arms
-/// below.
+/// below, and why `send_images` here MUST be the same flag the plan was built
+/// with (`build_body` derives it once from the model's catalog row).
 ///
 /// `ttl` is only ever consulted for a rolling ANCHOR: the LATEST marker
 /// (`Plan::is_latest`) always renders plain (Task 4's rule — see
 /// `CachePolicy::Static`'s doc comment for why), regardless of what the
 /// caller passed. Ignored entirely when `plan` is `None` (the ephemeral tail
 /// has no plan and so never marks anything).
-fn build_messages(items: &[Item], plan: Option<&cache_plan::Plan>, ttl: CacheTtl) -> Vec<Value> {
+fn build_messages(
+    items: &[Item],
+    plan: Option<&cache_plan::Plan>,
+    ttl: CacheTtl,
+    send_images: bool,
+) -> Vec<Value> {
     let marker = |idx: usize, block: usize| -> Option<Value> {
         let p = plan?;
         if p.is_latest(idx, block) {
@@ -278,12 +289,36 @@ fn build_messages(items: &[Item], plan: Option<&cache_plan::Plan>, ttl: CacheTtl
             // System items never reach the wire from here — the system prompt
             // travels in the request's `system` field (context assembly owns it).
             Item::System { .. } | Item::Unknown => continue,
-            Item::User { text, .. } => {
-                let mut block = json!({"type": "text", "text": text});
-                if let Some(cc) = marker(idx, 0) {
+            Item::User { text, images, .. } => {
+                // Images render before the text block (API guidance), and the
+                // text block is the only markable one: a marker there seals
+                // the image bytes before it into the cached prefix. When the
+                // model's catalog row refuses images, the blocks are dropped
+                // and the text gains one deterministic omission note — inside
+                // this block, never a new one, so the plan's arithmetic
+                // (which was built with the same flag) still matches.
+                let mut content = Vec::with_capacity(images.len() + 1);
+                if send_images {
+                    for img in images {
+                        content.push(json!({"type": "image", "source": {
+                            "type": "base64",
+                            "media_type": img.media_type,
+                            "data": img.data,
+                        }}));
+                    }
+                }
+                let text_block = if send_images { images.len() } else { 0 };
+                let rendered = if send_images {
+                    std::borrow::Cow::Borrowed(text.as_str())
+                } else {
+                    hotl_provider::transform::text_with_omitted_images(text, images.len())
+                };
+                let mut block = json!({"type": "text", "text": rendered.as_ref()});
+                if let Some(cc) = marker(idx, text_block) {
                     block["cache_control"] = cc;
                 }
-                out.push(json!({"role": "user", "content": [block]}));
+                content.push(block);
+                out.push(json!({"role": "user", "content": content}));
             }
             // Echoed verbatim, never marked: these blocks carry thinking
             // signatures the API validates byte for byte.
@@ -1605,6 +1640,16 @@ mod tests {
             vec![tool_results(15)],
             vec![tool_results(200)],
             vec![assistant(50), tool_results(50)],
+            vec![user_with_images("look", 8), tool_results(30)],
+            (0..10)
+                .flat_map(|i| {
+                    vec![
+                        user_with_images(&format!("img{i}"), 1 + i % 3),
+                        assistant(1),
+                        tool_results(1 + (i * 3) % 7),
+                    ]
+                })
+                .collect(),
             (0..30)
                 .flat_map(|i| {
                     vec![
@@ -1695,6 +1740,100 @@ mod tests {
                             synthetic: None,
                             images: Vec::new(),
                         },
+                        assistant(2),
+                        tool_results(1 + (i * 7) % 13),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        };
+        let a = wire_body(&static_req("sys", items()));
+        let b = wire_body(&static_req("sys", items()));
+        assert_eq!(a.to_string(), b.to_string());
+        assert!(count_markers(&a) > 2, "fixture must produce anchors");
+    }
+
+    fn user_with_images(text: &str, n: usize) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: None,
+            images: (0..n)
+                .map(|i| hotl_types::UserImage {
+                    media_type: "image/png".into(),
+                    data: format!("aW1n{i}=="),
+                })
+                .collect(),
+        }
+    }
+
+    /// The wire shape of an image-bearing user item: image blocks first
+    /// (base64 source form), the text block last. Model "m" is uncatalogued,
+    /// so the gate fails open — images are sent.
+    #[test]
+    fn image_blocks_render_before_the_text_block_with_base64_sources() {
+        let req = static_req("sys", vec![user_with_images("what is this?", 2)]);
+        let body = wire_body(&req);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        assert_eq!(
+            content[0]["source"],
+            serde_json::json!({"type": "base64", "media_type": "image/png", "data": "aW1n0=="})
+        );
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "what is this?");
+    }
+
+    /// Lockstep: the plan prices an image-bearing item at 1 + n blocks and
+    /// marks ONLY the text block — never an image block — so the marker seals
+    /// the image bytes before it into the cached prefix.
+    #[test]
+    fn an_image_bearing_item_marks_only_its_text_block() {
+        let body = wire_body(&static_req("sys", vec![user_with_images("go", 2)]));
+        // Wire blocks: image@1, image@2, text@3 — the latest marker is at 3.
+        assert_eq!(marked_block_indices(&body), vec![3]);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert!(content[0].get("cache_control").is_none());
+        assert!(content[1].get("cache_control").is_none());
+        assert!(content[2].get("cache_control").is_some());
+
+        // And image widths shift later crossings exactly like rendered blocks
+        // (they are rendered blocks): 12 images + text = 13, results at
+        // 14..=43, so the 15-crossing lands inside the batch at block 1.
+        let items = vec![user_with_images("wide", 12), tool_results(30)];
+        let p = cache_plan::plan(&items, true);
+        assert_eq!(p.latest, Some(cache_plan::Mark { item: 1, block: 29 }));
+        assert!(p
+            .anchors
+            .iter()
+            .all(|m| m.item == 1 || (m.item == 0 && m.block == 12)));
+    }
+
+    /// `send_images = false` (a catalogued non-vision model): image blocks
+    /// are dropped, the text block gains one deterministic omission note, and
+    /// the plan built with the same flag prices the item at exactly 1 block.
+    #[test]
+    fn a_gated_model_drops_images_and_notes_the_omission_in_the_text_block() {
+        let items = vec![user_with_images("see [Image #1]", 2)];
+        let plan = cache_plan::plan(&items, false);
+        assert_eq!(plan.latest, Some(cache_plan::Mark { item: 0, block: 0 }));
+        let msgs = build_messages(&items, Some(&plan), CacheTtl::FiveMinutes, false);
+        let content = msgs[0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 1, "images dropped, no extra block");
+        let text = content[0]["text"].as_str().unwrap();
+        assert!(text.starts_with("see [Image #1]\n\n[note: 2 attached image(s)"));
+        assert!(content[0].get("cache_control").is_some(), "still markable");
+    }
+
+    /// Speculative-vs-sequential byte identity holds for image-bearing
+    /// histories: base64 lives inline in the items, so two independent
+    /// rebuilds serialize the same bytes.
+    #[test]
+    fn equal_image_bearing_item_lists_serialize_to_equal_bytes() {
+        let items = || {
+            (0..8)
+                .flat_map(|i| {
+                    vec![
+                        user_with_images(&format!("u{i}"), 1 + i % 3),
                         assistant(2),
                         tool_results(1 + (i * 7) % 13),
                     ]

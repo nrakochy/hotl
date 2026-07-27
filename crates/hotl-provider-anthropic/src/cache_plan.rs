@@ -75,13 +75,16 @@ const MAX_ANCHORS: usize = MAX_BREAKPOINTS - 2;
 ///
 /// MUST mirror `build_messages` exactly — the planner's arithmetic is over
 /// *rendered* blocks, so an item this function mis-sizes moves every crossing
-/// after it. Anything `build_messages` skips costs 0.
-fn item_blocks(item: &Item) -> usize {
+/// after it. Anything `build_messages` skips costs 0. `send_images` is part
+/// of the mirrored contract: both walks must be handed the same flag
+/// (`build_body` derives it once from the model's catalog row), or crossings
+/// desync from wire positions.
+fn item_blocks(item: &Item, send_images: bool) -> usize {
     match item {
         // Never reaches the wire from the messages list: the system prompt
         // travels in the request's `system` field.
         Item::System { .. } | Item::Unknown => 0,
-        Item::User { .. } => 1,
+        Item::User { images, .. } => 1 + if send_images { images.len() } else { 0 },
         Item::Assistant { blocks } => blocks.len(),
         Item::ToolResults { results } => results.len(),
     }
@@ -150,17 +153,32 @@ impl Plan {
 /// Every durable item is a candidate regardless of its `synthetic` tag:
 /// ephemerality is positional now (`SamplingRequest::ephemeral_tail` is a
 /// separate list this planner never sees), so there is no tag to special-case.
-fn candidates(items: &[Item]) -> Vec<(usize, Mark)> {
+fn candidates(items: &[Item], send_images: bool) -> Vec<(usize, Mark)> {
     let mut out = Vec::new();
     let mut before = 0usize;
     for (item, entry) in items.iter().enumerate() {
         match entry {
-            Item::User { .. } => out.push((before + 1, Mark { item, block: 0 })),
+            // Only the trailing text block is markable: image blocks count
+            // toward cumulative wire position (so crossings shift correctly)
+            // but never carry markers — a marker on the text block already
+            // seals the images before it into the cached prefix. An
+            // image-heavy item therefore eats stride slack exactly like a
+            // wide assistant turn: same documented, deterministic residual.
+            Item::User { images, .. } => {
+                let text_block = if send_images { images.len() } else { 0 };
+                out.push((
+                    before + text_block + 1,
+                    Mark {
+                        item,
+                        block: text_block,
+                    },
+                ));
+            }
             Item::ToolResults { results } => out
                 .extend((0..results.len()).map(|block| (before + block + 1, Mark { item, block }))),
             Item::Assistant { .. } | Item::System { .. } | Item::Unknown => {}
         }
-        before += item_blocks(entry);
+        before += item_blocks(entry, send_images);
     }
     out
 }
@@ -188,9 +206,11 @@ fn crossings(cands: &[(usize, Mark)]) -> Vec<Mark> {
 }
 
 /// Plan the deep breakpoints for one durable item list. Pure: same items in,
-/// same plan out, always.
-pub(crate) fn plan(items: &[Item]) -> Plan {
-    let cands = candidates(items);
+/// same plan out, always — `send_images` comes from static catalog data and a
+/// fixed per-request model, so byte-identity across speculative and
+/// sequential rebuilds holds.
+pub(crate) fn plan(items: &[Item], send_images: bool) -> Plan {
+    let cands = candidates(items, send_images);
     // The last candidate *is* the last durable user-role block, by
     // construction — the same position the pre-anchor serializer marked. (A
     // degenerate `ToolResults` with zero results contributes no candidate, so
@@ -262,10 +282,10 @@ mod tests {
         // 15 → the tool_result at cumulative 15 (j = 12);
         // 30 → the tool_result at cumulative 30 (j = 27); 45 is past the end.
         assert_eq!(
-            crossings(&candidates(&items)),
+            crossings(&candidates(&items, true)),
             vec![mark(2, 12), mark(2, 27)]
         );
-        let p = plan(&items);
+        let p = plan(&items, true);
         assert_eq!(p.anchors, vec![mark(2, 12), mark(2, 27)]);
         assert_eq!(p.latest, Some(mark(2, 29)));
     }
@@ -275,7 +295,7 @@ mod tests {
     #[test]
     fn a_wide_tool_batch_gets_an_interior_anchor() {
         let items = vec![user("go"), assistant(1), results(30)];
-        let p = plan(&items);
+        let p = plan(&items, true);
         assert!(
             p.anchors.iter().all(|m| m.item == 2 && m.block > 0),
             "anchors must sit inside the batch, not before it: {:?}",
@@ -293,7 +313,7 @@ mod tests {
     #[test]
     fn at_most_two_anchors_and_they_are_the_deepest_two() {
         let items = vec![results(100)];
-        let all = crossings(&candidates(&items));
+        let all = crossings(&candidates(&items, true));
         // 15, 30, 45, 60, 75, 90 → blocks 14, 29, 44, 59, 74, 89.
         assert_eq!(
             all,
@@ -306,7 +326,7 @@ mod tests {
                 mark(0, 89)
             ]
         );
-        let p = plan(&items);
+        let p = plan(&items, true);
         assert_eq!(p.anchors, vec![mark(0, 74), mark(0, 89)]);
         assert_eq!(p.latest, Some(mark(0, 99)));
     }
@@ -318,8 +338,8 @@ mod tests {
         // 15 tool results: cumulative 1..=15, so crossing 1 is the last block,
         // which is also `latest`.
         let items = vec![results(ANCHOR_STRIDE)];
-        assert_eq!(crossings(&candidates(&items)), vec![mark(0, 14)]);
-        let p = plan(&items);
+        assert_eq!(crossings(&candidates(&items, true)), vec![mark(0, 14)]);
+        let p = plan(&items, true);
         assert_eq!(p.latest, Some(mark(0, 14)));
         assert!(p.anchors.is_empty(), "{:?}", p.anchors);
         assert!(p.marks(0, 14));
@@ -330,7 +350,7 @@ mod tests {
     #[test]
     fn plain_user_items_are_candidates_at_their_single_block() {
         let items = vec![user("a"), user("b"), user("c")];
-        let p = plan(&items);
+        let p = plan(&items, true);
         assert!(p.anchors.is_empty(), "no stride is crossed in 3 blocks");
         assert_eq!(p.latest, Some(mark(2, 0)));
     }
@@ -338,16 +358,19 @@ mod tests {
     /// Nothing to mark is a legal plan, not a panic.
     #[test]
     fn an_item_list_with_no_user_role_blocks_plans_nothing() {
-        let p = plan(&[]);
+        let p = plan(&[], true);
         assert!(p.anchors.is_empty() && p.latest.is_none());
-        let p = plan(&[
-            assistant(3),
-            Item::System { text: "s".into() },
-            Item::Unknown,
-        ]);
+        let p = plan(
+            &[
+                assistant(3),
+                Item::System { text: "s".into() },
+                Item::Unknown,
+            ],
+            true,
+        );
         assert!(p.anchors.is_empty() && p.latest.is_none());
         // A degenerate empty tool batch offers no block to carry a marker.
-        let p = plan(&[results(0)]);
+        let p = plan(&[results(0)], true);
         assert!(p.anchors.is_empty() && p.latest.is_none());
     }
 
@@ -362,8 +385,8 @@ mod tests {
             Item::Unknown,
             results(30),
         ];
-        let a = plan(&bare);
-        let b = plan(&padded);
+        let a = plan(&bare, true);
+        let b = plan(&padded, true);
         // Same block positions, shifted only by the two inserted item indices.
         assert_eq!(
             a.anchors.iter().map(|m| m.block).collect::<Vec<_>>(),
@@ -394,7 +417,7 @@ mod tests {
         let full = growing_transcript();
         let mut previous: Vec<Mark> = Vec::new();
         for n in 0..=full.len() {
-            let now = crossings(&candidates(&full[..n]));
+            let now = crossings(&candidates(&full[..n], true));
             assert!(
                 now.starts_with(&previous),
                 "a crossing moved when items were appended: {previous:?} -> {now:?} (n = {n})"
@@ -410,7 +433,7 @@ mod tests {
         // crossings, at the same position.
         let final_crossings = previous;
         for n in 0..=full.len() {
-            for anchor in plan(&full[..n]).anchors {
+            for anchor in plan(&full[..n], true).anchors {
                 assert!(
                     final_crossings.contains(&anchor),
                     "anchor {anchor:?} at n = {n} is not a crossing of the full transcript"
@@ -430,15 +453,15 @@ mod tests {
     fn an_oversized_assistant_turn_degrades_deterministically() {
         let items = vec![user("go"), assistant(25), user("next"), user("again")];
         // Blocks: user@1, assistant@2..=26, user@27, user@28.
-        assert_eq!(crossings(&candidates(&items)), vec![mark(2, 0)]);
-        let p = plan(&items);
+        assert_eq!(crossings(&candidates(&items, true)), vec![mark(2, 0)]);
+        let p = plan(&items, true);
         assert_eq!(p.anchors, vec![mark(2, 0)], "first candidate past the turn");
         assert_eq!(p.latest, Some(mark(3, 0)));
 
         // Still stable under append, which is the part that must not break.
         let mut previous: Vec<Mark> = Vec::new();
         for n in 0..=items.len() {
-            let now = crossings(&candidates(&items[..n]));
+            let now = crossings(&candidates(&items[..n], true));
             assert!(now.starts_with(&previous), "{previous:?} -> {now:?}");
             previous = now;
         }
@@ -451,8 +474,11 @@ mod tests {
         let items = vec![user("go"), assistant(40), user("next"), user("again")];
         // Blocks: user@1, assistant@2..=41, user@42, user@43.
         // 15 and 30 both resolve to the user at 42; 45 is past the end.
-        assert_eq!(crossings(&candidates(&items)), vec![mark(2, 0), mark(2, 0)]);
-        let p = plan(&items);
+        assert_eq!(
+            crossings(&candidates(&items, true)),
+            vec![mark(2, 0), mark(2, 0)]
+        );
+        let p = plan(&items, true);
         assert_eq!(p.anchors, vec![mark(2, 0)]);
         assert_eq!(p.latest, Some(mark(3, 0)));
     }
