@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-07-27
+
 First release to reach crates.io since 0.4.1. v0.5.0 through v0.6.1 were
 tagged and pushed but never published; those versions are skipped rather than
 backfilled, so 0.4.1 upgrades straight to this one. The `hotl subscribe`
