@@ -157,7 +157,7 @@ Built-ins are matched first, so a skill named `rename` cannot shadow
 matches nothing prints an unknown-command notice and costs you no turn.
 
 `/<skill>` exists because the agent is shown a compact index rather than every
-skill's description ([configuration.md](../configuration/)); when it doesn't
+skill's description ([skills.md](../skills/)); when it doesn't
 reach for the skill you had in mind, this is how you hand it over directly.
 
 ## Permission asks

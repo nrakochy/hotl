@@ -54,6 +54,7 @@ export default defineConfig({
 				{
 					label: 'Extending',
 					items: [
+						{ label: 'Skills', slug: 'skills' },
 						{ label: 'MCP servers', slug: 'mcp' },
 						{ label: 'Retrieval (recall)', slug: 'retrieval' },
 						{ label: 'Sub-agents (spawn, agent defs)', slug: 'agents' },
