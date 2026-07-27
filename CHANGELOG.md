@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-07-26
+
 ### Fixed
 
 - **The cache marker no longer lands on the todo reminder.** The `<todos>`
