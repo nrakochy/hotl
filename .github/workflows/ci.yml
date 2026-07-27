@@ -119,6 +119,34 @@ jobs:
         run: npm ci && npm run build
         working-directory: site
 
+  # Detects whether a push touched anything the nix legs actually build, so a
+  # docs/site/changelog-only push skips two ~8-minute cold builds that could
+  # not have turned out differently. First-party only (checkout + git).
+  # Fail-open: any doubt — force push, branch creation, unreachable `before`,
+  # a non-push event — counts as a build-input change.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      build-inputs: ${{ steps.diff.outputs.build-inputs }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: diff
+        run: |
+          set -euo pipefail
+          before="${{ github.event.before }}"
+          verdict=true
+          if [ "${{ github.event_name }}" = "push" ] && [ -n "$before" ] \
+            && ! printf '%s' "$before" | grep -q '^0*$' \
+            && git cat-file -e "$before" 2>/dev/null; then
+            if ! git diff --name-only "$before" "${{ github.sha }}" | grep -qE \
+              '^crates/|^Cargo\.(toml|lock)$|^flake\.(nix|lock)$|^\.github/workflows/ci\.yml$'; then
+              verdict=false
+            fi
+          fi
+          echo "build-inputs=$verdict" >> "$GITHUB_OUTPUT"
+
   # Flake evaluation + build gate. `nix flake check` builds checks.package,
   # which is the package derivation with the test suite re-enabled — so this
   # leg stays predictive of the nixpkgs build, which keeps tests on.
@@ -127,12 +155,17 @@ jobs:
   # each leg (nixpkgs delivers the toolchain prebuilt, never our dependency
   # tree), and it duplicates coverage the jobs above already have on PRs. Its
   # real job is proving *the flake* still evaluates and builds. Release tags
-  # get their own leg in nix-tag.yml, against the published tag.
+  # get their own leg in nix-tag.yml, against the published tag. Skipped
+  # entirely (via `changes`) when the push touched no build inputs: src = self
+  # means a docs-only push does yield a new derivation hash, but nothing in it
+  # can change what this leg gates — whether the flake evaluates, builds, and
+  # passes its suite.
   #
   # macos-latest is not redundant with ubuntu: darwin has the weaker sandbox
   # and different PTY semantics, so checkPhase behavior diverges there.
   nix:
-    if: github.ref == 'refs/heads/master'
+    needs: changes
+    if: github.ref == 'refs/heads/master' && needs.changes.outputs.build-inputs == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -158,7 +191,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # ~3 minutes of this job was compiling cargo-audit itself on a fresh
+      # runner — the scan is seconds. Cache the compiled binary keyed on its
+      # crates.io version: the trust root is unchanged (still this runner
+      # compiling the crates.io source, no new third-party action), and the
+      # advisory DB is never cached — every run fetches current advisories.
+      - id: audit-version
+        name: Resolve current cargo-audit version
+        run: |
+          v="$(cargo search cargo-audit --limit 1 2>/dev/null \
+            | sed -nE 's/^cargo-audit = "([0-9.]+)".*/\1/p')"
+          echo "v=${v:-unresolved}" >> "$GITHUB_OUTPUT"
+      # Skipped when the version lookup failed, so a stale "unresolved" entry
+      # can never mask a new release — the install step below runs instead.
+      - uses: actions/cache@v4
+        id: audit-cache
+        if: steps.audit-version.outputs.v != 'unresolved'
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ runner.os }}-${{ steps.audit-version.outputs.v }}
       - name: Install cargo-audit
+        if: steps.audit-cache.outputs.cache-hit != 'true'
         run: cargo install cargo-audit --locked
       - name: Audit dependencies
         run: cargo audit --deny warnings
