@@ -198,8 +198,10 @@ jobs:
       # advisory DB is never cached — every run fetches current advisories.
       - id: audit-version
         name: Resolve current cargo-audit version
+        # CARGO_TERM_COLOR=never: the toolchain action exports `always`, and
+        # the ANSI codes that forces into piped output break the line anchor.
         run: |
-          v="$(cargo search cargo-audit --limit 1 2>/dev/null \
+          v="$(CARGO_TERM_COLOR=never cargo search cargo-audit --limit 1 2>/dev/null \
             | sed -nE 's/^cargo-audit = "([0-9.]+)".*/\1/p')"
           echo "v=${v:-unresolved}" >> "$GITHUB_OUTPUT"
       # Skipped when the version lookup failed, so a stale "unresolved" entry
