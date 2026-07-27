@@ -136,12 +136,16 @@ impl OpenAiCompatProvider {
     /// OpenAI-compatible servers (llama.cpp, older vLLM/Ollama) reject
     /// `max_completion_tokens` with a 400, and this crate advertises them.
     fn body_for(req: &SamplingRequest, legacy: bool) -> Value {
+        // Derived once per request from static catalog data. The compat
+        // family is uncatalogued, so this fails open (images always sent) —
+        // a non-vision server answers with its own 400, surfaced honestly.
+        let send_images = hotl_provider::catalog::supports_images(&req.model);
         let mut messages = Vec::new();
         if !req.system.is_empty() {
             messages.push(json!({"role": "system", "content": req.system.as_ref()}));
         }
         for item in req.items.iter() {
-            convert_item(item, &mut messages);
+            convert_item(item, &mut messages, send_images);
         }
         // The ephemeral suffix keeps its wire position in this dialect too:
         // after every durable message, before MOIM. There is no marker to be
@@ -149,7 +153,7 @@ impl OpenAiCompatProvider {
         // engine's byte-identity claim is made over, so it is not this crate's
         // to reorder.
         for item in req.ephemeral_tail.iter() {
-            convert_item(item, &mut messages);
+            convert_item(item, &mut messages, send_images);
         }
         if let Some(tc) = &req.turn_context {
             messages.push(json!({"role": "user", "content": tc}));
@@ -191,10 +195,35 @@ fn tool_json(t: &ToolDef) -> Value {
     json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}})
 }
 
-fn convert_item(item: &Item, out: &mut Vec<Value>) {
+fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool) {
     match item {
         Item::System { .. } | Item::Unknown => {}
-        Item::User { text, .. } => out.push(json!({"role": "user", "content": text})),
+        // INVARIANT: an imageless user item stays `"content": <plain string>`
+        // — byte-identical to the pre-image wire. Some OpenAI-compat servers
+        // reject the array content form, so it appears only when images ride.
+        // Image parts precede the text part, matching the Anthropic dialect:
+        // one provider-neutral ordering rule.
+        Item::User { text, images, .. } => {
+            if send_images && !images.is_empty() {
+                let mut parts: Vec<Value> = images
+                    .iter()
+                    .map(|img| {
+                        json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{};base64,{}", img.media_type, img.data)
+                            }
+                        })
+                    })
+                    .collect();
+                parts.push(json!({"type": "text", "text": text}));
+                out.push(json!({"role": "user", "content": parts}));
+            } else {
+                let rendered =
+                    hotl_provider::transform::text_with_omitted_images(text, images.len());
+                out.push(json!({"role": "user", "content": rendered.as_ref()}));
+            }
+        }
         Item::Assistant { blocks } => {
             // Named canonicalization stage: provider-bound reasoning from a
             // foreign dialect never crosses (hotl_provider::transform).
@@ -1268,5 +1297,58 @@ mod tests {
         let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
         assert!(matches!(events.last(), Some(Err(ProviderError::Auth(_)))));
         assert_eq!(seen.lock().unwrap().len(), 1); // exactly one request — no blind retry
+    }
+
+    /// An image-bearing user item renders as the array content form: data-URL
+    /// image parts first, the text part last (the same ordering as the
+    /// Anthropic dialect). Model "m" is uncatalogued → the gate fails open.
+    #[test]
+    fn image_parts_render_as_data_urls_before_the_text_part() {
+        let mut req = sampling_req();
+        req.items = std::sync::Arc::new(vec![Item::User {
+            text: "what is this?".into(),
+            synthetic: None,
+            images: vec![hotl_types::UserImage {
+                media_type: "image/png".into(),
+                data: "aW1n".into(),
+            }],
+        }]);
+        let body = OpenAiCompatProvider::build_body(&req);
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["image_url"]["url"], "data:image/png;base64,aW1n");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "what is this?");
+    }
+
+    /// INVARIANT: an imageless user item keeps the plain-string content form,
+    /// byte-identical to the pre-image wire — some OpenAI-compat servers
+    /// reject array content.
+    #[test]
+    fn an_imageless_user_item_stays_a_plain_string() {
+        let body = OpenAiCompatProvider::build_body(&sampling_req());
+        assert_eq!(body["messages"][0]["content"], "hi");
+    }
+
+    /// The gated path: images dropped, one deterministic omission note inside
+    /// the plain-string content. Threaded directly through `convert_item`
+    /// because no catalog row combines the OpenAI dialect with images: false.
+    #[test]
+    fn a_gated_model_gets_the_plain_string_with_an_omission_note() {
+        let mut out = Vec::new();
+        convert_item(
+            &Item::User {
+                text: "see [Image #1]".into(),
+                synthetic: None,
+                images: vec![hotl_types::UserImage {
+                    media_type: "image/png".into(),
+                    data: "aW1n".into(),
+                }],
+            },
+            &mut out,
+            false,
+        );
+        let content = out[0]["content"].as_str().unwrap();
+        assert!(content.starts_with("see [Image #1]\n\n[note: 1 attached image(s)"));
     }
 }
