@@ -27,6 +27,14 @@ pub struct AgentObservation {
     pub cwd: String,
     pub status: Status,
     pub status_line: Option<String>,
+    /// The question the pane is currently putting to the human (an agent's
+    /// selection-form header, hotl's ask line), extracted best-effort from the
+    /// captured tail. Not the original task prompt — that isn't recoverable
+    /// from a screen tail. `None` when nothing is being asked or the detector
+    /// can't recognize one.
+    pub prompt: Option<String>,
+    /// Raw captured pane tail (last few non-blank screen lines, in order).
+    pub tail: Vec<String>,
     pub location: Location,
     pub source: Source,
 }
@@ -46,6 +54,8 @@ mod tests {
             cwd: "/tmp/proj".into(),
             status: Status::Idle,
             status_line: None,
+            prompt: None,
+            tail: vec!["❯".into()],
             location: Location {
                 group: "base-0".into(),
                 sub_group: Some("zsh (0)".into()),
@@ -65,6 +75,8 @@ mod tests {
         assert_eq!(o.agent.name, "claude");
         assert_eq!(o.status, Status::Idle);
         assert_eq!(o.status_line, None);
+        assert_eq!(o.prompt, None);
+        assert_eq!(o.tail, vec!["❯".to_string()]);
         assert_eq!(o.location.group, "base-0");
         assert_eq!(o.source, Source::Tmux);
         match o.location.handle {

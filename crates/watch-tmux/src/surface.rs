@@ -42,6 +42,8 @@ pub fn observations(
             cwd: pane.current_path.clone(),
             status,
             status_line: status_line(&tail),
+            prompt: None,
+            tail: tail.lines().map(str::to_string).collect(),
             location: Location {
                 group: pane.session.clone(),
                 sub_group: Some(format!("{} ({})", pane.window_name, pane.window_index)),
@@ -153,6 +155,13 @@ work\u{1f}0\u{1f}edit\u{1f}0\u{1f}%60\u{1f}40000\u{1f}claude\u{1f}/tmp/d\u{1f}1\
             Some("[I] .../tmp/a [main] ctx:9%")
         );
         assert_eq!(d.status_line, None);
+
+        assert_eq!(
+            a.tail,
+            vec!["❯".to_string(), "  [I] .../tmp/a [main] ctx:9%".to_string()],
+            "raw tail lines ride along in screen order"
+        );
+        assert!(d.tail.is_empty());
     }
 
     #[test]

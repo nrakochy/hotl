@@ -68,6 +68,8 @@ mod tests {
             cwd: cwd.into(),
             status: Status::Idle,
             status_line: None,
+            prompt: None,
+            tail: vec![],
             location: Location {
                 group: "g".into(),
                 sub_group: None,
