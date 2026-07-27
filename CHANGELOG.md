@@ -6,6 +6,45 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **A second Esc takes control back; Ctrl-C escalates to quit.** The two keys
+  now share one interrupt ladder: the first press cancels the turn, the
+  second stops waiting for the server. Esc detaches — the phase returns to
+  Idle unconditionally, and everything the dead turn still emits is absorbed
+  (usage folds into session totals; stray deltas, asks, and the late prompt
+  result cannot reclaim the screen). Esc also works in the ask/question
+  pickers, where it was a dead key. Ctrl-C quits: immediately when idle, on
+  the second press when busy, and it is no longer swallowed by the help
+  overlay. Headless `-p` gets the same second rung — a turn that ignores its
+  cancel no longer leaves the process unkillable; a second Ctrl-C force-quits
+  with exit code 130.
+
+- **The Nix build's test phase passes again.** `nix flake check` — and any
+  nixpkgs-style build with tests on — carried three latent failure classes,
+  each hidden behind the previous by cargo's fail-fast: three
+  `#[should_panic]` tests drove `debug_assert!`s that release builds compile
+  out (now dev-build-only); the loop-overhead perf gates compared a
+  real-hardware baseline against the builder's scratch filesystem, where
+  `sync_data()` is nearly free (now skipped in the checkPhase); and the Linux
+  builder has no writable path outside the sandbox floor — `/var/tmp` does
+  not exist there — so the eight tests that must witness a write outside the
+  floor are skipped on Linux, as the darwin floor list (now extended with the
+  0.7.0 `[sandbox]` tests) always was. Every skipped test still runs on the
+  raw CI runners, where the coverage is real.
+
+### Changed
+
+- **CI is faster.** Pushes that touch no build inputs (docs, changelog, site)
+  skip the two ~8-minute cold Nix legs; the audit job restores a cached
+  `cargo-audit` binary (~3 minutes → ~15 seconds) while still fetching
+  current advisories on every run; the MCP client suite dropped a 20-second
+  timeout sleep to 2 seconds under `cfg(test)`; and the Linux clippy gate is
+  clean again after the `[sandbox]` refactor left an orphaned Landlock
+  wrapper behind.
+
+- The site's quickstart and uninstall pages document the Nix install path.
+
 ## [0.7.0] - 2026-07-27
 
 ### Fixed
