@@ -185,6 +185,27 @@ mod tests {
             images: Vec::new(),
         }
     }
+
+    /// A folded image-bearing item digests as text only: the inline
+    /// `[Image #N]` marker survives, the base64 never reaches the summarize
+    /// call (which must stay far smaller than the window being compacted).
+    #[test]
+    fn summarize_prompt_renders_image_items_text_only() {
+        let items = vec![Item::User {
+            text: "look at [Image #1] please".into(),
+            synthetic: None,
+            images: vec![hotl_types::UserImage {
+                media_type: "image/png".into(),
+                data: "QkFTRTY0UEFZTE9BRA==".repeat(100),
+            }],
+        }];
+        let prompt = summarize_prompt(&items);
+        assert!(prompt.contains("[user] look at [Image #1] please"));
+        assert!(
+            !prompt.contains("QkFTRTY0"),
+            "base64 leaked into the digest"
+        );
+    }
     fn assistant(text: &str) -> Item {
         Item::Assistant {
             blocks: vec![json!({"type":"text","text":text})],

@@ -103,9 +103,21 @@ pub fn estimate_item(item: &Item) -> u64 {
     estimate_item_with(item, &TokenProfile::CONSERVATIVE)
 }
 
+/// Flat per-image estimate. Anthropic bills ≈ (w×h)/750 tokens and
+/// auto-resizes anything past ~1.15 MP, capping a single image near ~1590;
+/// OpenAI's high-detail tiling for typical sizes lands lower. 1600 covers the
+/// worst case on either dialect — the estimator's one invariant is
+/// never-undercount. The base64 payload must NEVER go through text
+/// estimation: a 5MB image would fake ~1.7M tokens and instantly trip the
+/// compaction threshold.
+pub const IMAGE_TOKENS_ESTIMATE: u64 = 1600;
+
 pub fn estimate_item_with(item: &Item, profile: &TokenProfile) -> u64 {
     let body = match item {
-        Item::System { text } | Item::User { text, .. } => estimate_text_with(text, profile),
+        Item::System { text } => estimate_text_with(text, profile),
+        Item::User { text, images, .. } => {
+            estimate_text_with(text, profile) + images.len() as u64 * IMAGE_TOKENS_ESTIMATE
+        }
         Item::Assistant { blocks } => blocks
             .iter()
             .map(|b| BLOCK_OVERHEAD + estimate_block(b, profile))
@@ -192,6 +204,29 @@ mod tests {
         // Astral-plane scalars usually tokenize to 2-4 tokens apiece.
         let emoji = "🙂🎉🚀".repeat(10); // 30 astral chars
         assert!(estimate_text(&emoji) >= 60, "{}", estimate_text(&emoji));
+    }
+
+    #[test]
+    fn images_are_estimated_flat_never_as_base64_text() {
+        // A "5MB" payload: if the base64 ever went through text estimation
+        // this would be ~1.7M tokens and trip compaction instantly.
+        let item = Item::User {
+            text: "look: [Image #1]".into(),
+            synthetic: None,
+            images: vec![hotl_types::UserImage {
+                media_type: "image/png".into(),
+                data: "A".repeat(5 * 1024 * 1024),
+            }],
+        };
+        let text_only = Item::User {
+            text: "look: [Image #1]".into(),
+            synthetic: None,
+            images: Vec::new(),
+        };
+        assert_eq!(
+            estimate_item(&item),
+            estimate_item(&text_only) + IMAGE_TOKENS_ESTIMATE
+        );
     }
 
     #[test]
