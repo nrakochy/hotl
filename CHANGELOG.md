@@ -6,6 +6,31 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **`[sandbox].writable` — owner-configured writable directories.** The kernel
+  write floor (working directory, temp, `/dev`) can now be widened with
+  directories listed in config.toml, for every sandboxed spawn — bash, grep,
+  diagnostics, hooks — so tools that keep caches outside the workspace (bazel,
+  ccache) work under the floor instead of dying on their first write. Missing
+  directories are created at startup; entries are canonicalized and validated
+  fail-closed, one by one. An entry that is, contains, or sits inside hotl's
+  own config or data dir is refused — a writable config dir would let a
+  sandboxed command rewrite the allow-rules and hooks that govern it — which
+  is also what keeps `~` and `/` unlistable. Risky system roots (`/etc`,
+  `/usr`, …) are honored with a loud warning. The startup probe picks its
+  outside-the-floor target outside the *widened* set, so `sandboxed:` still
+  means proven, and `hotl doctor` prints the resolved list plus every
+  validation warning.
+- **`[sandbox].file_tools = "writable"`** separately opts the `write`/`edit`
+  tools into those same directories. A write there becomes an ordinary ask
+  (the tier `mode = "auto"` approves) instead of the protected one, and runs
+  through the same symlink-refusing fd-descent guard as workspace writes,
+  anchored at the extra root. Protected filenames still escalate — the grant
+  widens *where* the tools may write, never what kind of write is waved
+  through. The default `"workspace"` keeps file tools workspace-only, and an
+  unknown value fails closed to it with a warning.
+
 ## [0.6.2] - 2026-07-27
 
 First release to reach crates.io since 0.4.1. v0.5.0 through v0.6.1 were
