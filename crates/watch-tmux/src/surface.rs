@@ -1,6 +1,6 @@
 use crate::panes::{list_panes, run_foreground, run_jump, Pane};
 use crate::procs::{agent_for, read_proc_table, ProcTable};
-use crate::status::classify;
+use crate::status::{classify, extract_prompt};
 use watch_types::{AgentObservation, Location, LocationHandle, Source, Surface, SurfaceError};
 
 pub struct TmuxSurface {
@@ -37,12 +37,13 @@ pub fn observations(
         };
         let tail = tail_for(&pane.pane_id);
         let status = classify(&agent.name, &pane.title, &tail);
+        let prompt = extract_prompt(&agent.name, &pane.title, &tail);
         out.push(AgentObservation {
             agent,
             cwd: pane.current_path.clone(),
             status,
             status_line: status_line(&tail),
-            prompt: None,
+            prompt,
             tail: tail.lines().map(str::to_string).collect(),
             location: Location {
                 group: pane.session.clone(),
@@ -162,6 +163,8 @@ work\u{1f}0\u{1f}edit\u{1f}0\u{1f}%60\u{1f}40000\u{1f}claude\u{1f}/tmp/d\u{1f}1\
             "raw tail lines ride along in screen order"
         );
         assert!(d.tail.is_empty());
+        assert_eq!(a.prompt, None, "idle pane asks nothing");
+        assert_eq!(d.prompt, None, "working pane asks nothing");
     }
 
     #[test]

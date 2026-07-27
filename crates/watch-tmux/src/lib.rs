@@ -10,6 +10,7 @@ pub use panes::{
 };
 pub use procs::{agent_for, parse_ps, read_proc_table, ProcTable};
 pub use status::{
-    classify, detector_for, ClaudeDetector, GenericDetector, Signals, StatusDetector,
+    classify, detector_for, extract_prompt, ClaudeDetector, GenericDetector, Signals,
+    StatusDetector,
 };
 pub use surface::{observations, TmuxSurface};

@@ -7,6 +7,12 @@ pub struct Signals<'a> {
 
 pub trait StatusDetector {
     fn classify(&self, sig: &Signals) -> Status;
+    /// The question the pane is presenting to the human, best-effort. Called
+    /// only for panes already classified Blocked (see [`extract_prompt`]), so
+    /// impls do pure extraction, not state detection.
+    fn prompt(&self, _sig: &Signals) -> Option<String> {
+        None
+    }
 }
 
 // Braille spinner char (U+2800..=U+28FF).
@@ -20,18 +26,32 @@ fn tail_is_blocked(tail: &str) -> bool {
         && (t.contains("enter to select") || t.contains("to navigate") || t.contains("↑↓"))
 }
 
+/// A selection-menu option line: optional `❯` cursor, then `N.`.
+fn is_menu_option(line: &str) -> bool {
+    let t = line.trim();
+    let t = t.strip_prefix('❯').unwrap_or(t).trim_start();
+    t.chars().next().is_some_and(|c| c.is_ascii_digit())
+        && t.trim_start_matches(|c: char| c.is_ascii_digit())
+            .starts_with('.')
+}
+
+/// Visual chrome: blank, or made only of box-drawing/rule characters — never
+/// the header line a question hunt should land on.
+fn is_chrome(line: &str) -> bool {
+    let t = line.trim();
+    t.chars().all(|c| {
+        matches!(
+            c,
+            '─' | '│' | '╭' | '╮' | '╰' | '╯' | '═' | '━' | '┄' | '-' | '·' | ' '
+        )
+    })
+}
+
 fn tail_is_idle(tail: &str) -> bool {
     tail.lines().any(|l| {
         let t = l.trim();
-        let Some(rest) = t.strip_prefix('❯') else {
-            return false;
-        };
         // "❯ 1. …" is a selection-menu item, not an idle prompt.
-        let rest = rest.trim_start();
-        !(rest.chars().next().is_some_and(|c| c.is_ascii_digit())
-            && rest
-                .trim_start_matches(|c: char| c.is_ascii_digit())
-                .starts_with('.'))
+        t.starts_with('❯') && !is_menu_option(t)
     })
 }
 
@@ -47,6 +67,22 @@ impl StatusDetector for ClaudeDetector {
         } else {
             Status::Unknown
         }
+    }
+
+    // The selection form renders its question just above the numbered
+    // options, so the header is the nearest content line over the first one.
+    fn prompt(&self, sig: &Signals) -> Option<String> {
+        let lines: Vec<&str> = sig.tail.lines().collect();
+        if let Some(menu_at) = lines.iter().position(|l| is_menu_option(l)) {
+            if let Some(header) = lines[..menu_at].iter().rev().find(|l| !is_chrome(l)) {
+                return Some(header.trim().to_string());
+            }
+        }
+        lines
+            .iter()
+            .rev()
+            .find(|l| l.trim().ends_with('?'))
+            .map(|l| l.trim().to_string())
     }
 }
 
@@ -99,6 +135,27 @@ impl StatusDetector for HotlDetector {
             Status::Unknown
         }
     }
+
+    fn prompt(&self, sig: &Signals) -> Option<String> {
+        let lines: Vec<&str> = sig.tail.lines().collect();
+        // Plain-terminal ask: the `allow …? [y/N — …]` line carries the
+        // tool summary itself.
+        if let Some(ask) = lines.iter().find(|l| l.to_lowercase().contains("[y/n")) {
+            return Some(ask.trim().to_string());
+        }
+        // Console-TUI ask: the hint row sits on the bottom screen line; the
+        // question (or what's left of the card) is the nearest content line
+        // above it. A hint-only tail has nothing worth extracting.
+        let hint_at = lines.iter().position(|l| {
+            let t = l.to_lowercase();
+            t.contains("y allow · n deny") || t.contains("1-9 pick an option")
+        })?;
+        lines[..hint_at]
+            .iter()
+            .rev()
+            .find(|l| !is_chrome(l))
+            .map(|l| l.trim().to_string())
+    }
 }
 
 pub struct GenericDetector;
@@ -124,6 +181,19 @@ pub fn detector_for(agent_name: &str) -> Box<dyn StatusDetector> {
 
 pub fn classify(agent_name: &str, title: &str, tail: &str) -> Status {
     detector_for(agent_name).classify(&Signals { title, tail })
+}
+
+/// The pending question of a Blocked pane, best-effort. Gated on the
+/// detector's own classification so `prompt` implies Blocked — a Working
+/// pane never carries a prompt (a stale ask frame must not flap a
+/// change-detecting consumer), and the extraction impls stay pure.
+pub fn extract_prompt(agent_name: &str, title: &str, tail: &str) -> Option<String> {
+    let sig = Signals { title, tail };
+    let detector = detector_for(agent_name);
+    if detector.classify(&sig) != Status::Blocked {
+        return None;
+    }
+    detector.prompt(&sig)
 }
 
 #[cfg(test)]
@@ -290,5 +360,77 @@ allow bash: cargo test? [y/N — add a reason after 'n' to tell the model why] "
     fn menu_option_prompt_is_not_idle() {
         // Generic detector has no blocked rule, so "❯ 1." must not read as idle either.
         assert_eq!(classify("codex", "plain", "❯ 1. Yes"), Status::Unknown);
+    }
+
+    #[test]
+    fn claude_prompt_is_the_menu_header_when_blocked() {
+        assert_eq!(
+            extract_prompt("claude", "✳", BLOCKED_TAIL).as_deref(),
+            Some("Do you want to proceed?")
+        );
+    }
+
+    #[test]
+    fn claude_prompt_none_unless_blocked() {
+        assert_eq!(extract_prompt("claude", "✳", IDLE_TAIL), None);
+        // A working title outranks a blocked-looking tail: no prompt either.
+        assert_eq!(extract_prompt("claude", "\u{2809}", BLOCKED_TAIL), None);
+    }
+
+    #[test]
+    fn claude_prompt_falls_back_to_the_question_line() {
+        let tail = "\
+Should I continue with the risky migration?
+enter to select · esc to cancel · ↑↓ to navigate";
+        assert_eq!(
+            extract_prompt("claude", "✳", tail).as_deref(),
+            Some("Should I continue with the risky migration?")
+        );
+    }
+
+    #[test]
+    fn claude_prompt_skips_chrome_between_header_and_menu() {
+        let tail = "\
+Do you want to proceed?
+─────────────
+❯ 1. Yes
+  2. No
+enter to select · esc to cancel · ↑↓ to navigate";
+        assert_eq!(
+            extract_prompt("claude", "✳", tail).as_deref(),
+            Some("Do you want to proceed?")
+        );
+    }
+
+    #[test]
+    fn hotl_prompt_is_the_plain_ask_line() {
+        assert_eq!(
+            extract_prompt("hotl", "plain", HOTL_ASK_TAIL).as_deref(),
+            Some("allow bash: cargo test? [y/N — add a reason after 'n' to tell the model why]")
+        );
+    }
+
+    #[test]
+    fn hotl_prompt_from_tui_hint_is_the_line_above() {
+        let tail = format!("Allow web fetch of docs.rs?\n{TUI_ASK_HINT}");
+        assert_eq!(
+            extract_prompt("hotl", "zsh", &tail).as_deref(),
+            Some("Allow web fetch of docs.rs?")
+        );
+    }
+
+    #[test]
+    fn hotl_hint_only_tail_has_no_prompt() {
+        assert_eq!(extract_prompt("hotl", "zsh", TUI_ASK_HINT), None);
+    }
+
+    #[test]
+    fn hotl_title_blocked_with_empty_tail_has_no_prompt() {
+        assert_eq!(extract_prompt("hotl", TUI_BLOCKED_TITLE, ""), None);
+    }
+
+    #[test]
+    fn generic_agent_never_extracts_a_prompt() {
+        assert_eq!(extract_prompt("codex", "plain", BLOCKED_TAIL), None);
     }
 }

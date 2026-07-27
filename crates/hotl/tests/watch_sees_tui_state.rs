@@ -113,6 +113,21 @@ fn watch_sees_blocked_while_a_question_is_up() {
     assert_eq!(seen_by_watch(&state, &cmds), Status::Blocked);
 }
 
+/// The extracted prompt is pinned to the real rendered ask card the same way
+/// the status readings above are: drift in the card layout fails here instead
+/// of silently blanking a remote notification.
+#[test]
+fn watch_extracts_the_ask_from_the_rendered_card() {
+    let mut state = session();
+    let cmds = ask(&mut state);
+    let prompt = watch_tmux::extract_prompt("hotl", &pane_title(&cmds), &captured_tail(&state))
+        .expect("a blocked pane with the card on screen yields a prompt");
+    assert!(
+        prompt.contains("cargo test"),
+        "prompt carries the tool summary, got: {prompt}"
+    );
+}
+
 #[test]
 fn watch_sees_working_once_the_ask_is_answered() {
     let mut state = session();
