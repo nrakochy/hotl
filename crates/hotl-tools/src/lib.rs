@@ -7,6 +7,7 @@
 
 pub mod agents;
 pub mod ask;
+pub mod b64;
 mod builtins;
 pub mod concurrency;
 pub mod diagnostics;

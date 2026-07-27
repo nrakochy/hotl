@@ -38,41 +38,13 @@ const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// `SessionConcurrency` applies to subprocesses and requests.
 const MAX_PROXY_CONNS: usize = 64;
 
-/// Base64 (RFC 4648, standard alphabet, padded). Encode-only, ~15 lines, so
-/// the proxy credential needs no new workspace dependency. The server side
-/// compares against a precomputed string, so no decoder is required.
-fn base64_encode(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            *chunk.get(1).unwrap_or(&0),
-            *chunk.get(2).unwrap_or(&0),
-        ];
-        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 {
-            ALPHABET[(n >> 6) as usize & 63] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            ALPHABET[n as usize & 63] as char
-        } else {
-            '='
-        });
-    }
-    out
-}
-
 /// An RFC 7617 `Basic` credential value, ready to compare against a
-/// `Proxy-Authorization` header.
+/// `Proxy-Authorization` header. The server side compares against this
+/// precomputed string, so no decoder is required.
 fn basic_auth_value(user: &str, pass: &str) -> String {
     format!(
         "Basic {}",
-        base64_encode(format!("{user}:{pass}").as_bytes())
+        crate::b64::encode(format!("{user}:{pass}").as_bytes())
     )
 }
 
