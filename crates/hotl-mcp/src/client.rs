@@ -32,7 +32,13 @@ const TOOL_CALL_TIMEOUT_SECS: u64 = 600;
 /// whole server, so an unbounded write inside it hangs *every* request to that
 /// server — including the `notifications/cancelled` that would have unblocked
 /// the situation. The timeout covers lock acquisition too.
+#[cfg(not(test))]
 const WRITE_TIMEOUT_SECS: u64 = 20;
+/// Same timeout path in tests, where the stuck peer is deliberate: 2s is
+/// ample to prove the write times out, and 20s of sleep was most of the
+/// suite's wall clock.
+#[cfg(test)]
+const WRITE_TIMEOUT_SECS: u64 = 2;
 /// A single JSON-RPC message. Generous (`tools/list` with large schemas is
 /// real) but finite: an endless line without `\n` used to grow a String until
 /// OOM, and the 50 KiB sanitizer cap applies only after the message is in
