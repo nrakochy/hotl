@@ -36,9 +36,8 @@ pub const FALLBACK_CONTEXT_WINDOW: u64 = 200_000;
 pub struct Caps {
     /// Accepts a `thinking` block (any dialect).
     pub thinking: bool,
-    /// Accepts image content blocks. hotl cannot send them yet (`Item::User`
-    /// is `{ text: String }`) — the flag is here so the day it can, the
-    /// per-model gate is data and not a new match arm.
+    /// Accepts image content blocks (`Item::User { images }` on the wire).
+    /// Gated per-request in the dialect serializers via [`supports_images`].
     pub images: bool,
     /// Accepts `output_config.effort`.
     pub effort: bool,
@@ -312,9 +311,26 @@ pub fn is_cacheable_prefix(model: &str, estimated_tokens: u64) -> bool {
     }
 }
 
+/// May a request for `model` carry image content blocks?
+///
+/// Fails **open** for an uncatalogued model — same philosophy as
+/// [`is_cacheable_prefix`]: hotl never allowlists model names, and the
+/// OpenAI-compat family is deliberately uncatalogued. A non-vision endpoint
+/// answers with its own 400, which is surfaced honestly; silently dropping
+/// the user's image is the worse lie.
+pub fn supports_images(model: &str) -> bool {
+    lookup(model).map(|m| m.caps.images).unwrap_or(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supports_images_reads_the_catalog_and_fails_open_for_unknown_models() {
+        assert!(supports_images(DEFAULT_MODEL));
+        assert!(supports_images("some-local-ollama-model"));
+    }
 
     #[test]
     fn default_model_is_in_the_catalog_and_has_a_million_token_window() {

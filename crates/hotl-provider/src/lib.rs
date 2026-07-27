@@ -1017,6 +1017,26 @@ pub mod retry {
 /// one that produced a block, provider-bound reasoning must not cross.
 pub mod transform {
     use serde_json::Value;
+    use std::borrow::Cow;
+
+    /// Degraded text for an image-bearing user item on a model whose catalog
+    /// row says `images: false`. The inline `[Image #N]` markers are already
+    /// in `text`; this only appends one deterministic note — inside the
+    /// existing text block, never a new block or item, so dialect block
+    /// arithmetic (cache markers) is untouched. Shared by both dialects so
+    /// the wording cannot drift. Borrowed when nothing was omitted.
+    ///
+    /// Degradation lives in the serializers, not the engine: the log keeps
+    /// images verbatim (the session may fall back onto an image-capable
+    /// model), and the effective model is only known per-request.
+    pub fn text_with_omitted_images(text: &str, omitted: usize) -> Cow<'_, str> {
+        if omitted == 0 {
+            return Cow::Borrowed(text);
+        }
+        Cow::Owned(format!(
+            "{text}\n\n[note: {omitted} attached image(s) were omitted — this model does not accept image input]"
+        ))
+    }
 
     /// Drop blocks that are provider-bound (signed/redacted thinking) when
     /// sending history to a foreign dialect. Text and tool_use always pass.
@@ -1050,6 +1070,16 @@ pub mod transform {
             assert_eq!(out.len(), 2);
             assert_eq!(out[0]["type"], "text");
             assert_eq!(out[1]["type"], "tool_use");
+        }
+
+        #[test]
+        fn omitted_images_note_appends_once_and_borrows_when_zero() {
+            assert!(matches!(
+                text_with_omitted_images("hi", 0),
+                std::borrow::Cow::Borrowed("hi")
+            ));
+            let got = text_with_omitted_images("see [Image #1]", 2);
+            assert!(got.starts_with("see [Image #1]\n\n[note: 2 attached image(s)"));
         }
     }
 }
