@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-27
+
 ### Fixed
 
 - **A crashed MCP server's stderr now reaches the error on every disconnect
@@ -16,8 +18,6 @@ semver promise of their own.
   explains the crash) were dropped. Both paths now append the stderr tail.
   This race is also what intermittently failed the release test gate from
   v0.5.2 on.
-
-## [0.7.0] - 2026-07-27
 
 ### Added
 
