@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-07-27
+
 ### Added
 
 - **`[sandbox].writable` — owner-configured writable directories.** The kernel
