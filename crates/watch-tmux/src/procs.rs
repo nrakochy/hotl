@@ -37,9 +37,11 @@ pub fn parse_ps(raw: &str) -> ProcTable {
 }
 
 /// `hotl` invocations that are not an interactive agent surface: the dashboard
-/// itself, the future orchestrator, maintenance commands, and the detached
-/// session host (whose asks park until `hotl attach` — which *is* captured).
-const HOTL_NON_AGENT_SUBCOMMANDS: &[&str] = &["watch", "fleet", "gc", "doctor", "serve"];
+/// itself, the future orchestrator, maintenance commands, the detached
+/// session host (whose asks park until `hotl attach` — which *is* captured),
+/// and the webhook bridge.
+const HOTL_NON_AGENT_SUBCOMMANDS: &[&str] =
+    &["watch", "fleet", "gc", "doctor", "serve", "subscribe"];
 
 fn matched_agent_name(command: &str, agent_names: &[String]) -> Option<String> {
     let mut words = command.split_whitespace();
@@ -188,6 +190,12 @@ mod tests {
         assert_eq!(matched_agent_name("hotl gc --dry-run", &n), None);
         assert_eq!(matched_agent_name("hotl doctor", &n), None);
         assert_eq!(matched_agent_name("hotl serve --id bg-1", &n), None);
+        // The webhook bridge observes agents; it must never appear as one.
+        assert_eq!(matched_agent_name("hotl subscribe", &n), None);
+        assert_eq!(
+            matched_agent_name("hotl subscribe --url https://example.com/h", &n),
+            None
+        );
     }
 
     #[test]
