@@ -24,24 +24,35 @@ hero:
 import { Card, CardGrid } from '@astrojs/starlight/components';
 
 <CardGrid>
-	<Card title="Nothing is ever lost" icon="document">
-		Sessions are append-only event logs: `hotl resume` continues one,
-		`hotl undo` reverses the agent's file changes via shadow-git snapshots,
-		and context compaction adds a summary on top of history instead of
-		rewriting it — so a failed compaction can't brick a session.
-		[Overview →](./overview/)
-	</Card>
 	<Card title="Context that stays slim" icon="random">
-		The window is spent on your task, not on ceremony:
+		The window is spent on your task, not on ceremony — every reduction is
+		deliberate, not incidental:
 
 		- oversized tool results are evicted to files — a preview stays inline,
 		  the agent pages the rest back on demand
+		- skills are indexed, lazily loaded & searched: what rides on every
+		  request is a grouped overview — one line per *source*, descriptions
+		  omitted, large sources collapsed to their first few names plus a
+		  count
 		- compaction summaries precompute in the background from ~60% full and
 		  fold in at ~80% without pausing the session
 		- the prompt prefix is byte-stable, so provider caches keep hitting —
 		  and a per-turn meter shows how full the window actually is
 
-		[Configuration →](./configuration/)
+		[Configuration →](./configuration/) · [Skills →](./skills/)
+	</Card>
+	<Card title="Nothing is ever lost" icon="document">
+		Sessions are append-only event logs that nothing rewrites:
+
+		- `hotl resume` picks any session back up where it stopped
+		- `hotl undo` reverses the agent's file changes via shadow-git
+		  snapshots taken around every mutating step
+		- a long session keeps its thread: compaction folds the middle into a
+		  typed digest — goal, state, decisions, files, what's next — and
+		  leaves recent turns verbatim, a summary added *on top of* history
+		  rather than a rewrite of it
+
+		[Overview →](./overview/)
 	</Card>
 	<Card title="You own the loop" icon="pen">
 		Steer mid-turn without killing the run — queued steers apply at the next
@@ -95,11 +106,18 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		[Sub-agents →](./agents/) · [Concurrency →](./configuration/)
 	</Card>
 	<Card title="Any model, any protocol" icon="setting">
-		`HOTL_MODEL=provider/model` — Anthropic's Messages API, or any
-		OpenAI-compatible endpoint: OpenAI, Groq, a local Ollama server, or a
-		gateway like LiteLLM. Keys come from the environment or a command you
-		name, never from the config file. An MCP client brings in external
-		tools, and `hotl acp` embeds the agent in any ACP-speaking editor.
+		`HOTL_MODEL=provider/model` is the whole model-selection story, and
+		standard protocols sit at the edges:
+
+		- `anthropic/…` speaks the Messages API — SSE streaming, prompt-cache
+		  placement
+		- `openai/…` covers every OpenAI-compatible endpoint: OpenAI, Groq, a
+		  local Ollama server, or a gateway like LiteLLM
+		- keys come from the environment or a command you name, never from the
+		  config file
+		- an MCP client (stdio transport) brings in external tools, and
+		  `hotl acp` embeds the agent in any ACP-speaking editor
+
 		[Gateways →](./gateway/) · [MCP →](./mcp/)
 	</Card>
 	<Card title="Extend it without forking it" icon="puzzle">
@@ -120,11 +138,14 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 	</Card>
 	<Card title="One config file, fail-closed" icon="seti:config">
 		Everything hand-editable lives in a single `config.toml` — no
-		`permissions.toml`/`mcp.toml`/`hooks.toml` sprawl. Precedence is always
-		env var > config.toml > default, so CI can override anything without
-		editing the file; a malformed file is ignored with a warning, never
-		half-applied; a typo'd permission mode fails closed to `ask`.
-		`hotl setup` writes a commented starter, `hotl doctor` checks the lot.
+		`permissions.toml`/`mcp.toml`/`hooks.toml` sprawl:
+
+		- precedence is always env var > config.toml > default, so CI can
+		  override anything without editing the file
+		- a malformed file is ignored with a warning, never half-applied
+		- a typo'd permission mode fails closed to `ask`
+		- `hotl setup` writes a commented starter, `hotl doctor` checks the lot
+
 		[Configuration →](./configuration/)
 	</Card>
 	<Card title="Security floor that never turns off" icon="approve-check">
