@@ -34,6 +34,41 @@ semver promise of their own.
   so a corrupt `trust.toml` previously showed up only as an unexplained wave of
   re-prompts.
 
+- **`/reload` — pick up `config.toml` changes mid-session.** `config.toml` was
+  read exactly once per process, so a new model, a new `[[allow]]` rule, a new
+  MCP server or a different theme cost you the session to try. `/reload` now
+  re-reads it, rebuilds the engine, and re-opens the session onto the new one
+  through the ordinary resume path — the transcript stays on screen, and the
+  model keeps its context, todos, name and mode. It reports what it got, plus
+  any warnings the reload produced.
+
+  Everything a scaffold owns reloads: `[provider]`, `[[allow]]`, `[[mcp]]`,
+  `[[hook]]`, the skill roster, `system-prompt.md`, `[context]`. So do the
+  console's own settings — theme, density, `vim_mode`, `mouse`,
+  `copy_on_select`. What does not is process-wide set-once state: `[sandbox]`
+  extras, `[network]` egress, the thread pools, and the prompt-history ring.
+  Those are named in the notice and documented, not silently ignored — a
+  reload that could widen the write floor or egress mid-process would be a
+  hole, not a feature.
+
+  Two deliberate limits. It **refuses while a turn is running** (rebuilding
+  replaces the session, and the reply in flight would go with it — abandoning
+  work stays the esc ladder's job), and it **does not override a mode you
+  chose**: `/mode` is logged with the session and survives the reload, the same
+  inheritance `hotl resume` gives you. A session that never set one has no mode
+  of its own and picks up the reloaded `[permissions] mode`; either way the
+  notice and the badge name what you ended up with.
+
+  A `config.toml` that does not parse, or names a provider that cannot be
+  selected, changes nothing: the running engine keeps serving and the notice
+  says the previous config is still live.
+
+  New ACP method `session/reload_config`, so an editor or orchestrator
+  embedding `hotl acp` gets it too, plus additive `config_reloaded` /
+  `config_reload_failed` `session/update` notifications (no schema bump). A
+  connection served without a reload hook answers the method with an explicit
+  error rather than a silent no-op.
+
 - **Drag to copy.** Selecting a region of the console with the left mouse
   button copies it to the clipboard on release, giving back what mouse
   capture took away. The selection is a region of the screen, so what is

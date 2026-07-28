@@ -43,29 +43,33 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         Err(code) => return code,
     };
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
-    let vim_mode = cfg.behavior.vim_mode();
     // Prompt-history tail, loaded (and startup-compacted) before the screen is
     // taken; the store is handed to the loop to append each submitted prompt.
+    // Startup-only on purpose — `/reload` does not re-read `[history]`.
     let (history_store, history) =
         crate::history::History::load(&cfg.history, &crate::agent::data_dir());
     if let Some(hint) = crate::setup::first_run_hint(&crate::agent::config_dir()) {
         eprintln!("hotl: {hint}");
     }
-    // Same [settings.theme] table (and warning behavior) as `hotl watch`;
-    // warnings print as plain lines before the alternate screen owns stdout.
-    let (watch_cfg, theme_warn) = watch_types::HotlConfig::load_with_warning();
-    if let Some(w) = theme_warn {
-        eprintln!("hotl: {w}");
-    }
-    let palette = Palette::from(&watch_cfg.settings.theme.resolve().0);
-    let (density, density_warn) = watch_cfg.settings.density();
-    if let Some(w) = density_warn {
+    // The same read `/reload` repeats. Warnings print as plain lines here,
+    // before the alternate screen owns stdout; on reload they become notices.
+    let settings = client_settings();
+    for w in &settings.warnings {
         eprintln!("hotl: {w}");
     }
 
     let (client_io, server_io) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server_io);
-    tokio::spawn(crate::acp::serve(sread, swrite, factory, info));
+    // `serve_with_reload`, not `serve`: `/reload` asks the engine to rebuild
+    // itself from `config.toml`. The TUI stays a pure ACP client — it hands
+    // over the hook and never calls it.
+    tokio::spawn(crate::acp::serve(
+        sread,
+        swrite,
+        factory,
+        info,
+        Some(crate::agent::reload_hook()),
+    ));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut reader = BufReader::new(cread);
     let mut client = AcpClient::new(cwrite);
@@ -84,18 +88,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     // the guard's `Drop` must not strand the terminal in raw mode.
     crate::term::restore_on_panic();
     crate::term::trap_signals();
-    // Mouse capture makes the wheel scroll the transcript and a drag select.
-    // It costs the terminal's own drag-select, which `copy_on_select` gives
-    // back from inside the app (hold Shift on most emulators for the real
-    // thing, or turn capture off entirely).
-    let mouse = resolve_mouse(
-        std::env::var("HOTL_MOUSE").ok().as_deref(),
-        cfg.behavior.mouse(),
-    );
-    // Without capture there are no drag events at all, so the copy feature
-    // depends on it rather than silently doing nothing.
-    let copy_on_select = mouse && cfg.behavior.copy_on_select();
-    let mut guard = match TerminalGuard::enter(mouse) {
+    let mut guard = match TerminalGuard::enter(settings.mouse) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("hotl: {e}");
@@ -108,25 +101,14 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         mode,
         context_window,
     } = opened;
-    let mut state = State::new(vim_mode, model);
+    let mut state = State::new(settings.vim_mode, model);
     state.session_name = session_name;
     // Server-side truth, seeded before the first draw: the badge must never
     // render a mode the session is not actually running (evaluation §5.7).
     state.mode = mode;
     state.context_window = context_window;
-    state.skills = skills.iter().map(|(n, _)| n.clone()).collect();
-    state
-        .commands
-        .extend(
-            skills
-                .into_iter()
-                .map(|(name, description)| hotl_tui::complete::Command {
-                    name,
-                    description,
-                    builtin: false,
-                }),
-        );
-    state.density = density;
+    state.set_skills(skills);
+    state.density = settings.density;
     state.editor.load_history(history);
     let result = run_loop(
         &mut guard,
@@ -135,9 +117,9 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         keys,
         &suspended,
         state,
-        palette,
+        settings.palette,
         history_store,
-        copy_on_select,
+        settings.copy_on_select,
     )
     .await;
     drop(guard);
@@ -148,32 +130,6 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
             1
         }
     }
-}
-
-/// `initialize`'s skill roster as `(name, description)`. Accepts the object
-/// shape `[{"name":…,"description":…}]` and the legacy bare-string shape
-/// `["name"]`, so a newer TUI against an older engine keeps `/<skill>`
-/// dispatch and simply shows no descriptions.
-fn parse_skills(hello: &Value) -> Vec<(String, String)> {
-    hello
-        .get("skills")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| match v {
-                    Value::String(name) => Some((name.clone(), String::new())),
-                    Value::Object(_) => v.get("name").and_then(Value::as_str).map(|name| {
-                        let description = v
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default();
-                        (name.to_string(), description.to_string())
-                    }),
-                    _ => None,
-                })
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Session settings from the handshake pair. The session's own `mode` wins
@@ -193,6 +149,49 @@ fn open_settings(hello: &Value, opened: &Value) -> (String, u64) {
         .filter(|&w| w > 0)
         .unwrap_or(hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
     (mode, window)
+}
+
+/// The half of `config.toml` no server knows about: everything the console
+/// renders or reads keys with. Read at startup and again on every `/reload`,
+/// through the one function below — startup and reload cannot drift.
+///
+/// `[history]` is deliberately absent: the recall ring is loaded once, before
+/// the screen is taken, and re-reading it mid-session would silently discard
+/// prompts submitted since.
+struct ClientSettings {
+    palette: Palette,
+    density: hotl_theme::Density,
+    vim_mode: bool,
+    mouse: bool,
+    copy_on_select: bool,
+    /// Theme and density parse warnings, printed at startup and shown as
+    /// transcript notices on reload.
+    warnings: Vec<String>,
+}
+
+fn client_settings() -> ClientSettings {
+    let cfg = crate::config::Config::load(&crate::agent::config_dir());
+    // Same [settings.theme] table (and warning behavior) as `hotl watch`.
+    let (watch_cfg, theme_warn) = watch_types::HotlConfig::load_with_warning();
+    let (density, density_warn) = watch_cfg.settings.density();
+    // Mouse capture makes the wheel scroll the transcript and a drag select.
+    // It costs the terminal's own drag-select, which `copy_on_select` gives
+    // back from inside the app (hold Shift on most emulators for the real
+    // thing, or turn capture off entirely).
+    let mouse = resolve_mouse(
+        std::env::var("HOTL_MOUSE").ok().as_deref(),
+        cfg.behavior.mouse(),
+    );
+    ClientSettings {
+        palette: Palette::from(&watch_cfg.settings.theme.resolve().0),
+        density,
+        vim_mode: cfg.behavior.vim_mode(),
+        mouse,
+        // Without capture there are no drag events at all, so the copy feature
+        // depends on it rather than silently doing nothing.
+        copy_on_select: mouse && cfg.behavior.copy_on_select(),
+        warnings: theme_warn.into_iter().chain(density_warn).collect(),
+    }
 }
 
 /// What the pre-TUI handshake learned: the opened session's display name
@@ -216,7 +215,7 @@ async fn handshake(
 ) -> Result<Opened, String> {
     let init = client.request("initialize", Value::Null).await;
     let hello = wait_response(reader, init).await?;
-    let skills = parse_skills(&hello);
+    let skills = hotl_tui::client::parse_skills(&hello);
     let open = match spec {
         None => client.request("session/new", json!({"name": name})).await,
         Some(sid) => {
@@ -253,9 +252,9 @@ async fn run_loop(
     mut keys: mpsc::Receiver<Event>,
     suspended: &AtomicBool,
     mut state: State,
-    palette: Palette,
+    mut palette: Palette,
     mut history: crate::history::History,
-    copy_on_select: bool,
+    mut copy_on_select: bool,
 ) -> io::Result<i32> {
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     // 8 ticks/sec, armed only while a turn runs — idle schedules no wakeups.
@@ -300,6 +299,25 @@ async fn run_loop(
                 Cmd::OpenEditor(text) => {
                     let content = suspended_editor(guard, suspended, &text);
                     queue.extend(update(&mut state, Msg::EditorDone(content)));
+                }
+                // The client-side half of `/reload`. The engine half is a wire
+                // request `exec_wire_cmd` already sent; these are the settings
+                // no server knows about, so they are re-read here and applied
+                // at once — the theme flips while the rebuild is still in
+                // flight.
+                Cmd::ReloadSettings => {
+                    let s = client_settings();
+                    palette = s.palette;
+                    guard.set_mouse(s.mouse);
+                    copy_on_select = s.copy_on_select;
+                    queue.extend(update(
+                        &mut state,
+                        Msg::SettingsReloaded {
+                            vim_mode: s.vim_mode,
+                            density: s.density,
+                            warnings: s.warnings,
+                        },
+                    ));
                 }
                 Cmd::Quit => return Ok(0),
                 // `exec_wire_cmd` handled every other variant.
@@ -689,8 +707,7 @@ fn age(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        osc52, parse_skills, parse_tui_args, resolve_mouse, resolve_session_arg, terminal_msg,
-        WHEEL_LINES,
+        osc52, parse_tui_args, resolve_mouse, resolve_session_arg, terminal_msg, WHEEL_LINES,
     };
     use crossterm::event::{Event, KeyModifiers};
     use hotl_tui::app::Msg;
@@ -978,39 +995,5 @@ mod tests {
             resolve_session_arg("fix-auth", &s),
             Ok(named.session_id.clone())
         );
-    }
-
-    #[test]
-    fn skills_parse_from_the_object_shape_with_descriptions() {
-        let hello = json!({"skills": [
-            {"name": "review", "description": "review a pull request"},
-            {"name": "bare"},
-        ]});
-        assert_eq!(
-            parse_skills(&hello),
-            vec![
-                ("review".to_string(), "review a pull request".to_string()),
-                ("bare".to_string(), String::new()),
-            ]
-        );
-    }
-
-    /// A newer TUI against an older engine degrades to names-only rather
-    /// than losing `/<skill>` dispatch entirely.
-    #[test]
-    fn skills_still_parse_from_the_legacy_bare_string_shape() {
-        let hello = json!({"skills": ["review", "acme:deploy"]});
-        assert_eq!(
-            parse_skills(&hello),
-            vec![
-                ("review".to_string(), String::new()),
-                ("acme:deploy".to_string(), String::new()),
-            ]
-        );
-    }
-
-    #[test]
-    fn a_missing_skills_field_yields_nothing() {
-        assert!(parse_skills(&json!({})).is_empty());
     }
 }

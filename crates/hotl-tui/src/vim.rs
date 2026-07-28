@@ -91,6 +91,17 @@ impl Editor {
         self.history = history;
     }
 
+    /// Turn modal editing on or off mid-session (`/reload` picking up a changed
+    /// `[behavior] vim_mode`). Drops back to Insert either way: leaving the
+    /// editor parked in Normal with no modal keys to escape it would strand
+    /// the buffer, and any half-typed operator is meaningless under the new
+    /// setting.
+    pub fn set_vim_mode(&mut self, vim: bool) {
+        self.vim = vim;
+        self.mode = Mode::Insert;
+        self.pending = Pending::default();
+    }
+
     /// The active `Ctrl-R` search as `(query, matched_entry)` for rendering,
     /// or `None` when not searching. The match is empty when nothing matches.
     pub fn search_prompt(&self) -> Option<(String, String)> {

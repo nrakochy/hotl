@@ -166,6 +166,7 @@ own.
 | `/rename <name>` | Rename the session (1–64 chars); the badge and terminal title follow. |
 | `/plan` | Switch to plan mode: read-only until you approve a plan (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). |
 | `/mode <ask\|auto\|plan\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing. |
+| `/reload` | Re-read `config.toml` without losing the session (see [Reloading config](#reloading-config)). |
 | `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. |
 | `/status` | What this session is running: name, model, permission mode, context window, todo count. |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
@@ -179,6 +180,48 @@ it, `Esc` dismisses. The descriptions beside each skill come from its
 roster entry and cost nothing by default: the always-sent tool description
 omits them, and the model only sees one if it explicitly queries the skill
 tool for it.
+
+### Reloading config
+
+`/reload` picks up `config.toml` edits without ending the session. It re-reads
+the file, rebuilds the engine from it, and re-opens your session onto the new
+one — the transcript stays on screen, and the model keeps its context, todos,
+name and permission mode. Everything the engine owns reloads: `[provider]
+model`, `[[allow]]` rules, `[[mcp]]` servers, `[[hook]]`, the skill roster,
+`system-prompt.md`, `[context]`. So do the console's own settings: theme,
+density, `vim_mode`, `mouse`, `copy_on_select`.
+
+It reports what it got — `config reloaded — model … · mode … · N skill(s)` —
+and any warnings the reload produced. If the file does not parse, or the
+provider it names cannot be selected, **nothing changes**: the running engine
+keeps serving and the notice says the previous config is still live.
+
+Two things it deliberately does not do:
+
+- **It refuses while a turn is running.** Rebuilding replaces the session, and
+  the reply in flight would go with it. Let the turn finish, or press `Esc`
+  twice to take control back, then reload. Abandoning work stays your call.
+- **It does not override a mode you chose.** `/mode` is logged with the
+  session, so a session running `plan` because you asked for `plan` still runs
+  `plan` after a reload — the same inheritance `hotl resume` gives you. A
+  session that never set a mode has none of its own, so it picks up the
+  reloaded `[permissions] mode`. Either way the notice and the badge name the
+  mode you ended up with; the badge is always the mode the engine is actually
+  enforcing.
+
+Some settings are fixed for the life of the process and a reload will not move
+them. Restart hotl to change these:
+
+| Setting | Why |
+|---|---|
+| `[sandbox]` extras | Installed once, before the first tool can run |
+| `[network]` egress | Same — and widening egress mid-process would be a hole, not a feature |
+| `[behavior] sandbox` | The confinement probe has already run |
+| `[concurrency] worker_threads` / `blocking_threads` | Resolved before the async runtime exists |
+| `[history]` | The recall ring is loaded at startup; re-reading it would drop prompts submitted since |
+
+Under `hotl acp` the same thing is a `session/reload_config` call, so an editor
+or orchestrator embedding hotl gets it too.
 
 ### The permission-mode badge
 

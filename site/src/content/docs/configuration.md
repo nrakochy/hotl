@@ -142,6 +142,23 @@ feel; it's opt-in, the default stays `tokyo-night`.
 
 **Precedence for the scalar settings: environment variable > config.toml > default.** So a `HOTL_MODEL` in the shell overrides `[provider].model`, and CI can override anything without editing the file.
 
+### Reloading without restarting
+
+`config.toml` is read at startup. In the console, `/reload` re-reads it and rebuilds the engine against the new file, keeping the session — the transcript, the model's context, the todos, the session name and its permission mode all carry forward. `hotl acp` clients reach the same thing as `session/reload_config`.
+
+Most of the file reloads: `[provider]`, `[[allow]]`, `[[mcp]]`, `[[hook]]`, `[diagnostics]`, `[skills]`, `[agents]`, `[context]`, `[behavior]`, `[settings]`, `system-prompt.md`. A reload that fails to parse or to select a provider changes nothing and says so — the running engine keeps serving.
+
+These are fixed for the life of the process; restart to change them:
+
+| Setting | Why |
+|---|---|
+| `[sandbox]`, `[network]` | Installed once, before the first tool can run. Widening egress or the write floor mid-process would defeat them. |
+| `[behavior] sandbox` | The confinement probe has already run. |
+| `[concurrency] worker_threads`, `blocking_threads` | Resolved before the async runtime is built. |
+| `[history]` | The recall ring is loaded at startup; re-reading it would drop prompts submitted since. |
+
+`[permissions] mode` reloads, but it never overrides a mode you chose: `/mode` is logged with the session and survives, exactly as it does across `hotl resume`. A session that never set one has no mode of its own and picks up the reloaded default. See [tui.md](../tui/#reloading-config).
+
 ### Other files (not "config", so not in config.toml)
 
 | File | Purpose |

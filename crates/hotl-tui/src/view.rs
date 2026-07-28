@@ -805,7 +805,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "pgup pgdn scroll · ctrl-home/end jump · mouse wheel",
         "drag to select and copy · shift-drag for the terminal's own select",
         "ctrl-t expand model thinking",
-        "/help /status /cost /clear /quit · /rename /plan /mode",
+        "/help /status /cost /clear /quit · /rename /plan /mode /reload",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
         "ctrl-e or :e open $EDITOR · ctrl-c quit (busy: cancel, again quit)",
@@ -1821,16 +1821,16 @@ mod tests {
         let rows = draw(&s);
         let popup: Vec<&String> = rows[..INPUT_TOP]
             .iter()
-            .filter(|r| r.contains("/rename") || r.contains("/review"))
+            .filter(|r| r.contains("/reload") || r.contains("/rename") || r.contains("/review"))
             .collect();
-        assert_eq!(popup.len(), 2, "both matches render: {rows:#?}");
+        assert_eq!(popup.len(), 3, "every match renders: {rows:#?}");
         assert!(
-            popup[0].contains("› /rename"),
+            popup[0].contains("› /reload"),
             "the first match is marked: {}",
             popup[0]
         );
         assert!(
-            popup[0].contains("name this session"),
+            popup[0].contains("re-read config.toml"),
             "descriptions render: {}",
             popup[0]
         );

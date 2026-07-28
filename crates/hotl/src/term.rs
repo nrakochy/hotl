@@ -94,6 +94,22 @@ impl TerminalGuard {
         }
     }
 
+    /// Turn mouse reporting on or off while the screen is held (`/reload`
+    /// picking up a changed `[behavior] mouse`). The field moves with it, so
+    /// `suspend`/`resume`/`Drop` stay symmetric with the *current* setting
+    /// rather than whatever `enter` was told at startup.
+    pub(crate) fn set_mouse(&mut self, on: bool) {
+        if on == self.mouse {
+            return;
+        }
+        self.mouse = on;
+        let _ = if on {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
+        };
+    }
+
     /// Hand the real screen to `$EDITOR` — every mode we set goes with it.
     pub(crate) fn suspend(&mut self) {
         self.release();

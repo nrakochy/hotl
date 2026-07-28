@@ -27,10 +27,11 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 8] = [
+const BUILTINS: [(&str, &str); 9] = [
     ("rename", "name this session"),
     ("plan", "switch to plan mode"),
     ("mode", "set the permission mode"),
+    ("reload", "re-read config.toml"),
     ("help", "show the key bindings"),
     ("status", "what this session is running"),
     ("cost", "token and cost breakdown"),
@@ -206,6 +207,7 @@ mod tests {
                 "plan",
                 "quit",
                 "clear",
+                "reload",
                 "rename",
                 "status",
                 "run",
@@ -226,10 +228,16 @@ mod tests {
         let c = recompute(&cmds, "/re", (0, 3), false).expect("open");
         assert_eq!(
             names(&cmds, &c),
-            vec!["rename", "review", "rag-recall"],
+            vec!["reload", "rename", "review", "rag-recall"],
             "`rag-recall` contains `re` (at \"rag-\"[re]\"call\") and must sort below the prefix hits; \
              `mode` has no `r` at all and must not appear"
         );
+        // `reload` and `rename` are both 6-char built-in prefix hits, so the
+        // table's own ordering decides and `/re` no longer means `rename`.
+        // One more letter separates them, which is the price of a builtin
+        // that shares a prefix — not a special case worth ranking around.
+        let c = recompute(&cmds, "/ren", (0, 4), false).expect("open");
+        assert_eq!(names(&cmds, &c), vec!["rename"]);
     }
 
     /// Regression: a skill whose name is a strict prefix of a longer builtin

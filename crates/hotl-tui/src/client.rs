@@ -13,6 +13,35 @@ use serde_json::{json, Value};
 use std::collections::VecDeque;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+/// A server-sent skill roster as `(name, description)` pairs — the `skills`
+/// array of an `initialize` result or of a `config_reloaded` update.
+///
+/// Accepts the object shape `[{"name":…,"description":…}]` and the legacy bare
+/// string shape `["name"]`, so a newer client against an older engine keeps
+/// `/<skill>` dispatch and simply shows no descriptions. One parser for the
+/// handshake and the reload notification, so a reloaded roster is decoded
+/// exactly like the one it replaces.
+pub fn parse_skills(from: &Value) -> Vec<(String, String)> {
+    from.get("skills")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| match v {
+                    Value::String(name) => Some((name.clone(), String::new())),
+                    Value::Object(_) => v.get("name").and_then(Value::as_str).map(|name| {
+                        let description = v
+                            .get("description")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        (name.to_string(), description.to_string())
+                    }),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// One decoded server→client line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerMsg {
@@ -296,6 +325,12 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             client
                 .request("session/set_mode", json!({"mode": mode}))
                 .await;
+        }
+        // The ack is noise like rename/set_mode: the engine broadcasts
+        // `config_reloaded` (or `config_reload_failed`), and that is what the
+        // client acts on — no id-plumbing in the runtime's loop.
+        Cmd::ReloadConfig => {
+            client.request("session/reload_config", Value::Null).await;
         }
         Cmd::ReplyPermission {
             req_id,
@@ -618,6 +653,89 @@ mod tests {
         assert_eq!(
             params["images"],
             json!([{"media_type": "image/png", "data": "aW1n"}])
+        );
+    }
+
+    #[test]
+    fn skills_parse_from_the_object_shape_with_descriptions() {
+        let hello = json!({"skills": [
+            {"name": "review", "description": "review a pull request"},
+            {"name": "bare"},
+        ]});
+        assert_eq!(
+            parse_skills(&hello),
+            vec![
+                ("review".to_string(), "review a pull request".to_string()),
+                ("bare".to_string(), String::new()),
+            ]
+        );
+    }
+
+    /// A newer TUI against an older engine degrades to names-only rather
+    /// than losing `/<skill>` dispatch entirely.
+    #[test]
+    fn skills_still_parse_from_the_legacy_bare_string_shape() {
+        let hello = json!({"skills": ["review", "acme:deploy"]});
+        assert_eq!(
+            parse_skills(&hello),
+            vec![
+                ("review".to_string(), String::new()),
+                ("acme:deploy".to_string(), String::new()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_skills_field_yields_nothing() {
+        assert!(parse_skills(&json!({})).is_empty());
+    }
+
+    /// The handshake result and the `config_reloaded` update carry the same
+    /// `skills` shape, so one parser serves both — a reloaded roster decodes
+    /// exactly like the one it replaces.
+    #[test]
+    fn the_reload_update_and_the_handshake_share_one_skill_parser() {
+        let update = json!({"type": "config_reloaded", "skills": [{"name": "run", "description": "launch the app"}]});
+        assert_eq!(
+            parse_skills(&update),
+            vec![("run".to_string(), "launch the app".to_string())]
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_config_is_a_bare_wire_request() {
+        let (mut read, write) = tokio::io::duplex(4096);
+        let mut client = AcpClient::new(write);
+        let mut ids = VecDeque::new();
+        assert!(
+            exec_wire_cmd(Cmd::ReloadConfig, &mut client, &mut ids)
+                .await
+                .is_none(),
+            "the wire half handles it; nothing returns to the runtime"
+        );
+        assert!(
+            ids.is_empty(),
+            "a reload is not a prompt — it must not park a prompt id"
+        );
+        drop(client);
+        let mut out = String::new();
+        read.read_to_string(&mut out).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(out.trim()).unwrap(),
+            json!({"jsonrpc": "2.0", "id": 1, "method": "session/reload_config"})
+        );
+    }
+
+    /// The settings half never leaves the core — the runtime owns the
+    /// filesystem, so `exec_wire_cmd` must hand it straight back.
+    #[tokio::test]
+    async fn reload_settings_is_the_runtime_half() {
+        let (_read, write) = tokio::io::duplex(4096);
+        let mut client = AcpClient::new(write);
+        let mut ids = VecDeque::new();
+        assert_eq!(
+            exec_wire_cmd(Cmd::ReloadSettings, &mut client, &mut ids).await,
+            Some(Cmd::ReloadSettings)
         );
     }
 }

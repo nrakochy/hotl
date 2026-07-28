@@ -273,6 +273,25 @@ impl State {
         }
     }
 
+    /// Seed the loadable-skill roster and the completion table from it.
+    ///
+    /// One path for both the open handshake and `/reload`, so `skills` (what
+    /// `/<name>` dispatch resolves against) and `commands` (what the popup
+    /// offers) can never disagree about which skills exist.
+    pub fn set_skills(&mut self, skills: Vec<(String, String)>) {
+        self.skills = skills.iter().map(|(name, _)| name.clone()).collect();
+        self.commands = complete::builtins();
+        self.commands.extend(
+            skills
+                .into_iter()
+                .map(|(name, description)| complete::Command {
+                    name,
+                    description,
+                    builtin: false,
+                }),
+        );
+    }
+
     #[cfg(test)]
     pub(crate) fn test_default() -> Self {
         State::new(true, "test-model".into())
@@ -328,6 +347,14 @@ pub enum Msg {
     Copied {
         lines: usize,
     },
+    /// The runtime re-read the client-side half of `config.toml`
+    /// (`Cmd::ReloadSettings`). Theme, mouse and copy-on-select live in the
+    /// runtime's own locals; these two live in `State`.
+    SettingsReloaded {
+        vim_mode: bool,
+        density: hotl_theme::Density,
+        warnings: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -357,6 +384,13 @@ pub enum Cmd {
         selected: Vec<String>,
         free_text: Option<String>,
     },
+    /// Send `session/reload_config` (fire-and-forget; the engine broadcasts
+    /// `config_reloaded`, which is what the client actually acts on).
+    ReloadConfig,
+    /// Re-read the client-side half of `config.toml` — theme, density, vim
+    /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
+    /// filesystem.
+    ReloadSettings,
     OpenEditor(String),
     SetTitle(String),
     /// Append a submitted prompt to the on-disk history file (the runtime
@@ -408,7 +442,14 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
         match &msg {
             Msg::Update(v) => {
                 let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
-                if !matches!(kind, "mode_changed" | "todos_changed") {
+                // The reload pair joins the durable-state exceptions: a
+                // `/reload` issued after an esc-esc detach replaces the session
+                // outright, and swallowing that would leave the badge, the
+                // model and the skill roster describing an engine that is gone.
+                if !matches!(
+                    kind,
+                    "mode_changed" | "todos_changed" | "config_reloaded" | "config_reload_failed"
+                ) {
                     return Vec::new();
                 }
             }
@@ -538,6 +579,22 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             state.copy_notice = (lines > 0).then_some(lines);
             Vec::new()
         }
+        // The runtime already applied the settings it owns (theme, mouse,
+        // copy-on-select); these two live here. `vim_mode` also has to reach
+        // the editor, which holds its own copy.
+        Msg::SettingsReloaded {
+            vim_mode,
+            density,
+            warnings,
+        } => {
+            state.vim_mode = vim_mode;
+            state.editor.set_vim_mode(vim_mode);
+            state.density = density;
+            for w in warnings {
+                notice(state, w);
+            }
+            Vec::new()
+        }
     }
 }
 
@@ -628,6 +685,51 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // INVARIANT: `state.mode` is what the engine enforces, never what the
         // user asked for. Enforced by `mode_changed_updates_the_badge_state`.
         "mode_changed" => state.mode = text_of("mode"),
+        // `/reload` landed: the engine now runs a scaffold built from the
+        // config on disk, and the session was re-opened onto it. Everything
+        // here is server-side truth — the client re-seeds rather than guesses,
+        // exactly as it does at the open handshake.
+        "config_reloaded" => {
+            state.model = text_of("model");
+            state.mode = text_of("mode");
+            if let Some(w) = v
+                .get("context_window")
+                .and_then(Value::as_u64)
+                .filter(|&w| w > 0)
+            {
+                state.context_window = w;
+            }
+            state.set_skills(crate::client::parse_skills(v));
+            for w in v
+                .get("warnings")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+            {
+                notice(state, w.to_string());
+            }
+            notice(
+                state,
+                format!(
+                    "config reloaded — model {} · mode {} · {} skill(s). \
+                     [sandbox], [network] and the thread pools are process-wide — restart to change those.",
+                    state.model,
+                    state.mode,
+                    state.skills.len()
+                ),
+            );
+        }
+        // The rebuild failed (a typo in config.toml, an unreachable provider).
+        // The engine deliberately kept running the old scaffold, and saying so
+        // is the whole point: a silent failure here reads as "reloaded".
+        "config_reload_failed" => notice(
+            state,
+            format!(
+                "config reload failed: {} — the previous config is still live",
+                text_of("reason")
+            ),
+        ),
         "prompt_queued" => {
             if let Some(TranscriptItem::Steer { queued, .. }) = state
                 .transcript
@@ -1019,6 +1121,25 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
                 return Vec::new();
             };
             set_mode(state, mode.as_str())
+        }
+        // Re-read `config.toml` without losing the session. The settings half
+        // goes first so the theme flips at once while the engine rebuild — a
+        // provider handshake and a skill walk — is still in flight.
+        //
+        // Idle-only, deliberately: a rebuild replaces the session, and the
+        // reply a running turn is mid-way through producing would die with it.
+        // Abandoning a turn stays the user's call (the esc ladder), never a
+        // side effect of a command about configuration.
+        "reload" => {
+            if state.phase != Phase::Idle {
+                notice(
+                    state,
+                    "/reload needs an idle session — finish the turn or press esc twice".into(),
+                );
+                return Vec::new();
+            }
+            notice(state, "reloading config…".into());
+            vec![Cmd::ReloadSettings, Cmd::ReloadConfig]
         }
         // `?` only opens help while the buffer is empty, so the moment you
         // have typed anything help is unreachable — a discoverability bug,
@@ -2155,12 +2276,13 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/");
-        // Eight built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(9));
+        // Nine built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(10));
         type_str(&mut s, "re");
-        assert_eq!(selected(&s), "rename");
-        // `rename` and `review` prefix-match; no other built-in contains "re".
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(2));
+        assert_eq!(selected(&s), "reload");
+        // `reload`, `rename` and `review` prefix-match; no other built-in
+        // contains "re".
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(3));
     }
 
     #[test]
@@ -2168,7 +2290,7 @@ mod tests {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/re");
         press(&mut s, KeyCode::Down);
-        assert_eq!(selected(&s), "review");
+        assert_eq!(selected(&s), "rename");
         assert_eq!(
             s.editor.text(),
             "/re",
@@ -2176,7 +2298,7 @@ mod tests {
         );
         press(&mut s, KeyCode::Up);
         press(&mut s, KeyCode::Up);
-        assert_eq!(selected(&s), "rename", "up saturates at the top");
+        assert_eq!(selected(&s), "reload", "up saturates at the top");
         for _ in 0..10 {
             press(&mut s, KeyCode::Down);
         }
@@ -2189,7 +2311,7 @@ mod tests {
         type_str(&mut s, "/re");
         let cmds = press(&mut s, KeyCode::Tab);
         assert!(cmds.is_empty(), "tab is not a submit: {cmds:?}");
-        assert_eq!(s.editor.text(), "/rename ");
+        assert_eq!(s.editor.text(), "/reload ");
         assert!(
             s.completion.is_none(),
             "the trailing space closes the popup"
@@ -2536,6 +2658,160 @@ mod tests {
                 cmd.name
             );
         }
+    }
+
+    #[test]
+    fn slash_reload_emits_the_settings_half_before_the_wire_half() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/reload");
+        assert_eq!(
+            cmds,
+            vec![Cmd::ReloadSettings, Cmd::ReloadConfig],
+            "the theme must flip before the engine rebuild is awaited"
+        );
+        assert_eq!(s.phase, Phase::Idle, "a reload never starts a turn");
+        assert!(last_notice(&s).contains("reloading"));
+    }
+
+    /// A rebuild replaces the session, taking the in-flight turn's reply with
+    /// it. Abandoning a turn stays the esc ladder's job.
+    #[test]
+    fn slash_reload_is_refused_while_a_turn_runs() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        let cmds = slash(&mut s, "reload");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert_eq!(
+            s.phase,
+            Phase::Sampling { ticks: 0 },
+            "the turn is untouched"
+        );
+        assert!(last_notice(&s).contains("idle session"));
+    }
+
+    #[test]
+    fn config_reloaded_reseeds_model_mode_window_and_the_skill_roster() {
+        let mut s = State::test_default();
+        s.set_skills(vec![("old".into(), "gone after the reload".into())]);
+        let cmds = update(
+            &mut s,
+            Msg::Update(json!({
+                "type": "config_reloaded",
+                "model": "anthropic/claude-opus-5",
+                "mode": "plan",
+                "context_window": 900_000,
+                "skills": [{"name": "run", "description": "launch the app"}],
+                "warnings": ["[skills.marketplaces] `bad name` — entry skipped"],
+            })),
+        );
+        assert!(cmds.is_empty(), "a reload notification commands nothing");
+        assert_eq!(s.model, "anthropic/claude-opus-5");
+        assert_eq!(s.mode, "plan");
+        assert_eq!(s.context_window, 900_000);
+        assert_eq!(s.skills, vec!["run".to_string()], "the old roster is gone");
+        assert!(
+            s.commands.iter().any(|c| c.name == "run" && !c.builtin),
+            "the completion table follows the roster"
+        );
+        assert!(
+            s.commands.iter().any(|c| c.name == "reload" && c.builtin),
+            "built-ins survive a roster swap"
+        );
+        assert!(!s.commands.iter().any(|c| c.name == "old"));
+        let notices: Vec<&String> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Notice { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            notices.iter().any(|t| t.contains("entry skipped")),
+            "server-side warnings reach the transcript: {notices:?}"
+        );
+        assert!(
+            notices.iter().any(|t| t.contains("config reloaded")),
+            "{notices:?}"
+        );
+    }
+
+    /// A zero (or absent) window is an older server saying nothing, not a
+    /// claim that the model has no context — the gauge must keep dividing by
+    /// what it already knows.
+    #[test]
+    fn config_reloaded_keeps_the_known_window_when_the_server_reports_none() {
+        let mut s = State::test_default();
+        s.context_window = 200_000;
+        update(
+            &mut s,
+            Msg::Update(json!({"type": "config_reloaded", "model": "m", "mode": "ask"})),
+        );
+        assert_eq!(s.context_window, 200_000);
+    }
+
+    #[test]
+    fn a_failed_reload_says_the_previous_config_is_still_live() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::Update(json!({
+                "type": "config_reload_failed",
+                "reason": "TOML parse error at line 3",
+            })),
+        );
+        let text = last_notice(&s);
+        assert!(text.contains("TOML parse error"), "{text}");
+        assert!(text.contains("still live"), "{text}");
+    }
+
+    /// The detached-turn filter swallows everything a dead turn emits. A
+    /// reload is not the dead turn talking — it replaced the session outright,
+    /// and a swallowed `config_reloaded` would leave the badge, the model and
+    /// the roster describing an engine that is gone.
+    #[test]
+    fn a_detached_turn_does_not_swallow_the_reload_notifications() {
+        let mut s = State::test_default();
+        s.detached_turns = 1;
+        update(
+            &mut s,
+            Msg::Update(
+                json!({"type": "config_reloaded", "model": "m2", "mode": "auto",
+                               "skills": [], "context_window": 123_456}),
+            ),
+        );
+        assert_eq!(s.model, "m2");
+        assert_eq!(s.mode, "auto");
+        assert_eq!(s.context_window, 123_456);
+
+        // …while an ordinary update from the dead turn still is swallowed.
+        let before = s.transcript.len();
+        update(
+            &mut s,
+            Msg::Update(json!({"type": "assistant_delta", "text": "ghost"})),
+        );
+        assert_eq!(s.transcript.len(), before);
+    }
+
+    #[test]
+    fn settings_reloaded_applies_vim_mode_and_density_and_shows_warnings() {
+        let mut s = State::test_default();
+        assert!(s.vim_mode, "test default is vim on");
+        update(
+            &mut s,
+            Msg::SettingsReloaded {
+                vim_mode: false,
+                density: hotl_theme::Density::Compact,
+                warnings: vec!["unknown density 'wat' — using comfortable".into()],
+            },
+        );
+        assert!(!s.vim_mode);
+        assert_eq!(s.density, hotl_theme::Density::Compact);
+        assert!(last_notice(&s).contains("unknown density"));
+        // The editor holds its own copy; a stale one would leave modal keys
+        // live after vim mode was turned off.
+        s.editor.set_text("abc");
+        assert_eq!(s.editor.text(), "abc");
     }
 
     #[test]

@@ -47,15 +47,32 @@ fn server_info() -> acp::ServerInfo {
 }
 
 fn scripted_factory_with_mode(mode: &'static str) -> acp::SessionFactory {
+    scripted_factory_recording(mode, None)
+}
+
+/// `scripted_factory_with_mode`, optionally recording the `session_id` of each
+/// `SessionSpec::Load` it is handed. That id is the only way to tell a resume
+/// through the store id from one through the connection's `acp-N` handle —
+/// a factory that ignores the spec (as the plain scripted one does) cannot.
+fn scripted_factory_recording(
+    mode: &'static str,
+    loads: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+) -> acp::SessionFactory {
     Box::new(move |spec| {
         // Echo the requested name back, as the real factory does — resolving
         // the open's name is the factory's job, not the protocol layer's.
         let name = match spec {
             acp::SessionSpec::New { name } => name,
-            acp::SessionSpec::Load { name, .. } => name,
+            acp::SessionSpec::Load { name, session_id } => {
+                if let Some(loads) = &loads {
+                    loads.lock().unwrap().push(session_id);
+                }
+                name
+            }
         };
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
             ScriptedProvider::text_reply("all done via acp"),
@@ -83,6 +100,7 @@ fn scripted_factory_with_mode(mode: &'static str) -> acp::SessionFactory {
             }),
             name,
             mode: mode.to_string(),
+            session_id,
         })
     })
 }
@@ -118,6 +136,7 @@ async fn initialize_advertises_skill_names_and_descriptions() {
             skills,
             ..server_info()
         },
+        None,
     ));
 
     let (cread, mut cwrite) = tokio::io::split(client);
@@ -141,7 +160,13 @@ async fn initialize_advertises_skill_names_and_descriptions() {
 async fn initialize_new_prompt_permission_and_result() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -234,6 +259,7 @@ async fn overlapping_prompts_resolve_in_order() {
     let factory: acp::SessionFactory = Box::new(|_spec| {
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
         std::mem::forget(dir);
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::text_reply("first turn"),
@@ -260,11 +286,12 @@ async fn overlapping_prompts_resolve_in_order() {
             }),
             name: None,
             mode: "ask".into(),
+            session_id,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, factory, server_info()));
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -299,7 +326,13 @@ async fn overlapping_prompts_resolve_in_order() {
 async fn replacing_a_session_clears_parked_state() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -375,7 +408,13 @@ async fn replacing_a_session_clears_parked_state() {
 async fn steer_is_acknowledged_and_reaches_engine() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -432,6 +471,7 @@ async fn prompt_images_are_validated_at_the_wire() {
         };
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
         std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
@@ -454,9 +494,10 @@ async fn prompt_images_are_validated_at_the_wire() {
             }),
             name,
             mode: "ask".into(),
+            session_id,
         })
     });
-    tokio::spawn(acp::serve(sread, swrite, factory, server_info()));
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -529,7 +570,13 @@ async fn read_until_id(
 async fn named_open_and_rename() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
@@ -588,6 +635,7 @@ async fn ask_user_round_trip_via_session_request_question() {
     let factory: acp::SessionFactory = Box::new(|_spec| {
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
         std::mem::forget(dir);
         let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
         let (event_tx, event_rx) = hotl_engine::event_channel();
@@ -640,11 +688,12 @@ async fn ask_user_round_trip_via_session_request_question() {
             ),
             name: None,
             mode: "ask".into(),
+            session_id,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, factory, server_info()));
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
 
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -702,7 +751,13 @@ async fn ask_user_round_trip_via_session_request_question() {
 async fn set_mode_acks_and_rejects_unknown_modes() {
     let (client, server) = tokio::io::duplex(64 * 1024);
     let (sread, swrite) = tokio::io::split(server);
-    tokio::spawn(acp::serve(sread, swrite, scripted_factory(), server_info()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
 
@@ -768,6 +823,7 @@ async fn the_session_reports_its_effective_mode() {
             context_window: 1_000_000,
             model: "m".into(),
         },
+        None,
     ));
     let (cread, mut cwrite) = tokio::io::split(client);
     let mut lines = BufReader::new(cread).lines();
@@ -823,4 +879,238 @@ async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead +
         .expect("io")
         .expect("eof");
     serde_json::from_str(&line).expect("valid json frame")
+}
+
+/// Read frames until `want` says one is the interesting one, or give up. The
+/// reload path interleaves an ack, a broadcast and whatever the replacement
+/// session's drain emits, and no test should depend on that order.
+async fn next_matching(
+    lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>,
+    want: impl Fn(&Value) -> bool,
+) -> Value {
+    for _ in 0..12 {
+        let m = next(lines).await;
+        if want(&m) {
+            return m;
+        }
+    }
+    panic!("no matching frame in 12 tries");
+}
+
+/// A rebuild that succeeds, handing back a second scripted factory plus the
+/// `ServerInfo` a freshly-read config would have produced. `loads` records the
+/// `session_id` the replacement factory is asked to resume.
+fn ok_reload(
+    info: acp::ServerInfo,
+    warnings: Vec<String>,
+    loads: Option<Arc<std::sync::Mutex<Vec<String>>>>,
+) -> acp::Reload {
+    Box::new(move || {
+        let (info, warnings, loads) = (info.clone(), warnings.clone(), loads.clone());
+        Box::pin(async move { Ok((scripted_factory_recording("plan", loads), info, warnings)) })
+    })
+}
+
+fn failing_reload(reason: &'static str) -> acp::Reload {
+    Box::new(move || Box::pin(async move { Err(reason.to_string()) }))
+}
+
+/// `/reload`'s engine half: the factory and the advertised roster are replaced
+/// and the live session is re-opened onto them, then every attached surface is
+/// told — the ack alone would leave a second client rendering a stale badge.
+#[tokio::test]
+async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    let reloaded = acp::ServerInfo {
+        skills: vec![acp::SkillInfo {
+            name: "run".into(),
+            description: "launch the app".into(),
+        }],
+        default_mode: "auto".into(),
+        context_window: 900_000,
+        model: "m2".into(),
+    };
+    // What `SessionSpec::Load` the replacement factory is handed, so this test
+    // can prove the resume names the *store* session id.
+    let loads: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        Some(ok_reload(
+            reloaded,
+            vec!["[network] egress unenforced".into()],
+            Some(loads.clone()),
+        )),
+    ));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = next(&mut lines).await;
+    let first_session = opened["result"]["sessionId"].clone();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/reload_config"}),
+    )
+    .await;
+
+    let ack = next_matching(&mut lines, |m| m["id"] == json!(3)).await;
+    assert_eq!(ack["result"]["ok"], json!(true), "{ack}");
+    assert_eq!(
+        ack["result"]["model"], "m2",
+        "the ack carries the new model"
+    );
+    assert_eq!(ack["result"]["contextWindow"], 900_000);
+    assert_ne!(
+        ack["result"]["sessionId"], first_session,
+        "the session was re-opened, so it is a new link in the log chain"
+    );
+
+    // REGRESSION: the resume must name the **store** session id, not this
+    // connection's `acp-N` handle. Resuming through the handle looks fine here
+    // — a scripted factory ignores the id — but against the real factory it
+    // fails `replay_chain` and the re-open dies with "could not load session
+    // acp-1", leaving the connection with no session at all.
+    let loaded = loads.lock().unwrap().clone();
+    assert_eq!(loaded.len(), 1, "the reload re-opens exactly once");
+    assert!(
+        !loaded[0].starts_with("acp-"),
+        "reload resumed through the connection handle `{}` instead of the store id",
+        loaded[0]
+    );
+
+    let note = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "config_reloaded"
+    })
+    .await;
+    let u = &note["params"]["update"];
+    assert_eq!(u["model"], "m2");
+    assert_eq!(u["mode"], "plan", "the re-opened session's own mode");
+    assert_eq!(u["context_window"], 900_000);
+    assert_eq!(
+        u["skills"],
+        json!([{"name": "run", "description": "launch the app"}]),
+        "the client re-seeds its `/`-completion from this"
+    );
+    assert_eq!(u["warnings"], json!(["[network] egress unenforced"]));
+
+    // The swap is real, not just advertised: `initialize` now answers with
+    // the reloaded roster too.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"initialize"}),
+    )
+    .await;
+    let init = next_matching(&mut lines, |m| m["id"] == json!(4)).await;
+    assert_eq!(init["result"]["contextWindow"], 900_000);
+    assert_eq!(init["result"]["defaultMode"], "auto");
+}
+
+/// A `config.toml` with a typo must not cost you the session: the running
+/// engine is left exactly as it was, and both the ack and the broadcast say so.
+#[tokio::test]
+async fn a_failed_reload_keeps_the_running_session_answering() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        Some(failing_reload("TOML parse error at line 3")),
+    ));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = next(&mut lines).await;
+    let session_id = opened["result"]["sessionId"].clone();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/reload_config"}),
+    )
+    .await;
+    let note = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "config_reload_failed"
+    })
+    .await;
+    assert!(note["params"]["update"]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("TOML parse error"));
+    let err = next_matching(&mut lines, |m| m["id"] == json!(3)).await;
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("config reload failed"));
+
+    // Still the same session, and still alive: the scripted turn reaches its
+    // gated `bash` call, which only the original session's drain can raise.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+    let ask = next_matching(&mut lines, |m| m["method"] == "session/request_permission").await;
+    assert_eq!(
+        ask["params"]["sessionId"], session_id,
+        "the pre-reload session is the one still running"
+    );
+}
+
+/// `serve` (no hook) is the `hotl acp`-over-stdio shape a host may embed
+/// without granting a config rebuild. It must say so rather than silently
+/// no-op — a client that read "ok" would show a reload that never happened.
+#[tokio::test]
+async fn reload_config_without_a_hook_is_an_error_not_a_silent_no_op() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/reload_config"}),
+    )
+    .await;
+    let m = next(&mut lines).await;
+    assert!(
+        m["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not supported"),
+        "{m}"
+    );
 }

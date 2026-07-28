@@ -11,6 +11,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
+use futures_util::future::BoxFuture;
 use hotl_engine::{AskReply, EngineEvent, Outcome, SessionHandle};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -104,11 +105,27 @@ pub struct SessionOpen {
     /// INVARIANT: equals what the engine's `Rules` will actually enforce.
     /// Enforced by `tests/acp_protocol.rs::the_session_reports_its_effective_mode`.
     pub mode: String,
+    /// The **store** session id — what `hotl_store::replay_chain` resolves and
+    /// what `SessionSpec::Load` takes, as distinct from the `acp-N` handle
+    /// this connection hands clients. `session/reload_config` resumes through
+    /// this; resuming through the handle id silently fails to replay.
+    pub session_id: String,
 }
 
 /// Builds a session per the client's request. The real binary wires engine
 /// deps here; tests inject a scripted-provider session.
 pub type SessionFactory = Box<dyn FnMut(SessionSpec) -> Result<SessionOpen, String> + Send>;
+
+/// Rebuilds the factory (and what `initialize` advertises) from a freshly-read
+/// `config.toml`, plus any warnings that read produced. This is the whole of
+/// `session/reload_config`'s engine knowledge: the protocol layer never learns
+/// how a scaffold is built, only that one can be rebuilt.
+///
+/// `Send` because `hotl tui` `tokio::spawn`s `serve`.
+pub type Reload = Box<
+    dyn FnMut() -> BoxFuture<'static, Result<(SessionFactory, ServerInfo, Vec<String>), String>>
+        + Send,
+>;
 
 /// One skill as `initialize` advertises it. The description is client-facing
 /// only — front ends render it in the `/` completion menu. Content still
@@ -142,11 +159,18 @@ pub struct ServerInfo {
 }
 
 /// Drive the protocol over one connection until the client hangs up.
+///
+/// `reload` grants the connection the ability to rebuild its engine from
+/// `config.toml` mid-flight (`session/reload_config`). `None` is a connection
+/// without that capability, and the method then answers with an explicit
+/// error — never a silent no-op, which a client would read as a reload that
+/// happened.
 pub async fn serve(
     read: impl AsyncRead + Send + Unpin + 'static,
     write: impl AsyncWrite + Send + Unpin + 'static,
     mut factory: SessionFactory,
-    info: ServerInfo,
+    mut info: ServerInfo,
+    mut reload: Option<Reload>,
 ) {
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -190,7 +214,8 @@ pub async fn serve(
             &pending_questions,
             &pending_prompt,
             &mut next_id,
-            &info,
+            &mut info,
+            &mut reload,
         )
         .await;
     }
@@ -198,6 +223,10 @@ pub async fn serve(
 
 struct SessionState {
     id: String,
+    /// The durable id this session's log carries — what a resume (and so
+    /// `session/reload_config`) has to name. Not `id`, which is this
+    /// connection's `acp-N` handle and means nothing to the store.
+    store_id: String,
     handle: SessionHandle,
     drain: tokio::task::JoinHandle<()>,
 }
@@ -212,7 +241,8 @@ async fn handle_request(
     pending_questions: &PendingQuestions,
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
-    info: &ServerInfo,
+    info: &mut ServerInfo,
+    reload: &mut Option<Reload>,
 ) {
     let id = msg.get("id").cloned().unwrap_or(Value::Null);
     match msg.get("method").and_then(Value::as_str).unwrap_or("") {
@@ -274,49 +304,28 @@ async fn handle_request(
             };
             match factory(spec) {
                 Ok(open) => {
-                    // Captured before `open.handle` moves into `start_session`.
-                    let mode = open.mode;
-                    // Replacing a session: interrupt its in-flight turn (its
-                    // events are about to stop rendering anywhere — it must
-                    // not keep running tools invisibly in the shared cwd),
-                    // stop its drain task, and drop its parked state — a
-                    // dropped ask sender reads as a deny to the old engine,
-                    // and a stale prompt id must never be answered with the
-                    // new session's first TurnDone.
-                    if let Some(old) = session.take() {
-                        old.handle.interrupt();
-                        old.drain.abort();
-                        pending
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clear();
-                        pending_questions
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clear();
-                        pending_prompt
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .clear();
-                    }
-                    let state = start_session(
-                        open.handle,
-                        writer.clone(),
-                        pending.clone(),
-                        pending_questions.clone(),
-                        pending_prompt.clone(),
+                    // Captured before `open.handle` moves into `install_session`.
+                    let mode = open.mode.clone();
+                    let name = open.name.clone();
+                    let sid = install_session(
+                        open,
+                        writer,
+                        session,
+                        pending,
+                        pending_questions,
+                        pending_prompt,
                         next_id,
-                        info.model.clone(),
+                        &info.model,
                     );
                     // Resume auto-continuation (M4/#8): a loaded projection
                     // that ends mid-turn (user prompt or unanswered tool
                     // results) picks the work back up; the engine no-ops when
                     // there is nothing to continue.
                     if method == "session/load" {
-                        state.handle.continue_turn().await;
+                        if let Some(state) = session.as_ref() {
+                            state.handle.continue_turn().await;
+                        }
                     }
-                    let sid = state.id.clone();
-                    *session = Some(state);
                     // The session's own effective mode rides the open result:
                     // a client's handshake runs before it takes the screen and
                     // wants the seed synchronously, rather than waiting for a
@@ -327,7 +336,7 @@ async fn handle_request(
                     reply_ok(
                         writer,
                         id,
-                        json!({"sessionId": sid, "name": open.name, "mode": mode, "images": true}),
+                        json!({"sessionId": sid, "name": name, "mode": mode, "images": true}),
                     )
                     .await;
                 }
@@ -431,13 +440,187 @@ async fn handle_request(
             }
             reply_ok(writer, id, json!({"cancelled": true})).await;
         }
+        // Re-read `config.toml` and rebuild the engine behind this connection,
+        // then re-open the live session through the ordinary resume path so its
+        // items, todos, name and mode carry forward. Everything a scaffold
+        // owns reloads: model, `[[allow]]`, `[[mcp]]`, `[[hook]]`, skills, the
+        // system prompt, `[context]`. What cannot is process-wide set-once
+        // state — `[sandbox]` extras, `[network]` egress, the thread pools —
+        // which the client is told about rather than left to guess at.
+        "session/reload_config" => {
+            let Some(hook) = reload.as_mut() else {
+                return reply_err(
+                    writer,
+                    id,
+                    "session/reload_config is not supported on this connection",
+                )
+                .await;
+            };
+            // A `config.toml` with a typo must never take the live session
+            // down: on failure the running engine is left exactly as it was.
+            let (new_factory, new_info, warnings) = match hook().await {
+                Ok(triple) => triple,
+                Err(e) => {
+                    if let Some(state) = session.as_ref() {
+                        let sid = state.id.clone();
+                        notify(
+                            writer,
+                            &sid,
+                            json!({"type": "config_reload_failed", "reason": e}),
+                        )
+                        .await;
+                    }
+                    return reply_err(writer, id, &format!("config reload failed: {e}")).await;
+                }
+            };
+            *factory = new_factory;
+            *info = new_info;
+            // No live session: the new factory is in place and the next
+            // `session/new` gets the reloaded engine. Nothing to re-open.
+            let Some(store_id) = session.as_ref().map(|s| s.store_id.clone()) else {
+                return reply_ok(
+                    writer,
+                    id,
+                    json!({"ok": true, "model": info.model, "warnings": warnings}),
+                )
+                .await;
+            };
+            // The **store** id, not this connection's `acp-N` handle — the
+            // factory replays a log chain, and `acp-1` names no log.
+            //
+            // `name: None` so the replay inherits the session's own name, and
+            // `SessionSpec::Load` so it inherits its own mode: a logged
+            // `/mode` outlives a `[permissions] mode` edit, exactly as across
+            // `hotl resume`. A session that never set one has nothing to
+            // inherit and takes the reloaded default — which the ack and the
+            // broadcast both report, so no client has to infer it.
+            let spec = SessionSpec::Load {
+                session_id: store_id,
+                name: None,
+            };
+            match factory(spec) {
+                Ok(open) => {
+                    let mode = open.mode.clone();
+                    let sid = install_session(
+                        open,
+                        writer,
+                        session,
+                        pending,
+                        pending_questions,
+                        pending_prompt,
+                        next_id,
+                        &info.model,
+                    );
+                    let skills: Vec<Value> = info
+                        .skills
+                        .iter()
+                        .map(|s| json!({"name": s.name, "description": s.description}))
+                        .collect();
+                    reply_ok(
+                        writer,
+                        id,
+                        json!({
+                            "ok": true,
+                            "sessionId": sid,
+                            "model": info.model,
+                            "mode": mode,
+                            "contextWindow": info.context_window,
+                            "warnings": warnings,
+                        }),
+                    )
+                    .await;
+                    // Broadcast, not just ack — same reasoning as
+                    // `mode_changed`: every attached surface needs the new
+                    // roster, and a client's loop needs no id-plumbing to get
+                    // it. Additive, so `UPDATE_SCHEMA_VERSION` stands.
+                    notify(
+                        writer,
+                        &sid,
+                        json!({
+                            "type": "config_reloaded",
+                            "model": info.model,
+                            "mode": mode,
+                            "context_window": info.context_window,
+                            "skills": skills,
+                            "warnings": warnings,
+                        }),
+                    )
+                    .await;
+                }
+                // The factory swapped but re-opening failed: say so loudly.
+                // The connection has no session now, so `session/new` is the
+                // way back — and it will use the reloaded engine.
+                Err(e) => {
+                    reply_err(
+                        writer,
+                        id,
+                        &format!("config reloaded but session re-open failed: {e}"),
+                    )
+                    .await
+                }
+            }
+        }
         other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
     }
+}
+
+/// Make `open` the connection's session, retiring whatever was there, and
+/// return the new session id.
+///
+/// Replacing a session: interrupt its in-flight turn (its events are about to
+/// stop rendering anywhere — it must not keep running tools invisibly in the
+/// shared cwd), stop its drain task, and drop its parked state — a dropped ask
+/// sender reads as a deny to the old engine, and a stale prompt id must never
+/// be answered with the new session's first TurnDone.
+///
+/// Shared by `session/new`, `session/load` and `session/reload_config` so the
+/// three can never drift on what "retire the old session" means.
+#[allow(clippy::too_many_arguments)]
+fn install_session(
+    open: SessionOpen,
+    writer: &Writer,
+    session: &mut Option<SessionState>,
+    pending: &Pending,
+    pending_questions: &PendingQuestions,
+    pending_prompt: &PendingPrompt,
+    next_id: &mut u64,
+    model: &str,
+) -> String {
+    if let Some(old) = session.take() {
+        old.handle.interrupt();
+        old.drain.abort();
+        pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        pending_questions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        pending_prompt
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+    let state = start_session(
+        open.handle,
+        open.session_id,
+        writer.clone(),
+        pending.clone(),
+        pending_questions.clone(),
+        pending_prompt.clone(),
+        next_id,
+        model.to_string(),
+    );
+    let sid = state.id.clone();
+    *session = Some(state);
+    sid
 }
 
 #[allow(clippy::too_many_arguments)]
 fn start_session(
     mut handle: SessionHandle,
+    store_id: String,
     writer: Writer,
     pending: Pending,
     pending_questions: PendingQuestions,
@@ -462,7 +645,12 @@ fn start_session(
         req_id_seed,
         model,
     ));
-    SessionState { id, handle, drain }
+    SessionState {
+        id,
+        store_id,
+        handle,
+        drain,
+    }
 }
 
 /// Map engine events to `session/update` notifications, turn permission asks

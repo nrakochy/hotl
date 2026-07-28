@@ -87,8 +87,12 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     };
     let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
-        Err(code) => return code,
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            return 1;
+        }
     };
+    print_warnings(&scaffold.warnings);
     let mut log = match SessionLog::create(
         &sessions_dir(),
         &scaffold.model,
@@ -153,28 +157,39 @@ pub async fn acp_main() -> i32 {
         Ok(triple) => triple,
         Err(code) => return code,
     };
-    crate::acp::serve(tokio::io::stdin(), tokio::io::stdout(), factory, info).await;
+    // With the reload hook, same as `hotl tui`: an editor or orchestrator
+    // driving hotl over stdio can pick up a `config.toml` edit with
+    // `session/reload_config` instead of restarting the process.
+    crate::acp::serve(
+        tokio::io::stdin(),
+        tokio::io::stdout(),
+        factory,
+        info,
+        Some(reload_hook()),
+    )
+    .await;
     0
 }
 
-/// The real-engine session factory `hotl acp` and `hotl tui` share, plus the
-/// resolved model name and what `initialize` advertises. Prints its own
-/// errors; `Err` carries the exit code.
-pub(crate) async fn acp_factory(
-) -> Result<(crate::acp::SessionFactory, String, crate::acp::ServerInfo), i32> {
+/// The real-engine session factory `hotl acp` and `hotl tui` share, built from
+/// a freshly-read `config.toml`, plus what `initialize` advertises and the
+/// startup warnings the caller decides how to surface.
+///
+/// Deliberately silent: `/reload` (`acp::Reload`) calls this with the
+/// alternate screen up, where a stray `eprintln!` would corrupt the display.
+/// The startup wrapper below is what prints.
+pub(crate) async fn build_acp() -> Result<
+    (
+        crate::acp::SessionFactory,
+        crate::acp::ServerInfo,
+        Vec<String>,
+    ),
+    String,
+> {
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
-    let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
-        Ok(triple) => triple,
-        Err(msg) => {
-            eprintln!("hotl: {msg}");
-            return Err(1);
-        }
-    };
-    let mut scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
-        Ok(s) => s,
-        Err(code) => return Err(code),
-    };
+    let (provider, model, key_source) = select_provider(&cfg, &secrets)?;
+    let mut scaffold = scaffold(provider, model, &secrets, cfg, key_source).await?;
     // §Task 4 (mode-derived 1h TTL): `hotl tui`/`hotl acp` sessions are
     // human-approval-gated and long-lived — pauses > 5 min are the dominant
     // cost pattern, and the stable prefix and rolling anchors are read every
@@ -183,7 +198,8 @@ pub(crate) async fn acp_factory(
     // session — `spawn_builder`'s captured config predates this mutation
     // (see `HotlChildBuilder::spawn_child`), so children are unaffected.
     scaffold.config.cache_ttl = CacheTtl::OneHour;
-    let model = scaffold.model.clone();
+    // Taken before the closure below moves `scaffold` out of reach.
+    let warnings = std::mem::take(&mut scaffold.warnings);
     let skills: Vec<crate::acp::SkillInfo> = scaffold
         .skills
         .iter()
@@ -199,7 +215,7 @@ pub(crate) async fn acp_factory(
         skills,
         default_mode: scaffold.rules.mode().as_str().to_string(),
         context_window: scaffold.config.context_window,
-        model: model.clone(),
+        model: scaffold.model.clone(),
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide
@@ -320,9 +336,36 @@ pub(crate) async fn acp_factory(
             handle,
             name: requested,
             mode,
+            // This log's own id — the one a later `session/load` (and so
+            // `session/reload_config`) must name to replay this chain.
+            session_id,
         })
     });
-    Ok((factory, model, info))
+    Ok((factory, info, warnings))
+}
+
+/// `build_acp` for the startup paths: prints what it collected (plain lines,
+/// before any guard takes the screen) and reports failure as an exit code.
+pub(crate) async fn acp_factory(
+) -> Result<(crate::acp::SessionFactory, String, crate::acp::ServerInfo), i32> {
+    match build_acp().await {
+        Ok((factory, info, warnings)) => {
+            print_warnings(&warnings);
+            let model = info.model.clone();
+            Ok((factory, model, info))
+        }
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            Err(1)
+        }
+    }
+}
+
+/// The hook `serve` calls on `session/reload_config`: rebuild the factory from
+/// whatever `config.toml` says *now*. Boxed because the protocol layer must not
+/// know how a scaffold is built — only that one can be rebuilt.
+pub(crate) fn reload_hook() -> crate::acp::Reload {
+    Box::new(|| Box::pin(build_acp()))
 }
 
 /// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a
@@ -339,8 +382,12 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     };
     let mut scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
-        Err(code) => return code,
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            return 1;
+        }
     };
+    print_warnings(&scaffold.warnings);
     // §Task 4 (mode-derived 1h TTL): attach-at-any-time is `hotl bg`'s design
     // center — sessions are long-lived and human-supervised, same rationale
     // as `acp_factory`. Set AFTER `scaffold()` returns; see that comment for
@@ -415,6 +462,11 @@ struct Scaffold {
     /// `[agents] claude` — whether `spawn`'s agent_type resolution also reads
     /// `~/.claude/agents/*.md` (mirrors `[skills] claude`).
     agents_include_claude: bool,
+    /// Startup warnings, collected rather than printed: `/reload` rebuilds a
+    /// scaffold with the alternate screen up, where a stray `eprintln!` would
+    /// corrupt the display. Startup callers print these verbatim; the reload
+    /// path ships them to the client as transcript notices.
+    warnings: Vec<String>,
 }
 
 /// Builds the process-wide scaffold, validating `key_source` first: a broken
@@ -426,14 +478,12 @@ async fn scaffold(
     secrets: &dyn SecretStore,
     cfg: crate::config::Config,
     key_source: Arc<dyn hotl_provider::key::KeySource>,
-) -> Result<Scaffold, i32> {
+) -> Result<Scaffold, String> {
     let initial_helper_key = match key_source.get().await {
         Ok(k) => k.filter(|_| key_source.refreshable()),
-        Err(e) => {
-            eprintln!("hotl: {e}");
-            return Err(1);
-        }
+        Err(e) => return Err(e.to_string()),
     };
+    let mut warnings: Vec<String> = Vec::new();
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
     let config_dir = config_dir();
     // config.toml [behavior].sandbox = false disables the floor (env still wins).
@@ -447,7 +497,7 @@ async fn scaffold(
     // the probe's outside-the-floor target avoids the configured roots.
     let (sandbox_extras, sandbox_warnings) = cfg.sandbox.resolve(&config_dir, &data_dir());
     for w in &sandbox_warnings {
-        eprintln!("hotl: WARNING — {w}");
+        warnings.push(format!("WARNING — {w}"));
     }
     hotl_tools::sandbox::init_extras(sandbox_extras);
     let sandbox_status = sandbox::probe();
@@ -456,7 +506,7 @@ async fn scaffold(
     // downstream can re-init it back to Open.
     let (egress_policy, egress_warning) = cfg.network.egress_policy();
     if let Some(warning) = &egress_warning {
-        eprintln!("hotl: WARNING — {warning}");
+        warnings.push(format!("WARNING — {warning}"));
     }
     hotl_tools::net::init(egress_policy);
     // Bash auto-allow needs the whole posture honest: the write floor
@@ -477,7 +527,7 @@ async fn scaffold(
     let (layer_c_worker_threads, _layer_c_blocking_threads) =
         layer_c_resolved(secrets, &cfg.concurrency);
     if let Some(warning) = layer_c_warning(layer_c_worker_threads) {
-        eprintln!("hotl: {warning}");
+        warnings.push(warning);
     }
     let concurrency =
         hotl_tools::concurrency::SessionConcurrency::new(concurrency_limits(secrets, &cfg));
@@ -500,11 +550,7 @@ async fn scaffold(
     // two independently-built ones.
     let (registry, skills, discovery_warnings) =
         build_registry(&cfg, &config_dir, concurrency.clone());
-    // The one place that owns stdout: `scaffold` runs before any terminal
-    // guard takes the screen, so these land as plain lines (T3-23).
-    for w in discovery_warnings {
-        eprintln!("hotl: {w}");
-    }
+    warnings.extend(discovery_warnings);
     let registry = Arc::new(registry);
     let hooks = load_hooks(&cfg, concurrency.clone());
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
@@ -525,7 +571,17 @@ async fn scaffold(
         spawn_builder,
         concurrency,
         agents_include_claude,
+        warnings,
     })
+}
+
+/// Print a scaffold's collected warnings. The startup paths call this the
+/// moment `scaffold()` returns, so a terminal-bound run's output is what it
+/// always was: plain lines, before any guard takes the screen (T3-23).
+fn print_warnings(warnings: &[String]) {
+    for w in warnings {
+        eprintln!("hotl: {w}");
+    }
 }
 
 impl Scaffold {
@@ -617,8 +673,12 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     let _wire_arm = provider.arm();
     let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
-        Err(code) => return code,
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            return 1;
+        }
     };
+    print_warnings(&scaffold.warnings);
 
     let mut log = match SessionLog::create(
         &sessions_dir(),
@@ -2197,20 +2257,55 @@ mod tests {
     fn acp_factory_arms_the_provider_on_every_session_open() {
         let src = include_str!("agent.rs");
         let body = src
-            .split("async fn acp_factory(")
+            .split("pub(crate) async fn build_acp(")
             .nth(1)
-            .expect("acp_factory exists")
-            .split("\npub async fn serve_main(")
+            .expect("build_acp exists")
+            .split("\npub(crate) async fn acp_factory(")
             .next()
-            .expect("acp_factory is followed by serve_main");
+            .expect("build_acp is followed by acp_factory");
         let factory_closure = body
             .split("let factory: crate::acp::SessionFactory = Box::new(move |spec| {")
             .nth(1)
-            .expect("acp_factory builds the SessionFactory closure");
+            .expect("build_acp builds the SessionFactory closure");
         assert!(
             factory_closure.contains(".arm()"),
             "the SessionFactory closure must arm the provider on every session open"
         );
+    }
+
+    /// The same T3-23 rule as `build_registry_has_no_direct_output`, now
+    /// load-bearing for a second reason: `/reload` runs `scaffold`/`build_acp`
+    /// with the alternate screen already up, so a warning printed here would
+    /// scribble over the console instead of reaching the transcript. Warnings
+    /// are collected into `Scaffold.warnings`; `print_warnings` is the one
+    /// caller, and only the startup paths use it.
+    #[test]
+    fn the_reloadable_build_path_has_no_direct_output() {
+        let src = include_str!("agent.rs");
+        for (name, start_pat, end_pat) in [
+            (
+                "scaffold",
+                "async fn scaffold(",
+                "\n/// Print a scaffold's collected warnings",
+            ),
+            (
+                "build_acp",
+                "pub(crate) async fn build_acp(",
+                "\n/// `build_acp` for the startup paths",
+            ),
+        ] {
+            let body = src
+                .split(start_pat)
+                .nth(1)
+                .unwrap_or_else(|| panic!("{name} exists"))
+                .split(end_pat)
+                .next()
+                .unwrap_or_else(|| panic!("{name} has a known end marker"));
+            assert!(
+                !body.contains("eprintln!") && !body.contains("println!"),
+                "{name} prints directly — a `/reload` would scribble on the alternate screen"
+            );
+        }
     }
 
     /// Library code inside a TUI process must not write to stderr — it lands

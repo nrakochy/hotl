@@ -44,6 +44,7 @@ fn scripted_factory() -> acp::SessionFactory {
     Box::new(|_spec| {
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
             ScriptedProvider::text_reply("all done via tui"),
@@ -71,6 +72,7 @@ fn scripted_factory() -> acp::SessionFactory {
             }),
             name: None,
             mode: "ask".into(),
+            session_id,
         })
     })
 }
@@ -81,6 +83,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
     Box::new(|_spec| {
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
         let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
         let (event_tx, event_rx) = hotl_engine::event_channel();
         let mut registry = Registry::builtin();
@@ -133,6 +136,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             ),
             name: None,
             mode: "ask".into(),
+            session_id,
         })
     })
 }
@@ -155,6 +159,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             context_window: 200_000,
             model: "m".into(),
         },
+        None,
     ));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut client = AcpClient::new(cwrite);
