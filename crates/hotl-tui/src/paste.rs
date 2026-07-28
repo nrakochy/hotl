@@ -123,6 +123,9 @@ fn substitute(text: &str, subs: &[(String, String)]) -> String {
     while i < text.len() {
         match subs
             .iter()
+            // An empty marker matches at every offset without consuming any
+            // input, so `i` would never advance — skip it, don't loop forever.
+            .filter(|(m, _)| !m.is_empty())
             .filter_map(|(m, r)| text[i..].find(m.as_str()).map(|off| (i + off, m, r)))
             .min_by_key(|&(at, m, _)| (at, std::cmp::Reverse(m.len())))
         {
@@ -475,6 +478,12 @@ mod tests {
         let p = expand_for_wire("[Pasted text #1 +3 lines]", &atts);
         assert_eq!(p.text, "sneaky [Image #1] inside");
         assert!(p.images.is_empty());
+    }
+
+    #[test]
+    fn substitute_ignores_an_empty_marker_instead_of_looping_forever() {
+        // Guard, not a feature: no producer emits "", but a bogus one must not hang.
+        assert_eq!(substitute("abc", &[(String::new(), "X".into())]), "abc");
     }
 
     #[test]
