@@ -6,6 +6,7 @@
 
 use std::path::Path;
 
+use hotl_mcp::trust::TrustState;
 use hotl_platform::{EnvSecrets, SecretStore};
 use hotl_store::Masker;
 use hotl_tools::sandbox;
@@ -58,6 +59,9 @@ pub fn doctor_main() -> i32 {
         permissions_check(&config_dir),
         rules_check(&config_dir),
         sessions_check(&sessions_dir),
+    ]);
+    checks.extend(mcp_check(&config_dir));
+    checks.extend([
         memory_check(&config_dir),
         audit_check(&sessions_dir),
         undo_check(),
@@ -287,6 +291,72 @@ fn rules_check(config_dir: &Path) -> Check {
     }
 }
 
+/// MCP servers and what the trust gate will do with each. This is also where
+/// `trust.toml`'s parse warnings surface: `build_registry` loads the store with
+/// `TrustStore::load`, which drops them, so a corrupt file would otherwise show
+/// up only as an unexplained wave of re-prompts.
+fn mcp_check(config_dir: &Path) -> Vec<Check> {
+    let servers = crate::config::Config::load(config_dir).mcp_servers();
+    let (store, warnings) = hotl_mcp::trust::TrustStore::load_reporting(config_dir);
+    let mut checks: Vec<Check> = warnings
+        .into_iter()
+        .map(|w| warn(format!("mcp: {w}")))
+        .collect();
+    // Stale grants are reported even with nothing configured — removing the
+    // last `[[mcp]]` entry is precisely how a grant is orphaned.
+    if servers.is_empty() {
+        checks.push(ok("mcp: no servers configured".into()));
+        checks.extend(stale_grant_checks(&store, &servers));
+        return checks;
+    }
+    let workspace = hotl_tools::workspace_root();
+    let states: Vec<_> = servers
+        .iter()
+        .map(|s| {
+            let fp = hotl_mcp::trust::Fingerprint::of(s);
+            (s.name.as_str(), store.state(&s.name, &fp, workspace))
+        })
+        .collect();
+    let count = |want| states.iter().filter(|(_, s)| *s == want).count();
+    checks.push(ok(format!(
+        "mcp: {} server(s) configured ({} trusted, {} screen on first use)",
+        servers.len(),
+        count(TrustState::Trusted),
+        count(TrustState::Untrusted)
+    )));
+    for (name, _) in states.iter().filter(|(_, s)| *s == TrustState::Unhashable) {
+        checks.push(warn(format!(
+            "mcp: `{name}`'s binary cannot be read, so hotl will ask every time — \
+             fix the path, or run: hotl mcp untrust {name}"
+        )));
+    }
+    checks.extend(stale_grant_checks(&store, &servers));
+    checks
+}
+
+/// Grants whose server has left the config. Harmless — the fingerprint must
+/// still match — but they are the residue nothing else reports.
+fn stale_grant_checks(
+    store: &hotl_mcp::trust::TrustStore,
+    servers: &[hotl_mcp::config::ServerConfig],
+) -> Vec<Check> {
+    let mut stale: Vec<_> = store
+        .entries()
+        .map(|(n, _)| n.to_string())
+        .filter(|n| !servers.iter().any(|s| &s.name == n))
+        .collect();
+    stale.sort();
+    stale
+        .into_iter()
+        .map(|n| {
+            warn(format!(
+                "mcp: trust.toml holds a grant for `{n}`, which is no longer \
+                 configured — run: hotl mcp untrust {n}"
+            ))
+        })
+        .collect()
+}
+
 fn sessions_check(sessions_dir: &Path) -> Check {
     if let Err(e) = std::fs::create_dir_all(sessions_dir) {
         return fail(format!(
@@ -341,6 +411,62 @@ fn audit_check(sessions_dir: &Path) -> Check {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lines(checks: &[Check]) -> String {
+        checks
+            .iter()
+            .map(|c| {
+                let tag = match c.status {
+                    Status::Ok => "ok",
+                    Status::Warn => "warn",
+                    Status::Fail => "FAIL",
+                };
+                format!("{tag} {}\n", c.line)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mcp_check_counts_states_and_flags_unreadable_binaries() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(lines(&mcp_check(dir.path())).contains("ok mcp: no servers configured"));
+
+        let bin = dir.path().join("server-bin");
+        std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[[mcp]]\nname = \"docs\"\ncommand = \"{}\"\n\n\
+                 [[mcp]]\nname = \"broken\"\ncommand = \"/definitely/not/here\"\n",
+                bin.display()
+            ),
+        )
+        .unwrap();
+        let out = lines(&mcp_check(dir.path()));
+        assert!(out.contains("2 server(s) configured"), "{out}");
+        assert!(out.contains("0 trusted, 1 screen on first use"), "{out}");
+        assert!(
+            out.contains("warn mcp: `broken`'s binary cannot be read"),
+            "{out}"
+        );
+    }
+
+    /// `build_registry` loads the trust store with `load`, which drops parse
+    /// warnings. Doctor is where they surface.
+    #[test]
+    fn mcp_check_surfaces_a_corrupt_trust_file_and_stale_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("trust.toml"), b"not = valid toml [").unwrap();
+        let out = lines(&mcp_check(dir.path()));
+        assert!(
+            out.contains("warn mcp:") && out.contains("trust.toml"),
+            "{out}"
+        );
+
+        std::fs::write(dir.path().join("trust.toml"), b"ghost = \"fp2:abc\"\n").unwrap();
+        let out = lines(&mcp_check(dir.path()));
+        assert!(out.contains("hotl mcp untrust ghost"), "{out}");
+    }
 
     #[test]
     fn key_source_line_names_active_source() {
