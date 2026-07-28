@@ -748,15 +748,16 @@ mod tests {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
         let mut ids = VecDeque::new();
+        let mut steer_ids = VecDeque::new();
         assert!(
-            exec_wire_cmd(Cmd::ReloadConfig, &mut client, &mut ids)
+            exec_wire_cmd(Cmd::ReloadConfig, &mut client, &mut ids, &mut steer_ids)
                 .await
                 .is_none(),
             "the wire half handles it; nothing returns to the runtime"
         );
         assert!(
-            ids.is_empty(),
-            "a reload is not a prompt — it must not park a prompt id"
+            ids.is_empty() && steer_ids.is_empty(),
+            "a reload is neither a prompt nor a steer — it must park no id"
         );
         drop(client);
         let mut out = String::new();
@@ -774,8 +775,9 @@ mod tests {
         let (_read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
         let mut ids = VecDeque::new();
+        let mut steer_ids = VecDeque::new();
         assert_eq!(
-            exec_wire_cmd(Cmd::ReloadSettings, &mut client, &mut ids).await,
+            exec_wire_cmd(Cmd::ReloadSettings, &mut client, &mut ids, &mut steer_ids).await,
             Some(Cmd::ReloadSettings)
         );
     }
