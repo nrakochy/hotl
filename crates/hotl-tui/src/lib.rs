@@ -10,6 +10,7 @@ pub mod client;
 pub mod complete;
 pub mod paste;
 pub mod scroll;
+pub mod select;
 pub mod view;
 pub mod vim;
 pub mod wrap;

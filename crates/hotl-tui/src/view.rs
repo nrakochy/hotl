@@ -27,15 +27,56 @@ const COMPLETE_MAX_ROWS: usize = 8;
 /// Reasoning is context for a decision, not the decision.
 const THINKING_COLLAPSED_LINES: usize = 3;
 
-pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
-    let area = frame.area();
-    let [transcript, strip, input, hint] = Layout::vertical([
+/// The four horizontal bands: transcript, status strip, input, hint. Shared by
+/// `view` and `selection_text` so the render and the copy can never disagree
+/// about where the transcript ends and the input box begins.
+fn regions(state: &State, area: Rect) -> [Rect; 4] {
+    Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
         Constraint::Length(input_height(state, area)),
         Constraint::Length(1),
     ])
-    .areas(area);
+    .areas(area)
+}
+
+/// The text under a drag selection, read back out of a rendered frame.
+///
+/// The transcript's spine is trimmed so dragging across a paragraph yields
+/// prose; the input box and hint are taken verbatim. Returns empty when the
+/// region holds nothing but whitespace.
+pub fn selection_text(
+    state: &State,
+    buf: &ratatui::buffer::Buffer,
+    sel: &crate::select::Selection,
+) -> String {
+    let transcript = regions(state, buf.area)[0];
+    // Where `Spine::wrap` hands the line over to content.
+    let text_col = state.density.gutter() as u16 + 2;
+    crate::select::region_text(buf, sel, transcript, text_col)
+}
+
+/// Reverse the selected cells. Runs last of all, so the highlight sits above
+/// every widget and popup. Reversed video is what terminals use for their own
+/// drag-select, so it reads correctly under any theme and needs no palette
+/// entry of its own.
+fn highlight(sel: &crate::select::Selection, frame: &mut Frame) {
+    let area = frame.area();
+    let buf = frame.buffer_mut();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if sel.contains(x, y) {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(Style::new().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+}
+
+pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
+    let area = frame.area();
+    let [transcript, strip, input, hint] = regions(state, area);
     render_transcript(state, p, frame, transcript);
     render_strip(state, p, frame, strip);
     render_input(state, p, frame, input);
@@ -49,6 +90,9 @@ pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     }
     if state.help_open {
         render_help(p, frame, transcript);
+    }
+    if let Some(sel) = &state.selection {
+        highlight(sel, frame);
     }
 }
 
@@ -607,6 +651,15 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // INVARIANT: while `Phase` is `WaitingAsk`/`WaitingQuestion` the hint names
     // only keys that phase's handler accepts. Enforced by
     // `an_ask_during_a_search_shows_the_ask_hint`.
+    //
+    // The copy notice sits *below* all four of those for the same reason: a
+    // mouse drag can finish during an ask, and "copied 3 lines" must not
+    // displace the keys the halted loop is waiting on. Enforced by
+    // `an_ask_hint_outranks_the_copy_notice`.
+    let copied = state.copy_notice.map(|n| {
+        let plural = if n == 1 { "" } else { "s" };
+        format!("copied {n} line{plural} · any key clears")
+    });
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
         (Phase::WaitingAsk { .. }, ..) => {
             "y allow · n deny · type a reason after n · esc interrupt · ctrl-c"
@@ -618,6 +671,7 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
             "type to search · ctrl-r older · enter accept · esc cancel"
         }
         _ if state.completion.is_some() => "↑↓ pick · tab complete · enter run · esc dismiss",
+        _ if copied.is_some() => copied.as_deref().unwrap_or_default(),
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
     };
@@ -748,7 +802,8 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "i a I A o O insert · h l 0 $ w b e motions (+counts)",
         "d c y operators · dd cc yy x p u",
         "j k scroll transcript when input is empty",
-        "pgup pgdn scroll · ctrl-home/end jump · mouse wheel (HOTL_MOUSE=0 disables)",
+        "pgup pgdn scroll · ctrl-home/end jump · mouse wheel",
+        "drag to select and copy · shift-drag for the terminal's own select",
         "ctrl-t expand model thinking",
         "/help /status /cost /clear /quit · /rename /plan /mode",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
@@ -892,6 +947,127 @@ mod tests {
     const STRIP: usize = 19;
     const INPUT_TOP: usize = 20;
     const HINT: usize = 23;
+
+    /// Column the `Comfortable` spine (gutter 2 + glyph + space) hands prose
+    /// over at, and the transcript text used by the selection tests.
+    const TEXT_COL: u16 = 4;
+    const PROSE: &str = "alpha beta gamma";
+
+    /// One assistant turn, so transcript row 0 is `"  ● alpha beta gamma"`.
+    fn state_with_prose() -> State {
+        let mut s = State::test_default();
+        s.transcript = vec![TranscriptItem::Assistant {
+            text: PROSE.to_string(),
+        }];
+        s
+    }
+
+    /// Every row that has reversed cells, as `(row, text of those cells)`.
+    fn reversed_rows(buffer: &ratatui::buffer::Buffer) -> Vec<(u16, String)> {
+        (0..buffer.area.height)
+            .filter_map(|y| {
+                let text: String = (0..buffer.area.width)
+                    .filter(|&x| {
+                        buffer
+                            .cell((x, y))
+                            .unwrap()
+                            .modifier
+                            .contains(Modifier::REVERSED)
+                    })
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect();
+                (!text.is_empty()).then_some((y, text))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_drag_highlights_exactly_the_cells_it_covers() {
+        let mut s = state_with_prose();
+        s.selection = Some(crate::select::Selection {
+            anchor: (TEXT_COL, 0),
+            head: (TEXT_COL + 4, 0),
+        });
+        let buffer = draw_buffer(&s);
+        assert_eq!(
+            reversed_rows(&buffer),
+            vec![(0, "alpha".to_string())],
+            "only the dragged cells may reverse"
+        );
+    }
+
+    #[test]
+    fn what_is_highlighted_is_what_gets_copied() {
+        // The feature's central invariant: the painted region and the scraped
+        // text are read from the same buffer, so they cannot disagree.
+        let mut s = state_with_prose();
+        let sel = crate::select::Selection {
+            anchor: (TEXT_COL, 0),
+            head: (TEXT_COL + 9, 0),
+        };
+        s.selection = Some(sel);
+        let buffer = draw_buffer(&s);
+        let highlighted: String = reversed_rows(&buffer)
+            .into_iter()
+            .map(|(_, text)| text.trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(highlighted, selection_text(&s, &buffer, &sel));
+        assert_eq!(highlighted, "alpha beta");
+    }
+
+    #[test]
+    fn dragging_from_the_left_edge_copies_prose_without_the_spine() {
+        let mut s = state_with_prose();
+        let sel = crate::select::Selection {
+            anchor: (0, 0),
+            head: (79, 0),
+        };
+        s.selection = Some(sel);
+        assert_eq!(selection_text(&s, &draw_buffer(&s), &sel), PROSE);
+    }
+
+    #[test]
+    fn a_finished_copy_is_reported_in_the_hint() {
+        let mut s = State::test_default();
+        s.copy_notice = Some(3);
+        assert!(draw(&s)[HINT].contains("copied 3 lines"), "{:?}", draw(&s));
+    }
+
+    #[test]
+    fn one_copied_line_reads_in_the_singular() {
+        let mut s = State::test_default();
+        s.copy_notice = Some(1);
+        assert!(draw(&s)[HINT].contains("copied 1 line ·"), "{:?}", draw(&s));
+    }
+
+    #[test]
+    fn the_help_overlay_names_drag_to_copy() {
+        let mut s = State::test_default();
+        s.help_open = true;
+        let rows = draw(&s);
+        assert!(
+            rows.iter().any(|r| r.contains("drag to select and copy")),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn an_ask_hint_outranks_the_copy_notice() {
+        // The hint-precedence INVARIANT: a phase that owns the keyboard must
+        // keep naming its own keys.
+        let mut s = State::test_default();
+        s.copy_notice = Some(3);
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "run rm -rf".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: Vec::new(),
+        };
+        assert!(draw(&s)[HINT].contains("y allow"), "{:?}", draw(&s));
+    }
 
     #[test]
     fn thinking_collapses_to_three_lines_with_a_toggle_hint() {

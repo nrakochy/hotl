@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::complete::{self, Completion};
 use crate::paste;
+use crate::select;
 use crate::vim::{Editor, EditorEvent};
 
 /// What the agent is doing right now. `ticks` count time *in this phase*
@@ -230,6 +231,15 @@ pub struct State {
     /// orphan valid tokens. Cleared on every submit; a mangled token's
     /// entry is silently dropped at expansion (the orphan rule).
     pub attachments: Vec<paste::Attachment>,
+    /// The live mouse drag, in *screen* cell coordinates rather than transcript
+    /// offsets. Transient: it survives only until the next real user action
+    /// (see the clearing rule at the top of `update`).
+    pub selection: Option<select::Selection>,
+    /// Lines copied by the last drag, shown in the hint until the next action
+    /// clears it. There is no timer to expire it — the runtime's ticker is
+    /// armed only while a turn runs, so an idle console would keep a timed
+    /// notice forever.
+    pub copy_notice: Option<usize>,
 }
 
 impl State {
@@ -258,6 +268,8 @@ impl State {
             dismissed: false,
             thinking_expanded: false,
             attachments: Vec::new(),
+            selection: None,
+            copy_notice: None,
         }
     }
 
@@ -299,6 +311,23 @@ pub enum Msg {
     Tick,
     /// `$EDITOR` result; `None` = unchanged/aborted.
     EditorDone(Option<String>),
+    /// Left button pressed: anchor a new selection at this cell.
+    SelectStart {
+        col: u16,
+        row: u16,
+    },
+    /// Left button dragged: move the selection head. One per cell crossed.
+    SelectExtend {
+        col: u16,
+        row: u16,
+    },
+    /// Left button released: copy, unless the drag never left its anchor.
+    SelectEnd,
+    /// The runtime finished a copy and reports how much reached the clipboard.
+    /// `0` means the region held nothing worth copying.
+    Copied {
+        lines: usize,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -333,6 +362,10 @@ pub enum Cmd {
     /// Append a submitted prompt to the on-disk history file (the runtime
     /// owns the file; the core just names what to persist).
     AppendHistory(String),
+    /// Copy this screen region to the clipboard. The core names the region;
+    /// the runtime resolves it against the rendered buffer and writes OSC 52,
+    /// then reports back as `Msg::Copied`.
+    CopySelection(select::Selection),
     Quit,
 }
 
@@ -345,6 +378,26 @@ fn title(state: &State, suffix: &str) -> String {
 }
 
 pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
+    // A selection is a region of the *screen*, so any deliberate user action
+    // retires it — but not the two message kinds that arrive on their own
+    // schedule. Excluding `Update` is what lets a drag work mid-turn, and it
+    // is safe to exclude: the highlight is painted at fixed cells and the copy
+    // scrapes the live buffer, so the two agree even as text moves underneath.
+    //
+    // INVARIANT: a live drag survives arriving stream tokens. Enforced by
+    // `streaming_updates_do_not_clear_a_live_drag`.
+    if !matches!(
+        &msg,
+        Msg::SelectStart { .. }
+            | Msg::SelectExtend { .. }
+            | Msg::SelectEnd
+            | Msg::Copied { .. }
+            | Msg::Tick
+            | Msg::Update(_)
+    ) {
+        state.selection = None;
+        state.copy_notice = None;
+    }
     // A detached turn (second Esc) is dead to the UI but alive on the wire
     // until its prompt result arrives. The wire is FIFO, so everything it
     // emits lands before that result: absorb it all here — except durable
@@ -458,6 +511,31 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 state.editor.set_text(text.trim_end_matches('\n'));
                 refresh(state);
             }
+            Vec::new()
+        }
+        Msg::SelectStart { col, row } => {
+            state.selection = Some(select::Selection::new(col, row));
+            state.copy_notice = None;
+            Vec::new()
+        }
+        Msg::SelectExtend { col, row } => {
+            if let Some(sel) = &mut state.selection {
+                sel.head = (col, row);
+            }
+            Vec::new()
+        }
+        // The highlight deliberately stays up after the copy — it is the only
+        // confirmation of *what* was copied. The clearing rule above retires it
+        // on the next action.
+        Msg::SelectEnd => match state.selection {
+            Some(sel) if !sel.is_empty() => vec![Cmd::CopySelection(sel)],
+            _ => {
+                state.selection = None;
+                Vec::new()
+            }
+        },
+        Msg::Copied { lines } => {
+            state.copy_notice = (lines > 0).then_some(lines);
             Vec::new()
         }
     }
@@ -2541,5 +2619,83 @@ mod tests {
             matches!(&cmds[..], [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(t)] if t == "hotl · fix-auth — working"),
             "got {cmds:?}"
         );
+    }
+
+    /// Press, drag to `(col, row)`, release — one whole mouse gesture.
+    fn drag_to(s: &mut State, col: u16, row: u16) -> Vec<Cmd> {
+        update(s, Msg::SelectStart { col: 2, row: 1 });
+        update(s, Msg::SelectExtend { col, row });
+        update(s, Msg::SelectEnd)
+    }
+
+    #[test]
+    fn a_finished_drag_asks_the_runtime_to_copy() {
+        let mut s = State::test_default();
+        let cmds = drag_to(&mut s, 9, 3);
+        assert!(
+            matches!(&cmds[..], [Cmd::CopySelection(sel)] if sel.anchor == (2, 1) && sel.head == (9, 3)),
+            "got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_finished_drag_leaves_the_highlight_up() {
+        let mut s = State::test_default();
+        drag_to(&mut s, 9, 3);
+        assert!(
+            s.selection.is_some(),
+            "the copied region stays visible until the next action"
+        );
+    }
+
+    #[test]
+    fn a_click_that_never_dragged_copies_nothing() {
+        let mut s = State::test_default();
+        update(&mut s, Msg::SelectStart { col: 2, row: 1 });
+        let cmds = update(&mut s, Msg::SelectEnd);
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert!(s.selection.is_none(), "a bare click leaves nothing painted");
+    }
+
+    #[test]
+    fn a_keypress_clears_the_selection_and_the_notice() {
+        let mut s = State::test_default();
+        drag_to(&mut s, 9, 3);
+        update(&mut s, Msg::Copied { lines: 3 });
+        press(&mut s, KeyCode::Char('x'));
+        assert!(s.selection.is_none());
+        assert!(s.copy_notice.is_none());
+    }
+
+    #[test]
+    fn streaming_updates_do_not_clear_a_live_drag() {
+        let mut s = State::test_default();
+        update(&mut s, Msg::SelectStart { col: 2, row: 1 });
+        upd(
+            &mut s,
+            json!({"type": "text_delta", "text": "still writing"}),
+        );
+        update(&mut s, Msg::SelectExtend { col: 9, row: 3 });
+        let cmds = update(&mut s, Msg::SelectEnd);
+        assert!(
+            matches!(&cmds[..], [Cmd::CopySelection(_)]),
+            "a drag must survive arriving tokens, got {cmds:?}"
+        );
+    }
+
+    #[test]
+    fn a_copy_of_nothing_raises_no_notice() {
+        let mut s = State::test_default();
+        drag_to(&mut s, 9, 3);
+        update(&mut s, Msg::Copied { lines: 0 });
+        assert_eq!(s.copy_notice, None);
+    }
+
+    #[test]
+    fn a_copy_records_the_line_count_for_the_hint() {
+        let mut s = State::test_default();
+        drag_to(&mut s, 9, 3);
+        update(&mut s, Msg::Copied { lines: 3 });
+        assert_eq!(s.copy_notice, Some(3));
     }
 }

@@ -206,12 +206,16 @@ fn the_e2e_harness_uses_the_real_dispatch() {
     );
 }
 
-fn draw(state: &State) -> Vec<String> {
+fn draw_buffer(state: &State) -> ratatui::buffer::Buffer {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
         .draw(|f| view(state, &Palette::default(), f))
         .unwrap();
-    let buffer = terminal.backend().buffer().clone();
+    terminal.backend().buffer().clone()
+}
+
+fn draw(state: &State) -> Vec<String> {
+    let buffer = draw_buffer(state);
     (0..buffer.area.height)
         .map(|y| {
             (0..buffer.area.width)
@@ -447,5 +451,55 @@ async fn deny_with_reason_reaches_engine() {
         rows.iter().any(|r| r.contains('⛔') && r.contains("bash")),
         "denied tool card renders: {:#?}",
         state.transcript
+    );
+}
+
+/// The whole copy path with the real stack: a scripted turn puts prose in the
+/// transcript, a drag over that row produces the same `Cmd::CopySelection` the
+/// runtime sees, and the runtime's own `selection_text` resolves it against a
+/// real rendered frame. The crossterm event → `Msg` half is covered by
+/// `tui::tests::a_left_drag_becomes_selection_messages` in the binary.
+#[tokio::test]
+async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
+    let (mut client, mut reader) = start().await;
+    let mut state = State::new(true, "m".into());
+    let mut prompt_ids = VecDeque::new();
+
+    type_prompt(&mut state, &mut client, &mut prompt_ids, "go").await;
+    loop {
+        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids) else {
+            continue;
+        };
+        let is_ask = matches!(msg, Msg::PermissionRequest { .. });
+        let is_result = matches!(msg, Msg::PromptResult { .. });
+        let cmds = update(&mut state, msg);
+        exec(cmds, &mut client, &mut prompt_ids).await;
+        if is_ask {
+            let cmds = press(&mut state, KeyCode::Char('y'));
+            exec(cmds, &mut client, &mut prompt_ids).await;
+        }
+        if is_result {
+            break;
+        }
+    }
+
+    const REPLY: &str = "all done via tui";
+    let row = draw(&state)
+        .iter()
+        .position(|r| r.contains(REPLY))
+        .expect("the scripted reply reached the transcript") as u16;
+
+    // Drag the whole row, starting left of the spine.
+    update(&mut state, Msg::SelectStart { col: 0, row });
+    update(&mut state, Msg::SelectExtend { col: 79, row });
+    let cmds = update(&mut state, Msg::SelectEnd);
+    let [Cmd::CopySelection(sel)] = &cmds[..] else {
+        panic!("a finished drag must ask for a copy, got {cmds:?}");
+    };
+
+    let copied = hotl_tui::view::selection_text(&state, &draw_buffer(&state), sel);
+    assert_eq!(
+        copied, REPLY,
+        "the gutter pad and role glyph must not reach the clipboard"
     );
 }
