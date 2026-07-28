@@ -124,14 +124,22 @@ is what you typed, not a wall of paste.
 Drag an image file onto the terminal and the pasted path becomes an
 `[Image #1]` token the same way. On submit, hotl reads the file and sends it
 to the model as a real image (png, jpg/jpeg, gif, webp — case-insensitive;
-5MB per image, 8 images per prompt). A path the file no longer resolves to
-degrades to an inline note, never an error. Models whose catalog entry cannot
+5MB per image, 8 images per prompt, 16MB decoded total per prompt). The
+console enforces those same caps itself before sending, so a path that no
+longer resolves, an image over a cap, an empty file, or a prompt over the
+total all degrade to an inline note on that one attachment — never an error,
+and the rest of the prompt still sends. Models whose catalog entry cannot
 take images get the text with a one-line omission note instead.
 
-Tokens are ordinary text: `Backspace` right after one deletes it whole, and
-editing inside one turns it back into literal text (its held content is
-dropped at submit). Prompt history stores the expanded text — recalled
-entries are self-contained, exactly the bytes the old behavior wrote.
+Past roughly 24MB of base64 (~18MB of image data) alive in the session's
+live context, hotl folds older history to make room.
+
+Tokens are ordinary text, and `Backspace` only swallows one whole while a
+live attachment backs it — the same bracketed text typed by hand deletes one
+character, like anywhere else. Editing inside a real token turns it back
+into literal text (its held content is dropped at submit). Recall (`↑`/`↓`)
+and prompt history both replay the expanded text — the path, not
+`[Image #1]` — so a recalled entry is self-contained.
 
 ### Model thinking
 
@@ -172,7 +180,7 @@ own.
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
 | `/quit` | Leave the console (the session log is already on disk). |
-| `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments. |
+| `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments — any attached images ride along too. |
 
 Typing `/` opens a menu of every command and skill, filtered as you keep
 typing: `↑` / `↓` pick, `Tab` completes the highlighted name, `Enter` runs

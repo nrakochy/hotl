@@ -139,6 +139,53 @@ semver promise of their own.
   only because nothing could fetch the real one; `hotl update` now looks it up.
   Use `--version X.Y.Z` to pin a release.
 
+### Fixed
+
+- **A recalled image prompt replays its path, not a dead token.** `↑` used to
+  drop the bare `[Image #1]` marker back into the composer with no image
+  behind it; recall and prompt history now hold the fully expanded text, so
+  resubmitting a recalled prompt is self-contained.
+
+- **A session carrying several large images now folds on image bytes, not
+  just token count.** The token estimator charges every image a flat,
+  size-blind 1600 tokens, so a handful of large screenshots could grow the
+  live context past what a request can actually hold long before the token
+  trigger noticed. A base64 byte budget (24MB alive in one request) now
+  joins the token check and forces an early fold instead.
+
+- **Held steers and queued prompts are bounded by image bytes, not just
+  text.** A 4MB cap on buffered images sits alongside the existing text cap;
+  images past it are dropped with an inline note instead of growing the
+  buffer without bound.
+
+- **Paste and image marker expansion is single-pass.** One paste's body can
+  contain text that happens to look like another paste's or image's marker;
+  expansion no longer re-scans its own output, so that text survives
+  verbatim instead of getting silently rewritten.
+
+- **`/skill` carries its attached images.** A slash command used to desugar
+  to a text-only prompt, silently dropping anything dragged in alongside it;
+  attachments now ride along.
+
+- **The console mirrors every server-side image cap.** Alongside the
+  existing count (8 per prompt) and per-image (5MB decoded) caps, it now
+  also enforces the per-prompt total (16MB decoded) and refuses a zero-byte
+  file — each degrades one attachment with an inline note rather than
+  failing the whole prompt.
+
+- **Dragging an image no longer freezes the console.** Reading the file and
+  base64-encoding it now run off the run loop, so a large drag-and-drop no
+  longer stalls key handling or the wire reader while it works.
+
+- **A rejected steer is now reported.** The transcript used to say nothing
+  when the engine refused a steer (bad images, most often); it now surfaces
+  the rejection reason as a notice.
+
+- **Backspace only swallows a whole attachment token while it's live.**
+  Typed text that merely matches the token grammar (`why does it render
+  [Image #1]` with nothing attached) now deletes one character at a time,
+  like everywhere else.
+
 ### Security
 
 - **The protected execute-later floor is airtight, and now covers bash.**
