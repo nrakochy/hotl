@@ -1759,7 +1759,7 @@ mod tests {
             images: (0..n)
                 .map(|i| hotl_types::UserImage {
                     media_type: "image/png".into(),
-                    data: format!("aW1n{i}=="),
+                    data: format!("aW1n{i}==").into(),
                 })
                 .collect(),
         }

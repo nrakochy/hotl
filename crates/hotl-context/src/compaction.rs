@@ -196,7 +196,7 @@ mod tests {
             synthetic: None,
             images: vec![hotl_types::UserImage {
                 media_type: "image/png".into(),
-                data: "QkFTRTY0UEFZTE9BRA==".repeat(100),
+                data: "QkFTRTY0UEFZTE9BRA==".repeat(100).into(),
             }],
         }];
         let prompt = summarize_prompt(&items);

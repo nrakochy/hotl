@@ -215,7 +215,7 @@ mod tests {
             synthetic: None,
             images: vec![hotl_types::UserImage {
                 media_type: "image/png".into(),
-                data: "A".repeat(5 * 1024 * 1024),
+                data: "A".repeat(5 * 1024 * 1024).into(),
             }],
         };
         let text_only = Item::User {

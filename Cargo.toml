@@ -35,7 +35,9 @@ homepage = "https://github.com/nrakochy/hotl"
 ratatui = "0.30"
 crossterm = "0.29"
 unicode-width = "0.2"
-serde = { version = "1", features = ["derive"] }
+# "rc" is for Item::User's Arc<str> image payload; Arc identity is not
+# preserved across a round-trip, which a flat append-only log does not need.
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 # PreparedPayload's wire buffer (commit-protocol.md §Proposal payloads):
 # cheap `Clone` (refcounted) so a prepared entry's bytes travel from the turn

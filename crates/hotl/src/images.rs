@@ -77,7 +77,7 @@ pub fn parse_images(params: &Value) -> Result<Vec<UserImage>, String> {
         }
         out.push(UserImage {
             media_type: media_type.to_string(),
-            data: data.to_string(),
+            data: data.into(),
         });
     }
     Ok(out)
@@ -130,7 +130,7 @@ mod tests {
         let got = parse_images(&img("image/png", "aW1nMQ==")).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].media_type, "image/png");
-        assert_eq!(got[0].data, "aW1nMQ==");
+        assert_eq!(&*got[0].data, "aW1nMQ==");
     }
 
     #[test]

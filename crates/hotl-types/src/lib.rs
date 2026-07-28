@@ -12,6 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 pub mod sanitize;
 
@@ -89,8 +90,10 @@ pub struct ToolResultItem {
 pub struct UserImage {
     /// IANA media type: image/png | image/jpeg | image/gif | image/webp.
     pub media_type: String,
-    /// Base64 (standard alphabet, padded), no data-URL prefix.
-    pub data: String,
+    /// Base64 (standard alphabet, padded), no data-URL prefix. `Arc` because
+    /// the projection is copy-on-write: a `String` here made every appended
+    /// entry memcpy every live image.
+    pub data: Arc<str>,
 }
 
 /// A session checklist item (`todo_write`, M4/tier-1 gap #3). Full-state
@@ -481,6 +484,47 @@ mod tests {
         assert!(json.contains(r#""images":[{"media_type":"image/png""#));
         let back: Item = serde_json::from_str(&json).unwrap();
         assert_eq!(back, item);
+    }
+
+    #[test]
+    fn cloning_an_item_shares_the_image_payload_instead_of_copying_it() {
+        let item = Item::User {
+            text: "look".into(),
+            synthetic: None,
+            images: vec![UserImage {
+                media_type: "image/png".into(),
+                data: "aW1nMQ==".into(),
+            }],
+        };
+        let copy = item.clone();
+        let (Item::User { images: a, .. }, Item::User { images: b, .. }) = (&item, &copy) else {
+            panic!("both are user items");
+        };
+        // INVARIANT: a projection clone never copies base64. Enforced by this test.
+        assert!(std::sync::Arc::ptr_eq(&a[0].data, &b[0].data));
+    }
+
+    #[test]
+    fn an_image_item_round_trips_and_an_imageless_one_stays_byte_identical() {
+        let with = Item::User {
+            text: "look".into(),
+            synthetic: None,
+            images: vec![UserImage {
+                media_type: "image/png".into(),
+                data: "aW1nMQ==".into(),
+            }],
+        };
+        let json = serde_json::to_string(&with).unwrap();
+        assert!(json.contains(r#""data":"aW1nMQ==""#), "{json}");
+        assert_eq!(serde_json::from_str::<Item>(&json).unwrap(), with);
+
+        let without = Item::User {
+            text: "look".into(),
+            synthetic: None,
+            images: Vec::new(),
+        };
+        let json = serde_json::to_string(&without).unwrap();
+        assert!(!json.contains("images"), "{json}");
     }
 
     #[test]

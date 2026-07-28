@@ -1916,13 +1916,44 @@ mod tests {
     use super::COMPACT_SUMMARIZE_TIMEOUT;
     use super::{
         awaiting_tool_results, commit_prepared, compact, fold_into, pair_tool_results,
-        release_steers, summarize_bounded, Pipeline, Resolution, SharedDeps,
+        release_steers, summarize_bounded, Head, Pipeline, ProjectionHead, Resolution, SharedDeps,
     };
     use hotl_store::SessionLog;
     use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
     use serde_json::json;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
+
+    #[test]
+    fn appending_to_the_head_shares_existing_image_payloads() {
+        let (tx, _rx) = tokio::sync::watch::channel(Arc::new(ProjectionHead {
+            items: Arc::new(Vec::new()),
+            todos: Arc::new(Vec::new()),
+            leaf: None,
+            epoch: 0,
+        }));
+        let img = hotl_types::UserImage {
+            media_type: "image/png".into(),
+            data: "aW1nMQ==".into(),
+        };
+        let before = Arc::clone(&img.data);
+        let mut head = Head::new(
+            tx,
+            vec![Item::User {
+                text: "look".into(),
+                synthetic: None,
+                images: vec![img],
+            }],
+            Vec::new(),
+        );
+        head.apply(Item::Assistant { blocks: Vec::new() });
+        let Item::User { images, .. } = &head.items()[0] else {
+            panic!("user item")
+        };
+        // INVARIANT: `Arc::make_mut`'s clone stays pointer-sized per image.
+        // Enforced by this test.
+        assert!(Arc::ptr_eq(&images[0].data, &before));
+    }
 
     /// T3-4. The paused clock is legal here: this drives `summarize_bounded`
     /// alone, with no actor and therefore no writer-thread ack for the clock to
