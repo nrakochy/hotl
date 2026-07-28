@@ -131,12 +131,25 @@ fn file_permission_with(verb: &str, input: &Value, extras: &[std::path::PathBuf]
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
     let summary = format!("{verb} {path}");
     let resolved = std::fs::canonicalize(path).ok();
-    let reason = execute_later_reason(path).or_else(|| {
-        resolved
-            .as_deref()
-            .and_then(|r| execute_later_reason(&r.to_string_lossy()))
-    });
     let target = write_target(fsguard::workspace_root(), extras, path);
+    // The write lands on the fsguard-*normalized* path (`Path::components()`
+    // has collapsed `//`, `./`, `..`), so classify the protected floor on that
+    // same normalized rel — not only the raw model string. Without this,
+    // `.github//workflows/x.yml` misses `contains(".github/workflows/")` on the
+    // raw string yet still writes into the real protected dir (Vuln 3).
+    let normalized_reason = match &target {
+        WriteTarget::Workspace(rel) | WriteTarget::Extra(_, rel) => {
+            execute_later_reason(&rel.to_string_lossy())
+        }
+        WriteTarget::OutsideApproved => None,
+    };
+    let reason = execute_later_reason(path)
+        .or_else(|| {
+            resolved
+                .as_deref()
+                .and_then(|r| execute_later_reason(&r.to_string_lossy()))
+        })
+        .or(normalized_reason);
     match (reason, target) {
         (Some(why), _) => Permission::AskProtected {
             summary,
@@ -1416,6 +1429,40 @@ mod tests {
             }
             other => panic!("symlink to .zshrc must escalate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn file_permission_normalizes_before_the_protected_check() {
+        // Vuln 3: a doubled separator collapses to the real protected dir on
+        // write, so the floor must classify the normalized path, not the raw
+        // string that `contains(".github/workflows/")` never matches.
+        match file_permission("write", &json!({"path": ".github//workflows/ci.yml"})) {
+            Permission::AskProtected { why, .. } => assert!(why.contains("CI workflow"), "{why}"),
+            other => panic!("a separator trick must not dodge the floor, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                file_permission("write", &json!({"path": ".git/./config"})),
+                Permission::AskProtected { .. }
+            ),
+            "a `.` segment must not dodge the floor either"
+        );
+    }
+
+    #[test]
+    fn file_permission_is_case_insensitive_for_protected_basenames() {
+        // Vuln 3 (case half): a case-insensitive volume resolves `MAKEFILE` to
+        // `Makefile`, so a byte-exact basename match cannot be the only guard.
+        match file_permission("write", &json!({"path": "MAKEFILE"})) {
+            Permission::AskProtected { why, .. } => {
+                assert!(why.contains("build entrypoint"), "{why}")
+            }
+            other => panic!("MAKEFILE must escalate like Makefile, got {other:?}"),
+        }
+        assert!(matches!(
+            file_permission("write", &json!({"path": "BUILD.RS"})),
+            Permission::AskProtected { .. }
+        ));
     }
 
     #[test]

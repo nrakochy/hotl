@@ -215,15 +215,18 @@ impl Registry {
 /// execution, authentication, or credential theft — happens outside any gate.
 /// Writes here get the escalated warning ask instead of an ordinary one.
 pub fn execute_later_reason(path: &str) -> Option<&'static str> {
-    let p = path.trim_start_matches("./");
-    let file = p.rsplit('/').next().unwrap_or(p);
+    // Case-fold so a case-insensitive volume (APFS/NTFS by default) cannot
+    // launder `MAKEFILE`/`BUILD.RS` past a byte-exact basename match. The
+    // protected set is all-ASCII, so ascii-lowercasing both sides is exact and
+    // free; on a case-sensitive volume the only effect is a harmless extra ask
+    // for an oddly-cased name. Callers pass the fsguard-normalized relative
+    // path, so `//` and `./` separator tricks are already collapsed here.
+    let p = path.trim_start_matches("./").to_ascii_lowercase();
+    let file = p.rsplit('/').next().unwrap_or(&p);
     if p.contains(".git/hooks/") {
         return Some("git hook: runs on your next git command");
     }
-    if matches!(
-        file,
-        "Makefile" | "makefile" | "GNUmakefile" | "justfile" | "Justfile"
-    ) {
+    if matches!(file, "makefile" | "gnumakefile" | "justfile") {
         return Some("build entrypoint: runs on your next make/just invocation");
     }
     // Build-time code entrypoints: a diagnostic or a plain `cargo build` /
@@ -231,7 +234,7 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     if matches!(file, "build.rs" | "conftest.py") || file.ends_with(".gyp") {
         return Some("build-time code: compiled and run by your build/test tooling");
     }
-    if matches!(file, "AGENTS.md" | "CLAUDE.md") {
+    if matches!(file, "agents.md" | "claude.md") {
         return Some("agent instructions: injected into future model contexts");
     }
     if file == "settings.json" || p.contains(".hotl/") || p.contains(".claude/") {
