@@ -84,10 +84,17 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     // the guard's `Drop` must not strand the terminal in raw mode.
     crate::term::restore_on_panic();
     crate::term::trap_signals();
-    // Mouse capture makes the wheel scroll the transcript, at the cost of the
-    // terminal's own drag-select (hold Shift on most emulators, or set
-    // HOTL_MOUSE=0). Env-only until R4 adds `[behavior] mouse` — RQ-1.
-    let mouse = std::env::var("HOTL_MOUSE").as_deref() != Ok("0");
+    // Mouse capture makes the wheel scroll the transcript and a drag select.
+    // It costs the terminal's own drag-select, which `copy_on_select` gives
+    // back from inside the app (hold Shift on most emulators for the real
+    // thing, or turn capture off entirely).
+    let mouse = resolve_mouse(
+        std::env::var("HOTL_MOUSE").ok().as_deref(),
+        cfg.behavior.mouse(),
+    );
+    // Without capture there are no drag events at all, so the copy feature
+    // depends on it rather than silently doing nothing.
+    let copy_on_select = mouse && cfg.behavior.copy_on_select();
     let mut guard = match TerminalGuard::enter(mouse) {
         Ok(g) => g,
         Err(e) => {
@@ -130,6 +137,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         state,
         palette,
         history_store,
+        copy_on_select,
     )
     .await;
     drop(guard);
@@ -247,6 +255,7 @@ async fn run_loop(
     mut state: State,
     palette: Palette,
     mut history: crate::history::History,
+    copy_on_select: bool,
 ) -> io::Result<i32> {
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     // 8 ticks/sec, armed only while a turn runs — idle schedules no wakeups.
@@ -256,7 +265,7 @@ async fn run_loop(
         guard.terminal.draw(|f| view(&state, &palette, f))?;
         let msg = tokio::select! {
             ev = keys.recv() => match ev {
-                Some(ev) => terminal_msg(ev), // `None` = redraw-only (resize, mouse motion)
+                Some(ev) => terminal_msg(ev, copy_on_select), // `None` = redraw-only (resize, mouse motion)
                 None => return Ok(1),
             },
             sm = read_server_msg(reader) => match sm {
@@ -284,6 +293,10 @@ async fn run_loop(
                     let _ = execute!(io::stdout(), SetTitle(&title));
                 }
                 Cmd::AppendHistory(text) => history.append(&text),
+                Cmd::CopySelection(sel) => {
+                    let lines = copy_region(guard, &state, &palette, &sel)?;
+                    queue.extend(update(&mut state, Msg::Copied { lines }));
+                }
                 Cmd::OpenEditor(text) => {
                     let content = suspended_editor(guard, suspended, &text);
                     queue.extend(update(&mut state, Msg::EditorDone(content)));
@@ -364,6 +377,44 @@ fn load_image(path: &str, cap: u64) -> Result<String, String> {
     Ok(hotl_tools::b64::encode(&bytes))
 }
 
+/// Put a screen region on the clipboard; returns the lines actually copied.
+///
+/// The region is resolved against a freshly rendered frame rather than the
+/// loop's own: `Terminal::draw` swaps buffers on the way out, so the drawn
+/// frame is reachable only through the `CompletedFrame` it returns, and that
+/// borrow cannot be held across the loop's `select!`. Re-drawing costs one
+/// frame per button release and yields exactly what the user is looking at,
+/// highlight included.
+///
+/// Transport is OSC 52 — no clipboard crate, and it works over SSH. A
+/// screen-bounded region is far under every terminal's payload cap, so it goes
+/// in one write. Terminals that refuse OSC 52 (or tmux without
+/// `set-clipboard on`) simply drop it; there is no reply to check.
+/// The OSC 52 clipboard write: `ESC ] 52 ; c ; <base64> BEL`. Base64 is what
+/// makes the payload safe to embed — newlines and control bytes in the copied
+/// text cannot terminate the sequence early.
+fn osc52(text: &str) -> String {
+    format!("\x1b]52;c;{}\x07", hotl_tools::b64::encode(text.as_bytes()))
+}
+
+fn copy_region(
+    guard: &mut TerminalGuard,
+    state: &State,
+    palette: &Palette,
+    sel: &hotl_tui::select::Selection,
+) -> io::Result<usize> {
+    use std::io::Write;
+    let frame = guard.terminal.draw(|f| view(state, palette, f))?;
+    let text = hotl_tui::view::selection_text(state, frame.buffer, sel);
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let mut out = io::stdout();
+    let _ = write!(out, "{}", osc52(&text));
+    let _ = out.flush();
+    Ok(text.lines().count())
+}
+
 /// Transcript items per wheel notch — a third of a page (`scroll::PAGE`).
 const WHEEL_LINES: usize = 3;
 
@@ -371,11 +422,15 @@ const WHEEL_LINES: usize = 3;
 /// needs as a redraw trigger (resize, focus, mouse motion, key release). Pure,
 /// so the select arm's mapping is unit-testable.
 ///
-/// The `None` for non-wheel mouse kinds is load-bearing rather than defensive:
-/// it drops motion and click noise before any `Msg` exists, so a mouse drag
-/// cannot drive a redraw storm through the loop.
-fn terminal_msg(ev: Event) -> Option<Msg> {
-    use crossterm::event::MouseEventKind;
+/// The `None` for the remaining mouse kinds is load-bearing rather than
+/// defensive: it drops motion and click noise before any `Msg` exists, so the
+/// mouse cannot drive a redraw storm through the loop. Left drags are the one
+/// exception, and only when `select` is on. They are safe to admit because
+/// button-less motion (mode 1003) is still dropped here, and mode 1002 reports
+/// at most one `Drag` per *cell crossed* — so the redraw rate is bounded by
+/// the width of the terminal, not by how fast the pointer is sampled.
+fn terminal_msg(ev: Event, select: bool) -> Option<Msg> {
+    use crossterm::event::{MouseButton, MouseEventKind};
     match ev {
         Event::Key(k) if k.kind == KeyEventKind::Press => Some(Msg::Key(k)),
         // Bracketed paste: the terminal hands us the whole payload as one
@@ -388,9 +443,29 @@ fn terminal_msg(ev: Event) -> Option<Msg> {
             MouseEventKind::ScrollDown => {
                 Some(Msg::Scroll(hotl_tui::scroll::Intent::Down(WHEEL_LINES)))
             }
+            MouseEventKind::Down(MouseButton::Left) if select => Some(Msg::SelectStart {
+                col: m.column,
+                row: m.row,
+            }),
+            MouseEventKind::Drag(MouseButton::Left) if select => Some(Msg::SelectExtend {
+                col: m.column,
+                row: m.row,
+            }),
+            MouseEventKind::Up(MouseButton::Left) if select => Some(Msg::SelectEnd),
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Mouse capture: `HOTL_MOUSE` beats `[behavior] mouse`, per the
+/// env > config.toml > default precedence in `config.rs`. Split out from the
+/// startup path so it is testable without touching the process environment.
+fn resolve_mouse(env: Option<&str>, cfg: bool) -> bool {
+    if env == Some("0") {
+        false
+    } else {
+        cfg
     }
 }
 
@@ -613,7 +688,10 @@ fn age(t: SystemTime) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_skills, parse_tui_args, resolve_session_arg, terminal_msg, WHEEL_LINES};
+    use super::{
+        osc52, parse_skills, parse_tui_args, resolve_mouse, resolve_session_arg, terminal_msg,
+        WHEEL_LINES,
+    };
     use crossterm::event::{Event, KeyModifiers};
     use hotl_tui::app::Msg;
     use serde_json::json;
@@ -696,27 +774,104 @@ mod tests {
         assert_eq!(window, hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
     }
 
+    /// A mouse event at `(col, row)`; column and row only matter for drags.
+    fn mouse_at(kind: crossterm::event::MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
     #[test]
     fn wheel_events_become_scroll_messages() {
-        use crossterm::event::{MouseEvent, MouseEventKind};
-        let ev = |kind| {
-            Event::Mouse(MouseEvent {
-                kind,
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE,
-            })
-        };
+        use crossterm::event::MouseEventKind;
+        let ev = |kind| mouse_at(kind, 0, 0);
         assert_eq!(
-            terminal_msg(ev(MouseEventKind::ScrollUp)),
+            terminal_msg(ev(MouseEventKind::ScrollUp), true),
             Some(Msg::Scroll(hotl_tui::scroll::Intent::Up(WHEEL_LINES)))
         );
         assert_eq!(
-            terminal_msg(ev(MouseEventKind::ScrollDown)),
+            terminal_msg(ev(MouseEventKind::ScrollDown), true),
             Some(Msg::Scroll(hotl_tui::scroll::Intent::Down(WHEEL_LINES)))
         );
-        // Motion and clicks are noise — they must not wake the update loop.
-        assert_eq!(terminal_msg(ev(MouseEventKind::Moved)), None);
+        // Button-less motion stays noise even with selection on — mode 1003
+        // reports it constantly and it must not wake the update loop.
+        assert_eq!(terminal_msg(ev(MouseEventKind::Moved), true), None);
+        assert_eq!(terminal_msg(ev(MouseEventKind::Moved), false), None);
+    }
+
+    #[test]
+    fn a_left_drag_becomes_selection_messages() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        assert_eq!(
+            terminal_msg(
+                mouse_at(MouseEventKind::Down(MouseButton::Left), 4, 2),
+                true
+            ),
+            Some(Msg::SelectStart { col: 4, row: 2 })
+        );
+        assert_eq!(
+            terminal_msg(
+                mouse_at(MouseEventKind::Drag(MouseButton::Left), 9, 5),
+                true
+            ),
+            Some(Msg::SelectExtend { col: 9, row: 5 })
+        );
+        assert_eq!(
+            terminal_msg(mouse_at(MouseEventKind::Up(MouseButton::Left), 9, 5), true),
+            Some(Msg::SelectEnd)
+        );
+    }
+
+    #[test]
+    fn a_left_drag_stays_dropped_when_copy_on_select_is_off() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Drag(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            assert_eq!(
+                terminal_msg(mouse_at(kind, 4, 2), false),
+                None,
+                "{kind:?} must be dropped before any Msg exists"
+            );
+        }
+    }
+
+    #[test]
+    fn other_mouse_buttons_are_never_selection() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            assert_eq!(
+                terminal_msg(mouse_at(MouseEventKind::Down(button), 4, 2), true),
+                None
+            );
+            assert_eq!(
+                terminal_msg(mouse_at(MouseEventKind::Drag(button), 4, 2), true),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn the_clipboard_escape_is_a_well_formed_osc_52() {
+        // `ESC ] 52 ; c ; <base64> BEL` — `c` is the clipboard selection.
+        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
+        // Newlines are payload, not terminators: a multi-line copy must not
+        // truncate at the first one.
+        assert_eq!(osc52("a\nb"), "\x1b]52;c;YQpi\x07");
+    }
+
+    #[test]
+    fn hotl_mouse_env_overrides_the_config_key() {
+        // Precedence is env > config.toml > default (config.rs module doc).
+        assert!(!resolve_mouse(Some("0"), true), "env off beats config on");
+        assert!(resolve_mouse(None, true));
+        assert!(!resolve_mouse(None, false), "config off is honored");
+        assert!(resolve_mouse(Some("1"), true));
     }
 
     fn v(args: &[&str]) -> Vec<String> {

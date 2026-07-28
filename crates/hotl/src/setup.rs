@@ -39,6 +39,8 @@ pub const DEFAULT_CONFIG: &str = "\
 [behavior]
 # sandbox = true             # false disables the bash sandbox floor
 # vim_mode = false           # true = vim-style keys in the console's input editor
+# mouse = true               # false stops mouse capture (wheel scroll + drag select)
+# copy_on_select = true      # false stops a mouse drag copying to the clipboard
 
 [permissions]
 mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.

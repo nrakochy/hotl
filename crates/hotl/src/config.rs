@@ -242,6 +242,14 @@ pub struct BehaviorCfg {
     /// Vim-style keys in the console's input editor. Resolve via
     /// [`BehaviorCfg::vim_mode`] — absent means **off**.
     pub vim_mode: Option<bool>,
+    /// Terminal mouse capture: the wheel scrolls the transcript and dragging
+    /// selects. Resolve via [`BehaviorCfg::mouse`] — absent means **on**.
+    /// `HOTL_MOUSE=0` overrides this, per the env-beats-config precedence.
+    pub mouse: Option<bool>,
+    /// Copy a mouse drag-selection to the clipboard on release. Resolve via
+    /// [`BehaviorCfg::copy_on_select`] — absent means **on**. Requires
+    /// `mouse`; without capture there are no drag events to act on.
+    pub copy_on_select: Option<bool>,
     /// Model samples one prompt may spend before the turn is cut short with
     /// `turn limit reached`. A tool round-trip costs one, so this is the
     /// agent loop's step budget. `-1` = unlimited (run until the model stops
@@ -260,6 +268,21 @@ impl BehaviorCfg {
     /// leaving them on strands nobody.
     pub fn vim_mode(&self) -> bool {
         self.vim_mode.unwrap_or(false)
+    }
+
+    /// Default **on**: the wheel scrolling the transcript is what most people
+    /// reach for first. The cost is the terminal's own drag-select, which
+    /// `copy_on_select` gives back from inside the app — and `Shift` still
+    /// bypasses capture on most emulators for anyone who wants the real thing.
+    pub fn mouse(&self) -> bool {
+        self.mouse.unwrap_or(true)
+    }
+
+    /// Default **on**: dragging out a region and finding it on the clipboard
+    /// is what capture took away, so restoring it is the unsurprising posture.
+    /// Turning it off returns the console to wheel-scroll only.
+    pub fn copy_on_select(&self) -> bool {
+        self.copy_on_select.unwrap_or(true)
     }
 }
 
@@ -1071,6 +1094,25 @@ mod tests {
         assert!(cfg_with("[behavior]\nvim_mode = true\n")
             .behavior
             .vim_mode());
+    }
+
+    #[test]
+    fn mouse_parses_and_resolves_on_unless_opted_out() {
+        assert_eq!(cfg_with("").behavior.mouse, None);
+        assert!(cfg_with("").behavior.mouse(), "capture is on by default");
+        assert!(!cfg_with("[behavior]\nmouse = false\n").behavior.mouse());
+    }
+
+    #[test]
+    fn copy_on_select_parses_and_resolves_on_unless_opted_out() {
+        assert_eq!(cfg_with("").behavior.copy_on_select, None);
+        assert!(
+            cfg_with("").behavior.copy_on_select(),
+            "drag-to-copy is on by default"
+        );
+        assert!(!cfg_with("[behavior]\ncopy_on_select = false\n")
+            .behavior
+            .copy_on_select());
     }
 
     #[test]
