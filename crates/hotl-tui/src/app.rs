@@ -319,6 +319,11 @@ pub enum Msg {
         outcome_text: Option<String>,
         usage: Value,
     },
+    /// The server refused a steer — image validation, most often. The
+    /// transcript's pinned "queued" chip must not outlive this.
+    SteerRejected {
+        why: String,
+    },
     Key(KeyEvent),
     /// Bracketed-paste payload. Literal text, never keys — see `Msg::Key`.
     /// A multi-line paste used to arrive as one `Enter` per line and submit
@@ -504,6 +509,18 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             outcome_text,
             usage,
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage),
+        Msg::SteerRejected { why } => {
+            if let Some(TranscriptItem::Steer { queued, .. }) = state
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|i| matches!(i, TranscriptItem::Steer { queued: true, .. }))
+            {
+                *queued = false;
+            }
+            notice(state, format!("steer rejected: {why}"));
+            Vec::new()
+        }
         Msg::Key(key) => on_key(state, key),
         Msg::Paste(text) => {
             // A dropped image path or a 3+-line paste compacts to a token;

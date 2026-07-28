@@ -234,13 +234,18 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
 }
 
 /// One server message → an Elm message, or `None` for frames the loop only
-/// needs as bookkeeping (an ack for steer/cancel/rename is noise).
+/// needs as bookkeeping (a cancel/rename ack, or an accepted-steer ack, is
+/// noise; a rejected steer is not — see the `Response` arm).
 ///
 /// Lives here, not in the runtime, because it is pure — `ServerMsg` and `Msg`
 /// are both this crate's types. `crates/hotl/tests/tui_e2e.rs` used to keep a
 /// hand-copy that had already drifted from the real one (§7); both now call
 /// this.
-pub fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> {
+pub fn translate(
+    msg: ServerMsg,
+    prompt_ids: &mut VecDeque<u64>,
+    steer_ids: &mut VecDeque<u64>,
+) -> Option<Msg> {
     match msg {
         ServerMsg::Update(v) => Some(Msg::Update(v)),
         ServerMsg::PermissionRequest {
@@ -258,10 +263,15 @@ pub fn translate(msg: ServerMsg, prompt_ids: &mut VecDeque<u64>) -> Option<Msg> 
             Some(Msg::QuestionRequest { req_id, question })
         }
         ServerMsg::Response { id, result } => {
-            // Only prompt replies become messages; steer/cancel acks are noise.
-            let pos = prompt_ids.iter().position(|&p| p == id)?;
-            prompt_ids.remove(pos);
-            Some(prompt_result_msg(result))
+            if let Some(pos) = prompt_ids.iter().position(|&p| p == id) {
+                prompt_ids.remove(pos);
+                return Some(prompt_result_msg(result));
+            }
+            let pos = steer_ids.iter().position(|&p| p == id)?;
+            steer_ids.remove(pos);
+            // An ack is still noise; a rejection is not — the transcript
+            // otherwise keeps claiming the steer is queued forever.
+            result.err().map(|why| Msg::SteerRejected { why })
         }
     }
 }
@@ -303,19 +313,20 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
     cmd: Cmd,
     client: &mut AcpClient<W>,
     prompt_ids: &mut VecDeque<u64>,
+    steer_ids: &mut VecDeque<u64>,
 ) -> Option<Cmd> {
     match cmd {
         Cmd::SendPrompt(p) => {
             prompt_ids.push_back(client.request("session/prompt", prompt_params(&p)).await);
         }
         Cmd::SendSteer(p) => {
-            client.request("session/steer", prompt_params(&p)).await;
+            steer_ids.push_back(client.request("session/steer", prompt_params(&p)).await);
         }
         Cmd::Cancel => {
             client.request("session/cancel", Value::Null).await;
         }
-        // Acks are noise, exactly as for steer: `translate` only surfaces
-        // prompt-id responses.
+        // Cancel/rename acks are noise: `translate` only surfaces prompt
+        // replies and rejected steers.
         Cmd::Rename(name) => {
             client
                 .request("session/rename", json!({"name": name}))
@@ -391,6 +402,7 @@ mod tests {
             ("tool", "tool_failure_budget"),
         ] {
             let mut ids = VecDeque::from([7]);
+            let mut steer_ids = VecDeque::new();
             let msg = ServerMsg::Response {
                 id: 7,
                 result: Ok(json!({"outcome": {"kind": kind, key: "payload"}})),
@@ -399,7 +411,7 @@ mod tests {
                 outcome_kind,
                 outcome_text,
                 ..
-            }) = translate(msg, &mut ids)
+            }) = translate(msg, &mut ids, &mut steer_ids)
             else {
                 panic!("not a prompt result")
             };
@@ -414,12 +426,40 @@ mod tests {
     #[test]
     fn translate_ignores_responses_that_are_not_prompt_replies() {
         let mut ids = VecDeque::from([7]);
+        let mut steer_ids = VecDeque::new();
         let ack = ServerMsg::Response {
             id: 99,
             result: Ok(json!({"ok": true})),
         };
-        assert!(translate(ack, &mut ids).is_none());
+        assert!(translate(ack, &mut ids, &mut steer_ids).is_none());
         assert_eq!(ids.len(), 1, "an unrelated ack consumes no prompt id");
+    }
+
+    #[test]
+    fn a_rejected_steer_surfaces_instead_of_vanishing() {
+        let mut prompt_ids = VecDeque::new();
+        let mut steer_ids = VecDeque::from([7]);
+        let msg = ServerMsg::Response {
+            id: 7,
+            result: Err("images[0] is empty".into()),
+        };
+        let Some(Msg::SteerRejected { why }) = translate(msg, &mut prompt_ids, &mut steer_ids)
+        else {
+            panic!("a steer error must become a message");
+        };
+        assert!(why.contains("images[0]"));
+        assert!(steer_ids.is_empty(), "the id is consumed either way");
+    }
+
+    #[test]
+    fn an_accepted_steer_stays_noise() {
+        let mut prompt_ids = VecDeque::new();
+        let mut steer_ids = VecDeque::from([7]);
+        let msg = ServerMsg::Response {
+            id: 7,
+            result: Ok(Value::Null),
+        };
+        assert!(translate(msg, &mut prompt_ids, &mut steer_ids).is_none());
     }
 
     #[tokio::test]

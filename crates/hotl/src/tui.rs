@@ -257,6 +257,7 @@ async fn run_loop(
     mut copy_on_select: bool,
 ) -> io::Result<i32> {
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
+    let mut steer_ids: VecDeque<u64> = VecDeque::new();
     // 8 ticks/sec, armed only while a turn runs — idle schedules no wakeups.
     let mut ticker = tokio::time::interval(Duration::from_millis(125));
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -268,7 +269,7 @@ async fn run_loop(
                 None => return Ok(1),
             },
             sm = read_server_msg(reader) => match sm {
-                Some(m) => translate(m, &mut prompt_ids),
+                Some(m) => translate(m, &mut prompt_ids, &mut steer_ids),
                 None => return Ok(1), // server hung up
             },
             _ = ticker.tick(), if state.phase != Phase::Idle => Some(Msg::Tick),
@@ -284,7 +285,8 @@ async fn run_loop(
                 Cmd::SendSteer(p) => Cmd::SendSteer(outbound(p).await),
                 other => other,
             };
-            let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids).await else {
+            let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids, &mut steer_ids).await
+            else {
                 continue;
             };
             match cmd {
