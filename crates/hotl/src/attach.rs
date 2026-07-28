@@ -49,8 +49,23 @@ async fn connect(id: &str) -> i32 {
             return 1;
         }
     };
-    println!("attached to {id} — type to prompt · Ctrl-D detaches · /stop ends the session");
     let (read, mut write) = stream.into_split();
+    // Authenticate with the per-session token before anything else (Vuln 1).
+    match std::fs::read_to_string(crate::session_server::token_path(id)) {
+        Ok(token) => {
+            let mut frame = json!({"t": "auth", "token": token.trim()}).to_string();
+            frame.push('\n');
+            if write.write_all(frame.as_bytes()).await.is_err() {
+                eprintln!("hotl attach: could not authenticate to `{id}`");
+                return 1;
+            }
+        }
+        Err(e) => {
+            eprintln!("hotl attach: no session token for `{id}` ({e}); is it still running?");
+            return 1;
+        }
+    }
+    println!("attached to {id} — type to prompt · Ctrl-D detaches · /stop ends the session");
 
     // Terminal stdin on a blocking thread → channel (same shape as the REPL).
     let (tx, mut stdin_rx) = mpsc::channel::<String>(8);

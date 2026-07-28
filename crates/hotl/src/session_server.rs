@@ -34,6 +34,9 @@ struct Shared {
     pending: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<hotl_engine::AskReply>, Value)>>,
     next_ask: AtomicU64,
     session_id: String,
+    /// Per-session secret a client must present before it can drive the session
+    /// or evict the attached human (Vuln 1).
+    token: String,
     /// The session's primary model — prices `turn_done.usage.cost_usd`
     /// (Task 5). See `wire::usage_frame` for the fallback-model imprecision
     /// this accepts.
@@ -46,6 +49,76 @@ pub fn run_dir() -> PathBuf {
         .parent()
         .map(|p| p.join("run"))
         .unwrap_or_else(|| PathBuf::from("run"))
+}
+
+/// The per-session auth-token file, next to the socket. Written 0600 by the
+/// server; read by `hotl attach` to authenticate.
+pub fn token_path(id: &str) -> PathBuf {
+    run_dir().join(format!("{id}.token"))
+}
+
+/// 256-bit hex secret from the OS CSPRNG. hotl is unix-only, so `/dev/urandom`
+/// is always present; a read failure fails the serve rather than minting a weak
+/// token.
+fn mint_token() -> std::io::Result<String> {
+    use std::io::Read;
+    let mut buf = [0u8; 32];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Length-checked constant-time compare (token length is fixed and public).
+fn tokens_match(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A connecting peer must be the same uid (defence in depth behind the 0600
+/// socket) and present the session token as its first frame. Returns the reader
+/// half to promote, or None (rejected — the caller leaves the incumbent alone).
+async fn authenticate(
+    stream: tokio::net::UnixStream,
+    token: &str,
+) -> Option<(
+    tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    tokio::net::unix::OwnedWriteHalf,
+)> {
+    if !peer_is_same_uid(&stream) {
+        return None;
+    }
+    let (read, mut write) = stream.into_split();
+    let mut lines = BufReader::new(read).lines();
+    // Bound the handshake so a silent connect cannot stall the accept loop.
+    let ok = matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line()).await,
+        Ok(Ok(Some(line))) if auth_frame_ok(&line, token)
+    );
+    if !ok {
+        let _ = write
+            .write_all(b"{\"t\":\"error\",\"message\":\"unauthorized\"}\n")
+            .await;
+        return None;
+    }
+    Some((lines, write))
+}
+
+fn auth_frame_ok(line: &str, token: &str) -> bool {
+    let Ok(msg) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    msg.get("t").and_then(Value::as_str) == Some("auth")
+        && msg
+            .get("token")
+            .and_then(Value::as_str)
+            .is_some_and(|t| tokens_match(t, token))
+}
+
+fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
+    // SAFETY: fd is a live connected unix socket for the call's duration.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
+    rc == 0 && uid == unsafe { libc::getuid() }
 }
 
 /// Live backgrounded sessions (their socket ids), from the run dir.
@@ -73,11 +146,14 @@ pub async fn serve(
     handle: SessionHandle,
     prompt: Option<String>,
 ) -> i32 {
+    use std::os::unix::fs::PermissionsExt;
     let dir = run_dir();
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("hotl serve: cannot create {}: {e}", dir.display());
         return 1;
     }
+    // Owner-only run dir: the socket and token file live here (Vuln 1).
+    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
     let sock = dir.join(format!("{session_id}.sock"));
     // A stale socket from a dead server is cleared; a *live* one means this
     // id collides with a running session (pid reuse, repeated --id) — refuse
@@ -103,9 +179,40 @@ pub async fn serve(
             return 1;
         }
     };
+    // Owner-only socket: only this uid can connect, even on a shared host.
+    let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
+    let token = match mint_token().and_then(|t| write_token(&session_id, &t).map(|_| t)) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("hotl serve: cannot write the session token: {e}");
+            return 1;
+        }
+    };
     let _guard = SockGuard::new(sock);
-    serve_on(listener, session_id, model, handle, prompt).await;
+    let _token_guard = TokenGuard(token_path(&session_id));
+    serve_on(listener, session_id, model, handle, prompt, token).await;
     0
+}
+
+/// Removes the token file when the server exits.
+struct TokenGuard(PathBuf);
+impl Drop for TokenGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+fn write_token(id: &str, token: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = token_path(id);
+    let _ = std::fs::remove_file(&path); // clear any stale token first
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?
+        .write_all(token.as_bytes())
 }
 
 /// The socket-server core over a pre-bound listener (testable without the
@@ -117,6 +224,7 @@ pub async fn serve_on(
     model: String,
     mut handle: SessionHandle,
     prompt: Option<String>,
+    token: String,
 ) {
     let events = std::mem::replace(&mut handle.events, tokio::sync::mpsc::channel(1).1);
     let shared = Arc::new(Shared {
@@ -125,6 +233,7 @@ pub async fn serve_on(
         pending: Mutex::new(HashMap::new()),
         next_ask: AtomicU64::new(1),
         session_id,
+        token,
         model,
     });
     tokio::spawn(drain_events(events, shared.clone()));
@@ -181,6 +290,12 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                     continue;
                 };
+                // Authenticate before touching the incumbent (Vuln 1): an
+                // unauthenticated connect can neither drive the session nor
+                // evict the attached human.
+                let Some((new_reader, write)) = authenticate(stream, &shared.token).await else {
+                    continue;
+                };
                 if reader.is_some() {
                     send(
                         &shared,
@@ -188,9 +303,8 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
                     )
                     .await;
                 }
-                let (read, write) = stream.into_split();
                 *shared.client.lock().await = Some(write);
-                reader = Some(BufReader::new(read).lines());
+                reader = Some(new_reader);
                 resend_pending(&shared).await;
             }
             // Lines::next_line is cancel-safe: a frame half-read when the
@@ -460,11 +574,13 @@ mod tests {
             "m".into(),
             scripted_session(),
             None,
+            "tok".into(),
         ));
 
-        // Attach, prompt; the scripted bash call is gated → an `ask` frame.
+        // Attach (authenticate first), prompt; the scripted bash call is gated.
         let (r, mut w) = UnixStream::connect(&sock).await.unwrap().into_split();
         let mut lines = tokio::io::BufReader::new(r).lines();
+        send(&mut w, json!({"t":"auth","token":"tok"})).await;
         send(&mut w, json!({"t":"prompt","text":"go"})).await;
         let ask_id = loop {
             let f = next(&mut lines).await;
@@ -481,6 +597,7 @@ mod tests {
         // Reattach: the parked ask is re-issued (the whole point).
         let (r2, mut w2) = UnixStream::connect(&sock).await.unwrap().into_split();
         let mut lines2 = tokio::io::BufReader::new(r2).lines();
+        send(&mut w2, json!({"t":"auth","token":"tok"})).await;
         let reissued = loop {
             let f = next(&mut lines2).await;
             if f["t"] == "ask" {
@@ -502,5 +619,58 @@ mod tests {
         };
         assert_eq!(done["outcome"]["kind"], "done");
         assert_eq!(done["outcome"]["text"], "done in the background");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_connect_is_rejected_and_keeps_the_incumbent() {
+        // Vuln 1: a connect that fails auth is refused and must not evict the
+        // attached human or drive the session.
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        tokio::spawn(serve_on(
+            listener,
+            "test".into(),
+            "m".into(),
+            scripted_session(),
+            None,
+            "tok".into(),
+        ));
+
+        // Authenticated client A drives to a parked ask.
+        let (r, mut w) = UnixStream::connect(&sock).await.unwrap().into_split();
+        let mut a = tokio::io::BufReader::new(r).lines();
+        send(&mut w, json!({"t":"auth","token":"tok"})).await;
+        send(&mut w, json!({"t":"prompt","text":"go"})).await;
+        let ask_id = loop {
+            let f = next(&mut a).await;
+            if f["t"] == "ask" {
+                break f["id"].as_u64().unwrap();
+            }
+        };
+
+        // Client B connects with the WRONG token: rejected outright.
+        let (rb, mut wb) = UnixStream::connect(&sock).await.unwrap().into_split();
+        let mut b = tokio::io::BufReader::new(rb).lines();
+        send(&mut wb, json!({"t":"auth","token":"WRONG"})).await;
+        assert_eq!(
+            next(&mut b).await["t"],
+            "error",
+            "an unauthenticated connect must be rejected"
+        );
+
+        // A was never evicted — it answers its ask and the turn completes.
+        send(&mut w, json!({"t":"ask_reply","id":ask_id,"allow":true})).await;
+        let done = loop {
+            let f = next(&mut a).await;
+            assert_ne!(
+                f["t"], "detached",
+                "A must not be evicted by an unauthed connect"
+            );
+            if f["t"] == "turn_done" {
+                break f;
+            }
+        };
+        assert_eq!(done["outcome"]["kind"], "done");
     }
 }
