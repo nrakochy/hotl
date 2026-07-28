@@ -113,15 +113,46 @@ pub fn paste_marker(n: usize, lines: usize) -> String {
     format!("[Pasted text #{n} +{lines} lines]")
 }
 
+/// Apply `(marker, replacement)` pairs to `text` in a single left-to-right
+/// pass. Scanning the ORIGINAL text is the whole point: a replacement's body
+/// may contain another marker verbatim, and a second `str::replace` pass would
+/// rewrite it.
+fn substitute(text: &str, subs: &[(String, String)]) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        match subs
+            .iter()
+            .filter_map(|(m, r)| text[i..].find(m.as_str()).map(|off| (i + off, m, r)))
+            .min_by_key(|&(at, m, _)| (at, std::cmp::Reverse(m.len())))
+        {
+            Some((at, m, r)) => {
+                out.push_str(&text[i..at]);
+                out.push_str(r);
+                i = at + m.len();
+            }
+            None => {
+                out.push_str(&text[i..]);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// Expand a submitted draft for the wire. Paste tokens are replaced by their
 /// content; image tokens stay inline (the model sees where the image sat) and
 /// surviving images become payload entries with `data: None`.
 ///
-/// Survival is checked against the ORIGINAL buffer text, not the
-/// partially-expanded output — a paste whose content happens to contain
-/// `[Image #1]` must not resurrect an image the human deleted.
+/// INVARIANT: image survival and paste substitution are both decided against
+/// the ORIGINAL buffer text, never a partially-expanded accumulator — a paste
+/// body containing `[Image #1]` or another paste's marker cannot resurrect a
+/// deleted token or get rewritten. Enforced by
+/// `paste_content_containing_a_marker_cannot_resurrect_an_image` (image half)
+/// and `one_pastes_body_is_never_rewritten_by_a_later_pastes_marker`
+/// (substitution half).
 pub fn expand_for_wire(text: &str, attachments: &[Attachment]) -> PromptPayload {
-    let mut out = text.to_string();
+    let mut subs = Vec::new();
     let mut images = Vec::new();
     let (mut img_n, mut paste_n) = (0usize, 0usize);
     for att in attachments {
@@ -143,14 +174,14 @@ pub fn expand_for_wire(text: &str, attachments: &[Attachment]) -> PromptPayload 
                 lines,
             } => {
                 paste_n += 1;
-                let marker = paste_marker(paste_n, *lines);
-                if text.contains(&marker) {
-                    out = out.replace(&marker, content);
-                }
+                subs.push((paste_marker(paste_n, *lines), content.clone()));
             }
         }
     }
-    PromptPayload { text: out, images }
+    PromptPayload {
+        text: substitute(text, &subs),
+        images,
+    }
 }
 
 /// Expand a submitted draft for the on-disk prompt history: paste tokens
@@ -158,24 +189,24 @@ pub fn expand_for_wire(text: &str, attachments: &[Attachment]) -> PromptPayload 
 /// pre-compaction behavior would have written, so a recalled entry is
 /// self-contained (a token without its side table is dead text).
 pub fn expand_for_history(text: &str, attachments: &[Attachment]) -> String {
-    let mut out = text.to_string();
+    let mut subs = Vec::new();
     let (mut img_n, mut paste_n) = (0usize, 0usize);
     for att in attachments {
         match att {
             Attachment::Image { path, .. } => {
                 img_n += 1;
-                out = out.replace(&image_marker(img_n), path);
+                subs.push((image_marker(img_n), path.clone()));
             }
             Attachment::Paste {
                 text: content,
                 lines,
             } => {
                 paste_n += 1;
-                out = out.replace(&paste_marker(paste_n, *lines), content);
+                subs.push((paste_marker(paste_n, *lines), content.clone()));
             }
         }
     }
-    out
+    substitute(text, &subs)
 }
 
 /// Byte ranges of well-formed tokens in one visual row, for chip styling.
@@ -444,6 +475,49 @@ mod tests {
         let p = expand_for_wire("[Pasted text #1 +3 lines]", &atts);
         assert_eq!(p.text, "sneaky [Image #1] inside");
         assert!(p.images.is_empty());
+    }
+
+    #[test]
+    fn one_pastes_body_is_never_rewritten_by_a_later_pastes_marker() {
+        let atts = vec![
+            Attachment::Paste {
+                text: "quoting [Pasted text #2 +3 lines] here".into(),
+                lines: 3,
+            },
+            Attachment::Paste {
+                text: "SECOND".into(),
+                lines: 3,
+            },
+        ];
+        let p = expand_for_wire(
+            "[Pasted text #1 +3 lines] and [Pasted text #2 +3 lines]",
+            &atts,
+        );
+        // The literal marker inside paste #1's body must survive verbatim.
+        assert_eq!(p.text, "quoting [Pasted text #2 +3 lines] here and SECOND");
+    }
+
+    #[test]
+    fn history_expansion_has_the_same_one_pass_guarantee() {
+        // Paste must precede Image in attachment order: the accumulator bug
+        // only fires when an earlier step's inserted body is re-scanned by a
+        // later step's replace — Image-then-Paste (the brief's original
+        // ordering) never re-visits the accumulator and does not discriminate.
+        let atts = vec![
+            Attachment::Paste {
+                text: "quoting [Image #1] here".into(),
+                lines: 3,
+            },
+            Attachment::Image {
+                path: "/a/b.png".into(),
+                media_type: "image/png".into(),
+            },
+        ];
+        // The image token the human deleted must not reappear from inside a body.
+        assert_eq!(
+            expand_for_history("[Pasted text #1 +3 lines]", &atts),
+            "quoting [Image #1] here"
+        );
     }
 
     #[test]
