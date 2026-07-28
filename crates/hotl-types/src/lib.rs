@@ -13,6 +13,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod sanitize;
+
 /// Bumped only on breaking changes to the persisted entry format.
 pub const FORMAT_VERSION: u32 = 1;
 

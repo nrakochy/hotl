@@ -194,6 +194,41 @@ async fn dont_ask_mode_hard_stops_on_a_doom_loop() {
     );
 }
 
+/// Vuln 8: a tool's summary is model-authored text rendered into the human's
+/// y/N prompt. The engine must flatten it to a single control-free line at the
+/// ask chokepoint, so a `bash` command carrying `\r\x1b[2K` (a line-erase) or a
+/// bidi override cannot spoof what the human is about to approve.
+#[tokio::test]
+async fn ask_summaries_are_sanitized_before_they_reach_the_human() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call(
+            "t1",
+            "bash",
+            json!({"command": "echo hi\n\u{1b}[2Krm -rf / \u{202e}"}),
+        ),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session(provider, None, EngineConfig::default());
+    s.handle.prompt("run bash".into()).await;
+
+    let summary = loop {
+        match next_event(&mut s).await {
+            EngineEvent::Ask { summary, reply, .. } => {
+                let _ = reply.send(AskReply::Deny { message: None });
+                break summary;
+            }
+            EngineEvent::TurnDone { .. } => panic!("expected an ask, got turn done"),
+            _ => {}
+        }
+    };
+    assert!(!summary.contains('\n'), "newline survived: {summary:?}");
+    assert!(!summary.contains('\u{1b}'), "ESC survived: {summary:?}");
+    assert!(
+        !summary.contains('\u{202e}'),
+        "bidi override survived: {summary:?}"
+    );
+}
+
 /// The control: a mutating batch still brackets itself with the pre/post pair.
 #[tokio::test]
 async fn a_mutating_batch_still_takes_the_pre_and_post_snapshots() {

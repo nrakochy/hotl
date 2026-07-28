@@ -14,13 +14,15 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+/// The summary sanitizer is canonical in the leaf crate now (so the engine gate
+/// and the builtin tools reach it without a dependency cycle); re-exported here
+/// for this module's envelope and for `hotl-retrieval`'s existing call site.
+pub use hotl_types::sanitize::{safe_summary, strip_control, MAX_SUMMARY_CHARS};
+
 pub const MAX_RESULT_BYTES: usize = 50 * 1024;
 /// Anything interpolated into an XML attribute value is bounded here — a
 /// source string is provenance, not payload.
 pub const MAX_SOURCE_BYTES: usize = 128;
-/// A y/N prompt is one terminal line; longer than this and the human stops
-/// reading the part that matters.
-pub const MAX_SUMMARY_CHARS: usize = 120;
 /// Cumulative enveloped bytes one tool instance may emit in a session. A
 /// single result is bounded by MAX_RESULT_BYTES; a thousand results were not.
 pub const SESSION_BUDGET_BYTES: usize = 4 * 1024 * 1024;
@@ -90,22 +92,6 @@ pub fn attr_safe(s: &str) -> String {
     out
 }
 
-/// Text safe to render into a human y/N approval prompt: no controls, no Cf,
-/// no newlines, one ellipsis-capped line.
-pub fn safe_summary(s: &str) -> String {
-    let flat: String = strip_control(s)
-        .chars()
-        .map(|c| if c.is_whitespace() { ' ' } else { c })
-        .collect();
-    let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.chars().count() <= MAX_SUMMARY_CHARS {
-        return flat;
-    }
-    let mut out: String = flat.chars().take(MAX_SUMMARY_CHARS - 1).collect();
-    out.push('…');
-    out
-}
-
 /// Cumulative external-content budget for one tool instance (one session).
 ///
 /// An `AtomicUsize` with a CAS loop rather than a `Mutex` so it stays correct
@@ -164,67 +150,6 @@ fn defang(content: &str) -> String {
                 }
             }
         }
-    }
-    out
-}
-
-/// Category Cf as of Unicode 15, enumerated rather than pulled from a
-/// `unicode-*` crate: no new dependency, and the ranges are stable. The
-/// Unicode Tags block (U+E0000-U+E007F) is the one that matters most — the
-/// standard invisible prompt-injection carrier that models decode as ASCII
-/// while a human reviewing the transcript sees nothing (S-3).
-fn is_format_char(c: char) -> bool {
-    matches!(c as u32,
-        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891
-        | 0x08E2 | 0x180E | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064
-        | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB | 0x110BD | 0x110CD
-        | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A
-        | 0xE0001 | 0xE0020..=0xE007F)
-}
-
-/// Strip ANSI escape sequences (CSI/OSC/two-byte), C0/C1 controls except
-/// `\n`/`\t`, and Unicode category Cf — bidi overrides, zero-width
-/// joiners/spaces, the byte-order mark, and the Unicode Tags block (S-3).
-fn strip_control(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            match chars.peek() {
-                // CSI: ESC [ ... final byte @–~
-                Some('[') => {
-                    chars.next();
-                    for c in chars.by_ref() {
-                        if ('\u{40}'..='\u{7e}').contains(&c) {
-                            break;
-                        }
-                    }
-                }
-                // OSC: ESC ] ... BEL or ESC \
-                Some(']') => {
-                    chars.next();
-                    while let Some(c) = chars.next() {
-                        if c == '\u{07}' {
-                            break;
-                        }
-                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
-                }
-                // Two-byte escapes (ESC c, ESC 7, …)
-                Some(_) => {
-                    chars.next();
-                }
-                None => {}
-            }
-            continue;
-        }
-        if (c.is_control() && c != '\n' && c != '\t') || is_format_char(c) {
-            continue;
-        }
-        out.push(c);
     }
     out
 }

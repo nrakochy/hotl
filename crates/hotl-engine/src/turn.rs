@@ -1330,7 +1330,8 @@ impl Turn {
             Permission::Ask { summary } => (Some(summary), None),
             Permission::AskProtected { summary, why } => (Some(summary), Some(why)),
         };
-        let display = summary.clone().unwrap_or_else(|| tu.name.clone());
+        let display =
+            hotl_types::sanitize::safe_summary(&summary.clone().unwrap_or_else(|| tu.name.clone()));
         if let Some(summary) = summary {
             match self.approve_input(tu, &input, summary, why).await {
                 AskReply::Allow => {}
@@ -2008,6 +2009,12 @@ impl Turn {
     /// mid-ask leaves a dangling record that resume re-surfaces. The log
     /// records are best-effort: a sealed log never blocks the ask itself.
     async fn ask(&self, summary: String, why: Option<String>) -> AskReply {
+        // Chokepoint (Vuln 8): `summary`/`why` are model-influenced text about
+        // to be rendered into the human's y/N prompt. Flatten each to a single
+        // control-free line here — once, for every tool — so none can smuggle a
+        // terminal escape or a line-erase into the approval the human acts on.
+        let summary = hotl_types::sanitize::safe_summary(&summary);
+        let why = why.map(|w| hotl_types::sanitize::safe_summary(&w));
         let id = hotl_types::new_ulid();
         // INVARIANT: the ask itself never blocks on the log — a sealed log
         // degrades the audit record, never the human moment. Enforced by

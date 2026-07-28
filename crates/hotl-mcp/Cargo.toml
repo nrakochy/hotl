@@ -12,6 +12,7 @@ homepage.workspace = true
 
 [dependencies]
 hotl-tools = { path = "../hotl-tools", version = "0.7.1" }
+hotl-types = { path = "../hotl-types", version = "0.7.1" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
