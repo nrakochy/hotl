@@ -22,7 +22,7 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
 | `hotl skills [add\|update\|remove]` | List every discovered skill with its source; manage skill marketplaces. See [skills.md](../skills/). |
 | `hotl watch` | The tmux dashboard (separate capability; [crates/hotl/README.md](https://github.com/nrakochy/hotl/blob/master/crates/hotl/README.md)). |
-| `hotl update [ver]` | Print the version + how to update (compares against `ver` if given). |
+| `hotl update` | Install the latest release. `--check` only looks; `--version X.Y.Z` picks one; `-y` skips the prompt. See [updating](../updating/). |
 | `hotl fleet` | Reserved (orchestrate); not built — exits 2. |
 | `hotl --help` | Usage summary. |
 

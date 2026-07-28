@@ -87,6 +87,7 @@ export default defineConfig({
 					items: [
 						{ label: 'Configuration', slug: 'configuration' },
 						{ label: 'Troubleshooting', slug: 'troubleshooting' },
+						{ label: 'Updating', slug: 'updating' },
 						{ label: 'Uninstall', slug: 'uninstall' },
 					],
 				},

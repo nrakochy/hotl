@@ -22,6 +22,32 @@ semver promise of their own.
   `HOTL_MOUSE` environment variable — which still wins when set, per the
   env > config > default precedence. Retires a documented TODO.
 
+- **`hotl update` installs the latest release.** It reads the release's
+  `dist-manifest.json`, verifies the archive's SHA-256 in process *before*
+  decompressing it, unpacks only the executable (refusing absolute or `..`
+  paths), runs `--version` on the result to prove it works, and only then
+  renames it over the running binary — atomically, and safely while hotl is
+  running. Any failure leaves the original untouched. `--check` looks without
+  writing, `--version X.Y.Z` installs a specific release including an older
+  one, `-y` skips the prompt.
+
+  It replaces only installs it can own: the installer script and hand-unpacked
+  tarballs. `cargo install`, Nix, Homebrew, and source builds are detected and
+  told the right command instead — overwriting a cargo-installed binary would
+  leave `.crates.toml` stale and be reverted by the next `cargo install`. The
+  installer and `cargo install` share `~/.cargo/bin`, so the two are separated
+  by cargo's own `.crates.toml` record rather than by path.
+
+  hotl contacts the feed **only** when you run the command; there is still no
+  background check. What the checksum does and does not prove is stated in the
+  docs: it catches a corrupt download, not a replaced release. That is the same
+  trust every existing install path already places in GitHub over TLS, and
+  signing is the separate change that would raise it.
+
+  A `security-enforced` build refuses to update, because the published binaries
+  are ordinary builds and swapping one in would silently drop the enforced
+  posture.
+
 - **Image input.** Drag an image onto the console and the pasted path
   compacts to an `[Image #1]` token; on submit hotl reads the file and sends
   it to the model as a real image content block — provider-neutral
@@ -39,6 +65,18 @@ semver promise of their own.
   token. `Backspace` right after a token deletes it whole; editing inside
   one turns it back into literal text. Prompt history stores the expanded
   bytes, so recalled entries stay self-contained.
+
+### Changed
+
+- **Release archives are `.tar.gz`, not `.tar.xz`.** `hotl update` decodes the
+  archive in process, and the pure-Rust xz decoders are far narrower crates
+  than `flate2`; keeping xz would have meant a C toolchain on the
+  `cargo install` path. Costs a few MB per download. Assets from v0.7.1 and
+  earlier stay `.tar.xz` and `hotl update --version` refuses them by name.
+
+- **`hotl update <version>` no longer takes a positional version.** It existed
+  only because nothing could fetch the real one; `hotl update` now looks it up.
+  Use `--version X.Y.Z` to pin a release.
 
 ## [0.7.1] - 2026-07-27
 

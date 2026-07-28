@@ -113,6 +113,11 @@ flake input:
 Nix builds hotl from source, so the first build compiles the whole dependency
 tree — use the prebuilt binary above if you want it now.
 
+To upgrade later, `hotl update` installs the latest release — replacing the
+binary in place if you used the installer script, and printing the right
+command if cargo, Nix, or Homebrew owns it. hotl checks for a release only when
+you run that command. See [updating](https://nrakochy.github.io/hotl/updating/).
+
 ## Execute — quick start
 
 Point `HOTL_MODEL` at a model (`provider/model` — `anthropic/…` or `openai/…`, which covers any OpenAI-compatible endpoint incl. local Ollama), then:

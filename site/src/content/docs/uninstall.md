@@ -36,4 +36,4 @@ rm -rf ~/.local/share/hotl
 
 ## What hotl never leaves behind
 
-hotl writes nothing outside those three locations and your explicit edits to your own files. It installs no daemon, no launch agent, no cron entry, and sends no telemetry — there is no background process to stop.
+hotl writes nothing outside those three locations, its own binary (only when you run [`hotl update`](../updating/)), and your explicit edits to your own files. It installs no daemon, no launch agent, no cron entry, and sends no telemetry — there is no background process to stop.
