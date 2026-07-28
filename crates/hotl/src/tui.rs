@@ -280,8 +280,8 @@ async fn run_loop(
             // back is the terminal-bound remainder this loop owns.
             // `@[file]` refs and image paths expand on the way out only.
             let cmd = match cmd {
-                Cmd::SendPrompt(p) => Cmd::SendPrompt(outbound(p)),
-                Cmd::SendSteer(p) => Cmd::SendSteer(outbound(p)),
+                Cmd::SendPrompt(p) => Cmd::SendPrompt(outbound(p).await),
+                Cmd::SendSteer(p) => Cmd::SendSteer(outbound(p).await),
                 other => other,
             };
             let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids).await else {
@@ -341,7 +341,7 @@ async fn run_loop(
 /// (`MAX_IMAGE_DECODED_BYTES`), and per-prompt total
 /// (`MAX_PROMPT_DECODED_BYTES`) — so a well-behaved client never sends what
 /// the server would reject.
-fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload {
+async fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload {
     let mut text = crate::setup::expand_file_refs(&p.text);
     let mut images = Vec::new();
     let mut total = 0usize;
@@ -361,7 +361,11 @@ fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload
         // `total` never exceeds `MAX_PROMPT_DECODED_BYTES`.
         let remaining = crate::images::MAX_PROMPT_DECODED_BYTES - total;
         let cap = (crate::images::MAX_IMAGE_DECODED_BYTES).min(remaining);
-        match load_image(&img.path, cap as u64) {
+        let path = img.path.clone();
+        let loaded = tokio::task::spawn_blocking(move || load_image(&path, cap as u64))
+            .await
+            .unwrap_or_else(|e| Err(e.to_string()));
+        match loaded {
             Ok((data, decoded)) => {
                 total += decoded;
                 images.push(hotl_tui::paste::ImageAttachment {
@@ -383,9 +387,10 @@ fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload
 
 /// Read + base64-encode one dropped image. Metadata first, so an over-cap
 /// file is refused without reading it. `~` expands to `$HOME` — terminals
-/// hand us the path exactly as dropped. Blocking on the loop thread is
-/// accepted precedent at this seam: `history.append` already does blocking
-/// fs here, and `$EDITOR` suspends the loop outright.
+/// hand us the path exactly as dropped. Stays synchronous and runs on
+/// `spawn_blocking`: `history.append` writes a few hundred bytes and can
+/// stay on the loop thread, but eight 5MB reads plus base64 would stall the
+/// wire reader and Ctrl-C for seconds.
 fn load_image(path: &str, cap: u64) -> Result<(String, usize), String> {
     let expanded = match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
@@ -414,8 +419,11 @@ fn load_image(path: &str, cap: u64) -> Result<(String, usize), String> {
         // with it; refusing here degrades one attachment instead.
         return Err("is empty".into());
     }
-    let bytes = std::fs::read(&expanded).map_err(|e| e.to_string())?;
-    Ok((hotl_tools::b64::encode(&bytes), bytes.len()))
+    let encoded = {
+        let bytes = std::fs::read(&expanded).map_err(|e| e.to_string())?;
+        hotl_tools::b64::encode(&bytes)
+    };
+    Ok((encoded, meta.len() as usize))
 }
 
 /// Put a screen region on the clipboard; returns the lines actually copied.
@@ -755,26 +763,30 @@ mod tests {
         }
     }
 
-    #[test]
-    fn file_refs_expand_on_the_way_out_not_in_the_transcript() {
+    #[tokio::test]
+    async fn file_refs_expand_on_the_way_out_not_in_the_transcript() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("note.txt");
         std::fs::write(&p, "CONTENTS").unwrap();
         let typed = format!("look at @[{}]", p.display());
         assert!(super::outbound(payload(&typed, Vec::new()))
+            .await
             .text
             .contains("CONTENTS"));
-        assert_eq!(super::outbound(payload("plain", Vec::new())).text, "plain");
+        assert_eq!(
+            super::outbound(payload("plain", Vec::new())).await.text,
+            "plain"
+        );
     }
 
-    #[test]
-    fn outbound_encodes_a_readable_image_and_annotates_a_missing_one() {
+    #[tokio::test]
+    async fn outbound_encodes_a_readable_image_and_annotates_a_missing_one() {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("shot.png");
         std::fs::write(&img, b"fake png bytes").unwrap();
         let good = attachment("[Image #1]", &img.display().to_string());
         let gone = attachment("[Image #2]", "/definitely/not/here.png");
-        let out = super::outbound(payload("see [Image #1] and [Image #2]", vec![good, gone]));
+        let out = super::outbound(payload("see [Image #1] and [Image #2]", vec![good, gone])).await;
         // The readable one is encoded in place…
         assert_eq!(out.images.len(), 1);
         assert_eq!(
@@ -800,13 +812,13 @@ mod tests {
         assert!(err.contains("per-prompt image budget"), "{err}");
     }
 
-    #[test]
-    fn a_zero_byte_file_is_refused_before_it_reaches_the_wire() {
+    #[tokio::test]
+    async fn a_zero_byte_file_is_refused_before_it_reaches_the_wire() {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("empty.png");
         std::fs::write(&img, b"").unwrap();
         let att = attachment("[Image #1]", &img.display().to_string());
-        let out = super::outbound(payload("see [Image #1]", vec![att]));
+        let out = super::outbound(payload("see [Image #1]", vec![att])).await;
         // The server's `decoded_len` rejects "" and takes the whole prompt with
         // it; refusing here degrades one attachment instead.
         assert!(out.images.is_empty());
