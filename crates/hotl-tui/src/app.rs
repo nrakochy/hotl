@@ -1018,7 +1018,7 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             // not leak their numbering into the next draft.
             state.attachments.clear();
             // INVARIANT: the editor's live-token set matches `State.attachments`.
-            // Enforced by `backspace_swallows_a_token_only_while_its_attachment_lives`.
+            // Enforced by `empty_submit_syncs_live_tokens_so_a_stale_look_alike_stays_prose`.
             state
                 .editor
                 .set_live_tokens(paste::live_tokens(&state.attachments));
@@ -1037,7 +1037,7 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             let payload = paste::expand_for_wire(&text, &state.attachments);
             state.attachments.clear();
             // INVARIANT: the editor's live-token set matches `State.attachments`.
-            // Enforced by `backspace_swallows_a_token_only_while_its_attachment_lives`.
+            // Enforced by `normal_submit_syncs_live_tokens_so_a_stale_look_alike_stays_prose`.
             state
                 .editor
                 .set_live_tokens(paste::live_tokens(&state.attachments));
@@ -1800,6 +1800,37 @@ mod tests {
         type_str(&mut s, "why does it render [Image #2]");
         press(&mut s, KeyCode::Backspace);
         assert_eq!(s.editor.text(), "why does it render [Image #2");
+    }
+
+    #[test]
+    fn normal_submit_syncs_live_tokens_so_a_stale_look_alike_stays_prose() {
+        // Without the sync-after-clear in the non-empty Submit arm, the
+        // live set would still hold "[Image #1]" from the paste and the
+        // whole re-typed token below would get swallowed instead of one char.
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/tmp/shot.png".into()));
+        press(&mut s, KeyCode::Enter);
+        assert!(s.attachments.is_empty());
+        type_str(&mut s, "why does it render [Image #1]");
+        press(&mut s, KeyCode::Backspace);
+        assert_eq!(s.editor.text(), "why does it render [Image #1");
+    }
+
+    #[test]
+    fn empty_submit_syncs_live_tokens_so_a_stale_look_alike_stays_prose() {
+        // Same discriminator, via the empty-buffer Submit arm: swallow the
+        // token (buffer empties, `attachments` still holds it), submit the
+        // empty buffer, then confirm a re-typed look-alike is just prose.
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/tmp/shot.png".into()));
+        press(&mut s, KeyCode::Backspace);
+        assert_eq!(s.editor.text(), "");
+        assert_eq!(s.attachments.len(), 1);
+        press(&mut s, KeyCode::Enter);
+        assert!(s.attachments.is_empty());
+        type_str(&mut s, "why does it render [Image #1]");
+        press(&mut s, KeyCode::Backspace);
+        assert_eq!(s.editor.text(), "why does it render [Image #1");
     }
 
     #[test]

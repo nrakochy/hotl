@@ -231,9 +231,11 @@ pub fn token_ranges(s: &str) -> Vec<Range<usize>> {
     out
 }
 
-/// If `s` ends with one full token, its length in chars — the backspace arm
-/// uses this to swallow a token whole. Tokens are pure ASCII, but the editor
-/// counts columns in chars, so the contract is chars.
+/// If `s` ends with one full token, its length in chars — grammar-only, no
+/// side table. The backspace arm calls `token_suffix_chars_in` instead,
+/// which layers the live-attachment check on top of this same boundary
+/// check; kept for its own contract and tests. Tokens are pure ASCII, but
+/// the editor counts columns in chars, so the contract is chars.
 pub fn token_suffix_chars(s: &str) -> Option<usize> {
     let start = s.rfind('[')?;
     let len = token_len_at(&s[start..])?;
