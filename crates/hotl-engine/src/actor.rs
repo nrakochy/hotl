@@ -43,6 +43,11 @@ const QUEUE_MAX: usize = 64;
 /// Bytes of held steering (or coalesced prompt) text before folding truncates
 /// with a marker.
 const HELD_BYTES_MAX: usize = 64 * 1024;
+/// Byte cap on images buffered across held steers and queued prompts. Text
+/// gets `HELD_BYTES_MAX`; base64 is three orders of magnitude denser, so it
+/// gets its own — and it stays well under `hotl_types::IMAGE_B64_BUDGET` so a
+/// released fold can never be the thing that trips the window budget.
+const HELD_IMAGE_B64_MAX: usize = 4 * 1024 * 1024;
 /// In-band disclosure that a fold dropped text. Stripped before each new fold
 /// so repeated folding never stacks markers.
 const FOLD_MARK: &str = "\n[… later text truncated]";
@@ -1203,6 +1208,27 @@ fn fold_into(dst: &mut String, text: &str, max_bytes: usize) {
     }
 }
 
+/// Append what fits of `src` to `dst` under `max_bytes` of base64, returning
+/// how many images were dropped. Dropping is disclosed in-band by the caller,
+/// the same bargain `fold_into` makes for text.
+fn fold_images(
+    dst: &mut Vec<hotl_types::UserImage>,
+    src: Vec<hotl_types::UserImage>,
+    max_bytes: usize,
+) -> usize {
+    let mut total: usize = dst.iter().map(|i| i.data.len()).sum();
+    let mut dropped = 0;
+    for img in src {
+        if total + img.data.len() > max_bytes {
+            dropped += 1;
+            continue;
+        }
+        total += img.data.len();
+        dst.push(img);
+    }
+    dropped
+}
+
 /// Whether the projection is mid-batch: it ends on an assistant turn whose
 /// tool calls have no results yet. Both APIs require those results to be the
 /// very next message, so nothing else may be appended in this window.
@@ -1242,20 +1268,38 @@ async fn admit_steer(
     steer: HeldSteer,
 ) {
     if running || awaiting_tool_results(head.items()) {
-        // Past the byte cap, coalesce into the last held steer rather than grow
-        // without bound — every entry is committed at once on release. Folded
-        // images ride along (same marker-numbering caveat as the prompt fold).
-        let total: usize = held.iter().map(|s| s.text.len()).sum();
-        match held.last_mut() {
-            Some(last) if total >= HELD_BYTES_MAX => {
-                fold_into(&mut last.text, &steer.text, HELD_BYTES_MAX);
-                last.images.extend(steer.images);
-            }
-            _ => held.push(steer),
-        }
+        // Past either byte cap — text or images — fold into the last held
+        // steer rather than grow without bound; it all commits at release.
+        push_or_fold_steer(held, steer);
         return;
     }
     append_steer(shared, log, head, pipeline, steer).await;
+}
+
+/// Push a steer onto the held buffer, or fold it into the last entry once
+/// either cap is reached. Sync and self-contained so the bound is unit-testable
+/// without a session behind it.
+fn push_or_fold_steer(held: &mut Vec<HeldSteer>, steer: HeldSteer) {
+    let text_total: usize = held.iter().map(|s| s.text.len()).sum();
+    let image_total: usize = held
+        .iter()
+        .flat_map(|s| s.images.iter())
+        .map(|i| i.data.len())
+        .sum();
+    let incoming: usize = steer.images.iter().map(|i| i.data.len()).sum();
+    let full = text_total >= HELD_BYTES_MAX || image_total + incoming > HELD_IMAGE_B64_MAX;
+    match held.last_mut() {
+        Some(last) if full => {
+            fold_into(&mut last.text, &steer.text, HELD_BYTES_MAX);
+            let dropped = fold_images(&mut last.images, steer.images, HELD_IMAGE_B64_MAX);
+            if dropped > 0 {
+                last.text.push_str(&format!(
+                    "\n[{dropped} image(s) not attached: steer buffer full]"
+                ));
+            }
+        }
+        _ => held.push(steer),
+    }
 }
 
 /// A steer waiting for a between-samples boundary, with the images its
@@ -1754,13 +1798,19 @@ async fn admit_prompt(
             // still `PromptQueued`. A folded prompt inherits the tag of the
             // entry it joins — only reachable past QUEUE_MAX pending prompts,
             // where provenance has already stopped being per-prompt. Its
-            // images ride along; two folded prompts may then both say
+            // images ride along up to `HELD_IMAGE_B64_MAX`; the overflow is
+            // dropped and disclosed. Two folded prompts may then both say
             // `[Image #1]`, and renumbering would mean parsing message text,
             // which types-layer policy forbids — accepted on this
             // pathological path (text folding already truncates far worse).
             Some(last) if full => {
                 fold_into(&mut last.text, &prompt.text, HELD_BYTES_MAX);
-                last.images.extend(prompt.images);
+                let dropped = fold_images(&mut last.images, prompt.images, HELD_IMAGE_B64_MAX);
+                if dropped > 0 {
+                    last.text.push_str(&format!(
+                        "\n[{dropped} image(s) not attached: prompt queue full]"
+                    ));
+                }
             }
             _ => queue.push_back(prompt),
         }
@@ -1916,8 +1966,9 @@ fn respawn_turn(
 mod tests {
     use super::COMPACT_SUMMARIZE_TIMEOUT;
     use super::{
-        awaiting_tool_results, commit_prepared, compact, fold_into, pair_tool_results,
-        release_steers, summarize_bounded, Head, Pipeline, ProjectionHead, Resolution, SharedDeps,
+        awaiting_tool_results, commit_prepared, compact, fold_images, fold_into, pair_tool_results,
+        push_or_fold_steer, release_steers, summarize_bounded, Head, HeldSteer, Pipeline,
+        ProjectionHead, Resolution, SharedDeps, HELD_IMAGE_B64_MAX,
     };
     use hotl_store::SessionLog;
     use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
@@ -2035,6 +2086,46 @@ mod tests {
         }
         assert!(dst.len() <= 128 + 64, "got {}", dst.len());
         assert!(dst.starts_with("first"));
+    }
+
+    #[test]
+    fn folding_bounds_held_images_and_reports_what_it_dropped() {
+        let img = |n: usize| hotl_types::UserImage {
+            media_type: "image/png".into(),
+            data: "A".repeat(n).into(),
+        };
+        let mut dst = vec![img(8)];
+        // Room for 8 more bytes: the first extra fits, the second does not.
+        let dropped = fold_images(&mut dst, vec![img(8), img(8)], 16);
+        assert_eq!(dropped, 1);
+        assert_eq!(dst.len(), 2);
+        assert!(dst.iter().map(|i| i.data.len()).sum::<usize>() <= 16);
+    }
+
+    #[test]
+    fn a_held_steer_over_the_image_cap_drops_images_rather_than_growing() {
+        // INVARIANT: the held-steer buffer is bounded in BYTES, images included.
+        // Enforced by this test.
+        let mut held: Vec<HeldSteer> = Vec::new();
+        let big = || hotl_types::UserImage {
+            media_type: "image/png".into(),
+            data: "A".repeat(HELD_IMAGE_B64_MAX).into(),
+        };
+        for _ in 0..4 {
+            push_or_fold_steer(
+                &mut held,
+                HeldSteer {
+                    text: "go".into(),
+                    images: vec![big()],
+                },
+            );
+        }
+        let total: usize = held
+            .iter()
+            .flat_map(|s| s.images.iter())
+            .map(|i| i.data.len())
+            .sum();
+        assert!(total <= HELD_IMAGE_B64_MAX, "{total}");
     }
 
     #[test]
