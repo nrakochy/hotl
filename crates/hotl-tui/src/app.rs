@@ -1060,11 +1060,11 @@ fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
 
 /// The display/wire fork: the transcript keeps `text` (tokens and all — what
 /// the human typed), the wire gets `payload` (tokens expanded, image paths
-/// riding). A slash command drops the payload; the skill desugar re-enters
-/// with a synthesized text-only one.
+/// riding). A built-in slash command drops the payload; the skill desugar
+/// re-uses its images.
 fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec<Cmd> {
     if let Some(rest) = text.trim().strip_prefix('/') {
-        return slash_command(state, rest);
+        return slash_command(state, rest, payload);
     }
     if state.phase == Phase::Idle {
         state.transcript.push(TranscriptItem::User { text });
@@ -1087,7 +1087,7 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
 /// override for skills the tool description no longer names. Anything
 /// else is a transcript notice — unresolved slash input never reaches the
 /// model.
-fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
+fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -> Vec<Cmd> {
     let (cmd, arg) = rest
         .split_once(char::is_whitespace)
         .map(|(c, a)| (c, a.trim()))
@@ -1200,13 +1200,25 @@ fn slash_command(state: &mut State, rest: &str) -> Vec<Cmd> {
         }
         "quit" => vec![Cmd::Quit],
         other if state.skills.iter().any(|s| s == other) => {
-            // Desugars to an ordinary prompt: the model calls the skill
-            // tool, so the TUI never reads skill files itself.
+            // Desugars to an ordinary prompt: the model calls the skill tool,
+            // so the TUI never reads skill files itself. The ARGUMENTS come
+            // from the expanded payload, not the raw buffer, so pastes arrive
+            // as content and image markers keep pointing at real attachments.
+            let expanded_arg = payload
+                .text
+                .trim()
+                .strip_prefix('/')
+                .and_then(|r| r.split_once(char::is_whitespace))
+                .map(|(_, a)| a.trim())
+                .unwrap_or("");
             let mut text = format!("Load the skill `{other}` and follow it for this task.");
-            if !arg.is_empty() {
-                text.push_str(&format!("\n\nARGUMENTS: {arg}"));
+            if !expanded_arg.is_empty() {
+                text.push_str(&format!("\n\nARGUMENTS: {expanded_arg}"));
             }
-            let payload = paste::PromptPayload::text_only(text.clone());
+            let payload = paste::PromptPayload {
+                text: text.clone(),
+                images: payload.images,
+            };
             submit(state, text, payload)
         }
         other => {
@@ -2577,7 +2589,7 @@ mod tests {
     }
 
     fn slash(s: &mut State, rest: &str) -> Vec<Cmd> {
-        slash_command(s, rest)
+        slash_command(s, rest, paste::PromptPayload::text_only(format!("/{rest}")))
     }
 
     fn last_notice(s: &State) -> String {
@@ -2854,6 +2866,33 @@ mod tests {
             panic!("expected a prompt, got {cmds:?}");
         };
         assert!(!p.text.contains("ARGUMENTS"), "{}", p.text);
+    }
+
+    #[test]
+    fn a_skill_invocation_carries_its_attached_images() {
+        let mut s = State::new(false, "m".into());
+        s.skills = vec!["brainstorming".into()];
+        type_str(&mut s, "/brainstorming ");
+        update(&mut s, Msg::Paste("/tmp/mockup.png".into()));
+        let cmds = press(&mut s, KeyCode::Enter);
+        let Some(Cmd::SendPrompt(p)) = cmds.iter().find_map(|c| match c {
+            Cmd::SendPrompt(p) => Some(Cmd::SendPrompt(p.clone())),
+            _ => None,
+        }) else {
+            panic!("a skill desugars to a prompt: {cmds:?}");
+        };
+        assert_eq!(p.images.len(), 1, "the mockup must ride along");
+        assert_eq!(p.images[0].path, "/tmp/mockup.png");
+        assert!(
+            p.text.contains("[Image #1]"),
+            "and its marker stays inline: {}",
+            p.text
+        );
+        assert!(
+            p.text.starts_with("Load the skill `brainstorming`"),
+            "{}",
+            p.text
+        );
     }
 
     #[test]
