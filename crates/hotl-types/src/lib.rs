@@ -105,6 +105,12 @@ pub const MAX_PROMPT_DECODED_BYTES: usize = 16 * 1024 * 1024;
 /// estimate alone would never trigger. 24MB of base64 (≈18MB decoded) leaves
 /// ~8MB for system, history text and tool schemas under the ~32MB request cap
 /// `MAX_PROMPT_DECODED_BYTES` already reasons about.
+///
+/// INVARIANT: one prompt's images always fit this budget. Enforced by
+/// `one_maximal_prompt_always_fits_the_window_image_budget`. That does not
+/// bound a fold's retries by itself — a minimal clean tail can hold more
+/// than one prompt (`compaction::is_clean_boundary` allows it) — so the real
+/// backstop against looping is `MAX_COMPACT_STREAK` in `hotl_engine::actor`.
 pub const IMAGE_B64_BUDGET: usize = 24 * 1024 * 1024;
 
 /// A session checklist item (`todo_write`, M4/tier-1 gap #3). Full-state
@@ -763,9 +769,8 @@ mod tests {
 
     #[test]
     fn one_maximal_prompt_always_fits_the_window_image_budget() {
-        // INVARIANT: the minimal compaction tail — one prompt's images — always
-        // fits IMAGE_B64_BUDGET, so a byte-triggered fold can never loop.
-        // Enforced by `one_maximal_prompt_always_fits_the_window_image_budget`.
+        // See `IMAGE_B64_BUDGET`'s doc comment for the invariant this proves
+        // (and the one it doesn't).
         let worst_case_b64 = MAX_PROMPT_DECODED_BYTES.div_ceil(3) * 4;
         assert!(
             worst_case_b64 <= IMAGE_B64_BUDGET,

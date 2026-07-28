@@ -344,6 +344,43 @@ mod tests {
         assert_eq!(p.kept_from, 2);
     }
 
+    /// `is_clean_boundary` only forbids a boundary immediately followed by
+    /// `ToolResults`; it says nothing about two `User` items back to back, so
+    /// the "minimal" fallback tail can still hold more than one prompt's
+    /// images. `plan` must hand that over-budget tail back (`kept_from =
+    /// latest`), never `None` — nothing here can shrink it further, so the
+    /// caller's retry loop (bounded by `MAX_COMPACT_STREAK`, not this
+    /// function) is what has to notice the bytes didn't drop.
+    #[test]
+    fn a_minimal_tail_can_still_exceed_the_image_budget() {
+        let img = |n: &str| hotl_types::UserImage {
+            media_type: "image/png".into(),
+            data: n.repeat(4).into(),
+        };
+        let items = vec![
+            assistant("calling"),
+            Item::User {
+                text: "s1".into(),
+                synthetic: None,
+                images: vec![img("A")],
+            },
+            Item::User {
+                text: "s2".into(),
+                synthetic: None,
+                images: vec![img("B")],
+            },
+            results("tool output"),
+        ];
+        // Budget admits one image, not two — and the only clean boundary
+        // (before "s1") carries both.
+        let p = plan(&items, u64::MAX, 4).expect("the fallback still returns a plan");
+        assert_eq!(p.kept_from, 1);
+        assert!(
+            crate::tokens::image_b64_bytes(&items[p.kept_from..]) > 4,
+            "the returned tail is still over budget"
+        );
+    }
+
     #[test]
     fn summarize_prompt_clips_results() {
         let folded = vec![user("goal"), results(&"z".repeat(5000))];

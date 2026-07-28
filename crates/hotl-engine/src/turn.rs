@@ -43,8 +43,13 @@ const SPECULATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30)
 /// pressures: tokens, and the image bytes the token estimate deliberately
 /// under-charges at a flat 1600 each. Pure so both are testable without a
 /// session behind them.
-/// INVARIANT: image bytes cannot grow the request without bound. Enforced by
+///
+/// INVARIANT: this returns `true` whenever image bytes cross
+/// `IMAGE_B64_BUDGET`, regardless of the token estimate. Enforced by
 /// `image_bytes_past_the_budget_force_a_fold_at_a_trivial_token_estimate`.
+/// Termination is NOT guaranteed here: a fold can hand back a tail still
+/// over budget (`compaction::plan`'s minimal-tail fallback); the real
+/// backstop against looping is `MAX_COMPACT_STREAK` in `crate::actor`.
 fn must_compact(estimate: u64, window: u64, image_bytes: usize) -> bool {
     estimate > (window as f64 * COMPACT_TRIGGER) as u64
         || image_bytes > hotl_types::IMAGE_B64_BUDGET
