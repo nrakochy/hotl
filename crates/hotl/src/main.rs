@@ -14,6 +14,7 @@
 //!   serve         (internal) host a session on a unix socket — used by `bg`
 //!   setup         write default config (safe defaults; never silent) (MD)
 //!   gc            prune old sessions/shadows/blobs per [retention] (retention)
+//!   mcp           inspect configured MCP servers and their trust grants (M3a)
 //!   update        install the latest release (or report one, with --check)
 
 mod acp;
@@ -32,6 +33,7 @@ mod gc;
 mod history;
 mod images;
 mod keysource;
+mod mcp_cli;
 mod session_server;
 mod setup;
 mod shell_hooks;
@@ -101,6 +103,7 @@ fn main() {
             std::process::exit(setup::setup_main(&agent::config_dir(), force));
         }
         Some("gc") => std::process::exit(gc::gc_main(&args)),
+        Some("mcp") => std::process::exit(mcp_cli::mcp_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
         Some("update") => std::process::exit(block_on(update::update_main(&args, &version_line()))),
         Some("init") => {
@@ -146,6 +149,7 @@ fn print_help() {
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
+         hotl mcp             list MCP servers and trust state; show/add/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
          hotl update          install the latest release (--check to only look)\n  \
          hotl resume [arg]    same as -r\n  \
