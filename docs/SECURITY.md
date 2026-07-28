@@ -179,6 +179,14 @@ Retention is explicit: `hotl gc` (with `--dry-run`) and a `[retention]` policy (
 
 A single-user tool on a single-user assumption. It runs `ps` (every user's process command lines) and `tmux capture-pane` (whatever is on screen); on a shared host these can surface other users' secrets (`mysql -pPASSWORD`, `--token=…`) and scrollback. All `ps`/`tmux` calls use argv arrays — no shell interpolation, so no command injection — making this local information disclosure inherent to a process dashboard, not an execution risk. Don't run it on a host where you shouldn't see other users' process arguments.
 
+## Self-update
+
+`hotl update` is the only thing that writes hotl's own binary, and only when you run it — there is no background check. It verifies the release archive's SHA-256 **in process before decompressing**, extracts only the executable (refusing absolute and `..` entry paths), runs `--version` on the result, and swaps by same-directory rename so a failure never leaves a partial binary.
+
+**The checksum is integrity, not provenance.** It travels in the same document, from the same host, over the same TLS session as the archive: it catches a corrupted or truncated download, not a release someone replaced upstream. A signature made with a key that never touches CI is the control that would cover that, and it is not shipped — see the gaps below. This is the same trust the installer script, `cargo install`, and `nix profile install` already place in the upstream host, not less.
+
+Installs owned by a package manager (cargo, Nix, Homebrew) and source builds are detected and refused with the right command instead — hotl never writes a binary another tool is tracking. **`security-enforced` builds refuse outright**: the published binaries are ordinary builds, so replacing one would silently drop the enforced posture the version banner advertises. A sandboxed child cannot reach the binary either, unless it happens to sit in the working directory or temp.
+
 ## Known gaps (planned, not shipped)
 
 - **No egress ask.** A host not on the allowlist gets a flat 403; there is no y/N ask ("bash wants to reach `host` — allow for this session?") the way tool permissions have. That interaction is what would make `allowlist` livable as the *default* — the first `cargo build` would ask once about crates.io instead of failing — and is the recorded path to flipping the egress default, along with a story for the SSH gap. Until it ships, egress restriction stays opt-in.
@@ -187,13 +195,14 @@ A single-user tool on a single-user assumption. It runs `ps` (every user's proce
 - **The egress proxy credential is not cryptographic.** It separates local processes within one session; it is visible to anything running as the same user, since it rides the child's environment. It is not a defense against that user.
 - **The permission pipeline has no AST or LLM inspectors.** Command scanning is heuristic (shell-operator detection), not tree-sitter-based; there are no LLM judges voting on calls.
 - **No third-party extension trust screens.** Moot today — hooks and settings load only from owner config, never from the repo — but required before any repo-supplied or third-party extension lane ships.
+- **Release artifacts are not signed.** `hotl update` verifies a SHA-256 that ships alongside the archive, which is integrity against corruption, not provenance. Closing it means a minisign key held offline and its public half compiled in — and it should raise the installer script at the same time, since signing only the updater hardens the one path that isn't the documented install.
 - **Browser/WASM profile does not exist** and has no kernel sandbox story yet; it will not ship without compensating controls.
 
 ## Standing rules
 
 - Tool descriptions must not promise protections the executor doesn't implement — tested as an invariant.
 - Supply chain: pinned deps; SHA-pinned remote installs default ON; lifecycle-script allowlists.
-- No telemetry. Secret-scrubbing in logs stays. Crash dumps are local, secret-scrubbed, and only ever shared manually by the user; the update *check* defaults off.
+- No telemetry. Secret-scrubbing in logs stays. Crash dumps are local, secret-scrubbed, and only ever shared manually by the user; there is no update check — `hotl update` reaches the network only when you run it.
 
 ## Reporting a vulnerability
 

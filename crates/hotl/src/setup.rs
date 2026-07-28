@@ -83,11 +83,6 @@ mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.
 # max_age_days = 30
 # max_sessions = 200
 
-[update]
-# hotl checks for releases only when you run `hotl update`, never on its own.
-# Reserved for a passive check; not implemented, and will default off.
-# check = false
-
 [history]
 # Console prompt recall (Up/Down, Ctrl-R search), persisted across sessions.
 # enabled = true                # false: recall works in-session, nothing on disk

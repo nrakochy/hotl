@@ -6,12 +6,17 @@ description: How `hotl update` works, what it verifies, and what it refuses to t
 ```
 hotl update                  # install the latest release
 hotl update --check          # look, don't touch
-hotl update --version 0.7.0  # install a specific release (including older)
+hotl update --version 0.8.0  # install a specific release (including older)
 hotl update -y               # don't ask before replacing the binary
 ```
 
 hotl contacts the release feed **only when you run this command**. There is no
 background check, no startup probe, and nothing to turn off.
+
+Before replacing anything it asks, showing the path and both versions. There is
+no prompt to answer when there is nothing to do — an already-current install
+just says so. Without a terminal on stdin (a script, CI) it will not guess:
+pass `-y`, or it stops and tells you to.
 
 ## It replaces only what it installed
 
@@ -33,6 +38,9 @@ So `hotl update` works out how this copy got here and acts accordingly:
 The installer script and `cargo install` both put the binary in
 `~/.cargo/bin/hotl`, so the path alone can't separate them — hotl checks
 whether cargo's own `.crates.toml` records `hotl`.
+
+`--check` works the same everywhere: it reports the available version whatever
+installed this copy, and never writes.
 
 ## What it verifies
 

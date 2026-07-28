@@ -26,7 +26,7 @@ Prebuilt binary, no toolchain needed (macOS / Linux):
 
     curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
 
-Or grab a `.tar.gz` for your platform from the
+Or grab the archive for your platform from the
 [latest release](https://github.com/nrakochy/hotl/releases/latest).
 With Rust ≥ 1.88 installed:
 
