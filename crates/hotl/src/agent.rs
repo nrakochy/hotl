@@ -841,11 +841,7 @@ fn build_registry(
         .map(|t| hotl_tools::diagnostics::Diagnostics::from_toml(&t))
         .unwrap_or_default();
     let mut registry = Registry::builtin_with(diagnostics);
-    let servers = cfg
-        .mcp_toml()
-        .and_then(|t| toml::from_str::<hotl_mcp::config::McpConfig>(&t).ok())
-        .map(|c| c.servers)
-        .unwrap_or_default();
+    let servers = cfg.mcp_servers();
     if !servers.is_empty() {
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
         registry.register(Box::new(hotl_mcp::McpTool::new(servers, trust)));

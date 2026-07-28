@@ -589,6 +589,17 @@ impl Config {
         toml::to_string(&toml::toml! { server = (servers.clone()) }).ok()
     }
 
+    /// The configured MCP servers, parsed. The registry and `hotl mcp` both
+    /// come through here so a roster can never disagree with what a turn loads.
+    /// A `[[mcp]]` section that fails to parse yields none, matching the
+    /// registry's prior behaviour of skipping the tool entirely.
+    pub fn mcp_servers(&self) -> Vec<hotl_mcp::config::ServerConfig> {
+        self.mcp_toml()
+            .and_then(|t| toml::from_str::<hotl_mcp::config::McpConfig>(&t).ok())
+            .map(|c| c.servers)
+            .unwrap_or_default()
+    }
+
     /// The `[[retrieval]]` backends as a `[[backend]]`-shaped TOML string
     /// (for `hotl_retrieval::config::RetrievalConfig`), or `None`.
     pub fn retrieval_toml(&self) -> Option<String> {
@@ -775,8 +786,20 @@ mod tests {
             cfg.mcp_toml().unwrap().contains("[[server]]")
                 && cfg.mcp_toml().unwrap().contains("docs")
         );
+        // The parsed form the registry and `hotl mcp` share.
+        let servers = cfg.mcp_servers();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "docs");
+        assert_eq!(servers[0].command, "/bin/docs");
         let hooks = cfg.hooks_toml().unwrap();
         assert!(hooks.contains("pre_tool") && hooks.contains("cargo check"));
+    }
+
+    #[test]
+    fn mcp_servers_is_empty_without_a_section() {
+        assert!(cfg_with("[provider]\nmodel = \"x\"\n")
+            .mcp_servers()
+            .is_empty());
     }
 
     #[test]
