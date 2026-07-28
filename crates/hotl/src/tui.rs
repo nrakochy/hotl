@@ -356,9 +356,9 @@ fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload
             text = text.replace(&img.marker, &note);
             continue;
         }
-        // INVARIANT: `total` never exceeds `MAX_PROMPT_DECODED_BYTES`, so this
-        // subtraction cannot underflow. Enforced by
-        // load_image_reports_the_remaining_prompt_budget_when_that_is_the_binding_cap.
+        // Cannot underflow: `total` grows only by `decoded`, which is bounded
+        // by `cap = min(MAX_IMAGE_DECODED_BYTES, remaining) <= remaining`, so
+        // `total` never exceeds `MAX_PROMPT_DECODED_BYTES`.
         let remaining = crate::images::MAX_PROMPT_DECODED_BYTES - total;
         let cap = (crate::images::MAX_IMAGE_DECODED_BYTES).min(remaining);
         match load_image(&img.path, cap as u64) {
@@ -796,16 +796,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("big.png");
         std::fs::write(&img, vec![0u8; 64]).unwrap();
-        let err = super::load_image(&img.display().to_string(), 16).unwrap_err();
-        assert!(err.contains("per-prompt image budget"), "{err}");
-    }
-
-    #[test]
-    fn load_image_reports_the_remaining_prompt_budget_when_that_is_the_binding_cap() {
-        let dir = tempfile::tempdir().unwrap();
-        let img = dir.path().join("shot.png");
-        std::fs::write(&img, vec![0u8; 64]).unwrap();
-        // A cap below the per-image ceiling can only be the per-prompt remainder.
         let err = super::load_image(&img.display().to_string(), 16).unwrap_err();
         assert!(err.contains("per-prompt image budget"), "{err}");
     }
