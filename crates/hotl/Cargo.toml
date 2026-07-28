@@ -53,6 +53,9 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 anyhow = { workspace = true }
 reqwest = { workspace = true }
+sha2 = { workspace = true }
+flate2 = { workspace = true }
+tar = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,4 +1,4 @@
-//! First-run wizard (`hotl setup`) and update check (`hotl update`) — MD.
+//! First-run wizard (`hotl setup`) — MD. Self-update lives in `update.rs`.
 //!
 //! `setup` writes the default config the "defaults are the safety design"
 //! belief depends on, but **never silently**: it's an explicit subcommand and
@@ -82,6 +82,11 @@ mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.
 # Prune old sessions/shadows/blobs (run `hotl gc`, or auto at startup once set).
 # max_age_days = 30
 # max_sessions = 200
+
+[update]
+# hotl checks for releases only when you run `hotl update`, never on its own.
+# Reserved for a passive check; not implemented, and will default off.
+# check = false
 
 [history]
 # Console prompt recall (Up/Down, Ctrl-R search), persisted across sessions.
@@ -218,24 +223,6 @@ pub fn expand_file_refs(text: &str) -> String {
     out
 }
 
-/// Compare two `x.y.z` versions: is `latest` newer than `current`?
-/// Non-numeric/short versions compare by the parts that parse (missing = 0).
-pub fn is_newer(current: &str, latest: &str) -> bool {
-    parts(latest) > parts(current)
-}
-
-fn parts(v: &str) -> (u64, u64, u64) {
-    let v = v.trim_start_matches('v');
-    let mut it = v
-        .split(['.', '-', '+'])
-        .map(|p| p.parse::<u64>().unwrap_or(0));
-    (
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-        it.next().unwrap_or(0),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,12 +272,5 @@ mod tests {
         assert_eq!(expand_file_refs("oops @[unclosed"), "oops @[unclosed");
     }
 
-    #[test]
-    fn version_ordering() {
-        assert!(is_newer("0.1.2", "0.2.0"));
-        assert!(is_newer("0.1.2", "0.1.3"));
-        assert!(is_newer("v0.1.2", "v1.0.0"));
-        assert!(!is_newer("0.2.0", "0.1.9"));
-        assert!(!is_newer("0.1.2", "0.1.2"));
-    }
+    // Version comparison moved to `update.rs` with its only caller.
 }

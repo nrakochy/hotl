@@ -14,7 +14,7 @@
 //!   serve         (internal) host a session on a unix socket — used by `bg`
 //!   setup         write default config (safe defaults; never silent) (MD)
 //!   gc            prune old sessions/shadows/blobs per [retention] (retention)
-//!   update        show version + how to update (MD)
+//!   update        install the latest release (or report one, with --check)
 
 mod acp;
 mod agent;
@@ -40,6 +40,7 @@ mod spawn;
 mod structured;
 mod term;
 mod tui;
+mod update;
 mod watch;
 mod wire;
 
@@ -101,7 +102,7 @@ fn main() {
         }
         Some("gc") => std::process::exit(gc::gc_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
-        Some("update") => std::process::exit(update_main(args.get(1).map(String::as_str))),
+        Some("update") => std::process::exit(block_on(update::update_main(&args, &version_line()))),
         Some("init") => {
             // Binary-generated shell integration (the `:` prefix).
             match args.get(1).map(String::as_str) {
@@ -146,6 +147,7 @@ fn print_help() {
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
+         hotl update          install the latest release (--check to only look)\n  \
          hotl resume [arg]    same as -r\n  \
          hotl undo            restore files to before the agent's last change\n  \
          hotl fleet           reserved (orchestrate)\n  \
@@ -175,25 +177,6 @@ fn version_line() -> String {
 /// source tag, and `--version` is what a user tries first.
 fn print_version() {
     println!("{}", version_line());
-}
-
-/// `hotl update`: report the current version, compare against `latest` if the
-/// caller supplied one, and point at the update path.
-fn update_main(latest: Option<&str>) -> i32 {
-    let current = env!("CARGO_PKG_VERSION");
-    println!("{}", version_line());
-    if let Some(latest) = latest {
-        if setup::is_newer(current, latest) {
-            println!("a newer version is available: {latest}");
-        } else {
-            println!("up to date (latest: {latest}).");
-        }
-    }
-    println!(
-        "to update: `cargo install --locked hotl`, or re-run the installer script.\n\
-         (automated self-update is not wired yet — it needs a signed release feed; MD.)"
-    );
-    0
 }
 
 /// The optional opening prompt for `hotl bg`: the first non-flag arg that is
