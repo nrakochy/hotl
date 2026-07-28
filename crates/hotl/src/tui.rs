@@ -337,11 +337,14 @@ async fn run_loop(
 /// A failed or over-cap read degrades exactly like `expand_file_refs`: the
 /// `[Image #N]` token is annotated in place in the text and the entry
 /// dropped — never a hard error. The caps are the server's own
-/// (`crate::images`), so a well-behaved client never sends what the server
-/// would reject.
+/// (`crate::images`) — count (`MAX_IMAGES_PER_PROMPT`), per-image
+/// (`MAX_IMAGE_DECODED_BYTES`), and per-prompt total
+/// (`MAX_PROMPT_DECODED_BYTES`) — so a well-behaved client never sends what
+/// the server would reject.
 fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload {
     let mut text = crate::setup::expand_file_refs(&p.text);
     let mut images = Vec::new();
+    let mut total = 0usize;
     for img in p.images {
         if images.len() >= crate::images::MAX_IMAGES_PER_PROMPT {
             let note = format!(
@@ -353,11 +356,19 @@ fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload
             text = text.replace(&img.marker, &note);
             continue;
         }
-        match load_image(&img.path, crate::images::MAX_IMAGE_DECODED_BYTES as u64) {
-            Ok(data) => images.push(hotl_tui::paste::ImageAttachment {
-                data: Some(data),
-                ..img
-            }),
+        // INVARIANT: `total` never exceeds `MAX_PROMPT_DECODED_BYTES`, so this
+        // subtraction cannot underflow. Enforced by
+        // load_image_reports_the_remaining_prompt_budget_when_that_is_the_binding_cap.
+        let remaining = crate::images::MAX_PROMPT_DECODED_BYTES - total;
+        let cap = (crate::images::MAX_IMAGE_DECODED_BYTES).min(remaining);
+        match load_image(&img.path, cap as u64) {
+            Ok((data, decoded)) => {
+                total += decoded;
+                images.push(hotl_tui::paste::ImageAttachment {
+                    data: Some(data),
+                    ..img
+                });
+            }
             Err(why) => {
                 let note = format!(
                     "{} (image {} could not be attached: {why})",
@@ -375,7 +386,7 @@ fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptPayload
 /// hand us the path exactly as dropped. Blocking on the loop thread is
 /// accepted precedent at this seam: `history.append` already does blocking
 /// fs here, and `$EDITOR` suspends the loop outright.
-fn load_image(path: &str, cap: u64) -> Result<String, String> {
+fn load_image(path: &str, cap: u64) -> Result<(String, usize), String> {
     let expanded = match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
             Some(home) => std::path::PathBuf::from(home).join(rest),
@@ -385,14 +396,26 @@ fn load_image(path: &str, cap: u64) -> Result<String, String> {
     };
     let meta = std::fs::metadata(&expanded).map_err(|e| e.to_string())?;
     if meta.len() > cap {
-        return Err(format!(
-            "{:.1}MB exceeds the {}MB per-image cap",
-            meta.len() as f64 / (1024.0 * 1024.0),
-            cap / (1024 * 1024)
-        ));
+        return Err(if cap < crate::images::MAX_IMAGE_DECODED_BYTES as u64 {
+            format!(
+                "only {:.1}MB of the per-prompt image budget is left",
+                cap as f64 / (1024.0 * 1024.0)
+            )
+        } else {
+            format!(
+                "{:.1}MB exceeds the {}MB per-image cap",
+                meta.len() as f64 / (1024.0 * 1024.0),
+                cap / (1024 * 1024)
+            )
+        });
+    }
+    if meta.len() == 0 {
+        // The server's `decoded_len` rejects "" and takes the whole prompt
+        // with it; refusing here degrades one attachment instead.
+        return Err("is empty".into());
     }
     let bytes = std::fs::read(&expanded).map_err(|e| e.to_string())?;
-    Ok(hotl_tools::b64::encode(&bytes))
+    Ok((hotl_tools::b64::encode(&bytes), bytes.len()))
 }
 
 /// Put a screen region on the clipboard; returns the lines actually copied.
@@ -769,12 +792,36 @@ mod tests {
     }
 
     #[test]
-    fn load_image_refuses_an_over_cap_file_without_reading_it() {
+    fn load_image_refuses_an_over_budget_file_without_reading_it() {
         let dir = tempfile::tempdir().unwrap();
         let img = dir.path().join("big.png");
         std::fs::write(&img, vec![0u8; 64]).unwrap();
         let err = super::load_image(&img.display().to_string(), 16).unwrap_err();
-        assert!(err.contains("per-image cap"), "{err}");
+        assert!(err.contains("per-prompt image budget"), "{err}");
+    }
+
+    #[test]
+    fn load_image_reports_the_remaining_prompt_budget_when_that_is_the_binding_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("shot.png");
+        std::fs::write(&img, vec![0u8; 64]).unwrap();
+        // A cap below the per-image ceiling can only be the per-prompt remainder.
+        let err = super::load_image(&img.display().to_string(), 16).unwrap_err();
+        assert!(err.contains("per-prompt image budget"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_byte_file_is_refused_before_it_reaches_the_wire() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("empty.png");
+        std::fs::write(&img, b"").unwrap();
+        let att = attachment("[Image #1]", &img.display().to_string());
+        let out = super::outbound(payload("see [Image #1]", vec![att]));
+        // The server's `decoded_len` rejects "" and takes the whole prompt with
+        // it; refusing here degrades one attachment instead.
+        assert!(out.images.is_empty());
+        assert!(out.text.contains("[Image #1] (image"), "{}", out.text);
+        assert!(out.text.contains("is empty"), "{}", out.text);
     }
 
     #[test]
