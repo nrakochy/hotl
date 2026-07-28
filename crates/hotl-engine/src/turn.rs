@@ -39,6 +39,17 @@ const SPECULATE_TRIGGER: f64 = 0.6;
 /// `interrupt_lands_during_the_speculative_summarize` (the cancel race).
 const SPECULATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Whether a projection must fold before it can be sampled. Two independent
+/// pressures: tokens, and the image bytes the token estimate deliberately
+/// under-charges at a flat 1600 each. Pure so both are testable without a
+/// session behind them.
+/// INVARIANT: image bytes cannot grow the request without bound. Enforced by
+/// `image_bytes_past_the_budget_force_a_fold_at_a_trivial_token_estimate`.
+fn must_compact(estimate: u64, window: u64, image_bytes: usize) -> bool {
+    estimate > (window as f64 * COMPACT_TRIGGER) as u64
+        || image_bytes > hotl_types::IMAGE_B64_BUDGET
+}
+
 /// Shared per-prompt budget for "intercept the end-turn, inject a reminder,
 /// continue" gates (index E4): the TodoGate and the `Stop` hook veto
 /// (`Turn::consult_stop`) both draw from this same counter (see
@@ -402,7 +413,7 @@ fn spawn_speculation(
     cancel: &CancellationToken,
 ) -> Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>> {
     let tail_budget = (shared.config.context_window as f64 * crate::actor::TAIL_RATIO) as u64;
-    let plan = hotl_context::compaction::plan(snapshot, tail_budget)?;
+    let plan = hotl_context::compaction::plan(snapshot, tail_budget, hotl_types::IMAGE_B64_BUDGET)?;
     let shared = Arc::clone(shared);
     let snapshot = Arc::clone(snapshot);
     let cancel = cancel.clone();
@@ -1522,7 +1533,11 @@ impl Turn {
     ) -> Result<SamplingRequest, SampleEnd> {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
-        if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
+        if must_compact(
+            estimate,
+            window,
+            hotl_context::tokens::image_b64_bytes(&snapshot.durable),
+        ) {
             return Err(SampleEnd::ContextFull);
         }
         self.maybe_speculate_digest(snapshot, estimate);
@@ -1561,7 +1576,11 @@ impl Turn {
     fn speculative_request(&self, snapshot: &crate::actor::Snapshot) -> Option<SamplingRequest> {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
-        if estimate > (window as f64 * COMPACT_TRIGGER) as u64 {
+        if must_compact(
+            estimate,
+            window,
+            hotl_context::tokens::image_b64_bytes(&snapshot.durable),
+        ) {
             return None;
         }
         Some(self.compose_request(snapshot, estimate, self.samples + 1))
@@ -2877,5 +2896,25 @@ mod tests {
             Commit::Committed,
         );
         assert!(matches!(end, TurnEnd::Outcome(Outcome::Done { .. })));
+    }
+
+    #[test]
+    fn image_bytes_past_the_budget_force_a_fold_at_a_trivial_token_estimate() {
+        let window = 200_000;
+        // Tokens nowhere near the trigger, bytes over budget: only the byte guard
+        // can catch this, and it is the case that bricks a session.
+        assert!(must_compact(1, window, hotl_types::IMAGE_B64_BUDGET + 1));
+        assert!(!must_compact(1, window, hotl_types::IMAGE_B64_BUDGET));
+        // The token trigger is unchanged.
+        assert!(must_compact(
+            (window as f64 * COMPACT_TRIGGER) as u64 + 1,
+            window,
+            0
+        ));
+        assert!(!must_compact(
+            (window as f64 * COMPACT_TRIGGER) as u64,
+            window,
+            0
+        ));
     }
 }

@@ -1625,7 +1625,8 @@ async fn compact(
         }
     }
     let tail_budget = (shared.config.context_window as f64 * TAIL_RATIO) as u64;
-    let Some(plan) = compaction::plan(head.items(), tail_budget) else {
+    let Some(plan) = compaction::plan(head.items(), tail_budget, hotl_types::IMAGE_B64_BUDGET)
+    else {
         return Err("context window exhausted — nothing left to compact".into());
     };
     // Reset mode (#9): fold *everything* after the preserved prefix into the

@@ -20,11 +20,15 @@ pub struct Plan {
 }
 
 /// Choose what to fold. Picks the earliest clean boundary whose tail fits
-/// `tail_budget` tokens (keeping the most verbatim history that fits); if no
-/// tail fits, keeps the minimal clean tail and folds everything else.
-/// `None` means nothing can fold — the caller must surface context exhaustion
-/// rather than loop.
-pub fn plan(items: &[Item], tail_budget: u64) -> Option<Plan> {
+/// BOTH `tail_budget` tokens and `image_budget` base64 image bytes (keeping
+/// the most verbatim history that fits); if no tail fits, keeps the minimal
+/// clean tail and folds everything else. `None` means nothing can fold — the
+/// caller must surface context exhaustion rather than loop.
+pub fn plan(items: &[Item], tail_budget: u64, image_budget: usize) -> Option<Plan> {
+    let fits = |b: usize| {
+        estimate_items(&items[b..]) <= tail_budget
+            && crate::tokens::image_b64_bytes(&items[b..]) <= image_budget
+    };
     let prefix_end = preserved_prefix_len(items);
     let boundaries: Vec<usize> = (prefix_end + 1..items.len())
         .filter(|&i| matches!(items[i], Item::User { .. } | Item::Assistant { .. }))
@@ -33,7 +37,7 @@ pub fn plan(items: &[Item], tail_budget: u64) -> Option<Plan> {
     let latest = *boundaries.last()?;
     let mut chosen = latest;
     for &b in boundaries.iter().rev() {
-        if estimate_items(&items[b..]) <= tail_budget {
+        if fits(b) {
             chosen = b;
         } else if chosen != latest || b != latest {
             break;
@@ -233,7 +237,7 @@ mod tests {
             results(&"x".repeat(3000)),
             assistant("done"),
         ];
-        let plan = plan(&items, 10).expect("plan");
+        let plan = plan(&items, 10, usize::MAX).expect("plan");
         assert_ne!(plan.kept_from, 2, "that cut orphans the results");
         let tail = &items[plan.kept_from..];
         assert!(
@@ -253,7 +257,7 @@ mod tests {
         ];
         // Tiny budget: even the minimal tail exceeds it — the plan must still
         // pick a clean boundary (the last assistant), never the results item.
-        let plan = plan(&items, 10).expect("plan");
+        let plan = plan(&items, 10, usize::MAX).expect("plan");
         assert_eq!(plan.kept_from, 3);
         assert!(matches!(items[plan.kept_from], Item::Assistant { .. }));
     }
@@ -261,7 +265,7 @@ mod tests {
     #[test]
     fn generous_budget_keeps_more_history() {
         let items = vec![user("a"), assistant("b"), user("c"), assistant("d")];
-        let plan = plan(&items, 10_000).expect("plan");
+        let plan = plan(&items, 10_000, usize::MAX).expect("plan");
         // Everything after the first foldable position fits: keep from index 1.
         assert_eq!(plan.kept_from, 1);
     }
@@ -277,7 +281,7 @@ mod tests {
             user("only prompt"),
         ];
         // Only boundary candidates strictly after the prompt exist — none do.
-        assert_eq!(plan(&items, 10), None);
+        assert_eq!(plan(&items, 10, usize::MAX), None);
 
         let with_history = {
             let mut v = items.clone();
@@ -286,7 +290,7 @@ mod tests {
             v.push(assistant("done"));
             v
         };
-        let p = plan(&with_history, 10).expect("plan");
+        let p = plan(&with_history, 10, usize::MAX).expect("plan");
         assert_eq!(p.prefix_end, 1, "instructions stay out of the fold");
         let digest = [digest_item("GOAL: test")];
         let applied = apply(&with_history, &p, &digest);
@@ -304,6 +308,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn the_plan_folds_past_an_over_budget_image_tail_even_when_tokens_fit() {
+        // Three user turns, each carrying an image; tokens are trivial, so only
+        // the byte budget can move `kept_from`.
+        let img = |n: &str| hotl_types::UserImage {
+            media_type: "image/png".into(),
+            data: n.repeat(4).into(),
+        };
+        let items = vec![
+            Item::System { text: "sys".into() },
+            Item::User {
+                text: "a".into(),
+                synthetic: None,
+                images: vec![img("A")],
+            },
+            Item::User {
+                text: "b".into(),
+                synthetic: None,
+                images: vec![img("B")],
+            },
+            Item::User {
+                text: "c".into(),
+                synthetic: None,
+                images: vec![img("C")],
+            },
+        ];
+        // A budget that admits one image but not two.
+        let p = plan(&items, u64::MAX, 4).expect("a boundary exists");
+        assert_eq!(p.kept_from, 3, "the tail must shrink to the last image");
+        // With room for everything, the tail stays as wide as the tokens allow.
+        let p = plan(&items, u64::MAX, usize::MAX).expect("a boundary exists");
+        assert_eq!(p.kept_from, 2);
     }
 
     #[test]

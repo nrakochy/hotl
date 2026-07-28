@@ -22,9 +22,7 @@ pub const MAX_IMAGES_PER_PROMPT: usize = 8;
 /// client-side (`tui.rs`), so a well-behaved client never trips this.
 pub const MAX_IMAGE_DECODED_BYTES: usize = 5 * 1024 * 1024;
 
-/// Per-prompt ceiling on total decoded bytes: headroom under the ~32MB
-/// request cap once history and tool schemas ride along.
-pub const MAX_PROMPT_DECODED_BYTES: usize = 16 * 1024 * 1024;
+pub use hotl_types::MAX_PROMPT_DECODED_BYTES;
 
 const MEDIA_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 

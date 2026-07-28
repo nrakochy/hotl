@@ -112,6 +112,18 @@ pub fn estimate_item(item: &Item) -> u64 {
 /// compaction threshold.
 pub const IMAGE_TOKENS_ESTIMATE: u64 = 1600;
 
+/// Base64 image bytes in a projection. The estimator charges images a flat
+/// token price on purpose, so bytes need their own accounting — this is it.
+pub fn image_b64_bytes(items: &[Item]) -> usize {
+    items
+        .iter()
+        .map(|i| match i {
+            Item::User { images, .. } => images.iter().map(|im| im.data.len()).sum(),
+            _ => 0,
+        })
+        .sum()
+}
+
 pub fn estimate_item_with(item: &Item, profile: &TokenProfile) -> u64 {
     let body = match item {
         Item::System { text } => estimate_text_with(text, profile),
@@ -312,5 +324,28 @@ mod tests {
         assert!(TokenProfile::from_chars_per_token(0.0).ascii_chars_per_token >= 1.0);
         assert!(TokenProfile::from_chars_per_token(-3.0).ascii_chars_per_token >= 1.0);
         assert!(estimate_text_with("abc", &TokenProfile::from_chars_per_token(0.0)) > 0);
+    }
+
+    #[test]
+    fn image_bytes_counts_base64_payloads_and_ignores_everything_else() {
+        let items = vec![
+            Item::System { text: "sys".into() },
+            Item::User {
+                text: "look".into(),
+                synthetic: None,
+                images: vec![
+                    hotl_types::UserImage {
+                        media_type: "image/png".into(),
+                        data: "AAAA".into(),
+                    },
+                    hotl_types::UserImage {
+                        media_type: "image/png".into(),
+                        data: "BBBBBBBB".into(),
+                    },
+                ],
+            },
+        ];
+        assert_eq!(image_b64_bytes(&items), 12);
+        assert_eq!(image_b64_bytes(&items[..1]), 0);
     }
 }

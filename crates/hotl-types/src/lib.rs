@@ -96,6 +96,17 @@ pub struct UserImage {
     pub data: Arc<str>,
 }
 
+/// Per-prompt ceiling on total DECODED image bytes.
+pub const MAX_PROMPT_DECODED_BYTES: usize = 16 * 1024 * 1024;
+
+/// Ceiling on base64 image bytes alive in one request. Images are the only
+/// payload the token estimator deliberately under-charges (a flat 1600 each),
+/// so they get their own budget; crossing it forces the fold the token
+/// estimate alone would never trigger. 24MB of base64 (≈18MB decoded) leaves
+/// ~8MB for system, history text and tool schemas under the ~32MB request cap
+/// `MAX_PROMPT_DECODED_BYTES` already reasons about.
+pub const IMAGE_B64_BUDGET: usize = 24 * 1024 * 1024;
+
 /// A session checklist item (`todo_write`, M4/tier-1 gap #3). Full-state
 /// replace: the model rewrites the whole list each call, so there is no
 /// separate id/patch shape to reconcile.
@@ -748,6 +759,18 @@ mod tests {
         assert_eq!(usage.cache_creation_5m_input_tokens, 0);
         assert_eq!(usage.cache_creation_1h_input_tokens, 0);
         assert_eq!(usage.cache_creation_input_tokens, 4);
+    }
+
+    #[test]
+    fn one_maximal_prompt_always_fits_the_window_image_budget() {
+        // INVARIANT: the minimal compaction tail — one prompt's images — always
+        // fits IMAGE_B64_BUDGET, so a byte-triggered fold can never loop.
+        // Enforced by `one_maximal_prompt_always_fits_the_window_image_budget`.
+        let worst_case_b64 = MAX_PROMPT_DECODED_BYTES.div_ceil(3) * 4;
+        assert!(
+            worst_case_b64 <= IMAGE_B64_BUDGET,
+            "{worst_case_b64} > {IMAGE_B64_BUDGET}"
+        );
     }
 
     #[test]
