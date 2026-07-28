@@ -240,6 +240,37 @@ pub fn token_suffix_chars(s: &str) -> Option<usize> {
     (start + len == s.len()).then(|| s[start..].chars().count())
 }
 
+/// The marker strings the side table currently backs, in draft order. The
+/// backspace arm needs them: the grammar alone cannot tell a live token from
+/// prose that happens to end like one.
+pub fn live_tokens(attachments: &[Attachment]) -> Vec<String> {
+    let (mut img_n, mut paste_n) = (0usize, 0usize);
+    attachments
+        .iter()
+        .map(|att| match att {
+            Attachment::Image { .. } => {
+                img_n += 1;
+                image_marker(img_n)
+            }
+            Attachment::Paste { lines, .. } => {
+                paste_n += 1;
+                paste_marker(paste_n, *lines)
+            }
+        })
+        .collect()
+}
+
+/// `token_suffix_chars`, restricted to tokens a live attachment backs.
+pub fn token_suffix_chars_in(s: &str, live: &[String]) -> Option<usize> {
+    let start = s.rfind('[')?;
+    let tok = &s[start..];
+    let len = token_len_at(tok)?;
+    if start + len != s.len() || !live.iter().any(|m| m == tok) {
+        return None;
+    }
+    Some(tok.chars().count())
+}
+
 /// Token length in bytes when `s` begins with a well-formed token.
 fn token_len_at(s: &str) -> Option<usize> {
     fn digits(s: &str) -> Option<usize> {
@@ -589,5 +620,23 @@ mod tests {
         assert_eq!(token_suffix_chars("say [Image #12] "), None);
         assert_eq!(token_suffix_chars("say [Image #]"), None);
         assert_eq!(token_suffix_chars("say Image #12]"), None);
+    }
+
+    #[test]
+    fn a_token_with_no_attachment_behind_it_is_not_a_token_to_swallow() {
+        let live = live_tokens(&[Attachment::Image {
+            path: "/a/b.png".into(),
+            media_type: "image/png".into(),
+        }]);
+        assert_eq!(live, vec!["[Image #1]".to_string()]);
+        assert_eq!(token_suffix_chars_in("look at [Image #1]", &live), Some(10));
+        assert_eq!(
+            token_suffix_chars_in("why does it render [Image #2]", &live),
+            None
+        );
+        assert_eq!(
+            token_suffix_chars_in("why does it render [Image #1]", &[]),
+            None
+        );
     }
 }

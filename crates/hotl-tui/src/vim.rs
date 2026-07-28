@@ -65,6 +65,10 @@ pub struct Editor {
     prefix: String,
     /// `Ctrl-R` reverse-i-search state, when active.
     search: Option<Search>,
+    /// The tokens the draft's side table currently backs, synced in from
+    /// `State.attachments` by the app. Empty by default, so a token-shaped
+    /// prefix backs nothing until the app says otherwise.
+    live_tokens: Vec<String>,
 }
 
 impl Editor {
@@ -83,6 +87,7 @@ impl Editor {
             draft: None,
             prefix: String::new(),
             search: None,
+            live_tokens: Vec::new(),
         }
     }
 
@@ -100,6 +105,12 @@ impl Editor {
         self.vim = vim;
         self.mode = Mode::Insert;
         self.pending = Pending::default();
+    }
+
+    /// The tokens the draft's side table currently backs. The app syncs this
+    /// whenever `State.attachments` changes; the editor never derives it.
+    pub fn set_live_tokens(&mut self, tokens: Vec<String>) {
+        self.live_tokens = tokens;
     }
 
     /// The active `Ctrl-R` search as `(query, matched_entry)` for rendering,
@@ -270,12 +281,17 @@ impl Editor {
                     // A full paste/image token right before the cursor
                     // deletes as one unit — its content lives in a side
                     // table, so char-by-char deletion of the token text is
-                    // never what the human means. Backspacing *inside* a
-                    // token stays per-char: mangling is the documented
-                    // escape hatch (the orphaned entry drops at submit).
-                    // Normal-mode `x`/`dw` keep character semantics.
+                    // never what the human means. Conditional on a live
+                    // attachment backing it: prose that merely matches the
+                    // grammar (`live_tokens` doesn't list it) deletes one
+                    // char like anything else. Backspacing *inside* a token
+                    // stays per-char: mangling is the documented escape
+                    // hatch (the orphaned entry drops at submit). Normal-mode
+                    // `x`/`dw` keep character semantics.
                     let prefix = char_slice(&self.lines[row], 0, col);
-                    if let Some(len) = crate::paste::token_suffix_chars(&prefix) {
+                    if let Some(len) =
+                        crate::paste::token_suffix_chars_in(&prefix, &self.live_tokens)
+                    {
                         char_remove_range(&mut self.lines[row], col - len, col);
                         self.cursor.1 = col - len;
                         return EditorEvent::None;
@@ -802,12 +818,14 @@ mod tests {
     #[test]
     fn backspace_after_a_token_swallows_it_whole() {
         let mut e = Editor::new(false);
+        e.set_live_tokens(vec!["[Image #1]".into()]);
         e.set_text("say [Image #1]");
         e.handle(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(e.text(), "say ");
         assert_eq!(e.cursor(), (0, 4));
 
         let mut e = Editor::new(false);
+        e.set_live_tokens(vec!["[Pasted text #2 +10 lines]".into()]);
         e.set_text("[Pasted text #2 +10 lines]");
         e.handle(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(e.text(), "");
@@ -820,6 +838,24 @@ mod tests {
         e.cursor_to((0, 9)); // just before the closing bracket
         e.handle(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
         assert_eq!(e.text(), "[Image #]");
+    }
+
+    #[test]
+    fn backspace_deletes_one_char_when_no_attachment_backs_the_token() {
+        let mut e = Editor::new(false);
+        e.set_live_tokens(Vec::new());
+        e.insert_text("why does it render [Image #1]");
+        keys(&mut e, "<bs>");
+        assert_eq!(e.text(), "why does it render [Image #1");
+    }
+
+    #[test]
+    fn backspace_still_swallows_a_token_the_side_table_backs() {
+        let mut e = Editor::new(false);
+        e.set_live_tokens(vec!["[Image #1]".into()]);
+        e.insert_text("look at [Image #1]");
+        keys(&mut e, "<bs>");
+        assert_eq!(e.text(), "look at ");
     }
 
     #[test]
