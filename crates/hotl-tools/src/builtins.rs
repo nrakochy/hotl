@@ -935,8 +935,10 @@ async fn grep_search(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .process_group(0);
+        .kill_on_drop(true);
+    // Own session + process group (pgid == pid): detaches the controlling
+    // terminal (Vuln 2) and keeps kill_group's kill(-pid) reaping the group.
+    sandbox::detach_session(&mut cmd);
     let child = cmd.spawn().map_err(|e| {
         ToolOutcome::err(format!(
             "Could not run ripgrep: {e}. Is `rg` installed? Fall back to `bash` with grep/find."
@@ -979,6 +981,101 @@ async fn grep_search(
 
 pub struct BashTool;
 
+/// The `>`/`>>` redirect targets in a command line, quote-aware. Skips fd
+/// duplications (`2>&1`, `>&2`), which name a descriptor, not a file.
+fn redirect_targets(cmd: &str) -> Vec<String> {
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut targets = Vec::new();
+    let mut i = 0;
+    let mut quote: Option<char> = None;
+    while i < chars.len() {
+        let c = chars[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '\'' | '"' => {
+                quote = Some(c);
+                i += 1;
+            }
+            '>' => {
+                i += 1;
+                if i < chars.len() && chars[i] == '>' {
+                    i += 1; // `>>`
+                }
+                while i < chars.len() && chars[i].is_whitespace() {
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == '&' {
+                    continue; // `>&fd` / `2>&1` — no file named
+                }
+                let mut t = String::new();
+                let mut tq: Option<char> = None;
+                while i < chars.len() {
+                    let ch = chars[i];
+                    match tq {
+                        Some(q) if ch == q => tq = None,
+                        Some(_) => t.push(ch),
+                        None if ch == '\'' || ch == '"' => tq = Some(ch),
+                        None if ch.is_whitespace()
+                            || matches!(ch, '|' | ';' | '&' | '<' | '>' | '(' | ')') =>
+                        {
+                            break
+                        }
+                        None => t.push(ch),
+                    }
+                    i += 1;
+                }
+                if !t.is_empty() {
+                    targets.push(t);
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    targets
+}
+
+/// The paths a bash command *writes*: `>`/`>>` redirect targets plus the file
+/// arguments of the common file-writing commands (`tee`, `dd of=`). bash is not
+/// fully statically analyzable; on macOS the kernel floor denies a protected
+/// write regardless, so a miss here degrades to that backstop, not to a silent
+/// write. Linux carries only this check until the deferred Landlock work lands.
+fn bash_write_targets(cmd: &str) -> Vec<String> {
+    let mut targets = redirect_targets(cmd);
+    for seg in crate::rules::shell_segments(cmd) {
+        let toks: Vec<String> = crate::rules::tokenize(seg)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let Some(first) = toks.first() else { continue };
+        match first.rsplit('/').next().unwrap_or(first) {
+            "tee" => targets.extend(toks[1..].iter().filter(|t| !t.starts_with('-')).cloned()),
+            "dd" => targets.extend(
+                toks[1..]
+                    .iter()
+                    .filter_map(|t| t.strip_prefix("of=").map(str::to_string)),
+            ),
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// The execute-later reason if any path this bash command *writes* is protected
+/// (Vuln 4). Reads are deliberately not escalated — the floor is about writes,
+/// so ordinary work stays out of the way.
+fn bash_protected_write_reason(cmd: &str) -> Option<&'static str> {
+    bash_write_targets(cmd).into_iter().find_map(|t| {
+        let normalized: std::path::PathBuf = std::path::Path::new(&t).components().collect();
+        execute_later_reason(&normalized.to_string_lossy())
+    })
+}
+
 impl Tool for BashTool {
     fn name(&self) -> &'static str {
         "bash"
@@ -1010,9 +1107,17 @@ impl Tool for BashTool {
             Some(net) => format!("{} {net}", sandbox_status().label()),
             None => sandbox_status().label(),
         };
-        Permission::Ask {
-            summary: format!("bash [{label}]: {short}"),
+        let summary = format!("bash [{label}]: {short}");
+        // Vuln 4: a bash command that writes an execute-later path escalates to
+        // the protected ask (which auto-mode cannot skip), just like the `write`
+        // tool. Reads stay an ordinary Ask, so normal work is unaffected.
+        if let Some(why) = bash_protected_write_reason(cmd) {
+            return Permission::AskProtected {
+                summary,
+                why: format!("bash writes a protected path — {why}"),
+            };
         }
+        Permission::Ask { summary }
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move { done(bash_impl(&input, cancel).await) })
@@ -1034,8 +1139,10 @@ async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
     cmd.stdin(std::process::Stdio::null())
         .stdout(child_out)
         .stderr(child_err)
-        .kill_on_drop(true)
-        .process_group(0);
+        .kill_on_drop(true);
+    // Own session + process group (pgid == pid): detaches the controlling
+    // terminal (Vuln 2) and keeps kill_group's kill(-pid) reaping the group.
+    sandbox::detach_session(&mut cmd);
     let child = cmd
         .spawn()
         .map_err(|e| ToolOutcome::err(format!("Could not start shell: {e}.")))?;
@@ -1463,6 +1570,42 @@ mod tests {
             file_permission("write", &json!({"path": "BUILD.RS"})),
             Permission::AskProtected { .. }
         ));
+    }
+
+    #[test]
+    fn bash_escalates_a_write_to_a_protected_path() {
+        // Vuln 4: bash writing an execute-later path must escalate to the
+        // protected ask (which auto-mode cannot skip), while ordinary commands
+        // — including *reading* a protected file — stay an ordinary Ask so the
+        // floor stays out of the way for normal work.
+        let protected = |cmd: &str| {
+            matches!(
+                BashTool.permission(&json!({ "command": cmd })),
+                Permission::AskProtected { .. }
+            )
+        };
+        assert!(protected("echo hi > .git/hooks/pre-commit"), "redirect");
+        assert!(protected("cat > Makefile"), "redirect to a basename");
+        assert!(
+            protected("echo x >> .github//workflows/ci.yml"),
+            "normalized"
+        );
+        assert!(protected("echo x | tee .git/hooks/pre-push"), "tee");
+        let ordinary = |cmd: &str| {
+            matches!(
+                BashTool.permission(&json!({ "command": cmd })),
+                Permission::Ask { .. }
+            )
+        };
+        assert!(ordinary("cargo test"), "unrelated command");
+        assert!(
+            ordinary("cat Makefile"),
+            "reading a protected file is not a write"
+        );
+        assert!(
+            ordinary("ls -la .github/workflows"),
+            "listing is not a write"
+        );
     }
 
     #[test]

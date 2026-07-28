@@ -699,7 +699,7 @@ const WRAPPER_DEPTH: usize = 2;
 /// Deliberately not quote-aware: splitting inside a quoted string only ever
 /// produces *more* segments to match against, which is the safe direction for
 /// the deny tier.
-fn shell_segments(cmd: &str) -> Vec<&str> {
+pub(crate) fn shell_segments(cmd: &str) -> Vec<&str> {
     cmd.split(|c| {
         matches!(
             c,
@@ -714,7 +714,7 @@ fn shell_segments(cmd: &str) -> Vec<&str> {
 /// Quote-aware whitespace tokenizer. Returns tokens with one level of quoting
 /// removed, plus whether each token was quoted (a quoted argument to a wrapper
 /// is the nested command).
-fn tokenize(seg: &str) -> Vec<(String, bool)> {
+pub(crate) fn tokenize(seg: &str) -> Vec<(String, bool)> {
     let (mut out, mut cur, mut quote, mut quoted) = (Vec::new(), String::new(), None, false);
     for ch in seg.chars() {
         match (quote, ch) {

@@ -94,8 +94,10 @@ impl Diagnostics {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
-            .process_group(0);
+            .kill_on_drop(true);
+        // Own session + process group (pgid == pid): detaches the controlling
+        // terminal (Vuln 2), preserving the kill(-pid) group reap.
+        sandbox::detach_session(&mut cmd);
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Outcome::Failed(e.to_string()),

@@ -411,6 +411,25 @@ pub fn build_command(
     apply_child_env(cmd, egress)
 }
 
+/// Put a spawned tool child in its own session (Vuln 2): with no controlling
+/// terminal it cannot `ioctl(TIOCSTI)` keystrokes into hotl's approval prompt
+/// or paint spoofed UI onto `/dev/tty`. `setsid` also makes the child a
+/// process-group leader with pgid == pid, preserving the `kill(-pid)` group
+/// reap that `.process_group(0)` used to provide (see `builtins::kill_group`).
+/// Stacks after any Landlock `pre_exec` already installed by the builders.
+pub fn detach_session(cmd: &mut tokio::process::Command) {
+    // SAFETY: `setsid` is async-signal-safe and touches no shared state; it is
+    // the only work done between fork and exec here.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
 /// Build a direct `program arg...` invocation (no shell) under the active
 /// floor and the resolved egress state — the argv-safe sibling of
 /// `build_command`, for callers (like `grep`) that must never splice a
@@ -553,6 +572,23 @@ fn apply_proxy_env(
 /// The extras ride `-D EXTRA_i=` parameters like CWD/TMP do — a literal path
 /// spliced into the profile text would need Seatbelt-string escaping and is a
 /// quoting hazard; a parameter is opaque to the profile language.
+/// Directories under the workspace whose writes are execute-later hazards the
+/// bash sandbox denies at the kernel (Vuln 4): git hooks (persistence), CI
+/// workflows (RCE with secrets on the next push), cargo config (rustc-wrapper /
+/// target runners), and the two agent-config dirs. Kept deliberately narrow —
+/// developer-facing generated files (Makefile, package.json, build.rs) and
+/// `.git/config` are *not* here, so ordinary build/git flows are never
+/// hard-denied; those rely on the permission-layer escalation
+/// (`bash_protected_write_reason`) and the deferred Linux work.
+#[cfg(target_os = "macos")]
+const PROTECTED_SUBPATHS: &[&str] = &[
+    ".git/hooks",
+    ".github/workflows",
+    ".cargo",
+    ".hotl",
+    ".claude",
+];
+
 #[cfg(target_os = "macos")]
 fn seatbelt_profile(
     confine_network: bool,
@@ -572,6 +608,15 @@ fn seatbelt_profile(
     );
     for i in 0..extra_count {
         profile.push_str(&format!("\n  (subpath (param \"EXTRA_{i}\"))"));
+    }
+    profile.push_str(")\n");
+    // Vuln 4: carve the execute-later dirs back out of the cwd write grant.
+    // Placed after the allow (SBPL is last-match-wins) and before any network
+    // clause, which is a different operation class. Each PROT_i is the absolute
+    // `<cwd>/<subpath>` passed as a `-D` param by `seatbelt_base_with`.
+    profile.push_str("(deny file-write*");
+    for i in 0..PROTECTED_SUBPATHS.len() {
+        profile.push_str(&format!("\n  (subpath (param \"PROT_{i}\"))"));
     }
     profile.push_str(")\n");
     if confine_network {
@@ -650,6 +695,13 @@ fn seatbelt_base_with(egress: &EgressState, extras: &[PathBuf]) -> tokio::proces
         .arg(format!("CWD={}", cwd.display()))
         .arg("-D")
         .arg(format!("TMP={}", tmp.display()));
+    // Vuln 4: the absolute execute-later dirs the profile denies write to. Byte-
+    // exact OsString concat so a non-UTF-8 cwd reaches sandbox-exec faithfully.
+    for (i, sub) in PROTECTED_SUBPATHS.iter().enumerate() {
+        let mut d = std::ffi::OsString::from(format!("PROT_{i}="));
+        d.push(cwd.join(sub).as_os_str());
+        cmd.arg("-D").arg(d);
+    }
     for (i, p) in extras.iter().enumerate() {
         // OsString concatenation, not format!: a non-UTF-8 path must reach
         // sandbox-exec byte-exact, never lossily rendered.
@@ -1082,6 +1134,86 @@ mod write_set_tests {
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn seatbelt_denies_protected_subpaths_under_cwd() {
+        // Vuln 4: a sandboxed bash cannot write the execute-later dirs even by
+        // an obscured path the static check missed, while ordinary in-cwd
+        // writes stay allowed. Driven against a tempdir CWD so no repo is
+        // touched and no process-global cwd is changed.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cwd = canon(dir.path().to_path_buf());
+        let profile = seatbelt_profile(false, unix_socket_policy(), automation_policy(), 0);
+        let run = |cmd: &str| {
+            let mut c = std::process::Command::new("/usr/bin/sandbox-exec");
+            // Run in the tempdir so the child's real cwd matches the CWD param
+            // (production always keeps them equal — build_command derives CWD
+            // from current_dir()).
+            c.current_dir(&cwd);
+            c.arg("-p")
+                .arg(&profile)
+                .arg("-D")
+                .arg(format!("CWD={}", cwd.display()))
+                .arg("-D")
+                .arg(format!("TMP={}", canon(std::env::temp_dir()).display()));
+            for (i, sub) in PROTECTED_SUBPATHS.iter().enumerate() {
+                c.arg("-D")
+                    .arg(format!("PROT_{i}={}", cwd.join(sub).display()));
+            }
+            c.arg("sh").arg("-c").arg(cmd);
+            c.output().expect("spawn sandbox-exec")
+        };
+
+        // Ordinary in-cwd write: allowed.
+        let ok = run("mkdir -p src && printf x > src/ok");
+        assert!(
+            ok.status.success(),
+            "cwd write should be allowed: {}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+
+        // A git hook: denied at the kernel.
+        let hook = run("mkdir -p .git/hooks && printf x > .git/hooks/pre-commit");
+        assert!(
+            !hook.status.success(),
+            "writing a git hook must be denied by the floor"
+        );
+        assert!(
+            !cwd.join(".git/hooks/pre-commit").exists(),
+            "the hook must not have been written"
+        );
+
+        // A CI workflow: also denied.
+        let wf = run("mkdir -p .github/workflows && printf x > .github/workflows/ci.yml");
+        assert!(!wf.status.success(), "writing a CI workflow must be denied");
+    }
+
+    #[test]
+    fn detach_session_starts_a_new_session_leader() {
+        // Vuln 2: a detached tool child leads its own session (sid == pid) and
+        // no longer shares hotl's session, so it has no route to hotl's
+        // controlling terminal — no TIOCSTI keystroke injection, no /dev/tty
+        // spoof. This is also what keeps kill_group's kill(-pid) working.
+        let mut cmd = tokio::process::Command::new("sleep");
+        cmd.arg("2");
+        detach_session(&mut cmd);
+        let mut child = cmd.as_std_mut().spawn().expect("spawn sleep");
+        let pid = child.id() as i32;
+        // pre_exec runs in the child after fork; poll until setsid has landed.
+        let mut child_sid = -1;
+        for _ in 0..100 {
+            child_sid = unsafe { libc::getsid(pid) };
+            if child_sid == pid {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let our_sid = unsafe { libc::getsid(0) };
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(child_sid, pid, "child is not a session leader");
+        assert_ne!(child_sid, our_sid, "child still shares hotl's session");
+    }
 
     async fn run(cmd: &str) -> std::process::Output {
         run_with(cmd, &EgressState::Open).await
