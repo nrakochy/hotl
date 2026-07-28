@@ -41,13 +41,22 @@ fn session(
     snapshots: Option<Arc<dyn Snapshotter>>,
     config: EngineConfig,
 ) -> Session {
+    session_with_rules(provider, snapshots, config, Rules::default())
+}
+
+fn session_with_rules(
+    provider: Arc<dyn Provider>,
+    snapshots: Option<Arc<dyn Snapshotter>>,
+    config: EngineConfig,
+    rules: Rules,
+) -> Session {
     let dir = tempfile::tempdir().expect("tempdir");
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
         .expect("session log");
     let handle = spawn_session(SessionDeps {
         provider,
         registry: Arc::new(Registry::builtin()),
-        rules: Arc::new(Rules::default()),
+        rules: Arc::new(rules),
         sandbox_enforced: false,
         clock: Arc::new(SystemClock),
         log,
@@ -226,6 +235,36 @@ async fn ask_summaries_are_sanitized_before_they_reach_the_human() {
     assert!(
         !summary.contains('\u{202e}'),
         "bidi override survived: {summary:?}"
+    );
+}
+
+/// Vuln 6: `read` is `Permission::None` in-workspace and short-circuited the
+/// gate before any rule ran, so a `[[deny]]` on it was silently dead. The gate
+/// must now consult the deny tiers for a `Permission::None` tool too.
+#[tokio::test]
+async fn a_deny_rule_bites_a_permission_none_tool() {
+    let rules = Rules::from_toml("[[deny]]\ntool = \"read\"\npath_prefix = \".env\"\n").unwrap();
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "read", json!({"path": ".env"})),
+        ScriptedProvider::text_reply("ok"),
+    ]));
+    let mut s = session_with_rules(provider, None, EngineConfig::default(), rules);
+    s.handle.prompt("read the env".into()).await;
+
+    let mut denied = false;
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::ToolDenied { .. } => denied = true,
+            EngineEvent::Ask { reply, .. } => {
+                let _ = reply.send(AskReply::Allow);
+            }
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        denied,
+        "a [[deny]] on read must refuse the call, not run it"
     );
 }
 

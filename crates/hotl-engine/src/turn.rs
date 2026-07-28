@@ -1364,6 +1364,21 @@ impl Turn {
                     };
                 }
             }
+        } else if let Some(rule) = self.shared.rules.denied(&tu.name, &input) {
+            // Vuln 6: a `Permission::None` tool (read/glob/grep in-workspace)
+            // skips the ask path above, but a `[[deny]]` on it must still
+            // refuse — deny is a "never" the gate owes regardless of how
+            // low-risk the tool's own permission is.
+            self.emit(EngineEvent::ToolDenied {
+                name: tu.name.clone(),
+            })
+            .await;
+            return Gate::Resolved {
+                outcome: ToolOutcome::err(format!(
+                    "a deny rule refused this call ({rule}); do not retry it"
+                )),
+                chargeable: false,
+            };
         }
         Gate::Ready {
             input,
