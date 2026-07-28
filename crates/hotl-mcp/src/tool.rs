@@ -253,11 +253,19 @@ impl McpTool {
                 // human approved *this* screen — and is not swallowed either:
                 // `permission()` says on every screen that hotl will keep
                 // asking, and why.
-                let _ = self
-                    .trust
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .record(&cfg.name, &fresh);
+                //
+                // Vuln 5: a server whose script lives in the agent-writable
+                // workspace is never trusted *durably* — an auto-allowed
+                // in-workspace edit could rewrite it between sessions. It is
+                // re-screened each session instead (this session's connect
+                // already passed the screen above).
+                if !fresh.has_arg_under(hotl_tools::workspace_root()) {
+                    let _ = self
+                        .trust
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .record(&cfg.name, &fresh);
+                }
                 Ok::<_, String>(client)
             })
             .await?;

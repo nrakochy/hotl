@@ -325,6 +325,13 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     None
 }
 
+/// The canonical workspace root. Re-exported for downstream crates (hotl-mcp)
+/// that must test whether a path is agent-writable — e.g. an MCP server whose
+/// script lives inside the workspace and so cannot be durably trusted (Vuln 5).
+pub fn workspace_root() -> &'static std::path::Path {
+    fsguard::workspace_root()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

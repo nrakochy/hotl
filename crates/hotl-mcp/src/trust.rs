@@ -27,16 +27,41 @@ pub struct Fingerprint {
     command: String,
     args: Vec<String>,
     hash: String,
+    /// Content hashes of any argument that resolves to an existing file — the
+    /// script/module an interpreter actually runs (`node server.js`,
+    /// `python x.py`). Hashing only `command` (the interpreter, which never
+    /// changes) left the real code outside the fingerprint (Vuln 5). Empty for
+    /// args that name no local file (`-m pkg`, `npx @pkg`, a `docker` image).
+    arg_hashes: Vec<(String, String)>,
 }
 
 impl Fingerprint {
     /// Reads the binary **once**. Callers must not re-derive the parts.
     pub fn of(cfg: &ServerConfig) -> Self {
+        let arg_hashes = cfg
+            .args
+            .iter()
+            .filter_map(|a| {
+                let p = resolve(a);
+                p.is_file().then(|| (a.clone(), file_hash(&p)))
+            })
+            .collect();
         Self {
             command: cfg.command.clone(),
             args: cfg.args.clone(),
             hash: binary_hash(&cfg.command),
+            arg_hashes,
         }
+    }
+
+    /// True when any argument resolves to a file inside `root` — the
+    /// agent-writable workspace. Such a server's script can be rewritten by an
+    /// auto-allowed in-workspace edit, so its trust must not be persisted
+    /// durably (`TrustStore::record` refuses it); it is re-screened each session.
+    pub fn has_arg_under(&self, root: &Path) -> bool {
+        self.arg_hashes
+            .iter()
+            .any(|(arg, _)| std::fs::canonicalize(resolve(arg)).is_ok_and(|p| p.starts_with(root)))
     }
 
     /// False when the binary could not be read. A grant is never recorded for
@@ -45,7 +70,7 @@ impl Fingerprint {
         self.hash.starts_with("sha256:")
     }
 
-    /// The recorded value. Versioned (`fp1:`) so a future scheme change
+    /// The recorded value. Versioned (`fp2:`) so a future scheme change
     /// invalidates old grants by construction rather than by accident. NUL
     /// cannot appear in an argv element, so the encoding is injective.
     pub fn key(&self) -> String {
@@ -57,7 +82,17 @@ impl Fingerprint {
             hasher.update([0]);
         }
         hasher.update(self.hash.as_bytes());
-        format!("fp1:{:x}", hasher.finalize())
+        hasher.update([0]);
+        // fp2: the scheme now folds in the content hash of any file-resolving
+        // arg. Old `fp1:` grants no longer match — the safe direction (they
+        // re-raise the screen once).
+        for (arg, h) in &self.arg_hashes {
+            hasher.update(arg.as_bytes());
+            hasher.update([0]);
+            hasher.update(h.as_bytes());
+            hasher.update([0]);
+        }
+        format!("fp2:{:x}", hasher.finalize())
     }
 }
 
@@ -69,7 +104,13 @@ impl fmt::Display for Fingerprint {
         if !self.args.is_empty() {
             write!(f, "\nargs: {:?}", self.args)?;
         }
-        write!(f, "\n  {}", self.hash)
+        write!(f, "\n  {}", self.hash)?;
+        // Show the script/module each interpreter arg actually runs, so the
+        // human screens the real code, not just the interpreter (Vuln 5).
+        for (arg, h) in &self.arg_hashes {
+            write!(f, "\n  {arg}: {h}")?;
+        }
+        Ok(())
     }
 }
 
@@ -184,14 +225,18 @@ impl TrustStore {
 /// shows that honestly, and [`TrustStore::record`] refuses to persist it.
 /// This is the primitive; [`Fingerprint`] is the trust key.
 pub fn binary_hash(command: &str) -> String {
-    let path = resolve(command);
-    let hash = |path: &Path| -> std::io::Result<String> {
+    file_hash(&resolve(command))
+}
+
+/// SHA-256 of a file's contents, or `unavailable:<err>` if it can't be read.
+fn file_hash(path: &Path) -> String {
+    let read = |path: &Path| -> std::io::Result<String> {
         let mut file = std::fs::File::open(path)?;
         let mut hasher = Sha256::new();
         std::io::copy(&mut file, &mut hasher)?;
         Ok(format!("sha256:{:x}", hasher.finalize()))
     };
-    hash(&path).unwrap_or_else(|e| format!("unavailable:{e}"))
+    read(path).unwrap_or_else(|e| format!("unavailable:{e}"))
 }
 
 fn resolve(command: &str) -> PathBuf {
@@ -243,6 +288,40 @@ mod tests {
             args: args.iter().map(|s| s.to_string()).collect(),
             description: String::new(),
         }
+    }
+
+    #[test]
+    fn editing_the_server_script_revokes_trust() {
+        // Vuln 5: hashing only the interpreter left the *script* it runs outside
+        // the fingerprint, so a prompt-injected edit to server.js reused the
+        // grant with no re-screen. A file-resolving arg's content is hashed too.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("server.js");
+        std::fs::write(&script, b"console.log('v1')").unwrap();
+        let cfg = cfg("/bin/sh", &[script.to_str().unwrap()]);
+        let before = Fingerprint::of(&cfg).key();
+        std::fs::write(&script, b"console.log('MALICIOUS')").unwrap();
+        let after = Fingerprint::of(&cfg).key();
+        assert_ne!(
+            before, after,
+            "editing the server script must re-raise the screen"
+        );
+    }
+
+    #[test]
+    fn a_workspace_script_is_flagged_as_agent_writable() {
+        // Vuln 5: a server whose script resolves inside a given root is flagged
+        // so `tool.rs` can refuse to persist its trust durably.
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("s.js");
+        std::fs::write(&script, b"x").unwrap();
+        let fp = Fingerprint::of(&cfg("/bin/sh", &[script.to_str().unwrap()]));
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert!(fp.has_arg_under(&root), "script under root must be flagged");
+        assert!(
+            !fp.has_arg_under(std::path::Path::new("/no/such/root")),
+            "an unrelated root must not match"
+        );
     }
 
     #[test]
