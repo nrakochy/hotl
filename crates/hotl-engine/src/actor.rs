@@ -1290,13 +1290,16 @@ fn push_or_fold_steer(held: &mut Vec<HeldSteer>, steer: HeldSteer) {
     let full = text_total >= HELD_BYTES_MAX || image_total + incoming > HELD_IMAGE_B64_MAX;
     match held.last_mut() {
         Some(last) if full => {
-            fold_into(&mut last.text, &steer.text, HELD_BYTES_MAX);
+            // Images first, disclosure on the INCOMING text, one fold_into
+            // call — keeps FOLD_MARK the literal tail so it never stacks.
             let dropped = fold_images(&mut last.images, steer.images, HELD_IMAGE_B64_MAX);
+            let mut text = steer.text;
             if dropped > 0 {
-                last.text.push_str(&format!(
+                text.push_str(&format!(
                     "\n[{dropped} image(s) not attached: steer buffer full]"
                 ));
             }
+            fold_into(&mut last.text, &text, HELD_BYTES_MAX);
         }
         _ => held.push(steer),
     }
@@ -1804,13 +1807,16 @@ async fn admit_prompt(
             // which types-layer policy forbids — accepted on this
             // pathological path (text folding already truncates far worse).
             Some(last) if full => {
-                fold_into(&mut last.text, &prompt.text, HELD_BYTES_MAX);
+                // Images first, disclosure on the INCOMING text, one fold_into
+                // call — keeps FOLD_MARK the literal tail so it never stacks.
                 let dropped = fold_images(&mut last.images, prompt.images, HELD_IMAGE_B64_MAX);
+                let mut text = prompt.text;
                 if dropped > 0 {
-                    last.text.push_str(&format!(
+                    text.push_str(&format!(
                         "\n[{dropped} image(s) not attached: prompt queue full]"
                     ));
                 }
+                fold_into(&mut last.text, &text, HELD_BYTES_MAX);
             }
             _ => queue.push_back(prompt),
         }
@@ -1968,7 +1974,7 @@ mod tests {
     use super::{
         awaiting_tool_results, commit_prepared, compact, fold_images, fold_into, pair_tool_results,
         push_or_fold_steer, release_steers, summarize_bounded, Head, HeldSteer, Pipeline,
-        ProjectionHead, Resolution, SharedDeps, HELD_IMAGE_B64_MAX,
+        ProjectionHead, Resolution, SharedDeps, FOLD_MARK, HELD_BYTES_MAX, HELD_IMAGE_B64_MAX,
     };
     use hotl_store::SessionLog;
     use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
@@ -2105,7 +2111,7 @@ mod tests {
     #[test]
     fn a_held_steer_over_the_image_cap_drops_images_rather_than_growing() {
         // INVARIANT: the held-steer buffer is bounded in BYTES, images included.
-        // Enforced by this test.
+        // Enforced by a_held_steer_over_the_image_cap_drops_images_rather_than_growing.
         let mut held: Vec<HeldSteer> = Vec::new();
         let big = || hotl_types::UserImage {
             media_type: "image/png".into(),
@@ -2126,6 +2132,45 @@ mod tests {
             .map(|i| i.data.len())
             .sum();
         assert!(total <= HELD_IMAGE_B64_MAX, "{total}");
+    }
+
+    #[test]
+    fn a_fold_that_drops_an_image_still_ends_with_fold_mark() {
+        // INVARIANT: FOLD_MARK is fold_into's literal tail after a truncating
+        // fold, even when that same fold also drops an image and appends a
+        // disclosure note — otherwise the next fold's FOLD_MARK-stripping
+        // precondition silently fails. Enforced by
+        // a_fold_that_drops_an_image_still_ends_with_fold_mark.
+        let mut held: Vec<HeldSteer> = Vec::new();
+        let img = |n: usize| hotl_types::UserImage {
+            media_type: "image/png".into(),
+            data: "A".repeat(n).into(),
+        };
+        // First push is unconditional: seed an entry with an image total
+        // that leaves no room for another byte.
+        push_or_fold_steer(
+            &mut held,
+            HeldSteer {
+                text: "seed".into(),
+                images: vec![img(HELD_IMAGE_B64_MAX)],
+            },
+        );
+        // Second push both truncates (text alone is over HELD_BYTES_MAX) and
+        // drops an image (the cap is already maxed) in the same fold.
+        push_or_fold_steer(
+            &mut held,
+            HeldSteer {
+                text: "y".repeat(HELD_BYTES_MAX + 4_096),
+                images: vec![img(1)],
+            },
+        );
+        let text = &held[0].text;
+        assert!(
+            text.ends_with(FOLD_MARK),
+            "a fold that also drops an image must still end in FOLD_MARK: \
+             ...{}",
+            &text[text.len().saturating_sub(120)..]
+        );
     }
 
     #[test]
