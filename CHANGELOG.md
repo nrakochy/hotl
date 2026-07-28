@@ -78,6 +78,53 @@ semver promise of their own.
   only because nothing could fetch the real one; `hotl update` now looks it up.
   Use `--version X.Y.Z` to pin a release.
 
+### Security
+
+- **The protected execute-later floor is airtight, and now covers bash.**
+  Writes to the execute-later class (`.git/hooks/`, `.github/workflows/`,
+  `Makefile`, `build.rs`, `.envrc`, shell rc files, …) are classified on the
+  filesystem-normalized path and case-folded, so a doubled separator
+  (`.github//workflows/x`) or a case variant (`MAKEFILE`) can no longer slip a
+  silent write past the raw-string check. `bash` is held to the same floor: a
+  command that *writes* an execute-later path escalates to the protected ask
+  instead of running unprompted, and on macOS the sandbox additionally denies
+  those writes at the kernel. Reads and ordinary build/git flows are unchanged
+  — the default stays low-friction.
+
+- **The `hotl serve` control socket is authenticated.** A backgrounded
+  session's unix socket now requires a per-session token (from the OS CSPRNG,
+  written `0600` next to the socket) plus a same-uid peer check before a client
+  is promoted; the run dir is `0700` and the socket `0600`. An unauthenticated
+  connection is refused *without* evicting the attached client — closing a path
+  by which any local process could take over a session, answer its permission
+  asks, or steer other live sessions. `hotl attach` authenticates
+  transparently.
+
+- **Sandboxed tool processes no longer share hotl's controlling terminal.**
+  `bash`, `grep`, and diagnostic children start their own session (`setsid`)
+  rather than only a new process group, so a confined command can no longer
+  inject keystrokes into — or paint spoofed UI over — the human's approval
+  prompt through the shared terminal. Process-group termination is unchanged.
+
+- **MCP server trust covers the script, not just the interpreter.** The
+  first-use approval fingerprint now hashes the contents of any argument that
+  resolves to a local file (the `server.js` a `node`/`python` command runs), so
+  editing a trusted server's script re-raises the approval screen instead of
+  silently reusing the grant. A server whose script lives inside the workspace
+  is never trusted durably.
+
+- **Deny rules apply everywhere they should.** A `[[deny]]` on a read-only tool
+  (`read`, `grep`, `glob`) is now enforced — those calls previously bypassed
+  rule evaluation entirely — and a `bash` deny can no longer be walked past by
+  piping the command into a shell (`echo '…' | sh`), a here-string, or by
+  casing the command name (`cUrl`).
+
+- **Model-authored approval summaries are sanitized.** Every permission
+  prompt's summary is flattened to a single control-character-free line at one
+  engine chokepoint, so a tool argument carrying terminal escapes (a `\r`-and-
+  erase sequence, a bidi override) can no longer spoof what the human is
+  approving. Previously only MCP and recall summaries were scrubbed.
+
 ## [0.7.1] - 2026-07-27
 
 ### Fixed
