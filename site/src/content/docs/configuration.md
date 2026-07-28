@@ -48,6 +48,11 @@ show_used_pct = true       # show context-fullness in each turn's status
 [behavior]
 sandbox = true             # false disables the bash sandbox floor
 vim_mode = false           # true = vim-style keys in the console's input editor
+mouse = true               # false stops mouse capture: no wheel scroll, no drag
+                           # select, and your terminal owns the mouse again
+copy_on_select = true      # false stops a mouse drag copying to the clipboard
+                           # (needs mouse = true; without capture there are no
+                           # drag events to act on)
 max_turns = 100            # model steps one prompt may spend (a tool round-trip
                            # costs one). -1 = unlimited: run until the model is
                            # done, the context fills, or you interrupt.
@@ -218,7 +223,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_CONCURRENCY_SUBPROCS` | `[concurrency].subprocs` | Reserved (subprocess batching; no effect yet). |
 | `HOTL_CONCURRENCY_WORKER_THREADS` | `[concurrency].worker_threads` | Reserved (tokio worker-thread pool; parsed but deliberately not wired — see below). |
 | `HOTL_CONCURRENCY_BLOCKING_THREADS` | `[concurrency].blocking_threads` | `spawn_blocking` pool cap (bounds `glob`'s tree walk; default 16). |
-| `HOTL_MOUSE` | *(pending `[behavior].mouse`)* | `0` disables console mouse capture, keeping your terminal's own drag-select and middle-click paste. Anything else leaves the wheel scrolling the transcript. |
+| `HOTL_MOUSE` | `[behavior].mouse` | `0` disables console mouse capture, keeping your terminal's own drag-select and middle-click paste. Anything else leaves the wheel scrolling the transcript and drags copying. |
 | `HOTL_THINKING` | *(pending `[behavior].thinking`)* | `0` turns off extended thinking. It is billed whether or not you read it, so this is the switch that matters if you don't. |
 | `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
 

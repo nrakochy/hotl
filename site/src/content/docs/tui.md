@@ -76,8 +76,39 @@ Top to bottom:
 `Home` and `End` on their own are line motions in the input, which is why the
 document-level jumps are the `Ctrl` pair.
 
-Mouse capture costs you the terminal's own drag-select. Hold `Shift` to bypass
-it on most emulators, or set `HOTL_MOUSE=0` to leave the mouse alone entirely.
+### Selecting and copying
+
+Drag with the left mouse button and the region highlights; let go and it is on
+your clipboard. The hint row confirms with `copied N lines`, and the next key
+you press clears both the highlight and the notice.
+
+What you see is what you get. Dragging a transcript line from the left edge
+copies the prose without the gutter pad or the role glyph, so pasting a reply
+elsewhere gives you the text and nothing else. Start the drag partway into a
+line and you get exactly the span you dragged. The input box and hint row have
+no spine and copy verbatim.
+
+Selection is a region of the *screen*, not of the conversation, so it cannot
+reach above the top of the window — scroll first, then drag.
+
+The copy travels as an [OSC 52][osc52] escape, which needs no helper process
+and works over SSH. Two caveats worth knowing:
+
+- Inside tmux it needs `set -g set-clipboard on`.
+- A few terminals disable OSC 52 by default as a security measure. There is no
+  reply to check, so a refused copy is silent.
+
+Mouse capture is what makes the wheel and the drag work, and it costs you the
+terminal's own drag-select. Hold `Shift` to bypass capture on most emulators
+and get the real thing back for one drag. To turn things off for good:
+
+| Setting | Effect |
+|---|---|
+| `[behavior] copy_on_select = false` | Drag does nothing; the wheel still scrolls |
+| `[behavior] mouse = false` | No capture at all — the terminal owns the mouse again |
+| `HOTL_MOUSE=0` | Same as above, per-run; overrides the config key |
+
+[osc52]: https://invisible-island.net/xterm/ctlseqs/ctlseqs.html#h3-Operating-System-Commands
 
 ### Pasting
 

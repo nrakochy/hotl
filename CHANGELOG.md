@@ -8,6 +8,20 @@ semver promise of their own.
 
 ### Added
 
+- **Drag to copy.** Selecting a region of the console with the left mouse
+  button copies it to the clipboard on release, giving back what mouse
+  capture took away. The selection is a region of the screen, so what is
+  highlighted is exactly what is copied — but dragging a transcript line from
+  the left edge trims the gutter and role glyph, so pasted prose arrives
+  clean. Transport is OSC 52: no clipboard dependency, and it works over SSH
+  (tmux needs `set-clipboard on`). The hint row confirms with `copied N
+  lines` until the next keypress. `[behavior] copy_on_select = false` turns
+  it off.
+
+- **`[behavior] mouse`.** Mouse capture is now a config key, not just the
+  `HOTL_MOUSE` environment variable — which still wins when set, per the
+  env > config > default precedence. Retires a documented TODO.
+
 - **Image input.** Drag an image onto the console and the pasted path
   compacts to an `[Image #1]` token; on submit hotl reads the file and sends
   it to the model as a real image content block — provider-neutral

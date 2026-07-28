@@ -59,9 +59,10 @@ pub(crate) struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    /// Take the screen. `mouse` requests wheel reporting — it costs the
-    /// terminal's own drag-select, so the console gates it on `HOTL_MOUSE`
-    /// and the watch dashboard (which has nothing to scroll) passes `false`.
+    /// Take the screen. `mouse` requests wheel and drag reporting — it costs
+    /// the terminal's own drag-select, which the console gives back as
+    /// `[behavior] copy_on_select`. Gated on `[behavior] mouse` / `HOTL_MOUSE`
+    /// there; the watch dashboard (nothing to scroll) passes `false`.
     pub(crate) fn enter(mouse: bool) -> io::Result<Self> {
         capture();
         enable_raw_mode()?;
