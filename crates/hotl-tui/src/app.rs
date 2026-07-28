@@ -2089,6 +2089,49 @@ mod tests {
     }
 
     #[test]
+    fn steer_rejected_clears_the_chip_and_notices_why() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        type_str(&mut s, "wait");
+        press(&mut s, KeyCode::Enter);
+        assert!(matches!(
+            s.transcript.last(),
+            Some(TranscriptItem::Steer { queued: true, .. })
+        ));
+        update(
+            &mut s,
+            Msg::SteerRejected {
+                why: "images[0] is empty".into(),
+            },
+        );
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("images[0]")),
+            "the rejection reason must reach the transcript"
+        );
+        let chip = s
+            .transcript
+            .iter()
+            .rev()
+            .find(|i| matches!(i, TranscriptItem::Steer { .. }));
+        assert!(
+            matches!(chip, Some(TranscriptItem::Steer { queued: false, .. })),
+            "the pinned chip must not outlive the rejection"
+        );
+    }
+
+    /// A rejection with no matching queued chip (already cleared by a racing
+    /// `prompt_queued`, or a stale id) must degrade to a notice-only, not panic.
+    #[test]
+    fn steer_rejected_with_no_queued_chip_only_notices() {
+        let mut s = State::test_default();
+        update(&mut s, Msg::SteerRejected { why: "boom".into() });
+        assert!(matches!(
+            s.transcript.last(),
+            Some(TranscriptItem::Notice { text }) if text.contains("boom")
+        ));
+    }
+
+    #[test]
     fn esc_interrupts_then_second_esc_takes_control_back() {
         let mut s = State::test_default();
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };

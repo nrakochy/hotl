@@ -460,6 +460,7 @@ mod tests {
             result: Ok(Value::Null),
         };
         assert!(translate(msg, &mut prompt_ids, &mut steer_ids).is_none());
+        assert!(steer_ids.is_empty(), "the id is consumed either way");
     }
 
     #[tokio::test]
