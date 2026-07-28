@@ -114,6 +114,34 @@ impl fmt::Display for Fingerprint {
     }
 }
 
+/// What hotl will do the next time a turn reaches this server. Reporting-only:
+/// every variant is derived from [`TrustStore::is_trusted`], so a roster can
+/// never claim something the gate would contradict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustState {
+    /// A grant is on file and the program still matches it. No screen.
+    Trusted,
+    /// No grant, or the program changed since the grant. Screens on first use.
+    Untrusted,
+    /// The binary could not be read, so no integrity check applies (T2-7b).
+    /// Never recorded, never honoured — screens every time.
+    Unhashable,
+    /// A file-resolving arg lives in the agent-writable workspace, so trust is
+    /// never persisted durably (Vuln 5). Screens once per session, by design.
+    SessionOnly,
+}
+
+impl TrustState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::Untrusted => "screens on first use",
+            Self::Unhashable => "unreadable binary — will ask every time",
+            Self::SessionOnly => "session-only (workspace script — never persisted)",
+        }
+    }
+}
+
 pub struct TrustStore {
     path: PathBuf,
     /// server name → approved fingerprint key
@@ -177,6 +205,43 @@ impl TrustStore {
         self.approved.insert(server.to_string(), fp.key());
         let raw = toml::to_string(&self.approved).map_err(|e| format!("{e}"))?;
         self.persist(&raw)
+    }
+
+    /// Drop a grant. Revocation only ever *reduces* privilege, which is why it
+    /// is the one mutation `hotl mcp` is allowed to make. `Ok(false)` when the
+    /// server held no grant — not an error, the end state is the same.
+    ///
+    /// INVARIANT: forgetting one server leaves every other grant intact.
+    /// Enforced by `forget_revokes_only_the_named_server`.
+    pub fn forget(&mut self, server: &str) -> Result<bool, String> {
+        if self.approved.remove(server).is_none() {
+            return Ok(false);
+        }
+        let raw = toml::to_string(&self.approved).map_err(|e| format!("{e}"))?;
+        self.persist(&raw)?;
+        Ok(true)
+    }
+
+    /// Recorded grants, for spotting ones whose server left the config.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.approved.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// What the next turn will do. `Trusted` is decided by [`Self::is_trusted`]
+    /// and checked first, so this never disagrees with the gate — a durable
+    /// grant that predates a config change moving the script into `workspace`
+    /// reports honestly as trusted, because that is what hotl will honour.
+    pub fn state(&self, server: &str, fp: &Fingerprint, workspace: &Path) -> TrustState {
+        if !fp.is_hashed() {
+            return TrustState::Unhashable;
+        }
+        if self.is_trusted(server, fp) {
+            return TrustState::Trusted;
+        }
+        if fp.has_arg_under(workspace) {
+            return TrustState::SessionOnly;
+        }
+        TrustState::Untrusted
     }
 
     /// Temp file in the same directory, then rename: a crash mid-write leaves
@@ -405,6 +470,65 @@ mod tests {
         );
         assert!(warnings[0].contains("trust.toml"));
         let _ = store;
+    }
+
+    #[test]
+    fn forget_revokes_only_the_named_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("server");
+        std::fs::write(&bin, b"x").unwrap();
+        let fp = Fingerprint::of(&cfg(bin.to_str().unwrap(), &[]));
+        let mut store = TrustStore::load(dir.path());
+        store.record("a", &fp).unwrap();
+        store.record("b", &fp).unwrap();
+
+        assert!(store.forget("a").unwrap(), "a held a grant");
+        assert!(!store.is_trusted("a", &fp));
+        assert!(store.is_trusted("b", &fp), "b is untouched");
+        // Durable, and forgetting an unknown name is a no-op, not an error.
+        let reloaded = TrustStore::load(dir.path());
+        assert!(!reloaded.is_trusted("a", &fp) && reloaded.is_trusted("b", &fp));
+        assert!(!TrustStore::load(dir.path()).forget("ghost").unwrap());
+    }
+
+    #[test]
+    fn state_reports_what_the_gate_will_do() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = Path::new("/no/such/root");
+        let bin = dir.path().join("server");
+        std::fs::write(&bin, b"x").unwrap();
+        let fp = Fingerprint::of(&cfg(bin.to_str().unwrap(), &[]));
+        let mut store = TrustStore::load(dir.path());
+
+        assert_eq!(store.state("docs", &fp, elsewhere), TrustState::Untrusted);
+        store.record("docs", &fp).unwrap();
+        assert_eq!(store.state("docs", &fp, elsewhere), TrustState::Trusted);
+
+        // An unreadable binary is never honoured, even against a stale key.
+        let gone = Fingerprint::of(&cfg("/definitely/not/here", &[]));
+        assert_eq!(
+            store.state("docs", &gone, elsewhere),
+            TrustState::Unhashable
+        );
+
+        // A script under the workspace is never durably trusted (Vuln 5).
+        let script = dir.path().join("s.js");
+        std::fs::write(&script, b"x").unwrap();
+        let ws = Fingerprint::of(&cfg("/bin/sh", &[script.to_str().unwrap()]));
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        assert_eq!(store.state("local", &ws, &root), TrustState::SessionOnly);
+    }
+
+    #[test]
+    fn entries_lists_recorded_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("server");
+        std::fs::write(&bin, b"x").unwrap();
+        let fp = Fingerprint::of(&cfg(bin.to_str().unwrap(), &[]));
+        let mut store = TrustStore::load(dir.path());
+        store.record("docs", &fp).unwrap();
+        let listed: Vec<_> = store.entries().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(listed, vec!["docs".to_string()]);
     }
 
     #[test]
