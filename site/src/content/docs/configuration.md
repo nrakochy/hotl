@@ -18,9 +18,10 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
 | `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/shadows/blobs per `[retention]`. See [below](#hotl-gc). |
 | `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
-| `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, memory, secrets audit, undo/git. Exit 1 if any check FAILs. |
+| `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, MCP trust, memory, secrets audit, undo/git. Exit 1 if any check FAILs. |
 | `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
 | `hotl skills [add\|update\|remove]` | List every discovered skill with its source; manage skill marketplaces. See [skills.md](../skills/). |
+| `hotl mcp [list\|show\|add\|untrust\|test]` | Inspect configured MCP servers and their trust grants. Read-mostly: it never writes `config.toml`, and there is no verb that grants trust. See [below](#hotl-mcp) and [mcp.md](../mcp/). |
 | `hotl watch` | The tmux dashboard (separate capability; [crates/hotl/README.md](https://github.com/nrakochy/hotl/blob/master/crates/hotl/README.md)). |
 | `hotl update` | Install the latest release. `--check` only looks; `--version X.Y.Z` picks one; `-y` skips the prompt. See [updating](../updating/). |
 | `hotl fleet` | Reserved (orchestrate); not built — exits 2. |
@@ -343,6 +344,35 @@ Protected paths outrank admin grants; admin denies outrank everything.
 ## hotl gc
 
 `hotl gc [--dry-run] [--days N] [--keep N]` prunes whole sessions (log + evicted-result blobs + shadow snapshot repo) older than `max_age_days` or beyond `max_sessions`, and sweeps dead backgrounded-session sockets. Flags override `[retention]`. With no policy and no flags it's a no-op that tells you so. `--dry-run` lists what would go without deleting.
+
+## hotl mcp
+
+Inspects the servers declared in `[[mcp]]` and the grants recorded in `trust.toml`.
+
+| Command | Effect |
+|---|---|
+| `hotl mcp [list]` | Every configured server, its command line, and what the trust gate will do with it. Also warns about a corrupt `trust.toml` and about grants whose server has left the config. |
+| `hotl mcp show <name>` | The exact fingerprint text the in-session approval screen shows, plus the recorded key. Reads the binary; never starts it. |
+| `hotl mcp add <name> <command> [args...]` | Prints a `[[mcp]]` block to paste into `config.toml`. **Writes nothing.** |
+| `hotl mcp untrust <name>\|--all` | Drops the grant, so the server is screened again on next use. |
+| `hotl mcp test <name>` | Starts the server, does the MCP handshake, lists its tools. Screens first if it is not already trusted, and records nothing either way. |
+
+Four trust states appear in `list`:
+
+- **trusted** — a grant is on file and the program still matches it; no screen.
+- **screens on first use** — no grant, or the program changed since the grant.
+- **unreadable binary — will ask every time** — the binary could not be hashed, so no integrity check applies. Grants are never recorded or honoured for it.
+- **session-only (workspace script — never persisted)** — a file-resolving argument lives inside the agent-writable workspace, so trust is deliberately not persisted across sessions.
+
+### Why it cannot grant trust
+
+`hotl mcp` is read-mostly on purpose, and the two limits are the design rather than an omission:
+
+**It never writes `config.toml`.** `add` prints a block for you to paste. A CLI that edited config would be a path `bash -c 'hotl mcp add …'` could take, and the permission layer does not cover that — its bash analysis reads redirects, `tee`, and `dd`, not a program that writes config as a side effect. Only the kernel sandbox stops it, and incidentally rather than by design.
+
+**There is no verb that grants trust.** Trust is recorded only by a human answering the in-session fingerprint screen. A CLI grant would be the "always allow" that hotl deliberately omits everywhere else. `untrust` is the one mutation this command makes, because revocation only ever *reduces* privilege.
+
+If you need non-interactive provisioning, register servers with a pasted `[[mcp]]` block and let each machine screen them once. See [permissions-and-sandbox](../permissions-and-sandbox/).
 
 ## Headless (`-p` / `--json`)
 

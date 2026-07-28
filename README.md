@@ -141,6 +141,7 @@ Full tutorial: [quickstart](https://nrakochy.github.io/hotl/quickstart/).
 | `hotl bg` / `hotl attach` | Run a session detached from any terminal, reconnect later |
 | `hotl acp` | Serve ACP over stdio so an ACP-speaking editor can embed the agent |
 | `hotl skills` | Manage skills and skill marketplaces |
+| `hotl mcp` | List MCP servers and their trust state; screen one, revoke a grant |
 | `hotl doctor` / `hotl setup` | Setup check (nonzero on failure); write a commented starter config |
 | `hotl gc` | Prune sessions and snapshots per `[retention]` |
 | `hotl watch` | The tmux supervision dashboard |

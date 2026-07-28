@@ -130,6 +130,17 @@ Everything that flows into the model's context from a source other than the user
 
 **Trust store — first-use screen.** The first call to a server raises a *protected* ask (never auto-allowable): server name, binary path, SHA-256 of the binary, and what approval means ("this program will run on your machine and its output will enter the model's context"). Approval is recorded in `~/.config/hotl/trust.toml` keyed by server name → binary hash; a changed hash re-raises the screen. An unreadable binary is recorded honestly as having no integrity check; a failed trust-store write keeps the grant in memory only and re-asks next session. Server binaries run **outside** the bash sandbox floor — they are user-installed programs, not model-directed commands; installing one is the trust decision.
 
+**`hotl mcp` cannot grant.** The inspection command is read-mostly by construction, and both limits are load-bearing rather than incidental:
+
+| Capability | Where it lives | Why |
+|---|---|---|
+| grant trust | the in-session screen only | A CLI verb writing `trust.toml` is the "always allow" the permission model omits everywhere else, and it is reachable from model-directed bash at the same uid with `hotl` on `PATH`. |
+| register a server | hand-edited `config.toml` | `hotl mcp add` *prints* the block. A CLI that wrote config would be a path `bash -c 'hotl mcp add …'` could take, and `bash_protected_write_reason` does not cover it — that analysis reads redirects, `tee`, and `dd`, not a program that writes config as a side effect. Only the kernel floor stops it, incidentally rather than by design. |
+| revoke a grant | `hotl mcp untrust` | Revocation only ever reduces privilege. |
+| start a server | `hotl mcp test` | Screens with the same fingerprint text first, refuses without a TTY, and records nothing — screening a one-shot spawn is not a durable grant. |
+
+Registering a server grants nothing: the first-use screen still fires. The invariants are enforced by `no_verb_ever_writes_config_toml` and `test_records_no_trust`.
+
 ## Retrieval (`recall`)
 
 The `recall` tool searches owner-configured knowledge backends (`[[retrieval]]`

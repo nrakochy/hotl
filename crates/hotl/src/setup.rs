@@ -123,6 +123,8 @@ prefix = \"git log\"
 # path_prefix = \"src/\"
 
 # --- MCP tool servers (first use asks, shows the binary + hash) ---
+# `hotl mcp add <name> <command> [args...]` prints a block like this one;
+# `hotl mcp` lists what is configured and whether it is trusted.
 # [[mcp]]
 # name = \"docs\"
 # command = \"/usr/local/bin/docs-mcp\"

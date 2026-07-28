@@ -8,6 +8,32 @@ semver promise of their own.
 
 ### Added
 
+- **`hotl mcp`.** Nothing outside a live turn could say which MCP servers were
+  configured, whether they were trusted, or what fingerprint the approval
+  screen would show; a broken server was discoverable only mid-turn, and a
+  grant could only be revoked by hand-editing `trust.toml`. `hotl mcp list`
+  gives the roster with a trust state per server — trusted, screens on first
+  use, unreadable binary, or session-only (a workspace script, never persisted
+  by design). `show` prints the exact screen text without starting anything,
+  `test` starts a server and lists its tools, `untrust` revokes.
+
+  The command is read-mostly on purpose. `add` **prints** a `[[mcp]]` block to
+  paste rather than writing `config.toml`: a CLI that edited config would be a
+  path `bash -c 'hotl mcp add …'` could take, and hotl's bash analysis reads
+  redirects, `tee`, and `dd` — not a program that writes config as a side
+  effect. And there is no verb that *grants* trust, because that would be the
+  "always allow" the permission model omits everywhere else. `untrust` is the
+  one mutation, since revocation only ever reduces privilege; `test` screens
+  with the same fingerprint text, refuses without a TTY, and records nothing.
+
+- **`hotl doctor` reports MCP trust.** How many servers are configured and how
+  many the gate will screen, a warning per server whose binary cannot be read,
+  and a warning per grant whose server has left the config. This is also where
+  `trust.toml`'s parse warnings finally surface — `load_reporting` was built to
+  produce them, but the registry loads the store with `load`, which drops them,
+  so a corrupt `trust.toml` previously showed up only as an unexplained wave of
+  re-prompts.
+
 - **Drag to copy.** Selecting a region of the console with the left mouse
   button copies it to the clipboard on release, giving back what mouse
   capture took away. The selection is a region of the screen, so what is
