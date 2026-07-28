@@ -433,11 +433,6 @@ impl Editor {
 
     fn submit(&mut self) -> EditorEvent {
         let text = self.text();
-        // Ring the prompt for recall, suppressing a consecutive duplicate.
-        if !text.trim().is_empty() && self.history.last().map(String::as_str) != Some(text.as_str())
-        {
-            self.history.push(text.clone());
-        }
         self.lines = vec![String::new()];
         self.cursor = (0, 0);
         self.mode = Mode::Insert;
@@ -446,6 +441,16 @@ impl Editor {
         self.end_recall();
         self.search = None;
         EditorEvent::Submit(text)
+    }
+
+    /// Ring a submitted prompt for recall, suppressing a consecutive
+    /// duplicate. Called by the app AFTER token expansion: a token without its
+    /// side table is dead text, and the side table dies with the draft.
+    pub fn remember(&mut self, text: String) {
+        if !text.trim().is_empty() && self.history.last().map(String::as_str) != Some(text.as_str())
+        {
+            self.history.push(text);
+        }
     }
 
     fn handle_normal(&mut self, key: KeyEvent) -> EditorEvent {
@@ -1028,9 +1033,11 @@ mod tests {
     #[test]
     fn submit_rings_the_prompt_with_consecutive_dedup() {
         let mut e = Editor::new(true);
-        keys(&mut e, "hello<cr>");
-        keys(&mut e, "hello<cr>"); // identical to the previous — not re-ringed
-        keys(&mut e, "world<cr>");
+        // The ring is no longer submit's decision — the app calls `remember`
+        // with the expanded text after submit returns.
+        e.remember("hello".into());
+        e.remember("hello".into()); // identical to the previous — not re-ringed
+        e.remember("world".into());
         keys(&mut e, "<up>");
         assert_eq!(e.text(), "world");
         keys(&mut e, "<up>");

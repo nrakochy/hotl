@@ -1003,6 +1003,10 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             // gets the fully-expanded text (exactly the bytes pre-compaction
             // behavior wrote, so a recalled entry is self-contained).
             let history_text = paste::expand_for_history(&text, &state.attachments);
+            // INVARIANT: the recall ring holds fully-expanded text, so a
+            // recalled prompt is self-contained. Enforced by
+            // `recalling_an_image_prompt_replays_the_path_not_a_dead_token`.
+            state.editor.remember(history_text.clone());
             let payload = paste::expand_for_wire(&text, &state.attachments);
             state.attachments.clear();
             let cmds = submit(state, text.clone(), payload);
@@ -1694,6 +1698,17 @@ mod tests {
         assert_eq!(p.images[0].path, "/tmp/shot.png");
         assert_eq!(p.images[0].data, None);
         assert!(s.attachments.is_empty(), "the table dies with the draft");
+    }
+
+    #[test]
+    fn recalling_an_image_prompt_replays_the_path_not_a_dead_token() {
+        let mut s = State::new(false, "m".into());
+        update(&mut s, Msg::Paste("/tmp/shot.png".into()));
+        type_str(&mut s, " what is this?");
+        press(&mut s, KeyCode::Enter);
+        // Up recalls the EXPANDED prompt, so a re-submit is self-contained.
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "/tmp/shot.png what is this?");
     }
 
     #[test]
