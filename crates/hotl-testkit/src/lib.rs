@@ -20,6 +20,9 @@ use hotl_types::{Entry, Item};
 
 pub use hotl_provider::ScriptedProvider as Scripted;
 
+/// The system prompt every harness runs under unless a scenario varies it.
+const DEFAULT_TEST_SYSTEM: &str = "test-system";
+
 pub struct Harness {
     pub handle: SessionHandle,
     pub provider: Arc<ScriptedProvider>,
@@ -133,6 +136,29 @@ impl Harness {
         config: EngineConfig,
     ) -> Self {
         Self::with_items(scripts, config, Vec::new())
+    }
+
+    /// Construct a harness with a pre-seeded projection **and its own system
+    /// prompt**. The system string is byte-stable for a session's lifetime by
+    /// construction, so the only way to vary it is at construction — which is
+    /// exactly what the fork cache proof's negative control has to do.
+    pub fn with_items_and_system(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+        system: &str,
+    ) -> Self {
+        Self::build_wrapped_with_system(
+            scripts,
+            config,
+            initial_items,
+            None,
+            Registry::builtin(),
+            Rules::default(),
+            false,
+            None,
+            system,
+        )
     }
 
     /// Construct a harness with a pre-seeded projection (resume scenarios).
@@ -303,14 +329,47 @@ impl Harness {
         sync_noop: bool,
         wrap: Option<ProviderWrap>,
     ) -> Self {
+        Self::build_wrapped_with_system(
+            scripts,
+            config,
+            initial_items,
+            hooks,
+            registry,
+            rules,
+            sync_noop,
+            wrap,
+            DEFAULT_TEST_SYSTEM,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build_wrapped_with_system(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        initial_items: Vec<Item>,
+        hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+        registry: Registry,
+        rules: Rules,
+        sync_noop: bool,
+        wrap: Option<ProviderWrap>,
+        system: &str,
+    ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
-        let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
+        let mut log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
             .expect("session log");
         if sync_noop {
             log.set_sync_noop(true);
         }
         let fsyncs = log.fsync_counter();
         let log_path = log.path().to_path_buf();
+        // Mirror the binary's `record_fresh_seed`: a session's seed is part of
+        // the projection it runs with, so it has to be part of the log too —
+        // otherwise a replay (and so any fork of this session) reconstructs the
+        // conversation one block short of what actually went on the wire.
+        for item in &initial_items {
+            log.append(&hotl_types::EntryPayload::Item { item: item.clone() }, 0)
+                .expect("seed append");
+        }
         let provider = Arc::new(ScriptedProvider::new(scripts));
         let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine_provider: Arc<dyn Provider> = match wrap {
@@ -324,7 +383,7 @@ impl Harness {
             sandbox_enforced: false,
             clock: Arc::new(SystemClock),
             log,
-            system: "test-system".into(),
+            system: system.into(),
             cwd: dir.path().to_path_buf(),
             snapshots: Some(Arc::new(RecordingSnapshotter(snapshots.clone()))),
             hooks,
@@ -1855,7 +1914,6 @@ mod tests {
     // because both build paths marked the same wrong block. The claims below
     // are about CONSECUTIVE requests — where markers land, and whether the
     // next request can still see the entry the last one wrote.
-
 
     /// An instant, permission-free, parallel-safe tool. The cache scenarios
     /// need *wide* turns (many `tool_use` blocks, many `tool_result` blocks)

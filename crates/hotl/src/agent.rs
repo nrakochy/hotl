@@ -297,6 +297,35 @@ pub(crate) fn cold_cache_note(
     ))
 }
 
+/// Commit a **fresh** session's seed — the memory and project-instruction
+/// items `initial_items` assembles — to its own log.
+///
+/// Without this the seed exists only in the actor's head, so `replay_chain`
+/// reconstructs the conversation *minus its leading context block*. That is
+/// invisible while a session is alive and fatal the moment anything replays
+/// it: a fork's inherited projection would start at the parent's first logged
+/// turn, one block short of what the parent actually sampled, and every
+/// message would sit at a different index. Not a prefix, no cache read, and a
+/// fork that has quietly forgotten the project's instructions.
+///
+/// Fresh sessions only. A resumed or forked session's items already live in
+/// an ancestor's log; re-logging them would duplicate them on the next replay.
+///
+/// INVARIANT: a session's replayed projection equals the projection it ran
+/// with. Enforced by
+/// `a_forks_first_request_extends_the_parents_last_request_byte_identically`
+/// (hotl-testkit) and `a_fresh_sessions_seed_survives_into_its_own_replay`.
+fn record_fresh_seed(log: &mut SessionLog, items: &[hotl_types::Item], now_ms: u64) {
+    for item in items {
+        // Best-effort, like the other bootstrap appends on this path: a seed
+        // that fails to commit costs replay fidelity, never the session.
+        let _ = log.append(
+            &hotl_types::EntryPayload::Item { item: item.clone() },
+            now_ms,
+        );
+    }
+}
+
 /// Create the new session's log for a fresh / resumed / forked open. The one
 /// place the ACP factory and the headless runner agree on what a fork's log
 /// starts with: the pinned lineage in the header, then the `BranchMove` seed
@@ -420,6 +449,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     }
     let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
     items.push(crate::structured::contract_item(&schema));
+    record_fresh_seed(&mut log, &items, scaffold.clock.now_ms());
     let session_id = log.session_id.clone();
     let mut handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
@@ -640,6 +670,9 @@ pub(crate) async fn build_acp() -> Result<
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+        if resumed.is_none() {
+            record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
+        }
         let handle = spawn_session_with_todos(
             (*scaffold.registry).clone(),
             Some(scaffold.spawn_registration(session_id.clone())),
@@ -741,6 +774,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     let session_id = log.session_id.clone();
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
+    record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration(session_id.clone())),
@@ -1073,6 +1107,9 @@ async fn run_session(
                                                                     // to reuse (D-A6).
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &lineage);
+    if lineage.is_none() {
+        record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
+    }
     let initial_todos = lineage
         .as_ref()
         .map(|l| l.todos.clone())
@@ -3123,6 +3160,46 @@ mod fork_tests {
         for p in [&child_path, &parent.path().to_path_buf()] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// Found by the wire-level fork proof, not by reading: `initial_items`
+    /// seed the actor's head and were never appended to the log, so
+    /// `replay_chain` reconstructed every session *minus its leading context
+    /// block*. Harmless while a session is alive; fatal to a fork, whose
+    /// projection would then start one block short of the parent's — not a
+    /// prefix, no cache read, and no memory or project instructions either.
+    #[test]
+    fn a_fresh_sessions_seed_survives_into_its_own_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = vec![
+            Item::User {
+                text: "<memory>the project uses hotl</memory>".into(),
+                synthetic: Some(hotl_types::SyntheticReason::SubagentResult),
+                images: Vec::new(),
+            },
+            Item::User {
+                text: "<project_instructions>squash-merge only</project_instructions>".into(),
+                synthetic: Some(hotl_types::SyntheticReason::SubagentResult),
+                images: Vec::new(),
+            },
+        ];
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        record_fresh_seed(&mut log, &seed, 2);
+        // The conversation the session then has.
+        push_user(&mut log, "explore the auth flow", 3);
+
+        let replayed = hotl_store::replay_chain(dir.path(), &log.session_id).unwrap();
+        assert_eq!(
+            replayed.items[..2],
+            seed[..],
+            "a fork of this session inherits the same context block the session itself ran with"
+        );
+        assert_eq!(replayed.items.len(), 3);
+
+        // And a fork of it re-seeds nothing: the block is already items 0..k
+        // of what it inherits (D-A6).
+        let forked = load_lineage(dir.path(), &log.session_id, KeepSpec::All).unwrap();
+        assert_eq!(forked.items, replayed.items);
     }
 
     #[test]
