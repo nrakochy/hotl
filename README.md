@@ -28,12 +28,14 @@ it discovers every agent across your tmux session, shows who's working and
 who's waiting, pings when one needs you, and `enter` jumps focus straight to
 it. Your attention goes where it's actually needed.
 
-**A safety floor under a gate you choose.** Four permission modes set how
-much you're asked: `auto` (default — ordinary calls run without prompting),
-`ask` (approve every mutating or executing call), `plan` (read-only until you
-approve a plan), and `dontask` (never wait for input; deny anything not
-pre-approved — the `-p`/CI posture). An unrecognized mode fails closed to
-`ask`. Underneath, regardless of mode: `bash` (and hooks, and diagnostics)
+**A safety floor under a gate you choose.** Three permission modes set how
+much you're asked: `bypass` (default — ordinary calls run without prompting),
+`ask` (approve every mutating or executing call), and `dontask` (never wait
+for input; deny anything not pre-approved — the CI posture). An unrecognized
+mode fails closed to `ask`. Plan mode is a separate toggle that composes with
+any of them: `/plan` makes `write` and `edit` always ask while leaving the
+shell and the network to the mode, so the agent can research a change without
+being able to casually make one. Underneath, regardless of mode: `bash` (and hooks, and diagnostics)
 runs confined by the kernel — Seatbelt on macOS, Landlock on Linux ≥ 6.2
 including WSL2 — with writes limited to the working directory, temp, and any
 `[sandbox].writable` directories the owner listed (never widenable from

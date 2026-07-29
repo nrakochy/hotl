@@ -78,10 +78,21 @@ pub trait Tool: Send + Sync {
         false
     }
     /// Does this tool only ever read (no filesystem mutation, no execution,
-    /// no network side effects)? Read-only tools run in plan mode; everything
-    /// else is blocked there. Like `parallel_safe`, the default is the safe
-    /// answer (false), and each read tool opts in.
+    /// no network side effects)? Read-only tools still run under `dontask`,
+    /// and they are the set a `ToolScope::ReadOnly` sub-agent gets. Like
+    /// `parallel_safe`, the default is the safe answer (false), and each read
+    /// tool opts in.
     fn read_only(&self) -> bool {
+        false
+    }
+    /// Does this tool exist to change files? Plan mode puts these on the same
+    /// footing as a protected path: always ask, never auto.
+    ///
+    /// Default false, unlike `read_only`'s safe-answer default, and
+    /// deliberately: a tool hotl cannot classify is governed by `mode` alone,
+    /// which is exactly what plan mode promises for everything it can't prove.
+    /// Defaulting true would block MCP-backed tools, which cannot know.
+    fn edits_files(&self) -> bool {
         false
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome>;

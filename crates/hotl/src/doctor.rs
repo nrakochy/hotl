@@ -259,10 +259,11 @@ fn config_check(config_dir: &Path) -> Check {
 
 fn permissions_check(config_dir: &Path) -> Check {
     let cfg = crate::config::Config::load(config_dir);
-    let (mode, warning) = cfg
-        .permissions
-        .resolve(std::env::var("HOTL_PERMISSIONS").ok().as_deref());
-    if let Some(w) = warning {
+    let resolved = cfg.permissions.resolve(
+        std::env::var("HOTL_PERMISSIONS").ok().as_deref(),
+        std::env::var("HOTL_PLAN").ok().as_deref(),
+    );
+    if let Some(w) = resolved.warning {
         return warn(format!("permissions: {w}"));
     }
     if hotl_tools::rules::enforced_build() {
@@ -275,9 +276,10 @@ fn permissions_check(config_dir: &Path) -> Check {
         Ok(None) => String::new(),
         Err(why) => return warn(format!("permissions: admin file {admin} refused — {why}")),
     };
-    let mode_word = mode.as_str();
+    let mode_word = resolved.mode.as_str();
+    let plan_note = if resolved.plan { " · plan" } else { "" };
     ok(format!(
-        "permissions: {mode_word} (protected paths always ask){admin_note}"
+        "permissions: {mode_word}{plan_note} (protected paths always ask){admin_note}"
     ))
 }
 

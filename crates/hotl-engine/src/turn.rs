@@ -1067,14 +1067,16 @@ impl Turn {
     /// the window is cleared so continuing doesn't immediately re-trigger
     /// the same warning on the very next batch.
     async fn handle_doom_loop(&mut self, uses: &[ToolUse], pattern: String) -> Option<Outcome> {
-        // Auto and DontAsk are the unattended postures: nobody is watching,
+        // Bypass and DontAsk are the unattended postures: nobody is watching,
         // and the doom guard is a malfunction brake, not a permission —
         // stop the turn instead of asking a question no one will answer.
+        // Plan is orthogonal and does not participate: plan+ask still has a
+        // human at the keyboard.
         // INVARIANT: an unattended mode never emits an unanswerable Ask.
         // Enforced by `dont_ask_mode_hard_stops_on_a_doom_loop`.
         let unattended = matches!(
             self.shared.effective_mode(),
-            hotl_tools::rules::PermissionMode::Auto | hotl_tools::rules::PermissionMode::DontAsk
+            hotl_tools::rules::PermissionMode::Bypass | hotl_tools::rules::PermissionMode::DontAsk
         );
         let stop = if unattended {
             true
@@ -1497,19 +1499,19 @@ impl Turn {
         summary: String,
         why: Option<String>,
     ) -> AskReply {
-        let protected = why.is_some();
-        let read_only = self
-            .shared
-            .registry
-            .get(&tu.name)
-            .is_some_and(|t| t.read_only());
+        let tool = self.shared.registry.get(&tu.name);
+        let facts = hotl_tools::rules::CallFacts {
+            sandbox_enforced: self.shared.sandbox_enforced,
+            protected: why.is_some(),
+            read_only: tool.as_ref().is_some_and(|t| t.read_only()),
+            edits_files: tool.as_ref().is_some_and(|t| t.edits_files()),
+        };
         match self.shared.rules.evaluate(
             self.shared.effective_mode(),
+            self.shared.effective_plan(),
             &tu.name,
             input,
-            self.shared.sandbox_enforced,
-            protected,
-            read_only,
+            facts,
         ) {
             Verdict::Auto { rule } => {
                 self.emit(EngineEvent::ToolAutoAllowed {

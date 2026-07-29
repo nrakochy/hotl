@@ -43,9 +43,12 @@ pub const DEFAULT_CONFIG: &str = "\
 # copy_on_select = true      # false stops a mouse drag copying to the clipboard
 
 [permissions]
-mode = \"auto\"   # no per-action y/N; protected paths + sandbox still guard.
-                # \"ask\" = approve every mutating/executing call. A
-                # security-enforced build ignores this key entirely.
+mode = \"bypass\"   # no per-action y/N; protected paths + sandbox still guard.
+                  # \"ask\" = approve every mutating/executing call.
+                  # \"dontask\" = never wait for input; deny what isn't
+                  # pre-approved. A security-enforced build ignores this key.
+# plan = false     # the other axis: file edits always ask, never auto —
+                  # everything else still follows `mode`. `/plan` toggles it.
 
 [skills]
 # claude = true   # false stops reading Claude Code skills (~/.claude/skills

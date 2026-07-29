@@ -51,7 +51,7 @@ Then, **for this tutorial only**, turn on per-action prompts so you see every de
 export HOTL_PERMISSIONS=ask
 ```
 
-(The out-of-the-box default is `auto`: ordinary tool calls run without asking, under the sandbox floor, with `undo` covering you. `ask` makes the gate visible, which is the point of a first session.)
+(The out-of-the-box default is `bypass`: ordinary tool calls run without asking, under the sandbox floor, with `undo` covering you. `ask` makes the gate visible, which is the point of a first session.)
 
 ## 3. Confirm the setup
 
@@ -109,7 +109,7 @@ It asks to confirm, lists the files it touched, and restores them to before the 
 
 ## You've now seen the whole loop
 
-Type a request → the agent reads freely → it **asks before changing anything** (in `ask` mode) → you approve per step → every change is snapshotted for `undo`. When you drop the `HOTL_PERMISSIONS=ask` from step 2, the default `auto` mode silences the ordinary prompts but keeps everything else: the kernel sandbox floor on `bash`, always-ask protection on execute-later paths (git hooks, shell rc, Makefiles, agent-instruction files), the full transcript of every auto-allowed call, and `undo`.
+Type a request → the agent reads freely → it **asks before changing anything** (in `ask` mode) → you approve per step → every change is snapshotted for `undo`. When you drop the `HOTL_PERMISSIONS=ask` from step 2, the default `bypass` mode silences the ordinary prompts but keeps everything else: the kernel sandbox floor on `bash`, always-ask protection on execute-later paths (git hooks, shell rc, Makefiles, agent-instruction files), the full transcript of every auto-allowed call, and `undo`.
 
 **Next:**
 - Staying in `ask` mode but tired of approving trusted commands every time? → allow-rules in [configuration.md](../configuration/#allow-rules-allow).

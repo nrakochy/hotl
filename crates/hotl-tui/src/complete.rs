@@ -29,7 +29,7 @@ pub struct Completion {
 /// are hand-written here because built-ins have no roster to read them from.
 const BUILTINS: [(&str, &str); 9] = [
     ("rename", "name this session"),
-    ("plan", "switch to plan mode"),
+    ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
     ("reload", "re-read config.toml"),
     ("help", "show the key bindings"),

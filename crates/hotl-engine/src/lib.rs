@@ -522,6 +522,9 @@ pub enum SessionCmd {
     /// Set the session's effective permission mode (durable: appended to the
     /// log as `ModeSet`; takes effect immediately — no `Rules` reallocation).
     SetMode(PermissionMode),
+    /// Toggle plan mode, the second permission axis (durable: appended to the
+    /// log as `PlanSet`; takes effect immediately, same shape as `SetMode`).
+    SetPlan(bool),
     /// Full-state replace of the `todo_write` checklist (durable: appended
     /// to the log as `Todos`, last-wins on replay — same shape as
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
@@ -679,6 +682,11 @@ impl SessionHandle {
     /// flips an atomic, it never reallocates `Rules`.
     pub async fn set_mode(&self, mode: PermissionMode) {
         let _ = self.cmd.send(SessionCmd::SetMode(mode)).await;
+    }
+    /// Toggle plan mode durably (a `plan_set` log entry; last one wins).
+    /// Immediate, atomic-backed, same as [`Self::set_mode`].
+    pub async fn set_plan(&self, plan: bool) {
+        let _ = self.cmd.send(SessionCmd::SetPlan(plan)).await;
     }
     /// Full-state replace of the todo checklist (a durable `todos` log
     /// entry). Exposed mainly for tests that pre-seed a list; the real

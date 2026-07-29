@@ -156,10 +156,15 @@ fn print_help() {
          hotl undo            restore files to before the agent's last change\n  \
          hotl fleet           reserved (orchestrate)\n  \
          hotl --version       print the version (-V, or `hotl version`)\n\n\
+         PERMISSIONS: [permissions] mode = bypass (default, no per-action y/N) | ask |\n  \
+         dontask (deny anything not pre-approved). `--plan` (or /plan, HOTL_PLAN=1) is a\n  \
+         separate axis that composes with any mode: write/edit always ask, while bash,\n  \
+         MCP, and the web tools still follow the mode.\n\n\
          CONFIG: ~/.config/hotl/config.toml (one file: [provider] [context] [behavior]\n  \
-         [retention], plus [[allow]] [[mcp]] [[hook]] [diagnostics]). Env vars override\n  \
-         (HOTL_MODEL, ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL,\n  \
-         HOTL_SANDBOX=off). Run `hotl setup` to write a starter.\n\n\
+         [permissions] [retention], plus [[allow]] [[mcp]] [[hook]] [diagnostics]). Env\n  \
+         vars override (HOTL_MODEL, ANTHROPIC_API_KEY / OPENAI_API_KEY,\n  \
+         HOTL_OPENAI_BASE_URL, HOTL_PERMISSIONS, HOTL_PLAN, HOTL_SANDBOX=off). Run\n  \
+         `hotl setup` to write a starter.\n\n\
          TUI: type to prompt · type mid-turn to steer · y/n answers asks · ? help · ctrl-c quits"
     );
 }

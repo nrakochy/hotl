@@ -29,6 +29,10 @@ pub(crate) struct Resumed {
     /// inheritance shape as the display name). `None` = the parent never
     /// left its startup default, so the resumed session keeps its own.
     pub mode: Option<String>,
+    /// The parent's last `PlanSet`, if any — the other permission axis, same
+    /// inheritance shape. `None` = never set, so the resumed session falls
+    /// back to a legacy `mode: "plan"` if present, else its own default.
+    pub plan: Option<bool>,
     /// The parent's last `Todos` snapshot, if any (durable, last-wins —
     /// same inheritance shape as `mode`/`name`). Empty = the parent never
     /// had a list, so the resumed session starts with none, same as fresh.
@@ -40,6 +44,12 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         Ok(parsed) => parsed,
         Err(code) => return code,
     };
+    // Same shape as `behavior.sandbox` → `HOTL_SANDBOX` below: the flag rides
+    // the env var `load_rules` already consults, rather than threading a bool
+    // through every session-construction signature.
+    if parsed.plan {
+        std::env::set_var("HOTL_PLAN", "1");
+    }
     match (parsed.schema, parsed.prompt) {
         (Some(schema), Some(prompt)) => match prompt.resolve() {
             Ok(text) => structured_main(&text, &schema, parsed.name).await,
@@ -119,7 +129,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         Some(scaffold.spawn_registration()),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, None, items, None, Vec::new());
+            let mut deps = scaffold.deps(log, None, items, None, None, Vec::new());
             deps.registry = registry;
             deps
         },
@@ -214,6 +224,7 @@ pub(crate) async fn build_acp() -> Result<
     let info = crate::acp::ServerInfo {
         skills,
         default_mode: scaffold.rules.mode().as_str().to_string(),
+        default_plan: scaffold.rules.plan(),
         context_window: scaffold.config.context_window,
         model: scaffold.model.clone(),
     };
@@ -243,6 +254,7 @@ pub(crate) async fn build_acp() -> Result<
                     items,
                     name: inherited,
                     mode,
+                    plan,
                     todos,
                     ..
                 } = replayed;
@@ -253,6 +265,7 @@ pub(crate) async fn build_acp() -> Result<
                         parent_id: header.session_id,
                         items,
                         mode,
+                        plan,
                         todos,
                     }),
                     name,
@@ -285,17 +298,37 @@ pub(crate) async fn build_acp() -> Result<
         let mode_override = inherited_mode
             .as_deref()
             .and_then(hotl_tools::rules::PermissionMode::from_str);
+        // A log written before plan became its own axis says `mode: "plan"`.
+        // That turns the overlay on and leaves the mode alone — it never
+        // named one. An explicit `PlanSet` (newer log) outranks it.
+        let legacy_plan = inherited_mode
+            .as_deref()
+            .is_some_and(hotl_tools::rules::is_legacy_plan_word);
+        let plan_override = resumed
+            .as_ref()
+            .and_then(|r| r.plan)
+            .or(legacy_plan.then_some(true));
         if let Some(m) = inherited_mode {
             // Re-log the *coerced* mode so a `security-enforced` build's log
-            // never claims `auto` while the session actually runs `ask` —
+            // never claims `bypass` while the session actually runs `ask` —
             // mirroring the runtime `SetMode` path. A recognized mode passes
             // through `enforced_mode`; an unrecognized (future) mode copies
             // forward verbatim, since we can't coerce what we can't parse.
-            let logged = mode_override
-                .map(|pm| hotl_tools::rules::enforced_mode(pm).as_str().to_string())
-                .unwrap_or(m);
+            // A legacy `"plan"` is *not* copied forward as a mode: it is
+            // re-logged below as the `PlanSet` it now means.
+            if !legacy_plan {
+                let logged = mode_override
+                    .map(|pm| hotl_tools::rules::enforced_mode(pm).as_str().to_string())
+                    .unwrap_or(m);
+                let _ = log.append(
+                    &hotl_types::EntryPayload::ModeSet { mode: logged },
+                    scaffold.clock.now_ms(),
+                );
+            }
+        }
+        if let Some(p) = plan_override {
             let _ = log.append(
-                &hotl_types::EntryPayload::ModeSet { mode: logged },
+                &hotl_types::EntryPayload::PlanSet { on: p },
                 scaffold.clock.now_ms(),
             );
         }
@@ -318,6 +351,7 @@ pub(crate) async fn build_acp() -> Result<
             .unwrap_or_else(|| scaffold.rules.mode())
             .as_str()
             .to_string();
+        let plan = plan_override.unwrap_or_else(|| scaffold.rules.plan());
         let session_id = log.session_id.clone();
         let (snapshots, initial) =
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
@@ -326,8 +360,14 @@ pub(crate) async fn build_acp() -> Result<
             Some(scaffold.spawn_registration()),
             scaffold.hooks.clone(),
             |registry| {
-                let mut deps =
-                    scaffold.deps(log, snapshots, initial, mode_override, inherited_todos);
+                let mut deps = scaffold.deps(
+                    log,
+                    snapshots,
+                    initial,
+                    mode_override,
+                    plan_override,
+                    inherited_todos,
+                );
                 deps.registry = registry;
                 deps
             },
@@ -336,6 +376,7 @@ pub(crate) async fn build_acp() -> Result<
             handle,
             name: requested,
             mode,
+            plan,
             // This log's own id — the one a later `session/load` (and so
             // `session/reload_config`) must name to replay this chain.
             session_id,
@@ -420,7 +461,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         Some(scaffold.spawn_registration()),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, snapshots, initial_items, None, Vec::new());
+            let mut deps = scaffold.deps(log, snapshots, initial_items, None, None, Vec::new());
             deps.registry = registry;
             deps
         },
@@ -618,11 +659,21 @@ impl Scaffold {
         snapshots: Option<Arc<dyn hotl_engine::Snapshotter>>,
         initial_items: Vec<hotl_types::Item>,
         mode_override: Option<hotl_tools::rules::PermissionMode>,
+        plan_override: Option<bool>,
         initial_todos: Vec<hotl_types::Todo>,
     ) -> SessionDeps {
-        let rules = match mode_override {
-            Some(m) => Arc::new((*self.rules).clone().with_mode(m)),
-            None => self.rules.clone(),
+        let rules = match (mode_override, plan_override) {
+            (None, None) => self.rules.clone(),
+            (m, p) => {
+                let mut r = (*self.rules).clone();
+                if let Some(m) = m {
+                    r = r.with_mode(m);
+                }
+                if let Some(p) = p {
+                    r = r.with_plan(p);
+                }
+                Arc::new(r)
+            }
         };
         SessionDeps {
             provider: self.provider.clone(),
@@ -710,7 +761,7 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
         Some(scaffold.spawn_registration()),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, snapshots, initial_items, None, Vec::new());
+            let mut deps = scaffold.deps(log, snapshots, initial_items, None, None, Vec::new());
             deps.registry = registry;
             deps
         },
@@ -1339,10 +1390,12 @@ pub(crate) const ADMIN_RULES_PATH: &str = "/etc/hotl/preapproved.toml";
 fn load_rules(cfg: &crate::config::Config) -> Arc<Rules> {
     let admin_path = std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| ADMIN_RULES_PATH.into());
     let env_mode = std::env::var("HOTL_PERMISSIONS").ok();
+    let env_plan = std::env::var("HOTL_PLAN").ok();
     let (rules, warnings) = load_rules_with(
         cfg,
         Some(std::path::Path::new(&admin_path)),
         env_mode.as_deref(),
+        env_plan.as_deref(),
     );
     for w in warnings {
         eprintln!("hotl: {w}");
@@ -1356,6 +1409,7 @@ fn load_rules_with(
     cfg: &crate::config::Config,
     admin_path: Option<&std::path::Path>,
     env_mode: Option<&str>,
+    env_plan: Option<&str>,
 ) -> (Arc<Rules>, Vec<String>) {
     let mut warnings = Vec::new();
     let mut rules = match cfg.allow_toml() {
@@ -1365,16 +1419,19 @@ fn load_rules_with(
         }),
         None => Rules::default(),
     };
-    let (mode, mode_warning) = cfg.permissions.resolve(env_mode);
-    warnings.extend(mode_warning);
-    if hotl_tools::rules::enforced_build() && mode == hotl_tools::rules::PermissionMode::Auto {
+    let resolved = cfg.permissions.resolve(env_mode, env_plan);
+    warnings.extend(resolved.warning);
+    if hotl_tools::rules::enforced_build()
+        && resolved.mode == hotl_tools::rules::PermissionMode::Bypass
+    {
         warnings.push(
-            "permissions.mode=auto requested, but this is a security-enforced build — \
+            "permissions.mode=bypass requested, but this is a security-enforced build — \
              per-action asks stay on"
                 .into(),
         );
     }
-    rules = rules.with_mode(mode); // enforced builds coerce Auto→Ask inside
+    rules = rules.with_mode(resolved.mode); // enforced builds coerce Bypass→Ask inside
+    rules = rules.with_plan(resolved.plan);
     if let Some(path) = admin_path {
         match load_admin(path) {
             Ok(Some(admin)) => rules.merge_admin(admin),
@@ -1650,6 +1707,8 @@ struct Args {
     json_events: bool,
     schema: Option<PathBuf>,
     name: Option<String>,
+    /// `--plan`: start with the plan overlay on, whatever the mode resolves to.
+    plan: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
@@ -1657,6 +1716,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut json_events = false;
     let mut schema: Option<PathBuf> = None;
     let mut name: Option<String> = None;
+    let mut plan = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1674,6 +1734,9 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
                 })
             }
             "--json" => json_events = true,
+            // The plan axis, not a mode: `--plan` composes with whatever
+            // `[permissions] mode` resolves to, headless or interactive.
+            "--plan" => plan = true,
             "--json-schema" => schema = iter.next().map(PathBuf::from),
             "-n" | "--name" => {
                 match iter
@@ -1703,6 +1766,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         json_events,
         schema,
         name,
+        plan,
     })
 }
 
@@ -2917,32 +2981,27 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o666)).unwrap();
         let (rules, warnings) =
-            load_rules_with(&crate::config::Config::default(), Some(&admin), None);
+            load_rules_with(&crate::config::Config::default(), Some(&admin), None, None);
         assert!(
             warnings.iter().any(|w| w.contains("preapproved")),
             "warnings: {warnings:?}"
         );
-        // Refused file contributes nothing; mode default auto still applies.
+        // Refused file contributes nothing; the bypass default still applies.
         assert!(matches!(
-            rules.evaluate(
-                rules.mode(),
-                "bash",
-                &serde_json::json!({"command": "git status"}),
-                true,
-                false,
-                false
-            ),
-            hotl_tools::rules::Verdict::Auto { rule } if rule == "permissions.mode=auto"
+            rules.evaluate(rules.mode(), false, "bash", &serde_json::json!({"command": "git status"}), hotl_tools::rules::CallFacts { sandbox_enforced: true, protected: false, read_only: false, edits_files: false }),
+            hotl_tools::rules::Verdict::Auto { rule } if rule == "permissions.mode=bypass"
         ));
         // Absent file: no warning, auto default.
         let (_, warnings) = load_rules_with(
             &crate::config::Config::default(),
             Some(&dir.path().join("nope.toml")),
             None,
+            None,
         );
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
         // Explicit ask via the env seam.
-        let (rules, _) = load_rules_with(&crate::config::Config::default(), None, Some("ask"));
+        let (rules, _) =
+            load_rules_with(&crate::config::Config::default(), None, Some("ask"), None);
         assert_eq!(rules.mode(), hotl_tools::rules::PermissionMode::Ask);
     }
 

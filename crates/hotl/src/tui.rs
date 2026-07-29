@@ -99,6 +99,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         name: session_name,
         skills,
         mode,
+        plan,
         context_window,
     } = opened;
     let mut state = State::new(settings.vim_mode, model);
@@ -106,6 +107,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     // Server-side truth, seeded before the first draw: the badge must never
     // render a mode the session is not actually running (evaluation §5.7).
     state.mode = mode;
+    state.plan = plan;
     state.context_window = context_window;
     state.set_skills(skills);
     state.density = settings.density;
@@ -136,19 +138,24 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
 /// over the server default (a resumed session inherits and coerces its own);
 /// both fall back so a newer client against an older server still runs — it
 /// simply shows the library default instead of guessing.
-fn open_settings(hello: &Value, opened: &Value) -> (String, u64) {
+fn open_settings(hello: &Value, opened: &Value) -> (String, bool, u64) {
     let mode = opened
         .get("mode")
         .or_else(|| hello.get("defaultMode"))
         .and_then(Value::as_str)
         .unwrap_or("ask")
         .to_string();
+    let plan = opened
+        .get("plan")
+        .or_else(|| hello.get("defaultPlan"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let window = hello
         .get("contextWindow")
         .and_then(Value::as_u64)
         .filter(|&w| w > 0)
         .unwrap_or(hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
-    (mode, window)
+    (mode, plan, window)
 }
 
 /// The half of `config.toml` no server knows about: everything the console
@@ -202,6 +209,7 @@ struct Opened {
     name: Option<String>,
     skills: Vec<(String, String)>,
     mode: String,
+    plan: bool,
     context_window: u64,
 }
 
@@ -225,11 +233,12 @@ async fn handshake(
         }
     };
     let v = wait_response(reader, open).await?;
-    let (mode, context_window) = open_settings(&hello, &v);
+    let (mode, plan, context_window) = open_settings(&hello, &v);
     Ok(Opened {
         name: v.get("name").and_then(Value::as_str).map(String::from),
         skills,
         mode,
+        plan,
         context_window,
     })
 }
@@ -625,6 +634,9 @@ fn parse_tui_args(args: &[String]) -> Result<TuiArgs, i32> {
                     }
                 }
             }
+            // Start with the plan overlay on; `/plan` toggles it after. Rides
+            // the env var `load_rules` reads, same as the headless `--plan`.
+            "--plan" => std::env::set_var("HOTL_PLAN", "1"),
             flag if flag.starts_with('-') => {
                 eprintln!("hotl: unknown argument `{flag}` (try --help)");
                 return Err(2);
@@ -840,12 +852,12 @@ mod tests {
     fn handshake_reads_the_mode_and_context_window() {
         let hello = json!({"defaultMode": "auto", "contextWindow": 1_000_000});
         let opened = json!({"sessionId": "s", "name": null, "mode": "plan"});
-        let (mode, window) = super::open_settings(&hello, &opened);
+        let (mode, _plan, window) = super::open_settings(&hello, &opened);
         assert_eq!(mode, "plan", "the session's mode beats the server default");
         assert_eq!(window, 1_000_000);
 
         // An older server that reports neither must not brick the client.
-        let (mode, window) = super::open_settings(&json!({}), &json!({}));
+        let (mode, _plan, window) = super::open_settings(&json!({}), &json!({}));
         assert_eq!(mode, "ask");
         assert_eq!(window, hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
     }

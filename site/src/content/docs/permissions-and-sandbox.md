@@ -7,42 +7,72 @@ The *why* behind hotl's safety model: what the y/N gate, protected paths, allow-
 
 ## The one control that matters: you choose when to approve
 
-hotl has four prompt modes, all routed through the same evaluation
-pipeline (deny rules and the protected-path floor apply identically to
-all of them). **`auto` (the default): ordinary tool calls run without
-asking.** The floor still holds: `bash` runs inside the kernel sandbox,
-writes to execute-later paths (git hooks, Makefiles, shell rc,
-agent-instruction files, hotl's own config) always stop and ask, deny rules
-refuse outright, every silenced prompt appears in the transcript as an
-auto-allow with its granting rule, and `hotl undo` reverses any change.
-**`ask`: every mutating or executing call asks y/N first** — set
-`[permissions] mode = "ask"` (or `HOTL_PERMISSIONS=ask`) if you want the
-human on every loop. When there's no human — headless `-p`, sub-agents, a
-timed-out interactive prompt — an ask becomes an automatic **no**, in every
-mode.
+Permissions have **two independent axes**. The *mode* says how a call is
+handled; *plan mode* says what posture you're in. Both route through the same
+evaluation pipeline, and deny rules and the protected-path floor apply
+identically no matter where you set them.
 
-**`plan`: read-only until you approve a plan.** Every tool that isn't
-structurally read-only (`read`, `glob`, `grep`, `recall`) is denied outright
-— the agent can explore and propose, but can't edit, write, run `bash`, or
-otherwise mutate anything, no matter what an `[[allow]]` rule says. Once the
-agent has proposed a plan you're happy with, switch out of plan mode
-(`/plan` again, `/mode auto`, or `session/set_mode` over ACP) and the agent
-continues from where it left off, now able to act. The mode switch is a
-durable log entry, so `hotl resume` restores whichever mode a session was
-last left in. Because plan mode is strictly read-only, it's also a genuinely
-safe unattended posture for read-only analysis: `hotl -p --plan "audit X"`
-can't mutate anything, sandbox or no sandbox.
+### The mode: how a call is handled
+
+**`bypass` (the default): ordinary tool calls run without asking.** The floor
+still holds: `bash` runs inside the kernel sandbox, writes to execute-later
+paths (git hooks, Makefiles, shell rc, agent-instruction files, hotl's own
+config) always stop and ask, deny rules refuse outright, every silenced prompt
+appears in the transcript as an auto-allow with its granting rule, and
+`hotl undo` reverses any change. It's named for what it does to the gate — it
+bypasses it — because that's a trust decision, not a convenience.
+
+**`ask`: every mutating or executing call asks y/N first** — set
+`[permissions] mode = "ask"` (or `HOTL_PERMISSIONS=ask`) if you want the human
+on every loop. When there's no human — headless `-p`, sub-agents, a timed-out
+interactive prompt — an ask becomes an automatic **no**, in every mode.
 
 **`dontask`: never wait for input.** Anything that would normally prompt is
 denied instead of asked — allow-rules and read-only tools still run, but
-nothing pauses for a human who isn't there. This is the right posture for
-`-p`/CI: a script that hits an unapproved action should fail loudly, not
-hang waiting on a prompt nobody will answer.
+nothing pauses for a human who isn't there. This is the right posture for CI:
+a script that hits an unapproved action should fail loudly, not hang waiting
+on a prompt nobody will answer.
 
-`plan` and `dontask` are strictly stricter than `ask` — they only ever
-*deny more* than the default pipeline would, never less — so a
-`security-enforced` build (which forces `auto` back to `ask`) leaves them
-alone.
+`dontask` is strictly stricter than `ask` — it only ever *denies more* than
+the default pipeline would, never less — so a `security-enforced` build (which
+forces `bypass` back to `ask`) leaves it alone.
+
+> `auto` was the old name for `bypass`. It still parses, in config files and
+> in session logs, and always will.
+
+### Plan mode: the other axis
+
+**`plan` puts `write` and `edit` on the same footing as a protected path:
+always ask, never auto.** Everything else — `bash`, MCP servers, `web_fetch`,
+`web_search` — takes the mode exactly as it would without plan on. So the
+agent can shell out, hit your issue tracker, and read a docs page while it
+works out what to propose, and still stops before it changes a file.
+
+Toggle it with `/plan` (or `/plan on` / `/plan off`), `--plan` on the command
+line, `[permissions] plan = true`, `HOTL_PLAN=1`, or `session/set_plan` over
+ACP. It composes with whichever mode you're in:
+
+| | `ask` | `bypass` | `dontask` |
+|---|---|---|---|
+| **plan off** | prompt per mutating call | run without prompting | allow-rule or refuse |
+| **plan on** | same as `ask` | shell and network run freely, **file edits stop and ask** | **file edits refused** (no one to say yes) |
+
+The toggle is a durable log entry, so `hotl resume` restores both axes as you
+left them. An `[[allow]]` rule on `write` or `edit` cannot auto-approve while
+plan is on — plan's floor sits above the allow tiers, the one thing it keeps
+from the days when it was a hard block.
+
+**Plan mode is a posture, not a boundary.** It is not a guarantee that your
+tree is untouched: `bash` follows the mode, so under plan+`bypass` a shell
+redirect (`printf … > src/main.rs`) changes a file without ever touching the
+`write` tool. What plan buys you is that the agent's *natural* path to a
+mutation stops for a human first, and that a shell doing it instead is
+conspicuous in the transcript. If you need something genuinely unable to
+mutate, that's `dontask` with no allow-rules — not plan.
+
+> `/mode plan` was valid before plan became its own axis. It now points you at
+> `/plan`, and a session log or config carrying `mode = "plan"` turns the
+> overlay on rather than reading as a typo.
 
 Admins who need `ask` guaranteed compile with `--features security-enforced`:
 that build ignores the mode key entirely (honestly: it's organizational
@@ -56,7 +86,7 @@ Everything else below exists to make that gate trustworthy: to keep an approved 
 
 ### `ask_user` is not a permission gate
 
-The `ask_user` tool ([configuration.md](../configuration/#built-in-tools)) puts a structured multiple-choice question to you — a header, a prompt, 2–4 options, plus free text. It looks like another y/N moment but it isn't one: **it never authorizes a tool call.** The answer becomes a plain-text tool result, the same shape a `read` returns, and nothing about that text can grant permission for a later mutating call — a model cannot launder an edit or a shell command through a question. That's also why its own permission is `None` and it runs even in `plan` mode: answering a question changes nothing on disk. Like an ordinary ask, a question with no human to answer it — headless `-p`, JSON mode, a sub-agent — never hangs: it resolves immediately to a documented "no human available" default the model can act on.
+The `ask_user` tool ([configuration.md](../configuration/#built-in-tools)) puts a structured multiple-choice question to you — a header, a prompt, 2–4 options, plus free text. It looks like another y/N moment but it isn't one: **it never authorizes a tool call.** The answer becomes a plain-text tool result, the same shape a `read` returns, and nothing about that text can grant permission for a later mutating call — a model cannot launder an edit or a shell command through a question. That's also why its own permission is `None` and it runs under plan mode: answering a question changes nothing on disk. Like an ordinary ask, a question with no human to answer it — headless `-p`, JSON mode, a sub-agent — never hangs: it resolves immediately to a documented "no human available" default the model can act on.
 
 ### Approved work runs concurrently where that's safe
 
@@ -93,7 +123,7 @@ The widening cannot be turned against hotl itself: an entry that would expose ho
 The floor is real on both platforms, but they are not equivalent, and the differences are worth knowing before you rely on one:
 
 - **Linux needs kernel ≥ 6.2** for the full floor. Below that (RHEL 9's 5.14, Ubuntu 22.04's 5.15) Landlock exists but lacks the *truncate* right, so an approved command can still zero a file anywhere on the host. hotl refuses to certify that as enforced: those kernels lose `bash` auto-allow unless you set `HOTL_SANDBOX=best-effort`, which accepts the partial floor and labels every ask `sandboxed:landlock(partial)`. Landlock's network confinement separately needs ≥ 6.7.
-- **Unix-domain sockets are a network operation, not a file write**, so the write floor never covered them. On macOS the container-daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) is denied by default — reaching the Docker API is a complete escape, since it can mount the host root — and `HOTL_UNIX_SOCKETS=open` opts back in, marked `unix:open` in every ask. `ssh-agent`/`gpg-agent` stay reachable so `git push` over SSH keeps working. **On Linux none of this is enforceable**: Landlock has no rule covering a connect to a pathname socket at any ABI. If a writable daemon socket is a privilege boundary you depend on, don't run `mode = "auto"` on that host.
+- **Unix-domain sockets are a network operation, not a file write**, so the write floor never covered them. On macOS the container-daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) is denied by default — reaching the Docker API is a complete escape, since it can mount the host root — and `HOTL_UNIX_SOCKETS=open` opts back in, marked `unix:open` in every ask. `ssh-agent`/`gpg-agent` stay reachable so `git push` over SSH keeps working. **On Linux none of this is enforceable**: Landlock has no rule covering a connect to a pathname socket at any ABI. If a writable daemon socket is a privilege boundary you depend on, don't run `mode = "bypass"` on that host.
 - **macOS also denies Apple Events** from a confined command, because `osascript -e 'tell application "Terminal" to do script …'` runs its payload in a process that isn't a descendant of the sandbox — an escape that never touches disk. Plain AppleScript still runs; only the cross-application send is refused. `HOTL_MACOS_AUTOMATION=allow` restores Xcode/Simulator flows that drive tools this way, marked `automation:allow`.
 
 ### Your provider key doesn't reach the commands you approve
@@ -127,7 +157,7 @@ Two targets get stricter treatment:
 - **Cloud instance-metadata addresses** (`169.254.169.254` and its siblings) are refused outright, on the first hop and on every redirect hop. On a cloud VM that endpoint hands out instance credentials to anything that asks, and nothing legitimate needs an agent to read it. `HOTL_WEB_ALLOW_METADATA=1` exists if you genuinely do.
 - **A redirect from the public web into your private network is refused.** You approved hop one; hop two into `10.0.0.5` or `127.0.0.1` is a target you never saw. An allowed public host could otherwise 302 into an internal service and return its response into the model's context. A chain that *starts* private is fine — "fetch `http://localhost:3000` and tell me what's wrong" is a real workflow, and that target was on screen when you approved it.
 
-Fetching a private or loopback address directly still works, but it is a **protected** ask: it prompts in every mode, including the default `auto`, the same way a write to an execute-later path does.
+Fetching a private or loopback address directly still works, but it is a **protected** ask: it prompts in every mode, including the default `bypass`, the same way a write to an execute-later path does.
 
 One honest limit: the classification reads literal addresses. A *hostname* that resolves into private space on a redirect hop isn't caught, because the decision has to be made without doing a DNS lookup.
 
@@ -150,7 +180,7 @@ The practical consequences:
 - **`read` outside the working directory is a protected ask.** An absolute
   path, a `..` escape, or a path that leaves through a symlink prompts — and
   it is *protected*, so it prompts in **every** mode, including the default
-  `auto`. This is the one deliberate exception to "ordinary tool calls run
+  `bypass`. This is the one deliberate exception to "ordinary tool calls run
   without asking", and it is deliberate for a plain reason: an ordinary ask
   is auto-approved under the shipped default, so it would have protected
   nothing.
@@ -177,7 +207,7 @@ boundary above ignores `[sandbox].writable` — those directories are writable
 to *bash*, not to the file tools. `file_tools = "writable"` in `[sandbox]`
 is the deliberate, documented step that extends the boundary: a `write` or
 `edit` whose path lands under a listed directory becomes an **ordinary** ask
-(the same tier as an in-workspace write, so `mode = "auto"` approves it)
+(the same tier as an in-workspace write, so `mode = "bypass"` approves it)
 instead of a protected one, and runs through the same fd-descent,
 symlink-refusing guard as workspace writes — anchored at that directory. Two
 things never change: a path outside both the workspace and the listed

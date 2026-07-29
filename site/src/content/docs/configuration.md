@@ -59,12 +59,15 @@ max_turns = 100            # model steps one prompt may spend (a tool round-trip
                            # done, the context fills, or you interrupt.
 
 [permissions]
-mode = "auto"   # "auto" | "ask" | "plan" | "dontask"
-                # auto: no per-action y/N; protected paths + sandbox still guard.
-                # ask: approve every mutating/executing call.
-                # plan: read-only until you approve a plan (see permissions-and-sandbox.md).
-                # dontask: never wait for input — deny anything not pre-approved (the -p/CI posture).
-                # A security-enforced build ignores this key entirely (ask stays on).
+mode = "bypass"   # "bypass" | "ask" | "dontask"  ("auto" = the old name for bypass)
+                  # bypass: no per-action y/N; protected paths + sandbox still guard.
+                  # ask: approve every mutating/executing call.
+                  # dontask: never wait for input — deny anything not pre-approved (CI).
+                  # A security-enforced build ignores this key entirely (ask stays on).
+plan = false      # the other axis, independent of mode: write/edit always ask,
+                  # never auto — everything else still follows `mode`.
+                  # `/plan`, `--plan`, or HOTL_PLAN=1 toggle it. See
+                  # permissions-and-sandbox.md.
 
 [network]
 egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
@@ -144,7 +147,7 @@ feel; it's opt-in, the default stays `tokyo-night`.
 
 ### Reloading without restarting
 
-`config.toml` is read at startup. In the console, `/reload` re-reads it and rebuilds the engine against the new file, keeping the session — the transcript, the model's context, the todos, the session name and its permission mode all carry forward. `hotl acp` clients reach the same thing as `session/reload_config`.
+`config.toml` is read at startup. In the console, `/reload` re-reads it and rebuilds the engine against the new file, keeping the session — the transcript, the model's context, the todos, the session name, its permission mode, and plan mode all carry forward. `hotl acp` clients reach the same thing as `session/reload_config`.
 
 Most of the file reloads: `[provider]`, `[[allow]]`, `[[mcp]]`, `[[hook]]`, `[diagnostics]`, `[skills]`, `[agents]`, `[context]`, `[behavior]`, `[settings]`, `system-prompt.md`. A reload that fails to parse or to select a provider changes nothing and says so — the running engine keeps serving.
 
@@ -210,7 +213,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 
 `todo_write` is session-scoped ephemeral context, not part of the model transcript: the current list rides into every request as a tagged reminder, but it never becomes part of the durable conversation the model reads back verbatim. A text-only reply with `pending`/`in_progress` items still open gets nudged to finish or update the list — bounded to at most two nudges per prompt, so it can never wedge an unattended run. Sub-agents spawned with the `spawn` tool get their own independent list, wired to their own session.
 
-`ask_user`'s permission is `None` for a specific reason, not an oversight: it is **not a permission gate**. It's a plain data-gathering round-trip — the human's answer becomes a text tool result, exactly like a `read` — so it never authorizes any mutating action on its own (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). It runs during plan mode for the same reason `read`/`glob`/`grep` do: asking a clarifying question changes nothing on disk. Headless (`-p`) and JSON-mode runs have no one to ask, so the question always resolves — never hangs — to a documented "no human available" answer the model can act on. See [tui.md](../tui/#questions) for the console picker.
+`ask_user`'s permission is `None` for a specific reason, not an oversight: it is **not a permission gate**. It's a plain data-gathering round-trip — the human's answer becomes a text tool result, exactly like a `read` — so it never authorizes any mutating action on its own (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). It runs under plan mode for the same reason `read`/`glob`/`grep` do: asking a clarifying question changes nothing on disk. Headless (`-p`) and JSON-mode runs have no one to ask, so the question always resolves — never hangs — to a documented "no human available" answer the model can act on. See [tui.md](../tui/#questions) for the console picker.
 
 ### Environment variables
 
@@ -226,7 +229,8 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. Leave unset to get the [per-model window](#context-window-context-window). |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
-| `HOTL_PERMISSIONS` | `[permissions].mode` | `auto` (default: no per-action asks) \| `ask` \| `plan` \| `dontask`; a typo fails closed to `ask`. |
+| `HOTL_PERMISSIONS` | `[permissions].mode` | `bypass` (default: no per-action asks) \| `ask` \| `dontask`; `auto` still parses as `bypass`, and a typo fails closed to `ask`. |
+| `HOTL_PLAN` | `[permissions].plan` | Any value but `0`/`false`/empty turns plan mode on. |
 | `HOTL_SANDBOX` | `[behavior].sandbox` | `off` disables the bash sandbox floor. `best-effort` accepts a *partial* Linux floor on kernels 5.13–6.1 (no truncate right); every ask is then labeled `sandboxed:landlock(partial)`. Unset is the hardened default. |
 | `HOTL_SANDBOX_PROBE_DIR` | — | Where the startup smoke test writes its probe file. Must be writable and outside the whole write set — the working directory, `TMPDIR`, and any `[sandbox].writable` entry. Only needed on hosts where neither `/var/tmp` nor `$HOME` qualifies — otherwise the sandbox reports itself unavailable rather than unproven. |
 | `HOTL_UNIX_SOCKETS` | — | `open` lifts the macOS deny on the container/orchestrator daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) for docker-in-the-loop workflows. Marks every ask `unix:open`. No effect on Linux, where the deny is not expressible. |
@@ -295,7 +299,7 @@ file_tools = "workspace"   # optional; see below
 
 The startup probe that certifies the sandbox stays honest: its outside-the-floor target is chosen outside the *widened* set, so an `Enforced` verdict always describes the floor your commands actually get. `hotl doctor` prints the resolved list and every validation warning.
 
-`file_tools` is a separate, deliberate step. By default (`"workspace"`) the `write`/`edit` file tools stay confined to the working directory — `writable` only widens what *spawned processes* (bash, grep, diagnostics, hooks) may write. Set `file_tools = "writable"` to let `write`/`edit` operate under the `writable` roots too: those writes become ordinary asks (the same tier as an in-workspace write, so `mode = "auto"` approves them), they go through the same symlink-refusing descent as workspace writes, and protected filenames ([protected paths](../permissions-and-sandbox/#protected-paths)) still escalate. An unknown value falls back to `"workspace"` with a warning.
+`file_tools` is a separate, deliberate step. By default (`"workspace"`) the `write`/`edit` file tools stay confined to the working directory — `writable` only widens what *spawned processes* (bash, grep, diagnostics, hooks) may write. Set `file_tools = "writable"` to let `write`/`edit` operate under the `writable` roots too: those writes become ordinary asks (the same tier as an in-workspace write, so `mode = "bypass"` approves them), they go through the same symlink-refusing descent as workspace writes, and protected filenames ([protected paths](../permissions-and-sandbox/#protected-paths)) still escalate. An unknown value falls back to `"workspace"` with a warning.
 
 ### Web tools (`web_fetch` / `web_search`, `[web]`)
 

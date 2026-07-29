@@ -137,7 +137,8 @@ Optional `~/.config/hotl/config.toml` (absent → sensible defaults):
     vim_mode = false               # agent console: true = modal vim input editor
 
     [permissions]
-    mode = "auto"                  # agent: "ask" = y/n on every mutating call
+    mode = "bypass"                # agent: "ask" = y/n on every mutating call
+    plan = false                   # agent: write/edit always ask (other axis)
 
     [sandbox]
     writable = ["~/.bazel_disk_cache"]   # agent: extra dirs sandboxed commands

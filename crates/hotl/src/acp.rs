@@ -105,6 +105,10 @@ pub struct SessionOpen {
     /// INVARIANT: equals what the engine's `Rules` will actually enforce.
     /// Enforced by `tests/acp_protocol.rs::the_session_reports_its_effective_mode`.
     pub mode: String,
+    /// Plan mode at open — the axis orthogonal to `mode`, inherited from the
+    /// resumed chain (a `PlanSet`, or a legacy `mode: "plan"`) else the config
+    /// default.
+    pub plan: bool,
     /// The **store** session id — what `hotl_store::replay_chain` resolves and
     /// what `SessionSpec::Load` takes, as distinct from the `acp-N` handle
     /// this connection hands clients. `session/reload_config` resumes through
@@ -147,6 +151,8 @@ pub struct ServerInfo {
     /// The configured permission mode a new session starts in, already run
     /// through `enforced_mode`. Clients render it; they never infer it.
     pub default_mode: String,
+    /// Whether a new session starts with the plan overlay on.
+    pub default_plan: bool,
     /// Model context window in tokens — what a UI's fullness gauge divides by.
     pub context_window: u64,
     /// The session's primary model — prices `turn_done`'s `usage.cost_usd`
@@ -268,6 +274,7 @@ async fn handle_request(
                     "schemaVersion": UPDATE_SCHEMA_VERSION,
                     "skills": skills,
                     "defaultMode": info.default_mode,
+                    "defaultPlan": info.default_plan,
                     "contextWindow": info.context_window,
                 }),
             )
@@ -306,6 +313,7 @@ async fn handle_request(
                 Ok(open) => {
                     // Captured before `open.handle` moves into `install_session`.
                     let mode = open.mode.clone();
+                    let plan = open.plan;
                     let name = open.name.clone();
                     let sid = install_session(
                         open,
@@ -336,7 +344,7 @@ async fn handle_request(
                     reply_ok(
                         writer,
                         id,
-                        json!({"sessionId": sid, "name": name, "mode": mode, "images": true}),
+                        json!({"sessionId": sid, "name": name, "mode": mode, "plan": plan, "images": true}),
                     )
                     .await;
                 }
@@ -389,22 +397,33 @@ async fn handle_request(
             let Some(state) = session.as_ref() else {
                 return reply_err(writer, id, "no session — call session/new first").await;
             };
-            let Some(mode) = msg
-                .pointer("/params/mode")
-                .and_then(Value::as_str)
-                .and_then(hotl_tools::rules::PermissionMode::from_str)
-            else {
+            let raw = msg.pointer("/params/mode").and_then(Value::as_str);
+            // `"plan"` was a mode before it became an overlay. A client still
+            // sending it means "turn plan on", and must not be told its mode
+            // word was a typo.
+            if raw.is_some_and(hotl_tools::rules::is_legacy_plan_word) {
+                state.handle.set_plan(true).await;
+                let session_id = state.id.clone();
+                reply_ok(writer, id, json!({"ok": true, "plan": true})).await;
+                return notify(
+                    writer,
+                    &session_id,
+                    json!({"type": "plan_changed", "plan": true}),
+                )
+                .await;
+            }
+            let Some(mode) = raw.and_then(hotl_tools::rules::PermissionMode::from_str) else {
                 return reply_err(
                     writer,
                     id,
-                    "session/set_mode requires params.mode (ask | auto | plan | dontask)",
+                    "session/set_mode requires params.mode (ask | bypass | dontask)",
                 )
                 .await;
             };
             // The *effective* mode, post-coercion: a `security-enforced` build
-            // forces Auto→Ask inside `Rules::with_mode`, so acking the
-            // requested mode would leave a client's badge reading `auto` for a
-            // session actually running `ask` — the §5.7 lie in reverse.
+            // forces Bypass→Ask inside `Rules::with_mode`, so acking the
+            // requested mode would leave a client's badge reading `bypass` for
+            // a session actually running `ask` — the §5.7 lie in reverse.
             let effective = hotl_tools::rules::enforced_mode(mode);
             state.handle.set_mode(mode).await;
             let session_id = state.id.clone();
@@ -416,6 +435,30 @@ async fn handle_request(
                 writer,
                 &session_id,
                 json!({"type": "mode_changed", "mode": effective.as_str()}),
+            )
+            .await;
+        }
+        "session/set_plan" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let Some(plan) = msg.pointer("/params/plan").and_then(Value::as_bool) else {
+                return reply_err(
+                    writer,
+                    id,
+                    "session/set_plan requires params.plan (a boolean)",
+                )
+                .await;
+            };
+            // No `enforced_mode` counterpart: the overlay only ever adds an
+            // ask, so what is requested is always what takes effect.
+            state.handle.set_plan(plan).await;
+            let session_id = state.id.clone();
+            reply_ok(writer, id, json!({"ok": true, "plan": plan})).await;
+            notify(
+                writer,
+                &session_id,
+                json!({"type": "plan_changed", "plan": plan}),
             )
             .await;
         }
@@ -501,6 +544,7 @@ async fn handle_request(
             match factory(spec) {
                 Ok(open) => {
                     let mode = open.mode.clone();
+                    let plan = open.plan;
                     let sid = install_session(
                         open,
                         writer,
@@ -524,6 +568,7 @@ async fn handle_request(
                             "sessionId": sid,
                             "model": info.model,
                             "mode": mode,
+                            "plan": plan,
                             "contextWindow": info.context_window,
                             "warnings": warnings,
                         }),
@@ -540,6 +585,7 @@ async fn handle_request(
                             "type": "config_reloaded",
                             "model": info.model,
                             "mode": mode,
+                            "plan": plan,
                             "context_window": info.context_window,
                             "skills": skills,
                             "warnings": warnings,

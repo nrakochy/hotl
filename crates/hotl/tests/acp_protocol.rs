@@ -38,6 +38,7 @@ fn server_info() -> acp::ServerInfo {
     acp::ServerInfo {
         skills: Vec::new(),
         default_mode: "ask".into(),
+        default_plan: false,
         context_window: 200_000,
         // Uncatalogued deliberately: matches `scripted_factory`'s session log
         // model ("m"), and keeps `cost_usd` absent for scenarios that don't
@@ -100,6 +101,7 @@ fn scripted_factory_recording(
             }),
             name,
             mode: mode.to_string(),
+            plan: false,
             session_id,
         })
     })
@@ -286,6 +288,7 @@ async fn overlapping_prompts_resolve_in_order() {
             }),
             name: None,
             mode: "ask".into(),
+            plan: false,
             session_id,
         })
     });
@@ -494,6 +497,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             }),
             name,
             mode: "ask".into(),
+            plan: false,
             session_id,
         })
     });
@@ -688,6 +692,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             ),
             name: None,
             mode: "ask".into(),
+            plan: false,
             session_id,
         })
     });
@@ -820,6 +825,7 @@ async fn the_session_reports_its_effective_mode() {
         acp::ServerInfo {
             skills: Vec::new(),
             default_mode: "auto".into(),
+            default_plan: false,
             context_window: 1_000_000,
             model: "m".into(),
         },
@@ -851,25 +857,104 @@ async fn the_session_reports_its_effective_mode() {
     // A mode change is broadcast, not just acked — any attached surface updates.
     send(
         &mut cwrite,
-        json!({"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"mode":"plan"}}),
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_mode","params":{"mode":"dontask"}}),
     )
     .await;
     let mut saw_notification = false;
     for _ in 0..8 {
         let m = next(&mut lines).await;
         if m["method"] == "session/update" && m["params"]["update"]["type"] == "mode_changed" {
-            assert_eq!(m["params"]["update"]["mode"], "plan");
+            assert_eq!(m["params"]["update"]["mode"], "dontask");
             saw_notification = true;
             break;
         }
         if m["id"] == json!(3) {
             assert_eq!(
-                m["result"]["mode"], "plan",
+                m["result"]["mode"], "dontask",
                 "the ack carries the effective mode"
             );
         }
     }
     assert!(saw_notification, "set_mode must broadcast mode_changed");
+}
+
+/// Plan is its own axis on the wire: `session/set_plan` acks and broadcasts
+/// `plan_changed`, and a client still sending the pre-split `set_mode {"mode":
+/// "plan"}` is routed to it rather than told its mode word is invalid.
+#[tokio::test]
+async fn set_plan_is_its_own_axis_and_the_legacy_plan_mode_word_still_works() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let hello = read_until_id(&mut lines, 1).await;
+    assert_eq!(hello["result"]["defaultPlan"], false);
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    assert_eq!(opened["result"]["plan"], false, "session/new reports plan");
+
+    // The dedicated method.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_plan","params":{"plan":true}}),
+    )
+    .await;
+    let mut saw = false;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "plan_changed" {
+            assert_eq!(m["params"]["update"]["plan"], true);
+            saw = true;
+            break;
+        }
+        if m["id"] == json!(3) {
+            assert_eq!(m["result"]["plan"], true, "the ack carries the plan state");
+        }
+    }
+    assert!(saw, "set_plan must broadcast plan_changed");
+
+    // The legacy spelling lands on the same axis, not on an error.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_mode","params":{"mode":"plan"}}),
+    )
+    .await;
+    let mut saw_legacy = false;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["id"] == json!(4) {
+            assert!(
+                m.get("error").is_none(),
+                "a pre-split client must not get an error: {m}"
+            );
+            assert_eq!(m["result"]["plan"], true);
+        }
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "plan_changed" {
+            saw_legacy = true;
+            break;
+        }
+    }
+    assert!(
+        saw_legacy,
+        "legacy set_mode(plan) must broadcast plan_changed"
+    );
 }
 
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {
@@ -928,6 +1013,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
             description: "launch the app".into(),
         }],
         default_mode: "auto".into(),
+        default_plan: false,
         context_window: 900_000,
         model: "m2".into(),
     };

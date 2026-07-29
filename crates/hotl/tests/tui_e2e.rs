@@ -72,6 +72,7 @@ fn scripted_factory() -> acp::SessionFactory {
             }),
             name: None,
             mode: "ask".into(),
+            plan: false,
             session_id,
         })
     })
@@ -136,6 +137,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             ),
             name: None,
             mode: "ask".into(),
+            plan: false,
             session_id,
         })
     })
@@ -156,6 +158,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
         acp::ServerInfo {
             skills: Vec::new(),
             default_mode: "ask".into(),
+            default_plan: false,
             context_window: 200_000,
             model: "m".into(),
         },

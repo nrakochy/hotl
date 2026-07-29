@@ -322,13 +322,23 @@ pub enum EntryPayload {
     Rename {
         name: String,
     },
-    /// Sets the session's effective permission mode (plan mode's
-    /// approve-and-continue, `/mode`, `session/set_mode`). Log-only, like
-    /// `Rename` — not a projection item; the last one wins on replay, so
-    /// `hotl resume` restores the mode the session was actually in. A
-    /// string, not the enum, for forward-compat: the engine maps it.
+    /// Sets the session's effective permission mode (`/mode`,
+    /// `session/set_mode`). Log-only, like `Rename` — not a projection item;
+    /// the last one wins on replay, so `hotl resume` restores the mode the
+    /// session was actually in. A string, not the enum, for forward-compat:
+    /// the engine maps it.
+    ///
+    /// Two legacy values the engine still maps on replay: `"auto"` (renamed
+    /// `"bypass"`) and `"plan"` (from when plan was a mode rather than the
+    /// separate [`Self::PlanSet`] axis).
     ModeSet {
         mode: String,
+    },
+    /// Toggles plan mode, the permission axis orthogonal to `ModeSet`
+    /// (`/plan`, `session/set_plan`). Log-only, last one wins, exactly like
+    /// `ModeSet`.
+    PlanSet {
+        on: bool,
     },
     /// A structured question (`ask_user`, tier-1 gap #4) committed durably
     /// **before** it surfaces — mirrors `PendingAsk`/`AskResolved` exactly:

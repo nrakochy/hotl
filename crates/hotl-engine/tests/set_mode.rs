@@ -1,6 +1,7 @@
 //! `SessionCmd::SetMode` appends a durable `mode_set` entry (mirrors
 //! `rename.rs`) and takes effect immediately on the running session — no
-//! `Arc<Rules>` reallocation, no waiting for resume.
+//! `Arc<Rules>` reallocation, no waiting for resume. `SetPlan` is the same
+//! contract on the other permission axis, via `plan_set`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,7 +39,7 @@ async fn set_mode_appends_a_durable_entry() {
         config,
     });
 
-    handle.set_mode(PermissionMode::Plan).await;
+    handle.set_mode(PermissionMode::DontAsk).await;
     handle.prompt("go".into()).await;
     loop {
         let ev = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
@@ -59,29 +60,24 @@ async fn set_mode_appends_a_durable_entry() {
             _ => None,
         })
         .collect();
-    assert_eq!(modes, vec!["plan".to_string()]);
+    assert_eq!(modes, vec!["dontask".to_string()]);
 }
 
-/// The mode flip must gate the *running* session immediately: no resume, no
-/// rebuilt `Rules`. A write issued after `set_mode(Plan)` is denied with a
-/// plan-mode reason.
+/// The plan axis gets its own durable entry, not a `mode_set`: the two are
+/// independent, and folding plan into the mode string is exactly the
+/// conflation this change removed.
 #[tokio::test]
-async fn set_mode_takes_effect_on_the_running_session() {
+async fn set_plan_appends_its_own_durable_entry() {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig::default();
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        ScriptedProvider::tool_call(
-            "t1",
-            "write",
-            json!({"path": "should-not-exist.txt", "content": "nope"}),
-        ),
-        ScriptedProvider::text_reply("done"),
-    ]));
+    let log_path = log.path().to_path_buf();
     let mut handle = spawn_session(SessionDeps {
-        provider,
+        provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+            "ok",
+        )])),
         registry: Arc::new(Registry::builtin()),
-        rules: Arc::new(Rules::default()), // starts in Ask, never Plan
+        rules: Arc::new(Rules::default()),
         sandbox_enforced: false,
         clock: Arc::new(SystemClock),
         log,
@@ -94,23 +90,93 @@ async fn set_mode_takes_effect_on_the_running_session() {
         config,
     });
 
-    handle.set_mode(PermissionMode::Plan).await;
+    handle.set_plan(true).await;
+    handle.set_plan(false).await;
+    handle.set_plan(true).await;
+    handle.prompt("go".into()).await;
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
+        if matches!(ev, EngineEvent::TurnDone { .. }) {
+            break;
+        }
+    }
+
+    let entries: Vec<bool> = std::fs::read_to_string(&log_path)
+        .expect("read log")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
+        .filter_map(|e| match e.payload {
+            EntryPayload::PlanSet { on } => Some(on),
+            EntryPayload::ModeSet { .. } => panic!("SetPlan must not write a mode_set"),
+            _ => None,
+        })
+        .collect();
+    // Every toggle is recorded; replay takes the last, so the session resumes
+    // with plan on.
+    assert_eq!(entries, vec![true, false, true]);
+}
+
+/// The flip must gate the *running* session immediately: no resume, no
+/// rebuilt `Rules`. A write issued after `set_plan(true)` stops for an ask it
+/// would otherwise never have raised, and the declined call writes nothing.
+#[tokio::test]
+async fn set_plan_takes_effect_on_the_running_session() {
+    // `write` resolves against the process-global fsguard root, not `cwd`.
+    let stray = "set-plan-declined.txt";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = EngineConfig::default();
+    let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "write", json!({"path": stray, "content": "nope"})),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut handle = spawn_session(SessionDeps {
+        provider,
+        registry: Arc::new(Registry::builtin()),
+        // Starts in Bypass with plan OFF: without the flip below this write
+        // would auto-allow, so the ask is unambiguously `set_plan`'s doing.
+        rules: Arc::new(Rules::default().with_mode(PermissionMode::Bypass)),
+        sandbox_enforced: false,
+        clock: Arc::new(SystemClock),
+        log,
+        system: "sys".into(),
+        cwd: dir.path().to_path_buf(),
+        snapshots: None,
+        hooks: None,
+        initial_items: Vec::new(),
+        initial_todos: Vec::new(),
+        config,
+    });
+
+    handle.set_plan(true).await;
     handle.prompt("go".into()).await;
 
-    let mut saw_denial = false;
+    let target = std::env::current_dir().expect("cwd").join(stray);
+    let _ = std::fs::remove_file(&target);
+    let (mut saw_ask, mut saw_auto) = (false, false);
     loop {
         match tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
             .await
             .expect("event timeout")
             .expect("event channel closed")
         {
-            EngineEvent::ToolDenied { .. } => saw_denial = true,
+            EngineEvent::Ask { reply, .. } => {
+                saw_ask = true;
+                let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
+            }
+            EngineEvent::ToolAutoAllowed { .. } => saw_auto = true,
             EngineEvent::TurnDone { .. } => break,
             _ => {}
         }
     }
-    assert!(saw_denial, "write must be plan-blocked after set_mode");
-    assert!(!dir.path().join("should-not-exist.txt").exists());
+    let landed = target.exists();
+    let _ = std::fs::remove_file(&target);
+    assert!(saw_ask, "write must ask after set_plan(true)");
+    assert!(!saw_auto, "plan's floor sits above the bypass tier");
+    assert!(!landed);
 }
 
 /// Plan 2 review, Finding 1 (CRITICAL): the `security-enforced` build's
@@ -161,7 +227,7 @@ async fn set_mode_auto_stays_auto_on_a_normal_build() {
         config,
     });
 
-    handle.set_mode(PermissionMode::Auto).await;
+    handle.set_mode(PermissionMode::Bypass).await;
     handle.prompt("go".into()).await;
 
     let mut saw_auto_allow = false;

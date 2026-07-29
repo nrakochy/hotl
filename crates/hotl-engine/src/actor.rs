@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
@@ -459,6 +459,11 @@ pub(crate) struct SharedDeps {
     /// reallocating `Rules` (task 4: mode moves, `Rules` stays a plain
     /// cheap-to-share value). Seeded from `rules.mode()` at session start.
     mode: AtomicU8,
+    /// Plan mode, the second permission axis. A separate cell rather than a
+    /// bit packed into `mode`: the two are set by separate commands and no
+    /// invariant couples them, so there is nothing to keep consistent across
+    /// a single load. Seeded from `rules.plan()` at session start.
+    plan: AtomicBool,
     pub sandbox_enforced: bool,
     pub clock: Arc<dyn Clock>,
     pub system: Arc<str>,
@@ -507,17 +512,15 @@ pub(crate) struct SharedDeps {
 fn mode_to_u8(mode: PermissionMode) -> u8 {
     match mode {
         PermissionMode::Ask => 0,
-        PermissionMode::Auto => 1,
-        PermissionMode::Plan => 2,
-        PermissionMode::DontAsk => 3,
+        PermissionMode::Bypass => 1,
+        PermissionMode::DontAsk => 2,
     }
 }
 
 fn u8_to_mode(v: u8) -> PermissionMode {
     match v {
-        1 => PermissionMode::Auto,
-        2 => PermissionMode::Plan,
-        3 => PermissionMode::DontAsk,
+        1 => PermissionMode::Bypass,
+        2 => PermissionMode::DontAsk,
         _ => PermissionMode::Ask,
     }
 }
@@ -529,6 +532,7 @@ impl SharedDeps {
         head_rx: tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
     ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
+        let plan = AtomicBool::new(deps.rules.plan());
         let hook_mask = deps
             .hooks
             .as_ref()
@@ -550,6 +554,7 @@ impl SharedDeps {
             registry: deps.registry,
             rules: deps.rules,
             mode,
+            plan,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,
             system: deps.system.into(),
@@ -589,7 +594,7 @@ impl SharedDeps {
     /// via ACP `session/set_mode` and the TUI `/mode` command). Routes
     /// through [`hotl_tools::rules::enforced_mode`] — the same coercion
     /// `Rules::with_mode` applies at startup — so a `security-enforced`
-    /// build can't be flipped to `Auto` mid-session by a client request.
+    /// build can't be flipped to `Bypass` mid-session by a client request.
     /// Returns the mode actually stored (post-coercion) so the caller logs
     /// the durable `ModeSet` entry with what really took effect, not the
     /// raw request.
@@ -597,6 +602,18 @@ impl SharedDeps {
         let mode = hotl_tools::rules::enforced_mode(mode);
         self.mode.store(mode_to_u8(mode), Ordering::Relaxed);
         mode
+    }
+
+    /// Plan mode right now — the second axis `evaluate` gates against.
+    pub(crate) fn effective_plan(&self) -> bool {
+        self.plan.load(Ordering::Relaxed)
+    }
+
+    /// Runtime plan-mutation entry point (`SessionCmd::SetPlan`, reachable via
+    /// ACP `session/set_plan` and the TUI `/plan` command). No `enforced_mode`
+    /// counterpart: the overlay only ever adds an ask, so no build tightens it.
+    fn set_plan(&self, plan: bool) {
+        self.plan.store(plan, Ordering::Relaxed);
     }
 
     /// Commit one entry: forward it to the writer at the `Durable` tier and
@@ -850,7 +867,7 @@ pub(crate) async fn run(
                 // is what `evaluate` reads. The durable entry is what lets
                 // `hotl resume` restore it, exactly like `Rename`/name — it
                 // records the post-coercion mode, so a security-enforced
-                // build's log never claims `auto` while it actually ran
+                // build's log never claims `bypass` while it actually ran
                 // `ask`.
                 let mode = shared.set_mode(mode);
                 let _ = shared
@@ -861,6 +878,20 @@ pub(crate) async fn run(
                         EntryPayload::ModeSet {
                             mode: mode.as_str().into(),
                         },
+                    )
+                    .await;
+            }
+            SessionCmd::SetPlan(plan) => {
+                // The plan axis, same shape as `SetMode`: atomic first so it
+                // gates the running session immediately, then the durable
+                // entry `hotl resume` replays. No coercion — see `set_plan`.
+                shared.set_plan(plan);
+                let _ = shared
+                    .append(
+                        &mut log,
+                        &mut pipeline,
+                        &mut head,
+                        EntryPayload::PlanSet { on: plan },
                     )
                     .await;
             }

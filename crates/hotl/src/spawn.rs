@@ -613,7 +613,7 @@ mod tests {
                 provider,
                 registry: Arc::new(registry),
                 rules: Arc::new(
-                    Rules::default().with_mode(hotl_tools::rules::PermissionMode::Auto),
+                    Rules::default().with_mode(hotl_tools::rules::PermissionMode::Bypass),
                 ),
                 sandbox_enforced: false,
                 clock: Arc::new(SystemClock),

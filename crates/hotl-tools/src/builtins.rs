@@ -417,6 +417,9 @@ impl Tool for WriteTool {
     fn permission(&self, input: &Value) -> Permission {
         file_permission("write", input)
     }
+    fn edits_files(&self) -> bool {
+        true
+    }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
             let root = fsguard::workspace_root();
@@ -502,6 +505,9 @@ impl Tool for EditTool {
             },
             "required": ["path", "old_string", "new_string"]
         })
+    }
+    fn edits_files(&self) -> bool {
+        true
     }
     fn permission(&self, input: &Value) -> Permission {
         file_permission("edit", input)

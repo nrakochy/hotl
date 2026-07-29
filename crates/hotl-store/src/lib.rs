@@ -138,6 +138,7 @@ pub enum EntryKind {
     AskResolved,
     Rename,
     ModeSet,
+    PlanSet,
     PendingQuestion,
     QuestionResolved,
     Todos,
@@ -158,6 +159,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::AskResolved { .. } => EntryKind::AskResolved,
             EntryPayload::Rename { .. } => EntryKind::Rename,
             EntryPayload::ModeSet { .. } => EntryKind::ModeSet,
+            EntryPayload::PlanSet { .. } => EntryKind::PlanSet,
             EntryPayload::PendingQuestion { .. } => EntryKind::PendingQuestion,
             EntryPayload::QuestionResolved { .. } => EntryKind::QuestionResolved,
             EntryPayload::Todos { .. } => EntryKind::Todos,
@@ -1250,6 +1252,9 @@ pub struct Replayed {
     /// child wins) — a raw string, forward-compat; the engine maps it to
     /// `PermissionMode`. `None` = no mode was ever set (use the process default).
     pub mode: Option<String>,
+    /// Plan mode (last `PlanSet` in the chain, child wins) — the axis
+    /// orthogonal to `mode`. `None` = never set (use the process default).
+    pub plan: Option<bool>,
     /// The session's todo checklist (last `Todos` entry in the chain, child
     /// wins) — same last-wins, log-only shape as `mode`/`name`. Empty = no
     /// list was ever set (a resumed session starts with none, same as fresh).
@@ -1266,6 +1271,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut warnings = Vec::new();
     let mut name = None;
     let mut mode = None;
+    let mut plan = None;
     let mut todos = Vec::new();
     let header = apply_log(
         path,
@@ -1273,6 +1279,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut warnings,
         &mut name,
         &mut mode,
+        &mut plan,
         &mut todos,
     )?;
     Ok(Replayed {
@@ -1280,6 +1287,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         items,
         name,
         mode,
+        plan,
         todos,
         warnings,
     })
@@ -1381,6 +1389,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     // the parent's.
     let mut name = None;
     let mut mode = None;
+    let mut plan = None;
     let mut todos = Vec::new();
     for (path, _) in lineage.iter().rev() {
         apply_log(
@@ -1389,6 +1398,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut warnings,
             &mut name,
             &mut mode,
+            &mut plan,
             &mut todos,
         )?;
     }
@@ -1397,6 +1407,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         items,
         name,
         mode,
+        plan,
         todos,
         warnings,
     })
@@ -1418,6 +1429,7 @@ fn apply_log(
     warnings: &mut Vec<String>,
     name: &mut Option<String>,
     mode: &mut Option<String>,
+    plan: &mut Option<bool>,
     todos: &mut Vec<hotl_types::Todo>,
 ) -> Result<hotl_types::SessionHeader, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -1520,6 +1532,8 @@ fn apply_log(
             // Log-only, like Rename: sets the session's effective mode, never
             // the projection. Last one wins, exactly like the display name.
             EntryPayload::ModeSet { mode: m } => *mode = Some(m),
+            // The other permission axis, same log-only last-one-wins shape.
+            EntryPayload::PlanSet { on } => *plan = Some(on),
             // Log-only durable snapshot of the todo checklist (tier-1 gap
             // #3), exactly like `Rename`/`ModeSet`: never rides the
             // projection, last one wins. The resumed actor's *starting* list
@@ -1988,6 +2002,56 @@ mod tests {
             replayed.items.is_empty(),
             "mode_set is not a projection item"
         );
+        assert_eq!(replayed.plan, None, "a mode_set never sets the plan axis");
+    }
+
+    /// The plan axis replays on its own, last-one-wins, without disturbing the
+    /// mode — the two are independent, which is the whole point of the split.
+    #[test]
+    fn plan_set_replays_last_one_wins_independently_of_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(&EntryPayload::PlanSet { on: true }, 2).unwrap();
+        log.append(
+            &EntryPayload::ModeSet {
+                mode: "dontask".into(),
+            },
+            3,
+        )
+        .unwrap();
+        log.append(&EntryPayload::PlanSet { on: false }, 4).unwrap();
+        log.append(&EntryPayload::PlanSet { on: true }, 5).unwrap();
+
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.plan, Some(true));
+        assert_eq!(replayed.mode.as_deref(), Some("dontask"));
+        assert!(
+            replayed.items.is_empty(),
+            "plan_set is not a projection item"
+        );
+    }
+
+    /// A log written before plan became its own axis carries `mode: "plan"`
+    /// and no `plan_set`. Replay hands both back verbatim; mapping the legacy
+    /// word onto the overlay is the resume path's job (`agent.rs`), and it
+    /// needs `plan: None` here to know nothing newer overrode it.
+    #[test]
+    fn a_pre_split_plan_log_replays_as_a_mode_string_with_no_plan_axis() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(
+            &EntryPayload::ModeSet {
+                mode: "plan".into(),
+            },
+            2,
+        )
+        .unwrap();
+
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.mode.as_deref(), Some("plan"));
+        assert_eq!(replayed.plan, None);
     }
 
     #[test]

@@ -119,31 +119,55 @@ fn expand_home(path: &str) -> std::path::PathBuf {
 
 #[derive(Debug, Default, Deserialize)]
 pub struct PermissionsCfg {
-    /// `"auto"` (default — no ordinary prompts) | `"ask"`.
+    /// `"bypass"` (default — no ordinary prompts) | `"ask"` | `"dontask"`.
+    /// `"auto"` is the old name for `"bypass"` and still parses.
     pub mode: Option<String>,
+    /// Plan mode, the axis orthogonal to `mode`: file edits always ask.
+    pub plan: Option<bool>,
+}
+
+/// The resolved `[permissions]` state: both axes plus one warning to print.
+pub struct ResolvedPermissions {
+    pub mode: hotl_tools::rules::PermissionMode,
+    pub plan: bool,
+    pub warning: Option<String>,
 }
 
 impl PermissionsCfg {
-    /// Resolve the mode: env (`HOTL_PERMISSIONS`) > config > default `auto`.
-    /// An unknown value fails **closed** to `Ask` with a warning — a typo
-    /// must never silently mean "don't prompt".
-    pub fn resolve(
-        &self,
-        env: Option<&str>,
-    ) -> (hotl_tools::rules::PermissionMode, Option<String>) {
-        use hotl_tools::rules::PermissionMode;
+    /// Resolve both axes: env (`HOTL_PERMISSIONS` / `HOTL_PLAN`) > config >
+    /// default (`bypass`, plan off). An unknown mode fails **closed** to `Ask`
+    /// with a warning — a typo must never silently mean "don't prompt".
+    ///
+    /// A `mode` of `"plan"` predates the overlay split: it turns plan on and
+    /// leaves the mode at the default, rather than failing closed as a typo
+    /// would (see [`hotl_tools::rules::is_legacy_plan_word`]).
+    pub fn resolve(&self, env: Option<&str>, plan_env: Option<&str>) -> ResolvedPermissions {
+        use hotl_tools::rules::{is_legacy_plan_word, PermissionMode};
         let source = env.or(self.mode.as_deref());
-        match source {
-            None => (PermissionMode::Auto, None),
+        let (mode, plan_from_mode, warning) = match source {
+            None => (PermissionMode::Bypass, false, None),
+            Some(s) if is_legacy_plan_word(s) => (PermissionMode::Bypass, true, None),
             Some(s) => match PermissionMode::from_str(s) {
-                Some(m) => (m, None),
+                Some(m) => (m, false, None),
                 None => (
                     PermissionMode::Ask,
+                    false,
                     Some(format!(
-                        "[permissions].mode = \"{s}\" is not a mode (ask | auto | plan | dontask) — failing closed to \"ask\""
+                        "[permissions].mode = \"{s}\" is not a mode (ask | bypass | dontask) — failing closed to \"ask\""
                     )),
                 ),
             },
+        };
+        // Anything but an explicit falsey word turns it on: `HOTL_PLAN=1`,
+        // `=true`, and a bare `HOTL_PLAN=` all read as "the user asked for it".
+        let plan = match plan_env {
+            Some(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "" | "0" | "false"),
+            None => self.plan.unwrap_or(plan_from_mode),
+        };
+        ResolvedPermissions {
+            mode,
+            plan,
+            warning,
         }
     }
 }
@@ -1061,42 +1085,84 @@ mod tests {
     #[test]
     fn permissions_mode_resolves_with_env_and_fails_closed() {
         use hotl_tools::rules::PermissionMode;
-        // Absent → the product default: auto, no warning.
-        let (m, w) = cfg_with("").permissions.resolve(None);
-        assert_eq!(m, PermissionMode::Auto);
-        assert!(w.is_none());
+        // Absent → the product default: bypass, plan off, no warning.
+        let r = cfg_with("").permissions.resolve(None, None);
+        assert_eq!(r.mode, PermissionMode::Bypass);
+        assert!(!r.plan);
+        assert!(r.warning.is_none());
         // Explicit ask.
-        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n")
+        let r = cfg_with("[permissions]\nmode = \"ask\"\n")
             .permissions
-            .resolve(None);
-        assert_eq!(m, PermissionMode::Ask);
+            .resolve(None, None);
+        assert_eq!(r.mode, PermissionMode::Ask);
         // Env beats config.
-        let (m, _) = cfg_with("[permissions]\nmode = \"ask\"\n")
+        let r = cfg_with("[permissions]\nmode = \"ask\"\n")
             .permissions
-            .resolve(Some("auto"));
-        assert_eq!(m, PermissionMode::Auto);
-        // Typo fails closed to ask, loudly — never silently auto.
-        let (m, w) = cfg_with("[permissions]\nmode = \"atuo\"\n")
+            .resolve(Some("bypass"), None);
+        assert_eq!(r.mode, PermissionMode::Bypass);
+        // Typo fails closed to ask, loudly — never silently bypass.
+        let r = cfg_with("[permissions]\nmode = \"byapss\"\n")
             .permissions
-            .resolve(None);
-        assert_eq!(m, PermissionMode::Ask);
-        assert!(w.unwrap().contains("atuo"));
-        // plan and dontask parse from config…
-        let (m, w) = cfg_with("[permissions]\nmode = \"plan\"\n")
+            .resolve(None, None);
+        assert_eq!(r.mode, PermissionMode::Ask);
+        assert!(r.warning.unwrap().contains("byapss"));
+        // dontask parses from config and from HOTL_PERMISSIONS.
+        let r = cfg_with("[permissions]\nmode = \"dontask\"\n")
             .permissions
-            .resolve(None);
-        assert_eq!(m, PermissionMode::Plan);
-        assert!(w.is_none());
-        let (m, w) = cfg_with("[permissions]\nmode = \"dontask\"\n")
+            .resolve(None, None);
+        assert_eq!(r.mode, PermissionMode::DontAsk);
+        assert!(r.warning.is_none());
+        let r = cfg_with("").permissions.resolve(Some("dontask"), None);
+        assert_eq!(r.mode, PermissionMode::DontAsk);
+    }
+
+    /// `auto` was renamed `bypass`, and `plan` stopped being a mode at all.
+    /// Both spellings still appear in configs and session logs in the wild.
+    #[test]
+    fn legacy_mode_words_still_resolve() {
+        use hotl_tools::rules::PermissionMode;
+        for src in [
+            "[permissions]\nmode = \"auto\"\n",
+            "[permissions]\nmode = \"AUTO\"\n",
+        ] {
+            let r = cfg_with(src).permissions.resolve(None, None);
+            assert_eq!(r.mode, PermissionMode::Bypass, "{src}");
+            assert!(!r.plan);
+            assert!(r.warning.is_none(), "a legacy name is not a typo");
+        }
+        // `plan` turns the overlay on and leaves the mode at its default —
+        // it never named one, so it must not fail closed as a typo would.
+        let r = cfg_with("[permissions]\nmode = \"plan\"\n")
             .permissions
-            .resolve(None);
-        assert_eq!(m, PermissionMode::DontAsk);
-        assert!(w.is_none());
-        // …and from HOTL_PERMISSIONS.
-        let (m, _) = cfg_with("").permissions.resolve(Some("plan"));
-        assert_eq!(m, PermissionMode::Plan);
-        let (m, _) = cfg_with("").permissions.resolve(Some("dontask"));
-        assert_eq!(m, PermissionMode::DontAsk);
+            .resolve(None, None);
+        assert_eq!(r.mode, PermissionMode::Bypass);
+        assert!(r.plan);
+        assert!(r.warning.is_none());
+        let r = cfg_with("").permissions.resolve(Some("plan"), None);
+        assert!(r.plan);
+    }
+
+    #[test]
+    fn plan_resolves_independently_of_mode() {
+        use hotl_tools::rules::PermissionMode;
+        // The two axes compose: an explicit plan flag rides any mode.
+        let r = cfg_with("[permissions]\nmode = \"dontask\"\nplan = true\n")
+            .permissions
+            .resolve(None, None);
+        assert_eq!(r.mode, PermissionMode::DontAsk);
+        assert!(r.plan);
+        // HOTL_PLAN beats the config key, in both directions.
+        let r = cfg_with("[permissions]\nplan = true\n")
+            .permissions
+            .resolve(None, Some("0"));
+        assert!(!r.plan);
+        let r = cfg_with("[permissions]\nplan = false\n")
+            .permissions
+            .resolve(None, Some("1"));
+        assert!(r.plan);
+        // A bare `HOTL_PLAN=` reads as "asked for it", not as unset.
+        assert!(cfg_with("").permissions.resolve(None, Some("yes")).plan);
+        assert!(!cfg_with("").permissions.resolve(None, Some("false")).plan);
     }
 
     #[test]

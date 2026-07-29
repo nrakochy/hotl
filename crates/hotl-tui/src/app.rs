@@ -192,12 +192,16 @@ pub struct State {
     /// Display name (badge + titles); seeded from the open handshake,
     /// updated by `/rename`.
     pub session_name: Option<String>,
-    /// Effective permission mode (`ask` | `auto` | `plan` | `dontask`).
+    /// Effective permission mode (`ask` | `bypass` | `dontask`).
     /// Seeded from the open handshake and corrected by every `mode_changed`
     /// notification, so it is what the engine enforces rather than what the
-    /// user asked for. `/plan` and `/mode` update it optimistically; the
-    /// notification is what makes an engine coercion visible.
+    /// user asked for. `/mode` updates it optimistically; the notification is
+    /// what makes an engine coercion visible.
     pub mode: String,
+    /// Plan mode, the axis orthogonal to `mode`: file edits always ask.
+    /// Same seed-then-correct shape, via `plan_changed`. No coercion exists
+    /// for it, so the optimistic update is always the one that sticks.
+    pub plan: bool,
     /// Model context window in tokens, from the handshake. What the context
     /// gauge divides by; `DEFAULT_CONTEXT_WINDOW` until a server reports one.
     pub context_window: u64,
@@ -259,6 +263,7 @@ impl State {
             pending_auto_rule: None,
             session_name: None,
             mode: "ask".into(),
+            plan: false,
             context_window: DEFAULT_CONTEXT_WINDOW,
             skills: Vec::new(),
             density: hotl_theme::Density::default(),
@@ -372,9 +377,11 @@ pub enum Cmd {
     /// Send `session/rename` (fire-and-forget; the ack is noise).
     Rename(String),
     /// Send `session/set_mode` (fire-and-forget; the ack is noise). Payload
-    /// is the mode name (`"ask" | "auto" | "plan" | "dontask"`) — already
-    /// validated by `slash_command` before this is emitted.
+    /// is the mode name (`"ask" | "bypass" | "dontask"`) — already validated
+    /// by `slash_command` before this is emitted.
     SetMode(String),
+    /// Send `session/set_plan` (fire-and-forget). The other permission axis.
+    SetPlan(bool),
     Cancel,
     ReplyPermission {
         req_id: u64,
@@ -694,12 +701,16 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             notice(state, format!("model fallback → {}", state.model));
         }
         // Server-side truth, not a client guess: the badge showed "ask" while
-        // the shipped default ran "auto" (evaluation §5.7). Optimistic /mode
-        // and /plan updates are corrected here when the engine coerces them
-        // (a security-enforced build forces Auto→Ask).
+        // the shipped default ran "bypass" (evaluation §5.7). Optimistic
+        // /mode updates are corrected here when the engine coerces them
+        // (a security-enforced build forces Bypass→Ask).
         // INVARIANT: `state.mode` is what the engine enforces, never what the
         // user asked for. Enforced by `mode_changed_updates_the_badge_state`.
         "mode_changed" => state.mode = text_of("mode"),
+        // The other axis. No coercion exists for it, so this only ever
+        // confirms the optimistic update — or carries a change another
+        // attached surface made.
+        "plan_changed" => state.plan = v.get("plan").and_then(Value::as_bool).unwrap_or(false),
         // `/reload` landed: the engine now runs a scaffold built from the
         // config on disk, and the session was re-opened onto it. Everything
         // here is server-side truth — the client re-seeds rather than guesses,
@@ -707,6 +718,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         "config_reloaded" => {
             state.model = text_of("model");
             state.mode = text_of("mode");
+            state.plan = v.get("plan").and_then(Value::as_bool).unwrap_or(false);
             if let Some(w) = v
                 .get("context_window")
                 .and_then(Value::as_u64)
@@ -1127,7 +1139,20 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             };
             vec![Cmd::Rename(name), Cmd::SetTitle(title(state, suffix))]
         }
-        "plan" => set_mode(state, "plan"),
+        // A toggle, not a mode switch: plan composes with whatever `/mode`
+        // says. `on`/`off` are for scripted input, where a toggle is a race.
+        "plan" => {
+            let want = match arg.trim() {
+                "" => !state.plan,
+                "on" | "true" => true,
+                "off" | "false" => false,
+                _ => {
+                    notice(state, "usage: /plan [on|off]".into());
+                    return Vec::new();
+                }
+            };
+            set_plan(state, want)
+        }
         "mode" => {
             // Delegate to `PermissionMode::from_str` — the same parser ACP's
             // `session/set_mode` uses — so the TUI and the wire protocol
@@ -1136,8 +1161,14 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             // list here previously rejected). The canonical `as_str()` form
             // is what gets stored/sent, so the badge and the wire payload
             // never disagree with what the alias actually meant.
+            // `/mode plan` predates the split; send the user to `/plan`
+            // rather than calling their old muscle memory a typo.
+            if hotl_tools::rules::is_legacy_plan_word(arg.trim()) {
+                notice(state, "plan is now its own toggle — use /plan".into());
+                return Vec::new();
+            }
             let Some(mode) = hotl_tools::rules::PermissionMode::from_str(arg.trim()) else {
-                notice(state, "usage: /mode <ask|auto|plan|dontask>".into());
+                notice(state, "usage: /mode <ask|bypass|dontask>".into());
                 return Vec::new();
             };
             set_mode(state, mode.as_str())
@@ -1173,10 +1204,11 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         "status" => {
             let name = state.session_name.as_deref().unwrap_or("(unnamed)");
             let todos = state.todos.len();
+            let plan = if state.plan { " · plan" } else { "" };
             notice(
                 state,
                 format!(
-                    "{name} · model {} · mode {} · context {} tok · {todos} todo(s)",
+                    "{name} · model {} · mode {}{plan} · context {} tok · {todos} todo(s)",
                     state.model, state.mode, state.context_window
                 ),
             );
@@ -1459,13 +1491,27 @@ fn clear_newest_queued_steer(state: &mut State) {
     }
 }
 
-/// `/plan` and `/mode <name>` share this: optimistic local update (the badge
-/// flips immediately) plus the durable `SetMode` the surface issues. Never
-/// starts a turn — a mode switch is session bookkeeping, not a prompt.
+/// `/mode <name>`: optimistic local update (the badge flips immediately) plus
+/// the durable `SetMode` the surface issues. Never starts a turn — a mode
+/// switch is session bookkeeping, not a prompt.
 fn set_mode(state: &mut State, mode: &str) -> Vec<Cmd> {
     state.mode = mode.to_string();
     notice(state, format!("permission mode set to {mode}"));
     vec![Cmd::SetMode(mode.to_string())]
+}
+
+/// `/plan`: same shape on the other axis.
+fn set_plan(state: &mut State, plan: bool) -> Vec<Cmd> {
+    state.plan = plan;
+    notice(
+        state,
+        if plan {
+            "plan mode on — file edits will ask, everything else follows the mode".into()
+        } else {
+            "plan mode off".to_string()
+        },
+    );
+    vec![Cmd::SetPlan(plan)]
 }
 
 #[cfg(test)]
@@ -2470,10 +2516,7 @@ mod tests {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/pl");
         let cmds = press(&mut s, KeyCode::Enter);
-        assert!(
-            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "plan"),
-            "got {cmds:?}"
-        );
+        assert!(matches!(&cmds[..], [Cmd::SetPlan(true)]), "got {cmds:?}");
         assert!(
             !matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("unknown")),
             "the partial word must never reach slash_command"
@@ -2576,9 +2619,9 @@ mod tests {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/mode ");
         assert!(s.completion.is_none());
-        let cmds = type_and_submit(&mut s, "auto");
+        let cmds = type_and_submit(&mut s, "bypass");
         assert!(
-            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "auto"),
+            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "bypass"),
             "got {cmds:?}"
         );
     }
@@ -2645,16 +2688,59 @@ mod tests {
         );
     }
 
+    /// `/plan` is a toggle on its own axis now: it never touches `s.mode`,
+    /// and a second invocation turns it back off.
     #[test]
-    fn slash_plan_sets_mode_and_does_not_start_a_turn() {
+    fn slash_plan_toggles_and_does_not_start_a_turn() {
         let mut s = State::test_default();
+        let before = s.mode.clone();
         let cmds = type_and_submit(&mut s, "/plan");
-        assert!(
-            matches!(&cmds[..], [Cmd::SetMode(m)] if m == "plan"),
-            "got {cmds:?}"
-        );
+        assert!(matches!(&cmds[..], [Cmd::SetPlan(true)]), "got {cmds:?}");
+        assert!(s.plan);
+        assert_eq!(s.mode, before, "the plan toggle must not move the mode");
         assert_eq!(s.phase, Phase::Idle);
-        assert_eq!(s.mode, "plan");
+
+        let cmds = type_and_submit(&mut s, "/plan");
+        assert!(matches!(&cmds[..], [Cmd::SetPlan(false)]), "got {cmds:?}");
+        assert!(!s.plan);
+    }
+
+    /// `on`/`off` exist because a bare toggle is a race for scripted input.
+    #[test]
+    fn slash_plan_accepts_explicit_on_and_off() {
+        let mut s = State::test_default();
+        assert!(matches!(
+            &type_and_submit(&mut s, "/plan on")[..],
+            [Cmd::SetPlan(true)]
+        ));
+        assert!(matches!(
+            &type_and_submit(&mut s, "/plan on")[..],
+            [Cmd::SetPlan(true)],
+        ));
+        assert!(s.plan, "`on` is idempotent, not a toggle");
+        assert!(matches!(
+            &type_and_submit(&mut s, "/plan off")[..],
+            [Cmd::SetPlan(false)]
+        ));
+        assert!(!s.plan);
+        // Anything else is usage, not a silent no-op.
+        assert!(type_and_submit(&mut s, "/plan sideways").is_empty());
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("usage"))
+        );
+    }
+
+    /// `/mode plan` was valid before the split. It must point at `/plan`
+    /// rather than read as a typo.
+    #[test]
+    fn slash_mode_plan_redirects_to_the_toggle() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/mode plan");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert!(!s.plan, "the redirect notice must not also flip the axis");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("/plan"))
+        );
     }
 
     #[test]
@@ -2741,12 +2827,13 @@ mod tests {
         assert!(s.help_open);
 
         let mut s = State::test_default();
-        s.mode = "auto".into();
+        s.mode = "bypass".into();
+        s.plan = true;
         s.model = "claude-opus-4-8".into();
         slash(&mut s, "status");
         let text = last_notice(&s);
         assert!(
-            text.contains("auto") && text.contains("claude-opus-4-8"),
+            text.contains("bypass") && text.contains("plan") && text.contains("claude-opus-4-8"),
             "{text}"
         );
 

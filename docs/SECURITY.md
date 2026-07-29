@@ -9,16 +9,25 @@ This document describes the controls as they exist in the code today. Gaps are l
 Prompting is a *mode*, not the identity of the tool. The trust boundary moves
 with it:
 
-| | default build, `mode="auto"` (default) | default build, `mode="ask"` | `security-enforced` build |
-|---|---|---|---|
-| Ordinary bash/write/edit/MCP | runs, no prompt, `ToolAutoAllowed` in transcript | y/N ask per action | y/N ask per action (config cannot change this) |
-| Protected execute-later paths | **always asks** (headless: denies) | always asks | always asks |
-| File tool (`read`/`write`/`edit`) outside the working directory | **always asks** (headless: denies) | always asks | always asks |
-| Admin preapproved (`/etc/hotl/preapproved.toml`) | grants apply (redundant under auto) | grants silence matching asks | grants are the admin's no-prompt channel |
-| Admin/user deny rules | refuse the call outright, with the rule named in the tool result | same | same |
-| Kernel sandbox / egress / undo / masking | on | on | on |
+| | default build, `mode="bypass"` (default) | default build, `mode="ask"` | `mode="dontask"` | `security-enforced` build |
+|---|---|---|---|---|
+| Ordinary bash/write/edit/MCP | runs, no prompt, `ToolAutoAllowed` in transcript | y/N ask per action | refused unless an allow-rule matches | y/N ask per action (config cannot change this) |
+| Protected execute-later paths | **always asks** (headless: denies) | always asks | always asks (headless: denies) | always asks |
+| File tool (`read`/`write`/`edit`) outside the working directory | **always asks** (headless: denies) | always asks | always asks (headless: denies) | always asks |
+| Admin preapproved (`/etc/hotl/preapproved.toml`) | grants apply (redundant under bypass) | grants silence matching asks | grants are the only thing that runs | grants are the admin's no-prompt channel |
+| Admin/user deny rules | refuse the call outright, with the rule named in the tool result | same | same | same |
+| Kernel sandbox / egress / undo / masking | on | on | on | on |
 
-In `auto`, the boundary is **sandbox + protected asks + deny rules + undo**,
+**Plan mode is a second, orthogonal axis, and is not a security control.** It
+moves `write`/`edit` into the "always asks" row above — never auto, not even
+via an allow-rule — and leaves every other tool on the mode's row. It is a
+posture that makes the agent's natural mutation path stop for a human; it is
+**not** a guarantee the tree is untouched, because `bash` still follows the
+mode and a shell redirect writes a file without the `write` tool. Do not treat
+`--plan` as a sandbox. The unattended read-only posture is `dontask` with no
+allow-rules.
+
+In `bypass`, the boundary is **sandbox + protected asks + deny rules + undo**,
 not per-action approval. The README's "safety" claim holds unconditionally
 only for the `security-enforced` build; the default build's floor is the row
 above. `/etc/hotl/preapproved.toml` is trusted only when root-owned and not
@@ -41,7 +50,7 @@ from the workspace-root fd reached it without traversing a symlink
 then uses, there is no name to re-resolve and no check/open race.
 Consequences: `glob`/`grep` refuse an out-of-tree or symlinked search root
 outright; `read` outside the tree is a **protected ask that outranks
-`mode=auto`**, so it prompts in every mode; `write`/`edit` never follow a
+`mode=bypass`**, so it prompts in every mode; `write`/`edit` never follow a
 symlink at any component and classify protected paths on the *resolved*
 target, so a symlink cannot launder a protected write into an ordinary one.
 This closes the "`ln -s ~ link` then `grep --path link`" read of the whole
@@ -108,7 +117,7 @@ So the human gate (not the sandbox) stays the *default* exfiltration boundary, a
 - The allowlist is host-granular: an allowed host is fully reachable, any path, any method — and therefore also usable as an exfiltration destination (an allowed `github.com` accepts pushes to any repo). List hosts you trust with your data, not merely hosts you fetch from.
 - The proxy is HTTP-only: `git` over SSH remotes, and any other non-HTTP protocol, cannot traverse it — under `off`/`allowlist` they fail at the kernel wall regardless of the list. Use HTTPS remotes when running restricted.
 - `web_fetch`'s SSRF guard classifies **literal addresses only**. Cloud instance-metadata addresses (`169.254.169.254`, `169.254.170.2`, `fd00:ec2::254`) are refused on every hop including the first, and a redirect out of the public internet into private/loopback space is refused as a target the human never approved (a chain that *starts* private is allowed, and was escalated at the ask). A **hostname that resolves** into private space on a redirect hop is not caught — a synchronous redirect policy cannot resolve names — so this narrows drive-by SSRF, it does not close it. `HOTL_WEB_ALLOW_METADATA=1` lifts the metadata refusal.
-- Unix-domain sockets are a network operation, not a file write, so the write floor does not cover them. On macOS the container/orchestrator daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) is denied by default — it is root-equivalent — and `HOTL_UNIX_SOCKETS=open` opts out, marked `unix:open` in every ask. `ssh-agent`/`gpg-agent` sockets stay reachable so `git push` over SSH keeps working; they are capability-limited, not arbitrary-write. **On Linux none of this is enforceable**: Landlock has no rule covering `connect(2)` to a pathname socket at any ABI (v6 `Scope` covers abstract sockets only), so a local daemon socket is reachable from a confined command. Do not run hotl with `mode = "auto"` on a host where a writable daemon socket is a privilege boundary you rely on.
+- Unix-domain sockets are a network operation, not a file write, so the write floor does not cover them. On macOS the container/orchestrator daemon socket class (`docker.sock`, `podman.sock`, `containerd`, `crio`) is denied by default — it is root-equivalent — and `HOTL_UNIX_SOCKETS=open` opts out, marked `unix:open` in every ask. `ssh-agent`/`gpg-agent` sockets stay reachable so `git push` over SSH keeps working; they are capability-limited, not arbitrary-write. **On Linux none of this is enforceable**: Landlock has no rule covering `connect(2)` to a pathname socket at any ABI (v6 `Scope` covers abstract sockets only), so a local daemon socket is reachable from a confined command. Do not run hotl with `mode = "bypass"` on a host where a writable daemon socket is a privilege boundary you rely on.
 
 ## Untrusted input → model context
 

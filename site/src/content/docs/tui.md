@@ -172,11 +172,11 @@ own.
 | Command | Effect |
 |---|---|
 | `/rename <name>` | Rename the session (1–64 chars); the badge and terminal title follow. |
-| `/plan` | Switch to plan mode: read-only until you approve a plan (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). |
-| `/mode <ask\|auto\|plan\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing. |
+| `/plan [on\|off]` | Toggle plan mode: `write`/`edit` always ask, everything else follows the mode (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). Bare `/plan` toggles; `on`/`off` are for scripted input. |
+| `/mode <ask\|bypass\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing; `/mode plan` points you at `/plan`. |
 | `/reload` | Re-read `config.toml` without losing the session (see [Reloading config](#reloading-config)). |
 | `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. |
-| `/status` | What this session is running: name, model, permission mode, context window, todo count. |
+| `/status` | What this session is running: name, model, permission mode and plan state, context window, todo count. |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
 | `/quit` | Leave the console (the session log is already on disk). |
@@ -209,13 +209,13 @@ Two things it deliberately does not do:
 - **It refuses while a turn is running.** Rebuilding replaces the session, and
   the reply in flight would go with it. Let the turn finish, or press `Esc`
   twice to take control back, then reload. Abandoning work stays your call.
-- **It does not override a mode you chose.** `/mode` is logged with the
-  session, so a session running `plan` because you asked for `plan` still runs
-  `plan` after a reload — the same inheritance `hotl resume` gives you. A
-  session that never set a mode has none of its own, so it picks up the
-  reloaded `[permissions] mode`. Either way the notice and the badge name the
-  mode you ended up with; the badge is always the mode the engine is actually
-  enforcing.
+- **It does not override a posture you chose.** `/mode` and `/plan` are both
+  logged with the session, so a session running `dontask` because you asked for
+  `dontask` still runs it after a reload, and a session you put in plan mode
+  stays there — the same inheritance `hotl resume` gives you. A session that
+  never set either has none of its own, so it picks up the reloaded
+  `[permissions]` values. Either way the notice and the badge name what you
+  ended up with; the badge is always what the engine is actually enforcing.
 
 Some settings are fixed for the life of the process and a reload will not move
 them. Restart hotl to change these:
@@ -239,15 +239,20 @@ name. Read it before you walk away from a run.
 The mode it shows is the one the engine is actually enforcing: it arrives from
 the server when the session opens and again whenever it changes, so it is never
 a guess. If a build coerces your request — a `security-enforced` build forces
-`auto` back to `ask` — the badge shows what you got, not what you asked for.
-`auto` and `dontask` wear the blocked color, because in those modes nobody is
+`bypass` back to `ask` — the badge shows what you got, not what you asked for.
+`bypass` and `dontask` wear the blocked color, because in those modes nobody is
 being consulted before a tool runs.
 
-**`hotl setup` writes `mode = "auto"`.** If you took the setup default, your
-sessions approve mutating tool calls without asking. `/mode ask` switches back.
+Plan mode is the other half of the posture, so the badge carries both: with it
+on the chip reads `plan · bypass` and takes the accent color, because plan is
+something you deliberately chose rather than a default you inherited.
 
-Switching mode never starts a turn — it's session bookkeeping, and it's
-durable (`hotl resume` restores whichever mode you left the session in).
+**`hotl setup` writes `mode = "bypass"`.** If you took the setup default, your
+sessions approve mutating tool calls without asking. `/mode ask` switches back,
+and `/plan` narrows just the file edits without giving up the shell.
+
+Switching either axis never starts a turn — it's session bookkeeping, and both
+are durable (`hotl resume` restores the posture you left the session in).
 
 Built-ins are matched first, so a skill named `rename` cannot shadow
 `/rename`. Any other name is looked up in your skill roster — bare

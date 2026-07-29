@@ -650,12 +650,12 @@ mod tests {
         );
     }
 
-    fn auto_rules() -> hotl_tools::rules::Rules {
-        hotl_tools::rules::Rules::default().with_mode(hotl_tools::rules::PermissionMode::Auto)
+    fn bypass_rules() -> hotl_tools::rules::Rules {
+        hotl_tools::rules::Rules::default().with_mode(hotl_tools::rules::PermissionMode::Bypass)
     }
 
     #[tokio::test]
-    async fn auto_mode_runs_mutating_calls_without_asking() {
+    async fn bypass_mode_runs_mutating_calls_without_asking() {
         // write (not bash): the harness runs unsandboxed, and auto mode
         // deliberately excludes unsandboxed bash — covered by rules tests.
         //
@@ -665,7 +665,7 @@ mod tests {
         // about the auto tier silencing an *ordinary* call. A scratch dir
         // created inside the process cwd is both in-tree and self-cleaning, so
         // the write still never leaves a stray file behind.
-        let mut h = Harness::with_rules(Vec::new(), cfg(), auto_rules());
+        let mut h = Harness::with_rules(Vec::new(), cfg(), bypass_rules());
         let scratch = tempfile::TempDir::new_in(".").expect("scratch dir");
         let note = format!(
             "{}/notes.txt",
@@ -693,7 +693,7 @@ mod tests {
         );
         assert!(scratch.path().join("notes.txt").exists(), "write ran");
         assert!(
-            h.seen.iter().any(|e| e.contains("permissions.mode=auto")),
+            h.seen.iter().any(|e| e.contains("permissions.mode=bypass")),
             "events: {:?}",
             h.seen
         );
@@ -706,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn auto_mode_protected_write_still_asks() {
-        let mut h = Harness::with_rules(Vec::new(), cfg(), auto_rules());
+        let mut h = Harness::with_rules(Vec::new(), cfg(), bypass_rules());
         // Protected by file name; inside the harness tempdir so the approved
         // write never touches the test process cwd.
         let makefile = h.dir().join("Makefile");
@@ -739,7 +739,7 @@ mod tests {
                 max_turns: 10,
                 ..Default::default()
             },
-            auto_rules(),
+            bypass_rules(),
         );
         let outcome = h.prompt_and_wait("go").await;
         assert!(

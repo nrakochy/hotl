@@ -532,12 +532,19 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // Mode badge, just left of the name chip. Always drawn: silence used to
     // mean "ask", but a narrow terminal drops the chip too, so absence was
     // ambiguous — and the mode it implied was wrong (`hotl setup` writes
-    // `mode = "auto"`, evaluation §5.7). A supervision tool states its
+    // `mode = "bypass"`, evaluation §5.7). A supervision tool states its
     // posture; it does not imply it by omission.
+    //
+    // Both axes ride one chip (`plan · bypass`): they are independent, and a
+    // badge showing only the mode would hide half the posture.
     // INVARIANT: every mode renders its own name. Enforced by
     // `the_mode_badge_is_always_drawn`.
     {
-        let chip = format!(" {} ", state.mode);
+        let chip = if state.plan {
+            format!(" plan · {} ", state.mode)
+        } else {
+            format!(" {} ", state.mode)
+        };
         let w = chip.chars().count() as u16;
         if w <= area.width {
             let name_w = state
@@ -547,11 +554,15 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
                 .unwrap_or(0);
             if w + name_w <= area.width {
                 // Unattended postures wear the blocked color: nobody is being
-                // consulted on this session's tool calls.
-                let style = match state.mode.as_str() {
-                    "plan" => Style::new().fg(p.band).bg(p.accent).bold(),
-                    "auto" | "dontask" => Style::new().fg(p.band).bg(p.blocked).bold(),
-                    _ => Style::new().fg(p.muted).bg(p.band),
+                // consulted on this session's tool calls. Plan outranks that —
+                // it is the posture the user deliberately chose.
+                let style = if state.plan {
+                    Style::new().fg(p.band).bg(p.accent).bold()
+                } else {
+                    match state.mode.as_str() {
+                        "bypass" | "dontask" => Style::new().fg(p.band).bg(p.blocked).bold(),
+                        _ => Style::new().fg(p.muted).bg(p.band),
+                    }
                 };
                 let rect = Rect {
                     x: area.x + area.width - name_w - w,
@@ -1487,7 +1498,7 @@ mod tests {
 
         // `ask` used to render nothing, on the reasoning that it is the
         // default posture. That only held if the value were true, and §5.7
-        // found it was not — `hotl setup` writes `mode = "auto"`. It is
+        // found it was not — `hotl setup` writes `mode = "bypass"`. It is
         // stated now, on the same row.
         let s = State::new(true, "m".into());
         assert_eq!(s.mode, "ask");
