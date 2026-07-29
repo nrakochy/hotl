@@ -108,6 +108,23 @@ impl Harness {
     pub fn log_path(&self) -> &std::path::Path {
         &self.log_path
     }
+
+    /// The directory that log lives in — what `hotl_store::replay_chain`
+    /// takes. A fork scenario seeds itself by replaying its parent from disk
+    /// (the production path), not by copying the parent's in-memory items.
+    pub fn sessions_dir(&self) -> &std::path::Path {
+        self.log_path
+            .parent()
+            .expect("the harness log always lives in its temp dir")
+    }
+
+    /// This session's store id — the other half of `replay_chain`'s arguments.
+    pub fn session_id(&self) -> &str {
+        self.log_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("the harness log is named <ulid>.jsonl")
+    }
 }
 
 impl Harness {
@@ -510,8 +527,265 @@ fn is_subsequence(needles: &[&str], haystack: &[String]) -> bool {
     needles.iter().all(|n| it.any(|h| h == n))
 }
 
+/// The cache-assert vocabulary: what "the durable prefix only ever grew"
+/// means on the wire, expressed once so every cache claim in the workspace is
+/// the same claim.
+///
+/// Public because the property is not one crate's: a *fork*'s first request
+/// has to extend its *parent's* last request byte for byte, which is a
+/// cross-session version of exactly what `assert_stable_cache_prefix` says
+/// within one. Asserting that from a second hand-rolled comparison would let
+/// the two definitions of "unchanged prefix" drift.
+pub mod wire {
+    use std::sync::Arc;
+
+    use hotl_provider::SamplingRequest;
+
+    /// The API's cache lookback, in wire content blocks. A marker further than
+    /// this past the nearest entry the previous request wrote cannot see it,
+    /// and the segment before it re-bills at write price.
+    pub const CACHE_LOOKBACK: usize = 20;
+
+    /// The API's per-request `cache_control` budget (a fifth is a 400).
+    pub const MARKER_BUDGET: usize = 4;
+
+    /// The request as the wire would carry it with **only its durable half**:
+    /// ephemeral tail emptied, MOIM dropped. Built by re-serializing the
+    /// `SamplingRequest` (the `without_moim` pattern), never by fishing
+    /// messages back out of a built body — a tail user message is
+    /// byte-indistinguishable from a durable one once it is JSON, which is
+    /// precisely why the split had to happen upstream of the serializer.
+    pub fn durable_wire_body(req: &SamplingRequest) -> serde_json::Value {
+        hotl_provider_anthropic::wire_body(&SamplingRequest {
+            ephemeral_tail: Arc::new(Vec::new()),
+            turn_context: None,
+            ..req.clone()
+        })
+    }
+
+    /// Every `cache_control` key removed, recursively.
+    ///
+    /// Markers are *metadata*: they are not part of the prefix the API hashes,
+    /// so moving one between requests does not invalidate an entry. "The same
+    /// conversation, grown" therefore has to compare equal whether or not an
+    /// anchor rolled — which is exactly what makes anchor-rolling safe.
+    pub fn without_markers(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::Object(map) => serde_json::Value::Object(
+                map.iter()
+                    .filter(|(k, _)| k.as_str() != "cache_control")
+                    .map(|(k, val)| (k.clone(), without_markers(val)))
+                    .collect(),
+            ),
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.iter().map(without_markers).collect())
+            }
+            other => other.clone(),
+        }
+    }
+
+    /// Every `cache_control` in a built body, counted structurally.
+    pub fn count_markers(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(map) => {
+                usize::from(map.contains_key("cache_control"))
+                    + map.values().map(count_markers).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count_markers).sum(),
+            _ => 0,
+        }
+    }
+
+    /// 1-based wire content-block index of every marker in `messages` — the
+    /// coordinate space the lookback counts in. The prefix marker (system, or
+    /// the last tool def) sits *before* block 1 and is represented by the
+    /// implicit start position 0.
+    pub fn marker_positions(body: &serde_json::Value) -> Vec<usize> {
+        let mut idx = 0usize;
+        let mut out = Vec::new();
+        for msg in body["messages"].as_array().expect("messages") {
+            for block in msg["content"].as_array().expect("content") {
+                idx += 1;
+                if block.get("cache_control").is_some() {
+                    out.push(idx);
+                }
+            }
+        }
+        out
+    }
+
+    /// Every marker's `ttl` (`None` = plain, i.e. the API's default 5m), in
+    /// the order the API parses the prompt: tools, then system, then messages
+    /// in wire order. That order is what "longer TTL before shorter" is a
+    /// claim about.
+    pub fn marker_ttls_in_prompt_order(body: &serde_json::Value) -> Vec<Option<String>> {
+        let mut out = Vec::new();
+        let mut take = |v: &serde_json::Value| {
+            if let Some(cc) = v.get("cache_control") {
+                out.push(cc.get("ttl").and_then(|t| t.as_str()).map(String::from));
+            }
+        };
+        for section in ["tools", "system"] {
+            for entry in body[section].as_array().into_iter().flatten() {
+                take(entry);
+            }
+        }
+        for msg in body["messages"].as_array().expect("messages") {
+            for block in msg["content"].as_array().expect("content") {
+                take(block);
+            }
+        }
+        out
+    }
+
+    /// Claims 2 and 3, held over one request: the marker budget, and TTL
+    /// ordering (the API requires longer-lived breakpoints to precede
+    /// shorter-lived ones).
+    pub fn assert_marker_budget_and_ttl_order(req: &SamplingRequest, label: &str) {
+        let body = hotl_provider_anthropic::wire_body(req);
+        let markers = count_markers(&body);
+        assert!(
+            markers <= MARKER_BUDGET,
+            "{label}: {markers} cache_control markers exceeds the API budget of \
+             {MARKER_BUDGET}:\n{body:#}"
+        );
+        let ttls = marker_ttls_in_prompt_order(&body);
+        if let Some(plain) = ttls.iter().position(Option::is_none) {
+            assert!(
+                ttls[plain..].iter().all(|t| t.as_deref() != Some("1h")),
+                "{label}: a 1h marker follows a plain (5m) one — longer TTLs must \
+                 come first: {ttls:?}"
+            );
+        }
+    }
+
+    /// Is `earlier`'s durable body a **structural prefix** of `later`'s: the
+    /// same system, the same tools, and every message `earlier` carried still
+    /// present, unchanged, at the same index? Markers are ignored (see
+    /// [`without_markers`]) — a rolled anchor is growth, not a rewrite.
+    pub fn is_structural_prefix(earlier: &serde_json::Value, later: &serde_json::Value) -> bool {
+        if without_markers(&earlier["system"]) != without_markers(&later["system"])
+            || without_markers(&earlier["tools"]) != without_markers(&later["tools"])
+        {
+            return false;
+        }
+        let a = earlier["messages"].as_array().expect("messages");
+        let b = later["messages"].as_array().expect("messages");
+        a.len() <= b.len()
+            && a.iter()
+                .zip(b)
+                .all(|(x, y)| without_markers(x) == without_markers(y))
+    }
+
+    /// Indices `i` where request `i + 1` broke the prefix relation with
+    /// request `i`. Empty for an ordinary session; exactly one across a
+    /// compaction fold, which is the only sanctioned discontinuity.
+    pub fn cache_prefix_breaks(requests: &[SamplingRequest]) -> Vec<usize> {
+        requests
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| {
+                !is_structural_prefix(&durable_wire_body(&pair[0]), &durable_wire_body(&pair[1]))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// THE suite. Over a sequence of requests one session actually issued:
+    ///
+    /// 1. every request's durable body is a structural prefix of the next's;
+    /// 2. no request exceeds the `cache_control` budget;
+    /// 3. no plain marker precedes a `1h` one in prompt order;
+    /// 4. the lookback guarantee, in its two halves — (4a) the **deepest**
+    ///    entry request N wrote is reachable from a marker in request N+1
+    ///    (else the longest cached prefix N+1 can find is shallower than the
+    ///    one N just paid to write, and everything past it re-bills — this is
+    ///    the billing claim); and (4b) no marker is more than a lookback past
+    ///    the nearest marker at or before it, counting request N's markers,
+    ///    request N+1's own shallower markers, and the start.
+    ///
+    /// Claim 4 is the one a byte-identity test cannot make: it is a statement
+    /// about two *different* requests, and it is what the original bug broke.
+    ///
+    /// Claim 4a is therefore not a universal property of the planner: a
+    /// fixture whose single turn appends ≥3 stride crossings at once (a
+    /// ~45+ block user-role turn) will fail it even though the code is
+    /// behaving exactly as designed — see the budget-exhaustion note in
+    /// `cache_plan`'s module doc. That one request legitimately re-bills its
+    /// history once and self-heals on the next sample, so such a fixture
+    /// needs its own assertion, not this one.
+    ///
+    /// (4b) deliberately admits N+1's own shallower markers as chain links.
+    /// Not because a deeper breakpoint can *read* one — within a single
+    /// request the lookup runs against entries that already existed, and
+    /// nothing can read an entry this same request is still creating. The
+    /// reason is that the content between N+1's own markers is **new**: it has
+    /// to be written this request no matter where the markers sit, so there is
+    /// no miss to price. What matters is the state afterwards — entries now
+    /// exist at both positions, so the chain N+2 walks back through is intact.
+    /// Requiring every marker to reach a marker of N alone would fail on
+    /// correct code: a request that adds an anchor deeper than anything the
+    /// previous request marked is exactly what a growing history is supposed
+    /// to do.
+    pub fn assert_stable_cache_prefix(requests: &[SamplingRequest]) {
+        assert!(
+            requests.len() >= 2,
+            "a cross-request claim needs at least two requests"
+        );
+        for (i, req) in requests.iter().enumerate() {
+            assert_marker_budget_and_ttl_order(req, &format!("request {i}"));
+        }
+        let breaks = cache_prefix_breaks(requests);
+        assert!(
+            breaks.is_empty(),
+            "the durable prefix must only ever grow; it changed at {breaks:?}"
+        );
+        for (i, pair) in requests.windows(2).enumerate() {
+            // The start (0) is always an entry: the prefix marker on
+            // system/tools seals everything before block 1.
+            let written: Vec<usize> = std::iter::once(0)
+                .chain(marker_positions(&durable_wire_body(&pair[0])))
+                .collect();
+            let now = marker_positions(&durable_wire_body(&pair[1]));
+            let deepest = *written.last().expect("0 is always written");
+
+            // (4a) the billing claim.
+            assert!(
+                now.iter()
+                    .any(|m| *m >= deepest && m - deepest <= CACHE_LOOKBACK),
+                "requests {i}->{}: nothing in {now:?} can see the deepest entry \
+                 request {i} wrote (block {deepest}) from within the \
+                 {CACHE_LOOKBACK}-block lookback — the history past it re-bills",
+                i + 1
+            );
+
+            // (4b) no marker outruns the chain.
+            let mut reachable = written.clone();
+            for p in &now {
+                let nearest = reachable
+                    .iter()
+                    .copied()
+                    .filter(|q| q <= p)
+                    .max()
+                    .expect("0 is always a candidate");
+                assert!(
+                    p - nearest <= CACHE_LOOKBACK,
+                    "requests {i}->{}: the marker at block {p} is {} blocks past the \
+                     nearest reachable entry ({reachable:?}) — outside the \
+                     {CACHE_LOOKBACK}-block lookback",
+                    i + 1,
+                    p - nearest
+                );
+                reachable.push(*p);
+                reachable.sort_unstable();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::wire::*;
     use super::*;
     use hotl_types::{StopReason, SyntheticReason, TokenUsage};
     use serde_json::json;
@@ -1582,246 +1856,6 @@ mod tests {
     // are about CONSECUTIVE requests — where markers land, and whether the
     // next request can still see the entry the last one wrote.
 
-    /// The API's cache lookback, in wire content blocks. A marker further than
-    /// this past the nearest entry the previous request wrote cannot see it,
-    /// and the segment before it re-bills at write price.
-    const CACHE_LOOKBACK: usize = 20;
-
-    /// The API's per-request `cache_control` budget (a fifth is a 400).
-    const MARKER_BUDGET: usize = 4;
-
-    /// The request as the wire would carry it with **only its durable half**:
-    /// ephemeral tail emptied, MOIM dropped. Built by re-serializing the
-    /// `SamplingRequest` (the `without_moim` pattern), never by fishing
-    /// messages back out of a built body — a tail user message is
-    /// byte-indistinguishable from a durable one once it is JSON, which is
-    /// precisely why the split had to happen upstream of the serializer.
-    fn durable_wire_body(req: &SamplingRequest) -> serde_json::Value {
-        hotl_provider_anthropic::wire_body(&SamplingRequest {
-            ephemeral_tail: Arc::new(Vec::new()),
-            turn_context: None,
-            ..req.clone()
-        })
-    }
-
-    /// Every `cache_control` key removed, recursively.
-    ///
-    /// Markers are *metadata*: they are not part of the prefix the API hashes,
-    /// so moving one between requests does not invalidate an entry. "The same
-    /// conversation, grown" therefore has to compare equal whether or not an
-    /// anchor rolled — which is exactly what makes anchor-rolling safe.
-    fn without_markers(v: &serde_json::Value) -> serde_json::Value {
-        match v {
-            serde_json::Value::Object(map) => serde_json::Value::Object(
-                map.iter()
-                    .filter(|(k, _)| k.as_str() != "cache_control")
-                    .map(|(k, val)| (k.clone(), without_markers(val)))
-                    .collect(),
-            ),
-            serde_json::Value::Array(items) => {
-                serde_json::Value::Array(items.iter().map(without_markers).collect())
-            }
-            other => other.clone(),
-        }
-    }
-
-    /// Every `cache_control` in a built body, counted structurally.
-    fn count_markers(v: &serde_json::Value) -> usize {
-        match v {
-            serde_json::Value::Object(map) => {
-                usize::from(map.contains_key("cache_control"))
-                    + map.values().map(count_markers).sum::<usize>()
-            }
-            serde_json::Value::Array(items) => items.iter().map(count_markers).sum(),
-            _ => 0,
-        }
-    }
-
-    /// 1-based wire content-block index of every marker in `messages` — the
-    /// coordinate space the lookback counts in. The prefix marker (system, or
-    /// the last tool def) sits *before* block 1 and is represented by the
-    /// implicit start position 0.
-    fn marker_positions(body: &serde_json::Value) -> Vec<usize> {
-        let mut idx = 0usize;
-        let mut out = Vec::new();
-        for msg in body["messages"].as_array().expect("messages") {
-            for block in msg["content"].as_array().expect("content") {
-                idx += 1;
-                if block.get("cache_control").is_some() {
-                    out.push(idx);
-                }
-            }
-        }
-        out
-    }
-
-    /// Every marker's `ttl` (`None` = plain, i.e. the API's default 5m), in
-    /// the order the API parses the prompt: tools, then system, then messages
-    /// in wire order. That order is what "longer TTL before shorter" is a
-    /// claim about.
-    fn marker_ttls_in_prompt_order(body: &serde_json::Value) -> Vec<Option<String>> {
-        let mut out = Vec::new();
-        let mut take = |v: &serde_json::Value| {
-            if let Some(cc) = v.get("cache_control") {
-                out.push(cc.get("ttl").and_then(|t| t.as_str()).map(String::from));
-            }
-        };
-        for section in ["tools", "system"] {
-            for entry in body[section].as_array().into_iter().flatten() {
-                take(entry);
-            }
-        }
-        for msg in body["messages"].as_array().expect("messages") {
-            for block in msg["content"].as_array().expect("content") {
-                take(block);
-            }
-        }
-        out
-    }
-
-    /// Claims 2 and 3, held over one request: the marker budget, and TTL
-    /// ordering (the API requires longer-lived breakpoints to precede
-    /// shorter-lived ones).
-    fn assert_marker_budget_and_ttl_order(req: &SamplingRequest, label: &str) {
-        let body = hotl_provider_anthropic::wire_body(req);
-        let markers = count_markers(&body);
-        assert!(
-            markers <= MARKER_BUDGET,
-            "{label}: {markers} cache_control markers exceeds the API budget of \
-             {MARKER_BUDGET}:\n{body:#}"
-        );
-        let ttls = marker_ttls_in_prompt_order(&body);
-        if let Some(plain) = ttls.iter().position(Option::is_none) {
-            assert!(
-                ttls[plain..].iter().all(|t| t.as_deref() != Some("1h")),
-                "{label}: a 1h marker follows a plain (5m) one — longer TTLs must \
-                 come first: {ttls:?}"
-            );
-        }
-    }
-
-    /// Is `earlier`'s durable body a **structural prefix** of `later`'s: the
-    /// same system, the same tools, and every message `earlier` carried still
-    /// present, unchanged, at the same index? Markers are ignored (see
-    /// [`without_markers`]) — a rolled anchor is growth, not a rewrite.
-    fn is_structural_prefix(earlier: &serde_json::Value, later: &serde_json::Value) -> bool {
-        if without_markers(&earlier["system"]) != without_markers(&later["system"])
-            || without_markers(&earlier["tools"]) != without_markers(&later["tools"])
-        {
-            return false;
-        }
-        let a = earlier["messages"].as_array().expect("messages");
-        let b = later["messages"].as_array().expect("messages");
-        a.len() <= b.len()
-            && a.iter()
-                .zip(b)
-                .all(|(x, y)| without_markers(x) == without_markers(y))
-    }
-
-    /// Indices `i` where request `i + 1` broke the prefix relation with
-    /// request `i`. Empty for an ordinary session; exactly one across a
-    /// compaction fold, which is the only sanctioned discontinuity.
-    fn cache_prefix_breaks(requests: &[SamplingRequest]) -> Vec<usize> {
-        requests
-            .windows(2)
-            .enumerate()
-            .filter(|(_, pair)| {
-                !is_structural_prefix(&durable_wire_body(&pair[0]), &durable_wire_body(&pair[1]))
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// THE suite. Over a sequence of requests one session actually issued:
-    ///
-    /// 1. every request's durable body is a structural prefix of the next's;
-    /// 2. no request exceeds the `cache_control` budget;
-    /// 3. no plain marker precedes a `1h` one in prompt order;
-    /// 4. the lookback guarantee, in its two halves — (4a) the **deepest**
-    ///    entry request N wrote is reachable from a marker in request N+1
-    ///    (else the longest cached prefix N+1 can find is shallower than the
-    ///    one N just paid to write, and everything past it re-bills — this is
-    ///    the billing claim); and (4b) no marker is more than a lookback past
-    ///    the nearest marker at or before it, counting request N's markers,
-    ///    request N+1's own shallower markers, and the start.
-    ///
-    /// Claim 4 is the one a byte-identity test cannot make: it is a statement
-    /// about two *different* requests, and it is what the original bug broke.
-    ///
-    /// Claim 4a is therefore not a universal property of the planner: a
-    /// fixture whose single turn appends ≥3 stride crossings at once (a
-    /// ~45+ block user-role turn) will fail it even though the code is
-    /// behaving exactly as designed — see the budget-exhaustion note in
-    /// `cache_plan`'s module doc. That one request legitimately re-bills its
-    /// history once and self-heals on the next sample, so such a fixture
-    /// needs its own assertion, not this one.
-    ///
-    /// (4b) deliberately admits N+1's own shallower markers as chain links.
-    /// Not because a deeper breakpoint can *read* one — within a single
-    /// request the lookup runs against entries that already existed, and
-    /// nothing can read an entry this same request is still creating. The
-    /// reason is that the content between N+1's own markers is **new**: it has
-    /// to be written this request no matter where the markers sit, so there is
-    /// no miss to price. What matters is the state afterwards — entries now
-    /// exist at both positions, so the chain N+2 walks back through is intact.
-    /// Requiring every marker to reach a marker of N alone would fail on
-    /// correct code: a request that adds an anchor deeper than anything the
-    /// previous request marked is exactly what a growing history is supposed
-    /// to do.
-    fn assert_stable_cache_prefix(requests: &[SamplingRequest]) {
-        assert!(
-            requests.len() >= 2,
-            "a cross-request claim needs at least two requests"
-        );
-        for (i, req) in requests.iter().enumerate() {
-            assert_marker_budget_and_ttl_order(req, &format!("request {i}"));
-        }
-        let breaks = cache_prefix_breaks(requests);
-        assert!(
-            breaks.is_empty(),
-            "the durable prefix must only ever grow; it changed at {breaks:?}"
-        );
-        for (i, pair) in requests.windows(2).enumerate() {
-            // The start (0) is always an entry: the prefix marker on
-            // system/tools seals everything before block 1.
-            let written: Vec<usize> = std::iter::once(0)
-                .chain(marker_positions(&durable_wire_body(&pair[0])))
-                .collect();
-            let now = marker_positions(&durable_wire_body(&pair[1]));
-            let deepest = *written.last().expect("0 is always written");
-
-            // (4a) the billing claim.
-            assert!(
-                now.iter()
-                    .any(|m| *m >= deepest && m - deepest <= CACHE_LOOKBACK),
-                "requests {i}->{}: nothing in {now:?} can see the deepest entry \
-                 request {i} wrote (block {deepest}) from within the \
-                 {CACHE_LOOKBACK}-block lookback — the history past it re-bills",
-                i + 1
-            );
-
-            // (4b) no marker outruns the chain.
-            let mut reachable = written.clone();
-            for p in &now {
-                let nearest = reachable
-                    .iter()
-                    .copied()
-                    .filter(|q| q <= p)
-                    .max()
-                    .expect("0 is always a candidate");
-                assert!(
-                    p - nearest <= CACHE_LOOKBACK,
-                    "requests {i}->{}: the marker at block {p} is {} blocks past the \
-                     nearest reachable entry ({reachable:?}) — outside the \
-                     {CACHE_LOOKBACK}-block lookback",
-                    i + 1,
-                    p - nearest
-                );
-                reachable.push(*p);
-                reachable.sort_unstable();
-            }
-        }
-    }
 
     /// An instant, permission-free, parallel-safe tool. The cache scenarios
     /// need *wide* turns (many `tool_use` blocks, many `tool_result` blocks)
