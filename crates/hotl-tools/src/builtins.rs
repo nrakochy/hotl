@@ -82,7 +82,7 @@ fn guarded_search_root(
 /// The extra write roots granted to `tool` by `[sandbox].file_tools` —
 /// empty unless the owner opted the mutating file tools into the
 /// `[sandbox].writable` set (`file_tools = "writable"`).
-fn granted_extras() -> &'static [std::path::PathBuf] {
+pub(crate) fn granted_extras() -> &'static [std::path::PathBuf] {
     match sandbox::file_tools_mode() {
         sandbox::FileToolsMode::Writable => sandbox::extra_writable(),
         sandbox::FileToolsMode::Workspace => &[],
@@ -91,7 +91,7 @@ fn granted_extras() -> &'static [std::path::PathBuf] {
 
 /// Where a mutating file tool's path lands, for both the permission pick and
 /// the run-time door — one classification, so the two can never disagree.
-enum WriteTarget {
+pub(crate) enum WriteTarget {
     /// Workspace-relative: the fd descent from the workspace root.
     Workspace(std::path::PathBuf),
     /// Under a granted `[sandbox].writable` root: the same fd descent,
@@ -103,7 +103,11 @@ enum WriteTarget {
     OutsideApproved,
 }
 
-fn write_target(root: &std::path::Path, extras: &[std::path::PathBuf], path: &str) -> WriteTarget {
+pub(crate) fn write_target(
+    root: &std::path::Path,
+    extras: &[std::path::PathBuf],
+    path: &str,
+) -> WriteTarget {
     match fsguard::classify(root, path) {
         fsguard::Placement::Inside(rel) => WriteTarget::Workspace(rel),
         fsguard::Placement::Outside(_) => match fsguard::extra_root_for(path, extras) {
@@ -534,7 +538,7 @@ impl Tool for EditTool {
         "Exact string replacement in a file. `old_string` must match exactly once, including whitespace; include surrounding lines to make it unique."
     }
     fn schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string"},
@@ -542,7 +546,15 @@ impl Tool for EditTool {
                 "new_string": {"type": "string"}
             },
             "required": ["path", "old_string", "new_string"]
-        })
+        });
+        // Never advertise an arg the build cannot honor (Decision D1).
+        if crate::minified::available() {
+            schema["properties"]["minified"] = json!({
+                "type": "boolean",
+                "description": "Match `old_string` against the minified token-stream view (as returned by read with minified:true) and splice the change into the real file, which keeps all its formatting. Matching is exact and must be unique in that view. Quote from a minified read, not a plain one."
+            });
+        }
+        schema
     }
     fn edits_files(&self) -> bool {
         true
@@ -553,14 +565,19 @@ impl Tool for EditTool {
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
             let root = fsguard::workspace_root();
-            let result = edit_in(root, granted_extras(), &input).await;
+            let extras = granted_extras();
+            let result = if wants_minified(&input) {
+                crate::minified::edit_minified_in(root, extras, &input, &self.minify).await
+            } else {
+                edit_in(root, extras, &input).await
+            };
             with_diagnostics(&self.diag, &input, result).await
         })
     }
 }
 
 /// Append the configured post-mutation check (M3a) to a successful result.
-async fn with_diagnostics(
+pub(crate) async fn with_diagnostics(
     diag: &crate::diagnostics::Diagnostics,
     input: &Value,
     result: ToolResult,
@@ -666,7 +683,7 @@ async fn edit_with_hook(
 /// Read a file for editing through whichever door its `WriteTarget` opened:
 /// the fd descent inside the workspace or a granted extra root, a plain open
 /// outside every boundary (which the human approved by path).
-fn read_guarded_to_string(
+pub(crate) fn read_guarded_to_string(
     root: &std::path::Path,
     target: &WriteTarget,
     path: &str,
@@ -695,7 +712,7 @@ fn read_guarded_to_string(
 /// granted extra root this is the atomic replace (temp sibling, fsync,
 /// `renameat`, parent fsync); outside every boundary, a plain whole-file
 /// write.
-fn write_guarded(
+pub(crate) fn write_guarded(
     root: &std::path::Path,
     target: &WriteTarget,
     path: &str,
