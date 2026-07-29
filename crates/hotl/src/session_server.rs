@@ -114,11 +114,11 @@ fn auth_frame_ok(line: &str, token: &str) -> bool {
 }
 
 fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
-    use std::os::fd::AsRawFd;
-    let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
-    // SAFETY: fd is a live connected unix socket for the call's duration.
-    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut uid, &mut gid) };
-    rc == 0 && uid == unsafe { libc::getuid() }
+    // peer_cred is the portable spelling: SO_PEERCRED on Linux, getpeereid on
+    // the BSDs. Calling `libc::getpeereid` directly does not build on Linux.
+    stream
+        .peer_cred()
+        .is_ok_and(|cred| cred.uid() == unsafe { libc::getuid() })
 }
 
 /// Live backgrounded sessions (their socket ids), from the run dir.
@@ -561,6 +561,14 @@ mod tests {
         s.push('\n');
         w.write_all(s.as_bytes()).await.unwrap();
         w.flush().await.unwrap();
+    }
+
+    // Guards the portable spelling of the peer check: a socket we opened
+    // ourselves must read back as our own uid on every supported platform.
+    #[tokio::test]
+    async fn peer_of_our_own_socket_reads_back_as_same_uid() {
+        let (ours, _theirs) = UnixStream::pair().unwrap();
+        assert!(peer_is_same_uid(&ours));
     }
 
     #[tokio::test]
