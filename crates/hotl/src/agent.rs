@@ -898,6 +898,7 @@ async fn scaffold(
         config.clone(),
         cwd.clone(),
         cfg.hooks_toml(),
+        minify_config(&cfg).0,
         system.clone(),
         model.clone(),
         sandbox_enforced,
@@ -1331,6 +1332,22 @@ fn snapshot_provider(cell: HeadCell, session_id: String) -> crate::spawn::Snapsh
 /// Warnings are returned to the one caller that owns stdout, matching the
 /// pattern `load_rules_with` already establishes in this file. Enforced by
 /// `build_registry_has_no_direct_output`.
+/// The `[minify]` section, with a warning rather than a silent default when it
+/// is present but malformed — a typo'd key that quietly disabled a feature is
+/// exactly the thing the returned-warnings channel exists for.
+fn minify_config(cfg: &crate::config::Config) -> (hotl_tools::MinifyConfig, Option<String>) {
+    match cfg.minify_toml() {
+        None => (hotl_tools::MinifyConfig::default(), None),
+        Some(t) => match toml::from_str::<hotl_tools::MinifyConfig>(&t) {
+            Ok(parsed) => (parsed, None),
+            Err(e) => (
+                hotl_tools::MinifyConfig::default(),
+                Some(format!("[minify] section ignored ({e}); using defaults")),
+            ),
+        },
+    }
+}
+
 fn build_registry(
     cfg: &crate::config::Config,
     config_dir: &std::path::Path,
@@ -1342,7 +1359,9 @@ fn build_registry(
         .hooks_toml()
         .map(|t| hotl_tools::diagnostics::Diagnostics::from_toml(&t))
         .unwrap_or_default();
-    let mut registry = Registry::builtin_with(diagnostics);
+    let (minify, minify_warning) = minify_config(cfg);
+    discovery_warnings.extend(minify_warning);
+    let mut registry = Registry::builtin_with(diagnostics, minify);
     let servers = cfg.mcp_servers();
     if !servers.is_empty() {
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
@@ -1428,6 +1447,8 @@ struct HotlChildBuilder {
     /// The parent's config.toml `[diagnostics]` (as a hooks.toml-shaped
     /// string), captured at construction — children don't re-read the file.
     hooks_toml: Option<String>,
+    /// The parent's `[minify]`, captured the same way and for the same reason.
+    minify: hotl_tools::MinifyConfig,
     system: String,
     model: String,
     sandbox_enforced: bool,
@@ -1462,7 +1483,7 @@ impl HotlChildBuilder {
             .as_deref()
             .map(hotl_tools::diagnostics::Diagnostics::from_toml)
             .unwrap_or_default();
-        let full = Registry::builtin_with(diagnostics);
+        let full = Registry::builtin_with(diagnostics, self.minify.clone());
         hotl_tools::agents::filter_registry(def, &full)
     }
 
@@ -1678,6 +1699,7 @@ fn child_builder(
     config: EngineConfig,
     cwd: PathBuf,
     hooks_toml: Option<String>,
+    minify: hotl_tools::MinifyConfig,
     system: String,
     model: String,
     sandbox_enforced: bool,
@@ -1690,6 +1712,7 @@ fn child_builder(
         config,
         cwd,
         hooks_toml,
+        minify,
         system,
         model,
         sandbox_enforced,
@@ -3438,6 +3461,7 @@ mod tests {
 
     pub(super) fn test_child_builder() -> HotlChildBuilder {
         HotlChildBuilder {
+            minify: hotl_tools::MinifyConfig::default(),
             provider: Arc::new(hotl_provider::ScriptedProvider::new(vec![])),
             rules: Arc::new(hotl_tools::rules::Rules::default()),
             clock: Arc::new(SystemClock),

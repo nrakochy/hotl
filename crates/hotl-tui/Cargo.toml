@@ -12,9 +12,16 @@ homepage.workspace = true
 keywords = ["tui", "ratatui", "agent", "console"]
 categories = ["command-line-utilities"]
 
+[features]
+default = ["minify"]
+# Forwarded to hotl-tools (Decision D1). Every internal dependent must forward
+# it, or feature unification re-enables the tree-sitter stack that
+# `--no-default-features` was meant to drop.
+minify = ["hotl-tools/minify"]
+
 [dependencies]
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.9.0", features = ["ratatui"] }
-hotl-tools = { path = "../hotl-tools", version = "0.9.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.9.0", default-features = false }
 # A leaf crate with no I/O — added to *remove* a hand-copied
 # `normalize_session_name`, not to reach the engine (§7).
 hotl-types = { path = "../hotl-types", version = "0.9.0" }

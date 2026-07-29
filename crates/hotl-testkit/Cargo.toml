@@ -10,13 +10,20 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["minify"]
+# Forwarded to hotl-tools (Decision D1). Every internal dependent must forward
+# it, or feature unification re-enables the tree-sitter stack that
+# `--no-default-features` was meant to drop.
+minify = ["hotl-engine/minify", "hotl-tools/minify"]
+
 [dependencies]
 hotl-types = { path = "../hotl-types", version = "0.9.0" }
 hotl-platform = { path = "../hotl-platform", version = "0.9.0" }
 hotl-provider = { path = "../hotl-provider", version = "0.9.0" }
-hotl-tools = { path = "../hotl-tools", version = "0.9.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.9.0", default-features = false }
 hotl-store = { path = "../hotl-store", version = "0.9.0" }
-hotl-engine = { path = "../hotl-engine", version = "0.9.0" }
+hotl-engine = { path = "../hotl-engine", version = "0.9.0", default-features = false }
 # The `wire` module states its claims over *provider-serialized* request bytes,
 # so the kit needs one real dialect to serialize with. A dependency rather than
 # a dev-dependency since `wire` is public: hotl-engine's fork-cache test is a

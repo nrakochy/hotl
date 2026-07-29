@@ -77,6 +77,15 @@ jobs:
         run: |
           cargo test -p hotl-tools --features security-enforced --locked
           cargo test -p hotl --features security-enforced --locked
+      # Decision D1's escape hatch, gated because it is easy to break silently:
+      # every internal crate between `hotl` and `hotl-tools` has to opt out of
+      # default features *and* forward `minify`, or feature unification pulls
+      # the C-compiling tree-sitter stack back in and this build stops being
+      # pure Rust. A `cargo check` would not notice; the grep does.
+      - name: Build without the minify feature (no C toolchain)
+        run: |
+          cargo test -p hotl --no-default-features --locked
+          ! cargo tree -p hotl --no-default-features -e normal | grep -q tree-sitter
 
   # MSRV floor gate. `rust-version` in Cargo.toml was declared but unverified —
   # every other job is @stable, so nothing caught the floor drifting upward.

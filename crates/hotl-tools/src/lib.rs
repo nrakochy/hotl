@@ -13,6 +13,7 @@ pub mod concurrency;
 pub mod diagnostics;
 pub(crate) mod fsguard;
 pub(crate) mod matcher;
+mod minified;
 pub mod net;
 pub mod rules;
 pub mod sandbox;
@@ -22,6 +23,7 @@ pub mod web;
 
 pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
+pub use minified::MinifyConfig;
 pub use todo::TodoWriteTool;
 pub use web::{WebFetchTool, WebSearchTool};
 
@@ -134,19 +136,26 @@ impl Registry {
     pub fn builtin() -> Self {
         static BUILTIN: OnceLock<Registry> = OnceLock::new();
         BUILTIN
-            .get_or_init(|| Self::builtin_with(diagnostics::Diagnostics::default()))
+            .get_or_init(|| {
+                Self::builtin_with(diagnostics::Diagnostics::default(), MinifyConfig::default())
+            })
             .clone()
     }
 
-    /// Builtins with post-mutation diagnostics (M3a) shared by edit/write.
-    /// `diag` is caller-supplied per call, so unlike `builtin` above this
-    /// always builds fresh.
-    pub fn builtin_with(diag: diagnostics::Diagnostics) -> Self {
+    /// Builtins with post-mutation diagnostics (M3a) shared by edit/write, and
+    /// the `[minify]` section read/edit consult. Both are caller-supplied per
+    /// call, so unlike `builtin` above this always builds fresh.
+    pub fn builtin_with(diag: diagnostics::Diagnostics, minify: MinifyConfig) -> Self {
         let diag = Arc::new(diag);
         Self {
             tools: vec![
-                Arc::new(ReadTool),
-                Arc::new(EditTool { diag: diag.clone() }),
+                Arc::new(ReadTool {
+                    minify: minify.clone(),
+                }),
+                Arc::new(EditTool {
+                    diag: diag.clone(),
+                    minify,
+                }),
                 Arc::new(WriteTool { diag }),
                 Arc::new(BashTool),
                 Arc::new(GlobTool),
@@ -386,8 +395,10 @@ mod tests {
     /// alias across calls the way the memoized `builtin()` now does.
     #[test]
     fn builtin_with_still_returns_fresh_instances() {
-        let a = Registry::builtin_with(diagnostics::Diagnostics::default());
-        let b = Registry::builtin_with(diagnostics::Diagnostics::default());
+        let a =
+            Registry::builtin_with(diagnostics::Diagnostics::default(), MinifyConfig::default());
+        let b =
+            Registry::builtin_with(diagnostics::Diagnostics::default(), MinifyConfig::default());
         assert!(!std::ptr::eq(
             a.get("read").expect("read"),
             b.get("read").expect("read")

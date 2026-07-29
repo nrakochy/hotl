@@ -1025,6 +1025,7 @@ version = "0.9.0"
 dependencies = [
  "futures-util",
  "globset",
+ "hotl-minify",
  "hotl-provider",
  "hotl-types",
  "ignore",

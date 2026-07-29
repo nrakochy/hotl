@@ -10,12 +10,19 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["minify"]
+# Forwarded to hotl-tools (Decision D1). Every internal dependent must forward
+# it, or feature unification re-enables the tree-sitter stack that
+# `--no-default-features` was meant to drop.
+minify = ["hotl-retrieval/minify", "hotl-tools/minify"]
+
 [dependencies]
 hotl-types = { path = "../hotl-types", version = "0.9.0" }
 hotl-platform = { path = "../hotl-platform", version = "0.9.0" }
 hotl-provider = { path = "../hotl-provider", version = "0.9.0" }
 hotl-context = { path = "../hotl-context", version = "0.9.0" }
-hotl-tools = { path = "../hotl-tools", version = "0.9.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.9.0", default-features = false }
 hotl-store = { path = "../hotl-store", version = "0.9.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,7 +35,7 @@ thiserror = { workspace = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-hotl-retrieval = { path = "../hotl-retrieval", version = "0.9.0" }
+hotl-retrieval = { path = "../hotl-retrieval", version = "0.9.0", default-features = false }
 tempfile = { workspace = true }
 # test-util: paused-clock tests measure summarize/sample overlap deterministically.
 tokio = { workspace = true, features = ["test-util"] }

@@ -637,6 +637,14 @@ impl Config {
     /// inner table directly rather than re-wrapping it under `web`), or
     /// `None` when absent — `web_fetch` registers regardless (it needs no
     /// backend); `web_search` simply never gets built.
+    /// The `[minify]` section's *contents* (for `hotl_tools::MinifyConfig`),
+    /// or `None` when absent — both keys default on, so absence and an empty
+    /// section mean the same thing.
+    pub fn minify_toml(&self) -> Option<String> {
+        let minify = self.raw.as_ref()?.get("minify")?;
+        toml::to_string(minify).ok()
+    }
+
     pub fn web_toml(&self) -> Option<String> {
         let web = self.raw.as_ref()?.get("web")?;
         toml::to_string(web).ok()
@@ -864,6 +872,17 @@ mod tests {
         assert_eq!(absent.concurrency.agents, None);
         assert_eq!(absent.concurrency.requests, None);
         assert_eq!(absent.concurrency.subprocs, None);
+    }
+
+    #[test]
+    fn minify_section_passes_through_and_is_absent_by_default() {
+        let cfg = cfg_with("[minify]\nenable = false\nkeep_comments = false\n");
+        let t = cfg.minify_toml().unwrap();
+        assert!(t.contains("enable = false"), "was: {t}");
+        assert!(t.contains("keep_comments = false"), "was: {t}");
+        // Absent section: None — both keys default on, so absence and an empty
+        // section mean the same thing.
+        assert!(cfg_with("").minify_toml().is_none());
     }
 
     #[test]

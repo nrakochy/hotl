@@ -164,7 +164,10 @@ fn file_permission_with(verb: &str, input: &Value, extras: &[std::path::PathBuf]
     }
 }
 
-pub struct ReadTool;
+#[derive(Default)]
+pub struct ReadTool {
+    pub minify: crate::MinifyConfig,
+}
 
 impl Tool for ReadTool {
     fn name(&self) -> &'static str {
@@ -486,6 +489,7 @@ fn guarded_write_bytes(
 #[derive(Default)]
 pub struct EditTool {
     pub diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
+    pub minify: crate::MinifyConfig,
 }
 
 impl Tool for EditTool {
@@ -1397,9 +1401,9 @@ mod tests {
     #[test]
     fn read_inside_the_workspace_needs_no_permission() {
         let inside = json!({"path": "Cargo.toml"});
-        assert_eq!(ReadTool.permission(&inside), Permission::None);
+        assert_eq!(ReadTool::default().permission(&inside), Permission::None);
         assert_eq!(
-            ReadTool.permission(&json!({"path": "src/../src/lib.rs"})),
+            ReadTool::default().permission(&json!({"path": "src/../src/lib.rs"})),
             Permission::None
         );
     }
@@ -1408,7 +1412,7 @@ mod tests {
     fn read_outside_the_workspace_is_protected_not_free() {
         // T1-6's headline: this ran with NO prompt, in every mode, including
         // plan and dontask.
-        let out = ReadTool.permission(&json!({"path": "/Users/you/.ssh/id_rsa"}));
+        let out = ReadTool::default().permission(&json!({"path": "/Users/you/.ssh/id_rsa"}));
         match out {
             Permission::AskProtected { summary, why } => {
                 assert!(summary.contains("id_rsa"));
@@ -1418,7 +1422,7 @@ mod tests {
         }
         // `..` escapes are the same class.
         assert!(matches!(
-            ReadTool.permission(&json!({"path": "../../etc/shadow"})),
+            ReadTool::default().permission(&json!({"path": "../../etc/shadow"})),
             Permission::AskProtected { .. }
         ));
     }
@@ -2133,7 +2137,7 @@ mod tests {
             json!({"path": p, "content": "one\ntwo\n"}),
         );
         assert!(!w.is_error, "{}", w.content);
-        let r = run(&ReadTool, json!({"path": p}));
+        let r = run(&ReadTool::default(), json!({"path": p}));
         assert!(!r.is_error);
         assert!(r.content.contains("one") && r.content.contains("two"));
     }
@@ -2142,7 +2146,7 @@ mod tests {
     fn only_read_is_parallel_safe_among_builtins() {
         // read has no side effects, so calls in one batch may overlap; the
         // mutating/executing builtins must stay serial within a batch.
-        assert!(ReadTool.parallel_safe());
+        assert!(ReadTool::default().parallel_safe());
         assert!(!EditTool::default().parallel_safe());
         assert!(!WriteTool::default().parallel_safe());
         assert!(!BashTool.parallel_safe());

@@ -18,9 +18,13 @@ name = "hotl"
 path = "src/main.rs"
 
 [features]
+default = ["minify"]
 # Forwarded compile-time permission enforcement: per-action asks cannot be
 # disabled by any config in a binary built with this.
 security-enforced = ["hotl-tools/security-enforced"]
+# Forwarded tree-sitter minified read/edit (Decision D1). Default on;
+# `cargo install hotl --no-default-features` is a pure-Rust build.
+minify = ["hotl-mcp/minify", "hotl-retrieval/minify", "hotl-engine/minify", "hotl-tui/minify", "hotl-tools/minify"]
 
 [dependencies]
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.9.0", features = ["ratatui"] }
@@ -35,13 +39,13 @@ hotl-platform = { path = "../hotl-platform", version = "0.9.0" }
 hotl-provider = { path = "../hotl-provider", version = "0.9.0" }
 hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.9.0" }
 hotl-provider-openai = { path = "../hotl-provider-openai", version = "0.9.0" }
-hotl-tools = { path = "../hotl-tools", version = "0.9.0" }
-hotl-mcp = { path = "../hotl-mcp", version = "0.9.0" }
-hotl-retrieval = { path = "../hotl-retrieval", version = "0.9.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.9.0", default-features = false }
+hotl-mcp = { path = "../hotl-mcp", version = "0.9.0", default-features = false }
+hotl-retrieval = { path = "../hotl-retrieval", version = "0.9.0", default-features = false }
 hotl-store = { path = "../hotl-store", version = "0.9.0" }
 hotl-context = { path = "../hotl-context", version = "0.9.0" }
-hotl-engine = { path = "../hotl-engine", version = "0.9.0" }
-hotl-tui = { path = "../hotl-tui", version = "0.9.0" }
+hotl-engine = { path = "../hotl-engine", version = "0.9.0", default-features = false }
+hotl-tui = { path = "../hotl-tui", version = "0.9.0", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }

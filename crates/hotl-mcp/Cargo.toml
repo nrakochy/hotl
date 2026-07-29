@@ -10,8 +10,15 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+default = ["minify"]
+# Forwarded to hotl-tools (Decision D1). Every internal dependent must forward
+# it, or feature unification re-enables the tree-sitter stack that
+# `--no-default-features` was meant to drop.
+minify = ["hotl-tools/minify"]
+
 [dependencies]
-hotl-tools = { path = "../hotl-tools", version = "0.9.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.9.0", default-features = false }
 hotl-types = { path = "../hotl-types", version = "0.9.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }

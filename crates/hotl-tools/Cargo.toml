@@ -11,11 +11,18 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
+default = ["minify"]
 # Compile-time permission enforcement: with this on, mode=auto cannot exist
 # at runtime (Rules::with_mode coerces it to Ask — see rules.rs).
 security-enforced = []
+# The tree-sitter parsing stack behind `read --minified` / `edit --minified`.
+# A build-footprint flag, not a security contract: the grammars compile C, and
+# `--no-default-features` restores the pure-Rust build (Decision D1). With it
+# off, `minified: true` is a prompt-shaped error and the schema omits the arg.
+minify = ["dep:hotl-minify"]
 
 [dependencies]
+hotl-minify = { path = "../hotl-minify", version = "0.9.0", optional = true }
 hotl-provider = { path = "../hotl-provider", version = "0.9.0" }
 hotl-types = { path = "../hotl-types", version = "0.9.0" }
 serde = { workspace = true }
