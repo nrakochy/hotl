@@ -24,6 +24,12 @@ use tokio::signal::unix::{signal, SignalKind};
 /// Context inherited from an earlier session (`hotl resume` — M3b).
 pub(crate) struct Resumed {
     pub parent_id: String,
+    /// The parent's tip at load time — the fork-point pin the new log records
+    /// so nothing the parent logs afterwards can rewrite this session's
+    /// inherited history (`hotl_store::ParentRef::tip_entry_id`). Resume
+    /// carries it too: a resumed parent is usually dead, but "usually" is not
+    /// an invariant.
+    pub parent_tip_entry_id: Option<String>,
     pub items: Vec<hotl_types::Item>,
     /// The parent's last `ModeSet`, if any (durable, last-wins — same
     /// inheritance shape as the display name). `None` = the parent never
@@ -256,6 +262,7 @@ pub(crate) async fn build_acp() -> Result<
                     mode,
                     plan,
                     todos,
+                    tip_entry_id,
                     ..
                 } = replayed;
                 // An explicit rename-on-resume beats the inherited name.
@@ -263,6 +270,7 @@ pub(crate) async fn build_acp() -> Result<
                 (
                     Some(Resumed {
                         parent_id: header.session_id,
+                        parent_tip_entry_id: tip_entry_id,
                         items,
                         mode,
                         plan,
@@ -272,11 +280,14 @@ pub(crate) async fn build_acp() -> Result<
                 )
             }
         };
-        let parent_id = resumed.as_ref().map(|r| r.parent_id.clone());
+        let parent = resumed.as_ref().map(|r| hotl_store::ParentRef {
+            session_id: r.parent_id.clone(),
+            tip_entry_id: r.parent_tip_entry_id.clone(),
+        });
         let mut log = SessionLog::create(
             &sessions_dir(),
             &scaffold.model,
-            parent_id,
+            parent,
             scaffold.masker(),
             scaffold.clock.now_ms(),
         )

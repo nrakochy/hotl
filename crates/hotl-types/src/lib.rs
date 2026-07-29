@@ -248,6 +248,22 @@ pub struct SessionHeader {
     pub session_id: String,
     /// Reserved for fork/resume (M3); always serialized so old logs stay readable.
     pub parent_session_id: Option<String>,
+    /// Fork-point pin: the id of the last parent entry that was part of this
+    /// session's seed. Ancestor replay stops after it, so a parent whose own
+    /// session keeps working post-fork — appending turns, or compacting, which
+    /// rewrites the projection *prefix* — cannot retroactively rewrite this
+    /// session's inherited history. Only a log's own live session appends to
+    /// it, so pinning the fork-time tip fully restores snapshot semantics.
+    ///
+    /// `None` (every log written before the field existed) = uncapped ancestor
+    /// replay, i.e. the original behavior.
+    ///
+    /// INVARIANT: a pinned child's replay is unaffected by anything the parent
+    /// logs after the fork. Enforced by
+    /// `a_pinned_child_ignores_parent_entries_appended_after_the_fork` and
+    /// `a_pinned_child_survives_a_post_fork_parent_compaction` (hotl-store).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_tip_entry_id: Option<String>,
     pub model: String,
     pub created_at_ms: u64,
 }

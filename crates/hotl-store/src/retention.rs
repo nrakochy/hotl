@@ -173,7 +173,7 @@ fn remove(p: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Masker, SessionLog};
+    use crate::{Masker, ParentRef, SessionLog};
 
     fn make_session(sessions: &Path, shadow: &Path) -> String {
         let log = SessionLog::create(sessions, "m", None, Masker::empty(), 0).unwrap();
@@ -201,8 +201,14 @@ mod tests {
         let mut ids = Vec::new();
         let mut parent: Option<String> = None;
         for _ in 0..depth {
-            let log =
-                SessionLog::create(sessions, "m", parent.clone(), Masker::empty(), 0).unwrap();
+            let log = SessionLog::create(
+                sessions,
+                "m",
+                parent.clone().map(ParentRef::unpinned),
+                Masker::empty(),
+                0,
+            )
+            .unwrap();
             let id = log.session_id.clone();
             log.write_blob("t1", "big result").unwrap();
             std::fs::create_dir_all(shadow.join(format!("{id}.git"))).unwrap();
@@ -241,6 +247,39 @@ mod tests {
                 "{id} must survive — a live conversation depends on it"
             );
         }
+    }
+
+    /// Forking at a prefix keeps the parent's *blobs* reachable (a kept tool
+    /// result may live in one), so lineage protection has to cover the whole
+    /// artifact set, not just the `.jsonl`. It does — `session_paths` prunes
+    /// log + blobs + shadow together and protection is per-session-id — and
+    /// this pins it so a later split of the three can't quietly break forks.
+    #[test]
+    fn gc_protects_a_forked_from_parents_blob_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path();
+        let sessions = data.join("sessions");
+        let shadow = data.join("shadow");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&shadow).unwrap();
+
+        let chain = make_chain(&sessions, &shadow, 2);
+        let parent = chain.first().unwrap();
+        let policy = RetentionPolicy {
+            max_sessions: Some(1),
+            max_age: None,
+        };
+        let report = gc(data, &policy, false);
+
+        assert_eq!(report.protected, [parent.as_str()]);
+        assert!(
+            sessions.join(format!("{parent}.jsonl")).exists(),
+            "the forked-from log survives"
+        );
+        assert!(
+            sessions.join(format!("{parent}.blobs")).is_dir(),
+            "so do its blobs — a fork's inherited tool results point into them"
+        );
     }
 
     #[test]

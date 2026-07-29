@@ -415,6 +415,33 @@ pub struct SessionLog {
     pub session_id: String,
 }
 
+/// Who a new session descends from, and *how far*. The pair is one value
+/// because the two halves are never independently correct: an id without a
+/// tip means "replay whatever the parent contains whenever you next read it",
+/// which is only sound for a parent that is already dead.
+///
+/// `tip_entry_id: None` = uncapped ancestor replay (the pre-pin behavior);
+/// pass it only for a parent no live session is still appending to.
+pub struct ParentRef {
+    pub session_id: String,
+    /// The parent's newest entry at fork time. Ancestor replay stops after it.
+    pub tip_entry_id: Option<String>,
+}
+
+impl ParentRef {
+    /// Lineage with no horizon — what every log written before the pin existed
+    /// carries. Test-only: production callers know their parent's tip and must
+    /// pass it, because a parent whose session is still live will otherwise
+    /// rewrite this session's history out from under it.
+    #[cfg(test)]
+    pub(crate) fn unpinned(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            tip_entry_id: None,
+        }
+    }
+}
+
 /// Blob ceiling. A tool result already over this is unreadable to a model;
 /// the blob is an escape hatch for the log, not an archive.
 const BLOB_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -455,7 +482,7 @@ impl SessionLog {
     pub fn create(
         dir: &Path,
         model: &str,
-        parent_session_id: Option<String>,
+        parent: Option<ParentRef>,
         masker: Masker,
         now_ms: u64,
     ) -> std::io::Result<Self> {
@@ -502,12 +529,20 @@ impl SessionLog {
             sync_noop,
             session_id: session_id.clone(),
         };
+        let (parent_session_id, parent_tip_entry_id) = match parent {
+            Some(ParentRef {
+                session_id,
+                tip_entry_id,
+            }) => (Some(session_id), tip_entry_id),
+            None => (None, None),
+        };
         log.append(
             &EntryPayload::Header {
                 header: SessionHeader {
                     format_version: FORMAT_VERSION,
                     session_id,
                     parent_session_id,
+                    parent_tip_entry_id,
                     model: model.to_string(),
                     created_at_ms: now_ms,
                 },
@@ -1264,6 +1299,10 @@ pub struct Replayed {
     /// a warning means "this log was edited/corrupted since it was written",
     /// not "replay is unsafe".
     pub warnings: Vec<String>,
+    /// Id of the last entry applied from the **requested** session's own log —
+    /// the coordinate a fork of this session pins itself to
+    /// ([`ParentRef::tip_entry_id`]). `None` for an empty log.
+    pub tip_entry_id: Option<String>,
 }
 
 pub fn replay(path: &Path) -> Result<Replayed, String> {
@@ -1273,7 +1312,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut mode = None;
     let mut plan = None;
     let mut todos = Vec::new();
-    let header = apply_log(
+    let applied = apply_log(
         path,
         &mut items,
         &mut warnings,
@@ -1281,15 +1320,17 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut mode,
         &mut plan,
         &mut todos,
+        None,
     )?;
     Ok(Replayed {
-        header,
+        header: applied.header,
         items,
         name,
         mode,
         plan,
         todos,
         warnings,
+        tip_entry_id: applied.last_entry_id,
     })
 }
 
@@ -1331,6 +1372,15 @@ pub const LINEAGE_DEPTH_CAP: usize = 32;
 /// requested session's own log is required. Enforced by
 /// `replay_chain_survives_a_pruned_ancestor` and
 /// `replay_chain_still_fails_when_the_requested_session_is_gone`.
+///
+/// INVARIANT: an ancestor is applied only as far as the fork-point pin its own
+/// child recorded ([`hotl_types::SessionHeader::parent_tip_entry_id`]), so a
+/// parent that keeps working after the fork — appending, or compacting —
+/// cannot rewrite this session's inherited history. A pin naming an entry the
+/// parent log does not contain degrades to a full apply plus a warning.
+/// Enforced by `a_pinned_child_ignores_parent_entries_appended_after_the_fork`,
+/// `a_pinned_child_survives_a_post_fork_parent_compaction` and
+/// `a_pin_naming_a_missing_entry_applies_all_and_warns`.
 pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut warnings = Vec::new();
     let mut lineage = Vec::new();
@@ -1391,8 +1441,14 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut mode = None;
     let mut plan = None;
     let mut todos = Vec::new();
-    for (path, _) in lineage.iter().rev() {
-        apply_log(
+    let mut tip_entry_id = None;
+    for (depth, (path, _)) in lineage.iter().enumerate().rev() {
+        // Each ancestor is capped by the pin *its own child* recorded. The
+        // requested session (depth 0) has no child here and is never capped.
+        let stop_after = depth
+            .checked_sub(1)
+            .and_then(|child| lineage[child].1.parent_tip_entry_id.as_deref());
+        let applied = apply_log(
             path,
             &mut items,
             &mut warnings,
@@ -1400,7 +1456,11 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut mode,
             &mut plan,
             &mut todos,
+            stop_after,
         )?;
+        if depth == 0 {
+            tip_entry_id = applied.last_entry_id;
+        }
     }
     Ok(Replayed {
         header: newest_header,
@@ -1410,7 +1470,16 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         plan,
         todos,
         warnings,
+        tip_entry_id,
     })
+}
+
+/// What applying one log yielded beyond its effect on the projection.
+struct Applied {
+    header: hotl_types::SessionHeader,
+    /// Id of the last entry actually applied — the log's tip, or the fork-point
+    /// pin when `stop_after` cut the read short.
+    last_entry_id: Option<String>,
 }
 
 /// Apply one log's entries onto an existing projection; returns its header.
@@ -1419,10 +1488,16 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
 /// rather than a hard failure — replay stays defensive either way, but a
 /// tampered or truncated log should not be trusted silently.
 ///
+/// `stop_after` is the fork-point horizon: stop after applying the entry with
+/// that id, so a child never sees what its parent logged post-fork. A pin the
+/// log does not contain applies everything and warns (the same defensive
+/// posture as the chain-break warning — a truncated or edited parent).
+///
 /// INVARIANT: an unparseable *final* line is recovered as a warning (the crash
 /// signature of a non-atomic append); an unparseable line anywhere else is a
 /// hard error. Enforced by `replay_recovers_the_prefix_of_a_torn_final_line`
 /// and `replay_still_rejects_corruption_in_the_middle_of_a_log`.
+#[allow(clippy::too_many_arguments)]
 fn apply_log(
     path: &Path,
     items: &mut Vec<hotl_types::Item>,
@@ -1431,10 +1506,12 @@ fn apply_log(
     mode: &mut Option<String>,
     plan: &mut Option<bool>,
     todos: &mut Vec<hotl_types::Todo>,
-) -> Result<hotl_types::SessionHeader, String> {
+    stop_after: Option<&str>,
+) -> Result<Applied, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut header = None;
     let mut prev_id: Option<String> = None;
+    let mut horizon_reached = false;
     let mut chain_ok = true;
     let mut unknown_kinds = 0usize;
     // §2b: an unresolved pending_ask at end-of-log means the session stopped
@@ -1547,6 +1624,22 @@ fn apply_log(
             // history. Count them and say so (T3-19).
             EntryPayload::Unknown => unknown_kinds += 1,
         }
+        // The fork-point horizon, checked *after* applying: the pinned entry
+        // was part of the child's seed, so it belongs in the projection.
+        if stop_after.is_some() && stop_after == prev_id.as_deref() {
+            horizon_reached = true;
+            break;
+        }
+    }
+    if let Some(pin) = stop_after {
+        if !horizon_reached {
+            warnings.push(format!(
+                "{}: the fork point of a later session (entry {pin}) is not in this log — it was \
+                 edited or truncated after the fork, so the whole log was replayed instead. The \
+                 reconstructed history may include work the forked session never saw.",
+                path.display()
+            ));
+        }
     }
     if unknown_kinds > 0 {
         warnings.push(format!(
@@ -1568,7 +1661,11 @@ fn apply_log(
             "an unanswered question was pending when the session stopped: {header}"
         ));
     }
-    header.ok_or_else(|| format!("{}: no header entry", path.display()))
+    let header = header.ok_or_else(|| format!("{}: no header entry", path.display()))?;
+    Ok(Applied {
+        header,
+        last_entry_id: prev_id,
+    })
 }
 
 /// The parent session id recorded in a log's header, if any — a first-line
@@ -2132,15 +2229,26 @@ mod tests {
         let parent_id = parent.session_id.clone();
 
         // Child with no rename of its own → inherits.
-        let child =
-            SessionLog::create(dir.path(), "m", Some(parent_id.clone()), Masker::empty(), 3)
-                .unwrap();
+        let child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef::unpinned(parent_id.clone())),
+            Masker::empty(),
+            3,
+        )
+        .unwrap();
         let replayed = replay_chain(dir.path(), &child.session_id).unwrap();
         assert_eq!(replayed.name.as_deref(), Some("from-parent"));
 
         // Child that renames → overrides.
-        let mut child2 =
-            SessionLog::create(dir.path(), "m", Some(parent_id), Masker::empty(), 4).unwrap();
+        let mut child2 = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef::unpinned(parent_id)),
+            Masker::empty(),
+            4,
+        )
+        .unwrap();
         child2
             .append(
                 &EntryPayload::Rename {
@@ -2636,8 +2744,14 @@ mod tests {
         let parent_path = parent.path().to_path_buf();
         let parent_id = parent.session_id.clone();
         drop(parent);
-        let child =
-            SessionLog::create(dir.path(), "m", Some(parent_id), Masker::empty(), 3).unwrap();
+        let child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef::unpinned(parent_id)),
+            Masker::empty(),
+            3,
+        )
+        .unwrap();
 
         let mut whole = std::fs::read_to_string(&parent_path).unwrap();
         whole.push_str(r#"{"id":"01TORN""#);
@@ -2745,8 +2859,14 @@ mod tests {
         // is a conversation resumed 33 times, not a pathological input.
         let mut parent: Option<String> = None;
         for _ in 0..(LINEAGE_DEPTH_CAP + 1) {
-            let log =
-                SessionLog::create(dir.path(), "m", parent.clone(), Masker::empty(), 1).unwrap();
+            let log = SessionLog::create(
+                dir.path(),
+                "m",
+                parent.clone().map(ParentRef::unpinned),
+                Masker::empty(),
+                1,
+            )
+            .unwrap();
             parent = Some(log.session_id.clone());
         }
         let newest = parent.unwrap();
@@ -2767,8 +2887,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut parent: Option<String> = None;
         for _ in 0..LINEAGE_DEPTH_CAP {
-            let log =
-                SessionLog::create(dir.path(), "m", parent.clone(), Masker::empty(), 1).unwrap();
+            let log = SessionLog::create(
+                dir.path(),
+                "m",
+                parent.clone().map(ParentRef::unpinned),
+                Masker::empty(),
+                1,
+            )
+            .unwrap();
             parent = Some(log.session_id.clone());
         }
         let replayed = replay_chain(dir.path(), &parent.unwrap()).unwrap();
@@ -2799,8 +2925,14 @@ mod tests {
         let parent_id = parent.session_id.clone();
         drop(parent);
 
-        let mut child =
-            SessionLog::create(dir.path(), "m", Some(parent_id), Masker::empty(), 3).unwrap();
+        let mut child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef::unpinned(parent_id)),
+            Masker::empty(),
+            3,
+        )
+        .unwrap();
         child
             .append(
                 &EntryPayload::Item {
@@ -2837,14 +2969,235 @@ mod tests {
         assert!(err.contains("01NOPE"), "got {err}");
     }
 
+    /// Append `text` as a user item; returns the entry id.
+    fn push_user(log: &mut SessionLog, text: &str, ts: u64) -> String {
+        log.append(
+            &EntryPayload::Item {
+                item: Item::User {
+                    text: text.into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            ts,
+        )
+        .unwrap()
+    }
+
+    fn user_texts(items: &[Item]) -> Vec<String> {
+        items
+            .iter()
+            .map(|i| match i {
+                Item::User { text, .. } => text.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pinned_child_ignores_parent_entries_appended_after_the_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        push_user(&mut parent, "one", 2);
+        let tip = push_user(&mut parent, "two", 3);
+        let parent_id = parent.session_id.clone();
+
+        let child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef {
+                session_id: parent_id,
+                tip_entry_id: Some(tip),
+            }),
+            Masker::empty(),
+            4,
+        )
+        .unwrap();
+
+        // The parent's own session keeps working — the interactive
+        // branch-a-tangent case, and every spawned fork.
+        push_user(&mut parent, "three", 5);
+
+        let replayed = replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(
+            user_texts(&replayed.items),
+            ["one", "two"],
+            "the fork inherits the parent as it was at fork time, not as it is now"
+        );
+        assert!(replayed.warnings.is_empty(), "{:?}", replayed.warnings);
+    }
+
+    #[test]
+    fn a_pinned_child_survives_a_post_fork_parent_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        for (n, text) in ["one", "two", "three", "four"].iter().enumerate() {
+            push_user(&mut parent, text, 2 + n as u64);
+        }
+        let tip = parent.last_id().map(str::to_string);
+        let parent_id = parent.session_id.clone();
+
+        let child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef {
+                session_id: parent_id,
+                tip_entry_id: tip,
+            }),
+            Masker::empty(),
+            10,
+        )
+        .unwrap();
+
+        // The live-parent hazard: a compaction rewrites the projection
+        // *prefix*, so an uncapped replay would hand the child a history its
+        // engine never sampled (the `apply_log` "silently wrong projection"
+        // class).
+        parent
+            .append(
+                &EntryPayload::Compaction {
+                    digest: vec![Item::User {
+                        text: "DIGEST".into(),
+                        synthetic: None,
+                        images: Vec::new(),
+                    }],
+                    prefix_end: 0,
+                    kept_from: 3,
+                    degraded: false,
+                },
+                11,
+            )
+            .unwrap();
+
+        let replayed = replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(
+            user_texts(&replayed.items),
+            ["one", "two", "three", "four"],
+            "a post-fork compaction must not reach into the fork's history"
+        );
+    }
+
+    #[test]
+    fn an_unpinned_child_replays_the_parent_in_full_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        push_user(&mut parent, "one", 2);
+        let parent_id = parent.session_id.clone();
+        let child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef::unpinned(parent_id.clone())),
+            Masker::empty(),
+            3,
+        )
+        .unwrap();
+        push_user(&mut parent, "two", 4);
+
+        let replayed = replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(
+            user_texts(&replayed.items),
+            ["one", "two"],
+            "no pin means the pre-pin behavior, unchanged"
+        );
+        assert!(replayed.warnings.is_empty(), "{:?}", replayed.warnings);
+
+        // And an old-format header line, with no such field at all.
+        let legacy_id = "01LEGACYCHILD";
+        let header = format!(
+            r#"{{"id":"h1","parent_id":null,"ts_ms":0,"payload":{{"kind":"header","header":{{"format_version":1,"session_id":"{legacy_id}","parent_session_id":"{parent_id}","model":"m","created_at_ms":0}}}}}}"#
+        );
+        std::fs::write(
+            dir.path().join(format!("{legacy_id}.jsonl")),
+            format!("{header}\n"),
+        )
+        .unwrap();
+        let legacy = replay_chain(dir.path(), legacy_id).unwrap();
+        assert_eq!(user_texts(&legacy.items), ["one", "two"]);
+        assert!(legacy.warnings.is_empty(), "{:?}", legacy.warnings);
+    }
+
+    #[test]
+    fn a_pin_naming_a_missing_entry_applies_all_and_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        push_user(&mut parent, "one", 2);
+        let parent_id = parent.session_id.clone();
+        let child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef {
+                session_id: parent_id,
+                tip_entry_id: Some("01NOTINTHISLOG".into()),
+            }),
+            Masker::empty(),
+            3,
+        )
+        .unwrap();
+
+        let replayed = replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(
+            user_texts(&replayed.items),
+            ["one"],
+            "an unresolvable pin degrades to a full apply, never to an empty history"
+        );
+        assert!(
+            replayed
+                .warnings
+                .iter()
+                .any(|w| w.contains("fork point") && w.contains("01NOTINTHISLOG")),
+            "an unresolvable pin must name itself, got {:?}",
+            replayed.warnings
+        );
+    }
+
+    #[test]
+    fn replayed_reports_the_requested_sessions_tip_entry_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        push_user(&mut parent, "one", 2);
+        let parent_id = parent.session_id.clone();
+        let parent_tip = parent.last_id().map(str::to_string);
+        assert_eq!(
+            replay_chain(dir.path(), &parent_id).unwrap().tip_entry_id,
+            parent_tip,
+            "a root session's tip is its own last entry"
+        );
+
+        let mut child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef {
+                session_id: parent_id,
+                tip_entry_id: parent_tip,
+            }),
+            Masker::empty(),
+            3,
+        )
+        .unwrap();
+        let child_tip = push_user(&mut child, "two", 4);
+        assert_eq!(
+            replay_chain(dir.path(), &child.session_id)
+                .unwrap()
+                .tip_entry_id,
+            Some(child_tip),
+            "the tip is the REQUESTED session's own last entry, never an ancestor's"
+        );
+    }
+
     #[test]
     fn ancestor_ids_walks_the_chain_and_survives_a_cycle() {
         let dir = tempfile::tempdir().unwrap();
         let mut parent: Option<String> = None;
         let mut ids = Vec::new();
         for _ in 0..3 {
-            let log =
-                SessionLog::create(dir.path(), "m", parent.clone(), Masker::empty(), 1).unwrap();
+            let log = SessionLog::create(
+                dir.path(),
+                "m",
+                parent.clone().map(ParentRef::unpinned),
+                Masker::empty(),
+                1,
+            )
+            .unwrap();
             parent = Some(log.session_id.clone());
             ids.push(log.session_id.clone());
         }
