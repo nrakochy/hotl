@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-29
+
 ### Changed
 
 - **Plan mode is an overlay, not a fourth mode.** Plan meant "pure reads

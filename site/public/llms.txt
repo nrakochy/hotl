@@ -1,6 +1,6 @@
 # hotl
 
-> hotl is a human-on-the-loop terminal AI agent in one static binary — no Node, no Python, no daemon, no telemetry. Bare `hotl` is the agent (full-screen console TUI, `-p "<prompt>"` headless, `--json` for a JSONL event stream, `--plan` for plan mode). `hotl watch` is a tmux dashboard for supervising agent processes. `hotl bg`/`hotl attach` run a session detached from any terminal. `hotl acp` serves ACP over stdio so an ACP-speaking editor can embed the agent. `hotl update` installs the latest release (`--check` only looks). `hotl fleet` is reserved and exits 2. Version 0.8.0; pre-1.0, breaking changes at every 0.x minor.
+> hotl is a human-on-the-loop terminal AI agent in one static binary — no Node, no Python, no daemon, no telemetry. Bare `hotl` is the agent (full-screen console TUI, `-p "<prompt>"` headless, `--json` for a JSONL event stream, `--plan` for plan mode). `hotl watch` is a tmux dashboard for supervising agent processes. `hotl bg`/`hotl attach` run a session detached from any terminal. `hotl acp` serves ACP over stdio so an ACP-speaking editor can embed the agent. `hotl update` installs the latest release (`--check` only looks). `hotl fleet` is reserved and exits 2. Version 0.9.0; pre-1.0, breaking changes at every 0.x minor.
 
 Facts an agent needs before acting:
 
