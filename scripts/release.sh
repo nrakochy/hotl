@@ -125,6 +125,19 @@ sed -E 's/(text: crates\.io v)[0-9]+\.[0-9]+\.[0-9]+/\1'"$new"'/' \
   site/src/content/docs/index.mdx > site/src/content/docs/index.mdx.tmp \
   && mv site/src/content/docs/index.mdx.tmp site/src/content/docs/index.mdx
 
+# So does llms.txt's summary line — the file agents read instead of the docs
+# site. Nothing kept it in step until now, and it sat at 0.6.2 through two
+# releases; a version an agent quotes back at a user has to be the real one.
+sed -E 's/(^> hotl is .*Version )[0-9]+\.[0-9]+\.[0-9]+(;)/\1'"$new"'\2/' \
+  site/public/llms.txt > site/public/llms.txt.tmp \
+  && mv site/public/llms.txt.tmp site/public/llms.txt
+
+if ! grep -q "Version $new;" site/public/llms.txt; then
+  echo "error: llms.txt version line did not update to $new — its wording" >&2
+  echo "       probably drifted from the sed above. Fix before tagging." >&2
+  exit 1
+fi
+
 # Promote the changelog: what was unreleased is now this version, and a fresh
 # empty [Unreleased] takes its place. The entries themselves are untouched —
 # they simply end up under a dated heading.

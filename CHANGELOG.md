@@ -8,46 +8,88 @@ semver promise of their own.
 
 ### Changed
 
-- **Plan mode is an overlay, not a fourth mode; `auto` is now `bypass`.**
-  Plan meant "pure reads only", which made it useless for the thing it should
-  be best at: the agent couldn't reach an issue tracker, fetch a doc page, or
-  run `git log` while working out what to propose, and nothing could widen it
-  — plan's block sat above the allow tiers on purpose.
+- **Plan mode is an overlay, not a fourth mode.** Plan meant "pure reads
+  only": every tool that wasn't `read`/`glob`/`grep` was denied outright, and
+  nothing could widen it — plan's block sat above the allow tiers on purpose.
+  That made it useless for the thing it should be best at. An agent asked to
+  *plan* a change couldn't reach an issue tracker, fetch a doc page, or run
+  `git log` to work out what to propose.
 
   Permissions now have two independent axes. The **mode** (`ask` | `bypass` |
-  `dontask`) says how a call is handled; **plan** says what posture you're in.
-  Plan's only effect is to put `write` and `edit` on the same footing as a
-  protected path — always ask, never auto, not even via an `[[allow]]` rule.
-  Everything else takes the mode untouched. So plan+`bypass` shells out and
-  reaches the network freely but stops before a file changes, plan+`ask` is
-  just `ask`, and plan+`dontask` refuses the edit outright.
+  `dontask`) decides how a call is handled; **plan** decides what posture the
+  session is in. Plan's entire permission effect is to put `write` and `edit`
+  on the same footing as a protected path — always ask, never auto, not even
+  via an `[[allow]]` rule. Every other tool takes the mode untouched:
 
-  Toggle it with `/plan` (or `/plan on|off`), the new `--plan` flag,
+  | | `ask` | `bypass` | `dontask` |
+  |---|---|---|---|
+  | **plan off** | prompt per mutating call | run without prompting | allow-rule or refuse |
+  | **plan on** | same as `ask` | shell and network run freely, **file edits stop and ask** | **file edits refused** |
+
+  Internally this needed no new mechanism. `Rules::evaluate` already had a
+  tier meaning "always ask, never auto" that sits above the allow rules — the
+  protected-path floor. Plan is that tier applied to two more tools, selected
+  by a new `Tool::edits_files`. `read_only()` is untouched, so `dontask` and
+  `ToolScope::ReadOnly` sub-agents behave exactly as before.
+
+  Turning it on: `/plan` (or `/plan on|off`), the new `--plan` flag,
   `[permissions] plan = true`, `HOTL_PLAN=1`, or `session/set_plan` over ACP.
-  It is durable in its own `plan_set` log entry, so `hotl resume` restores
-  both axes. The TUI badge carries both: `plan · bypass`.
+  The toggle is durable in its own `plan_set` log entry, independent of
+  `mode_set`, so `hotl resume` restores both axes. The TUI badge carries both:
+  `plan · bypass`, in the accent color.
 
-  This is deliberately **not** an enforcement boundary, and the docs now say
-  so. `bash` follows the mode, so a shell redirect writes a file without the
-  `write` tool. Plan makes the agent's natural mutation path stop for a human;
-  the unattended can't-mutate posture is `dontask` with no allow-rules.
+  **Plan is a posture, not an enforcement boundary, and the docs now say so.**
+  Because `bash` follows the mode, a shell redirect (`printf … > src/main.rs`)
+  changes a file without ever touching the `write` tool. What plan buys is
+  that the agent's *natural* mutation path stops for a human, and that a shell
+  doing it instead is conspicuous in the transcript. The previous claim that
+  `hotl -p --plan` "can't mutate anything, sandbox or no sandbox" is gone from
+  `SECURITY.md` and `permissions-and-sandbox.md`. The unattended can't-mutate
+  posture is `dontask` with no allow-rules.
 
-  `auto` is renamed `bypass` — it is the mode that bypasses the gate, which is
-  a trust decision rather than a convenience. `auto` still parses everywhere,
-  permanently: every config and session log in the wild carries it. A session
-  logged as `mode = "plan"` resumes with the overlay on and the mode falling
-  back to your configured default, which means such a session gains the shell
-  and the network on its next resume. That is the intended change.
+- **`auto` is renamed `bypass`.** It is the mode that bypasses the gate, and
+  that is a trust decision rather than a convenience — the old name read like
+  the latter. `hotl setup` now writes `mode = "bypass"`, and `hotl doctor`,
+  the TUI badge, `/status`, the ACP frames, and the auto-allow rule string
+  (`permissions.mode=bypass`) all follow.
+
+### Migration
+
+Nothing to do for most users; both old spellings keep working.
+
+- `mode = "auto"` still parses, permanently, in `config.toml`,
+  `HOTL_PERMISSIONS`, ACP `session/set_mode`, and session logs. It resolves to
+  `bypass`. Only the canonical output changed — new logs say `bypass`.
+- `mode = "plan"` turns the overlay on and leaves the mode at your configured
+  default, rather than failing closed as a typo would. This applies to
+  `config.toml`, `HOTL_PERMISSIONS`, ACP, and replayed session logs alike.
+- **A session logged as `plan` gains the shell and the network on its next
+  `hotl resume`**, because the mode axis falls back to your default (`bypass`
+  out of the box). This is the intended change, but it is the one behavior
+  shift that arrives without you asking for it.
+- `/mode plan` now points you at `/plan` instead of switching modes.
+- ACP clients: `session/new`, `session/load`, `initialize`, and
+  `session/reload_config` gained `plan` / `defaultPlan` fields, and a new
+  `plan_changed` notification joins `mode_changed`. All additive, so
+  `UPDATE_SCHEMA_VERSION` stands. A client still sending
+  `set_mode {"mode": "plan"}` is routed to the overlay and acked, not errored.
 
 ### Fixed
 
 - **`--plan` now exists.** `permissions-and-sandbox.md` had advertised
-  `hotl -p --plan "audit X"` while `parse_args` rejected it with exit 2.
+  `hotl -p --plan "audit X"` since the flag was documented, while `parse_args`
+  rejected it with exit 2. It works now, interactively and headless.
 - **`dontask` is no longer described as "the `-p`/CI posture".** Five doc
   locations said so; headless `-p` actually resolves to the configured
   default, and being headless only changes what an *ask* does (it denies).
   The prose is corrected rather than the behavior — changing `-p`'s default
-  mode is a separate decision.
+  mode is a separate decision, deliberately not taken here.
+- **`recall` is no longer listed as a plan-mode read-only tool.**
+  `permissions-and-sandbox.md` named it alongside `read`/`glob`/`grep`, but a
+  recall backend can spawn an arbitrary configured program, and a test has
+  asserted `read_only() == false` for it since it left that class.
+- **`scripts/release.sh` now bumps `llms.txt`.** Its version line was two
+  releases stale (0.6.2) because nothing kept it in step.
 
 ## [0.8.0] - 2026-07-29
 
