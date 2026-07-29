@@ -141,6 +141,8 @@ fn print_help() {
         "hotl — human on the loop\n\n\
          USAGE:\n  hotl [id-prefix]     console TUI (execute); -n/--name names the session\n  \
          hotl -r [n|id|name]  resume: bare lists sessions; arg = list number, id-prefix, or name\n  \
+         hotl --fork-from <s> start a NEW session with another's history (s = the -r arg, or @last)\n  \
+         \x20                 --keep <items> / --keep-turns <n> fork at a prefix instead of the head\n  \
          hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \

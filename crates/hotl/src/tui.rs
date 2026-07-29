@@ -34,7 +34,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         );
         return 2;
     }
-    let TuiArgs { spec, name } = match parse_tui_args(&args) {
+    let tui_args = match parse_tui_args(&args) {
         Ok(a) => a,
         Err(code) => return code,
     };
@@ -74,7 +74,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut reader = BufReader::new(cread);
     let mut client = AcpClient::new(cwrite);
 
-    let opened = match handshake(&mut client, &mut reader, spec, name).await {
+    let opened = match handshake(&mut client, &mut reader, tui_args).await {
         Ok(o) => o,
         Err(e) => {
             eprintln!("hotl: {e}");
@@ -218,15 +218,35 @@ struct Opened {
 async fn handshake(
     client: &mut Client,
     reader: &mut ServerReader,
-    spec: Option<String>,
-    name: Option<String>,
+    args: TuiArgs,
 ) -> Result<Opened, String> {
     let init = client.request("initialize", Value::Null).await;
     let hello = wait_response(reader, init).await?;
     let skills = hotl_tui::client::parse_skills(&hello);
-    let open = match spec {
-        None => client.request("session/new", json!({"name": name})).await,
-        Some(sid) => {
+    let TuiArgs {
+        spec,
+        name,
+        fork_from,
+        keep,
+        keep_turns,
+    } = args;
+    // A fork rides `session/load` as extension params rather than a new
+    // method: existing clients ignore what they don't know, so the wire stays
+    // backward-compatible. Turn resolution is deliberately server-side — the
+    // projection those turns are counted against only exists there.
+    let open = match (spec, fork_from) {
+        (_, Some(sid)) => {
+            let mut params = json!({"sessionId": sid, "name": name, "fork": true});
+            if let Some(n) = keep {
+                params["keepItems"] = json!(n);
+            }
+            if let Some(t) = keep_turns {
+                params["keepTurns"] = json!(t);
+            }
+            client.request("session/load", params).await
+        }
+        (None, None) => client.request("session/new", json!({"name": name})).await,
+        (Some(sid), None) => {
             client
                 .request("session/load", json!({"sessionId": sid, "name": name}))
                 .await
@@ -596,58 +616,170 @@ fn run_external_editor(text: &str) -> Option<String> {
 pub(crate) struct TuiArgs {
     pub spec: Option<String>,
     pub name: Option<String>,
+    /// A resolved session id to **fork** from, mutually exclusive with `spec`.
+    pub fork_from: Option<String>,
+    pub keep: Option<usize>,
+    pub keep_turns: Option<usize>,
+}
+
+/// The console's flags as typed, before any of them touch the store. Split out
+/// so the rules about which combinations mean anything are a pure function
+/// with real messages, rather than something only reachable through a live
+/// sessions directory.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct RawTuiArgs {
+    pub spec: Option<String>,
+    /// True when `spec` came from a bare positional rather than `-r`. The two
+    /// resolve differently and always have: a positional is an id-prefix only,
+    /// while `-r` also accepts a picker list number and a session name.
+    pub spec_is_positional: bool,
+    pub resume_bare: bool,
+    pub name: Option<String>,
+    pub fork_from: Option<String>,
+    pub keep: Option<usize>,
+    pub keep_turns: Option<usize>,
 }
 
 /// The console's argument surface: `[id-prefix]`, `-r/--resume [arg]`,
-/// `-n/--name <name>`. `hotl resume [arg]` arrives here rewritten to
-/// `--resume` by main.rs.
-fn parse_tui_args(args: &[String]) -> Result<TuiArgs, i32> {
-    let mut spec: Option<String> = None;
-    let mut resume_bare = false;
-    let mut name: Option<String> = None;
+/// `-n/--name <name>`, `--fork-from <arg>` with `--keep`/`--keep-turns`.
+/// `hotl resume [arg]` arrives here rewritten to `--resume` by main.rs.
+fn parse_tui_flags(args: &[String]) -> Result<RawTuiArgs, String> {
+    let mut out = RawTuiArgs::default();
     let mut it = args.iter().peekable();
+    let value = |it: &mut std::iter::Peekable<std::slice::Iter<String>>, flag: &str| {
+        it.next()
+            .cloned()
+            .ok_or_else(|| format!("{flag} needs a value"))
+    };
     while let Some(a) = it.next() {
         match a.as_str() {
             // The one-time migration hint: `tui` was a subcommand before the
             // default flip, and would otherwise read as a session-id prefix.
             "tui" => {
-                eprintln!("hotl: the TUI is now just `hotl` (the `tui` subcommand was removed)");
-                return Err(2);
+                return Err(
+                    "the TUI is now just `hotl` (the `tui` subcommand was removed)".to_string(),
+                )
             }
             "-r" | "--resume" => match it.peek() {
-                Some(v) if !v.starts_with('-') => {
-                    let arg = it.next().expect("peeked");
-                    spec = Some(resolve_session_arg(arg, &newest_first())?);
-                }
-                _ => resume_bare = true,
+                Some(v) if !v.starts_with('-') => out.spec = it.next().cloned(),
+                _ => out.resume_bare = true,
             },
+            "--fork-from" => out.fork_from = Some(value(&mut it, "--fork-from")?),
+            "--keep" => out.keep = Some(count(&value(&mut it, "--keep")?, "--keep")?),
+            "--keep-turns" => {
+                out.keep_turns = Some(count(&value(&mut it, "--keep-turns")?, "--keep-turns")?)
+            }
             "-n" | "--name" => {
                 match it
                     .next()
                     .map(String::as_str)
                     .and_then(hotl_types::normalize_session_name)
                 {
-                    Some(n) => name = Some(n),
-                    None => {
-                        eprintln!("hotl: -n/--name needs a value of 1–64 chars");
-                        return Err(2);
-                    }
+                    Some(n) => out.name = Some(n),
+                    None => return Err("-n/--name needs a value of 1–64 chars".to_string()),
                 }
             }
             // Start with the plan overlay on; `/plan` toggles it after. Rides
             // the env var `load_rules` reads, same as the headless `--plan`.
             "--plan" => std::env::set_var("HOTL_PLAN", "1"),
             flag if flag.starts_with('-') => {
-                eprintln!("hotl: unknown argument `{flag}` (try --help)");
-                return Err(2);
+                return Err(format!("unknown argument `{flag}` (try --help)"))
             }
-            prefix => spec = Some(by_prefix(prefix)?),
+            prefix => {
+                out.spec = Some(prefix.to_string());
+                out.spec_is_positional = true;
+            }
         }
     }
-    if resume_bare && spec.is_none() {
-        spec = Some(pick_session()?);
+    check_lineage_flags(
+        out.spec.is_some() || out.resume_bare,
+        out.fork_from.is_some(),
+        out.keep,
+        out.keep_turns,
+    )?;
+    Ok(out)
+}
+
+fn count(raw: &str, flag: &str) -> Result<usize, String> {
+    raw.parse()
+        .map_err(|_| format!("{flag} needs a non-negative whole number, got `{raw}`"))
+}
+
+/// Resume and fork are two different things to do with one session, and the
+/// keep flags are two coordinate systems onto one cut. Shared with the
+/// headless parser so `hotl -p` and the console reject the same nonsense in
+/// the same words.
+pub(crate) fn check_lineage_flags(
+    resuming: bool,
+    forking: bool,
+    keep: Option<usize>,
+    keep_turns: Option<usize>,
+) -> Result<(), String> {
+    if resuming && forking {
+        return Err(
+            "either resume or fork a session, not both — a fork always starts a new \
+                    session, so -r has nothing left to mean"
+                .to_string(),
+        );
     }
-    Ok(TuiArgs { spec, name })
+    if keep.is_some() && keep_turns.is_some() {
+        return Err("pass one of --keep or --keep-turns, not both".to_string());
+    }
+    if !forking && (keep.is_some() || keep_turns.is_some()) {
+        return Err(
+            "--keep/--keep-turns requires --fork-from — there is nothing to cut back \
+                    without a session to fork"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn parse_tui_args(args: &[String]) -> Result<TuiArgs, i32> {
+    let raw = parse_tui_flags(args).map_err(|e| {
+        eprintln!("hotl: {e}");
+        2
+    })?;
+    let RawTuiArgs {
+        spec,
+        spec_is_positional,
+        resume_bare,
+        name,
+        fork_from,
+        keep,
+        keep_turns,
+    } = raw;
+    let sessions = newest_first();
+    let spec = match spec {
+        Some(arg) if spec_is_positional => Some(by_prefix(&arg)?),
+        Some(arg) => Some(resolve_session_arg(&arg, &sessions)?),
+        None if resume_bare => Some(pick_session()?),
+        None => None,
+    };
+    let fork_from = match fork_from {
+        Some(arg) => {
+            let id = resolve_session_arg(&arg, &sessions)?;
+            // Library code never prints; this is the CLI, and the honest
+            // framing of the feature's economics belongs where the user can
+            // still change their mind about running the phases back-to-back.
+            if let Some(note) = crate::agent::cold_cache_note(
+                &crate::agent::sessions_dir(),
+                &id,
+                hotl_provider::CacheTtl::OneHour,
+            ) {
+                eprintln!("hotl: {note}");
+            }
+            Some(id)
+        }
+        None => None,
+    };
+    Ok(TuiArgs {
+        spec,
+        name,
+        fork_from,
+        keep,
+        keep_turns,
+    })
 }
 
 /// `-r <arg>` resolution: picker list number → unique id-prefix → unique
@@ -656,6 +788,17 @@ fn resolve_session_arg(
     arg: &str,
     sessions: &[(String, PathBuf, SystemTime)],
 ) -> Result<String, i32> {
+    // `@last` is what makes a phase pipeline scriptable: each phase forks the
+    // one before it without the script having to capture an id.
+    if arg == "@last" {
+        return match sessions.first() {
+            Some((id, ..)) => Ok(id.clone()),
+            None => {
+                eprintln!("hotl: `@last` needs a previous session and there are none yet");
+                Err(2)
+            }
+        };
+    }
     if let Ok(n) = arg.parse::<usize>() {
         if (1..=sessions.len().min(20)).contains(&n) {
             return Ok(sessions[n - 1].0.clone());
@@ -728,9 +871,14 @@ fn pick_session() -> Result<String, i32> {
     }
     eprintln!("pick a session:");
     for (i, (id, path, t)) in sessions.iter().enumerate().take(20) {
+        // A header-only first-line read per row — cheap enough for a listing
+        // that already stats every file.
+        let from = hotl_store::session_parent(path)
+            .map(|p| format!("  ↳ from {}", &p[..p.len().min(8)]))
+            .unwrap_or_default();
         match hotl_store::session_name(path) {
-            Some(name) => eprintln!("  {}) {id}  {name}  {}", i + 1, age(*t)),
-            None => eprintln!("  {}) {id}  {}", i + 1, age(*t)),
+            Some(name) => eprintln!("  {}) {id}  {name}  {}{from}", i + 1, age(*t)),
+            None => eprintln!("  {}) {id}  {}{from}", i + 1, age(*t)),
         }
     }
     eprint!("> ");
@@ -760,7 +908,8 @@ fn age(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        osc52, parse_tui_args, resolve_mouse, resolve_session_arg, terminal_msg, WHEEL_LINES,
+        osc52, parse_tui_args, parse_tui_flags, resolve_mouse, resolve_session_arg, terminal_msg,
+        WHEEL_LINES,
     };
     use crossterm::event::{Event, KeyModifiers};
     use hotl_tui::app::Msg;
@@ -1004,6 +1153,53 @@ mod tests {
         assert_eq!(args.name.as_deref(), Some("fix-auth"));
         assert_eq!(parse_tui_args(&v(&["-n"])).unwrap_err(), 2);
         assert_eq!(parse_tui_args(&v(&["--name", "   "])).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn fork_from_and_keep_are_parsed_and_are_incompatible_with_resume() {
+        let a = parse_tui_flags(&v(&[
+            "--fork-from",
+            "sunny-day",
+            "--keep",
+            "12",
+            "-n",
+            "plan-b",
+        ]))
+        .unwrap();
+        assert_eq!(a.fork_from.as_deref(), Some("sunny-day"));
+        assert_eq!(a.keep, Some(12));
+        assert_eq!(a.name.as_deref(), Some("plan-b"));
+
+        let a = parse_tui_flags(&v(&["--fork-from", "@last", "--keep-turns", "3"])).unwrap();
+        assert_eq!(a.fork_from.as_deref(), Some("@last"));
+        assert_eq!(a.keep_turns, Some(3));
+
+        let err = parse_tui_flags(&v(&["-r", "x", "--fork-from", "y"])).unwrap_err();
+        assert!(
+            err.contains("either resume or fork"),
+            "one lineage verb per invocation: {err}"
+        );
+        let err = parse_tui_flags(&v(&["--keep", "3"])).unwrap_err();
+        assert!(err.contains("requires --fork-from"), "{err}");
+        let err = parse_tui_flags(&v(&[
+            "--fork-from",
+            "x",
+            "--keep",
+            "3",
+            "--keep-turns",
+            "1",
+        ]))
+        .unwrap_err();
+        assert!(err.contains("one of --keep or --keep-turns"), "{err}");
+        let err = parse_tui_flags(&v(&["--fork-from", "x", "--keep", "half"])).unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+    }
+
+    #[test]
+    fn at_last_resolves_to_the_newest_session() {
+        let s = sessions(&["01AAA", "01BBB"]);
+        assert_eq!(resolve_session_arg("@last", &s), Ok("01AAA".to_string()));
+        assert_eq!(resolve_session_arg("@last", &[]).unwrap_err(), 2);
     }
 
     #[test]

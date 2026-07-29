@@ -172,6 +172,43 @@ fn record_fork_point(log: &mut SessionLog, keep_items: usize, now_ms: u64) -> Re
     Ok(())
 }
 
+/// The honesty clause, as a line the CLI can print. A fork always has perfect
+/// recall of the parent's raw transcript — that part has no TTL. The ~10%
+/// cache read only happens when the fork's first request lands inside the
+/// parent's cache window, so a parent that has been idle longer than the TTL
+/// means paying full input price once. Say so before the sample, not after
+/// the invoice.
+///
+/// `None` when the parent looks warm (or its mtime is unreadable — never warn
+/// on a guess).
+pub(crate) fn cold_cache_note(
+    sessions_dir: &std::path::Path,
+    session_id: &str,
+    ttl: CacheTtl,
+) -> Option<String> {
+    let window = match ttl {
+        CacheTtl::FiveMinutes => std::time::Duration::from_secs(5 * 60),
+        CacheTtl::OneHour => std::time::Duration::from_secs(60 * 60),
+    };
+    let idle = std::fs::metadata(sessions_dir.join(format!("{session_id}.jsonl")))
+        .and_then(|m| m.modified())
+        .ok()?
+        .elapsed()
+        .ok()?;
+    if idle <= window {
+        return None;
+    }
+    let (n, unit) = match ttl {
+        CacheTtl::FiveMinutes => (5, "m"),
+        CacheTtl::OneHour => (1, "h"),
+    };
+    Some(format!(
+        "{session_id} was last active more than {n}{unit} ago, so its prompt cache has expired \
+         — this fork's first request pays full input price for the inherited transcript, and \
+         caches normally after that. The history it inherits is complete either way."
+    ))
+}
+
 /// Create the new session's log for a fresh / resumed / forked open. The one
 /// place the ACP factory and the headless runner agree on what a fork's log
 /// starts with: the pinned lineage in the header, then the `BranchMove` seed
