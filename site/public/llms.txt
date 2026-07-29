@@ -24,6 +24,7 @@ Facts an agent needs before acting:
 - [Permissions & sandbox](https://nrakochy.github.io/hotl/permissions-and-sandbox/): what the gate and sandbox protect and what they deliberately do not
 - [Troubleshooting](https://nrakochy.github.io/hotl/troubleshooting/): error message → cause → fix table
 - [TUI console](https://nrakochy.github.io/hotl/tui/): interactive console keys, opt-in vim input mode (`[behavior] vim_mode`, default off), prompt history and Ctrl-R search
+- [Sessions, resume & forking](https://nrakochy.github.io/hotl/sessions/): `-r` resume, `--fork-from`/`--keep-turns` forking a session's history into a new one, and phase pipelines
 - [Shell integration](https://nrakochy.github.io/hotl/shell/): zsh `: ` prefix, `@[path]` file capture, OSC-133 marks
 - [Background sessions](https://nrakochy.github.io/hotl/backgrounding/): `hotl bg` / `hotl attach` detached sessions, with asks parked until you reattach
 - [Skills](https://nrakochy.github.io/hotl/skills/): saved procedures loaded on demand — the grouped index, search, why there is no index database, trust envelope, marketplaces

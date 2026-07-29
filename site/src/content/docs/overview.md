@@ -22,6 +22,7 @@ hotl is a human-on-the-loop agent harness in one binary: bare `hotl` is the codi
 |---|---|
 | Run it the first time, start to finish | [quickstart.md](../quickstart/) |
 | Drive the agent from a full-screen console | [tui.md](../tui/) |
+| Continue an earlier session, or fork one into a new phase | [sessions.md](../sessions/) |
 | Prompt the agent straight from your shell (`: ` prefix) | [shell.md](../shell/) |
 | Run a session detached and reconnect later | [backgrounding.md](../backgrounding/) |
 | Understand the y/N gate, protected paths, and the sandbox — and what they don't cover | [permissions-and-sandbox.md](../permissions-and-sandbox/) |

@@ -12,7 +12,12 @@ hotl                  # new session
 hotl <id-prefix>      # continue a specific earlier session
 hotl --resume         # pick from recent sessions (numbered list, newest first)
 hotl resume [id]      # same thing, spelled as a subcommand
+hotl --fork-from [id] # NEW session seeded with that one's history (--keep-turns N for a prefix)
 ```
+
+Resume continues a conversation; fork branches a new one from it, leaving the
+original free to keep running. See [sessions.md](../sessions/) for the full
+semantics and for phase pipelines.
 
 Bare `hotl` **is** the console (the `tui` subcommand and the old line-based REPL are gone). It needs a real terminal: piped stdin/stdout exits with a pointer at `hotl -p "prompt"`, the headless path for scripts and CI.
 

@@ -63,6 +63,7 @@ export default defineConfig({
 					label: 'Using the agent',
 					items: [
 						{ label: 'The TUI console', slug: 'tui' },
+						{ label: 'Sessions, resume & forking', slug: 'sessions' },
 						{ label: 'Shell integration (zsh)', slug: 'shell' },
 						{ label: 'Background sessions', slug: 'backgrounding' },
 					],
