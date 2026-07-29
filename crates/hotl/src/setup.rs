@@ -36,6 +36,12 @@ pub const DEFAULT_CONFIG: &str = "\
 # compaction_reset = false   # fresh-slate compaction instead of in-place
 # show_used_pct = true       # show context-fullness in each turn's status
 
+[minify]
+# `read`/`edit` with minified:true serve a token-stream view of source code
+# (20-26% smaller with comments, 44-59% without). Rust/Go/Python/JS/TS.
+# enable = true         # false makes minified:true serve the plain view
+# keep_comments = false # strips comments: bigger saving, loses the why
+
 [behavior]
 # sandbox = true             # false disables the bash sandbox floor
 # vim_mode = false           # true = vim-style keys in the console's input editor

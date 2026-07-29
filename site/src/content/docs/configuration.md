@@ -188,8 +188,8 @@ search over collapsed sources, bodies read on demand, marketplaces, and the
 
 | Tool | Effect | Permission |
 |---|---|---|
-| `read` | Read a text file (2000 lines / 200KB per call; any single line over 8KB is clipped; `offset`/`limit` continue a truncated read). | None inside the working directory — **outside it, a protected ask** |
-| `edit` | Exact string replacement in a file. | Ask (protected paths escalate) |
+| `read` | Read a text file (2000 lines / 200KB per call; any single line over 8KB is clipped; `offset`/`limit` continue a truncated read). `minified: true` serves a smaller token-stream view of source code instead — see [`[minify]`](#minified-reads-and-edits-minify). | None inside the working directory — **outside it, a protected ask** |
+| `edit` | Exact string replacement in a file. `minified: true` matches against the minified view and splices into the real file, which keeps its formatting. | Ask (protected paths escalate) |
 | `write` | Write a file, creating parent directories. | Ask (protected paths escalate) |
 | `bash` | Run a shell command under the sandbox floor. stdout and stderr share one pipe, so output arrives in the order the command actually wrote it; a failure ends with `[exit N]` or `[killed by SIGNAME]`. | Ask |
 | `glob` | List files under the working directory matching a **real glob**: `*` (does not cross `/`), `**` (recurses), `?`, `[a-z]`, `{a,b}`. A pattern with no `/` matches the file name at any depth (`*.rs`). Newest-first by default (`sort`: `"mtime"` \| `"path"`), capped at 1000. Respects `.gitignore`; `.git` is never walked; symlinks are never followed. In-process — no subprocess, so it still works with no `rg` on `PATH` or when the sandbox floor degrades, and the walk runs on the blocking pool so a large or hostile tree cannot stall the runtime. | None — read-only |
@@ -309,6 +309,77 @@ The startup probe that certifies the sandbox stays honest: its outside-the-floor
 Both tools honor the *same* `[network]` egress policy `bash` does — there is exactly one egress authority, never a second allowlist. With `egress = "off"` both refuse every host outright; with `"allowlist"`, a host outside `allow` fails closed with a message telling you to add it. Even when a fetch is allowed, it still asks (network side effects can exfiltrate via the URL itself) — the ask names every host in the batch.
 
 Every byte a fetch or search returns enters the model inside the untrusted-content envelope, tagged with its source (`web:<host>`) — web content is data the model can use to inform its work, never an instruction it can act on unprompted, the same treatment `spawn` and `recall` results get.
+
+### Minified reads and edits (`[minify]`)
+
+Reading source files is usually an agent's largest token expense, and a good
+share of a source file is typography: indentation, blank lines, alignment.
+`read` with `minified: true` serves a **token-stream re-serialization** instead
+— the file parsed with a tree-sitter grammar, its leaf tokens re-joined with the
+smallest separators that preserve meaning.
+
+```toml
+[minify]
+# enable = true          # false makes `minified: true` serve the plain view
+# keep_comments = true   # false strips comments (lossy — see below)
+```
+
+Supported: `.rs`, `.go`, `.py`/`.pyi`, `.js`/`.mjs`/`.cjs`/`.jsx`,
+`.ts`/`.mts`/`.cts`, `.tsx`. Anything else falls back to the plain view.
+
+**What it actually saves.** Measured on hotl's own source: **20–26%** with
+comments kept, **44–59%** with them stripped. Small or comment-light files save
+less (10–18% kept). It is not a uniform win and the headline is not one number —
+the trailer on every minified read reports the real figure for that file. Two
+honesty notes: these are *byte* savings run through hotl's flat ~3 chars/token
+estimator, and a real BPE tokenizer encodes a newline-plus-indent run as roughly
+one token, so the token saving is smaller than the byte saving. And a JSX-heavy
+`.tsx` file saves only on its non-JSX portion, because JSX whitespace is
+renderer-visible and is copied through untouched.
+
+**`keep_comments` defaults to `true`,** because comments are meaning and
+stripping them is the lossy mode. Turn it off when you want the larger saving and
+accept that the model is reading code with the *why* removed.
+
+**Not whitespace-stripping.** Some languages are whitespace-*sensitive*: Python's
+indentation is syntax, and Go and JavaScript insert implicit semicolons at line
+breaks. So Python keeps one logical line per line with indentation renormalized
+to one space per level, and Go and JS/TS get explicit `;` at the statement
+boundaries where the source relied on automatic insertion — read from the parse
+tree, not guessed. Every minified view is then re-parsed and its named-node
+structure compared against the source's; a mismatch is a refusal, not a warning.
+
+**Whole file only.** `offset`/`limit` are refused with an error naming the plain
+read. They are raw-file line numbers, and the minified view has no lines the
+model can count, so paging in that coordinate system would ask the model to name
+positions it cannot see. A view over the 200KB cap falls back to the plain paged
+read.
+
+**Every failure serves the plain view with a note saying why** — no grammar for
+the extension, a file that does not parse, the minifier declining its own output,
+`enable = false`. The feature can cost you savings; it cannot cost you access.
+The note matters as much as the fallback: it is how you notice a grammar has
+gone stale.
+
+**Editing through the view.** Text quoted from a minified read will not match a
+plain `edit` — the whitespace differs. Pass `minified: true` to `edit` as well:
+`old_string` is matched in the minified view, the match is projected back to
+exact source byte offsets, and only those bytes are replaced. **The file on disk
+keeps all its comments, indentation and formatting; it is never written in
+minified form.** Matching is exact and must be unique in that view (the domain is
+already whitespace-normalized, so tolerant matching would only blur uniqueness).
+Two refusals to expect: a multi-line `new_string` in Python, because it would
+land at a source column the view never showed; and any splice that would leave
+the file no longer parsing, checked before the write, so nothing is written.
+
+One caveat worth knowing: `new_string` lands in the file in the spelling you
+wrote it, so a minified-style replacement stays minified-style in that one spot.
+For Rust, `cargo fmt` heals it at commit time.
+
+**Build footprint.** The tree-sitter grammars compile C. They sit behind a
+default-on `minify` cargo feature, so `cargo install hotl --no-default-features`
+is a pure-Rust build; in that build the `minified` argument is not advertised in
+the tool schema at all.
 
 ### Context window (`[context] window`)
 
