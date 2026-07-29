@@ -208,6 +208,18 @@ mod enabled {
                  (omit `minified`)."
             ))
         })?;
+        // Guard 1, cheapest first — before any IO. In a language whose
+        // indentation *is* syntax, a multi-line replacement lands with the
+        // model's own indentation at a source column it never saw, and the
+        // corruption surfaces on the next read rather than here. vix splices
+        // these verbatim and never tests the case.
+        if lang == Lang::Python && new.contains('\n') {
+            return Err(ToolOutcome::err(format!(
+                "multi-line replacements can corrupt python indentation through the minified \
+                 view, because `new_string` lands at a source column the minified view does not \
+                 show. Use a plain edit (omit `minified`) for this change to `{path}`."
+            )));
+        }
         let target = builtins::write_target(root, extras, path);
         let content = builtins::read_guarded_to_string(root, &target, path)?;
         let m = minify(lang, &content, cfg.keep_comments).map_err(|e| {
@@ -224,6 +236,18 @@ mod enabled {
             ))
         })?;
         let updated = format!("{}{new}{}", &content[..src_start], &content[src_end..]);
+        // Guard 2: prove the result before writing it. `minify` refused a file
+        // that did not parse upstream, so "was clean, is not" is the only
+        // reachable regression — but the pre-check is kept anyway, so the guard
+        // states its own precondition instead of assuming it. vix has no
+        // post-splice re-parse at all, which is how a corrupted splice becomes
+        // visible only on the *next* read.
+        if hotl_minify::parses_clean(lang, &content) && !hotl_minify::parses_clean(lang, &updated) {
+            return Err(ToolOutcome::err(format!(
+                "this edit would leave `{path}` no longer parsing, so nothing was written. \
+                 Re-check `old_string`/`new_string` against a fresh minified read."
+            )));
+        }
         // Same re-read-and-compare-then-write sequence as the plain edit, so
         // both routes inherit one concurrency posture rather than two (D-B10).
         let now = builtins::read_guarded_to_string(root, &target, path)?;
@@ -488,13 +512,16 @@ mod enabled {
         #[tokio::test]
         async fn a_match_covering_only_invented_formatting_is_refused() {
             let (_o, root, _home) = fsguard::tests::fixture();
-            write(&root, "src/m.py", "def f(a):\n    return a\n");
+            // The newline after a kept line comment is synthesized — the source
+            // has one there, but not one the position map points at. Rust, not
+            // Python, so the multi-line guard cannot claim this case first.
+            write(&root, "src/m.rs", "fn f() -> u32 {\n    // sum\n    1\n}\n");
             let err = edit_minified_in(
                 &root,
                 &[],
                 &json!({
-                    "path": "src/m.py", "minified": true,
-                    "old_string": "\n ", "new_string": "\n  "
+                    "path": "src/m.rs", "minified": true,
+                    "old_string": "\n", "new_string": " "
                 }),
                 &MinifyConfig::default(),
             )
@@ -637,6 +664,78 @@ mod enabled {
                 "# hi\n",
                 "a refused edit writes nothing"
             );
+        }
+
+        #[tokio::test]
+        async fn a_splice_that_breaks_the_parse_is_refused_and_the_file_is_untouched() {
+            let (_o, root, _home) = fsguard::tests::fixture();
+            let src = "fn f() -> u32 { 1 }\n";
+            write(&root, "src/m.rs", src);
+            let err = edit_minified_in(
+                &root,
+                &[],
+                &json!({
+                    "path": "src/m.rs", "minified": true,
+                    "old_string": "{1}", "new_string": "{ 1"
+                }),
+                &MinifyConfig::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(err.content.contains("no longer parsing"), "{}", err.content);
+            assert_eq!(
+                std::fs::read_to_string(root.join("src/m.rs")).unwrap(),
+                src,
+                "nothing was written"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_multiline_replacement_in_python_is_refused_with_advice() {
+            let (_o, root, _home) = fsguard::tests::fixture();
+            write(&root, "src/m.py", "def f(a):\n    return a\n");
+            let err = edit_minified_in(
+                &root,
+                &[],
+                &json!({
+                    "path": "src/m.py", "minified": true,
+                    "old_string": "return a", "new_string": "x = a\n return x"
+                }),
+                &MinifyConfig::default(),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                err.content.contains("plain edit"),
+                "the way out is named: {}",
+                err.content
+            );
+            assert_eq!(
+                std::fs::read_to_string(root.join("src/m.py")).unwrap(),
+                "def f(a):\n    return a\n",
+                "refused before any IO"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_multiline_replacement_is_allowed_where_indentation_is_not_syntax() {
+            // The refusal is Python-specific, not a blanket ban: Rust's
+            // indentation carries no meaning, so a multi-line splice is fine.
+            let (_o, root, _home) = fsguard::tests::fixture();
+            write(&root, "src/m.rs", "fn f() -> u32 {\n    1\n}\n");
+            edit_minified_in(
+                &root,
+                &[],
+                &json!({
+                    "path": "src/m.rs", "minified": true,
+                    "old_string": "1", "new_string": "{\n        let x = 1;\n        x\n    }"
+                }),
+                &MinifyConfig::default(),
+            )
+            .await
+            .unwrap();
+            let after = std::fs::read_to_string(root.join("src/m.rs")).unwrap();
+            assert!(after.contains("let x = 1;"), "{after}");
         }
 
         #[tokio::test]
