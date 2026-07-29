@@ -11,6 +11,7 @@ members = [
     "crates/hotl-provider",
     "crates/hotl-provider-anthropic",
     "crates/hotl-provider-openai",
+    "crates/hotl-minify",
     "crates/hotl-tools",
     "crates/hotl-mcp",
     "crates/hotl-retrieval",
@@ -61,9 +62,21 @@ libc = "0.2"
 sha2 = "0.10"
 # `hotl update` unpacks the release archive. Pure-Rust backends on purpose:
 # `cargo install hotl` must not start needing a C toolchain (same reasoning as
-# reqwest/rustls above).
+# reqwest/rustls above). Relaxed 2026-07-29 for tree-sitter only (Decision D1):
+# the grammars below compile C, so they sit behind hotl-tools' default-on
+# `minify` feature — `cargo install hotl --no-default-features` is still a
+# pure-Rust build.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 tar = { version = "0.4", default-features = false }
+# The parsing stack behind `read --minified` / `edit --minified`. Exact pins:
+# a grammar's generated parser is ABI-versioned against the core, and the
+# minifier's correctness depends on node kinds that a grammar bump can rename.
+tree-sitter = "=0.26.11"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-go = "=0.25.0"
+tree-sitter-python = "=0.25.0"
+tree-sitter-javascript = "=0.25.0"
+tree-sitter-typescript = "=0.23.2"
 # Ripgrep's own traversal + glob crates. `ignore` defaults to
 # follow_links(false) — the cheapest containment layer — and is gitignore-aware;
 # `globset` is a real glob matcher (`*` vs `**`, classes, alternates).
