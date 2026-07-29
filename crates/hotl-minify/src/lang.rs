@@ -43,6 +43,63 @@ impl Lang {
             "comment" | "line_comment" | "block_comment" | "doc_comment" | "html_comment"
         )
     }
+
+    /// Is this a statement-class node whose terminator is optional — i.e. one
+    /// where the tree, not a lexical guess, tells us ASI fired (D-B7)?
+    ///
+    /// An omission here costs coverage, never correctness: a statement boundary
+    /// we fail to record joins plainly, and if that changes the meaning the
+    /// AST-shape check refuses the whole minify.
+    pub(crate) fn is_asi_statement(self, node_kind: &str) -> bool {
+        /// Shared by JS and TS.
+        const SCRIPT: &[&str] = &[
+            "expression_statement",
+            "lexical_declaration",
+            "variable_declaration",
+            "return_statement",
+            "break_statement",
+            "continue_statement",
+            "throw_statement",
+            "do_statement",
+            "import_statement",
+            "export_statement",
+            "debugger_statement",
+            "field_definition",
+        ];
+        /// TS's type-level members, whose `;`/`,` is equally optional.
+        const TYPED: &[&str] = &[
+            "type_alias_declaration",
+            "import_alias",
+            "property_signature",
+            "method_signature",
+            "public_field_definition",
+            "abstract_method_signature",
+            "index_signature",
+            "call_signature",
+            "construct_signature",
+        ];
+        match self {
+            Lang::JavaScript => SCRIPT.contains(&node_kind),
+            Lang::TypeScript | Lang::Tsx => {
+                SCRIPT.contains(&node_kind) || TYPED.contains(&node_kind)
+            }
+            Lang::Rust | Lang::Go | Lang::Python => false,
+        }
+    }
+
+    /// Does this subtree own its inter-token whitespace, so the joiner must copy
+    /// its gaps rather than synthesize them? `jsx_text` carries its own spacing,
+    /// but attribute lists do not: `class="a" id="b"` has no re-lex hazard the
+    /// separator table can see, and joining it is invalid.
+    pub(crate) fn owns_its_whitespace(self, node_kind: &str) -> bool {
+        match self {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => matches!(
+                node_kind,
+                "jsx_element" | "jsx_fragment" | "jsx_self_closing_element"
+            ),
+            Lang::Rust | Lang::Go | Lang::Python => false,
+        }
+    }
 }
 
 #[cfg(test)]

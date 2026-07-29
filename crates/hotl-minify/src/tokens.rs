@@ -1,4 +1,6 @@
-//! The tree-sitter side: parse, and walk the tree for leaf tokens.
+//! The tree-sitter side: parse, and walk the tree for everything the joiner
+//! needs — leaf tokens, the statement boundaries where ASI fired, and the
+//! subtrees whose whitespace is not ours to remove.
 //!
 //! The extraction layer is `pub`: the joiner is its only real consumer, but
 //! an internal crate with no semver promise gains nothing from hiding it, and
@@ -25,6 +27,29 @@ pub enum TokenKind {
     Comment,
 }
 
+/// What one walk of the tree yields.
+#[derive(Debug, Default)]
+pub struct Extraction {
+    pub tokens: Vec<Token>,
+    /// End bytes of statement-class nodes that did **not** spell their own
+    /// terminator — the tree's record of where ASI fired. Sorted, deduplicated.
+    /// Empty for languages that need no ASI reconstruction.
+    pub semi_ends: Vec<usize>,
+    /// Byte ranges whose inter-token gaps are renderer-visible (JSX), so the
+    /// joiner copies those gaps instead of synthesizing them.
+    pub verbatim: Vec<(usize, usize)>,
+}
+
+impl Extraction {
+    pub fn ends_a_statement(&self, offset: usize) -> bool {
+        self.semi_ends.binary_search(&offset).is_ok()
+    }
+
+    pub fn is_verbatim_gap(&self, from: usize, to: usize) -> bool {
+        self.verbatim.iter().any(|(a, b)| *a <= from && to <= *b)
+    }
+}
+
 pub(crate) fn parse(lang: Lang, source: &str) -> Option<tree_sitter::Tree> {
     let mut parser = tree_sitter::Parser::new();
     parser.set_language(&lang.grammar()).ok()?;
@@ -36,45 +61,81 @@ pub fn parses_clean(lang: Lang, source: &str) -> bool {
     parse(lang, source).is_some_and(|t| !t.root_node().has_error())
 }
 
-/// Depth-first leaf walk. Zero-width leaves (a grammar's synthetic
-/// indent/dedent markers) are dropped; everything else is a source slice.
-pub fn leaf_tokens(lang: Lang, source: &str) -> Result<Vec<Token>, MinifyError> {
+pub fn extract(lang: Lang, source: &str) -> Result<Extraction, MinifyError> {
     let tree = parse(lang, source).ok_or(MinifyError::SourceHasErrors)?;
     if tree.root_node().has_error() {
         return Err(MinifyError::SourceHasErrors);
     }
-    let mut out = Vec::new();
+    let mut w = Walker {
+        lang,
+        source,
+        out: Extraction::default(),
+    };
     let mut cursor = tree.root_node().walk();
-    walk(&mut cursor, lang, &mut out);
-    out.retain(|t| t.start < t.end);
-    check_coverage(source, &out)?;
+    w.visit(&mut cursor);
+    let mut out = w.out;
+    out.tokens.retain(|t| t.start < t.end);
+    out.semi_ends.sort_unstable();
+    out.semi_ends.dedup();
+    check_coverage(source, &out.tokens)?;
     Ok(out)
 }
 
-fn walk(cursor: &mut tree_sitter::TreeCursor, lang: Lang, out: &mut Vec<Token>) {
-    loop {
-        let node = cursor.node();
-        // Comments are atomic even when the grammar gives them children:
-        // tree-sitter-rust's `line_comment` has a `//` child that stops short
-        // of the node, so descending would drop the comment's actual text.
-        if lang.is_comment(node.kind()) {
-            out.push(Token {
-                start: node.start_byte(),
-                end: node.end_byte(),
-                kind: TokenKind::Comment,
-            });
-        } else if node.child_count() == 0 {
-            out.push(Token {
-                start: node.start_byte(),
-                end: node.end_byte(),
-                kind: TokenKind::Code,
-            });
-        } else if cursor.goto_first_child() {
-            walk(cursor, lang, out);
-            cursor.goto_parent();
+struct Walker<'s> {
+    lang: Lang,
+    source: &'s str,
+    out: Extraction,
+}
+
+impl Walker<'_> {
+    /// Depth-first. Zero-width leaves (a grammar's synthetic indent/dedent
+    /// markers) fall out in `extract`; everything else is a source slice.
+    fn visit(&mut self, cursor: &mut tree_sitter::TreeCursor) {
+        loop {
+            let node = cursor.node();
+            self.note(&node);
+            // Comments are atomic even when the grammar gives them children:
+            // tree-sitter-rust's `line_comment` has a `//` child that stops
+            // short of the node, so descending would drop the comment's text.
+            if self.lang.is_comment(node.kind()) {
+                self.push(&node, TokenKind::Comment);
+            } else if node.child_count() == 0 {
+                self.push(&node, TokenKind::Code);
+            } else if cursor.goto_first_child() {
+                self.visit(cursor);
+                cursor.goto_parent();
+            }
+            if !cursor.goto_next_sibling() {
+                return;
+            }
         }
-        if !cursor.goto_next_sibling() {
+    }
+
+    fn push(&mut self, node: &tree_sitter::Node, kind: TokenKind) {
+        self.out.tokens.push(Token {
+            start: node.start_byte(),
+            end: node.end_byte(),
+            kind,
+        });
+    }
+
+    /// Record what the joiner cannot see from the token stream alone: which
+    /// byte positions end a statement that spelled no terminator, and which
+    /// subtrees own their whitespace.
+    fn note(&mut self, node: &tree_sitter::Node) {
+        let kind = node.kind();
+        if self.lang.owns_its_whitespace(kind) {
+            self.out.verbatim.push((node.start_byte(), node.end_byte()));
+        }
+        if !self.lang.is_asi_statement(kind) {
             return;
+        }
+        // The node's own last token *is* its terminator when it spelled one.
+        // `,` counts: an object-type member ending in `,` needs no `;` added,
+        // and appending one there is a syntax error.
+        let text = &self.source[node.start_byte()..node.end_byte()];
+        if !text.ends_with(';') && !text.ends_with(',') {
+            self.out.semi_ends.push(node.end_byte());
         }
     }
 }
@@ -111,7 +172,7 @@ mod tests {
     #[test]
     fn leaf_tokens_cover_every_non_whitespace_byte_of_rust_source() {
         let src = "fn add(a: u32, b: u32) -> u32 {\n    // sum\n    a + b\n}\n";
-        let toks = leaf_tokens(Lang::Rust, src).unwrap();
+        let toks = extract(Lang::Rust, src).unwrap().tokens;
         // Every token's bytes are verbatim source bytes.
         for t in &toks {
             assert!(t.start < t.end && t.end <= src.len());
@@ -133,7 +194,7 @@ mod tests {
     #[test]
     fn source_with_a_syntax_error_is_refused() {
         assert_eq!(
-            leaf_tokens(Lang::Rust, "fn broken( {").unwrap_err(),
+            extract(Lang::Rust, "fn broken( {").unwrap_err(),
             MinifyError::SourceHasErrors
         );
     }
@@ -181,5 +242,23 @@ mod tests {
             ]
         )
         .is_ok());
+    }
+
+    #[test]
+    fn a_language_without_asi_records_no_statement_boundaries() {
+        let ex = extract(Lang::Rust, "fn f() -> u32 { 1 }\n").unwrap();
+        assert!(ex.semi_ends.is_empty() && ex.verbatim.is_empty());
+    }
+
+    #[test]
+    fn a_js_statement_that_spelled_its_own_semicolon_records_no_boundary() {
+        let with = extract(Lang::JavaScript, "const a = 1;\nconst b = 2;\n").unwrap();
+        assert!(
+            with.semi_ends.is_empty(),
+            "explicit terminators need no reconstruction: {:?}",
+            with.semi_ends
+        );
+        let without = extract(Lang::JavaScript, "const a = 1\nconst b = 2\n").unwrap();
+        assert_eq!(without.semi_ends.len(), 2);
     }
 }

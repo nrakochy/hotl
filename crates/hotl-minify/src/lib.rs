@@ -16,7 +16,7 @@ mod lang;
 mod tokens;
 
 pub use lang::{language_for_path, Lang};
-pub use tokens::{leaf_tokens, parses_clean, Token, TokenKind};
+pub use tokens::{extract, parses_clean, Extraction, Token, TokenKind};
 
 /// A minified view plus the map back to the source it came from.
 pub struct Minified {
@@ -46,8 +46,8 @@ impl Minified {
 /// Re-serialize `source` as a token stream. Validation (re-parse, AST-shape
 /// equivalence) arrives in Task 4.
 pub fn minify(lang: Lang, source: &str, keep_comments: bool) -> Result<Minified, MinifyError> {
-    let toks = tokens::leaf_tokens(lang, source)?;
-    Ok(join::join(lang, source, &toks, keep_comments))
+    let ex = tokens::extract(lang, source)?;
+    Ok(join::join(lang, source, &ex, keep_comments))
 }
 
 #[derive(Debug, PartialEq, Eq)]

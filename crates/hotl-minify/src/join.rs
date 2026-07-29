@@ -6,8 +6,19 @@
 
 use std::borrow::Cow;
 
-use crate::tokens::{Token, TokenKind};
+use crate::tokens::{Extraction, Token, TokenKind};
 use crate::{Lang, Minified, Segment};
+
+/// What goes between two emitted tokens.
+enum Sep {
+    /// Text we invented. It exists nowhere in the source, so `project_span`
+    /// must snap away from it.
+    Synthetic(Cow<'static, str>),
+    /// A source byte range copied through untouched — JSX's renderer-visible
+    /// whitespace. Recorded as a real segment: it *is* source bytes, so a match
+    /// landing in it projects like any token.
+    Verbatim(usize, usize),
+}
 
 /// Characters that can compose a longer operator with a neighbour, so two of
 /// them must never touch: `>` then `=` would become `>=`.
@@ -29,17 +40,27 @@ fn base_separator(prev_last: char, next_first: char) -> &'static str {
     }
 }
 
-pub(crate) fn join(lang: Lang, source: &str, tokens: &[Token], keep_comments: bool) -> Minified {
+pub(crate) fn join(lang: Lang, source: &str, ex: &Extraction, keep_comments: bool) -> Minified {
     let py = (lang == Lang::Python).then(|| PyLines::new(source));
     let mut text = String::with_capacity(source.len() / 2);
-    let mut segments = Vec::with_capacity(tokens.len());
+    let mut segments = Vec::with_capacity(ex.tokens.len());
     let mut prev: Option<&Token> = None;
-    for tok in tokens {
+    for tok in &ex.tokens {
         if tok.kind == TokenKind::Comment && !keep_comments {
             continue;
         }
         if let Some(p) = prev {
-            text.push_str(&separator(lang, source, p, tok, py.as_ref()));
+            match separator(lang, source, p, tok, py.as_ref(), ex) {
+                Sep::Synthetic(s) => text.push_str(&s),
+                Sep::Verbatim(a, b) => {
+                    segments.push(Segment {
+                        out_start: text.len(),
+                        len: b - a,
+                        src_start: a,
+                    });
+                    text.push_str(&source[a..b]);
+                }
+            }
         }
         segments.push(Segment {
             out_start: text.len(),
@@ -52,22 +73,44 @@ pub(crate) fn join(lang: Lang, source: &str, tokens: &[Token], keep_comments: bo
     Minified { text, segments }
 }
 
-/// Language dispatch. Task 3b adds JS/TS statement boundaries and JSX gaps.
 fn separator(
     lang: Lang,
     source: &str,
     prev: &Token,
     next: &Token,
     py: Option<&PyLines>,
-) -> Cow<'static, str> {
+    ex: &Extraction,
+) -> Sep {
     match lang {
-        Lang::Go => go_separator(source, prev, next),
+        Lang::Go => Sep::Synthetic(go_separator(source, prev, next)),
         // `py` is `Some` exactly when `lang` is Python — same `match` in `join`.
-        Lang::Python => python_separator(source, prev, next, py.expect("python line table")),
-        Lang::Rust | Lang::JavaScript | Lang::TypeScript | Lang::Tsx => {
-            Cow::Borrowed(rust_separator(source, prev, next))
-        }
+        Lang::Python => Sep::Synthetic(python_separator(
+            source,
+            prev,
+            next,
+            py.expect("python line table"),
+        )),
+        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => script_separator(source, prev, next, ex),
+        Lang::Rust => Sep::Synthetic(Cow::Borrowed(rust_separator(source, prev, next))),
     }
+}
+
+/// JS/TS: the gap is copied when it sits inside a JSX subtree, becomes an
+/// explicit `;` when it crosses a line break at a statement boundary the tree
+/// recorded, and otherwise joins like any other language.
+///
+/// The `;` is the whole of D-B7: `let a = b\n(c)` is one call while `a\n++b` is
+/// two statements, and the token pair at the break is the same shape in both —
+/// only the tree knows which. Where the source relied on ASI it says so; where
+/// the break was a continuation, no statement ends there.
+fn script_separator(source: &str, prev: &Token, next: &Token, ex: &Extraction) -> Sep {
+    if ex.is_verbatim_gap(prev.end, next.start) {
+        return Sep::Verbatim(prev.end, next.start);
+    }
+    if crossed_newline(source, prev, next) && ex.ends_a_statement(prev.end) {
+        return Sep::Synthetic(Cow::Borrowed(";"));
+    }
+    Sep::Synthetic(Cow::Borrowed(rust_separator(source, prev, next)))
 }
 
 fn rust_separator(source: &str, prev: &Token, next: &Token) -> &'static str {
@@ -254,6 +297,84 @@ mod tests {
         let src = "def f(a):\n    if a:\n        x = 1\n# note\n        y = 2\n";
         let m = minify(Lang::Python, src, true).unwrap();
         assert!(m.text.contains("\n  y"), "y stays at level 2: {}", m.text);
+    }
+
+    #[test]
+    fn a_semicolonless_js_file_gets_explicit_semicolons_at_statement_boundaries() {
+        let src = "const a = 1\nconst b = a + 1\n";
+        let m = minify(Lang::JavaScript, src, true).unwrap();
+        assert_eq!(m.text, "const a=1;const b=a+1");
+    }
+
+    #[test]
+    fn a_restricted_production_keeps_its_asi_semicolon() {
+        // `return` + newline + expr is `return; expr` in the source; joining
+        // without `;` would parse clean and mean something else.
+        let src = "function f(x) {\n  return\n  x\n}\n";
+        let m = minify(Lang::JavaScript, src, true).unwrap();
+        assert!(m.text.contains("return;x"), "got: {}", m.text);
+    }
+
+    #[test]
+    fn a_multiline_continuation_is_joined_without_a_semicolon() {
+        let src = "const a = b\n  .c()\n  .d()\n";
+        let m = minify(Lang::JavaScript, src, true).unwrap();
+        assert_eq!(m.text, "const a=b.c().d()");
+    }
+
+    #[test]
+    fn a_paren_continuation_stays_a_call_not_two_statements() {
+        // The source parsed `f\n(1)` as one call expression; no statement ends
+        // at `f`, so no `;` may appear there.
+        let src = "const x = f\n(1)\n";
+        let m = minify(Lang::JavaScript, src, true).unwrap();
+        assert!(!m.text.contains(";("), "got: {}", m.text);
+    }
+
+    #[test]
+    fn a_next_line_increment_stays_two_statements() {
+        // `a\n++b` is two statements in the source. Joining to `a++b` would be
+        // one, and would parse clean.
+        let src = "let a = 1\nlet b = 2\na\n++b\n";
+        let m = minify(Lang::JavaScript, src, true).unwrap();
+        assert!(m.text.contains("a;++b"), "got: {}", m.text);
+    }
+
+    #[test]
+    fn ts_interface_members_get_separators_that_reparse() {
+        let src = "interface A {\n  x: number\n  y: string\n}\n";
+        let m = minify(Lang::TypeScript, src, true).unwrap();
+        assert!(
+            crate::parses_clean(Lang::TypeScript, &m.text),
+            "got: {}",
+            m.text
+        );
+        assert!(m.text.contains("x:number;y:string"), "got: {}", m.text);
+    }
+
+    #[test]
+    fn jsx_text_whitespace_is_preserved_verbatim() {
+        let src = "const el = (\n  <p>\n    hello <b>world</b>\n  </p>\n)\n";
+        let m = minify(Lang::Tsx, src, true).unwrap();
+        assert!(
+            m.text.contains("hello <b>world</b>"),
+            "renderer-visible space kept: {}",
+            m.text
+        );
+    }
+
+    #[test]
+    fn jsx_attribute_lists_keep_the_space_that_separates_them() {
+        // No re-lex hazard `base_separator` can see between `"a"` and `id`,
+        // yet joining them is a syntax error. The verbatim-gap rule is what
+        // saves it.
+        let src = "const el = <p className=\"a\" id=\"b\">hi</p>\n";
+        let m = minify(Lang::Tsx, src, true).unwrap();
+        assert!(
+            crate::parses_clean(Lang::Tsx, &m.text),
+            "attributes still separated: {}",
+            m.text
+        );
     }
 
     #[test]
