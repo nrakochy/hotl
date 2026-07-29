@@ -66,7 +66,9 @@ pub(crate) fn join(lang: Lang, source: &str, ex: &Extraction, keep_comments: boo
             };
             match cx.separator() {
                 Sep::Synthetic(s) => text.push_str(&s),
-                Sep::Verbatim(a, b) => {
+                // An empty gap records nothing: a zero-length segment overlaps
+                // no range, so `project_span` could never snap to it.
+                Sep::Verbatim(a, b) if a < b => {
                     segments.push(Segment {
                         out_start: text.len(),
                         len: b - a,
@@ -74,6 +76,7 @@ pub(crate) fn join(lang: Lang, source: &str, ex: &Extraction, keep_comments: boo
                     });
                     text.push_str(&source[a..b]);
                 }
+                Sep::Verbatim(..) => {}
             }
         }
         segments.push(Segment {

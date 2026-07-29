@@ -42,6 +42,45 @@ impl Minified {
     pub fn segments(&self) -> &[Segment] {
         &self.segments
     }
+
+    /// Map a byte range of `text` back to a byte range of the source.
+    ///
+    /// Linear inside a segment — a segment's minified bytes *are* its source
+    /// bytes, so the offset carries over. A boundary landing in a synthetic gap
+    /// snaps inward to the nearest real token: start forward, end backward. A
+    /// range covering nothing but synthetic text is rejected — there is no source
+    /// to point at, and splicing over the separators we invented would corrupt
+    /// the file.
+    ///
+    /// The projected range is a superset of the match in source space: source
+    /// formatting *between* the matched tokens rides along, which is exactly
+    /// what makes the splice replace a contiguous region.
+    pub fn project_span(&self, start: usize, end: usize) -> Result<(usize, usize), ProjectError> {
+        if start >= end {
+            return Err(ProjectError::OnlySynthetic);
+        }
+        let overlaps = |s: &&Segment| s.out_start < end && s.out_start + s.len > start;
+        let first = self.segments.iter().find(overlaps);
+        let last = self.segments.iter().rev().find(overlaps);
+        let (Some(first), Some(last)) = (first, last) else {
+            return Err(ProjectError::OnlySynthetic);
+        };
+        let src_start = first.src_start + start.saturating_sub(first.out_start);
+        let src_end = last.src_start + (end.min(last.out_start + last.len) - last.out_start);
+        Ok((src_start, src_end))
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ProjectError {
+    /// The range covered only separators the minifier invented, nothing real.
+    OnlySynthetic,
+}
+
+impl std::fmt::Display for ProjectError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the range covers only synthesized formatting")
+    }
 }
 
 /// Re-serialize `source` as a token stream, then prove the result.
@@ -235,6 +274,79 @@ mod fixture_tests {
                 kept < src.len(),
                 "{lang:?}: comment-preserving mode still saves bytes"
             );
+        }
+    }
+
+    #[test]
+    fn a_span_inside_one_token_projects_linearly() {
+        let src = "fn add(a: u32) -> u32 { a }\n";
+        let m = minify(Lang::Rust, src, true).unwrap();
+        let pos = m.text.find("add").unwrap();
+        let (s, e) = m.project_span(pos, pos + 3).unwrap();
+        assert_eq!(&src[s..e], "add");
+    }
+
+    #[test]
+    fn a_span_crossing_synthetic_separators_snaps_to_real_token_boundaries() {
+        let src = "let a = 1;\nlet b = 2;\n";
+        let m = minify(Lang::Rust, src, true).unwrap();
+        // Match spanning from inside `1;` across the (removed) newline into `let`.
+        let start = m.text.find("1;let").unwrap();
+        let (s, e) = m.project_span(start, start + "1;let".len()).unwrap();
+        assert_eq!(
+            &src[s..e],
+            "1;\nlet",
+            "the newline between tokens rides along in source space"
+        );
+    }
+
+    #[test]
+    fn a_match_that_is_only_synthetic_separator_text_is_rejected() {
+        let src = "def f(a):\n    return a\n";
+        let m = minify(Lang::Python, src, true).unwrap();
+        let nl = m.text.find('\n').unwrap();
+        assert_eq!(
+            m.project_span(nl, nl + 1).unwrap_err(),
+            ProjectError::OnlySynthetic
+        );
+    }
+
+    #[test]
+    fn an_empty_range_is_rejected_rather_than_projected_to_an_insertion_point() {
+        // `edit` refuses an empty `old_string` upstream, but a zero-width range
+        // has no tokens to snap to and must not silently become one.
+        let m = minify(Lang::Rust, "fn f() {}\n", true).unwrap();
+        assert_eq!(
+            m.project_span(3, 3).unwrap_err(),
+            ProjectError::OnlySynthetic
+        );
+    }
+
+    #[test]
+    fn a_span_landing_in_a_jsx_gap_projects_because_that_gap_is_real_source() {
+        // JSX gaps are copied, not invented, so they are recorded as segments —
+        // a match inside one has source bytes to point at.
+        let src = "const el = <p>hello <b>world</b></p>\n";
+        let m = minify(Lang::Tsx, src, true).unwrap();
+        let at = m.text.find("hello ").unwrap();
+        let (s, e) = m.project_span(at, at + "hello ".len()).unwrap();
+        assert_eq!(&src[s..e], "hello ");
+    }
+
+    #[test]
+    fn projecting_any_token_of_any_fixture_recovers_that_token_verbatim() {
+        for (lang, src) in fixtures() {
+            let m = minify(lang, src, true).unwrap();
+            for seg in m.segments() {
+                let (s, e) = m
+                    .project_span(seg.out_start, seg.out_start + seg.len)
+                    .unwrap_or_else(|err| panic!("{lang:?}: {err}"));
+                assert_eq!(
+                    &src[s..e],
+                    &m.text[seg.out_start..seg.out_start + seg.len],
+                    "{lang:?}: projection is not the identity on a whole segment"
+                );
+            }
         }
     }
 
