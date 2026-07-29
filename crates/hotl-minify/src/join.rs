@@ -9,6 +9,15 @@ use std::borrow::Cow;
 use crate::tokens::{Extraction, Token, TokenKind};
 use crate::{Lang, Minified, Segment};
 
+/// Characters that can compose a longer operator with a neighbour, so two of
+/// them must never touch: `>` then `=` would become `>=`.
+const OPERATOR_CHARS: &str = "+-*/%<>=!&|^~.?:#@";
+
+/// Tokens an ASI semicolon is never needed before: the closer terminates the
+/// statement on its own. Skipping it keeps the output smaller *and* keeps the
+/// parse shape identical, which the AST-equivalence check cares about.
+const CLOSERS: [&str; 3] = ["}", ")", "]"];
+
 /// What goes between two emitted tokens.
 enum Sep {
     /// Text we invented. It exists nowhere in the source, so `project_span`
@@ -19,10 +28,6 @@ enum Sep {
     /// landing in it projects like any token.
     Verbatim(usize, usize),
 }
-
-/// Characters that can compose a longer operator with a neighbour, so two of
-/// them must never touch: `>` then `=` would become `>=`.
-const OPERATOR_CHARS: &str = "+-*/%<>=!&|^~.?:#@";
 
 fn wordy(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
@@ -41,16 +46,25 @@ fn base_separator(prev_last: char, next_first: char) -> &'static str {
 }
 
 pub(crate) fn join(lang: Lang, source: &str, ex: &Extraction, keep_comments: bool) -> Minified {
-    let py = (lang == Lang::Python).then(|| PyLines::new(source));
+    let py = (lang == Lang::Python).then(|| PyLines::new(source, &ex.tokens));
     let mut text = String::with_capacity(source.len() / 2);
     let mut segments = Vec::with_capacity(ex.tokens.len());
     let mut prev: Option<&Token> = None;
-    for tok in &ex.tokens {
+    for (i, tok) in ex.tokens.iter().enumerate() {
         if tok.kind == TokenKind::Comment && !keep_comments {
             continue;
         }
         if let Some(p) = prev {
-            match separator(lang, source, p, tok, py.as_ref(), ex) {
+            let cx = Gap {
+                lang,
+                source,
+                prev: p,
+                next: tok,
+                next_index: i,
+                py: py.as_ref(),
+                ex,
+            };
+            match cx.separator() {
                 Sep::Synthetic(s) => text.push_str(&s),
                 Sep::Verbatim(a, b) => {
                     segments.push(Segment {
@@ -73,70 +87,107 @@ pub(crate) fn join(lang: Lang, source: &str, ex: &Extraction, keep_comments: boo
     Minified { text, segments }
 }
 
-fn separator(
+/// Everything the separator decision needs about one gap between two emitted
+/// tokens.
+struct Gap<'a> {
     lang: Lang,
-    source: &str,
-    prev: &Token,
-    next: &Token,
-    py: Option<&PyLines>,
-    ex: &Extraction,
-) -> Sep {
-    match lang {
-        Lang::Go => Sep::Synthetic(go_separator(source, prev, next)),
-        // `py` is `Some` exactly when `lang` is Python — same `match` in `join`.
-        Lang::Python => Sep::Synthetic(python_separator(
-            source,
-            prev,
-            next,
-            py.expect("python line table"),
-        )),
-        Lang::JavaScript | Lang::TypeScript | Lang::Tsx => script_separator(source, prev, next, ex),
-        Lang::Rust => Sep::Synthetic(Cow::Borrowed(rust_separator(source, prev, next))),
+    source: &'a str,
+    prev: &'a Token,
+    next: &'a Token,
+    next_index: usize,
+    py: Option<&'a PyLines>,
+    ex: &'a Extraction,
+}
+
+impl Gap<'_> {
+    fn separator(&self) -> Sep {
+        let sep = match self.lang {
+            Lang::Go => Sep::Synthetic(self.go_separator()),
+            // `py` is `Some` exactly when `lang` is Python — same test in `join`.
+            Lang::Python => Sep::Synthetic(self.python_separator()),
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => self.script_separator(),
+            Lang::Rust => Sep::Synthetic(Cow::Borrowed(self.base())),
+        };
+        self.guard_line_comment(sep)
     }
-}
 
-/// JS/TS: the gap is copied when it sits inside a JSX subtree, becomes an
-/// explicit `;` when it crosses a line break at a statement boundary the tree
-/// recorded, and otherwise joins like any other language.
-///
-/// The `;` is the whole of D-B7: `let a = b\n(c)` is one call while `a\n++b` is
-/// two statements, and the token pair at the break is the same shape in both —
-/// only the tree knows which. Where the source relied on ASI it says so; where
-/// the break was a continuation, no statement ends there.
-fn script_separator(source: &str, prev: &Token, next: &Token, ex: &Extraction) -> Sep {
-    if ex.is_verbatim_gap(prev.end, next.start) {
-        return Sep::Verbatim(prev.end, next.start);
+    /// A kept `//` or `#` comment swallows everything to the next newline, so
+    /// the token after one can never share its line.
+    fn guard_line_comment(&self, sep: Sep) -> Sep {
+        if self.prev.kind != TokenKind::Comment {
+            return sep;
+        }
+        let text = self.text(self.prev);
+        if !(text.starts_with("//") || text.starts_with('#')) {
+            return sep;
+        }
+        match &sep {
+            // Python's own separator already carries the newline *and* the
+            // indentation; replacing it would outdent the next line.
+            Sep::Synthetic(s) if s.contains('\n') => sep,
+            Sep::Verbatim(a, b) if self.source[*a..*b].contains('\n') => sep,
+            _ => Sep::Synthetic(Cow::Borrowed("\n")),
+        }
     }
-    if crossed_newline(source, prev, next) && ex.ends_a_statement(prev.end) {
-        return Sep::Synthetic(Cow::Borrowed(";"));
+
+    fn text(&self, tok: &Token) -> &str {
+        &self.source[tok.start..tok.end]
     }
-    Sep::Synthetic(Cow::Borrowed(rust_separator(source, prev, next)))
-}
 
-fn rust_separator(source: &str, prev: &Token, next: &Token) -> &'static str {
-    base_separator(last_char(source, prev), first_char(source, next))
-}
-
-fn last_char(source: &str, tok: &Token) -> char {
-    source[tok.start..tok.end].chars().last().unwrap_or(' ')
-}
-
-fn first_char(source: &str, tok: &Token) -> char {
-    source[tok.start..tok.end].chars().next().unwrap_or(' ')
-}
-
-fn crossed_newline(source: &str, prev: &Token, next: &Token) -> bool {
-    source[prev.end..next.start].contains('\n')
-}
-
-/// Go's automatic semicolon rule, applied at the original line boundaries: the
-/// spec inserts `;` when a line ends in an identifier, a literal, or one of
-/// `break continue fallthrough return ++ -- ) ] }`.
-fn go_separator(source: &str, prev: &Token, next: &Token) -> Cow<'static, str> {
-    if crossed_newline(source, prev, next) && go_asi_trigger(&source[prev.start..prev.end]) {
-        return Cow::Borrowed(";");
+    fn base(&self) -> &'static str {
+        let prev_last = self.text(self.prev).chars().last().unwrap_or(' ');
+        let next_first = self.text(self.next).chars().next().unwrap_or(' ');
+        base_separator(prev_last, next_first)
     }
-    Cow::Borrowed(rust_separator(source, prev, next))
+
+    fn crossed_newline(&self) -> bool {
+        self.source[self.prev.end..self.next.start].contains('\n')
+    }
+
+    fn next_is_closer(&self) -> bool {
+        CLOSERS.contains(&self.text(self.next))
+    }
+
+    /// Go's automatic semicolon rule, applied at the original line boundaries:
+    /// the spec inserts `;` when a line ends in an identifier, a literal, or one
+    /// of `break continue fallthrough return ++ -- ) ] }`.
+    fn go_separator(&self) -> Cow<'static, str> {
+        if self.crossed_newline() && !self.next_is_closer() && go_asi_trigger(self.text(self.prev))
+        {
+            return Cow::Borrowed(";");
+        }
+        Cow::Borrowed(self.base())
+    }
+
+    /// JS/TS: the gap is copied when it sits inside a JSX subtree, becomes an
+    /// explicit `;` when it crosses a line break at a statement boundary the
+    /// tree recorded, and otherwise joins like any other language.
+    ///
+    /// The `;` is the whole of D-B7: `let a = b\n(c)` is one call while `a\n++b`
+    /// is two statements, and the token pair at the break is the same shape in
+    /// both — only the tree knows which.
+    fn script_separator(&self) -> Sep {
+        if self.ex.is_verbatim_gap(self.prev.end, self.next.start) {
+            return Sep::Verbatim(self.prev.end, self.next.start);
+        }
+        if self.crossed_newline()
+            && !self.next_is_closer()
+            && self.ex.ends_a_statement(self.prev.end)
+        {
+            return Sep::Synthetic(Cow::Borrowed(";"));
+        }
+        Sep::Synthetic(Cow::Borrowed(self.base()))
+    }
+
+    /// Python keeps one logical line per line; only the indentation is
+    /// rewritten, to one space per level.
+    fn python_separator(&self) -> Cow<'static, str> {
+        let py = self.py.expect("python line table");
+        match py.line_start_level(self.next_index) {
+            Some(level) => Cow::Owned(format!("\n{}", " ".repeat(level))),
+            None => Cow::Borrowed(self.base()),
+        }
+    }
 }
 
 fn go_asi_trigger(tok: &str) -> bool {
@@ -149,72 +200,91 @@ fn go_asi_trigger(tok: &str) -> bool {
         .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '"' || c == '`' || c == '\'')
 }
 
-/// Python keeps one source line per line; only the indentation is rewritten,
-/// to one space per level.
-fn python_separator(source: &str, prev: &Token, next: &Token, py: &PyLines) -> Cow<'static, str> {
-    if crossed_newline(source, prev, next) {
-        let level = py.level_at(next.start);
-        return Cow::Owned(format!("\n{}", " ".repeat(level)));
-    }
-    Cow::Borrowed(rust_separator(source, prev, next))
-}
-
-/// Per-line indent levels plus the byte offsets they start at, so a token's
-/// level is a lookup rather than a re-scan.
+/// Python's logical line structure, derived from the token stream rather than
+/// the raw text.
+///
+/// INVARIANT: only tokens that begin a *logical* line touch the indent stack.
+/// A line inside a triple-quoted string, or inside an open bracket, is not one:
+/// scanning raw text instead lets a string's indented interior line push a
+/// bogus indent width, which re-nests the code that follows. Enforced by
+/// `a_python_docstring_with_an_odd_interior_indent_does_not_renest_what_follows`.
+///
+/// INVARIANT: blank and comment-only lines contribute no level. CPython's
+/// tokenizer emits no INDENT/DEDENT for them, and counting them would let an
+/// outdented `# note` inside a block pop the stack and silently re-nest what
+/// follows — a valid parse with changed meaning. Enforced by
+/// `an_outdented_comment_inside_a_python_block_does_not_renest_what_follows`.
 struct PyLines {
-    starts: Vec<usize>,
-    levels: Vec<usize>,
+    /// `Some(level)` for tokens that begin a logical line.
+    levels: Vec<Option<usize>>,
 }
 
 impl PyLines {
-    fn new(source: &str) -> Self {
-        let mut starts = vec![0usize];
-        starts.extend(
-            source
-                .bytes()
-                .enumerate()
-                .filter(|(_, b)| *b == b'\n')
-                .map(|(i, _)| i + 1),
-        );
-        Self {
-            starts,
-            levels: python_levels(source),
+    fn new(source: &str, tokens: &[Token]) -> Self {
+        let line_starts = line_starts(source);
+        let mut stack: Vec<usize> = vec![0];
+        let mut depth = 0usize;
+        let mut levels = vec![None; tokens.len()];
+        let mut prev_end: Option<usize> = None;
+        for (i, tok) in tokens.iter().enumerate() {
+            let fresh_line = prev_end.is_some_and(|e| source[e..tok.start].contains('\n'));
+            if fresh_line && depth == 0 {
+                levels[i] = Some(if tok.kind == TokenKind::Comment {
+                    stack.len() - 1
+                } else {
+                    let start = *line_starts
+                        .range(..=tok.start)
+                        .next_back()
+                        .expect("line 0 always present");
+                    push_level(&mut stack, tok.start - start)
+                });
+            }
+            depth = depth.saturating_add_signed(bracket_delta(tok, &source[tok.start..tok.end]));
+            prev_end = Some(tok.end);
         }
+        Self { levels }
     }
 
-    fn level_at(&self, offset: usize) -> usize {
-        let line = self.starts.partition_point(|s| *s <= offset).max(1) - 1;
-        self.levels.get(line).copied().unwrap_or(0)
+    fn line_start_level(&self, token_index: usize) -> Option<usize> {
+        self.levels.get(token_index).copied().flatten()
     }
 }
 
-/// Indent level per source line: a stack of seen indent widths, matching
-/// Python's tokenizer.
-///
-/// INVARIANT: levels come only from code-bearing lines. CPython's tokenizer
-/// generates no INDENT/DEDENT for blank or comment-only lines; treating them as
-/// code would let an outdented `# note` inside a block pop the stack and
-/// silently re-nest what follows — a valid parse with changed meaning. Enforced
-/// by `an_outdented_comment_inside_a_python_block_does_not_renest_what_follows`.
-pub(crate) fn python_levels(source: &str) -> Vec<usize> {
-    let mut stack: Vec<usize> = vec![0];
-    let mut levels = Vec::new();
-    for line in source.lines() {
-        let trimmed = line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            levels.push(stack.len() - 1);
-            continue;
-        }
-        let width = line.len() - trimmed.len();
-        while *stack.last().unwrap_or(&0) > width {
-            stack.pop();
-        }
-        if width > *stack.last().unwrap_or(&0) {
-            stack.push(width);
-        }
-        levels.push(stack.len() - 1);
+fn line_starts(source: &str) -> std::collections::BTreeSet<usize> {
+    let mut set = std::collections::BTreeSet::new();
+    set.insert(0usize);
+    set.extend(
+        source
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b'\n')
+            .map(|(i, _)| i + 1),
+    );
+    set
+}
+
+/// The tokenizer's indent stack: pop past anything wider, push anything wider.
+fn push_level(stack: &mut Vec<usize>, width: usize) -> usize {
+    while stack.last().copied().unwrap_or(0) > width {
+        stack.pop();
     }
-    levels
+    if width > stack.last().copied().unwrap_or(0) {
+        stack.push(width);
+    }
+    stack.len() - 1
+}
+
+/// Bracket nesting, which is what makes a Python line break implicit. Counting
+/// f-string interpolation braces along the way is harmless: they balance.
+fn bracket_delta(tok: &Token, text: &str) -> isize {
+    if tok.kind == TokenKind::Comment {
+        return 0;
+    }
+    match text {
+        "(" | "[" | "{" => 1,
+        ")" | "]" | "}" => -1,
+        _ => 0,
+    }
 }
 
 #[cfg(test)]
@@ -267,11 +337,7 @@ mod tests {
         let src = "package m\n\nfunc Add(a int, b int) int {\n\tx := a + b\n\treturn x\n}\n";
         let m = minify(Lang::Go, src, true).unwrap();
         assert!(!m.text.contains('\n'));
-        assert!(
-            m.text.contains("x:=a+b;return x") || m.text.contains("x:=a+b;return x;"),
-            "got: {}",
-            m.text
-        );
+        assert!(m.text.contains("x:=a+b;return x"), "got: {}", m.text);
     }
 
     #[test]
@@ -279,6 +345,15 @@ mod tests {
         let src = "package m\n\nfunc F(\n\ta int,\n) int { return a }\n";
         let m = minify(Lang::Go, src, true).unwrap();
         assert!(!m.text.contains("(;"), "no ASI after an opener: {}", m.text);
+    }
+
+    #[test]
+    fn no_asi_semicolon_is_inserted_before_a_closing_brace() {
+        // The closer terminates the statement itself, so the `;` is pure waste
+        // — and an extra one changes the parse shape the equivalence check pins.
+        let src = "package m\n\nfunc F() int {\n\treturn 1\n}\n";
+        let m = minify(Lang::Go, src, true).unwrap();
+        assert!(!m.text.contains(";}"), "got: {}", m.text);
     }
 
     #[test]
@@ -297,6 +372,35 @@ mod tests {
         let src = "def f(a):\n    if a:\n        x = 1\n# note\n        y = 2\n";
         let m = minify(Lang::Python, src, true).unwrap();
         assert!(m.text.contains("\n  y"), "y stays at level 2: {}", m.text);
+    }
+
+    #[test]
+    fn a_python_docstring_with_an_odd_interior_indent_does_not_renest_what_follows() {
+        // The interior line sits at column 3 — between the stack's 0 and 4.
+        // Scanning raw text would push 3 and then read `return` at 4 as one
+        // level deeper than it is.
+        let src = "def f():\n    x = \"\"\"abc\n   def\"\"\"\n    return x\n";
+        let m = minify(Lang::Python, src, true).unwrap();
+        assert!(
+            m.text.contains("\n return x"),
+            "return stays at level 1: {:?}",
+            m.text
+        );
+        assert!(
+            crate::parses_clean(Lang::Python, &m.text),
+            "got: {}",
+            m.text
+        );
+    }
+
+    #[test]
+    fn a_python_bracket_continuation_is_joined_onto_one_line() {
+        // Python ignores line breaks inside brackets, so there is nothing to
+        // preserve — and joining keeps the continuation's column off the
+        // indent stack.
+        let src = "def f():\n    x = g(1,\n          2)\n    return x\n";
+        let m = minify(Lang::Python, src, true).unwrap();
+        assert!(m.text.contains("x=g(1,2)"), "got: {:?}", m.text);
     }
 
     #[test]
@@ -383,10 +487,57 @@ mod tests {
         let m = minify(Lang::Go, src, true).unwrap();
         assert!(!m.text.contains(",;"), "no ASI after a comma: {}", m.text);
         assert!(
-            m.text.contains("A int;"),
+            m.text.contains("A int"),
             "struct fields still separate: {}",
             m.text
         );
         assert!(crate::parses_clean(Lang::Go, &m.text), "got: {}", m.text);
+    }
+
+    #[test]
+    fn a_kept_line_comment_is_followed_by_a_newline_so_it_cannot_swallow_code() {
+        let src = "fn f() -> u32 {\n    // the answer\n    42\n}\n";
+        let m = minify(Lang::Rust, src, true).unwrap();
+        assert!(m.text.contains("// the answer\n"), "got: {}", m.text);
+        assert!(crate::parses_clean(Lang::Rust, &m.text));
+    }
+
+    #[test]
+    fn a_kept_block_comment_stays_inline() {
+        let src = "fn f() -> u32 {\n    /* the answer */\n    42\n}\n";
+        let m = minify(Lang::Rust, src, true).unwrap();
+        assert!(!m.text.contains('\n'), "got: {}", m.text);
+        assert!(crate::parses_clean(Lang::Rust, &m.text));
+    }
+
+    #[test]
+    fn stripped_comments_do_not_appear_and_the_result_still_reparses() {
+        let src = "fn f() -> u32 {\n    // gone\n    42\n}\n";
+        let m = minify(Lang::Rust, src, false).unwrap();
+        assert!(!m.text.contains("gone"));
+        assert!(crate::parses_clean(Lang::Rust, &m.text));
+    }
+
+    #[test]
+    fn comment_modes_are_both_idempotent() {
+        for keep in [true, false] {
+            let src = include_str!("../fixtures/sample.rs");
+            let once = minify(Lang::Rust, src, keep).unwrap().text;
+            assert_eq!(
+                once,
+                minify(Lang::Rust, &once, keep).unwrap().text,
+                "keep_comments={keep}: second pass must be a fixed point"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dropped_comment_still_contributes_its_line_break_to_go_asi() {
+        let src = "package m\n\nfunc F() {\n\tx := 1\n\t// c\n\ty := x\n\t_ = y\n}\n";
+        let m = minify(Lang::Go, src, false).unwrap();
+        assert!(!m.text.contains("// c"), "comment gone: {}", m.text);
+        // The `;` still fires: the gap the dropped comment sat in is the one
+        // measured for the line break.
+        assert!(m.text.contains("x:=1;y:=x"), "got: {}", m.text);
     }
 }

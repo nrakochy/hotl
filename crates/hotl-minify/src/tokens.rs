@@ -94,12 +94,9 @@ impl Walker<'_> {
         loop {
             let node = cursor.node();
             self.note(&node);
-            // Comments are atomic even when the grammar gives them children:
-            // tree-sitter-rust's `line_comment` has a `//` child that stops
-            // short of the node, so descending would drop the comment's text.
             if self.lang.is_comment(node.kind()) {
                 self.push(&node, TokenKind::Comment);
-            } else if node.child_count() == 0 {
+            } else if node.child_count() == 0 || !children_cover(&node, self.source) {
                 self.push(&node, TokenKind::Code);
             } else if cursor.goto_first_child() {
                 self.visit(cursor);
@@ -138,6 +135,26 @@ impl Walker<'_> {
             self.out.semi_ends.push(node.end_byte());
         }
     }
+}
+
+/// Do a node's children account for all of its non-whitespace bytes?
+///
+/// When they don't, the node is emitted whole rather than descended into — a
+/// grammar is free to leave bytes out of its child list, and tree-sitter-rust
+/// does: `raw_string_literal` has a single `string_content` child and no node
+/// at all for the `r#"` / `"#` delimiters, and `line_comment` has a `//` child
+/// that stops short of the comment text. Emitting the parent verbatim is always
+/// byte-safe; descending past a hole silently deletes code.
+fn children_cover(node: &tree_sitter::Node, source: &str) -> bool {
+    let mut at = node.start_byte();
+    for i in 0..node.child_count() as u32 {
+        let child = node.child(i).expect("i < child_count");
+        if child.start_byte() < at || !source[at..child.start_byte()].trim().is_empty() {
+            return false;
+        }
+        at = child.end_byte();
+    }
+    source[at..node.end_byte()].trim().is_empty()
 }
 
 /// INVARIANT: the token set accounts for every non-whitespace byte of the
