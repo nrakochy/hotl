@@ -78,6 +78,31 @@ fi
 echo "running the workspace tests (the publish workflow's gate) ..."
 cargo test --workspace --locked --quiet
 
+# Those tests only prove the release builds on *this* machine. Every release
+# target but macOS is Linux, and the local Nix toolchain carries no Linux std
+# to cross-check against — so a BSD-only libc call compiles clean here and
+# fails every Linux job minutes after the tag is public (v0.8.0:
+# `libc::getpeereid`). Compile for Linux in a container while refusing is still
+# free.
+if [ "${HOTL_SKIP_LINUX_CHECK:-0}" = 1 ]; then
+  echo "skipping the Linux cross-check (HOTL_SKIP_LINUX_CHECK=1)."
+elif ! docker info >/dev/null 2>&1; then
+  echo "error: Docker is unavailable, so the Linux build cannot be verified." >&2
+  echo "hint: start Docker, or re-run with HOTL_SKIP_LINUX_CHECK=1 to accept" >&2
+  echo "      that a Linux-only break may reach the tag." >&2
+  exit 1
+else
+  echo "checking the workspace builds on Linux ..."
+  # --all-targets covers test code too; check (not test) keeps the linker out
+  # of it, which is what a small Docker VM runs out of memory on.
+  docker run --rm \
+    -v "$PWD":/src:ro \
+    -v hotl-linux-check-target:/target \
+    -v hotl-linux-check-registry:/usr/local/cargo/registry \
+    -w /src rust:slim \
+    cargo check --workspace --locked --all-targets --target-dir /target
+fi
+
 echo "releasing $current -> $new"
 
 # Bump the first bare `version = "..."` line — the [workspace.package] one,
