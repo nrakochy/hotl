@@ -32,16 +32,33 @@ use tokio_util::sync::CancellationToken;
 pub trait ChildBuilder: Send + Sync {
     fn build(&self, def: &AgentDef, brief: &str) -> Result<SessionHandle, String>;
     /// `fork`: seed the child with the parent's own history instead of a
-    /// fresh context. `history` is the parent's projection at the moment of
-    /// the call (see `SpawnTool::snapshot`); the returned session ends on an
-    /// unanswered turn (the brief is already the last item), so the caller
-    /// drives it with `continue_turn()`, not `prompt()`.
+    /// fresh context. `seed` is the parent's projection at the moment of the
+    /// call plus the lineage that projection came from (see
+    /// `SpawnTool::snapshot`); the returned session ends on an unanswered turn
+    /// (the brief is already the last item), so the caller drives it with
+    /// `continue_turn()`, not `prompt()`.
     fn build_fork(
         &self,
         def: &AgentDef,
         brief: &str,
-        history: Vec<Item>,
+        seed: ForkSeed,
     ) -> Result<SessionHandle, String>;
+}
+
+/// What a `fork: true` spawn inherits: the parent's durable projection, and
+/// the lineage coordinate it was read at.
+///
+/// The two travel together because they are read together — from one
+/// published head, whose `leaf` *is* the entry the projection ends at. A
+/// forked child's parent is live by definition (it just issued the spawn), so
+/// an id without a matching horizon would make the child replay the parent's
+/// whole future.
+#[derive(Debug)]
+pub struct ForkSeed {
+    pub history: Vec<Item>,
+    pub parent_session_id: String,
+    /// The parent's durable leaf at the moment `history` was read.
+    pub parent_tip_entry_id: Option<String>,
 }
 
 /// Reaches back into *this session's own actor* to read its current
@@ -57,7 +74,7 @@ pub trait ChildBuilder: Send + Sync {
 /// Yields the **durable** projection only — never the ephemeral per-sample
 /// tail (see `agent.rs::snapshot_provider`). A fork seed is committed into the
 /// child's own log, so an ephemeral item in it would stop being ephemeral.
-pub type SnapshotFn = Arc<dyn Fn() -> BoxFuture<'static, Option<Arc<Vec<Item>>>> + Send + Sync>;
+pub type SnapshotFn = Arc<dyn Fn() -> BoxFuture<'static, Option<ForkSeed>> + Send + Sync>;
 
 /// Process-wide mutating-child guard (index "guard parallel mutating
 /// children"): two children editing the same working tree concurrently would
@@ -165,7 +182,7 @@ impl SpawnTool {
                 );
             };
             match (snapshot)().await {
-                Some(history) => self.builder.build_fork(&def, task, (*history).clone()),
+                Some(seed) => self.builder.build_fork(&def, task, seed),
                 None => {
                     return ToolOutcome::err(
                         "Could not read the parent session's context to fork from — \
@@ -357,10 +374,10 @@ mod tests {
             &self,
             def: &AgentDef,
             brief: &str,
-            history: Vec<Item>,
+            seed: ForkSeed,
         ) -> Result<SessionHandle, String> {
             self.seen.lock().unwrap().push(def.clone());
-            self.fork_history.lock().unwrap().push(history);
+            self.fork_history.lock().unwrap().push(seed.history);
             let dir = tempfile::tempdir().unwrap();
             let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
             std::mem::forget(dir);
@@ -512,7 +529,13 @@ mod tests {
             let history = history.clone();
             Arc::new(move || {
                 let history = history.clone();
-                Box::pin(async move { Some(Arc::new(history)) })
+                Box::pin(async move {
+                    Some(ForkSeed {
+                        history,
+                        parent_session_id: "01PARENT".into(),
+                        parent_tip_entry_id: Some("01TIP".into()),
+                    })
+                })
             })
         };
         let tool = tool(child.clone()).with_snapshot(snapshot);
@@ -635,7 +658,7 @@ mod tests {
             &self,
             def: &AgentDef,
             brief: &str,
-            _history: Vec<Item>,
+            _seed: ForkSeed,
         ) -> Result<SessionHandle, String> {
             self.build(def, brief)
         }

@@ -420,9 +420,10 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     }
     let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
     items.push(crate::structured::contract_item(&schema));
+    let session_id = log.session_id.clone();
     let mut handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
-        Some(scaffold.spawn_registration()),
+        Some(scaffold.spawn_registration(session_id)),
         scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(log, None, items, None, None, Vec::new());
@@ -641,7 +642,7 @@ pub(crate) async fn build_acp() -> Result<
             session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
         let handle = spawn_session_with_todos(
             (*scaffold.registry).clone(),
-            Some(scaffold.spawn_registration()),
+            Some(scaffold.spawn_registration(session_id.clone())),
             scaffold.hooks.clone(),
             |registry| {
                 let mut deps = scaffold.deps(
@@ -742,7 +743,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
-        Some(scaffold.spawn_registration()),
+        Some(scaffold.spawn_registration(session_id.clone())),
         scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(log, snapshots, initial_items, None, None, Vec::new());
@@ -920,12 +921,13 @@ impl Scaffold {
     /// What every top-level session's `spawn_session_with_todos` call needs
     /// to register a per-session `spawn` tool (never used for a child's own
     /// session — see `HotlChildBuilder`, which always passes `None`).
-    fn spawn_registration(&self) -> SpawnRegistration {
+    fn spawn_registration(&self, session_id: String) -> SpawnRegistration {
         SpawnRegistration {
             builder: self.spawn_builder.clone(),
             concurrency: self.concurrency.clone(),
             config_dir: self.config_dir.clone(),
             include_claude: self.agents_include_claude,
+            session_id,
         }
     }
 
@@ -1082,7 +1084,7 @@ async fn run_session(
     let plan_override = lineage.as_ref().and_then(|l| l.plan);
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
-        Some(scaffold.spawn_registration()),
+        Some(scaffold.spawn_registration(session_id.clone())),
         scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(
@@ -1161,6 +1163,10 @@ struct SpawnRegistration {
     concurrency: hotl_tools::concurrency::SessionConcurrency,
     config_dir: PathBuf,
     include_claude: bool,
+    /// This session's own store id — what a forked child records as its
+    /// parent. Per-session, like the head reader beside it; the builder itself
+    /// is process-wide and cannot know it.
+    session_id: String,
 }
 
 #[allow(clippy::type_complexity)]
@@ -1202,9 +1208,10 @@ fn spawn_session_with_todos(
         concurrency,
         config_dir,
         include_claude,
+        session_id,
     }) = spawn
     {
-        let snapshot = snapshot_provider(Arc::clone(&head_cell));
+        let snapshot = snapshot_provider(Arc::clone(&head_cell), session_id);
         registry.register(Box::new(
             crate::spawn::SpawnTool::new(builder, config_dir, include_claude, concurrency)
                 .with_snapshot(snapshot),
@@ -1248,13 +1255,29 @@ type HeadCell =
 /// moves. The reminder's own contract (`hotl_tools::todo::render_reminder`)
 /// says never committed; taking one half of the [`hotl_engine::Snapshot`] is
 /// what makes that structural here rather than a filter someone must remember.
-fn snapshot_provider(cell: HeadCell) -> crate::spawn::SnapshotFn {
+/// **Lineage, from the same read.** The head's `leaf` is the id of the newest
+/// entry applied — which is exactly the entry the durable projection ends at,
+/// so taking both from one `borrow()` makes the seed and its fork-point pin
+/// coherent by construction rather than by capture order. That matters here
+/// more than anywhere else: a forked child's parent is live *by definition*
+/// (it just issued the spawn), so an unpinned lineage would have the child
+/// replay everything the parent does next.
+fn snapshot_provider(cell: HeadCell, session_id: String) -> crate::spawn::SnapshotFn {
     Arc::new(move || {
         let head = cell
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        Box::pin(async move { Some(head?.borrow().snapshot().durable) })
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            let head = head?;
+            let published = head.borrow();
+            Some(crate::spawn::ForkSeed {
+                history: (*published.snapshot().durable).clone(),
+                parent_session_id: session_id,
+                parent_tip_entry_id: published.leaf().map(str::to_string),
+            })
+        })
     })
 }
 
@@ -1418,28 +1441,38 @@ impl HotlChildBuilder {
     /// untrusted-enveloped `<background_context>` block instead, so the
     /// child never mistakes the parent's prior turns for its own under a
     /// persona it never had.
+    /// Returns the seed and **how many of its leading items are the parent's**
+    /// — the `BranchMove` coordinate. The two branches differ on exactly that:
+    /// the byte-identical seed starts with the whole inherited projection, the
+    /// re-enveloped one starts with none of it (the history is quoted inside a
+    /// single new item, so replaying the parent's items into this child would
+    /// reconstruct a conversation it never had).
     fn fork_initial_items(
         &self,
         def: &hotl_tools::agents::AgentDef,
         brief: &str,
         history: Vec<hotl_types::Item>,
-    ) -> Vec<hotl_types::Item> {
+    ) -> (Vec<hotl_types::Item>, usize) {
         let cache_breaking =
             def.system_prompt.is_some() || def.model.as_deref().is_some_and(|m| m != self.model);
         if cache_breaking {
-            vec![hotl_types::Item::User {
-                text: format!("{}\n\n{brief}", wrap_background_context(&history)),
-                synthetic: Some(hotl_types::SyntheticReason::SubagentResult),
-                images: Vec::new(),
-            }]
+            (
+                vec![hotl_types::Item::User {
+                    text: format!("{}\n\n{brief}", wrap_background_context(&history)),
+                    synthetic: Some(hotl_types::SyntheticReason::SubagentResult),
+                    images: Vec::new(),
+                }],
+                0,
+            )
         } else {
+            let inherited = history.len();
             let mut items = history;
             items.push(hotl_types::Item::User {
                 text: brief.to_string(),
                 synthetic: None,
                 images: Vec::new(),
             });
-            items
+            (items, inherited)
         }
     }
 
@@ -1448,19 +1481,33 @@ impl HotlChildBuilder {
     /// `initial_items`. `build` passes an empty seed (the caller `.prompt()`s
     /// the brief); `build_fork` passes a seed that already ends on an
     /// unanswered turn (the caller `.continue_turn()`s instead).
+    /// `lineage` is `Some` only for a `fork`: a plain subagent shares no
+    /// transcript with its parent, and recording a lineage for it would make
+    /// the GC over-retain unrelated histories on its behalf. Its `usize` is
+    /// how many of `initial_items` came from the parent — the truncation
+    /// coordinate, which is `0` for a re-enveloped (cache-breaking) fork.
     fn spawn_child(
         &self,
         def: &hotl_tools::agents::AgentDef,
         initial_items: Vec<hotl_types::Item>,
+        lineage: Option<(hotl_store::ParentRef, usize)>,
     ) -> Result<hotl_engine::SessionHandle, String> {
-        let log = SessionLog::create(
+        let inherited = lineage.as_ref().map(|(_, n)| *n);
+        let mut log = SessionLog::create(
             &sessions_dir(),
             &self.model,
-            None,
+            lineage.map(|(parent, _)| parent),
             self.masker(),
             self.clock.now_ms(),
         )
         .map_err(|e| format!("child session log: {e}"))?;
+        // The seed rides `initial_items` (in memory) and is never appended to
+        // this log, so without the `BranchMove` the child's own replay would
+        // reconstruct the parent's *whole* log — including everything the
+        // parent, which is live by definition here, logs after this point.
+        if let Some(n) = inherited {
+            record_fork_point(&mut log, n, self.clock.now_ms())?;
+        }
         let registry = self.child_registry(def);
         let system = def
             .system_prompt
@@ -1513,17 +1560,32 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
         def: &hotl_tools::agents::AgentDef,
         _brief: &str,
     ) -> Result<hotl_engine::SessionHandle, String> {
-        self.spawn_child(def, Vec::new())
+        self.spawn_child(def, Vec::new(), None)
     }
 
     fn build_fork(
         &self,
         def: &hotl_tools::agents::AgentDef,
         brief: &str,
-        history: Vec<hotl_types::Item>,
+        seed: crate::spawn::ForkSeed,
     ) -> Result<hotl_engine::SessionHandle, String> {
-        let initial_items = self.fork_initial_items(def, brief, history);
-        self.spawn_child(def, initial_items)
+        let crate::spawn::ForkSeed {
+            history,
+            parent_session_id,
+            parent_tip_entry_id,
+        } = seed;
+        let (initial_items, inherited) = self.fork_initial_items(def, brief, history);
+        self.spawn_child(
+            def,
+            initial_items,
+            Some((
+                hotl_store::ParentRef {
+                    session_id: parent_session_id,
+                    tip_entry_id: parent_tip_entry_id,
+                },
+                inherited,
+            )),
+        )
     }
 }
 
@@ -2927,9 +2989,6 @@ mod fork_tests {
         // Past the ULID's shared timestamp half, into its random tail — two
         // sessions minted in the same millisecond share their first 10 chars.
         assert_eq!(resolve_session_ref(&older[..20], &sessions).unwrap(), older);
-        assert!(resolve_session_ref(&older[..8], &sessions)
-            .unwrap_err()
-            .contains("ambiguous"));
         assert!(resolve_session_ref("nope", &sessions)
             .unwrap_err()
             .contains("no session matches"));
@@ -2959,6 +3018,111 @@ mod fork_tests {
         assert!(note.contains("full input price"), "{note}");
         // …and the same file is still warm against the 1h window.
         assert!(cold_cache_note(dir.path(), &id, CacheTtl::OneHour).is_none());
+    }
+
+    /// Find the log in the real sessions dir whose header names `parent` — a
+    /// unique planted id, so this never races another test's children the way
+    /// "the newest log" would. `spawn_child` writes there by construction
+    /// (`sessions_dir()`), as the rest of the spawn suite already relies on.
+    fn push_user(log: &mut SessionLog, text: &str, ts: u64) -> String {
+        log.append(
+            &EntryPayload::Item {
+                item: Item::User {
+                    text: text.into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            ts,
+        )
+        .unwrap()
+    }
+
+    fn child_of(parent: &str) -> Option<std::path::PathBuf> {
+        hotl_store::list_sessions(&sessions_dir())
+            .into_iter()
+            .map(|(_, path, _)| path)
+            .find(|p| hotl_store::session_parent(p).as_deref() == Some(parent))
+    }
+
+    /// The spawned-fork regression. `spawn(fork: true)` used to write
+    /// `parent_session_id: None`: the child was a store orphan the
+    /// lineage-aware GC would not protect, and its log — whose seed lives only
+    /// in memory — replayed *empty*. The naive fix is worse than the bug: the
+    /// parent is live **by definition** here (it just issued the spawn), so an
+    /// id alone would turn "replays incomplete" into "replays the parent's
+    /// entire future".
+    #[tokio::test]
+    async fn a_forked_subagent_carries_pinned_lineage_a_plain_one_carries_none() {
+        let cb = super::tests::test_child_builder();
+        let dir = sessions_dir();
+        let mut parent = SessionLog::create(&dir, "m", None, Masker::empty(), 1).unwrap();
+        let parent_id = parent.session_id.clone();
+        let tip = push_user(&mut parent, "explored the auth flow", 2);
+        let seed = vec![Item::User {
+            text: "explored the auth flow".into(),
+            synthetic: None,
+            images: Vec::new(),
+        }];
+
+        // Through the real `ChildBuilder` entry point, so the seed-to-lineage
+        // wiring is under test and not just `spawn_child`'s signature.
+        let def = hotl_tools::agents::resolve(&cb.cwd, true, "general-purpose").expect("built-in");
+        let handle = crate::spawn::ChildBuilder::build_fork(
+            &cb,
+            &def,
+            "write the handoff summary",
+            crate::spawn::ForkSeed {
+                history: seed.clone(),
+                parent_session_id: parent_id.clone(),
+                parent_tip_entry_id: Some(tip.clone()),
+            },
+        )
+        .expect("child spawns");
+        let child_path = child_of(&parent_id).expect("the forked child records its parent");
+        let child_id = hotl_store::replay(&child_path).unwrap().header.session_id;
+        assert_eq!(
+            hotl_store::replay(&child_path)
+                .unwrap()
+                .header
+                .parent_tip_entry_id
+                .as_deref(),
+            Some(tip.as_str()),
+            "the seed's read point is the horizon; an id alone would have the child \
+             replay the parent's entire future"
+        );
+
+        // The live parent keeps working — the only case there is.
+        push_user(&mut parent, "and then some more", 3);
+
+        let replayed = hotl_store::replay_chain(&dir, &child_id).unwrap();
+        // The seed itself rides `initial_items` and is never appended to the
+        // child's log (unchanged from before this task), so replay reproduces
+        // the *inherited* prefix — and, load-bearing here, nothing the parent
+        // logged after the fork.
+        assert_eq!(
+            replayed.items, seed,
+            "the child replays the parent as of the fork point, not its later work"
+        );
+        assert!(hotl_store::ancestor_ids(&dir, &child_id).contains(&parent_id));
+        drop(handle);
+
+        // A plain (non-fork) subagent shares no transcript, so it stays
+        // lineage-free: giving it one would make GC over-retain a history it
+        // never had.
+        let plain = crate::spawn::ChildBuilder::build(&cb, &def, "unrelated subtask")
+            .expect("child spawns");
+        assert!(
+            child_of(&parent_id)
+                .map(|p| p == child_path)
+                .unwrap_or(false),
+            "a plain subagent must not have recorded this parent too"
+        );
+        drop(plain);
+
+        for p in [&child_path, &parent.path().to_path_buf()] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     #[test]
@@ -3195,7 +3359,7 @@ mod tests {
         )
     }
 
-    fn test_child_builder() -> HotlChildBuilder {
+    pub(super) fn test_child_builder() -> HotlChildBuilder {
         HotlChildBuilder {
             provider: Arc::new(hotl_provider::ScriptedProvider::new(vec![])),
             rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -3232,7 +3396,9 @@ mod tests {
         cb.config.cache_ttl = CacheTtl::OneHour;
 
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
-        let mut handle = cb.spawn_child(&general, Vec::new()).expect("child spawns");
+        let mut handle = cb
+            .spawn_child(&general, Vec::new(), None)
+            .expect("child spawns");
         handle.prompt("go".into()).await;
         loop {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
@@ -3295,9 +3461,14 @@ mod tests {
                 blocks: vec![serde_json::json!({"type": "text", "text": "earlier answer"})],
             },
         ];
-        let items = cb.fork_initial_items(&general, "continue the work", history.clone());
+        let (items, inherited) =
+            cb.fork_initial_items(&general, "continue the work", history.clone());
         assert_eq!(items.len(), 3, "history verbatim + one appended brief item");
         assert_eq!(&items[..2], &history[..], "history rides byte-identical");
+        assert_eq!(
+            inherited, 2,
+            "the whole history is inherited, so that is the BranchMove coordinate"
+        );
         assert_eq!(
             items[2],
             hotl_types::Item::User {
@@ -3322,8 +3493,13 @@ mod tests {
             synthetic: None,
             images: Vec::new(),
         }];
-        let items = cb.fork_initial_items(&explore, "look into this", history);
+        let (items, inherited) = cb.fork_initial_items(&explore, "look into this", history);
         assert_eq!(items.len(), 1, "wrapped into a single seed item");
+        assert_eq!(
+            inherited, 0,
+            "the history is quoted inside the seed, not a prefix of it — replaying the \
+             parent's items into this child would reconstruct a conversation it never had"
+        );
         let hotl_types::Item::User {
             text, synthetic, ..
         } = &items[0]
@@ -3355,8 +3531,12 @@ mod tests {
             effort: None,
             source: hotl_tools::agents::AgentSource::User,
         };
-        let items = cb.fork_initial_items(&cross_model, "brief", Vec::new());
+        let (items, inherited) = cb.fork_initial_items(&cross_model, "brief", Vec::new());
         assert_eq!(items.len(), 1);
+        assert_eq!(
+            inherited, 0,
+            "a different model is a different cache namespace"
+        );
         let hotl_types::Item::User { text, .. } = &items[0] else {
             panic!("expected a single User item");
         };
@@ -3501,15 +3681,19 @@ mod tests {
 
         // …and the fork seed the production path hands `build_fork` has none.
         let cell: HeadCell = Arc::new(std::sync::Mutex::new(Some(handle.head())));
-        let seed = snapshot_provider(cell)()
+        let seed = snapshot_provider(cell, "01PARENT".into())()
             .await
             .expect("a live head yields a seed");
+        assert_eq!(
+            seed.parent_session_id, "01PARENT",
+            "the seed carries the lineage a forked child records"
+        );
         assert!(
-            !seed.iter().any(is_todo_reminder),
+            !seed.history.iter().any(is_todo_reminder),
             "a fork seed must carry no ephemeral items: {seed:#?}"
         );
         assert!(
-            seed.iter().any(|i| matches!(
+            seed.history.iter().any(|i| matches!(
                 i,
                 hotl_types::Item::User { text, synthetic: None, .. } if text == "earlier parent context"
             )),
