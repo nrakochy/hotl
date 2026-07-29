@@ -172,6 +172,94 @@ fn record_fork_point(log: &mut SessionLog, keep_items: usize, now_ms: u64) -> Re
     Ok(())
 }
 
+/// Sessions newest-first — the order `@last` and the picker's list numbers
+/// both mean.
+pub(crate) fn sessions_newest_first(
+    sessions_dir: &std::path::Path,
+) -> Vec<(String, PathBuf, std::time::SystemTime)> {
+    let mut sessions = hotl_store::list_sessions(sessions_dir);
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.2));
+    sessions
+}
+
+/// `@last` → id-prefix → exact name. The half of session resolution that has
+/// no picker behind it, so the headless runner and the console can share it
+/// verbatim — `hotl -p --fork-from auth-explore` and `hotl --fork-from
+/// auth-explore` must never disagree about which session that is. The TUI
+/// layers picker list numbers on top (`resolve_session_arg`).
+///
+/// Ambiguity is an error; resolution never falls through past a hit.
+pub(crate) fn resolve_session_ref(
+    arg: &str,
+    sessions: &[(String, PathBuf, std::time::SystemTime)],
+) -> Result<String, String> {
+    // `@last` is what makes a phase pipeline scriptable: each phase forks the
+    // one before it without the script having to capture an id.
+    if arg == "@last" {
+        return match sessions.first() {
+            Some((id, ..)) => Ok(id.clone()),
+            None => Err("`@last` needs a previous session and there are none yet".to_string()),
+        };
+    }
+    let by_id: Vec<_> = sessions
+        .iter()
+        .filter(|(id, ..)| id.starts_with(arg))
+        .collect();
+    match by_id.len() {
+        1 => return Ok(by_id[0].0.clone()),
+        0 => {}
+        n => return Err(format!("`{arg}` is ambiguous ({n} sessions)")),
+    }
+    let by_name: Vec<_> = sessions
+        .iter()
+        .filter(|(_, path, _)| hotl_store::session_name(path).as_deref() == Some(arg))
+        .collect();
+    match by_name.len() {
+        1 => Ok(by_name[0].0.clone()),
+        0 => Err(format!("no session matches `{arg}`")),
+        n => {
+            let ids: Vec<&str> = by_name.iter().map(|(id, ..)| id.as_str()).collect();
+            Err(format!(
+                "{n} sessions are named `{arg}` — use the id: {}",
+                ids.join(", ")
+            ))
+        }
+    }
+}
+
+/// The headless fork request, as typed. Unresolved on purpose: `parse_args`
+/// stays a pure function of its arguments, and resolution needs the store.
+#[derive(Debug, Clone)]
+pub(crate) struct ForkArgs {
+    pub from: String,
+    pub keep: Option<usize>,
+    pub keep_turns: Option<usize>,
+}
+
+/// Turn the headless fork flags into a lineage to seed from, resolving the
+/// session reference and the keep coordinate against the real store. Split out
+/// of `run_session` so the whole decision is testable without a provider: that
+/// function does real disk and env I/O from its first line onward.
+///
+/// `Ok(None)` = no fork requested; seed as a fresh session does.
+fn headless_lineage(
+    sessions_dir: &std::path::Path,
+    fork_from: Option<&str>,
+    keep: Option<usize>,
+    keep_turns: Option<usize>,
+) -> Result<Option<Resumed>, String> {
+    let Some(arg) = fork_from else {
+        return Ok(None);
+    };
+    let id = resolve_session_ref(arg, &sessions_newest_first(sessions_dir))?;
+    let keep = match (keep, keep_turns) {
+        (Some(n), _) => KeepSpec::Items(n),
+        (_, Some(t)) => KeepSpec::Turns(t),
+        _ => KeepSpec::All,
+    };
+    load_lineage(sessions_dir, &id, keep).map(Some)
+}
+
 /// The honesty clause, as a line the CLI can print. A fork always has perfect
 /// recall of the parent's raw transcript — that part has no TTL. The ~10%
 /// cache read only happens when the fork's first request lands inside the
@@ -253,13 +341,18 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
     if parsed.plan {
         std::env::set_var("HOTL_PLAN", "1");
     }
+    let fork = parsed.fork_from.map(|from| ForkArgs {
+        from,
+        keep: parsed.keep,
+        keep_turns: parsed.keep_turns,
+    });
     match (parsed.schema, parsed.prompt) {
         (Some(schema), Some(prompt)) => match prompt.resolve() {
             Ok(text) => structured_main(&text, &schema, parsed.name).await,
             Err(code) => code,
         },
         (None, Some(prompt)) => match prompt.resolve() {
-            Ok(text) => run_session(text, parsed.json_events, parsed.name).await,
+            Ok(text) => run_session(text, parsed.json_events, parsed.name, fork).await,
             Err(code) => code,
         },
         // Reachable via e.g. `hotl --json` with no -p (main.rs routes any
@@ -894,7 +987,33 @@ fn masker_with_helper(initial_helper_key: Option<&str>) -> Masker {
     }
 }
 
-async fn run_session(prompt: String, json_events: bool, name: Option<String>) -> i32 {
+async fn run_session(
+    prompt: String,
+    json_events: bool,
+    name: Option<String>,
+    fork: Option<ForkArgs>,
+) -> i32 {
+    // Resolved before the provider is even selected: a bad `--fork-from` is a
+    // usage error, and paying for a scaffold to discover it is silly.
+    let lineage = match headless_lineage(
+        &sessions_dir(),
+        fork.as_ref().map(|f| f.from.as_str()),
+        fork.as_ref().and_then(|f| f.keep),
+        fork.as_ref().and_then(|f| f.keep_turns),
+    ) {
+        Ok(l) => l,
+        Err(msg) => {
+            eprintln!("hotl: {msg}");
+            return 2;
+        }
+    };
+    // Headless keeps the 5m default TTL (only the TUI/ACP paths buy the 1h
+    // write premium), so that is the window a `-p` pipeline is racing.
+    if let Some(l) = &lineage {
+        if let Some(note) = cold_cache_note(&sessions_dir(), &l.parent_id, CacheTtl::FiveMinutes) {
+            eprintln!("hotl: {note}");
+        }
+    }
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -922,16 +1041,17 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     };
     print_warnings(&scaffold.warnings);
 
-    let mut log = match SessionLog::create(
+    let mut log = match create_session_log(
         &sessions_dir(),
         &scaffold.model,
-        None,
         scaffold.masker(),
         scaffold.clock.now_ms(),
+        lineage.as_ref(),
+        lineage.is_some(),
     ) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("hotl: could not create session log: {e}");
+            eprintln!("hotl: {e}");
             return 1;
         }
     };
@@ -945,14 +1065,34 @@ async fn run_session(prompt: String, json_events: bool, name: Option<String>) ->
     spawn_secret_audit(log.path().to_path_buf());
     let gc_config_dir = scaffold.config_dir.clone();
     std::thread::spawn(move || crate::gc::auto_gc(&gc_config_dir)); // retention, off the hot path
+                                                                    // A fork seeds from its inherited projection; memory and project
+                                                                    // instructions are already items 0..k of it, so re-injecting them would
+                                                                    // both duplicate the content and rewrite the very prefix the fork exists
+                                                                    // to reuse (D-A6).
     let (snapshots, initial_items) =
-        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
+        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &lineage);
+    let initial_todos = lineage
+        .as_ref()
+        .map(|l| l.todos.clone())
+        .unwrap_or_default();
+    let mode_override = lineage
+        .as_ref()
+        .and_then(|l| l.mode.as_deref())
+        .and_then(hotl_tools::rules::PermissionMode::from_str);
+    let plan_override = lineage.as_ref().and_then(|l| l.plan);
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration()),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, snapshots, initial_items, None, None, Vec::new());
+            let mut deps = scaffold.deps(
+                log,
+                snapshots,
+                initial_items,
+                mode_override,
+                plan_override,
+                initial_todos,
+            );
             deps.registry = registry;
             deps
         },
@@ -1893,6 +2033,7 @@ impl Prompt {
     }
 }
 
+#[derive(Debug, Default)]
 struct Args {
     prompt: Option<Prompt>,
     json_events: bool,
@@ -1900,6 +2041,12 @@ struct Args {
     name: Option<String>,
     /// `--plan`: start with the plan overlay on, whatever the mode resolves to.
     plan: bool,
+    /// `--fork-from <n|id|name|@last>`: seed this run with another session's
+    /// history. Unresolved here — resolution needs the sessions dir, which
+    /// argument parsing must stay free of to stay testable.
+    fork_from: Option<String>,
+    keep: Option<usize>,
+    keep_turns: Option<usize>,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
@@ -1908,6 +2055,9 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut schema: Option<PathBuf> = None;
     let mut name: Option<String> = None;
     let mut plan = false;
+    let mut fork_from: Option<String> = None;
+    let mut keep: Option<usize> = None;
+    let mut keep_turns: Option<usize> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -1929,6 +2079,23 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
             // `[permissions] mode` resolves to, headless or interactive.
             "--plan" => plan = true,
             "--json-schema" => schema = iter.next().map(PathBuf::from),
+            "--fork-from" | "--keep" | "--keep-turns" => {
+                let Some(v) = iter.next() else {
+                    eprintln!("hotl: {arg} needs a value");
+                    return Err(2);
+                };
+                let number = |raw: &str| -> Result<usize, i32> {
+                    raw.parse().map_err(|_| {
+                        eprintln!("hotl: {arg} needs a non-negative whole number, got `{raw}`");
+                        2
+                    })
+                };
+                match arg.as_str() {
+                    "--fork-from" => fork_from = Some(v),
+                    "--keep" => keep = Some(number(&v)?),
+                    _ => keep_turns = Some(number(&v)?),
+                }
+            }
             "-n" | "--name" => {
                 match iter
                     .next()
@@ -1952,12 +2119,28 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         eprintln!("hotl: --json-schema requires -p \"<prompt>\"");
         return Err(2);
     }
+    // `structured_main` is its own session-construction path and does not seed
+    // from a lineage. Say so rather than accepting the flag and ignoring it.
+    if schema.is_some() && fork_from.is_some() {
+        eprintln!("hotl: --fork-from is not supported with --json-schema");
+        return Err(2);
+    }
+    // Headless has no `-r`, so "resuming" is always false here; the shared
+    // check still owns the --keep-without-a-fork and two-coordinates rules,
+    // in the same words the console uses.
+    if let Err(e) = crate::tui::check_lineage_flags(false, fork_from.is_some(), keep, keep_turns) {
+        eprintln!("hotl: {e}");
+        return Err(2);
+    }
     Ok(Args {
         prompt,
         json_events,
         schema,
         name,
         plan,
+        fork_from,
+        keep,
+        keep_turns,
     })
 }
 
@@ -2646,6 +2829,136 @@ mod fork_tests {
         let replayed = hotl_store::replay_chain(dir.path(), &child.session_id).unwrap();
         assert_eq!(replayed.items, resumed.items, "frozen at the fork point");
         assert_eq!(replayed.items.len(), seeded);
+    }
+
+    #[test]
+    fn headless_fork_flags_parse_and_reject_the_same_nonsense_the_console_does() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let a = parse_args(v(&[
+            "-p",
+            "write the plan",
+            "--fork-from",
+            "@last",
+            "--keep-turns",
+            "3",
+        ]))
+        .unwrap();
+        assert_eq!(a.fork_from.as_deref(), Some("@last"));
+        assert_eq!(a.keep_turns, Some(3));
+
+        let a = parse_args(v(&[
+            "-p",
+            "x",
+            "--fork-from",
+            "auth-explore",
+            "--keep",
+            "12",
+        ]))
+        .unwrap();
+        assert_eq!(a.keep, Some(12));
+
+        for bad in [
+            vec!["-p", "x", "--keep", "3"],
+            vec![
+                "-p",
+                "x",
+                "--fork-from",
+                "y",
+                "--keep",
+                "3",
+                "--keep-turns",
+                "1",
+            ],
+            vec!["-p", "x", "--fork-from", "y", "--keep", "half"],
+            vec!["-p", "x", "--fork-from"],
+            vec!["-p", "x", "--json-schema", "s.json", "--fork-from", "y"],
+        ] {
+            assert!(parse_args(v(&bad)).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn the_headless_seed_is_the_parents_projection_under_a_pinned_new_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+        parent
+            .append(
+                &EntryPayload::Rename {
+                    name: "auth-explore".into(),
+                },
+                3,
+            )
+            .unwrap();
+
+        // Resolved by name, exactly as `hotl -p … --fork-from auth-explore` does.
+        let lineage = headless_lineage(dir.path(), Some("auth-explore"), None, Some(2))
+            .unwrap()
+            .expect("a fork was requested");
+        assert_eq!(lineage.items.len(), 5, "through the end of turn 2");
+        assert_eq!(lineage.parent_id, parent_id);
+
+        let log =
+            create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&lineage), true).unwrap();
+        let header = hotl_store::replay(log.path()).unwrap().header;
+        assert_eq!(
+            header.parent_session_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+        assert!(
+            header.parent_tip_entry_id.is_some(),
+            "pinned, not just linked"
+        );
+
+        // And with no --fork-from at all, nothing is inherited.
+        assert!(headless_lineage(dir.path(), None, None, None)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn at_last_and_a_bad_reference_resolve_the_way_the_console_resolves_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (older, _a) = parent_with_three_turns(dir.path());
+        let (newest, _b) = parent_with_three_turns(dir.path());
+        assert_ne!(older, newest);
+
+        let sessions = sessions_newest_first(dir.path());
+        assert_eq!(resolve_session_ref("@last", &sessions).unwrap(), newest);
+        // Past the ULID's shared timestamp half, into its random tail — two
+        // sessions minted in the same millisecond share their first 10 chars.
+        assert_eq!(resolve_session_ref(&older[..20], &sessions).unwrap(), older);
+        assert!(resolve_session_ref(&older[..8], &sessions)
+            .unwrap_err()
+            .contains("ambiguous"));
+        assert!(resolve_session_ref("nope", &sessions)
+            .unwrap_err()
+            .contains("no session matches"));
+        assert!(resolve_session_ref("@last", &[])
+            .unwrap_err()
+            .contains("none yet"));
+    }
+
+    #[test]
+    fn a_cold_parent_warns_and_a_warm_one_stays_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let (id, log) = parent_with_three_turns(dir.path());
+        assert!(
+            cold_cache_note(dir.path(), &id, CacheTtl::FiveMinutes).is_none(),
+            "a session written a moment ago is warm"
+        );
+
+        let path = log.path().to_path_buf();
+        let f = std::fs::File::options().write(true).open(&path).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(600)),
+        )
+        .unwrap();
+        let note = cold_cache_note(dir.path(), &id, CacheTtl::FiveMinutes)
+            .expect("10 minutes idle is past the 5m window");
+        assert!(note.contains("full input price"), "{note}");
+        // …and the same file is still warm against the 1h window.
+        assert!(cold_cache_note(dir.path(), &id, CacheTtl::OneHour).is_none());
     }
 
     #[test]

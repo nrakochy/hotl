@@ -788,53 +788,17 @@ fn resolve_session_arg(
     arg: &str,
     sessions: &[(String, PathBuf, SystemTime)],
 ) -> Result<String, i32> {
-    // `@last` is what makes a phase pipeline scriptable: each phase forks the
-    // one before it without the script having to capture an id.
-    if arg == "@last" {
-        return match sessions.first() {
-            Some((id, ..)) => Ok(id.clone()),
-            None => {
-                eprintln!("hotl: `@last` needs a previous session and there are none yet");
-                Err(2)
-            }
-        };
-    }
+    // The picker list number is the console's own coordinate — it means
+    // nothing headless, so it lives here rather than in the shared resolver.
     if let Ok(n) = arg.parse::<usize>() {
         if (1..=sessions.len().min(20)).contains(&n) {
             return Ok(sessions[n - 1].0.clone());
         }
     }
-    let by_id: Vec<_> = sessions
-        .iter()
-        .filter(|(id, ..)| id.starts_with(arg))
-        .collect();
-    match by_id.len() {
-        1 => return Ok(by_id[0].0.clone()),
-        0 => {}
-        n => {
-            eprintln!("hotl: `{arg}` is ambiguous ({n} sessions)");
-            return Err(2);
-        }
-    }
-    let by_name: Vec<_> = sessions
-        .iter()
-        .filter(|(_, path, _)| hotl_store::session_name(path).as_deref() == Some(arg))
-        .collect();
-    match by_name.len() {
-        1 => Ok(by_name[0].0.clone()),
-        0 => {
-            eprintln!("hotl: no session matches `{arg}`");
-            Err(2)
-        }
-        n => {
-            let ids: Vec<&str> = by_name.iter().map(|(id, ..)| id.as_str()).collect();
-            eprintln!(
-                "hotl: {n} sessions are named `{arg}` — use the id: {}",
-                ids.join(", ")
-            );
-            Err(2)
-        }
-    }
+    crate::agent::resolve_session_ref(arg, sessions).map_err(|e| {
+        eprintln!("hotl: {e}");
+        2
+    })
 }
 
 fn by_prefix(prefix: &str) -> Result<String, i32> {
@@ -857,9 +821,7 @@ fn by_prefix(prefix: &str) -> Result<String, i32> {
 }
 
 fn newest_first() -> Vec<(String, PathBuf, SystemTime)> {
-    let mut sessions = hotl_store::list_sessions(&crate::agent::sessions_dir());
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.2));
-    sessions
+    crate::agent::sessions_newest_first(&crate::agent::sessions_dir())
 }
 
 /// Plain pre-TUI list prompt (the in-TUI picker is a v1 cut).
