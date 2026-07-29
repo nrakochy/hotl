@@ -391,8 +391,12 @@ async fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptP
 /// file is refused without reading it. `~` expands to `$HOME` — terminals
 /// hand us the path exactly as dropped. Stays synchronous and runs on
 /// `spawn_blocking`: `history.append` writes a few hundred bytes and can
-/// stay on the loop thread, but eight 5MB reads plus base64 would stall the
-/// wire reader and Ctrl-C for seconds.
+/// stay on the loop thread, but eight 5MB reads plus base64, run inline on
+/// `block_on`'s `current_thread` runtime, would stall every other task
+/// sharing its one worker — chiefly the in-process `acp::serve` task, which
+/// `spawn_blocking` genuinely frees to keep running. It does not free the
+/// wire reader: that lives in this same run-loop task as the caller and
+/// stays unpolled for the `.await`'s duration either way.
 fn load_image(path: &str, cap: u64) -> Result<(String, usize), String> {
     let expanded = match path.strip_prefix("~/") {
         Some(rest) => match std::env::var_os("HOME") {
@@ -404,10 +408,14 @@ fn load_image(path: &str, cap: u64) -> Result<(String, usize), String> {
     let meta = std::fs::metadata(&expanded).map_err(|e| e.to_string())?;
     if meta.len() > cap {
         return Err(if cap < crate::images::MAX_IMAGE_DECODED_BYTES as u64 {
-            format!(
-                "only {:.1}MB of the per-prompt image budget is left",
-                cap as f64 / (1024.0 * 1024.0)
-            )
+            if cap == 0 {
+                "no room left in the per-prompt image budget".into()
+            } else {
+                format!(
+                    "only {:.1}MB of the per-prompt image budget is left",
+                    cap as f64 / (1024.0 * 1024.0)
+                )
+            }
         } else {
             format!(
                 "{:.1}MB exceeds the {}MB per-image cap",

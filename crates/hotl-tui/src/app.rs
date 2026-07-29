@@ -510,14 +510,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             usage,
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage),
         Msg::SteerRejected { why } => {
-            if let Some(TranscriptItem::Steer { queued, .. }) = state
-                .transcript
-                .iter_mut()
-                .rev()
-                .find(|i| matches!(i, TranscriptItem::Steer { queued: true, .. }))
-            {
-                *queued = false;
-            }
+            clear_newest_queued_steer(state);
             notice(state, format!("steer rejected: {why}"));
             Vec::new()
         }
@@ -752,16 +745,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 text_of("reason")
             ),
         ),
-        "prompt_queued" => {
-            if let Some(TranscriptItem::Steer { queued, .. }) = state
-                .transcript
-                .iter_mut()
-                .rev()
-                .find(|i| matches!(i, TranscriptItem::Steer { queued: true, .. }))
-            {
-                *queued = false;
-            }
-        }
+        "prompt_queued" => clear_newest_queued_steer(state),
         "compacted" => {
             let degraded = v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
             notice(
@@ -1458,6 +1442,21 @@ fn mark_last_tool(state: &mut State, name: &str, status: ToolStatus) {
 
 fn notice(state: &mut State, text: String) {
     state.transcript.push(TranscriptItem::Notice { text });
+}
+
+/// Un-pin the newest queued steer chip (`SteerRejected`, `prompt_queued`).
+/// Newest-only is wrong once two steers can queue at once (tracker #43) —
+/// the real fix needs an id on `TranscriptItem::Steer` — but until then this
+/// is the one place that decision lives.
+fn clear_newest_queued_steer(state: &mut State) {
+    if let Some(TranscriptItem::Steer { queued, .. }) = state
+        .transcript
+        .iter_mut()
+        .rev()
+        .find(|i| matches!(i, TranscriptItem::Steer { queued: true, .. }))
+    {
+        *queued = false;
+    }
 }
 
 /// `/plan` and `/mode <name>` share this: optimistic local update (the badge

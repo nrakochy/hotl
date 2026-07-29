@@ -55,6 +55,23 @@ fn must_compact(estimate: u64, window: u64, image_bytes: usize) -> bool {
         || image_bytes > hotl_types::IMAGE_B64_BUDGET
 }
 
+/// Whether the speculative digest should fire early (M2): tokens past
+/// [`SPECULATE_TRIGGER`], or image bytes past the same trigger ratio applied
+/// to [`hotl_types::IMAGE_B64_BUDGET`] (0.6 / 0.8 = 0.75 of the budget) —
+/// mirrors `must_compact`'s two pressures so byte-heavy sessions get the same
+/// speculative head start token-heavy ones do. Pure for the same reason
+/// `must_compact` is.
+///
+/// INVARIANT: fires strictly before `must_compact` on the byte axis, same as
+/// it already does on the token axis (`SPECULATE_TRIGGER < COMPACT_TRIGGER`):
+/// 0.75 * IMAGE_B64_BUDGET < IMAGE_B64_BUDGET. Enforced by
+/// `image_bytes_past_the_speculate_threshold_fire_early_at_a_trivial_token_estimate`.
+fn should_speculate(estimate: u64, window: u64, image_bytes: usize) -> bool {
+    estimate > (window as f64 * SPECULATE_TRIGGER) as u64
+        || image_bytes as f64
+            > hotl_types::IMAGE_B64_BUDGET as f64 * (SPECULATE_TRIGGER / COMPACT_TRIGGER)
+}
+
 /// Shared per-prompt budget for "intercept the end-turn, inject a reminder,
 /// continue" gates (index E4): the TodoGate and the `Stop` hook veto
 /// (`Turn::consult_stop`) both draw from this same counter (see
@@ -960,7 +977,8 @@ impl Turn {
                 // at the last boundary, so `build_request` never runs for
                 // this sample — but the fold's head start still has to.
                 let estimate = self.estimate_tokens(&snapshot);
-                self.maybe_speculate_digest(&snapshot, estimate);
+                let image_bytes = hotl_context::tokens::image_b64_bytes(&snapshot.durable);
+                self.maybe_speculate_digest(&snapshot, estimate, image_bytes);
                 adopted
             }
             None => {
@@ -1538,14 +1556,11 @@ impl Turn {
     ) -> Result<SamplingRequest, SampleEnd> {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
-        if must_compact(
-            estimate,
-            window,
-            hotl_context::tokens::image_b64_bytes(&snapshot.durable),
-        ) {
+        let image_bytes = hotl_context::tokens::image_b64_bytes(&snapshot.durable);
+        if must_compact(estimate, window, image_bytes) {
             return Err(SampleEnd::ContextFull);
         }
-        self.maybe_speculate_digest(snapshot, estimate);
+        self.maybe_speculate_digest(snapshot, estimate, image_bytes);
         Ok(self.compose_request(snapshot, estimate, self.samples))
     }
 
@@ -1553,11 +1568,16 @@ impl Turn {
     /// [`SPECULATE_TRIGGER`] (M2). Called once per sample on **both** paths:
     /// an adopted optimistic dispatch never reaches `build_request`, and the
     /// fold must still get its head start.
-    fn maybe_speculate_digest(&mut self, snapshot: &crate::actor::Snapshot, estimate: u64) {
+    fn maybe_speculate_digest(
+        &mut self,
+        snapshot: &crate::actor::Snapshot,
+        estimate: u64,
+        image_bytes: usize,
+    ) {
         let window = self.shared.config.context_window.max(1);
         if self.speculation.is_none()
             && !self.shared.config.compaction_reset
-            && estimate > (window as f64 * SPECULATE_TRIGGER) as u64
+            && should_speculate(estimate, window, image_bytes)
         {
             // Durable only, deliberately: `actor::compact` plans and applies
             // against `head.items()`, so a speculative plan's `prefix_end` /
@@ -2918,6 +2938,29 @@ mod tests {
         ));
         assert!(!must_compact(
             (window as f64 * COMPACT_TRIGGER) as u64,
+            window,
+            0
+        ));
+    }
+
+    #[test]
+    fn image_bytes_past_the_speculate_threshold_fire_early_at_a_trivial_token_estimate() {
+        let window = 200_000;
+        let threshold =
+            (hotl_types::IMAGE_B64_BUDGET as f64 * (SPECULATE_TRIGGER / COMPACT_TRIGGER)) as usize;
+        // Tokens nowhere near the trigger, bytes past the scaled threshold: only
+        // the byte guard can catch this — the case `maybe_speculate_digest`
+        // used to miss, leaving byte-triggered folds with no head start.
+        assert!(should_speculate(1, window, threshold + 1));
+        assert!(!should_speculate(1, window, threshold));
+        // The token trigger is unchanged.
+        assert!(should_speculate(
+            (window as f64 * SPECULATE_TRIGGER) as u64 + 1,
+            window,
+            0
+        ));
+        assert!(!should_speculate(
+            (window as f64 * SPECULATE_TRIGGER) as u64,
             window,
             0
         ));

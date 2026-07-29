@@ -264,13 +264,9 @@ pub fn live_tokens(attachments: &[Attachment]) -> Vec<String> {
 
 /// `token_suffix_chars`, restricted to tokens a live attachment backs.
 pub fn token_suffix_chars_in(s: &str, live: &[String]) -> Option<usize> {
-    let start = s.rfind('[')?;
-    let tok = &s[start..];
-    let len = token_len_at(tok)?;
-    if start + len != s.len() || !live.iter().any(|m| m == tok) {
-        return None;
-    }
-    Some(tok.chars().count())
+    let n = token_suffix_chars(s)?;
+    let tok = &s[s.rfind('[')?..];
+    live.iter().any(|m| m == tok).then_some(n)
 }
 
 /// Token length in bytes when `s` begins with a well-formed token.

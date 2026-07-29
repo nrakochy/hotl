@@ -240,10 +240,10 @@ fn parse_serve_args(args: &[String]) -> (String, Option<String>, Option<String>)
 /// `current_thread` builder — that call is valid on any runtime flavor
 /// (unlike `.worker_threads()`, which only applies to `multi_thread` and
 /// stays deliberately inert; see `agent::layer_c_warning`) and is the one
-/// Layer-C lever that actually matters here: it bounds `glob`'s
-/// `spawn_blocking` tree walk, the sole real blocking-pool user in hotl
-/// today. Read once, synchronously, before the runtime exists — config
-/// loading itself needs no async.
+/// Layer-C lever that actually matters here: it bounds both real
+/// blocking-pool users in hotl today — `glob`'s `spawn_blocking` tree walk
+/// and `tui::load_image`'s decode-plus-base64 work. Read once, synchronously,
+/// before the runtime exists — config loading itself needs no async.
 fn block_on(f: impl std::future::Future<Output = i32>) -> i32 {
     let mut builder = tokio::runtime::Builder::new_current_thread();
     builder.enable_all();

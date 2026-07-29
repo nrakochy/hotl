@@ -1190,6 +1190,13 @@ fn outcome_detail(outcome: &Outcome) -> String {
 /// some were dropped, and an unbounded buffer is worse than both.
 /// INVARIANT: neither the prompt queue nor the held-steer buffer grows without
 /// bound. Enforced by `folding_bounds_the_buffer_and_discloses_the_truncation`.
+///
+/// Callers (`push_or_fold_steer`, `admit_prompt`'s queue-full arm) append
+/// their own image-drop note onto `text`'s tail before calling in. A fold
+/// triggered by the *text* cap can then truncate that note away along with
+/// the rest of the tail — FOLD_MARK still discloses that something was
+/// dropped, just not what. The image-only-full case (text under cap, only
+/// images over) keeps the note intact. Correct trade, not a bug.
 fn fold_into(dst: &mut String, text: &str, max_bytes: usize) {
     if dst.ends_with(FOLD_MARK) {
         dst.truncate(dst.len() - FOLD_MARK.len());
