@@ -87,6 +87,29 @@ impl Lang {
         }
     }
 
+    /// Is this the body of a block, class or switch — the one kind of `}` that
+    /// terminates its enclosing statement without a `;`?
+    ///
+    /// An object literal's `}` is not, which is why this asks the tree instead of
+    /// looking at the statement's last character. A kind missing here costs a
+    /// spurious `;`, which the AST-shape check catches as an added
+    /// `empty_statement`.
+    pub(crate) fn is_body(self, node_kind: &str) -> bool {
+        match self {
+            Lang::JavaScript | Lang::TypeScript | Lang::Tsx => matches!(
+                node_kind,
+                "statement_block"
+                    | "class_body"
+                    | "switch_body"
+                    | "enum_body"
+                    | "interface_body"
+                    | "module"
+                    | "internal_module"
+            ),
+            Lang::Rust | Lang::Go | Lang::Python => false,
+        }
+    }
+
     /// Does this subtree own its inter-token whitespace, so the joiner must copy
     /// its gaps rather than synthesize them? `jsx_text` carries its own spacing,
     /// but attribute lists do not: `class="a" id="b"` has no re-lex hazard the

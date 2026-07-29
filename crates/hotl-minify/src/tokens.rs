@@ -131,9 +131,78 @@ impl Walker<'_> {
         // `,` counts: an object-type member ending in `,` needs no `;` added,
         // and appending one there is a syntax error.
         let text = &self.source[node.start_byte()..node.end_byte()];
-        if !text.ends_with(';') && !text.ends_with(',') {
+        if !text.ends_with(';') && !text.ends_with(',') && !self.self_terminating(node) {
             self.out.semi_ends.push(node.end_byte());
         }
+    }
+
+    /// Does this statement end itself without help?
+    ///
+    /// Only one shape does: a `}` that closes a *body* — a block, a class, a
+    /// switch. The `}` of an object literal does not, so `const a = {}` still
+    /// needs its `;`, and the two are indistinguishable from the statement's
+    /// text. The tree tells them apart: ask what the final `}` belongs to.
+    fn self_terminating(&self, node: &tree_sitter::Node) -> bool {
+        let end = node.end_byte();
+        if !self.source[..end].ends_with('}') {
+            return false;
+        }
+        node.descendant_for_byte_range(end - 1, end)
+            .and_then(|last| last.parent())
+            .is_some_and(|p| self.lang.is_body(p.kind()))
+    }
+}
+
+/// Prove the minified output before anyone sees it: it must parse clean, and its
+/// named-node structure must equal the source's.
+///
+/// One parse serves both checks. The kind sequence skips comment nodes so both
+/// `keep_comments` modes compare equal to the same source.
+pub(crate) fn verify(lang: Lang, source: &str, output: &str) -> Result<(), MinifyError> {
+    let bad = || MinifyError::ProducedInvalid {
+        // `chars`, not a byte slice: `&output[..80]` panics mid-codepoint.
+        near: output.chars().take(80).collect(),
+    };
+    let tree = parse(lang, output).ok_or_else(bad)?;
+    if tree.root_node().has_error() {
+        return Err(bad());
+    }
+    let src_tree = parse(lang, source).ok_or_else(bad)?;
+    if named_kinds(lang, &src_tree) != named_kinds(lang, &tree) {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// Pre-order sequence of named, non-comment node kinds.
+///
+/// A comment is skipped whole, children included: tree-sitter-rust nests
+/// `outer_doc_comment_marker` and `doc_comment` inside `line_comment`, and
+/// counting those would make every stripped-comment output look like a
+/// structural change.
+fn named_kinds(lang: Lang, tree: &tree_sitter::Tree) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    let mut descend = true;
+    loop {
+        if descend {
+            let node = cursor.node();
+            let comment = lang.is_comment(node.kind());
+            if node.is_named() && !comment {
+                out.push(node.kind());
+            }
+            if !comment && cursor.goto_first_child() {
+                continue;
+            }
+        }
+        if cursor.goto_next_sibling() {
+            descend = true;
+            continue;
+        }
+        if !cursor.goto_parent() {
+            return out;
+        }
+        descend = false;
     }
 }
 
@@ -265,6 +334,36 @@ mod tests {
     fn a_language_without_asi_records_no_statement_boundaries() {
         let ex = extract(Lang::Rust, "fn f() -> u32 { 1 }\n").unwrap();
         assert!(ex.semi_ends.is_empty() && ex.verbatim.is_empty());
+    }
+
+    #[test]
+    fn a_block_bodied_export_needs_no_semicolon_but_an_object_literal_does() {
+        // Both statements end in `}`. Only one of them ends itself.
+        let block = extract(Lang::JavaScript, "export function f() {}\nconst a = 1\n").unwrap();
+        assert_eq!(
+            block.semi_ends.len(),
+            1,
+            "only `const a = 1` needs one: {:?}",
+            block.semi_ends
+        );
+        let object = extract(Lang::JavaScript, "const a = {}\nconst b = 1\n").unwrap();
+        assert_eq!(
+            object.semi_ends.len(),
+            2,
+            "an object literal's `}}` terminates nothing: {:?}",
+            object.semi_ends
+        );
+    }
+
+    #[test]
+    fn a_comment_subtree_is_skipped_whole_by_the_structure_comparison() {
+        // tree-sitter-rust nests `doc_comment` inside `line_comment`. Counting
+        // those children would make every strip-mode output look like drift.
+        let src = "/// doc\nfn f() {}\n";
+        assert_eq!(
+            named_kinds(Lang::Rust, &parse(Lang::Rust, src).unwrap()),
+            named_kinds(Lang::Rust, &parse(Lang::Rust, "fn f(){}").unwrap())
+        );
     }
 
     #[test]
