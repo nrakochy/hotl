@@ -35,3 +35,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 tempfile = { workspace = true }
+
+[dev-dependencies]
+# The minified-read savings assertion is stated on the engine's own estimator,
+# not a private one.
+hotl-context = { path = "../hotl-context", version = "0.9.0" }
