@@ -22,6 +22,7 @@ use tokio::signal::unix::{signal, SignalKind};
 // contributes only the side effects.
 
 /// Context inherited from an earlier session (`hotl resume` — M3b).
+#[derive(Debug)]
 pub(crate) struct Resumed {
     pub parent_id: String,
     /// The parent's tip at load time — the fork-point pin the new log records
@@ -30,6 +31,9 @@ pub(crate) struct Resumed {
     /// carries it too: a resumed parent is usually dead, but "usually" is not
     /// an invariant.
     pub parent_tip_entry_id: Option<String>,
+    /// The chain's display name (last `Rename`, child wins). Resume adopts it;
+    /// a **fork** deliberately ignores it — see D-A3.
+    pub inherited_name: Option<String>,
     pub items: Vec<hotl_types::Item>,
     /// The parent's last `ModeSet`, if any (durable, last-wins — same
     /// inheritance shape as the display name). `None` = the parent never
@@ -43,6 +47,162 @@ pub(crate) struct Resumed {
     /// same inheritance shape as `mode`/`name`). Empty = the parent never
     /// had a list, so the resumed session starts with none, same as fresh.
     pub todos: Vec<hotl_types::Todo>,
+}
+
+use crate::acp::KeepSpec;
+
+/// Resolve a [`KeepSpec`] to a projection length, rejecting anything that is
+/// not a turn boundary (D-A10).
+///
+/// One constraint kills three defects: a mid-turn seed would need
+/// `pair_tool_results` repair (and a repaired projection is *not* byte-identical
+/// to the parent's prefix, quietly voiding the cache read the fork exists for),
+/// it would leave the fork ending on an unanswered turn, and it would hand the
+/// model a dangling half-turn as history.
+fn resolve_keep(items: &[hotl_types::Item], keep: KeepSpec) -> Result<usize, String> {
+    let is_assistant = |i: usize| matches!(items.get(i), Some(hotl_types::Item::Assistant { .. }));
+    match keep {
+        KeepSpec::All => Ok(items.len()),
+        KeepSpec::Items(n) => {
+            if n > items.len() {
+                return Err(format!(
+                    "--keep {n} is more than this session has ({} items). Fork at head by \
+                     omitting --keep, or pick a smaller prefix.",
+                    items.len()
+                ));
+            }
+            if n > 0 && is_assistant(n - 1) {
+                return Ok(n);
+            }
+            // Name the nearest lower boundary so the retry is one edit away.
+            match (1..n).rev().find(|k| is_assistant(k - 1)) {
+                Some(k) => Err(format!(
+                    "--keep {n} lands mid-turn; a fork has to start where the parent finished \
+                     answering. The nearest boundary below it is --keep {k}."
+                )),
+                None => Err(format!(
+                    "--keep {n} lands mid-turn and there is no completed turn below it — the \
+                     session has no answered turn that early. Use --keep-turns to pick by turn."
+                )),
+            }
+        }
+        KeepSpec::Turns(t) => {
+            if t == 0 {
+                return Err(
+                    "--keep-turns 0 would keep no conversation at all; start a fresh session \
+                     instead."
+                        .to_string(),
+                );
+            }
+            let mut turn = 0usize;
+            let mut boundary = None;
+            for (i, item) in items.iter().enumerate() {
+                match item {
+                    // Only a real user turn counts: the memory and
+                    // project-instruction items seeded at session start are
+                    // synthetic, and nobody thinks of them as turn 1.
+                    hotl_types::Item::User {
+                        synthetic: None, ..
+                    } => {
+                        if turn == t {
+                            break;
+                        }
+                        turn += 1;
+                    }
+                    // The last assistant item of turn `t` is the boundary —
+                    // a turn can hold several (assistant → tool results →
+                    // assistant), and the fork keeps the whole of it.
+                    hotl_types::Item::Assistant { .. } if turn == t => boundary = Some(i + 1),
+                    _ => {}
+                }
+            }
+            boundary.ok_or_else(|| {
+                format!("--keep-turns {t} is more completed turns than this session has.")
+            })
+        }
+    }
+}
+
+/// Replay a lineage and truncate it to `keep`. The one path both the ACP
+/// factory and the headless runner take to seed a resumed or forked session,
+/// so the pin, the boundary rule and the todo rule cannot diverge between them.
+pub(crate) fn load_lineage(
+    sessions_dir: &std::path::Path,
+    sid: &str,
+    keep: KeepSpec,
+) -> Result<Resumed, String> {
+    let replayed = hotl_store::replay_chain(sessions_dir, sid)
+        .map_err(|e| format!("could not load session {sid}: {e}"))?;
+    let hotl_store::Replayed {
+        header,
+        mut items,
+        name,
+        mode,
+        plan,
+        todos,
+        tip_entry_id,
+        ..
+    } = replayed;
+    let n = resolve_keep(&items, keep)?;
+    let truncated = n < items.len();
+    items.truncate(n);
+    Ok(Resumed {
+        parent_id: header.session_id,
+        parent_tip_entry_id: tip_entry_id,
+        inherited_name: name,
+        items,
+        mode,
+        plan,
+        // D-A11: todos describe the parent's *final* state. A fork cut back to
+        // an earlier prefix would inherit a checklist about work its own
+        // history no longer contains — actively misleading, so drop it.
+        todos: if truncated { Vec::new() } else { todos },
+    })
+}
+
+/// Record the fork point in the child's own log: `keep_items` is the seeded
+/// projection length, so replaying the *child* reproduces its seed from disk
+/// with no new mechanism — and stays that length however far the parent runs
+/// on. Written for every fork, head included (D-A12): the entry costs one line
+/// and makes the child's replay self-describing even if its pin is later
+/// unresolvable.
+fn record_fork_point(log: &mut SessionLog, keep_items: usize, now_ms: u64) -> Result<(), String> {
+    log.append(&hotl_types::EntryPayload::BranchMove { keep_items }, now_ms)
+        .map_err(|e| format!("could not record the fork point: {e}"))?;
+    Ok(())
+}
+
+/// Create the new session's log for a fresh / resumed / forked open. The one
+/// place the ACP factory and the headless runner agree on what a fork's log
+/// starts with: the pinned lineage in the header, then the `BranchMove` seed
+/// marker, before this session logs anything of its own.
+///
+/// INVARIANT: a fork's own replay reproduces its seed and stays immune to
+/// everything the parent logs afterwards. Enforced by
+/// `every_fork_writes_a_branch_move_its_own_replay_reproduces` and
+/// `a_forks_replay_is_immune_to_the_parent_working_after_the_fork`.
+pub(crate) fn create_session_log(
+    sessions_dir: &std::path::Path,
+    model: &str,
+    masker: Masker,
+    now_ms: u64,
+    lineage: Option<&Resumed>,
+    is_fork: bool,
+) -> Result<SessionLog, String> {
+    let parent = lineage.map(|r| hotl_store::ParentRef {
+        session_id: r.parent_id.clone(),
+        tip_entry_id: r.parent_tip_entry_id.clone(),
+    });
+    let mut log = SessionLog::create(sessions_dir, model, parent, masker, now_ms)
+        .map_err(|e| format!("could not create session log: {e}"))?;
+    if is_fork {
+        record_fork_point(
+            &mut log,
+            lineage.map(|r| r.items.len()).unwrap_or(0),
+            now_ms,
+        )?;
+    }
+    Ok(log)
 }
 
 pub async fn agent_main(args: Vec<String>) -> i32 {
@@ -247,51 +407,34 @@ pub(crate) async fn build_acp() -> Result<
         // typing-time trigger (first composer keystroke) has no ACP signal
         // to hang off today — see the task report for that deferral.
         scaffold.provider.arm().detach();
-        let (resumed, requested) = match spec {
-            crate::acp::SessionSpec::New { name } => (None, name),
+        let (resumed, requested, is_fork) = match spec {
+            crate::acp::SessionSpec::New { name } => (None, name, false),
             crate::acp::SessionSpec::Load {
                 session_id: sid,
                 name,
             } => {
-                let replayed = hotl_store::replay_chain(&sessions_dir(), &sid)
-                    .map_err(|e| format!("could not load session {sid}: {e}"))?;
-                let hotl_store::Replayed {
-                    header,
-                    items,
-                    name: inherited,
-                    mode,
-                    plan,
-                    todos,
-                    tip_entry_id,
-                    ..
-                } = replayed;
+                let resumed = load_lineage(&sessions_dir(), &sid, KeepSpec::All)?;
                 // An explicit rename-on-resume beats the inherited name.
-                let name = name.or(inherited);
-                (
-                    Some(Resumed {
-                        parent_id: header.session_id,
-                        parent_tip_entry_id: tip_entry_id,
-                        items,
-                        mode,
-                        plan,
-                        todos,
-                    }),
-                    name,
-                )
+                let name = name.or_else(|| resumed.inherited_name.clone());
+                (Some(resumed), name, false)
             }
+            // A fork is a resume that (a) may stop at a prefix and (b) never
+            // takes the parent's name: two live sessions sharing one name
+            // would break `-r <name>` resolution outright (D-A3).
+            crate::acp::SessionSpec::Fork {
+                session_id: sid,
+                keep,
+                name,
+            } => (Some(load_lineage(&sessions_dir(), &sid, keep)?), name, true),
         };
-        let parent = resumed.as_ref().map(|r| hotl_store::ParentRef {
-            session_id: r.parent_id.clone(),
-            tip_entry_id: r.parent_tip_entry_id.clone(),
-        });
-        let mut log = SessionLog::create(
+        let mut log = create_session_log(
             &sessions_dir(),
             &scaffold.model,
-            parent,
             scaffold.masker(),
             scaffold.clock.now_ms(),
-        )
-        .map_err(|e| format!("could not create session log: {e}"))?;
+            resumed.as_ref(),
+            is_fork,
+        )?;
         // Copy-forward: the resumed name lives in this log too, so listing
         // and name resolution stay a single-file scan.
         if let Some(n) = &requested {
@@ -2279,6 +2422,225 @@ pub(crate) fn data_dir() -> PathBuf {
 
 pub(crate) fn sessions_dir() -> PathBuf {
     data_dir().join("sessions")
+}
+
+#[cfg(test)]
+mod fork_tests {
+    use super::*;
+    use hotl_types::{EntryPayload, Item};
+
+    /// Three complete turns, plus the synthetic memory item every real session
+    /// is seeded with — so the turn resolver is exercised against a projection
+    /// shaped like a real one, not a tidy alternating pair list.
+    ///
+    /// Projection: `[synthetic User, User, Assistant] * 3` → 7 items.
+    fn parent_with_three_turns(dir: &std::path::Path) -> (String, SessionLog) {
+        let mut log = SessionLog::create(dir, "m", None, Masker::empty(), 1).unwrap();
+        let push = |log: &mut SessionLog, item: Item| {
+            log.append(&EntryPayload::Item { item }, 2).unwrap();
+        };
+        push(
+            &mut log,
+            Item::User {
+                text: "<memory>…</memory>".into(),
+                synthetic: Some(hotl_types::SyntheticReason::SubagentResult),
+                images: Vec::new(),
+            },
+        );
+        for n in 1..=3 {
+            push(
+                &mut log,
+                Item::User {
+                    text: format!("ask {n}"),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            );
+            push(
+                &mut log,
+                Item::Assistant {
+                    blocks: vec![serde_json::json!({"type":"text","text":format!("answer {n}")})],
+                },
+            );
+        }
+        (log.session_id.clone(), log)
+    }
+
+    #[test]
+    fn a_fork_log_replays_to_the_truncated_prefix_and_carries_lineage() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, _parent) = parent_with_three_turns(dir.path());
+
+        let resumed = load_lineage(dir.path(), &parent_id, KeepSpec::Items(5)).unwrap();
+        assert_eq!(resumed.items.len(), 5, "through the end of turn 2");
+        assert_eq!(resumed.parent_id, parent_id);
+        assert!(
+            resumed.parent_tip_entry_id.is_some(),
+            "the pin is captured from the replay, not invented at the CLI"
+        );
+    }
+
+    #[test]
+    fn keep_items_off_a_turn_boundary_is_rejected_naming_the_nearest_valid_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, _parent) = parent_with_three_turns(dir.path());
+
+        // Item 4 is `User { "ask 2" }` — a fork there would start mid-turn.
+        let err = load_lineage(dir.path(), &parent_id, KeepSpec::Items(4)).unwrap_err();
+        assert!(err.contains("--keep 3"), "must name the way out: {err}");
+
+        // And the boundaries themselves are accepted.
+        for n in [3, 5, 7] {
+            load_lineage(dir.path(), &parent_id, KeepSpec::Items(n))
+                .unwrap_or_else(|e| panic!("--keep {n} is a turn boundary: {e}"));
+        }
+    }
+
+    #[test]
+    fn keep_turns_resolves_to_the_boundary_after_the_nth_completed_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, _parent) = parent_with_three_turns(dir.path());
+
+        let one = load_lineage(dir.path(), &parent_id, KeepSpec::Turns(1)).unwrap();
+        assert_eq!(one.items.len(), 3, "synthetic seed + the first turn");
+        let two = load_lineage(dir.path(), &parent_id, KeepSpec::Turns(2)).unwrap();
+        assert_eq!(two.items.len(), 5);
+        let all = load_lineage(dir.path(), &parent_id, KeepSpec::Turns(3)).unwrap();
+        assert_eq!(all.items.len(), 7);
+
+        let err = load_lineage(dir.path(), &parent_id, KeepSpec::Turns(4)).unwrap_err();
+        assert!(err.contains("more completed turns"), "{err}");
+    }
+
+    #[test]
+    fn a_truncated_fork_drops_inherited_todos_but_a_head_fork_keeps_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+        parent
+            .append(
+                &EntryPayload::Todos {
+                    items: vec![hotl_types::Todo {
+                        content: "finish turn 3's follow-up".into(),
+                        status: hotl_types::TodoStatus::Pending,
+                        active_form: None,
+                    }],
+                },
+                3,
+            )
+            .unwrap();
+
+        let head = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
+        assert_eq!(head.todos.len(), 1, "fork-at-head keeps resume parity");
+        let cut = load_lineage(dir.path(), &parent_id, KeepSpec::Turns(1)).unwrap();
+        assert!(
+            cut.todos.is_empty(),
+            "a checklist about work the fork's history no longer contains is worse than none"
+        );
+    }
+
+    #[test]
+    fn every_fork_writes_a_branch_move_its_own_replay_reproduces() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, _parent) = parent_with_three_turns(dir.path());
+
+        let resumed = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
+        let seeded = resumed.items.len();
+        let child =
+            create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&resumed), true).unwrap();
+
+        let replayed = hotl_store::replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(
+            replayed.items.len(),
+            seeded,
+            "a BranchMove is written at head too, so the fork's length is self-describing"
+        );
+        assert_eq!(
+            replayed.header.parent_session_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+        assert!(
+            replayed.header.parent_tip_entry_id.is_some(),
+            "pin persisted"
+        );
+    }
+
+    #[test]
+    fn a_forks_replay_is_immune_to_the_parent_working_after_the_fork() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+
+        let resumed = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
+        let seeded = resumed.items.len();
+        let child =
+            create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&resumed), true).unwrap();
+
+        // The parent's session keeps going: two more items, then a compaction
+        // — the one entry class that rewrites the projection *prefix*.
+        for text in ["ask 4", "answer 4"] {
+            parent
+                .append(
+                    &EntryPayload::Item {
+                        item: Item::User {
+                            text: text.into(),
+                            synthetic: None,
+                            images: Vec::new(),
+                        },
+                    },
+                    10,
+                )
+                .unwrap();
+        }
+        parent
+            .append(
+                &EntryPayload::Compaction {
+                    digest: vec![Item::User {
+                        text: "DIGEST".into(),
+                        synthetic: None,
+                        images: Vec::new(),
+                    }],
+                    prefix_end: 0,
+                    kept_from: 8,
+                    degraded: false,
+                },
+                11,
+            )
+            .unwrap();
+
+        let replayed = hotl_store::replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(replayed.items, resumed.items, "frozen at the fork point");
+        assert_eq!(replayed.items.len(), seeded);
+    }
+
+    #[test]
+    fn a_fork_does_not_inherit_the_parents_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+        parent
+            .append(
+                &EntryPayload::Rename {
+                    name: "auth-explore".into(),
+                },
+                3,
+            )
+            .unwrap();
+
+        let resumed = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
+        assert_eq!(
+            resumed.inherited_name.as_deref(),
+            Some("auth-explore"),
+            "the name is reported…"
+        );
+        // …and the Fork arm simply never adopts it — two live sessions sharing
+        // one name would break `-r <name>` resolution outright (D-A3). The
+        // factory's `Load` arm is the only caller that reads this field.
+        let child =
+            create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&resumed), true).unwrap();
+        assert_eq!(
+            hotl_store::session_name(child.path()),
+            None,
+            "the fork's own log carries no rename until the user gives it one"
+        );
+    }
 }
 
 #[cfg(test)]

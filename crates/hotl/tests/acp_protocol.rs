@@ -70,6 +70,19 @@ fn scripted_factory_recording(
                 }
                 name
             }
+            acp::SessionSpec::Fork {
+                name,
+                session_id,
+                keep,
+            } => {
+                if let Some(loads) = &loads {
+                    loads
+                        .lock()
+                        .unwrap()
+                        .push(format!("fork:{session_id}:{keep:?}"));
+                }
+                name
+            }
         };
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
@@ -105,6 +118,206 @@ fn scripted_factory_recording(
             session_id,
         })
     })
+}
+
+/// A factory whose opened session is already mid-turn — its projection ends on
+/// an unanswered user item, exactly what `needs_continuation` fires on — and
+/// whose provider has two distinguishable replies queued. Which reply the
+/// client sees first says whether the open auto-continued.
+fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::SessionFactory {
+    Box::new(move |spec| {
+        match &spec {
+            acp::SessionSpec::New { .. } => seen.lock().unwrap().push("new".into()),
+            acp::SessionSpec::Load { session_id, .. } => {
+                seen.lock().unwrap().push(format!("load:{session_id}"))
+            }
+            acp::SessionSpec::Fork {
+                session_id, keep, ..
+            } => seen
+                .lock()
+                .unwrap()
+                .push(format!("fork:{session_id}:{keep:?}")),
+        }
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        std::mem::forget(dir);
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                provider: Arc::new(ScriptedProvider::new(vec![
+                    ScriptedProvider::text_reply("FIRST"),
+                    ScriptedProvider::text_reply("SECOND"),
+                ])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: vec![hotl_types::Item::User {
+                    text: "the parent's last, unanswered prompt".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                }],
+                initial_todos: Vec::new(),
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+            mode: "auto".to_string(),
+            plan: false,
+            session_id,
+        })
+    })
+}
+
+/// D-A9: a resume of an interrupted session finishes the interrupted turn; a
+/// **fork** of the same session must not. The user forked to send the
+/// conversation somewhere else, and auto-continuing would spend a full-price
+/// sample re-answering the parent's stale prompt before the phase instruction
+/// ever arrives.
+#[tokio::test]
+async fn a_fork_never_auto_continues_but_a_resume_still_does() {
+    // Resume: the reply arrives with no prompt from the client at all.
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        interrupted_factory(seen.clone()),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+    )
+    .await;
+    let text = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "text_delta"
+    })
+    .await;
+    assert_eq!(
+        text["params"]["update"]["text"], "FIRST",
+        "a resumed interrupted turn picks itself back up"
+    );
+    assert_eq!(seen.lock().unwrap().clone(), ["load:S1"]);
+
+    // Fork: the same session, the same interrupted projection — but the first
+    // reply the client ever sees is the answer to its *own* prompt.
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        interrupted_factory(seen.clone()),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+               "params":{"sessionId":"S1","fork":true,"keepTurns":2}}),
+    )
+    .await;
+    let opened = next_matching(&mut lines, |m| m["id"] == json!(2)).await;
+    assert!(opened["result"]["sessionId"].as_str().is_some(), "{opened}");
+    assert_eq!(
+        seen.lock().unwrap().clone(),
+        ["fork:S1:Turns(2)"],
+        "`fork: true` plus `keepTurns` reaches the factory as a Fork spec"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt",
+               "params":{"text":"Entering phase: Plan."}}),
+    )
+    .await;
+    let text = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "text_delta"
+    })
+    .await;
+    assert_eq!(
+        text["params"]["update"]["text"], "FIRST",
+        "the fork spent no sample before the client's first prompt — an \
+         auto-continue would have consumed FIRST and left SECOND here"
+    );
+}
+
+/// The two keep coordinates are alternatives, not a pair, and neither means
+/// anything without `fork: true`.
+#[tokio::test]
+async fn keep_params_are_rejected_without_a_fork_and_against_each_other() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load",
+               "params":{"sessionId":"S1","keepItems":4}}),
+    )
+    .await;
+    let err = next_matching(&mut lines, |m| m["id"] == json!(2)).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("fork"),
+        "{err}"
+    );
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/load",
+               "params":{"sessionId":"S1","fork":true,"keepItems":4,"keepTurns":2}}),
+    )
+    .await;
+    let err = next_matching(&mut lines, |m| m["id"] == json!(3)).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("mutually exclusive"),
+        "{err}"
+    );
 }
 
 async fn send(w: &mut (impl AsyncWriteExt + Unpin), v: Value) {
@@ -470,7 +683,7 @@ async fn prompt_images_are_validated_at_the_wire() {
     let factory: acp::SessionFactory = Box::new(move |spec| {
         let name = match spec {
             acp::SessionSpec::New { name } => name,
-            acp::SessionSpec::Load { name, .. } => name,
+            acp::SessionSpec::Load { name, .. } | acp::SessionSpec::Fork { name, .. } => name,
         };
         let dir = tempfile::tempdir().expect("tmp");
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");

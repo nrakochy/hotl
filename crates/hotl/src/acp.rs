@@ -84,6 +84,20 @@ fn question_answer_from_result(result: Option<&Value>) -> hotl_types::QuestionAn
 /// (the engine queues overlapping prompts and finishes them FIFO).
 type PendingPrompt = Arc<std::sync::Mutex<VecDeque<Value>>>;
 
+/// How much of a forked-from session's projection the fork keeps.
+///
+/// `Items` is the stored coordinate — the same one `BranchMove { keep_items }`
+/// replays against (`items.truncate(n)`). `Turns` is a *resolver* on top of it,
+/// never a second stored coordinate: raw item indices are unusable by hand
+/// (compaction digests, tool-result batches and synthetic items all count),
+/// but the log must record the coordinate replay understands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepSpec {
+    All,
+    Items(usize),
+    Turns(usize),
+}
+
 /// What a client asked the factory to produce.
 pub enum SessionSpec {
     New {
@@ -91,6 +105,15 @@ pub enum SessionSpec {
     },
     Load {
         session_id: String,
+        name: Option<String>,
+    },
+    /// A **new** session seeded with another's projection — optionally only a
+    /// prefix of it — pinned to that session's fork-time tip. Unlike `Load`,
+    /// the parent may still be live: the pin plus the fork's own `BranchMove`
+    /// freeze the inherited history whatever the parent does next.
+    Fork {
+        session_id: String,
+        keep: KeepSpec,
         name: Option<String>,
     },
 }
@@ -295,8 +318,29 @@ async fn handle_request(
                     }
                 },
             };
+            let is_fork = msg
+                .pointer("/params/fork")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let spec = if method == "session/load" {
+                let keep = match keep_spec(msg) {
+                    Ok(k) => k,
+                    Err(e) => return reply_err(writer, id, &e).await,
+                };
+                if !is_fork && keep != KeepSpec::All {
+                    return reply_err(
+                        writer,
+                        id,
+                        "params.keepItems/keepTurns only apply to a fork (params.fork: true)",
+                    )
+                    .await;
+                }
                 match msg.pointer("/params/sessionId").and_then(Value::as_str) {
+                    Some(sid) if is_fork => SessionSpec::Fork {
+                        session_id: sid.to_string(),
+                        keep,
+                        name,
+                    },
                     Some(sid) => SessionSpec::Load {
                         session_id: sid.to_string(),
                         name,
@@ -329,7 +373,14 @@ async fn handle_request(
                     // that ends mid-turn (user prompt or unanswered tool
                     // results) picks the work back up; the engine no-ops when
                     // there is nothing to continue.
-                    if method == "session/load" {
+                    //
+                    // A **fork** never does (D-A9). For resume, finishing the
+                    // interrupted turn is what the user wants; for a fork the
+                    // sense is inverted — they forked to send it somewhere
+                    // else, and auto-continuing would spend a full-price
+                    // sample re-answering the parent's stale prompt before the
+                    // phase instruction ever arrives.
+                    if method == "session/load" && !is_fork {
                         if let Some(state) = session.as_ref() {
                             state.handle.continue_turn().await;
                         }
@@ -607,6 +658,29 @@ async fn handle_request(
             }
         }
         other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
+    }
+}
+
+/// `keepItems` / `keepTurns` off a `session/load` request. Mutually exclusive:
+/// they are two coordinate systems onto the same cut, and a request naming both
+/// has no single meaning worth guessing at.
+fn keep_spec(msg: &Value) -> Result<KeepSpec, String> {
+    let read = |key: &str| -> Result<Option<usize>, String> {
+        match msg.pointer(&format!("/params/{key}")) {
+            None | Some(Value::Null) => Ok(None),
+            Some(v) => v
+                .as_u64()
+                .map(|n| Some(n as usize))
+                .ok_or_else(|| format!("params.{key} must be a non-negative integer")),
+        }
+    };
+    match (read("keepItems")?, read("keepTurns")?) {
+        (Some(_), Some(_)) => {
+            Err("params.keepItems and params.keepTurns are mutually exclusive".to_string())
+        }
+        (Some(n), None) => Ok(KeepSpec::Items(n)),
+        (None, Some(t)) => Ok(KeepSpec::Turns(t)),
+        (None, None) => Ok(KeepSpec::All),
     }
 }
 
