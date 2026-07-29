@@ -9,7 +9,7 @@ use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-const READ_MAX_BYTES: usize = 200 * 1024;
+pub(crate) const READ_MAX_BYTES: usize = 200 * 1024;
 const READ_MAX_LINES: usize = 2000;
 /// The most one "line" may ever occupy. A minified bundle is one line.
 const READ_MAX_LINE: usize = 8 * 1024;
@@ -22,7 +22,7 @@ const BASH_OUTPUT_SLACK: usize = 1024;
 
 /// Errors double as results: `Err(ToolOutcome)` is the errors-as-prompts
 /// channel, letting tool bodies use `?`.
-type ToolResult = Result<ToolOutcome, ToolOutcome>;
+pub(crate) type ToolResult = Result<ToolOutcome, ToolOutcome>;
 
 fn done(result: ToolResult) -> ToolOutcome {
     result.unwrap_or_else(|e| e)
@@ -33,7 +33,7 @@ pub(crate) fn sandbox_status() -> &'static SandboxStatus {
     STATUS.get_or_init(sandbox::probe)
 }
 
-fn str_arg<'v>(input: &'v Value, key: &str) -> Result<&'v str, ToolOutcome> {
+pub(crate) fn str_arg<'v>(input: &'v Value, key: &str) -> Result<&'v str, ToolOutcome> {
     input.get(key).and_then(Value::as_str).ok_or_else(|| {
         ToolOutcome::err(format!(
             "Missing required string argument `{key}`. Re-send the call with `{key}` set."
@@ -186,7 +186,7 @@ impl Tool for ReadTool {
          `offset`/`limit` to continue a truncated read."
     }
     fn schema(&self) -> Value {
-        json!({
+        let mut schema = json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path, relative to the working directory. An absolute path outside the working directory is permitted but prompts for approval."},
@@ -194,7 +194,15 @@ impl Tool for ReadTool {
                 "limit": {"type": "integer", "description": "Maximum lines to return (default 2000)"}
             },
             "required": ["path"]
-        })
+        });
+        // Never advertise an arg the build cannot honor (Decision D1).
+        if crate::minified::available() {
+            schema["properties"]["minified"] = json!({
+                "type": "boolean",
+                "description": "Serve a token-stream view of source code (formatting whitespace removed, structure intact; ~10-40% smaller). Whole-file only — `offset`/`limit` do not apply. Supported: .rs, .go, .py, .js/.mjs/.cjs/.jsx, .ts/.mts/.cts, .tsx; anything else falls back to the plain view with a note. Text quoted from this view matches `edit` with minified:true, not a plain edit."
+            });
+        }
+        schema
     }
     /// INVARIANT: a read that stays inside the workspace runs unprompted; a
     /// read that leaves it is `AskProtected` — the one tier that outranks
@@ -220,8 +228,24 @@ impl Tool for ReadTool {
         }
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(read_in(fsguard::workspace_root(), &input).await) })
+        Box::pin(async move {
+            let root = fsguard::workspace_root();
+            done(if wants_minified(&input) {
+                crate::minified::read_minified_in(root, &input, &self.minify).await
+            } else {
+                read_in(root, &input).await
+            })
+        })
     }
+}
+
+/// The `minified` arg. Absent or false means the plain path runs completely
+/// unchanged — the whole point of extending `read` rather than adding a tool.
+fn wants_minified(input: &Value) -> bool {
+    input
+        .get("minified")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// `root`-parameterized so tests drive it against a tempdir without touching
@@ -235,21 +259,31 @@ impl Tool for ReadTool {
 /// had. That is what makes the fd check safe to do *after* the ask, with no
 /// shared state between the two. Enforced by
 /// `read_refuses_a_symlink_out_of_the_workspace_and_says_how_to_proceed`.
-async fn read_in(root: &std::path::Path, input: &Value) -> ToolResult {
+pub(crate) async fn read_in(root: &std::path::Path, input: &Value) -> ToolResult {
     let path = str_arg(input, "path")?;
-    let file = match fsguard::classify(root, path) {
+    let file = open_for_read(root, path)?;
+    read_stream(tokio::fs::File::from_std(file), path, input).await
+}
+
+/// The read door, shared by the plain and minified modes so the two can never
+/// disagree about containment.
+pub(crate) fn open_for_read(
+    root: &std::path::Path,
+    path: &str,
+) -> Result<std::fs::File, ToolOutcome> {
+    match fsguard::classify(root, path) {
         // Inside: the fd descent is the boundary.
-        fsguard::Placement::Inside(rel) => fsguard::open_beneath(root, &rel)
-            .map_err(|e| ToolOutcome::err(e.prompt("read", path)))?,
+        fsguard::Placement::Inside(rel) => {
+            fsguard::open_beneath(root, &rel).map_err(|e| ToolOutcome::err(e.prompt("read", path)))
+        }
         // Outside: the human approved *this path*, so open it plainly —
         // following links is what they agreed to.
         fsguard::Placement::Outside(_) => std::fs::File::open(path).map_err(|e| {
             ToolOutcome::err(format!(
                 "Could not read `{path}`: {e}. Check the path (use `glob`) and try again."
             ))
-        })?,
-    };
-    read_stream(tokio::fs::File::from_std(file), path, input).await
+        }),
+    }
 }
 
 /// The output window: which lines were kept, and where the next call resumes.
