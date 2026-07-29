@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-07-29
+
 ### Added
 
 - **`hotl mcp`.** Nothing outside a live turn could say which MCP servers were
