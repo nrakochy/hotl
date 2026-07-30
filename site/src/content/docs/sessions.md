@@ -94,12 +94,17 @@ prefix that is byte-for-byte identical to a recent one at roughly a tenth of
 normal input cost. A fork's first request *is* such a prefix — hotl proves this
 on wire bytes, not by intention — so an inherited transcript that would
 otherwise be re-billed in full costs about 10%. The catch is the cache's
-lifetime: five minutes by default, an hour with `[context] cache_ttl = "1h"`.
-Run the phases in one sitting and you get the discount; run them hours apart
-and the first request pays full price once, then caches normally. hotl prints a
-note when the session you are forking looks too cold for the discount.
+lifetime, and it is shorter than you might guess: **five minutes for headless
+`-p` runs**, one hour for console sessions. That is not a setting — hotl picks
+it per surface, because a console session has human pauses worth paying the
+longer cache's premium for and a scripted run does not.
 
-So this is a script you run, not a cron job you schedule. (One residual worth
+So a `-p` pipeline has a five-minute window between phases. Run them back to
+back and you get the discount; leave a gap and the first request pays full price
+once, then caches normally. hotl prints a note when the session you are forking
+looks too cold for it.
+
+This is a script you run, not a cron job you schedule. (One residual worth
 naming: cache matching looks back a bounded distance from the request's newest
 breakpoint, so a pathologically block-heavy final turn can leave a sliver of the
 tail uncached. The rolling anchors bound how big that sliver can get.)
@@ -122,10 +127,13 @@ The same rule explains the two `spawn` fork shapes described in
 can't reuse the cache anyway, so `fork` wraps the history into a labeled
 background block for it instead of replaying it as the child's own turns.
 
-**Cheap summarizer.** A fork under `[context] fast_model` is cache-breaking by
-definition — a different model is a different cache namespace — but still worth
-it on a long transcript: you pay full input once on a cheaper model instead of
-having an expensive one re-read everything.
+**Cheap summarizer.** To have a wrap-up fork run on a cheaper model, give its
+agent def its own `model:` ([sub-agents](../agents/)). That is cache-breaking by
+definition — a different model is a different cache namespace — but still often
+worth it on a long transcript: you pay full input once on a cheap model instead
+of having an expensive one re-read everything. (`[provider] fast_model` is a
+different thing: it is the model hotl uses for its own compaction summaries, and
+it does not affect what a fork runs on.)
 
 ## The wrap-up recipe
 
