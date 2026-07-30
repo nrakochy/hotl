@@ -6,6 +6,90 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **`read` and `edit` gained a `minified` mode: a token-stream view of source
+  code, and edits that match against it without ever writing it to disk.**
+  Reading source is usually an agent's largest token expense, and much of a
+  source file is typography — indentation, blank lines, alignment. `read` with
+  `minified: true` parses the file with a tree-sitter grammar and re-joins its
+  leaf tokens with the smallest separators that preserve meaning.
+
+  Measured on hotl's own source: **20–26% fewer bytes with comments kept,
+  44–59% with them stripped.** Comment-light or small files save less (10–18%
+  kept). It is not a uniform win, so every minified read carries a trailer
+  reporting the real figure for that file rather than a headline. Two honesty
+  notes, stated in the docs as well: these are *byte* savings run through
+  hotl's flat ~3 chars/token estimator, and a real tokenizer encodes a
+  newline-plus-indent run as roughly one token — so the token saving is
+  smaller. A JSX-heavy `.tsx` saves only on its non-JSX portion, because JSX
+  whitespace is renderer-visible and is copied through untouched.
+
+  Languages: Rust, Go, Python, JavaScript, TypeScript, TSX/JSX. Anything else
+  serves the plain view.
+
+  **`keep_comments` defaults to `true`**, because comments are meaning and
+  stripping them is the lossy mode. Set `[minify] keep_comments = false` for
+  the larger saving and accept that the model reads code with the *why*
+  removed.
+
+  This is not whitespace-stripping. Some languages are whitespace-*sensitive*:
+  Python's indentation is syntax, and Go and JS/TS insert implicit semicolons
+  at line breaks. So Python keeps one logical line per line with indentation
+  renormalized to one space per level, and Go and JS/TS get explicit `;` at the
+  statement boundaries where the source relied on automatic insertion — read
+  from the parse tree, not guessed from a lexical trigger table, because
+  `let a = b\n(c)` is one call expression while `a\n++b` is two statements and
+  the token pair at the line break is identical in both. Every view is then
+  re-parsed *and* its named-node structure compared against the source's; a
+  mismatch is a refusal, not a warning. That check is the load-bearing one: a
+  bare re-parse passes on output that means something else.
+
+  **Every failure serves the plain view with a note saying why** — no grammar
+  for the extension, a file that does not parse, a view over the 200KB cap,
+  `enable = false`. The feature can cost you savings; it cannot cost you
+  access. The note is as important as the fallback: it is how a stale grammar
+  becomes diagnosable from the transcript instead of just producing zero
+  savings forever.
+
+  `offset`/`limit` are **refused** in minified mode rather than reinterpreted.
+  They are raw-file line numbers, and the minified view has no lines the model
+  can count, so paging in that coordinate system would ask the model to name
+  positions it cannot see. The error names the plain read.
+
+  **Editing.** Text quoted from a minified read will not match a plain `edit` —
+  the whitespace differs. Pass `minified: true` there too: `old_string` is
+  matched in the minified view, the match is projected back to exact source
+  byte offsets, and only those bytes are replaced. **The file on disk keeps all
+  its comments, indentation, and formatting; it is never written in minified
+  form.** What makes that safe rather than clever is the position map's
+  invariant — a segment's minified bytes are a verbatim copy of its source
+  bytes, so the projection is arithmetic. Matching is exact and must be unique
+  in that view (the domain is already whitespace-normalized, so tolerant
+  matching would only blur uniqueness). Two guards refuse rather than risk the
+  file: a multi-line `new_string` in Python, which would land at a source
+  column the view never showed, and any splice that would leave the file no
+  longer parsing — checked *before* the write, so nothing is written.
+
+  One caveat: `new_string` lands in the file in the spelling you wrote it, so a
+  minified-style replacement stays minified-style in that one spot. `cargo fmt`
+  heals Rust at commit time.
+
+  Configuration is one section, both keys defaulting on:
+
+  ```toml
+  [minify]
+  # enable = true          # false makes minified:true serve the plain view
+  # keep_comments = true   # false strips comments (lossy)
+  ```
+
+  **Build footprint.** The tree-sitter grammars compile C, which the workspace
+  had avoided on purpose. They sit behind a default-on `minify` cargo feature,
+  so `cargo install hotl --no-default-features` is still a pure-Rust build with
+  no C toolchain required; in that build the `minified` argument is not
+  advertised in the tool schema at all, so the model never sees an option the
+  binary cannot honor.
+
 ## [0.9.0] - 2026-07-29
 
 ### Changed

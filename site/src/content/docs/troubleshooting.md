@@ -37,6 +37,22 @@ Look up the message you saw. Text in `code` is what hotl prints; find yours by g
 | `preapproved rules at … refused` | The admin file isn't root-owned, or is group/world-writable. | `sudo chown root /etc/hotl/preapproved.toml && sudo chmod 644 /etc/hotl/preapproved.toml` |
 | `permissions.mode=auto requested, but this is a security-enforced build` | Expected on enforced builds; per-action asks are the build's contract. | None. |
 
+## Minified reads and edits
+
+| Message or symptom | Cause | Fix |
+|---|---|---|
+| `[minified unavailable for \`X\`: no grammar for this file type…]` | The extension isn't one of the six supported languages. | None — the plain view was served. Expected for Markdown, TOML, shell, and everything else. |
+| `[minified unavailable for \`X\`: the file does not parse cleanly…]` | The grammar found a syntax error. Either the file really is broken, or the pinned grammar is older than the syntax the file uses (a new language edition feature). | If the file is valid, the grammar is stale — that's the note's purpose. The plain view was served, so nothing is blocked. |
+| `[minified unavailable …: the minifier produced output it could not verify…]` | Self-validation caught its own output: the view failed re-parse, or its structure didn't match the source's. A bug guard firing, not a file problem. | None needed — it degraded to the plain view, which is the designed behavior. Worth reporting with the file. |
+| `[minified unavailable …: the minified view is N bytes, over the … cap]` | Minified reads are whole-file or nothing, and this file exceeds 200KB even minified. | None — the plain paged read was served. Use `offset`/`limit` on it as usual. |
+| `minified reads return the whole file, so \`offset\`/\`limit\` do not apply` | The model passed both `minified: true` and a paging argument. | Expected, and self-correcting: the error names the plain read. The minified view has no line numbers to page by. |
+| `\`old_string\` was not found in the minified view of \`X\`` | Almost always: the text was quoted from a **plain** read, whose whitespace differs. | Re-read with `minified: true` and copy from that view — or drop `minified` from the edit. |
+| `the matched text … is only formatting the minifier inserted` | `old_string` covered only separators the minifier synthesized, which exist nowhere in the file. | Include a real token in `old_string`. |
+| `multi-line replacements can corrupt python indentation through the minified view` | A `new_string` containing a newline, in a language where indentation *is* syntax. | Use a plain edit (omit `minified`) for that change. Deliberate refusal, not a limitation to work around. |
+| `this edit would leave \`X\` no longer parsing; nothing was written` | The projected splice would break the file. Caught before the write. | Re-check `old_string`/`new_string` against a fresh minified read. The file is untouched. |
+| `this build has no minify support` | A `--no-default-features` build (no C toolchain). The `minified` argument isn't in the tool schema for such builds, so a model shouldn't reach this. | Re-issue without `minified`, or use a default build. |
+| Savings look smaller than expected | Comment-light or small files save 10–18%; `keep_comments = true` (the default) is the conservative mode; JSX-heavy `.tsx` saves only on its non-JSX portion. | Set `[minify] keep_comments = false` for 44–59%, accepting that the model reads code without the *why*. The per-read trailer always reports the real figure. |
+
 ## MCP servers
 
 | Message or symptom | Cause | Fix |
