@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.9.1] - 2026-07-30
+
 ### Added
 
 - **`read` and `edit` gained a `minified` mode: a token-stream view of source
