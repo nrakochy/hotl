@@ -15,6 +15,20 @@ semver promise of their own.
   red on the first attempt. Maintainer tooling — no change to installed
   behavior.
 
+### Fixed
+
+- **The loop ledger's first phase stamp could be silently overwritten.**
+  `now_nanos` reads elapsed time from an epoch initialized on its own first
+  call, so the first caller in a process read `0` — which `stamp` and `width`
+  both use to mean "never stamped". A real reading is now floored at 1ns, so
+  `0` is only ever the sentinel. Visible as a ~1-in-5 flaky
+  `first_stamp_wins`; in a real session it could drop the earliest phase
+  boundary from a profile.
+- **The `nix (macos-latest)` CI leg is green again.** Its darwin skip list had
+  fallen behind the code by three tests that need a subprocess to run through
+  the sandbox floor — impossible inside nix's own Seatbelt builder. Red since
+  v0.8.0.
+
 ## [0.9.1] - 2026-07-30
 
 ### Added

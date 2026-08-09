@@ -213,21 +213,52 @@ changelog's `[Unreleased]` section, and commits.
     scripts/release.sh major    # 1.0
     scripts/release.sh 0.4.2    # explicit version
 
-It then **pushes the commit, waits for CI to go green on it, and only then
-creates and pushes the `vX.Y.Z` tag.** The tag triggers three workflows — the
-crates.io publish, the prebuilt-binary/installer release, and the Nix tag
-check — and none of them waits for CI on its own, so holding the tag is what
-keeps a red commit from going out half-published. `publish.yml` re-checks the
-same evidence before it publishes, which covers a tag cut by hand.
+The full sequence, in order:
+
+1. **Refuse early.** Clean tree; `[Unreleased]` exists and is non-empty; no
+   section for this version yet; `gh` present and authenticated. Nothing is
+   edited until every reason to refuse is established — a half-bumped tree is
+   worse than no release.
+2. **Test locally.** `cargo test --workspace --locked`, then `cargo check` for
+   Linux in a `rust:slim` container. The local suite only proves the release
+   builds on *this* machine, and every release target but macOS is Linux.
+3. **Bump and commit** — version, path-dep pins, docs hero, `llms.txt`,
+   changelog promotion.
+4. **Push the commit alone**, then **wait for CI to go green on that exact
+   SHA**.
+5. **Tag and push the tag** — a second, separate push.
+
+Step 5 is what the whole gate protects. The tag triggers three workflows — the
+crates.io publish, the prebuilt-binary/installer release, and the Nix tag check
+— and none of them waits for CI on its own, so holding the tag is the only
+thing that stops all three. `publish.yml` re-checks the same evidence before it
+publishes, which covers a tag cut by hand or from another machine.
+
+The wait requires these `ci.yml` jobs to be green on the commit:
+
+    fmt  watch  harness  msrv  docs  audit
+
+The `nix` legs are deliberately advisory — they are master-only, legitimately
+skipped when no build input moved, and re-verified against the published tag by
+`nix-tag.yml`, whose failure is already non-fatal. A Nix-only regression can
+therefore still reach a tag; `nix-tag.yml` reports it minutes later.
 
 If CI goes red, the script stops with the commit pushed and nothing tagged.
 Fix the break, then finish the release without re-bumping anything:
 
     scripts/release.sh --tag-only
 
-`HOTL_SKIP_CI_WAIT=1` tags without waiting. It is an escape hatch for a CI
-outage, not a shortcut: `publish.yml` still refuses, so the practical result
-is binaries and a GitHub Release without the crates.io publish.
+It re-reads the version from `Cargo.toml`, refuses unless `HEAD` is what
+`origin/<branch>` points at, waits, tags, and pushes. It edits no files.
+
+| Env var | Effect |
+|---|---|
+| `HOTL_SKIP_CI_WAIT=1` | Tag without waiting. `publish.yml` still refuses, so the practical result is binaries and a GitHub Release without the crates.io publish. An escape hatch for a CI outage, not a shortcut |
+| `HOTL_SKIP_LINUX_CHECK=1` | Skip the Docker Linux cross-check (accepts that a Linux-only break may reach the tag) |
+| `HOTL_CI_WAIT_TIMEOUT` | Seconds to wait for CI, default 1800 |
+| `HOTL_CI_POLL_INTERVAL` | Seconds between polls, default 15 |
+
+`scripts/wait-for-ci.sh <sha>` can be run on its own to check any commit.
 
 Versions are immutable on crates.io — always go up, never reuse one. The tag
 must match the `[workspace.package]` version (the script keeps them in sync).
