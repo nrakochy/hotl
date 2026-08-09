@@ -13,6 +13,10 @@
 #   scripts/release.sh minor      # 0.1.0 -> 0.2.0   (breaking, while pre-1.0)
 #   scripts/release.sh major      # 0.1.0 -> 1.0.0
 #   scripts/release.sh 0.4.2      # set an explicit version
+#
+# Env:
+#   HOTL_SKIP_LINUX_CHECK=1   accept that a Linux-only break may reach the tag
+#   HOTL_SKIP_CI_WAIT=1       tag without waiting for green CI on the commit
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -40,6 +44,24 @@ tag="v$new"
 if git rev-parse "$tag" >/dev/null 2>&1; then
   echo "error: tag $tag already exists." >&2
   exit 1
+fi
+
+# The tag is what makes a release public, and the wait below is what holds it
+# back — so a missing `gh` has to be a refusal here, not a surprise after the
+# changelog has already been promoted.
+if [ "${HOTL_SKIP_CI_WAIT:-0}" != 1 ]; then
+  command -v gh >/dev/null 2>&1 || {
+    echo "error: gh is required to wait for CI before tagging." >&2
+    echo "hint: install the GitHub CLI, or re-run with HOTL_SKIP_CI_WAIT=1 to" >&2
+    echo "      accept a tag that no green CI run vouches for." >&2
+    exit 1
+  }
+  gh auth status >/dev/null 2>&1 || {
+    echo "error: gh is not authenticated, so CI status cannot be read." >&2
+    echo "hint: run 'gh auth login', or re-run with HOTL_SKIP_CI_WAIT=1 to" >&2
+    echo "      accept a tag that no green CI run vouches for." >&2
+    exit 1
+  }
 fi
 
 # --- changelog checks, before anything is edited --------------------------
@@ -154,7 +176,20 @@ awk -v v="$new" -v d="$(date +%F)" '
 
 cargo build --quiet            # sync Cargo.lock to the new version
 git commit -aqm "release: $tag"
+
+# The tag triggers publish.yml, release.yml and nix-tag.yml — all three, none
+# of which waits for CI. So the commit and the tag are two separate pushes:
+# send the commit, wait for CI to go green on it, and only then tag.
+branch="$(git rev-parse --abbrev-ref HEAD)"
+git push origin "$branch"
+
+if [ "${HOTL_SKIP_CI_WAIT:-0}" = 1 ]; then
+  echo "skipping the CI wait (HOTL_SKIP_CI_WAIT=1) — publish.yml will refuse if CI is red."
+else
+  bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"
+fi
+
 git tag -a "$tag" -m "$tag"
-git push --follow-tags
+git push origin "$tag"
 
 echo "pushed $tag — crates.io publish and release binaries are building."
