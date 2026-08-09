@@ -90,6 +90,12 @@ impl SandboxStatus {
 /// the hardened state, and inventing a marker there would put one on every
 /// unit test.
 fn read_posture() -> Reads {
+    // The probe found the carve unenforceable on this host: say so rather
+    // than let the ask imply a confinement that is not there. Per decision 5
+    // this labels, it does not revoke bash's allow-rules.
+    if read_carve_enforced() == Some(false) {
+        return Reads::Open;
+    }
     let deny = read_deny();
     if !deny.always.is_empty() && deny.secrets.is_empty() {
         Reads::Open
@@ -434,48 +440,129 @@ fn shell_single_quote(p: &std::path::Path) -> Option<String> {
     Some(format!("'{}'", s.replace('\'', r"'\''")))
 }
 
-/// Spawn a child under `build` that tries to create a file outside the
-/// confinement, and certify the mechanism only if it fails **and** the file
-/// does not exist afterwards. `build` is injected so the negative case is
-/// testable on any host, with no sandbox required.
+/// Whether the plan-0022 read-carve was proven enforced by `probe()`.
+/// `None` before the probe has run, or on a host where there was nothing to
+/// prove (an empty Tier A). `hotl doctor` prints it and the ask label marks
+/// `reads:open` when it is `Some(false)`.
+pub fn read_carve_enforced() -> Option<bool> {
+    READ_CARVE_ENFORCED.get().copied()
+}
+
+static READ_CARVE_ENFORCED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// The exit-code base the probe script uses. Anything outside `BASE..BASE+4`
+/// means the child never reached our `exit` — a `sandbox-exec` that refused
+/// the profile, a killed process — and is reported as *unverifiable* rather
+/// than silently read as an escape.
+const PROBE_EXIT_BASE: i32 = 10;
+
+/// Spawn a child under `build` that tries to (1) create a file outside the
+/// write confinement and (2) read a canary inside the read-carve, and certify
+/// the mechanism only if the write failed **and** left nothing on disk.
+/// `build` is injected so the negative case is testable on any host, with no
+/// sandbox required.
+///
+/// One spawn, not two: `probe_is_memoized_so_it_costs_one_spawn_per_process`
+/// pins the cost at one child per process.
+///
+/// **A failed read-carve does not demote the verdict** (plan 0022, task 7).
+/// Write-confinement is the older, load-bearing claim that gates `bash`
+/// allow-rules; demoting on a host that cannot narrow reads would revoke
+/// auto-approval for a restriction nobody opted into — the regression
+/// decision 5 rejects. The host is labeled `reads:open` instead.
 pub fn verify_confinement_with(
     mechanism: &str,
     build: impl Fn(&str) -> tokio::process::Command,
 ) -> Result<(), String> {
     let dir = probe_dir()?;
-    let target = dir.join(format!(
-        "hotl-sbx-probe-{}-{}",
+    let stamp = format!(
+        "{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
-    ));
+    );
+    let target = dir.join(format!("hotl-sbx-probe-{stamp}"));
     let _ = std::fs::remove_file(&target);
     let quoted = shell_single_quote(&target)
         .ok_or_else(|| format!("cannot verify {mechanism}: unquotable probe path"))?;
-    let outcome = run_bounded(build(&format!("echo hotl-probe > {quoted}")));
+
+    let canary = read_probe_canary(&stamp);
+    let read_script = match canary.as_ref().and_then(|c| shell_single_quote(c)) {
+        Some(q) => format!("cat {q} >/dev/null 2>&1 && r=1"),
+        None => "true".to_string(),
+    };
+    // The write runs in a subshell so a shell that treats a failed redirect
+    // as fatal kills only the subshell — otherwise a working sandbox would
+    // look unverifiable. Exit code carries both bits: +2 write escaped,
+    // +1 read escaped.
+    let script = format!(
+        "w=0; r=0; ( echo hotl-probe > {quoted} ) 2>/dev/null && w=1; {read_script}; \
+         exit $(( {PROBE_EXIT_BASE} + w * 2 + r ))"
+    );
+    let outcome = run_bounded(build(&script));
     let leaked = target.exists();
     if leaked {
         let _ = std::fs::remove_file(&target);
     }
-    match outcome {
-        Ok(success) if leaked || success => Err(format!(
+    // Delete the canary on *every* path, including the escape path — the same
+    // rule `tests/sandbox_probe_leak.rs` enforces for the write probe.
+    if let Some(c) = &canary {
+        let _ = std::fs::remove_file(c);
+    }
+    let code = match outcome {
+        Ok(code) => code,
+        Err(e) => return Err(format!("`{mechanism}` could not be verified: {e}")),
+    };
+    let Some(bits) = code
+        .checked_sub(PROBE_EXIT_BASE)
+        .filter(|b| (0..4).contains(b))
+    else {
+        return Err(format!(
+            "`{mechanism}` could not be verified: the probe child exited {code} without \
+             reaching its own `exit` — the profile/ruleset was probably rejected"
+        ));
+    };
+    if canary.is_some() {
+        let _ = READ_CARVE_ENFORCED.set(bits & 1 == 0);
+    }
+    if leaked || bits & 2 != 0 {
+        return Err(format!(
             "`{mechanism}` did not confine a write to {} — the profile/ruleset is not \
              being applied on this host, so bash cannot be auto-approved",
             target.display()
-        )),
-        Ok(_) => Ok(()),
-        Err(e) => Err(format!("`{mechanism}` could not be verified: {e}")),
+        ));
     }
+    Ok(())
+}
+
+/// Plant a canary inside Tier A and prove the *parent* can read it back.
+/// Without that positive control a "the child could not read it" result
+/// proves nothing — the file might simply be unreadable to everyone.
+/// `None` means there was nothing to test (no carve, or no Tier A dir that
+/// exists and round-trips), and the read half is skipped rather than faked.
+fn read_probe_canary(stamp: &str) -> Option<PathBuf> {
+    for dir in &read_deny().always {
+        let path = dir.join(format!("hotl-sbx-read-probe-{stamp}"));
+        if std::fs::write(&path, b"hotl-read-probe").is_err() {
+            continue;
+        }
+        if std::fs::read(&path).is_ok_and(|b| b == b"hotl-read-probe") {
+            return Some(path);
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+    None
 }
 
 /// Run to completion under `PROBE_TIMEOUT` using the **std** command inside
 /// the tokio one: `probe()` is sync and is called from contexts with and
 /// without a tokio runtime (`doctor.rs` vs `builtins.rs`), so it must not
 /// depend on a reactor. `as_std_mut` keeps any `pre_exec` closure the Landlock
-/// path installed. Returns Ok(child_succeeded).
-fn run_bounded(mut cmd: tokio::process::Command) -> std::io::Result<bool> {
+/// path installed. Returns Ok(exit code); a signal death reports -1, which is
+/// outside the probe's own code range and so reads as unverifiable.
+fn run_bounded(mut cmd: tokio::process::Command) -> std::io::Result<i32> {
     let std_cmd = cmd.as_std_mut();
     std_cmd
         .stdin(std::process::Stdio::null())
@@ -485,7 +572,7 @@ fn run_bounded(mut cmd: tokio::process::Command) -> std::io::Result<bool> {
     let deadline = std::time::Instant::now() + PROBE_TIMEOUT;
     loop {
         match child.try_wait()? {
-            Some(status) => return Ok(status.success()),
+            Some(status) => return Ok(status.code().unwrap_or(-1)),
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();

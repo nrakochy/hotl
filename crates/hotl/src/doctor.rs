@@ -257,6 +257,27 @@ fn sandbox_check(config_dir: &Path) -> Vec<Check> {
             "sandbox: unavailable ({reason}) — every exec is individually gated"
         )),
     });
+    // The probe tests the read carve in the same spawn; a host that cannot
+    // enforce it keeps its `bash` allow-rules and says so instead (plan 0022
+    // decision 5).
+    match hotl_tools::sandbox::read_carve_enforced() {
+        Some(true) => checks.push(ok(
+            "sandbox: read carve enforced (verified by the probe)".into()
+        )),
+        Some(false) => checks.push(warn(
+            "sandbox: the read carve is NOT enforced on this host — a sandboxed command \
+             can read hotl's own config/state and your credentials; every ask is marked \
+             `reads:open`"
+                .into(),
+        )),
+        None => {}
+    }
+    for failure in hotl_tools::sandbox::read_carve_failures() {
+        checks.push(warn(format!(
+            "sandbox: the read carve could not open {failure} — reads under it are denied \
+             to sandboxed commands, which is fail-closed but was not asked for"
+        )));
+    }
     checks
 }
 

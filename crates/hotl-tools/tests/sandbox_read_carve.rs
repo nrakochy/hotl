@@ -57,6 +57,23 @@ async fn the_carve_denies_hotls_own_run_dir_through_the_process_global_path() {
         return;
     };
 
+    // Plan 0022 task 7: the probe tested the carve in the same spawn it uses
+    // for the write, and certified it. It also cleaned up after itself — a
+    // leaked probe canary inside Tier A is exactly the thing the carve exists
+    // to keep out of reach.
+    assert_eq!(
+        sandbox::read_carve_enforced(),
+        Some(true),
+        "the probe must certify the read carve on a host that enforces it"
+    );
+    let strays: Vec<_> = std::fs::read_dir(&run_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n != "session.token")
+        .collect();
+    assert!(strays.is_empty(), "the probe left {strays:?} behind");
+
     // Positive control: the canary is readable from the parent, and from a
     // sandboxed child at a path outside the carve. Without this the negative
     // below would pass on a host where nothing is readable anyway.
