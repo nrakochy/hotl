@@ -46,7 +46,7 @@ Frontmatter fields:
 | `tools` | `all` (default) \| `read-only` \| a comma list of tool names (`read, grep, bash`). |
 | `model` | Override the child's model. Omit to inherit the parent's. |
 | `effort` | Parsed, not yet applied — hotl has no effort ladder today (only a thinking on/off switch). Reserved for a future release. |
-| `isolation` | Parsed-but-deferred (Claude-compat: `isolation: worktree`). Per-child workspace isolation isn't built yet — hotl notes it and ignores it rather than silently no-op-ing. |
+| `isolation` | `worktree` gives this def's children their own git worktree to work in; `none` (default) shares your working directory. See [Worktree isolation](#worktree-isolation) below. Beats the `[agents] isolation` default. |
 
 The body after the `---` fence is the child's system prompt. Omit it to
 inherit the parent's system prompt unchanged (useful for a def that only
@@ -104,13 +104,70 @@ prior turns.
   4) bounds how many children run their expensive step (the LLM call) at
   once, globally across the whole process — a model that issues 30 `spawn`
   calls in one batch still only runs 4 at a time; the rest queue. Two
-  *mutating* children (anything broader than a read-only tool scope) never
-  run concurrently regardless of that budget — per-child workspace isolation
-  (`isolation: worktree`) isn't built yet, and two children editing the same
-  tree at once would corrupt each other. Read-only fan-out (`explore`) is
-  unaffected and can run at full width.
+  *mutating* children (anything broader than a read-only tool scope) that
+  share your working directory never run concurrently regardless of that
+  budget — two children editing the same tree at once would corrupt each
+  other. **Isolated children are the exception**: they each edit their own
+  worktree, so they run at full width. Read-only fan-out (`explore`) has
+  never been affected.
 - **`teammate` (a peer topology, not a child) is reserved** — not available
   yet.
+
+## Worktree isolation
+
+Turn it on per def:
+
+```
+---
+name: refactorer
+isolation: worktree
+---
+```
+
+…or for every mutating child:
+
+    [agents]
+    isolation = "worktree"
+
+The def's own `isolation:` wins where both are set. Read-only defs
+(`explore`, `plan`, anything with a read-only tool scope) are never isolated
+— they cannot write, and a checkout per child would be pure cost on the
+fan-out hot path.
+
+**What the child starts from.** A copy of your **current working tree** —
+including uncommitted and untracked files, so the child reads what you are
+actually looking at, not the last commit. **Gitignored files are not
+copied.** That is what keeps `target/` and `node_modules/` free, and it is
+the same line `hotl undo`'s snapshot draws — but it also means a child
+cannot read your `.env`, and a child that builds pays a cold build.
+
+**What happens when it finishes.**
+
+- Its changes are applied to your working tree **whole or not at all**, and
+  **never staged** — your index is untouched either way.
+- On conflict nothing is applied. The child's worktree is left in place and
+  its path is reported along with the diff, so its work is never destroyed.
+- Two isolated children can produce diffs that conflict with *each other*.
+  The second to finish loses and reports. That is the accepted cost of
+  running them in parallel.
+- If you keep editing while a child runs, a child seeded three turns ago may
+  be diffing against a base you have moved past. `git apply` refuses; the
+  work is preserved and reported rather than merged wrong.
+
+**The bash caveat.** The file tools (`read`/`write`/`edit`/`glob`/`grep`)
+are strictly confined to the worktree. `bash` is not: hotl's kernel write
+floor is process-wide, so a command can `cd ..` and write to your tree. This
+is isolation against *accidental* collision between children, not
+containment of a hostile one.
+
+**Where it lives.** `<workspace>/.git/hotl-worktrees/<id>` — inside `.git/`,
+so it never shows up in `git status`, `glob`, `grep`, or an undo snapshot.
+Worktrees are removed when the child finishes; a conflicted one stays until
+you deal with it.
+
+**Without git** — no `git` on `PATH`, or a workspace that is not a git
+worktree — the child runs in your working directory as usual and the
+`spawn` result says so.
 
 See [Configuration → Concurrency](../configuration/#concurrency-concurrency)
 for the full `[concurrency]` reference, and

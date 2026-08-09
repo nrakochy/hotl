@@ -90,6 +90,12 @@ claude = true               # false: skip ~/.claude/skills and Claude plugin ski
 acme = "https://github.com/acme/skills.git"   # managed checkout
 team = "~/work/team-skills"                    # local, read in place
 
+[agents]                    # sub-agent defs (see agents.md)
+claude = true               # false: skip ~/.claude/agents
+isolation = "none"          # "worktree": every mutating child gets its own
+                            # git worktree and they run in parallel; a def's
+                            # own `isolation:` frontmatter wins
+
 [concurrency]               # Layer-B budgets; every field optional, safe defaults
 requests = 4                # concurrent web_fetch/web_search HTTP requests
 agents = 4                  # concurrent spawn sub-agent sessions (global, parent + children)
@@ -170,7 +176,7 @@ These are fixed for the life of the process; restart to change them:
 | `system-prompt.md` | Replaces the built-in agent instructions (prose). |
 | `memory/MEMORY.md` | Loaded into every session's starting context (capped at 16 KB), enveloped. |
 | `skills/*.md` | One procedure per file; the `skill` tool lists and loads them by name. See [skills.md](../skills/). |
-| `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort` frontmatter, body = system prompt. See [agents.md](../agents/). |
+| `agents/*.md` | One sub-agent definition per file — `tools`/`model`/`effort`/`isolation` frontmatter, body = system prompt. See [agents.md](../agents/). |
 | `trust.toml` | Written by hotl, not you: approved MCP server binary hashes. |
 
 ### Skills (`[skills]`)
@@ -416,7 +422,7 @@ Setting this too high overflows the model mid-turn; too low burns a summarize ca
 The shared budget that bounds concurrent external work, one process-wide instance shared by the parent session and every sub-agent it spawns:
 
 - `requests` caps how many `web_fetch`/`web_search` HTTP calls run at once (a batch of 20 URLs never opens more than `requests` sockets simultaneously; default 4).
-- `agents` caps how many `spawn` children run their expensive step (the LLM call) at once — a model that issues 30 `spawn` calls in one batch still only runs `agents` at a time; the rest queue rather than stampeding the provider (default 4). See [agents.md](../agents/).
+- `agents` caps how many `spawn` children run their expensive step (the LLM call) at once — a model that issues 30 `spawn` calls in one batch still only runs `agents` at a time; the rest queue rather than stampeding the provider (default 4). Two *mutating* children that share your working directory are serialized on top of that cap; children with `isolation = "worktree"` are not. See [agents.md](../agents/).
 - `subprocs` is reserved config surface for upcoming subprocess-batching work; setting it has no effect yet.
 - `blocking_threads` caps the tokio blocking-thread pool (default 16) — the pool `glob`'s tree walk uses; tokio's own unconfigured default is 512.
 - `worker_threads` is parsed for completeness but stays deliberately inert: it only applies to a multi-threaded async runtime, and hotl runs a single-threaded (`current_thread`) runtime everywhere by design (switching would risk breaking `!Send` futures in the TUI/actor code). Setting it logs a startup warning noting it has no effect.

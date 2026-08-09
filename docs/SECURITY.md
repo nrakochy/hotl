@@ -189,6 +189,13 @@ in config.toml). The tool is absent when nothing is configured.
 
 **`spawn` (sub-agents).** The child has **no human on the loop**, so its permission asks default-deny — it runs only auto-allowed/read-only tools under the parent's sandbox floor and rules. The depth cap is **structural, not a counter**: children are built with a builtins-only tool registry — no `spawn`, no MCP — so a child cannot recurse or reach external servers; the capability simply isn't in its registry. Results return to the parent inside the untrusted envelope. `fork` and `teammate` are reserved topologies.
 
+**Worktree isolation (`isolation: worktree`, `[agents] isolation`).** An isolated child works in its own `git worktree` under `<workspace>/.git/hotl-worktrees/`, and its diff is applied back to your working tree when it finishes. Two limits are deliberate and worth knowing:
+
+| Limit | What it means |
+|---|---|
+| Sub-agent edits reach your working tree with **no second y/n gate** | The `spawn` call itself is gated (an ordinary ask), and `hotl undo`'s shadow snapshot still holds the pre-batch state. That snapshot covers the working tree only, which is why the merge-back uses plain `git apply` and **never** `--index`: a staging-area change is exactly what undo cannot reverse. The apply is all-or-nothing — on conflict nothing is written and the child's worktree is left in place at the reported path. |
+| Isolation confines the **file tools**, not `bash` | `read`/`write`/`edit`/`glob`/`grep` descend from the worktree's root fd and cannot name their way out. The *kernel* write floor is process-wide and set once at startup, so a child's `bash` can `cd ..` and write to the parent's tree. This is cooperative isolation against accidental collision, **not adversarial containment**. Narrowing the floor per child is tracked as debt. |
+
 **`hotl acp` (protocol surface).** The connected client answers `session/request_permission` round-trips — it *is* the human-on-the-loop for that session, exactly like the console. A missing or malformed reply, or a client that hangs up, resolves to deny.
 
 ## Hooks

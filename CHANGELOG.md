@@ -6,6 +6,43 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-sub-agent worktree isolation: `isolation: worktree`.** An isolated
+  sub-agent works in its own `git worktree` instead of your working
+  directory, and its changes are applied back when it finishes. Turn it on
+  per def (`isolation: worktree` in `agents/*.md` frontmatter — a field that
+  has parsed and been ignored since M4) or for every mutating child
+  (`[agents] isolation = "worktree"`). The def's own setting wins; read-only
+  defs like `explore` are never isolated.
+
+  **Isolated children run in parallel.** Two mutating children sharing one
+  working tree would corrupt each other, so hotl has serialized them for a
+  child's entire lifetime. Worktrees make that collision physically
+  impossible, so isolated children now run at the full `[concurrency].agents`
+  width and take a lock only for the duration of one `git apply`. A mutating
+  child *without* a worktree is serialized exactly as before.
+
+  Three things worth knowing before turning it on:
+
+  - The child starts from a copy of your **current working tree** —
+    uncommitted and untracked files included, so it reads what you are
+    actually looking at rather than the last commit. **Gitignored files are
+    not copied**: that is what keeps `target/` free, and it also means a
+    child cannot read your `.env` and a child that builds pays a cold build.
+  - Its changes are applied **whole or not at all**, and **never staged**.
+    On conflict nothing is written, and the child's worktree is left in place
+    with its path and diff reported — its work is never destroyed. Two
+    isolated children can also conflict with each other; the second to finish
+    loses and reports.
+  - Isolation confines the **file tools**, not `bash`. hotl's kernel write
+    floor is process-wide, so a child's `bash` can `cd ..` and write to your
+    tree. This is isolation against accidental collision, not containment of
+    a hostile child.
+
+  Without git — or in a directory that is not a git worktree — the child runs
+  in your working directory as before and the `spawn` result says so.
+
 ### Changed
 
 - **The kernel sandbox denies a fixed set of reads. Default on, behavior
