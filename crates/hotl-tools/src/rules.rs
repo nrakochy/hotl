@@ -43,6 +43,8 @@
 
 use serde::Deserialize;
 use serde_json::Value;
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 
 /// Whether ordinary (unprotected) tool calls prompt. `Ask` is the library
 /// default; the binary resolves the product default from config.
@@ -123,6 +125,10 @@ pub struct Rules {
     admin_deny: Vec<AllowRule>,
     #[serde(skip)]
     lock_user_allows: bool,
+    /// The home directory `~/`-rooted `path_prefix` values expand against.
+    /// A parameter rather than a `$HOME` read so matching stays hermetic.
+    #[serde(skip)]
+    home: Option<PathBuf>,
 }
 
 /// The admin tier: `/etc/hotl/preapproved.toml`. Same rule schema as the
@@ -268,6 +274,18 @@ impl Rules {
         self.plan
     }
 
+    /// The home directory `~/`-rooted `path_prefix` values expand against.
+    /// `None` (the default) keeps the pre-0025 literal behavior, which is what
+    /// every hermetic test in this module expects.
+    pub fn with_home(mut self, home: Option<PathBuf>) -> Self {
+        self.home = home;
+        self
+    }
+
+    pub fn home(&self) -> Option<&Path> {
+        self.home.as_deref()
+    }
+
     /// Rules that cannot match anything, as human-readable warnings. A typo'd
     /// key or a missing predicate used to be silent — and a silent permission
     /// rule is the whole shape of T1-7. Pure; the binary prints these at
@@ -358,10 +376,10 @@ impl Rules {
         input: &Value,
         facts: CallFacts,
     ) -> Verdict {
-        if let Some(rule) = match_deny(&self.admin_deny, tool, input) {
+        if let Some(rule) = match_deny(&self.admin_deny, tool, input, self.home()) {
             return Verdict::Deny { rule };
         }
-        if let Some(rule) = match_deny(&self.deny, tool, input) {
+        if let Some(rule) = match_deny(&self.deny, tool, input, self.home()) {
             return Verdict::Deny { rule };
         }
         if facts.protected {
@@ -370,13 +388,25 @@ impl Rules {
         if plan && facts.edits_files {
             return Verdict::Ask; // plan's floor: never auto into a file change
         }
-        if let Some(rule) = match_allow(&self.admin_allow, tool, input, facts.sandbox_enforced) {
+        if let Some(rule) = match_allow(
+            &self.admin_allow,
+            tool,
+            input,
+            facts.sandbox_enforced,
+            self.home(),
+        ) {
             return Verdict::Auto {
                 rule: format!("admin: {rule}"),
             };
         }
         if !self.lock_user_allows {
-            if let Some(rule) = match_allow(&self.allow, tool, input, facts.sandbox_enforced) {
+            if let Some(rule) = match_allow(
+                &self.allow,
+                tool,
+                input,
+                facts.sandbox_enforced,
+                self.home(),
+            ) {
                 return Verdict::Auto { rule };
             }
         }
@@ -411,7 +441,8 @@ impl Rules {
     /// this deliberately runs neither. Plan's floor is likewise irrelevant: a
     /// `Permission::None` tool is not an `edits_files` tool.
     pub fn denied(&self, tool: &str, input: &Value) -> Option<String> {
-        match_deny(&self.admin_deny, tool, input).or_else(|| match_deny(&self.deny, tool, input))
+        match_deny(&self.admin_deny, tool, input, self.home())
+            .or_else(|| match_deny(&self.deny, tool, input, self.home()))
     }
 }
 
@@ -516,6 +547,7 @@ fn match_allow(
     tool: &str,
     input: &Value,
     sandbox_enforced: bool,
+    home: Option<&Path>,
 ) -> Option<String> {
     for rule in rules {
         if rule.tool != tool {
@@ -564,7 +596,8 @@ fn match_allow(
                 // INVARIANT: no `..` escape and no absolute path ever matches a
                 // relative allow prefix. Enforced by
                 // `path_traversal_never_auto_allows`.
-                if let Some(resolved) = values.iter().find_map(|p| lexically_contained(p, pp)) {
+                if let Some(resolved) = values.iter().find_map(|p| lexically_contained(p, pp, home))
+                {
                     return Some(format!("{tool} path `{pp}` ({resolved})"));
                 }
             }
@@ -593,7 +626,12 @@ fn match_allow(
 /// INVARIANT: every allow-side match is also a deny-side match for the same
 /// rule text — deny is never weaker than allow. Enforced by
 /// `deny_is_never_weaker_than_allow`.
-fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> {
+fn match_deny(
+    rules: &[AllowRule],
+    tool: &str,
+    input: &Value,
+    home: Option<&Path>,
+) -> Option<String> {
     for rule in rules {
         if rule.tool != tool {
             continue;
@@ -616,7 +654,7 @@ fn match_deny(rules: &[AllowRule], tool: &str, input: &Value) -> Option<String> 
             }
         }
         if let Some(pp) = &rule.path_prefix {
-            if values.iter().any(|path| deny_path_matches(path, pp)) {
+            if values.iter().any(|path| deny_path_matches(path, pp, home)) {
                 return Some(format!("{tool} path `{pp}`"));
             }
         }
@@ -676,28 +714,51 @@ fn probe(tool: &str) -> AllowRule {
 ///
 /// Matching is on whole components — `.ssh/` never matches `.sshfs/`.
 ///
+/// A `~/`-rooted prefix expands against `home` and then anchors like any other
+/// absolute one — `~/.ssh` denies `/Users/you/.ssh/id_rsa` and nothing at a
+/// deeper `.ssh`.
+///
 /// INVARIANT: relative deny prefixes match at any depth, absolute ones only at
-/// the root. Enforced by `deny_path_prefix_matches_absolute_and_relative`.
-fn deny_path_matches(path: &str, prefix: &str) -> bool {
-    // Legacy raw comparison, preserved so this change only ever adds denials.
+/// the root. Enforced by `deny_path_prefix_matches_absolute_and_relative` and
+/// `tilde_path_prefix_anchors_at_the_root`.
+fn deny_path_matches(path: &str, prefix: &str, home: Option<&Path>) -> bool {
+    // Legacy raw comparison against the UNEXPANDED prefix: this is the arm
+    // that catches a model-written literal `~/.ssh/id_rsa`. Expanding here
+    // would remove a denial, and this tier only ever adds them.
     let pp_trim = prefix.trim_start_matches("./");
     if path.trim_start_matches("./").starts_with(pp_trim)
         || lexical_normalize(path).starts_with(pp_trim)
     {
         return true;
     }
-    let pat: Vec<&str> = components(prefix);
+    let expanded = expand_tilde(prefix, home);
+    let pat: Vec<&str> = components(&expanded);
     if pat.is_empty() {
         return true; // an empty prefix denies everything, as before
     }
     let normalized = lexical_normalize(path);
     let hay: Vec<&str> = components(&normalized);
-    if prefix.starts_with('/') {
+    // `expanded`, not `prefix`: an expanded `~/.ssh` must anchor at the root
+    // rather than fall through to the floating arm below.
+    if expanded.starts_with('/') {
         return normalized.starts_with('/')
             && hay.len() >= pat.len()
             && hay[..pat.len()] == pat[..];
     }
     hay.windows(pat.len()).any(|w| w == pat.as_slice())
+}
+
+/// `~/…` against `home`. Everything else is returned untouched — a bare `~`
+/// and `~user` are forms hotl resolves nowhere else, so they stay literal and
+/// [`project`] reports them as unprojectable.
+fn expand_tilde<'a>(prefix: &'a str, home: Option<&Path>) -> Cow<'a, str> {
+    match (prefix.strip_prefix("~/"), home) {
+        (Some(rest), Some(home)) => Cow::Owned(format!(
+            "{}/{rest}",
+            home.to_string_lossy().trim_end_matches('/')
+        )),
+        _ => Cow::Borrowed(prefix),
+    }
 }
 
 /// Path components, with empty/`.` segments dropped.
@@ -892,10 +953,23 @@ fn ordered_subsequence(hay: &[String], needles: &[&str]) -> bool {
 ///
 /// INVARIANT: a `..` escape out of an allow prefix never auto-allows. Enforced
 /// by `path_traversal_never_auto_allows`.
-fn lexically_contained(path: &str, prefix: &str) -> Option<String> {
+/// A `~/`-rooted prefix is tested both raw and expanded. The expanded form is
+/// a genuine loosening — `[[allow]] write path_prefix = "~/x"` auto-approves
+/// nothing today and afterwards auto-approves writes under `$HOME/x` — kept
+/// because the alternative is a config language where the same syntax works on
+/// the deny side and silently fails on the allow side (plan 0025, decision 8).
+fn lexically_contained(path: &str, prefix: &str, home: Option<&Path>) -> Option<String> {
     let resolved = lexical_normalize(path);
-    let prefix = prefix.trim_start_matches("./");
-    resolved.starts_with(prefix).then_some(resolved)
+    let expanded = expand_tilde(prefix, home);
+    for p in [
+        prefix.trim_start_matches("./"),
+        expanded.trim_start_matches("./"),
+    ] {
+        if resolved.starts_with(p) {
+            return Some(resolved);
+        }
+    }
+    None
 }
 
 fn lexical_normalize(path: &str) -> String {
@@ -1917,6 +1991,93 @@ prefix = "payments"
             ),
             Verdict::Auto { .. }
         ));
+    }
+
+    /// A `~/.ssh` deny over `read`, with an optional expansion home.
+    fn tilde_deny(home: Option<&str>) -> Rules {
+        Rules::from_toml("[[deny]]\ntool = \"read\"\npath_prefix = \"~/.ssh\"\n")
+            .unwrap()
+            .with_home(home.map(PathBuf::from))
+    }
+
+    fn read_denied(r: &Rules, path: &str) -> bool {
+        r.denied("read", &json!({"path": path})).is_some()
+    }
+
+    #[test]
+    fn tilde_path_prefix_matches_an_absolute_home_path() {
+        let r = tilde_deny(Some("/fixture/home"));
+        assert!(read_denied(&r, "/fixture/home/.ssh/id_ed25519"));
+        assert!(read_denied(&r, "/fixture/home/.ssh"));
+        assert!(!read_denied(&r, "/fixture/home/notes.md"));
+    }
+
+    /// The site-2 regression: an expanded prefix anchors at the root, so it
+    /// must not fall through to the floating arm and match at any depth.
+    #[test]
+    fn tilde_path_prefix_anchors_at_the_root() {
+        let r = tilde_deny(Some("/fixture/home"));
+        assert!(!read_denied(&r, "/tmp/scratch/fixture/home/.ssh/id_rsa"));
+    }
+
+    /// Site 1 survives: a model-written literal `~/…` still matches.
+    #[test]
+    fn tilde_path_prefix_still_matches_a_literal_tilde_input() {
+        for home in [Some("/fixture/home"), None] {
+            let r = tilde_deny(home);
+            assert!(read_denied(&r, "~/.ssh/id_rsa"), "home = {home:?}");
+        }
+    }
+
+    /// The seam defaults off — every other hermetic test in this module pins
+    /// pre-0025 behavior, and this is what proves they still do.
+    #[test]
+    fn tilde_expansion_is_off_without_a_home() {
+        let r = tilde_deny(None);
+        assert!(!read_denied(&r, "/fixture/home/.ssh/id_ed25519"));
+        assert!(read_denied(&r, "~/.ssh/id_rsa"));
+    }
+
+    #[test]
+    fn bare_tilde_and_tilde_user_stay_literal() {
+        for prefix in ["~", "~someone/.ssh"] {
+            let r = Rules::from_toml(&format!(
+                "[[deny]]\ntool = \"read\"\npath_prefix = \"{prefix}\"\n"
+            ))
+            .unwrap()
+            .with_home(Some(PathBuf::from("/fixture/home")));
+            assert!(
+                !read_denied(&r, "/fixture/home/.ssh/id_rsa"),
+                "`{prefix}` must not expand"
+            );
+        }
+    }
+
+    /// The one loosening in plan 0025: a `~/`-rooted allow rule begins
+    /// auto-approving what it always read as granting.
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn tilde_path_prefix_expands_on_the_allow_side_too() {
+        let r = Rules::from_toml("[[allow]]\ntool = \"write\"\npath_prefix = \"~/x\"\n")
+            .unwrap()
+            .with_home(Some(PathBuf::from("/fixture/home")));
+        let auto = |rules: &Rules, path: &str| {
+            matches!(
+                rules.evaluate(
+                    PermissionMode::Ask,
+                    false,
+                    "write",
+                    &json!({"path": path}),
+                    facts(true, false, false)
+                ),
+                Verdict::Auto { .. }
+            )
+        };
+        assert!(auto(&r, "/fixture/home/x/notes.md"));
+        assert!(!auto(&r, "/fixture/home/y/notes.md"));
+        // And off without a home, exactly as before.
+        let off = Rules::from_toml("[[allow]]\ntool = \"write\"\npath_prefix = \"~/x\"\n").unwrap();
+        assert!(!auto(&off, "/fixture/home/x/notes.md"));
     }
 
     #[test]

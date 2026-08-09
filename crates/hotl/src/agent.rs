@@ -1972,6 +1972,8 @@ fn load_rules_with(
     }
     rules = rules.with_mode(resolved.mode); // enforced builds coerce Bypass→Ask inside
     rules = rules.with_plan(resolved.plan);
+    // `~/`-rooted path_prefix values expand against this (plan 0025 task 1).
+    rules = rules.with_home(crate::config::home_dir());
     if let Some(path) = admin_path {
         match load_admin(path) {
             Ok(Some(admin)) => rules.merge_admin(admin),

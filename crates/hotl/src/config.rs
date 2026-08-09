@@ -127,7 +127,7 @@ pub fn is_git_url(source: &str) -> bool {
 /// `$HOME`, or `None` where the environment does not name one (a daemon with
 /// a scrubbed env). The credential read-carve is `$HOME`-relative, so no home
 /// simply means no Tier B — narrower, never wider.
-fn home_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
     std::env::var_os("HOME").map(std::path::PathBuf::from)
 }
 
