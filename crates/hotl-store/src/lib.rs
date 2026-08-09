@@ -20,6 +20,7 @@
 
 pub mod retention;
 pub mod shadow;
+pub mod worktree;
 
 use std::borrow::Cow;
 use std::fs::{DirBuilder, File, OpenOptions};
