@@ -95,6 +95,23 @@ pub struct AgentsCfg {
     /// `false` stops reading `~/.claude/agents`. Default: read it when
     /// present.
     pub claude: Option<bool>,
+    /// `"worktree"` gives every mutating child its own git worktree by
+    /// default. A def's own `isolation:` frontmatter wins over this. Unknown
+    /// values fail closed to no isolation. Default: off.
+    pub isolation: Option<String>,
+}
+
+impl AgentsCfg {
+    /// The configured default, resolved through the one fail-closed parse
+    /// `agents.rs` also uses for frontmatter — deliberately not a second match
+    /// arm, so the two spellings can never drift apart.
+    pub fn isolation(&self) -> hotl_tools::agents::Isolation {
+        self.isolation
+            .as_deref()
+            .map_or(hotl_tools::agents::Isolation::None, |raw| {
+                hotl_tools::agents::parse_isolation(raw, "`[agents] isolation`")
+            })
+    }
 }
 
 /// A git URL as opposed to a local path: a fetch scheme, an scp-style
@@ -816,6 +833,31 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), toml).unwrap();
         Config::load(dir.path())
+    }
+
+    #[test]
+    fn agents_isolation_parses_fail_closed() {
+        use hotl_tools::agents::Isolation;
+        assert_eq!(cfg_with("").agents.isolation(), Isolation::None);
+        assert_eq!(
+            cfg_with("[agents]\nisolation = \"worktree\"\n")
+                .agents
+                .isolation(),
+            Isolation::Worktree
+        );
+        assert_eq!(
+            cfg_with("[agents]\nisolation = \"none\"\n")
+                .agents
+                .isolation(),
+            Isolation::None
+        );
+        // A typo must not become the permissive reading.
+        assert_eq!(
+            cfg_with("[agents]\nisolation = \"worktee\"\n")
+                .agents
+                .isolation(),
+            Isolation::None
+        );
     }
 
     #[test]

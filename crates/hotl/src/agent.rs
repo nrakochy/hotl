@@ -3630,6 +3630,7 @@ mod tests {
             tools: hotl_tools::agents::ToolScope::All,
             model: Some("a-different-model".into()),
             effort: None,
+            isolation: hotl_tools::agents::Isolation::None,
             source: hotl_tools::agents::AgentSource::User,
         };
         let (items, inherited) = cb.fork_initial_items(&cross_model, "brief", Vec::new());

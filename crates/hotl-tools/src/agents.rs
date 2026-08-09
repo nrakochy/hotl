@@ -41,6 +41,37 @@ pub enum ToolScope {
     Only(Vec<String>),
 }
 
+/// Whether a child gets its own git worktree to work in.
+///
+/// A def's `isolation:` frontmatter wins; `[agents] isolation` in config.toml
+/// is the fallback; off is the default. Read-only defs are never isolated
+/// regardless — `explore` and `plan` have nothing to isolate and a checkout is
+/// not free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    #[default]
+    None,
+    Worktree,
+}
+
+/// `"worktree"` | `"none"`. Fail-closed like `SandboxCfg::file_tools`: an
+/// unknown value is `None` plus a warning, never a guess. Shared by the
+/// frontmatter parse and the `[agents] isolation` config parse so the two can
+/// never drift.
+pub fn parse_isolation(raw: &str, whose: &str) -> Isolation {
+    match raw.trim() {
+        "worktree" => Isolation::Worktree,
+        "none" | "" => Isolation::None,
+        other => {
+            eprintln!(
+                "hotl: {whose} sets `isolation: {other}`, which is not a known value \
+                 (`worktree` | `none`) — running without isolation."
+            );
+            Isolation::None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentDef {
     pub name: String,
@@ -54,6 +85,10 @@ pub struct AgentDef {
     /// today (only a `thinking: bool`), so this rides along for a future
     /// plan rather than being silently dropped.
     pub effort: Option<String>,
+    /// Whether this def's children get their own git worktree. `None` here
+    /// means "unset", not "off": the `[agents] isolation` default still
+    /// applies (`hotl::agent::HotlChildBuilder::spawn_child`).
+    pub isolation: Isolation,
     pub source: AgentSource,
 }
 
@@ -77,6 +112,9 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             tools: ToolScope::All,
             model: None,
             effort: None,
+            // The three built-ins stay unset; `[agents] isolation` is what
+            // turns worktrees on for `general-purpose`.
+            isolation: Isolation::None,
             source: AgentSource::BuiltIn,
         }),
         "explore" => Some(AgentDef {
@@ -94,6 +132,7 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             tools: ToolScope::ReadOnly,
             model: None,
             effort: None,
+            isolation: Isolation::None,
             source: AgentSource::BuiltIn,
         }),
         "plan" => Some(AgentDef {
@@ -111,6 +150,7 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             tools: ToolScope::ReadOnly,
             model: None,
             effort: None,
+            isolation: Isolation::None,
             source: AgentSource::BuiltIn,
         }),
         _ => None,
@@ -123,11 +163,9 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
 /// `name:` field — callers scanning a directory fall back to the filename
 /// via [`parse_def_or_named`].
 ///
-/// `isolation:` is recognized-but-deferred: a Claude-compat frontmatter field
-/// naming a reserved seam (per-child worktree isolation) hotl hasn't built
-/// yet. It's parsed only so an owner who writes it gets a one-line note
-/// rather than silent no-op — the value itself is never stored on
-/// [`AgentDef`] and has no effect.
+/// `isolation:` (`worktree` | `none`) selects whether this def's children get
+/// their own git worktree; see [`Isolation`]. It is the highest-precedence
+/// setting — `[agents] isolation` only applies to defs that stay silent.
 pub fn parse_def(text: &str, source: AgentSource) -> Option<AgentDef> {
     parse_def_or_named(text, source, None)
 }
@@ -159,9 +197,9 @@ pub fn parse_def_or_named(
         .unwrap_or(ToolScope::All);
     let model = get("model:");
     let effort = get("effort:");
-    if let Some(isolation) = get("isolation:") {
-        eprintln!("{}", isolation_note(&name, &isolation));
-    }
+    let isolation = get("isolation:")
+        .map(|raw| parse_isolation(&raw, &format!("agent def `{name}`")))
+        .unwrap_or_default();
     let system_prompt = if body.trim().is_empty() {
         None
     } else {
@@ -174,22 +212,9 @@ pub fn parse_def_or_named(
         tools,
         model,
         effort,
+        isolation,
         source,
     })
-}
-
-/// The one-line stderr note for a def that sets `isolation:` — pulled out
-/// as a pure function so the message is unit-testable without capturing
-/// stderr. `isolation` rides along parsed-but-deferred (like `effort`): a
-/// Claude-compat field naming a reserved seam (per-child worktree
-/// isolation) hotl hasn't built, so an owner who writes it gets a signal
-/// instead of a silent no-op.
-fn isolation_note(name: &str, isolation: &str) -> String {
-    format!(
-        "hotl: agent def `{name}` sets `isolation: {isolation}` — per-child workspace isolation \
-         is a reserved/deferred seam and is currently ignored; the child runs in the parent's \
-         workspace like any other."
-    )
 }
 
 /// `all` | `read-only`/`readonly` | a comma list of tool names.
@@ -470,6 +495,7 @@ mod tests {
             tools: ToolScope::All,
             model: None,
             effort: None,
+            isolation: Isolation::None,
             source: AgentSource::User,
         };
         let child = filter_registry(&all_def, &full);
@@ -501,6 +527,7 @@ mod tests {
             tools: ToolScope::Only(vec!["read".into(), "glob".into()]),
             model: None,
             effort: None,
+            isolation: Isolation::None,
             source: AgentSource::User,
         };
         assert!(is_read_only(&only_reads));
@@ -512,22 +539,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_def_accepts_isolation_key_as_deferred_and_notes_it() {
-        // `isolation:` (Claude-compat frontmatter for per-child worktree
-        // isolation) must not fail parsing and must not be stored on
-        // `AgentDef` — it's parsed-but-deferred, same class as `effort`.
+    fn parse_def_stores_worktree_isolation() {
         let md = "---\nname: worktreed\nisolation: worktree\n---\nbody";
         let d = parse_def(md, AgentSource::User).unwrap();
         assert_eq!(d.name, "worktreed");
         assert_eq!(d.tools, ToolScope::All);
+        assert_eq!(d.isolation, Isolation::Worktree);
 
-        // The stderr note fired by that same parse is exercised directly
-        // via the pure message-builder (capturing real stderr would need a
-        // test-only dependency); confirm it names the field, the value, and
-        // that it's currently a no-op.
-        let note = isolation_note("worktreed", "worktree");
-        assert!(note.contains("worktreed"));
-        assert!(note.contains("isolation: worktree"));
-        assert!(note.contains("ignored"));
+        // Silent and explicit-`none` defs are both unset.
+        let silent = parse_def("---\nname: plain\n---\nbody", AgentSource::User).unwrap();
+        assert_eq!(silent.isolation, Isolation::None);
+        let off = parse_def(
+            "---\nname: p\nisolation: none\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        assert_eq!(off.isolation, Isolation::None);
+    }
+
+    /// Fail-closed, the same shape `SandboxCfg::file_tools` uses: a typo does
+    /// not silently become the permissive reading.
+    #[test]
+    fn parse_def_falls_back_to_none_on_an_unknown_isolation_value() {
+        let md = "---\nname: typo\nisolation: worktee\n---\nbody";
+        let d = parse_def(md, AgentSource::User).unwrap();
+        assert_eq!(d.isolation, Isolation::None);
+        assert_eq!(parse_isolation("container", "test"), Isolation::None);
     }
 }
