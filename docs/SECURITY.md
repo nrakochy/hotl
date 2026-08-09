@@ -116,7 +116,42 @@ So the human gate (not the sandbox) stays the *default* exfiltration boundary, a
 
 - **`open`** (default) — egress unrestricted; exactly the behavior described above.
 - **`off`** — no egress: the kernel confines the command to loopback and unix-domain sockets.
-- **`allowlist`** (`allow = ["github.com", "*.crates.io"]`) — the same kernel loopback-only confinement, plus a local filtering HTTP proxy for the listed hosts. Matching is case-insensitive and host-granular (no ports, no paths); `*.example.com` matches the apex and any subdomain depth; an empty list allows nothing.
+- **`allowlist`** (`allow = ["internal.example.com"]`) — the same kernel loopback-only confinement, plus a local filtering HTTP proxy for the effective allowlist. Matching is case-insensitive and host-granular (no ports, no paths); `*.example.com` matches the apex and any subdomain depth.
+
+#### What an egress allowlist is actually for
+
+hotl runs a model that reads untrusted input — web pages, issue text, dependency READMEs, tool output. Prompt injection in any of it can steer the agent. The workspace floor and the permission gate bound what it can *do*; egress restriction bounds where what it reads and writes can *go*. **The asset is the contents of the workspace and the developer's credentials; the adversary is an injected instruction, not a malicious human at the keyboard.**
+
+Three consequences, and they drive the design of everything below.
+
+- **A prompt the human clears reflexively is not a control.** Under this threat model prompt volume is a security property, not a UX nicety: every prompt answered without reading makes the next one likelier to be answered without reading. This is why the starter list and the shown-hosts rule exist.
+- **A durable grant deserves more friction than a keypress.** An injected agent that gets one host permanently allowlisted has a standing exfiltration channel. So the prompt grants only for the session; permanent grants are made by editing `config.toml`.
+- **The starter allowlist is not an anti-exfiltration control.** It bounds accidents and drive-by fetches. It does **not** stop a determined injected agent: `github.com` is on the list and is bidirectional — a gist push is exfiltration.
+
+**Residual risk, accepted and recorded.** A human approves a bash command whose visible URL host differs from where it actually connects; or approves an unfamiliar host at the egress prompt because it appeared during a build.
+
+#### The starter allowlist
+
+An allowlist starts from a curated set of 19 exact hosts — the package registries, their CDNs, and the git forges a build reaches without anyone deciding to reach them — with the owner's `allow` appended, deduped on the normalized host. `defaults = false` drops it. Exact hosts, never wildcards, and a test enforces that: a default nobody can enumerate is a default nobody can audit. The full list is enumerated in the configuration docs; adding to it is a security review, not a convenience patch.
+
+#### The egress ask
+
+A host the allowlist does not cover reaches an interactive human as a two-answer prompt (`y` allow for this session / `n` deny) on the console TUI, `hotl attach`, and ACP (`session/request_egress`). Both answers are remembered for the session, symmetrically — remembering the deny is what stops a retry loop from using the human as a rate limiter. Neither answer writes `config.toml`; the prompt prints the line to paste.
+
+**Three filters sit in front of the human**, in cost order: the static allowlist, the session decision table, and the **shown-hosts rule** — the ask does not fire for a host the human was already shown when they approved the call that opened the connection. Four conditions, all required:
+
+1. The call reached a human (`Verdict::Ask` → `Turn::ask` returned an allow). **`Verdict::Auto` does not count** — an allow-rule is not a human, and a rule-approved `curl` reaching an unlisted host is exactly the case the ask exists for.
+2. The host came from the **sanitized summary string that was rendered**, never the raw tool input.
+3. Extraction is **URL-parse-based**, never substring or regex matching.
+4. **Any URL carrying a userinfo component contributes nothing.** `https://good.com@evil.com/` parses to host `evil.com` while a reader's eye lands on `good.com`; that mismatch must still prompt.
+
+An edited approval (`AllowEdited`) contributes nothing either — the summary is stale. The shown-host set is scoped to the in-flight calls and is **never** written into the session table: a host is durably granted only by an explicit `y`.
+
+**Dedup is per host, not per connection.** One `npm install` opens many connections at once; the first drives the ask and the rest await the same answer. This is a liveness requirement, not an optimization — a blocked connection holds one of the 64 proxy permits while it waits. The consequence to state plainly: **one `y` releases every connection to that host for the session**, and a `CONNECT` tunnel then carries unbounded bytes in both directions for its lifetime.
+
+**Fail-closed everywhere that is not a live human `y`.** Headless (`-p`, `--schema`) never installs the ask sink at all, so it denies by construction rather than by a conditional; sub-agents deny with a message their model can act on; a cancelled turn, a two-minute deadline, a poisoned lock, a panicking sink, a dropped event, a malformed reply — all refuse. A deadline or a missing human records **nothing**: a timeout is not a decision, so the next connection asks again rather than inheriting a denial nobody made. `egress = "off"` has no ask and cannot have one — the kernel refuses with no proxy in the path to intercept.
+
+**This ask is reachable by model-authored input, and the honest statement is narrow.** The model authors the bash command and therefore the host. What is true: the model cannot provoke an egress ask without first clearing the permission gate for the call that opens the connection, and the ask never manufactures an approval — it can only withhold one. But an injected model *can* use it to put unfamiliar hostnames in front of a human. A rule-auto-approved `web_fetch` is the cheapest way to do so. The prompt therefore names the control and the host, and grants nothing beyond the session.
 
 **Kernel backing.** macOS: Seatbelt network clauses — deny all network, then re-allow unix-domain sockets and loopback. Linux: Landlock net (ABI v4, kernel ≥ 6.7), handled as a **hard requirement** — `ConnectTcp` with zero allowed ports for `off`, exactly the proxy port for `allowlist`; a kernel without the net ABI can never silently skip net enforcement.
 
@@ -231,7 +266,10 @@ Installs owned by a package manager (cargo, Nix, Homebrew) and source builds are
 
 ## Known gaps (planned, not shipped)
 
-- **No egress ask.** A host not on the allowlist gets a flat 403; there is no y/N ask ("bash wants to reach `host` — allow for this session?") the way tool permissions have. That interaction is what would make `allowlist` livable as the *default* — the first `cargo build` would ask once about crates.io instead of failing — and is the recorded path to flipping the egress default, along with a story for the SSH gap. Until it ships, egress restriction stays opt-in.
+- **`egress = "off"` has no ask, and will not get one.** The confinement is at the kernel, with no proxy in the path to intercept a connection, so there is nothing to ask about. Documented as a limitation, not deferred as debt. (The `allowlist` ask shipped in 0.10 — see "Network egress" above.)
+- **The egress ask does not cover MCP servers.** They are spawned outside the floor, so the proxy never sees their traffic. Same non-goal as the read carve's.
+- **The prompt cannot make a grant permanent.** By design (a durable grant reachable by one keypress inverts the threat model), but if the paste-a-line flow proves annoying in practice this is the thing to revisit.
+- **Egress restriction is still opt-in.** The remaining blocker to flipping the default is evidence, not machinery; the gate is recorded in OPEN.md.
 - **The read carve does not reach in-tree secrets.** `.env` and `config/secrets.yml` inside the working directory stay readable to `bash`, and cannot be carved without breaking the agent's actual job. This is a deliberate non-goal, not a deferral — with egress open by default, the approval prompt remains the exfiltration boundary for them.
 - **The read carve does not reach MCP servers or `api_key_helper`.** Both are spawned outside the floor: installing an MCP server is the trust decision (first-use hash screen), and the key helper exists to reach a credential store.
 - **Linux has no kernel deny for the execute-later paths under the workspace** (`.git/hooks`, `.github/workflows`, `.cargo`, `.hotl`, `.claude`), which macOS denies in the Seatbelt profile. Landlock's rights union across ancestors, so expressing it would mean granting no write on the workspace root itself — measured on 6.8, that also denies creating any new file at the top of the tree and `.git/index.lock`. Linux relies on the permission-layer escalation alone here.

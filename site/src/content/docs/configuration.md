@@ -72,7 +72,9 @@ plan = false      # the other axis, independent of mode: write/edit always ask,
 
 [network]
 egress = "open"            # "open" | "off" | "allowlist" (bash network egress)
-allow = ["github.com", "*.crates.io"]   # hosts reachable in allowlist mode
+allow = ["internal.example.com"]   # hosts reachable in allowlist mode, on top
+                                   # of hotl's starter list
+defaults = true            # false: use exactly `allow`, no starter list
 
 [sandbox]                  # widen the kernel write floor (see below)
 writable = ["~/Library/Caches/bazel", "~/.bazel_disk_cache"]
@@ -286,7 +288,26 @@ Declare external tool servers. Each is exposed to the model through one `mcp` to
 
 ### Network egress (`[network]`)
 
-Restricts what `bash` commands (and diagnostics/hooks, which run under the same floor) may reach over the network. `egress` is one of `open` (default; unrestricted), `off` (loopback and unix-domain sockets only), or `allowlist` (loopback plus the hosts in `allow`, reached through a local filtering proxy). `allow` entries are hostnames or `*.domain` wildcards — a wildcard matches the apex and any subdomain depth; no ports; matching is case-insensitive; an empty list allows nothing. An unknown `egress` value fails closed to `off` with a startup warning. While a restriction is configured, the bash ask label carries `net:off` / `net:allow(N)` — or `NET:UNENFORCED(reason)` on hosts where the kernel cannot back it (Linux needs kernel ≥ 6.7 for Landlock net; `HOTL_SANDBOX=off` also unenforces it), in which case `bash` allow-rules stop auto-approving. A denied fetch returns `hotl egress: "HOST" is not in [network].allow`. Why and limits: [permissions-and-sandbox.md](../permissions-and-sandbox/#opting-out-of-open-egress).
+Restricts what `bash` commands (and diagnostics/hooks, which run under the same floor) may reach over the network. `egress` is one of `open` (default; unrestricted), `off` (loopback and unix-domain sockets only), or `allowlist` (loopback plus the effective allowlist, reached through a local filtering proxy). `allow` entries are hostnames or `*.domain` wildcards — a wildcard matches the apex and any subdomain depth; no ports; matching is case-insensitive. An unknown `egress` value fails closed to `off` with a startup warning. While a restriction is configured, the bash ask label carries `net:off` / `net:allow(N)` — or `NET:UNENFORCED(reason)` on hosts where the kernel cannot back it (Linux needs kernel ≥ 6.7 for Landlock net; `HOTL_SANDBOX=off` also unenforces it), in which case `bash` allow-rules stop auto-approving. Why and limits: [permissions-and-sandbox.md](../permissions-and-sandbox/#opting-out-of-open-egress).
+
+**The effective allowlist is hotl's starter list plus your `allow`**, deduped on the normalized host, starter entries first. `defaults = false` drops the starter list, so the allowlist is exactly what you wrote. `hotl doctor` prints the effective list split by source.
+
+The starter list — 19 exact hosts, never wildcards, because a default nobody can enumerate is a default nobody can audit:
+
+```
+crates.io  static.crates.io  index.crates.io  static.rust-lang.org
+sh.rustup.rs  docs.rs
+registry.npmjs.org  registry.yarnpkg.com
+pypi.org  files.pythonhosted.org
+proxy.golang.org  sum.golang.org
+rubygems.org
+github.com  api.github.com  codeload.github.com
+objects.githubusercontent.com  raw.githubusercontent.com  gitlab.com
+```
+
+It bounds accidents and drive-by fetches; it is **not** an anti-exfiltration control — `github.com` is bidirectional and a gist push leaves through it.
+
+A host outside the effective list **asks** on an interactive surface (`[y] allow for this session · [n] deny`) and returns `hotl egress: "HOST" is not in [network].allow` when denied, when nobody answers within two minutes, or when there is no human to ask — headless and sub-agents never get the prompt. The ask is skipped for hosts that were on screen in a call you approved this turn; see [permissions-and-sandbox.md](../permissions-and-sandbox/#a-blocked-host-is-a-question-not-a-dead-end).
 
 ### Sandbox write floor (`[sandbox]`)
 

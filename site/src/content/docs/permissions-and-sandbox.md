@@ -156,15 +156,41 @@ The scrub is deliberately narrow. The tempting rule — strip anything named lik
 
 ## Opting out of open egress
 
-`[network].egress` in `config.toml` closes the door the previous section describes as open. Set it to `"off"` and an approved command can reach only your own machine — loopback and unix-domain sockets; the kernel refuses everything else. Set it to `"allowlist"` and you add a short list of hosts the agent may fetch from:
+`[network].egress` in `config.toml` closes the door the previous section describes as open. Set it to `"off"` and an approved command can reach only your own machine — loopback and unix-domain sockets; the kernel refuses everything else. Set it to `"allowlist"` and you add whatever hosts the agent needs beyond the ones hotl already ships:
 
 ```toml
 [network]
 egress = "allowlist"
-allow = ["github.com", "*.crates.io"]
+allow = ["internal.example.com", "*.corp.example.com"]
 ```
 
 Allowed hosts are reached through a small local proxy, so `cargo fetch` and `git pull` keep working while a `curl` to anywhere else gets a 403 that tells the model exactly which control refused it (`hotl egress: "HOST" is not in [network].allow`). Tools that ignore the proxy environment don't get around anything — they hit the kernel's loopback-only wall and fail. Every bash ask shows the active state: `net:off` or `net:allow(N)`.
+
+### An allowlist doesn't start empty
+
+Until 0.10 it did, which is the real reason nobody ran `allowlist`: the first ten minutes of any session were a wall of 403s from package registries. An allowlist now starts from a **starter list** hotl ships — the registries, their CDNs, and the forges a build reaches without anyone deciding to reach them — and your `allow` entries are added to it. `hotl doctor` prints the effective list with both sources; [configuration.md](../configuration/#network-egress-network) enumerates it inline. `defaults = false` under `[network]` drops it and gives you a list containing exactly what you wrote.
+
+**It is not an anti-exfiltration control, and it does not claim to be.** It bounds accidents and drive-by fetches. `github.com` is on it and is bidirectional — a gist push leaves through it. Adding to the list is a security review, not a convenience patch, which is why every entry is an exact host and a test refuses wildcards there.
+
+### A blocked host is a question, not a dead end
+
+The other reason nobody ran `allowlist`: the only recourse to a 403 was to stop the session, edit `config.toml`, restart, and re-prompt. Now a host that isn't on the list prompts:
+
+```
+  network: reaching "registry.npmjs.org" was not in the approved command
+  this host is not in [network].allow
+  [y] allow for this session   [n] deny
+```
+
+Both answers stick for the rest of the session, and both are session-scoped only — `y` doesn't touch your config, it prints the line to paste if you want it permanently. Remembering the *deny* matters as much as remembering the allow: without it, a retrying command uses you as a rate limiter.
+
+**The prompt is deliberately rare, and that is the security property, not a nicety.** A prompt you clear reflexively is not a control, and every one you answer without reading makes the next one likelier to go the same way. So three filters sit in front of you: the starter list, the session's own decisions, and — the interesting one — **hosts you already saw**. If you approved `curl https://docs.example.com/x`, you read that host; the connection it opens does not prompt again. What still prompts is the surprise: a redirect, a CDN, a transitive registry dep, a host that only appeared because a `[[allow]]` rule approved the command without showing it to you. That last case is the point — *a rule is not a human*, so a rule-approved `curl` to an unlisted host still asks.
+
+Two sharp edges worth knowing. A URL carrying userinfo (`https://good.com@evil.com/`) counts as showing you **nothing**, because your eye lands on `good.com` while the connection goes to `evil.com`. And approving an *edited* command shows nothing either — the summary you read is stale the moment you change it.
+
+**What `y` actually grants.** One host, for this session, for every connection to it — not one connection. A `CONNECT` tunnel then carries unbounded bytes in both directions for as long as it lives. That is a bigger grant than the single prompt suggests, which is why it is worth reading the host.
+
+**Where it doesn't ask.** Headless (`-p`, `--schema`) never installs the prompt at all — an unlisted host 403s immediately rather than hanging. Sub-agents are denied the same way. `egress = "off"` has no prompt either, and cannot: the kernel refuses the connection with no proxy in the path to intercept. If nobody answers within two minutes the connection is refused, but nothing is recorded — a timeout is not a decision, so the next attempt asks again.
 
 Three honest caveats. First, this is **opt-in**: the default stays open because the agent legitimately fetches things, and a silently broken network by default would just teach everyone to turn the feature off. Second, **only HTTP traffic can traverse the proxy** — `git` over an SSH remote (`git@github.com:…`) fails under `off`/`allowlist` no matter what you allow; switch those repos to HTTPS remotes while running restricted. Third, it is **not airtight**: an allowed host is allowed for *everything* (an allowlisted `github.com` can still receive a push of your data), DNS still resolves (macOS resolves names via a local system service; on Linux, Landlock confines TCP only, and needs kernel ≥ 6.7), so a determined DNS-tunnel can still leak — treat egress restriction as a strong brake on casual exfiltration, not a cleanroom. And if the kernel can't enforce the restriction you configured, hotl says so loudly — `NET:UNENFORCED(reason)` in every bash ask — and `bash` allow-rules stop auto-approving, the same fail-closed posture as an unsandboxed host. The full mechanics and limits live in [SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md).
 

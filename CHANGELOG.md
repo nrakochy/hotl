@@ -8,6 +8,60 @@ semver promise of their own.
 
 ### Added
 
+- **`egress = "allowlist"` is usable now: it starts with a list, and a blocked
+  host asks instead of 403ing.** Two things kept anyone from turning egress
+  restriction on. The list started empty, so the first ten minutes of a real
+  session were a wall of failures; and a blocked host produced a flat 403 whose
+  only recourse was to stop the session, edit `config.toml`, restart, and
+  re-prompt. Both are fixed. The default is unchanged — egress is still `open`
+  — but the restricted mode is now something you could plausibly live in.
+
+  **An allowlist starts from a curated list** of 19 exact hosts: the package
+  registries (crates.io, npm, PyPI, Go, RubyGems), their CDNs, and the git
+  forges a build reaches without anyone deciding to reach them. Your `allow`
+  entries are added to it; `defaults = false` under `[network]` drops it.
+  `hotl doctor` now prints the egress posture and the effective list split by
+  source, and `configuration.md` enumerates the starter list inline — a default
+  nobody can enumerate is a default nobody can audit, which is also why every
+  entry is an exact host and a test refuses wildcards there.
+
+  It is **not** an anti-exfiltration control and does not claim to be. It
+  bounds accidents and drive-by fetches. `github.com` is on it and is
+  bidirectional: a gist push leaves through it.
+
+  **A host outside the list now prompts** on the console TUI, `hotl attach`,
+  and ACP (`session/request_egress`): `y` allows it for the session, `n` denies
+  it for the session. Both stick, symmetrically — remembering the deny is what
+  stops a retrying command from using you as a rate limiter. Neither writes
+  `config.toml`; a permanent grant stays a deliberate edit, and the prompt
+  prints the line to paste. One `y` covers every connection to that host for
+  the session, which is a larger grant than one prompt suggests.
+
+  **The prompt is deliberately rare, and that is the security property.** A
+  prompt you clear reflexively is not a control. So the ask does not fire for a
+  host you were already shown: approve `curl https://docs.example.com/x` and
+  the connection it opens does not ask again. What still asks is the surprise —
+  a redirect, a CDN, a transitive dep, or a host that only appeared because an
+  `[[allow]]` rule approved the command without showing it to you. *A rule is
+  not a human*, so a rule-approved `curl` to an unlisted host still prompts.
+  Two sharp edges: a URL carrying userinfo (`https://good.com@evil.com/`) shows
+  you nothing, because your eye lands on one host while the connection goes to
+  another; and editing a command at the ask makes its summary stale, so it
+  shows nothing either.
+
+  Everything that is not a live human `y` refuses. Headless (`-p`, `--schema`)
+  never installs the prompt at all, so it denies by construction rather than by
+  a flag; sub-agents deny with a message their model can act on; a cancelled
+  turn, a two-minute deadline, a malformed reply, a dropped event all refuse. A
+  deadline records nothing — a timeout is not a decision, so the next attempt
+  asks again. `egress = "off"` has no prompt and cannot: the kernel refuses the
+  connection with no proxy in the path to intercept. The 403 body an existing
+  deployment sees is byte-for-byte what it was.
+
+  `web_fetch`/`web_search` share the same session decision table as bash's
+  proxy, so one answer covers both. Full threat model and limits:
+  [SECURITY.md](docs/SECURITY.md) §Network egress.
+
 - **Per-sub-agent worktree isolation: `isolation: worktree`.** An isolated
   sub-agent works in its own `git worktree` instead of your working
   directory, and its changes are applied back when it finishes. Turn it on

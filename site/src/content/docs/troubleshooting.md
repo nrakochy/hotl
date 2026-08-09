@@ -28,6 +28,11 @@ Look up the message you saw. Text in `code` is what hotl prints; find yours by g
 | Every `bash` ask says `reads:open` | `[sandbox].readable` lifted the whole credential tier, or the probe found the carve unenforceable on this host. | Check `hotl doctor` — it prints the resolved deny set and whether the probe certified the carve. |
 | `sandbox: the read carve could not open …` in `hotl doctor` | The carve's descent could not open a directory, so reads under it are denied to sandboxed commands without anyone asking for that. | Fail-closed, but usually a permissions oddity on that directory. Fix its mode, or expect commands reading under it to fail. |
 | `⚠ PROTECTED PATH —` before an ask | The write targets a write-now/execute-later file (git hook, build.rs, ssh, creds, …). | Intended. Approve only if you meant to write that file; it can run code or grant access later. |
+| A command hangs about two minutes, then fails with `hotl egress: "HOST" is not in [network].allow` | `egress = "allowlist"` and the host isn't covered. An egress prompt went up and nobody answered inside the two-minute deadline. | Answer the prompt (`y` allows the host for the session). Nothing is recorded on a timeout, so the next attempt asks again. Add the host to `[network].allow` to stop being asked. |
+| Under `allowlist`, an unlisted host 403s instantly with `(no interactive surface …)` and you were never asked | Headless (`-p`, `--schema`) and sub-agents never get the egress prompt — by construction, not by a flag. | Add the host to `[network].allow`, or run interactively. |
+| You get an egress prompt for a host you *just* approved in a bash command | The command was approved by an `[[allow]]` rule rather than by you, or the URL carried userinfo (`https://a.com@b.com/`), or you edited the command at the ask. | Working as intended — a rule is not a human, and in the userinfo case the host your eye read is not the host being reached. Answer the prompt. |
+| Every host prompts and `allow` looks right | `defaults = false` dropped hotl's starter list, or the entries don't match (no ports in patterns; `example.com` is exact, `*.example.com` is the wildcard). | `hotl doctor` prints the effective list split by source. |
+| You want egress restriction off entirely | — | One line: `egress = "open"` under `[network]`. |
 
 ## During a turn
 
