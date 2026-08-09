@@ -278,6 +278,53 @@ Rules that do **not** auto-allow, even with a matching rule (safety carve-outs):
 - A `write`/`edit` path that resolves outside the prefix after `..` normalization, or is absolute against a relative prefix.
 - Any write to a protected (execute-later) path — always asks. See [permissions-and-sandbox.md](../permissions-and-sandbox/#protected-paths).
 
+### Deny-rules (`[[deny]]`)
+
+Same schema as `[[allow]]`, opposite meaning: a match refuses the call outright,
+before any allow tier, any mode, and any `bypass`. Deny outranks everything, and
+unlike an allow rule it also governs the tools that never prompt at all
+(`read`, `glob`, `grep`).
+
+```toml
+[[deny]]
+tool = "read"
+path_prefix = "~/Documents/tax"    # also denied to shell commands — see below
+
+[[deny]]
+tool = "bash"
+prefix = "curl "                   # hotl's bash tool only
+```
+
+**A deny rule that names a real directory also becomes a kernel read-deny**, so
+it reaches `bash` and not just hotl's own file tools — the third tier of
+[the read carve](../permissions-and-sandbox/#the-read-carve). Which shapes reach
+the kernel, and which stay in-process, is the `path_prefix` distinction below.
+`hotl doctor` lists both.
+
+#### `path_prefix`, three forms
+
+| Form | Matches | Reaches shell commands? |
+|---|---|---|
+| `/Volumes/secrets` — **absolute** | only at the filesystem root | **yes** (if the path exists) |
+| `~/.ssh` — **home-rooted** | expands against `$HOME`, then anchors at the root | **yes** (if the path exists) |
+| `.ssh/` — **floating relative** | that component sequence at *any* depth: `.ssh/id_rsa`, `src/../.ssh/config`, `/Users/you/.ssh/authorized_keys` | no |
+
+Matching is on whole components, so `.ssh/` never matches `.sshfs/`. On the deny
+side the floating form deliberately over-matches: catching a path you did not
+mean costs an ask, while missing one costs the secret. It has no kernel
+expression, though — that would mean enumerating every matching directory on the
+disk at startup and silently missing any created later — so hotl reports it
+rather than approximating. Name the directory (`~/.ssh`) to cover shell commands
+too.
+
+`~/` expansion applies to both sections. On the allow side that means a
+`path_prefix = "~/x"` rule begins auto-approving under `$HOME/x`, which is what
+it always read as granting but did not do.
+
+`path_prefix = "/"` and `path_prefix = ""` are refused at the kernel with a
+message naming the rule: each would deny every read and leave the agent unable
+to run anything. They still deny in-process.
+
 ### MCP servers (`[[mcp]]`)
 
 Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve its binary (shown with its SHA-256), and a changed binary re-prompts. Server output is sanitized before it reaches the model. Full guide: [mcp.md](../mcp/).
@@ -342,6 +389,13 @@ Validation mirrors `writable` — absolute paths, `~/` expands, symlinks resolve
 - **An entry inside a writable root is dropped, loudly.** Landlock resolves the closest matching rule, so a write grant on an ancestor re-opens the read regardless of what the deny set says; shipping the denial anyway would be a claim the kernel does not honor.
 
 `[sandbox]` is installed once at startup, so changing `readable` needs a session restart. For a one-off, press `s` instead of `y` at the `bash` ask — that lifts the credential tier for that single command. Once `readable` has emptied the tier, every ask is labeled `reads:open`. `hotl doctor` prints the resolved deny set and every warning.
+
+`readable` and `[[deny]]` rules are complementary, not two ways to do one thing:
+`readable` **subtracts** from the credential tier, and a projectable
+[`[[deny]]`](#deny-rules-deny) **adds** a third tier. Neither can reach the
+other's — `readable` cannot lift a deny rule (a deny is a "never"), and a deny
+rule cannot un-lift a `readable` entry it does not name. Both are honored, and
+`s` lifts only the credential tier.
 
 `file_tools` is a separate, deliberate step. By default (`"workspace"`) the `write`/`edit` file tools stay confined to the working directory — `writable` only widens what *spawned processes* (bash, grep, diagnostics, hooks) may write. Set `file_tools = "writable"` to let `write`/`edit` operate under the `writable` roots too: those writes become ordinary asks (the same tier as an in-workspace write, so `mode = "bypass"` approves them), they go through the same symlink-refusing descent as workspace writes, and protected filenames ([protected paths](../permissions-and-sandbox/#protected-paths)) still escalate. An unknown value falls back to `"workspace"` with a warning.
 

@@ -99,6 +99,42 @@ semver promise of their own.
 
 ### Changed
 
+- **A `[[deny]]` rule over a path now also denies the read to shell commands.
+  Tightening, opt-in by writing the rule.** A path deny governed only hotl's own
+  file tools: it stopped `read {"path": "/Volumes/secrets/k"}` and did nothing
+  at all about `bash {"command": "cat /Volumes/secrets/k"}`. You wrote down an
+  intent and half of it was enforced. A deny rule naming an existing directory
+  by an **absolute** or **`~/`-rooted** `path_prefix` is now projected onto the
+  kernel read-deny as a third tier, alongside hotl's own dirs and the credential
+  class. It is unliftable — a deny is a "never" in-process, and `s` at a bash
+  ask lifts only the credential tier.
+
+  Projection is conservative and says what it skipped. A **floating relative**
+  prefix (`.ssh/`, which matches at any depth) has no kernel expression, and
+  neither does a command-subject rule (`bash prefix = "curl "`); both are still
+  enforced in full in-process, and `hotl doctor` lists them under
+  `not reaching shell commands` with the form to write instead. A path inside a
+  write root cannot be denied at all (Landlock unions rights across ancestors)
+  and is dropped with a warning rather than reported as live.
+  `path_prefix = "/"` and `""` are refused at the kernel, each with its own
+  message. `[[allow]]` rules move the kernel floor in neither direction.
+
+  `hotl doctor` grows a `containment` section naming what put each denied path
+  there — built-in, hotl default, or the rule text itself.
+
+- **`~/` in `path_prefix` now expands on the deny side. Tightening.**
+  `path_prefix = "~/.ssh"` matched only a literal `~/…` tool input, so it missed
+  `/Users/you/.ssh/id_ed25519` — the form a model actually writes. It expands
+  against `$HOME` and anchors at the root; the literal form keeps matching too.
+
+- **`~/` in `path_prefix` also expands on the allow side. Loosening.** An
+  `[[allow]]` rule with `path_prefix = "~/x"` auto-approved nothing before;
+  it now auto-approves writes under `$HOME/x`. That is plainly what the rule was
+  written to mean, and the alternative ships a config language where the same
+  syntax works in one section and silently fails in the other — but it is an
+  auto-approval that did not exist, in the tier that skips the human. Check any
+  `~/`-rooted allow rule you already have.
+
 - **The kernel sandbox denies a fixed set of reads. Default on, behavior
   change.** The floor confined writes; reads were wholly open, which left two
   live holes. The session token under the data dir is mode 0600 in a 0700
@@ -166,6 +202,19 @@ semver promise of their own.
   first attempt. Maintainer tooling — no change to installed behavior.
 
 ### Fixed
+
+- **A `[[deny]]` rule in `config.toml` never loaded at all. Tightening.** Only
+  the `[[allow]]` section was lifted out of `config.toml` before the rules were
+  parsed, so every user-written `[[deny]]` was dropped on the floor — it governed
+  nothing, and said nothing about it. Only `/etc/hotl/preapproved.toml` could
+  deny. Both sections load now, which means a deny rule already sitting in your
+  config starts refusing what it always said it would.
+
+- **`Rules::lint` had no caller.** It reports rules that can never match — an
+  unknown key from a typo, a rule with no predicate, an allow rule over a tool
+  with no declared subject — and nothing printed it, so a silently dead
+  permission rule stayed silent. Startup and `hotl doctor` both print it now,
+  along with the kernel-reach notes above.
 
 - **The loop ledger's first phase stamp could be silently overwritten.**
   `now_nanos` reads elapsed time from an epoch initialized on its own first

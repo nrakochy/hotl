@@ -104,12 +104,15 @@ The sandbox stops the agent **tampering with your filesystem outside the project
 
 ### The read carve
 
-Two tiers are denied to every sandboxed child — the `bash` tool, `grep`'s ripgrep, post-edit diagnostic commands, and your shell hooks alike. Three of those four never show you a prompt, which is why the config lever exists.
+Three tiers are denied to every sandboxed child — the `bash` tool, `grep`'s ripgrep, post-edit diagnostic commands, and your shell hooks alike. Three of those four never show you a prompt, which is why the config lever exists.
 
 | Tier | What | Liftable? |
 |---|---|---|
 | **A** | hotl's own config dir (`~/.config/hotl`) and data dir (`~/.local/share/hotl`) | **never** |
 | **B** | `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, and `.netrc` / `.npmrc` / `.pypirc` / `.dockercfg` in `$HOME` | yes, two ways |
+| **C** | directories your own `[[deny]]` rules name | **never** (the rule is a "never") |
+
+Tiers B and C point in opposite directions and neither replaces the other: `[sandbox].readable` *subtracts* from B, and your deny rules *add* C.
 
 Tier A is the important one and the reason there is no override: the session token under the data dir is what drives hotl's own control socket. A sandboxed `bash` runs as *you*, so file permissions do not stop it reading that token — and a command that reads it can approve its own future tool calls. The config dir holds your allow-rules, hooks, and `api_key_helper` for the same reason. The `read`, `write` and `edit` tools refuse those paths outright too, in every mode, with no prompt that unlocks them — which does mean the agent can't read your `config.toml` for you either.
 
@@ -121,6 +124,35 @@ readable = ["~/.aws"]   # standing; needs a session restart
 ```
 
 …or press **`s`** instead of `y` at a `bash` ask, which lifts Tier B for **that one command only**. The `s` option appears only where it would do something. Once config has lifted the tier, every ask says `reads:open`; the hardened default stays silent.
+
+**Tier C is your own deny rules, enforced at the kernel too.** A `[[deny]]` over
+a path used to govern only hotl's own file tools — it stopped
+`read {"path": "/Volumes/secrets/k"}` and did nothing at all about
+`bash {"command": "cat /Volumes/secrets/k"}`. You wrote down an intent and half
+of it was enforced. Now a deny rule that names a real directory becomes a kernel
+read-deny as well:
+
+```toml
+[[deny]]
+tool = "read"
+path_prefix = "/Volumes/secrets"   # or "~/Documents/tax"
+```
+
+It is unliftable on purpose: a deny rule is a "never" in-process, so a kernel
+twin that `s` could lift would be the drift this closes.
+
+**Not every deny rule can reach the kernel, and hotl tells you which.** The
+kernel sees paths, not command names or match patterns, so three shapes stay
+in-process only:
+
+- `path_prefix = ".ssh/"` — a *floating* prefix, matching at any depth. Expressing that at the kernel would mean enumerating every `.ssh` on the disk at startup and missing any created later, so hotl reports it instead of approximating. Write `path_prefix = "~/.ssh"` to cover shell commands too.
+- `[[deny]] tool = "bash" prefix = "curl "` — a command name has no kernel expression, and never will.
+- a path that does not exist yet — nothing to deny; it starts reaching the kernel once it exists.
+
+Each of those is still enforced in full for `read`/`write`/`edit`/`glob`/`grep`.
+`hotl doctor` lists them under `not reaching shell commands`, with the form to
+write instead, and names the rule behind every path it *does* deny. `[[allow]]`
+rules never move the kernel floor in either direction.
 
 **It denies contents, not existence.** `ls ~` and `ls -la ~` keep working — the carve blocks reading file data, not `stat`. One honest platform difference: on Linux `ls ~/.ssh` still lists filenames (Landlock has no sub-path carve-out, so the parent's directory-listing right is hierarchical) where macOS hides them. File contents are denied on both.
 
