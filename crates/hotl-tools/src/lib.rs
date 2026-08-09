@@ -146,20 +146,41 @@ impl Registry {
     /// the `[minify]` section read/edit consult. Both are caller-supplied per
     /// call, so unlike `builtin` above this always builds fresh.
     pub fn builtin_with(diag: diagnostics::Diagnostics, minify: MinifyConfig) -> Self {
+        Self::builtin_with_root(diag, minify, Arc::from(fsguard::workspace_root()))
+    }
+
+    /// The same builtins, resolving every relative path against `root` instead
+    /// of the process workspace. An isolated sub-agent gets one of these rooted
+    /// at its git worktree (`hotl::agent::HotlChildBuilder::spawn_child`), which
+    /// is how two mutating children stop sharing one working directory.
+    ///
+    /// `root` must be the process workspace root or a directory beneath it —
+    /// the kernel write floor is process-wide and set once at startup, so a
+    /// root outside it would pass `fsguard` and then be refused by the sandbox.
+    pub fn builtin_with_root(
+        diag: diagnostics::Diagnostics,
+        minify: MinifyConfig,
+        root: Arc<std::path::Path>,
+    ) -> Self {
         let diag = Arc::new(diag);
         Self {
             tools: vec![
                 Arc::new(ReadTool {
                     minify: minify.clone(),
+                    root: root.clone(),
                 }),
                 Arc::new(EditTool {
                     diag: diag.clone(),
                     minify,
+                    root: root.clone(),
                 }),
-                Arc::new(WriteTool { diag }),
-                Arc::new(BashTool),
-                Arc::new(GlobTool),
-                Arc::new(GrepTool),
+                Arc::new(WriteTool {
+                    diag,
+                    root: root.clone(),
+                }),
+                Arc::new(BashTool { root: root.clone() }),
+                Arc::new(GlobTool { root: root.clone() }),
+                Arc::new(GrepTool { root }),
             ],
         }
     }
@@ -395,6 +416,55 @@ mod tests {
         assert!(paths.contains(&std::path::PathBuf::from("/h/.config/gcloud")));
         assert!(paths.contains(&std::path::PathBuf::from("/h/.netrc")));
         assert_eq!(paths.len(), CREDENTIAL_DIRS.len() + CREDENTIAL_FILES.len());
+    }
+
+    /// The rooted registry actually reroots. Every relative path a tool is
+    /// handed resolves under `root`, not the process workspace — which is the
+    /// whole mechanism behind isolated sub-agents. Without this,
+    /// `builtin_with_root` could thread a root nobody reads and every isolated
+    /// child would quietly edit the parent's tree while looking contained.
+    ///
+    /// Note this is a `run` assertion, not a `permission` one: `fsguard::classify`
+    /// is purely lexical (an absolute path is `Outside` for every root), so the
+    /// permission tier cannot see the difference. The bytes can.
+    #[tokio::test]
+    async fn a_rooted_registry_resolves_relative_paths_under_its_own_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let rooted = Registry::builtin_with_root(
+            diagnostics::Diagnostics::default(),
+            MinifyConfig::default(),
+            Arc::from(root.as_path()),
+        );
+
+        let out = rooted
+            .get("write")
+            .unwrap()
+            .run(
+                serde_json::json!({"path": "probe.txt", "content": "child"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("probe.txt")).unwrap(),
+            "child"
+        );
+        assert!(
+            !fsguard::workspace_root().join("probe.txt").exists(),
+            "the rooted write escaped into the process workspace"
+        );
+
+        // And it reads back through its own root, not the process one.
+        let out = rooted
+            .get("read")
+            .unwrap()
+            .run(
+                serde_json::json!({"path": "probe.txt"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(out.content.contains("child"), "{}", out.content);
     }
 
     #[test]

@@ -1,7 +1,8 @@
 //! The four M0 built-ins. Failure messages are prompts (they instruct the
 //! model); truncation carries continuation hints.
 
-use std::sync::OnceLock;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 
 use crate::sandbox::{self, SandboxStatus};
 use crate::{execute_later_reason, fsguard, Permission, Tool, ToolOutcome};
@@ -26,6 +27,13 @@ pub(crate) type ToolResult = Result<ToolOutcome, ToolOutcome>;
 
 fn done(result: ToolResult) -> ToolOutcome {
     result.unwrap_or_else(|e| e)
+}
+
+/// The root a file tool resolves paths against when nobody rooted it
+/// explicitly: the process workspace. A child session running in a git
+/// worktree gets its own root instead (`Registry::builtin_with_root`).
+pub(crate) fn default_root() -> Arc<Path> {
+    Arc::from(fsguard::workspace_root())
 }
 
 pub(crate) fn sandbox_status() -> &'static SandboxStatus {
@@ -210,11 +218,16 @@ pub(crate) fn write_target(
 /// checked before the extra-root grant, so a granted directory never
 /// downgrades a protected filename — enforced by
 /// `file_permission_downgrades_extra_paths_only_when_granted`.
-fn file_permission(verb: &str, input: &Value) -> Permission {
-    file_permission_with(verb, input, granted_extras())
+fn file_permission(root: &Path, verb: &str, input: &Value) -> Permission {
+    file_permission_with(root, verb, input, granted_extras())
 }
 
-fn file_permission_with(verb: &str, input: &Value, extras: &[std::path::PathBuf]) -> Permission {
+fn file_permission_with(
+    root: &Path,
+    verb: &str,
+    input: &Value,
+    extras: &[std::path::PathBuf],
+) -> Permission {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
     let summary = format!("{verb} {path}");
     // Tier A never reaches a y/n: the run-time door refuses regardless, and
@@ -223,7 +236,7 @@ fn file_permission_with(verb: &str, input: &Value, extras: &[std::path::PathBuf]
         return Permission::AskProtected { summary, why };
     }
     let resolved = std::fs::canonicalize(path).ok();
-    let target = write_target(fsguard::workspace_root(), extras, path);
+    let target = write_target(root, extras, path);
     // The write lands on the fsguard-*normalized* path (`Path::components()`
     // has collapsed `//`, `./`, `..`), so classify the protected floor on that
     // same normalized rel — not only the raw model string. Without this,
@@ -256,9 +269,21 @@ fn file_permission_with(verb: &str, input: &Value, extras: &[std::path::PathBuf]
     }
 }
 
-#[derive(Default)]
 pub struct ReadTool {
     pub minify: crate::MinifyConfig,
+    /// The directory every relative path in this tool's calls descends from.
+    /// The process workspace for the parent session; a git worktree for an
+    /// isolated child (`Registry::builtin_with_root`).
+    pub root: Arc<Path>,
+}
+
+impl Default for ReadTool {
+    fn default() -> Self {
+        Self {
+            minify: crate::MinifyConfig::default(),
+            root: default_root(),
+        }
+    }
 }
 
 impl Tool for ReadTool {
@@ -311,7 +336,7 @@ impl Tool for ReadTool {
                 why,
             };
         }
-        match fsguard::classify(fsguard::workspace_root(), path) {
+        match fsguard::classify(&self.root, path) {
             fsguard::Placement::Inside(_) => Permission::None,
             fsguard::Placement::Outside(_) => Permission::AskProtected {
                 summary: format!("read {path}"),
@@ -329,7 +354,7 @@ impl Tool for ReadTool {
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
-            let root = fsguard::workspace_root();
+            let root = &*self.root;
             done(if wants_minified(&input) {
                 crate::minified::read_minified_in(root, &input, &self.minify).await
             } else {
@@ -534,9 +559,19 @@ async fn read_stream(file: tokio::fs::File, path: &str, input: &Value) -> ToolRe
     Ok(ToolOutcome::ok(out))
 }
 
-#[derive(Default)]
 pub struct WriteTool {
-    pub diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
+    pub diag: Arc<crate::diagnostics::Diagnostics>,
+    /// See `ReadTool::root`.
+    pub root: Arc<Path>,
+}
+
+impl Default for WriteTool {
+    fn default() -> Self {
+        Self {
+            diag: Arc::default(),
+            root: default_root(),
+        }
+    }
 }
 
 impl Tool for WriteTool {
@@ -557,14 +592,14 @@ impl Tool for WriteTool {
         })
     }
     fn permission(&self, input: &Value) -> Permission {
-        file_permission("write", input)
+        file_permission(&self.root, "write", input)
     }
     fn edits_files(&self) -> bool {
         true
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
-            let root = fsguard::workspace_root();
+            let root = &*self.root;
             let result = write_in(root, granted_extras(), &input).await;
             with_diagnostics(&self.diag, &input, result).await
         })
@@ -630,10 +665,21 @@ fn guarded_write_bytes(
         .map_err(|e| ToolOutcome::err(format!("Could not write `{path}`: {e}.")))
 }
 
-#[derive(Default)]
 pub struct EditTool {
-    pub diag: std::sync::Arc<crate::diagnostics::Diagnostics>,
+    pub diag: Arc<crate::diagnostics::Diagnostics>,
     pub minify: crate::MinifyConfig,
+    /// See `ReadTool::root`.
+    pub root: Arc<Path>,
+}
+
+impl Default for EditTool {
+    fn default() -> Self {
+        Self {
+            diag: Arc::default(),
+            minify: crate::MinifyConfig::default(),
+            root: default_root(),
+        }
+    }
 }
 
 impl Tool for EditTool {
@@ -666,11 +712,11 @@ impl Tool for EditTool {
         true
     }
     fn permission(&self, input: &Value) -> Permission {
-        file_permission("edit", input)
+        file_permission(&self.root, "edit", input)
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
-            let root = fsguard::workspace_root();
+            let root = &*self.root;
             let extras = granted_extras();
             let result = if wants_minified(&input) {
                 crate::minified::edit_minified_in(root, extras, &input, &self.minify).await
@@ -844,7 +890,18 @@ const GLOB_MAX_DEPTH: usize = 64;
 const GLOB_MAX_ENTRIES: usize = 200_000;
 const GLOB_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 
-pub struct GlobTool;
+pub struct GlobTool {
+    /// See `ReadTool::root`.
+    pub root: Arc<Path>,
+}
+
+impl Default for GlobTool {
+    fn default() -> Self {
+        Self {
+            root: default_root(),
+        }
+    }
+}
 
 impl Tool for GlobTool {
     fn name(&self) -> &'static str {
@@ -878,9 +935,7 @@ impl Tool for GlobTool {
         Permission::None
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(
-            async move { done(glob_run_input(fsguard::workspace_root(), &input, cancel).await) },
-        )
+        Box::pin(async move { done(glob_run_input(&self.root, &input, cancel).await) })
     }
 }
 
@@ -1016,7 +1071,18 @@ struct GlobHit {
 
 const GREP_MAX_OUTPUT: usize = 50 * 1024;
 
-pub struct GrepTool;
+pub struct GrepTool {
+    /// See `ReadTool::root`.
+    pub root: Arc<Path>,
+}
+
+impl Default for GrepTool {
+    fn default() -> Self {
+        Self {
+            root: default_root(),
+        }
+    }
+}
 
 impl Tool for GrepTool {
     fn name(&self) -> &'static str {
@@ -1050,7 +1116,7 @@ impl Tool for GrepTool {
         Permission::None
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(grep_in(fsguard::workspace_root(), &input, cancel).await) })
+        Box::pin(async move { done(grep_in(&self.root, &input, cancel).await) })
     }
 }
 
@@ -1151,7 +1217,21 @@ async fn grep_search(
     }
 }
 
-pub struct BashTool;
+pub struct BashTool {
+    /// The shell's `current_dir`. Confinement here is cooperative, not
+    /// enforced: the kernel write floor (`sandbox.rs`) is process-wide, so a
+    /// command that `cd ..`s out of an isolated child's worktree still writes
+    /// the parent's tree. Tracked as debt; see docs/SECURITY.md.
+    pub root: Arc<Path>,
+}
+
+impl Default for BashTool {
+    fn default() -> Self {
+        Self {
+            root: default_root(),
+        }
+    }
+}
 
 /// The `>`/`>>` redirect targets in a command line, quote-aware. Skips fd
 /// duplications (`2>&1`, `>&2`), which name a descriptor, not a file.
@@ -1292,11 +1372,11 @@ impl Tool for BashTool {
         Permission::Ask { summary }
     }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
-        Box::pin(async move { done(bash_impl(&input, cancel).await) })
+        Box::pin(async move { done(bash_impl(&self.root, &input, cancel).await) })
     }
 }
 
-async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
+async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> ToolResult {
     let command = str_arg(input, "command")?;
     let timeout_ms = input
         .get("timeout_ms")
@@ -1306,6 +1386,10 @@ async fn bash_impl(input: &Value, cancel: CancellationToken) -> ToolResult {
 
     let egress = crate::net::egress_state().await;
     let mut cmd = sandbox::build_command(command, sandbox_status(), &egress);
+    // `build_command` itself stays root-agnostic — the sandbox floor is
+    // process-wide and this is only where the shell starts, not where it is
+    // confined.
+    cmd.current_dir(root);
     let (child_out, child_err, pipe) = merged_pipe()
         .map_err(|e| ToolOutcome::err(format!("Could not create the output pipe: {e}.")))?;
     cmd.stdin(std::process::Stdio::null())
@@ -1702,7 +1786,11 @@ mod tests {
         std::fs::create_dir_all(root.join("docs")).unwrap();
         std::os::unix::fs::symlink(&rc, root.join("docs/notes.md")).unwrap();
         let p = root.join("docs/notes.md");
-        match file_permission("write", &json!({"path": p.to_str().unwrap()})) {
+        match file_permission(
+            fsguard::workspace_root(),
+            "write",
+            &json!({"path": p.to_str().unwrap()}),
+        ) {
             Permission::AskProtected { why, .. } => {
                 assert!(why.contains("shell startup file"), "{why}")
             }
@@ -1715,13 +1803,21 @@ mod tests {
         // Vuln 3: a doubled separator collapses to the real protected dir on
         // write, so the floor must classify the normalized path, not the raw
         // string that `contains(".github/workflows/")` never matches.
-        match file_permission("write", &json!({"path": ".github//workflows/ci.yml"})) {
+        match file_permission(
+            fsguard::workspace_root(),
+            "write",
+            &json!({"path": ".github//workflows/ci.yml"}),
+        ) {
             Permission::AskProtected { why, .. } => assert!(why.contains("CI workflow"), "{why}"),
             other => panic!("a separator trick must not dodge the floor, got {other:?}"),
         }
         assert!(
             matches!(
-                file_permission("write", &json!({"path": ".git/./config"})),
+                file_permission(
+                    fsguard::workspace_root(),
+                    "write",
+                    &json!({"path": ".git/./config"})
+                ),
                 Permission::AskProtected { .. }
             ),
             "a `.` segment must not dodge the floor either"
@@ -1732,14 +1828,22 @@ mod tests {
     fn file_permission_is_case_insensitive_for_protected_basenames() {
         // Vuln 3 (case half): a case-insensitive volume resolves `MAKEFILE` to
         // `Makefile`, so a byte-exact basename match cannot be the only guard.
-        match file_permission("write", &json!({"path": "MAKEFILE"})) {
+        match file_permission(
+            fsguard::workspace_root(),
+            "write",
+            &json!({"path": "MAKEFILE"}),
+        ) {
             Permission::AskProtected { why, .. } => {
                 assert!(why.contains("build entrypoint"), "{why}")
             }
             other => panic!("MAKEFILE must escalate like Makefile, got {other:?}"),
         }
         assert!(matches!(
-            file_permission("write", &json!({"path": "BUILD.RS"})),
+            file_permission(
+                fsguard::workspace_root(),
+                "write",
+                &json!({"path": "BUILD.RS"})
+            ),
             Permission::AskProtected { .. }
         ));
     }
@@ -1752,7 +1856,7 @@ mod tests {
         // floor stays out of the way for normal work.
         let protected = |cmd: &str| {
             matches!(
-                BashTool.permission(&json!({ "command": cmd })),
+                BashTool::default().permission(&json!({ "command": cmd })),
                 Permission::AskProtected { .. }
             )
         };
@@ -1765,7 +1869,7 @@ mod tests {
         assert!(protected("echo x | tee .git/hooks/pre-push"), "tee");
         let ordinary = |cmd: &str| {
             matches!(
-                BashTool.permission(&json!({ "command": cmd })),
+                BashTool::default().permission(&json!({ "command": cmd })),
                 Permission::Ask { .. }
             )
         };
@@ -1790,18 +1894,18 @@ mod tests {
         // Granted: an ordinary ask, the same tier as an in-workspace write
         // (auto-approved under mode=auto — that is the point of the grant).
         assert!(matches!(
-            file_permission_with("write", &input, &extras),
+            file_permission_with(fsguard::workspace_root(), "write", &input, &extras),
             Permission::Ask { .. }
         ));
         // Not granted: the protected ask, exactly as before.
         assert!(matches!(
-            file_permission_with("write", &input, &[]),
+            file_permission_with(fsguard::workspace_root(), "write", &input, &[]),
             Permission::AskProtected { .. }
         ));
         // A protected filename under a granted extra still escalates — the
         // execute-later class outranks the grant.
         let protected = json!({"path": extra.join("Makefile").to_str().unwrap()});
-        match file_permission_with("write", &protected, &extras) {
+        match file_permission_with(fsguard::workspace_root(), "write", &protected, &extras) {
             Permission::AskProtected { why, .. } => {
                 assert!(why.contains("build entrypoint"), "{why}")
             }
@@ -2168,7 +2272,7 @@ mod tests {
 
     #[tokio::test]
     async fn glob_refuses_escape() {
-        let out = GlobTool
+        let out = GlobTool::default()
             .run(
                 json!({"pattern": "*.rs", "path": "/etc"}),
                 CancellationToken::new(),
@@ -2252,7 +2356,7 @@ mod tests {
 
     #[tokio::test]
     async fn grep_refuses_out_of_workspace_path() {
-        let out = GrepTool
+        let out = GrepTool::default()
             .run(
                 json!({"pattern": "x", "path": "/etc"}),
                 CancellationToken::new(),
@@ -2311,7 +2415,7 @@ mod tests {
         assert!(ReadTool::default().parallel_safe());
         assert!(!EditTool::default().parallel_safe());
         assert!(!WriteTool::default().parallel_safe());
-        assert!(!BashTool.parallel_safe());
+        assert!(!BashTool::default().parallel_safe());
     }
 
     #[test]
@@ -2320,7 +2424,7 @@ mod tests {
         // see all of stdout, then all of stderr, and reason about a sequence
         // that never happened.
         let out = run(
-            &BashTool,
+            &BashTool::default(),
             json!({"command": "printf 'one\\n'; printf 'two\\n' >&2; printf 'three\\n'"}),
         );
         assert!(!out.is_error, "{}", out.content);
@@ -2334,14 +2438,14 @@ mod tests {
 
     #[test]
     fn bash_reports_the_exit_status_structurally() {
-        let f = run(&BashTool, json!({"command": "exit 3"}));
+        let f = run(&BashTool::default(), json!({"command": "exit 3"}));
         assert!(
             f.is_error && f.content.contains("status 3"),
             "{}",
             f.content
         );
         assert!(f.content.contains("[exit 3]"), "{}", f.content);
-        let k = run(&BashTool, json!({"command": "kill -TERM $$"}));
+        let k = run(&BashTool::default(), json!({"command": "kill -TERM $$"}));
         assert!(k.is_error && k.content.contains("signal"), "{}", k.content);
         assert!(k.content.contains("[killed by SIGTERM]"), "{}", k.content);
     }
@@ -2355,7 +2459,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let marker = dir.path().join("still-alive");
         let cmd = format!("(sleep 1; touch {}) & sleep 5", marker.to_str().unwrap());
-        let t = run(&BashTool, json!({"command": cmd, "timeout_ms": 300}));
+        let t = run(
+            &BashTool::default(),
+            json!({"command": cmd, "timeout_ms": 300}),
+        );
         assert!(
             t.is_error && t.content.contains("timed out"),
             "{}",
@@ -2372,14 +2479,17 @@ mod tests {
 
     #[test]
     fn bash_captures_exit_and_timeout() {
-        let ok = run(&BashTool, json!({"command": "echo hi"}));
+        let ok = run(&BashTool::default(), json!({"command": "echo hi"}));
         assert!(!ok.is_error);
         assert!(ok.content.contains("hi"));
 
-        let fail = run(&BashTool, json!({"command": "exit 3"}));
+        let fail = run(&BashTool::default(), json!({"command": "exit 3"}));
         assert!(fail.is_error && fail.content.contains("status 3"));
 
-        let t = run(&BashTool, json!({"command": "sleep 5", "timeout_ms": 200}));
+        let t = run(
+            &BashTool::default(),
+            json!({"command": "sleep 5", "timeout_ms": 200}),
+        );
         assert!(t.is_error && t.content.contains("timed out"));
     }
 }

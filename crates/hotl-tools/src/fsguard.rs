@@ -33,17 +33,22 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
-/// The workspace root, canonicalized once.
+/// The process workspace root, canonicalized once. Also the default root for
+/// a session that was not given one of its own.
 ///
-/// INVARIANT: the guard's root set — this directory, plus any
+/// INVARIANT: the guard's root set — a session's root, plus any
 /// `[sandbox].writable` extras a tool was granted via `[sandbox].file_tools`
 /// — is a subset of the kernel write set (`sandbox::write_roots()`).
-/// The workspace half holds because `sandbox.rs:180` (seatbelt) and
-/// `sandbox.rs:270` (landlock) canonicalize `current_dir()` exactly like
-/// this function (enforced by `guard_root_matches_sandbox_root`); the extras
-/// half holds by construction — both sides read the same set-once
-/// `sandbox::EXTRAS`. If either boundary named a directory the other does
-/// not, one of them would be decorative.
+/// A session root is either this directory or one **beneath** it (an isolated
+/// child's git worktree, `hotl::agent::HotlChildBuilder::spawn_child`), and the
+/// floor covers the whole workspace, so the containment holds either way. The
+/// equal case holds because `sandbox.rs` (seatbelt and landlock alike)
+/// canonicalizes `current_dir()` exactly like this function — enforced by
+/// `guard_root_matches_sandbox_root`; the beneath case by
+/// `child_root_is_beneath_the_sandbox_root`. The extras half holds by
+/// construction — both sides read the same set-once `sandbox::EXTRAS`. If
+/// either boundary named a directory the other does not, one of them would be
+/// decorative.
 pub(crate) fn workspace_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
@@ -858,6 +863,26 @@ pub(crate) mod tests {
         // different directory, one of the two would be decorative.
         let sandbox_root = std::env::current_dir().unwrap().canonicalize().unwrap();
         assert_eq!(workspace_root(), sandbox_root.as_path());
+    }
+
+    #[test]
+    fn child_root_is_beneath_the_sandbox_root() {
+        // The weakened half of the INVARIANT above: an isolated child roots its
+        // tools at `<workspace>/.git/hotl-worktrees/<id>`, which is not equal to
+        // the kernel floor's cwd entry but is contained by it. If this ever
+        // stopped holding — a worktree in `$TMPDIR`, say — the file tools would
+        // happily descend into a directory the kernel then refuses to write.
+        let floor = crate::sandbox::write_roots()
+            .first()
+            .expect("the write floor always carries the workspace")
+            .clone();
+        let child = floor.join(".git/hotl-worktrees/01JEXAMPLE");
+        assert!(
+            child.starts_with(&floor),
+            "child root {} escaped the floor {}",
+            child.display(),
+            floor.display()
+        );
     }
 
     #[test]
