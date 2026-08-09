@@ -418,9 +418,46 @@ pub struct NetworkCfg {
     /// Hosts reachable in allowlist mode (`"github.com"`, `"*.crates.io"`).
     #[serde(default)]
     pub allow: Vec<String>,
+    /// Start from hotl's `STARTER_ALLOW` (default `true`). Set `false` for a
+    /// list containing exactly what you wrote and nothing else.
+    #[serde(default)]
+    pub defaults: Option<bool>,
 }
 
 impl NetworkCfg {
+    /// The allowlist the proxy actually enforces: `STARTER_ALLOW` (unless
+    /// `defaults = false`) plus the owner's `allow`, deduped, order-stable
+    /// with the starter entries first. Deduping is on the normalized host so
+    /// `"GitHub.com"` in config does not double an entry.
+    pub fn effective_allow(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let entries = self
+            .defaults
+            .unwrap_or(true)
+            .then(|| hotl_tools::net::STARTER_ALLOW.iter().map(|s| s.to_string()))
+            .into_iter()
+            .flatten()
+            .chain(self.allow.iter().cloned());
+        for entry in entries {
+            if seen.insert(hotl_tools::net::normalize_host(&entry)) {
+                out.push(entry);
+            }
+        }
+        out
+    }
+
+    /// How many of `effective_allow` came from hotl's starter list — the split
+    /// `hotl doctor` prints, so a human can tell what they chose from what
+    /// hotl chose for them.
+    pub fn starter_count(&self) -> usize {
+        if self.defaults.unwrap_or(true) {
+            hotl_tools::net::STARTER_ALLOW.len()
+        } else {
+            0
+        }
+    }
+
     /// Resolve `[network]` to the process egress policy. An unknown mode
     /// fails **closed** to `Off` with a loud warning — a typo must never
     /// mean "open".
@@ -429,7 +466,9 @@ impl NetworkCfg {
         match self.egress.as_deref() {
             None | Some("open") => (EgressPolicy::Open, None),
             Some("off") => (EgressPolicy::Off, None),
-            Some("allowlist") => (EgressPolicy::Allowlist(self.allow.clone()), None),
+            // The starter list exists only inside `Allowlist`; `Off` and
+            // `Open` are untouched by it.
+            Some("allowlist") => (EgressPolicy::Allowlist(self.effective_allow()), None),
             Some(other) => (
                 EgressPolicy::Off,
                 Some(format!(
@@ -1099,7 +1138,7 @@ mod tests {
         assert_eq!(policy, EgressPolicy::Off);
         assert!(warning.is_none());
         let cfg = cfg_with(
-            "[network]\negress = \"allowlist\"\nallow = [\"github.com\", \"*.crates.io\"]\n",
+            "[network]\negress = \"allowlist\"\ndefaults = false\nallow = [\"github.com\", \"*.crates.io\"]\n",
         );
         let (policy, warning) = cfg.network.egress_policy();
         assert_eq!(
@@ -1113,6 +1152,66 @@ mod tests {
             .egress_policy();
         assert_eq!(policy, EgressPolicy::Off);
         assert!(warning.unwrap().contains("opne"));
+    }
+
+    /// 0026 Task 1: an allowlist starts from hotl's curated list, so a fresh
+    /// `cargo build` produces zero prompts before the ask machinery is ever
+    /// exercised. The owner's entries are appended, never replaced.
+    #[test]
+    fn starter_allow_is_merged_and_deduped() {
+        let cfg = cfg_with(
+            "[network]\negress = \"allowlist\"\nallow = [\"github.com\", \"internal.example.com\"]\n",
+        );
+        let effective = cfg.network.effective_allow();
+        assert_eq!(
+            effective.iter().filter(|h| *h == "github.com").count(),
+            1,
+            "github.com is on the starter list; config must not double it"
+        );
+        assert!(effective.contains(&"internal.example.com".to_string()));
+        assert_eq!(
+            effective.len(),
+            hotl_tools::net::STARTER_ALLOW.len() + 1,
+            "exactly one entry is new: {effective:?}"
+        );
+        // Order-stable, starter entries first.
+        assert_eq!(effective[0], hotl_tools::net::STARTER_ALLOW[0]);
+        assert_eq!(effective.last().unwrap(), "internal.example.com");
+    }
+
+    #[test]
+    fn starter_dedup_is_case_and_trailing_dot_insensitive() {
+        let cfg = cfg_with("[network]\negress = \"allowlist\"\nallow = [\"GitHub.com.\"]\n");
+        assert_eq!(
+            cfg.network.effective_allow().len(),
+            hotl_tools::net::STARTER_ALLOW.len(),
+            "a differently-spelled starter host must not add a second entry"
+        );
+    }
+
+    #[test]
+    fn defaults_false_yields_exactly_the_user_list() {
+        let cfg = cfg_with(
+            "[network]\negress = \"allowlist\"\ndefaults = false\nallow = [\"internal.example.com\"]\n",
+        );
+        assert_eq!(
+            cfg.network.effective_allow(),
+            vec!["internal.example.com".to_string()]
+        );
+        assert_eq!(cfg.network.starter_count(), 0);
+    }
+
+    #[test]
+    fn egress_open_and_off_are_unaffected_by_the_starter_list() {
+        use hotl_tools::net::EgressPolicy;
+        let (policy, _) = cfg_with("[network]\negress = \"open\"\n")
+            .network
+            .egress_policy();
+        assert_eq!(policy, EgressPolicy::Open);
+        let (policy, _) = cfg_with("[network]\negress = \"off\"\n")
+            .network
+            .egress_policy();
+        assert_eq!(policy, EgressPolicy::Off);
     }
 
     /// Shared harness for `[sandbox]` resolve tests: a scratch area holding a

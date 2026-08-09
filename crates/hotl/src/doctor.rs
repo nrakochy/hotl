@@ -54,6 +54,7 @@ pub fn doctor_main() -> i32 {
     let gateway = gateway_check(&rt);
     let mut checks = vec![provider_check()];
     checks.extend(sandbox_check(&config_dir));
+    checks.extend(egress_checks(&config_dir));
     checks.extend([
         config_check(&config_dir),
         permissions_check(&config_dir),
@@ -277,6 +278,64 @@ fn sandbox_check(config_dir: &Path) -> Vec<Check> {
             "sandbox: the read carve could not open {failure} — reads under it are denied \
              to sandboxed commands, which is fail-closed but was not asked for"
         )));
+    }
+    checks
+}
+
+/// The egress posture, with the effective allowlist split by source. The list
+/// hotl ships is the one an eventual default flip imposes on everyone, so it
+/// has to be enumerable without reading source (0026 Step 1.3).
+///
+/// Reads the config rather than `egress_state()`: resolving the state starts
+/// the filtering proxy, and `doctor` reports posture, it does not open sockets.
+fn egress_checks(config_dir: &Path) -> Vec<Check> {
+    let cfg = crate::config::Config::load(config_dir);
+    let (policy, warning) = cfg.network.egress_policy();
+    let mut checks: Vec<Check> = Vec::new();
+    if let Some(warning) = warning {
+        checks.push(fail(format!("egress: {warning}")));
+    }
+    match policy {
+        hotl_tools::net::EgressPolicy::Open => {
+            checks.push(ok("egress: open — unrestricted; the human gate is the \
+                            exfiltration boundary"
+                .into()));
+        }
+        hotl_tools::net::EgressPolicy::Off => {
+            checks.push(ok(
+                "egress: off — loopback and unix sockets only, no ask (no proxy in the path)"
+                    .into(),
+            ));
+        }
+        hotl_tools::net::EgressPolicy::Allowlist(effective) => {
+            let starter = cfg.network.starter_count();
+            let custom: Vec<&String> = effective.iter().skip(starter).collect();
+            checks.push(ok(format!(
+                "egress: allowlist — {} host{} total",
+                effective.len(),
+                if effective.len() == 1 { "" } else { "s" }
+            )));
+            if starter > 0 {
+                checks.push(ok(format!(
+                    "egress: {starter} from hotl's starter list \
+                     (set [network].defaults = false to drop): {}",
+                    hotl_tools::net::STARTER_ALLOW.join(", ")
+                )));
+            }
+            checks.push(if custom.is_empty() {
+                ok("egress: 0 from config.toml [network].allow".into())
+            } else {
+                ok(format!(
+                    "egress: {} from config.toml [network].allow: {}",
+                    custom.len(),
+                    custom
+                        .iter()
+                        .map(|h| h.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            });
+        }
     }
     checks
 }

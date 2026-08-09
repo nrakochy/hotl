@@ -38,6 +38,52 @@ const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// `SessionConcurrency` applies to subprocesses and requests.
 const MAX_PROXY_CONNS: usize = 64;
 
+/// Hosts an allowlist starts with: the package registries, their CDNs, and the
+/// git forges a build reaches without anyone deciding to reach them. Bounds
+/// accidents and drive-by fetches — NOT exfiltration: `github.com` is
+/// bidirectional and a gist push leaves through it (docs/SECURITY.md).
+///
+/// Exact hosts, never wildcards: a default nobody can enumerate is a default
+/// nobody can audit. Enforced by `starter_allow_has_no_wildcards`.
+pub const STARTER_ALLOW: &[&str] = &[
+    // Rust
+    "crates.io",
+    "static.crates.io",
+    "index.crates.io",
+    "static.rust-lang.org",
+    "sh.rustup.rs",
+    "docs.rs",
+    // Node
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    // Python
+    "pypi.org",
+    "files.pythonhosted.org",
+    // Go
+    "proxy.golang.org",
+    "sum.golang.org",
+    // Ruby
+    "rubygems.org",
+    // Forges
+    "github.com",
+    "api.github.com",
+    "codeload.github.com",
+    "objects.githubusercontent.com",
+    "raw.githubusercontent.com",
+    "gitlab.com",
+];
+
+/// The one normalization every host comparison uses: lowercase, trailing root
+/// dot stripped. Shared because a table that normalizes differently from
+/// `host_matches` produces a prompt that reappears forever (0026 watch-out 5).
+///
+/// Deliberately does not strip a port: callers already split host from port
+/// (`split_host_port`, `http_target`), and stripping here would silently
+/// accept `example.com:443` as a pattern.
+pub fn normalize_host(host: &str) -> String {
+    host.trim_end_matches('.').to_ascii_lowercase()
+}
+
 /// An RFC 7617 `Basic` credential value, ready to compare against a
 /// `Proxy-Authorization` header. The server side compares against this
 /// precomputed string, so no decoder is required.
@@ -221,7 +267,7 @@ pub fn label_suffix() -> Option<String> {
 /// (`a.example.com`, `a.b.example.com`). No ports in patterns; a trailing dot
 /// on the host is stripped. An empty pattern list allows nothing.
 fn host_matches(host: &str, patterns: &[String]) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    let host = normalize_host(host);
     patterns.iter().any(|pattern| {
         let pattern = pattern.to_ascii_lowercase();
         match pattern.strip_prefix("*.") {
@@ -556,6 +602,23 @@ mod tests {
         // The public entrypoint reads the (unset-in-tests, so default Open)
         // process-wide policy.
         assert_eq!(host_allowed("anything.example"), HostVerdict::NoPolicy);
+    }
+
+    /// 0026 watch-out 8: every host on the starter list is one hotl asserts is
+    /// fine to reach by default. A wildcard would make that set unenumerable,
+    /// so widening it has to be a deliberate edit to this test too.
+    #[test]
+    fn starter_allow_has_no_wildcards() {
+        assert!(STARTER_ALLOW.iter().all(|host| !host.contains('*')));
+    }
+
+    #[test]
+    fn starter_allow_is_lowercase_and_has_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for host in STARTER_ALLOW {
+            assert_eq!(*host, normalize_host(host), "{host} is not normalized");
+            assert!(seen.insert(*host), "{host} appears twice");
+        }
     }
 
     #[test]
