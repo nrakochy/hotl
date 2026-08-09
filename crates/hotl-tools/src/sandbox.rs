@@ -678,6 +678,7 @@ fn seatbelt_profile(
     unix_sockets: UnixSockets,
     automation: Automation,
     extra_count: usize,
+    noread_count: usize,
 ) -> String {
     let mut profile = String::from(
         r#"(version 1)
@@ -702,6 +703,23 @@ fn seatbelt_profile(
         profile.push_str(&format!("\n  (subpath (param \"PROT_{i}\"))"));
     }
     profile.push_str(")\n");
+    // Plan 0022: the read-carve. `(allow default)` at the top is what grants
+    // reads today, so these denies must follow it — SBPL is last-match-wins.
+    // `file-read-data`, *not* `file-read*`: the latter also denies
+    // file-read-metadata, which breaks `ls -la ~` (it stats every child).
+    // With data alone, `stat` succeeds while contents and directory listing
+    // do not — the path exists, its contents do not. Each NOREAD_i is an
+    // absolute path passed as a `-D` param by `seatbelt_base_with`.
+    //
+    // The `> 0` guard keeps the profile byte-identical to the pre-0022 text
+    // when nothing is carved, which the clause tests rely on.
+    if noread_count > 0 {
+        profile.push_str("(deny file-read-data");
+        for i in 0..noread_count {
+            profile.push_str(&format!("\n  (subpath (param \"NOREAD_{i}\"))"));
+        }
+        profile.push_str(")\n");
+    }
     if confine_network {
         profile.push_str(
             r#"(deny network*)
@@ -756,13 +774,18 @@ fn seatbelt_profile(
 /// shared by the `sh -c` and direct-argv exec shapes.
 #[cfg(target_os = "macos")]
 fn seatbelt_base(egress: &EgressState) -> tokio::process::Command {
-    seatbelt_base_with(egress, extra_writable())
+    seatbelt_base_with(egress, extra_writable(), &spawn_read_deny())
 }
 
 /// The extras-explicit seam — behavioral tests drive configured write roots
-/// through here without touching the process-global `EXTRAS`.
+/// and read denials through here without touching the process-global
+/// `EXTRAS` or the `SECRET_READS` task-local.
 #[cfg(target_os = "macos")]
-fn seatbelt_base_with(egress: &EgressState, extras: &[PathBuf]) -> tokio::process::Command {
+fn seatbelt_base_with(
+    egress: &EgressState,
+    extras: &[PathBuf],
+    noread: &[PathBuf],
+) -> tokio::process::Command {
     let confine_network = matches!(egress, EgressState::Off | EgressState::Proxy(_));
     let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let tmp = canon(std::env::temp_dir());
@@ -773,6 +796,7 @@ fn seatbelt_base_with(egress: &EgressState, extras: &[PathBuf]) -> tokio::proces
             unix_socket_policy(),
             automation_policy(),
             extras.len(),
+            noread.len(),
         ))
         .arg("-D")
         .arg(format!("CWD={}", cwd.display()))
@@ -789,6 +813,12 @@ fn seatbelt_base_with(egress: &EgressState, extras: &[PathBuf]) -> tokio::proces
         // OsString concatenation, not format!: a non-UTF-8 path must reach
         // sandbox-exec byte-exact, never lossily rendered.
         let mut d = std::ffi::OsString::from(format!("EXTRA_{i}="));
+        d.push(p.as_os_str());
+        cmd.arg("-D").arg(d);
+    }
+    // Plan 0022: the read-carve paths. Same byte-exact OsString concat.
+    for (i, p) in noread.iter().enumerate() {
+        let mut d = std::ffi::OsString::from(format!("NOREAD_{i}="));
         d.push(p.as_os_str());
         cmd.arg("-D").arg(d);
     }
@@ -1226,7 +1256,7 @@ mod tests {
         // touched and no process-global cwd is changed.
         let dir = tempfile::tempdir().expect("tempdir");
         let cwd = canon(dir.path().to_path_buf());
-        let profile = seatbelt_profile(false, unix_socket_policy(), automation_policy(), 0);
+        let profile = seatbelt_profile(false, unix_socket_policy(), automation_policy(), 0, 0);
         let run = |cmd: &str| {
             let mut c = std::process::Command::new("/usr/bin/sandbox-exec");
             // Run in the tempdir so the child's real cwd matches the CWD param
@@ -1322,7 +1352,7 @@ mod tests {
     /// behavioral tests below and `seatbelt_confines_writes` prove enforcement.
     #[test]
     fn seatbelt_profile_carries_every_required_clause() {
-        let open = seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Deny, 0);
+        let open = seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Deny, 0, 0);
         for clause in [
             "(deny file-write*)",
             "(subpath (param \"CWD\"))",
@@ -1332,14 +1362,20 @@ mod tests {
         ] {
             assert!(open.contains(clause), "profile lost `{clause}`:\n{open}");
         }
-        // No configured extras → byte-identical to today's profile shape.
+        // No configured extras and no carve → byte-identical to the pre-0022
+        // profile shape.
         assert!(!open.contains("EXTRA"), "no EXTRA params without extras");
+        assert!(!open.contains("NOREAD"), "no NOREAD params without a carve");
+        assert!(
+            !open.contains("file-read"),
+            "reads untouched without a carve"
+        );
         // Both opt-outs really opt out.
         assert!(
-            !seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Allow, 0)
+            !seatbelt_profile(false, UnixSockets::DenyDaemons, Automation::Allow, 0, 0)
                 .contains("appleevent-send")
         );
-        let confined = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny, 0);
+        let confined = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny, 0, 0);
         for clause in [
             "(deny network*)",
             "(allow network* (local unix) (remote unix))",
@@ -1355,7 +1391,7 @@ mod tests {
 
     #[test]
     fn seatbelt_profile_re_allows_each_configured_extra_via_params() {
-        let p = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny, 2);
+        let p = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny, 2, 0);
         for clause in [
             "(subpath (param \"EXTRA_0\"))",
             "(subpath (param \"EXTRA_1\"))",
@@ -1366,6 +1402,94 @@ mod tests {
         // container-daemon denies stay terminal so nothing widens them back.
         let deny = p.find("(deny network-outbound").expect("daemon deny");
         assert!(p.find("EXTRA_1").unwrap() < deny);
+    }
+
+    /// Plan 0022. Two properties the read-carve block must have: it denies
+    /// *data* only (metadata stays readable, or `ls -la ~` breaks), and it
+    /// sits after the write clauses and before the terminal socket denies, so
+    /// nothing later widens it back.
+    #[test]
+    fn seatbelt_read_deny_precedes_the_terminal_socket_denies() {
+        let p = seatbelt_profile(true, UnixSockets::DenyDaemons, Automation::Deny, 0, 2);
+        for clause in [
+            "(deny file-read-data",
+            "(subpath (param \"NOREAD_0\"))",
+            "(subpath (param \"NOREAD_1\"))",
+        ] {
+            assert!(p.contains(clause), "profile lost `{clause}`:\n{p}");
+        }
+        // Data, never metadata: `file-read*` would deny file-read-metadata
+        // too, and `ls -la ~` stats every child.
+        assert!(
+            !p.contains("(deny file-read*"),
+            "denying metadata breaks `ls -la`:\n{p}"
+        );
+        let read = p.find("(deny file-read-data").expect("read deny");
+        let write = p.find("(deny file-write*)").expect("write deny");
+        let socket = p.find("(deny network-outbound").expect("daemon deny");
+        assert!(write < read, "the read carve must follow the write floor");
+        assert!(
+            read < socket,
+            "the socket denies must stay terminal (nothing widens them back)"
+        );
+    }
+
+    /// The behavioral half: a carved path really is unreadable, its metadata
+    /// really is not, and a sibling outside the carve reads fine. Without
+    /// that last positive control the test would pass on a broken profile
+    /// that denied everything.
+    #[tokio::test]
+    async fn seatbelt_denies_reading_a_carved_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let carved = canon(dir.path().to_path_buf()).join("secrets");
+        let open = canon(dir.path().to_path_buf()).join("ordinary");
+        std::fs::create_dir_all(&carved).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::write(carved.join("id_probe"), b"canary").unwrap();
+        std::fs::write(open.join("id_probe"), b"canary").unwrap();
+
+        let run = |script: String, noread: Vec<PathBuf>| async move {
+            let mut cmd = seatbelt_base_with(&EgressState::Open, &[], &noread);
+            cmd.arg("sh").arg("-c").arg(script);
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .await
+                .expect("spawn")
+        };
+        let cat = |p: &std::path::Path| format!("cat {}", p.display());
+
+        // Positive control 1: with nothing carved, the canary reads.
+        let control = run(cat(&carved.join("id_probe")), vec![]).await;
+        assert!(
+            control.status.success(),
+            "the canary must be readable without a carve: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+
+        let carve = vec![carved.clone()];
+        // The carve denies the contents...
+        let denied = run(cat(&carved.join("id_probe")), carve.clone()).await;
+        assert!(!denied.status.success(), "a carved path must not read");
+        assert!(!String::from_utf8_lossy(&denied.stdout).contains("canary"));
+        // ...but not its metadata: `stat` is what `ls -la` needs.
+        let stat = run(
+            format!("stat {} > /dev/null", carved.join("id_probe").display()),
+            carve.clone(),
+        )
+        .await;
+        assert!(
+            stat.status.success(),
+            "metadata must stay readable (`ls -la` stats every child): {}",
+            String::from_utf8_lossy(&stat.stderr)
+        );
+        // Positive control 2: a sibling outside the carve is untouched.
+        let sibling = run(cat(&open.join("id_probe")), carve).await;
+        assert!(
+            sibling.status.success(),
+            "a path outside the carve must still read: {}",
+            String::from_utf8_lossy(&sibling.stderr)
+        );
     }
 
     #[tokio::test]
@@ -1388,7 +1512,7 @@ mod tests {
         );
 
         // Same write with the extra configured: allowed.
-        let mut cmd = seatbelt_base_with(&EgressState::Open, std::slice::from_ref(&extra));
+        let mut cmd = seatbelt_base_with(&EgressState::Open, std::slice::from_ref(&extra), &[]);
         cmd.arg("sh").arg("-c").arg(&script);
         let ok = cmd
             .stdout(std::process::Stdio::piped())
@@ -1409,7 +1533,7 @@ mod tests {
     #[test]
     fn seatbelt_denies_the_container_daemon_socket_class_in_both_network_modes() {
         for confined in [false, true] {
-            let p = seatbelt_profile(confined, UnixSockets::DenyDaemons, Automation::Deny, 0);
+            let p = seatbelt_profile(confined, UnixSockets::DenyDaemons, Automation::Deny, 0, 0);
             // The first *deny* on network-outbound: the `(allow
             // network-outbound (remote ip …))` of the confined profile also
             // contains the operation name, so match on the deny itself.
@@ -1433,7 +1557,7 @@ mod tests {
         }
         // The opt-out really opts out.
         assert!(
-            !seatbelt_profile(false, UnixSockets::Open, Automation::Deny, 0).contains("docker")
+            !seatbelt_profile(false, UnixSockets::Open, Automation::Deny, 0, 0).contains("docker")
         );
     }
 
@@ -1563,9 +1687,20 @@ mod tests {
         );
         assert!(!leaked, "file must not exist outside the sandbox");
 
-        // Reads outside stay allowed (floor is write-confinement).
+        // Reads outside cwd stay allowed *except* where plan 0022 carves
+        // them. This process installed no extras, so the carve is empty and
+        // `$HOME` is wholly readable; `seatbelt_denies_reading_a_carved_path`
+        // owns the negative, and `tests/sandbox_read_carve.rs` owns it
+        // through the process-global path.
         let read = run(&format!("ls {home} > /dev/null")).await;
-        assert!(read.status.success(), "reads outside cwd should be allowed");
+        assert!(
+            read.status.success(),
+            "with an empty carve, reads outside cwd stay allowed"
+        );
+        assert!(
+            read_deny().is_empty(),
+            "this process must not have installed a carve"
+        );
     }
 }
 
