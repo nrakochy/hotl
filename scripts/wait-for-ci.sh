@@ -123,8 +123,8 @@ while :; do
   if [ "$SECONDS" -ge "$timeout" ]; then
     echo "error: CI never reported$pending for $sha within ${timeout}s." >&2
     echo "hint: ci.yml ignores tags (ci.yml:13), so a commit that was never pushed to a" >&2
-    echo "      branch has no CI run and never will. Push the branch first, or re-run" >&2
-    echo "      with HOTL_SKIP_CI_WAIT=1 to accept an ungated release." >&2
+    echo "      branch has no CI run and never will. Push the branch first, then finish" >&2
+    echo "      the release with 'scripts/release.sh --tag-only'." >&2
     exit 1
   fi
 

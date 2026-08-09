@@ -17,7 +17,9 @@
 #
 # Env:
 #   HOTL_SKIP_LINUX_CHECK=1   accept that a Linux-only break may reach the tag
-#   HOTL_SKIP_CI_WAIT=1       tag without waiting for green CI on the commit
+#
+# There is deliberately no way to tag without green CI. If CI is red or the
+# API is unreachable, this script does not create a tag.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -56,20 +58,16 @@ fi
 # The tag is what makes a release public, and the wait below is what holds it
 # back — so a missing `gh` has to be a refusal here, not a surprise after the
 # changelog has already been promoted.
-if [ "${HOTL_SKIP_CI_WAIT:-0}" != 1 ]; then
-  command -v gh >/dev/null 2>&1 || {
-    echo "error: gh is required to wait for CI before tagging." >&2
-    echo "hint: install the GitHub CLI, or re-run with HOTL_SKIP_CI_WAIT=1 to" >&2
-    echo "      accept a tag that no green CI run vouches for." >&2
-    exit 1
-  }
-  gh auth status >/dev/null 2>&1 || {
-    echo "error: gh is not authenticated, so CI status cannot be read." >&2
-    echo "hint: run 'gh auth login', or re-run with HOTL_SKIP_CI_WAIT=1 to" >&2
-    echo "      accept a tag that no green CI run vouches for." >&2
-    exit 1
-  }
-fi
+command -v gh >/dev/null 2>&1 || {
+  echo "error: gh is required to read CI status before tagging." >&2
+  echo "hint: install the GitHub CLI (https://cli.github.com)." >&2
+  exit 1
+}
+gh auth status >/dev/null 2>&1 || {
+  echo "error: gh is not authenticated, so CI status cannot be read." >&2
+  echo "hint: run 'gh auth login'." >&2
+  exit 1
+}
 
 # --tag-only is the recovery path for a red CI: the version bump is committed
 # and pushed but untagged, and re-running a normal release would refuse on its
@@ -89,11 +87,7 @@ if [ "$tag_only" = 1 ]; then
     exit 1
   fi
 
-  if [ "${HOTL_SKIP_CI_WAIT:-0}" = 1 ]; then
-    echo "skipping the CI wait (HOTL_SKIP_CI_WAIT=1) — publish.yml will refuse if CI is red."
-  else
-    bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"
-  fi
+  bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"
 
   git tag -a "$tag" -m "$tag"
   git push origin "$tag"
@@ -220,9 +214,7 @@ git commit -aqm "release: $tag"
 branch="$(git rev-parse --abbrev-ref HEAD)"
 git push origin "$branch"
 
-if [ "${HOTL_SKIP_CI_WAIT:-0}" = 1 ]; then
-  echo "skipping the CI wait (HOTL_SKIP_CI_WAIT=1) — publish.yml will refuse if CI is red."
-elif ! bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"; then
+if ! bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"; then
   echo "the release commit is pushed but untagged, so nothing is public yet." >&2
   echo "hint: fix the break, then finish with 'scripts/release.sh --tag-only'." >&2
   exit 1

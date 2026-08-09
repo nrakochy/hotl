@@ -251,9 +251,12 @@ Fix the break, then finish the release without re-bumping anything:
 It re-reads the version from `Cargo.toml`, refuses unless `HEAD` is what
 `origin/<branch>` points at, waits, tags, and pushes. It edits no files.
 
+**There is no way to tag without green CI.** No flag, no env var. If CI is red,
+still running, or unreachable, the script exits without creating a tag — so
+none of the three release workflows can fire. Recover with `--tag-only`.
+
 | Env var | Effect |
 |---|---|
-| `HOTL_SKIP_CI_WAIT=1` | Tag without waiting. `publish.yml` still refuses, so the practical result is binaries and a GitHub Release without the crates.io publish. An escape hatch for a CI outage, not a shortcut |
 | `HOTL_SKIP_LINUX_CHECK=1` | Skip the Docker Linux cross-check (accepts that a Linux-only break may reach the tag) |
 | `HOTL_CI_WAIT_TIMEOUT` | Seconds to wait for CI, default 1800 |
 | `HOTL_CI_POLL_INTERVAL` | Seconds between polls, default 15 |
