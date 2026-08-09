@@ -328,6 +328,25 @@ impl Rules {
         out
     }
 
+    /// [`Rules::lint`] plus the kernel-reach diagnostics: which deny rules do
+    /// **not** reach shell commands, and what to write instead. A separate
+    /// function because it needs a path resolver and `lint` is pure.
+    ///
+    /// The kernel-reach lines are **informational**, not errors — a
+    /// `[[deny]] bash prefix = "curl "` is a perfectly good rule that the gate
+    /// enforces in full; it simply has no kernel expression. They are marked so
+    /// callers can render them without alarm.
+    pub fn lint_containment(&self, resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Vec<String> {
+        let mut out = self.lint();
+        out.extend(
+            project(self, resolve)
+                .unprojectable
+                .into_iter()
+                .map(|why| format!("note: {why}")),
+        );
+        out
+    }
+
     /// Every deny tier, admin first, tagged with the section an owner wrote it
     /// in. The projection reads these in this order so its output is stable.
     fn deny_tiers(&self) -> [(&'static str, &Vec<AllowRule>); 2] {
@@ -461,12 +480,38 @@ impl Rules {
 /// while missing what it does not cover.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Containment {
-    /// Canonical absolute paths sandboxed children must not read, from
-    /// projectable deny rules. Becomes `sandbox::ReadDeny::rules`.
-    pub read_deny: Vec<PathBuf>,
+    /// Canonical absolute paths sandboxed children must not read, each carrying
+    /// the rule that produced it. Becomes `sandbox::ReadDeny::rules`.
+    pub read_deny: Vec<ProjectedDeny>,
     /// Rules that could not be projected, each with a reason. Surfaced by
     /// [`Rules::lint_containment`] and `hotl doctor` — never silently dropped.
     pub unprojectable: Vec<String>,
+}
+
+/// One projected path and the rule behind it. The attribution is not decoration:
+/// a containment set nobody can trace back to a rule is one nobody will trust or
+/// maintain, so `hotl doctor` names the rule on every line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectedDeny {
+    pub path: PathBuf,
+    /// The rule as the owner wrote it, e.g. `[[deny]] read path_prefix = "/x"`.
+    pub rule: String,
+}
+
+impl Containment {
+    /// The projected paths, attribution dropped.
+    pub fn paths(&self) -> Vec<PathBuf> {
+        self.read_deny.iter().map(|p| p.path.clone()).collect()
+    }
+
+    /// The rule behind a path in the resolved carve, if this projection produced
+    /// it. `hotl doctor` uses it to attribute Tier C lines.
+    pub fn rule_for(&self, path: &Path) -> Option<&str> {
+        self.read_deny
+            .iter()
+            .find(|p| p.path == path)
+            .map(|p| p.rule.as_str())
+    }
 }
 
 /// Project the deny tiers onto the kernel read floor.
@@ -483,9 +528,14 @@ pub fn project(rules: &Rules, resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Con
     for (kind, set) in rules.deny_tiers() {
         for rule in set {
             match project_rule(rule, rules.home(), resolve) {
-                Projection::Path(p) => {
-                    if !out.read_deny.contains(&p) {
-                        out.read_deny.push(p);
+                Projection::Path(path) => {
+                    if !out.read_deny.iter().any(|p| p.path == path) {
+                        let text = format!(
+                            "[[{kind}]] {} path_prefix = \"{}\"",
+                            rule.tool,
+                            rule.path_prefix.as_deref().unwrap_or_default()
+                        );
+                        out.read_deny.push(ProjectedDeny { path, rule: text });
                     }
                 }
                 Projection::Report(why) => {
@@ -2372,7 +2422,7 @@ prefix = "read"
             None,
             &["/Volumes/secrets"],
         );
-        assert_eq!(c.read_deny, vec![PathBuf::from("/Volumes/secrets")]);
+        assert_eq!(c.paths(), vec![PathBuf::from("/Volumes/secrets")]);
         assert!(c.unprojectable.is_empty(), "{:#?}", c.unprojectable);
     }
 
@@ -2383,7 +2433,7 @@ prefix = "read"
             Some("/fixture/home"),
             &["/fixture/home/.aws"],
         );
-        assert_eq!(c.read_deny, vec![PathBuf::from("/fixture/home/.aws")]);
+        assert_eq!(c.paths(), vec![PathBuf::from("/fixture/home/.aws")]);
         assert!(c.unprojectable.is_empty(), "{:#?}", c.unprojectable);
     }
 
@@ -2449,7 +2499,7 @@ prefix = "read"
                 .unwrap(),
         );
         let c = project(&rules, &fixture_fs(&["/Volumes/secrets"]));
-        assert_eq!(c.read_deny, vec![PathBuf::from("/Volumes/secrets")]);
+        assert_eq!(c.paths(), vec![PathBuf::from("/Volumes/secrets")]);
     }
 
     /// Watch-out 4: an allow rule must produce nothing at all — not a
@@ -2494,6 +2544,35 @@ prefix = "read"
         assert!(!dir.exists(), "projection created {}", dir.display());
     }
 
+    /// A rule that cannot reach the kernel is informational, not an error: the
+    /// gate enforces it in full. A rule that can never match anything stays a
+    /// warning. `lint_containment` carries both, distinguishably.
+    #[test]
+    fn lint_containment_marks_kernel_reach_notes_apart_from_broken_rules() {
+        let rules = Rules::from_toml(
+            r#"
+[[deny]]
+tool = "bash"
+prefix = "curl "
+
+[[deny]]
+tool = "read"
+path_prefix = ".ssh/"
+
+[[deny]]
+tool = "write"              # no predicate: matches nothing
+"#,
+        )
+        .unwrap();
+        let lint = rules.lint_containment(&fixture_fs(&[]));
+        let (notes, broken): (Vec<_>, Vec<_>) = lint.iter().partition(|l| l.starts_with("note: "));
+        assert_eq!(notes.len(), 2, "{lint:#?}");
+        assert_eq!(broken.len(), 1, "{lint:#?}");
+        assert!(broken[0].contains("matches \nnothing") || broken[0].contains("matches nothing"));
+        // `lint` itself is unchanged — the notes are additive.
+        assert_eq!(rules.lint().len(), 1);
+    }
+
     #[test]
     fn projection_is_deterministic_and_deduplicated() {
         let toml = r#"
@@ -2520,7 +2599,7 @@ path_prefix = "/Volumes/other"
         let existing = &["/Volumes/secrets", "/Volumes/other"];
         let first = projected(toml, None, existing);
         assert_eq!(
-            first.read_deny,
+            first.paths(),
             vec![
                 PathBuf::from("/Volumes/secrets"),
                 PathBuf::from("/Volumes/other")

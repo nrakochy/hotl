@@ -1932,19 +1932,26 @@ pub(crate) const ADMIN_RULES_PATH: &str = "/etc/hotl/preapproved.toml";
 /// permission mode. Prints its startup warnings — posture never changes
 /// silently.
 pub(crate) fn load_rules(cfg: &crate::config::Config) -> Arc<Rules> {
-    let admin_path = std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| ADMIN_RULES_PATH.into());
-    let env_mode = std::env::var("HOTL_PERMISSIONS").ok();
-    let env_plan = std::env::var("HOTL_PLAN").ok();
-    let (rules, warnings) = load_rules_with(
-        cfg,
-        Some(std::path::Path::new(&admin_path)),
-        env_mode.as_deref(),
-        env_plan.as_deref(),
-    );
+    let (rules, warnings) = load_rules_reporting(cfg);
     for w in warnings {
         eprintln!("hotl: {w}");
     }
     rules
+}
+
+/// [`load_rules`] without the printing, so `hotl doctor` can render the same
+/// warnings as report rows instead of stderr noise — and so it loads the rule
+/// set exactly once (each load re-runs the lint).
+pub(crate) fn load_rules_reporting(cfg: &crate::config::Config) -> (Arc<Rules>, Vec<String>) {
+    let admin_path = std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| ADMIN_RULES_PATH.into());
+    let env_mode = std::env::var("HOTL_PERMISSIONS").ok();
+    let env_plan = std::env::var("HOTL_PLAN").ok();
+    load_rules_with(
+        cfg,
+        Some(std::path::Path::new(&admin_path)),
+        env_mode.as_deref(),
+        env_plan.as_deref(),
+    )
 }
 
 /// The testable core of [`load_rules`]: explicit admin path + env mode, no
@@ -1988,6 +1995,10 @@ fn load_rules_with(
             )),
         }
     }
+    // After the admin merge, so the lint sees the full set. A rule that matches
+    // nothing, or that the kernel cannot reach, used to be silent — and a silent
+    // permission rule is the whole shape of T1-7.
+    warnings.extend(rules.lint_containment(&|p| p.canonicalize().ok()));
     (Arc::new(rules), warnings)
 }
 

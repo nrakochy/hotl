@@ -46,7 +46,7 @@ async fn a_projected_deny_rule_denies_reads_to_a_sandboxed_command() {
     .unwrap();
     let containment = rules::project(&rules, &|p| p.canonicalize().ok());
     assert_eq!(
-        containment.read_deny,
+        containment.paths(),
         vec![vault.canonicalize().unwrap()],
         "the rule must project: {:#?}",
         containment.unprojectable
@@ -61,8 +61,8 @@ async fn a_projected_deny_rule_denies_reads_to_a_sandboxed_command() {
     .unwrap()
     .with_home(Some(base.clone()));
     assert_eq!(
-        rules::project(&tilde, &|p| p.canonicalize().ok()).read_deny,
-        containment.read_deny,
+        rules::project(&tilde, &|p| p.canonicalize().ok()).paths(),
+        containment.paths(),
         "the ~/-rooted form must project to the same path"
     );
 
@@ -72,12 +72,12 @@ async fn a_projected_deny_rule_denies_reads_to_a_sandboxed_command() {
         read_deny: ReadDeny {
             always: Vec::new(),
             secrets: Vec::new(),
-            rules: containment.read_deny.clone(),
+            rules: containment.paths(),
         },
     });
 
     // The projection reached the process-global extras, in its own tier.
-    assert_eq!(sandbox::read_deny().rules, containment.read_deny);
+    assert_eq!(sandbox::read_deny().rules, containment.paths());
     assert!(sandbox::read_deny().always.is_empty());
 
     let status = sandbox::probe();

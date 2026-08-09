@@ -734,15 +734,15 @@ impl SandboxCfg {
         // is not more privileged than a built-in credential path, and the write
         // -grant physics are identical.
         let mut rules = Vec::new();
-        for path in &containment.read_deny {
-            let resolved = canon_or(path);
+        for projected in &containment.read_deny {
+            let resolved = canon_or(&projected.path);
             if overlaps(&resolved, &canon_or(config_dir))
                 || overlaps(&resolved, &canon_or(data_dir))
             {
                 warnings.push(format!(
-                    "[[deny]] over {} is already denied as one of hotl's own dirs — the rule is \
-                     honored, the duplicate entry dropped",
-                    resolved.display()
+                    "{} is already denied as one of hotl's own dirs — the rule is honored, the \
+                     duplicate entry dropped",
+                    projected.rule
                 ));
                 continue;
             }
@@ -757,16 +757,20 @@ impl SandboxCfg {
             }
             if let Some(root) = risky_root(&resolved) {
                 warnings.push(format!(
-                    "[[deny]] over {} denies reads under the system root {root} to sandboxed \
-                     commands — honored, but commands that need what lives there will fail",
-                    resolved.display()
+                    "{} denies reads under the system root {root} to sandboxed commands — \
+                     honored, but commands that need what lives there will fail",
+                    projected.rule
                 ));
             }
             if !rules.contains(&resolved) && !secrets.contains(&resolved) {
                 rules.push(resolved);
             }
         }
-        warnings.extend(containment.unprojectable.iter().cloned());
+        // `containment.unprojectable` is deliberately NOT pushed here: those
+        // rules work in-process and only lack kernel reach, so they belong in
+        // the informational lint channel (`Rules::lint_containment`) rather than
+        // among the sandbox's refusals. `[[deny]] bash prefix = "curl "` is a
+        // good rule and must not read as a misconfiguration.
         hotl_tools::sandbox::ReadDeny {
             always,
             secrets,
@@ -1503,6 +1507,14 @@ path_prefix = "/Volumes/secrets"
         )
     }
 
+    /// A Tier C entry with a stand-in rule text, for driving the seam directly.
+    fn projected(path: &Path) -> hotl_tools::rules::ProjectedDeny {
+        hotl_tools::rules::ProjectedDeny {
+            path: path.to_path_buf(),
+            rule: format!("[[deny]] read path_prefix = \"{}\"", path.display()),
+        }
+    }
+
     /// `read_deny` plus an explicit Tier C (plan 0025), so a projection can be
     /// driven without a rules file or a real `$HOME`.
     fn read_deny_projecting(
@@ -1664,7 +1676,7 @@ path_prefix = "/Volumes/secrets"
         std::fs::create_dir_all(&vault).unwrap();
         let vault = vault.canonicalize().unwrap();
         let containment = hotl_tools::rules::Containment {
-            read_deny: vec![vault.clone()],
+            read_deny: vec![projected(&vault)],
             unprojectable: vec!["read path_prefix = \".ssh/\" applies at any depth".into()],
         };
         let (deny, warnings) = read_deny_projecting(
@@ -1680,11 +1692,10 @@ path_prefix = "/Volumes/secrets"
         // refusal message and the read-probe canary location.
         assert_eq!(deny.always.len(), 2);
         assert!(!deny.always.contains(&deny.rules[0]));
-        // An unprojectable rule is reported, not dropped.
-        assert!(
-            warnings.iter().any(|w| w.contains("any depth")),
-            "{warnings:?}"
-        );
+        // The unprojectable reason is NOT a sandbox refusal: the rule works
+        // in-process and only lacks kernel reach, so it travels the
+        // informational lint channel (`Rules::lint_containment`) instead.
+        assert!(warnings.is_empty(), "{warnings:?}");
     }
 
     /// The Tier C twin of `read_deny_drops_an_entry_that_sits_inside_a_write_grant`
@@ -1699,7 +1710,7 @@ path_prefix = "/Volumes/secrets"
         std::fs::create_dir_all(&inside).unwrap();
         let granted = scratch.path().join("work").canonicalize().unwrap();
         let containment = hotl_tools::rules::Containment {
-            read_deny: vec![inside.canonicalize().unwrap()],
+            read_deny: vec![projected(&inside.canonicalize().unwrap())],
             unprojectable: Vec::new(),
         };
         let (deny, warnings) = read_deny_projecting(
@@ -1810,10 +1821,20 @@ path_prefix = "/Volumes/secrets"
                 ],
             },
         );
+        // Byte-identical to the two-tier carve, and no extra sandbox warning.
         assert_eq!(with_floating.always, base.always);
         assert_eq!(with_floating.secrets, base.secrets);
         assert!(with_floating.rules.is_empty());
-        assert_eq!(warnings.len(), base_warnings.len() + 1, "{warnings:?}");
+        assert_eq!(warnings.len(), base_warnings.len(), "{warnings:?}");
+        // Not silence, though: the lint says so, and says what to write.
+        let rules = hotl_tools::rules::Rules::from_toml(
+            "[[deny]]\ntool = \"read\"\npath_prefix = \".ssh/\"\n",
+        )
+        .unwrap();
+        let lint = rules.lint_containment(&|p| p.canonicalize().ok());
+        assert_eq!(lint.len(), 1, "{lint:?}");
+        assert!(lint[0].starts_with("note: "), "{}", lint[0]);
+        assert!(lint[0].contains("~/.ssh"), "{}", lint[0]);
     }
 
     #[test]

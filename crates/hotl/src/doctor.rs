@@ -52,15 +52,16 @@ pub fn doctor_main() -> i32 {
         .expect("failed to build doctor's single-threaded runtime");
     let key_helper = key_helper_check(&rt);
     let gateway = gateway_check(&rt);
+    // Loaded once, here: every load re-runs the lint, and the containment floor
+    // must be computed from the same rule set the sandbox section describes.
+    let (rules, rule_warnings) =
+        crate::agent::load_rules_reporting(&crate::config::Config::load(&config_dir));
     let mut checks = vec![provider_check()];
-    checks.extend(sandbox_check(&config_dir));
+    checks.extend(sandbox_check(&config_dir, &rules));
     checks.extend(egress_checks(&config_dir));
-    checks.extend([
-        config_check(&config_dir),
-        permissions_check(&config_dir),
-        rules_check(&config_dir),
-        sessions_check(&sessions_dir),
-    ]);
+    checks.extend([config_check(&config_dir), permissions_check(&config_dir)]);
+    checks.extend(rules_check(&config_dir, rule_warnings));
+    checks.push(sessions_check(&sessions_dir));
     checks.extend(mcp_check(&config_dir));
     checks.extend([
         memory_check(&config_dir),
@@ -218,18 +219,69 @@ fn join_paths(paths: &[std::path::PathBuf]) -> String {
         .join(", ")
 }
 
+/// The read-carve as a traced section: every denied path on its own line, with
+/// what put it there and whether anything can lift it. A containment set nobody
+/// can trace back to a rule is one nobody will trust or maintain (plan 0025
+/// task 4). Continuation lines are indented to sit under the status tag.
+fn containment_section(
+    deny: &hotl_tools::sandbox::ReadDeny,
+    containment: &hotl_tools::rules::Containment,
+) -> String {
+    let mut out = String::from("containment · reads denied to shell commands");
+    let mut row = |path: &std::path::Path, why: &str| {
+        out.push_str(&format!("\n        {}    {why}", path.display()));
+    };
+    for p in &deny.always {
+        row(p, "built-in, not liftable");
+    }
+    for p in &deny.secrets {
+        row(p, "hotl default (lift: [sandbox].readable)");
+    }
+    for p in &deny.rules {
+        // The rule text, or a fallback that still says where the path came from
+        // rather than leaving a line nobody can account for.
+        let why = containment
+            .rule_for(p)
+            .map(str::to_string)
+            .unwrap_or_else(|| "a [[deny]] rule".to_string());
+        row(p, &why);
+    }
+    if deny.secrets.is_empty() {
+        out.push_str("\n        (every credential path lifted by [sandbox].readable)");
+    }
+    out.push_str(&unprojectable_block(containment));
+    out
+}
+
+/// The deny rules with no kernel expression, as continuation lines. Not an
+/// error: each is enforced in full in-process and only lacks kernel reach, so
+/// the wording says what it still governs and what to write instead.
+fn unprojectable_block(containment: &hotl_tools::rules::Containment) -> String {
+    if containment.unprojectable.is_empty() {
+        return String::new();
+    }
+    let mut out = format!(
+        "\n        not reaching shell commands ({}) — still enforced for hotl's own tools:",
+        containment.unprojectable.len()
+    );
+    for why in &containment.unprojectable {
+        out.push_str(&format!("\n          {why}"));
+    }
+    out
+}
+
 /// Resolves and *installs* the `[sandbox]` extras (set-once) before probing —
 /// the same order agent startup uses — so the verdict certifies the widened
 /// floor, and each refused/dubious entry gets its own warn line.
-fn sandbox_check(config_dir: &Path) -> Vec<Check> {
+fn sandbox_check(config_dir: &Path, rules: &hotl_tools::rules::Rules) -> Vec<Check> {
     let cfg = crate::config::Config::load(config_dir);
-    // The same `load_rules` agent startup uses, admin tier included: `doctor`
-    // computing its own weaker rule set would have it confidently describing a
-    // containment floor nobody has (plan 0025 watch-out 5).
-    let rules = crate::agent::load_rules(&cfg);
+    // `rules` came from the same `load_rules` agent startup uses, admin tier
+    // included: `doctor` computing its own weaker rule set would have it
+    // confidently describing a containment floor nobody has (plan 0025
+    // watch-out 5).
     let (extras, warnings) = cfg
         .sandbox
-        .resolve(config_dir, &crate::agent::data_dir(), &rules);
+        .resolve(config_dir, &crate::agent::data_dir(), rules);
     let mut checks: Vec<Check> = warnings
         .into_iter()
         .map(|w| warn(format!("sandbox: {w}")))
@@ -240,19 +292,16 @@ fn sandbox_check(config_dir: &Path) -> Vec<Check> {
         format!(" · [sandbox].writable: {}", join_paths(&extras.writable))
     };
     // The resolved read-carve, printed so `hotl doctor` describes the floor
-    // children actually get rather than the one config asked for (plan 0022).
+    // children actually get rather than the one config asked for (plan 0022),
+    // and traced back to what put each path there (plan 0025).
+    let containment = hotl_tools::rules::project(rules, &|p| p.canonicalize().ok());
     checks.push(if extras.read_deny.is_empty() {
-        warn("sandbox: read-carve empty — sandboxed commands can read everything".into())
-    } else {
-        ok(format!(
-            "sandbox: reads denied · always: {} · credentials: {}",
-            join_paths(&extras.read_deny.always),
-            if extras.read_deny.secrets.is_empty() {
-                "none (all lifted by [sandbox].readable)".to_string()
-            } else {
-                join_paths(&extras.read_deny.secrets)
-            }
+        warn(format!(
+            "sandbox: read-carve empty — sandboxed commands can read everything{}",
+            unprojectable_block(&containment)
         ))
+    } else {
+        ok(containment_section(&extras.read_deny, &containment))
     });
     hotl_tools::sandbox::init_extras(extras);
     checks.push(match sandbox::probe() {
@@ -384,14 +433,33 @@ fn permissions_check(config_dir: &Path) -> Check {
     ))
 }
 
-fn rules_check(config_dir: &Path) -> Check {
-    match crate::config::Config::load(config_dir).rules_toml() {
-        None => ok("allow rules: none (every gated tool call asks)".into()),
+/// The rule set, plus its lint. `Rules::lint` reports rules that can never
+/// match and `lint_containment` adds the ones the kernel cannot reach; a lint
+/// line nobody prints is a rule that fails silently, which is the shape of T1-7.
+fn rules_check(config_dir: &Path, rule_warnings: Vec<String>) -> Vec<Check> {
+    let cfg = crate::config::Config::load(config_dir);
+    let mut checks = match cfg.rules_toml() {
+        None => vec![ok("allow rules: none (every gated tool call asks)".into())],
         Some(t) => match hotl_tools::rules::Rules::from_toml(&t) {
-            Ok(_) => ok("allow rules: [[allow]] in config.toml loaded".into()),
-            Err(e) => warn(format!("allow rules: config.toml [[allow]] ignored: {e}")),
+            Ok(_) => vec![ok(
+                "allow rules: [[allow]]/[[deny]] in config.toml loaded".into()
+            )],
+            Err(e) => vec![warn(format!(
+                "allow rules: config.toml [[allow]] ignored: {e}"
+            ))],
         },
+    };
+    // `rule_warnings` are the lines agent startup prints. The kernel-reach notes
+    // among them are already listed under the containment section above, so only
+    // the real problems — a rule that matches nothing, a refused admin file —
+    // get a row here.
+    for line in rule_warnings {
+        if line.starts_with("note: ") {
+            continue;
+        }
+        checks.push(warn(format!("rules: {line}")));
     }
+    checks
 }
 
 /// MCP servers and what the trust gate will do with each. This is also where
