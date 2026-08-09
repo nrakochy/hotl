@@ -20,6 +20,9 @@ async fn configured_extras_widen_the_floor_and_keep_the_probe_sound() {
     sandbox::init_extras(SandboxExtras {
         writable: vec![extra.clone()],
         file_tools: FileToolsMode::Workspace,
+        // The read-carve has its own integration binary (`sandbox_read_carve`);
+        // an empty set here keeps this test about the write widening alone.
+        read_deny: sandbox::ReadDeny::default(),
     });
 
     let status = sandbox::probe();

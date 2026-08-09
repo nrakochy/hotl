@@ -230,6 +230,17 @@ impl Registry {
     }
 }
 
+/// The credential class, shared by the execute-later *write* classification
+/// below and the kernel read-carve (`sandbox::credential_read_paths`). One
+/// list, so the two cannot drift.
+///
+/// Entries are `$HOME`-relative and carry their trailing separator: the write
+/// classification matches them as substrings of a normalized path, so
+/// `.ssh/` must not also match `.sshrc`.
+pub(crate) const CREDENTIAL_DIRS: &[&str] = &[".ssh/", ".aws/", ".config/gcloud/", ".azure/"];
+/// The `$HOME` dotfiles in the same class — matched on the basename.
+pub(crate) const CREDENTIAL_FILES: &[&str] = &[".npmrc", ".pypirc", ".netrc", ".dockercfg"];
+
 /// The execute-later class: files whose *write* is benign-looking but
 /// whose later effect —
 /// execution, authentication, or credential theft — happens outside any gate.
@@ -319,15 +330,13 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
         return Some("CI workflow: runs on your next push, with the repo's secrets");
     }
     // SSH: authorized_keys grants login; config can rewrite where ssh connects.
+    // Its reason is specific, so it is matched ahead of the shared arm below
+    // (it is a `CREDENTIAL_DIRS` entry too, and never reaches that arm).
     if p.contains(".ssh/") {
         return Some("SSH config/keys: can grant login or redirect your connections");
     }
     // Cloud + package-registry credentials: write-to-steal or token planting.
-    if p.contains(".aws/")
-        || p.contains(".config/gcloud/")
-        || p.contains(".azure/")
-        || matches!(file, ".npmrc" | ".pypirc" | ".netrc" | ".dockercfg")
-    {
+    if CREDENTIAL_DIRS.iter().any(|d| p.contains(d)) || CREDENTIAL_FILES.contains(&file) {
         return Some("credentials file: writing here can steal or plant auth tokens");
     }
     // git config aliases / hooksPath run as commands on the next git call.
@@ -355,6 +364,38 @@ pub fn workspace_root() -> &'static std::path::Path {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan 0022 factored the credential paths out of `execute_later_reason`
+    /// so the kernel *read*-carve and the *write* classification share one
+    /// list. This is the anti-drift assertion: every entry still classifies,
+    /// with the reason strings the asks (and their tests) already show.
+    #[test]
+    fn credential_list_is_shared_with_the_write_classification() {
+        for dir in CREDENTIAL_DIRS {
+            let path = format!("home/{dir}thing");
+            let reason = execute_later_reason(&path).unwrap_or_else(|| panic!("{path}"));
+            let expected = if *dir == ".ssh/" {
+                "SSH config/keys: can grant login or redirect your connections"
+            } else {
+                "credentials file: writing here can steal or plant auth tokens"
+            };
+            assert_eq!(reason, expected, "{path}");
+        }
+        for file in CREDENTIAL_FILES {
+            let path = format!("home/{file}");
+            assert_eq!(
+                execute_later_reason(&path),
+                Some("credentials file: writing here can steal or plant auth tokens"),
+                "{path}"
+            );
+        }
+        // The read carve absolutizes the same list, separators stripped.
+        let paths = sandbox::credential_read_paths(std::path::Path::new("/h"));
+        assert!(paths.contains(&std::path::PathBuf::from("/h/.ssh")));
+        assert!(paths.contains(&std::path::PathBuf::from("/h/.config/gcloud")));
+        assert!(paths.contains(&std::path::PathBuf::from("/h/.netrc")));
+        assert_eq!(paths.len(), CREDENTIAL_DIRS.len() + CREDENTIAL_FILES.len());
+    }
 
     #[test]
     fn builtin_registry_includes_search_tools() {

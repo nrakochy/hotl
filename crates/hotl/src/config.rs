@@ -107,6 +107,13 @@ pub fn is_git_url(source: &str) -> bool {
         || source.ends_with(".git")
 }
 
+/// `$HOME`, or `None` where the environment does not name one (a daemon with
+/// a scrubbed env). The credential read-carve is `$HOME`-relative, so no home
+/// simply means no Tier B — narrower, never wider.
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
 /// Expand a leading `~/` against `$HOME`.
 fn expand_home(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
@@ -425,6 +432,15 @@ pub struct SandboxCfg {
     /// created at startup; hotl's own config/data dirs can never be listed.
     #[serde(default)]
     pub writable: Vec<String>,
+    /// Paths lifted out of the default credential **read**-deny for sandboxed
+    /// commands. Mirrors `writable` — absolute, `~/` expands, canonicalized,
+    /// and refused if it touches hotl's own config or data dir — with two
+    /// deliberate differences: a missing directory is never created (creating
+    /// `~/.ssh` as a side effect of parsing config would be surprising and
+    /// wrong), and a missing entry is dropped with a warning rather than an
+    /// error, because a read-deny for a path that does not exist is a no-op.
+    #[serde(default)]
+    pub readable: Vec<String>,
     /// `"workspace"` (default) | `"writable"` — how far the mutating file
     /// tools (`write`, `edit`) follow the `writable` roots.
     pub file_tools: Option<String>,
@@ -531,14 +547,130 @@ impl SandboxCfg {
                     .to_string(),
             );
         }
+        let read_deny = self.resolve_read_deny(
+            config_dir,
+            data_dir,
+            &hotl_tools::sandbox::write_roots_with(&writable),
+            home_dir().as_deref(),
+            &mut warnings,
+        );
         (
             hotl_tools::sandbox::SandboxExtras {
                 writable,
                 file_tools,
+                read_deny,
             },
             warnings,
         )
     }
+
+    /// The two read-carve tiers (plan 0022).
+    ///
+    /// Tier A is hotl's own config and data dirs — the session token under the
+    /// data dir drives the session socket, which *is* the permission gate, so
+    /// a confined child that can read it has escalated out of the gate
+    /// entirely. It is built here rather than accepted from config, and the
+    /// `readable` refusal below is what keeps it that way. The run dir lives
+    /// inside the data dir (`session_server::run_dir` = `data_dir()/run`), so
+    /// denying the data dir already covers it — that is why it has no entry.
+    ///
+    /// Tier B is the credential class, minus every `readable` entry.
+    ///
+    /// `granted` (the resolved kernel write set) and `home` are parameters
+    /// rather than reads of process state so the unit tests can drive them —
+    /// the same `_with`-seam convention `sandbox.rs` uses. Without it a test
+    /// running from a tempdir would see its own `$HOME` swallowed by the
+    /// `TMPDIR` write root.
+    fn resolve_read_deny(
+        &self,
+        config_dir: &Path,
+        data_dir: &Path,
+        granted: &[std::path::PathBuf],
+        home: Option<&Path>,
+        warnings: &mut Vec<String>,
+    ) -> hotl_tools::sandbox::ReadDeny {
+        let mut readable: Vec<std::path::PathBuf> = Vec::new();
+        for entry in &self.readable {
+            let expanded = expand_home(entry);
+            if !expanded.is_absolute() {
+                warnings.push(format!(
+                    "[sandbox].readable `{entry}` is not an absolute path — entry ignored"
+                ));
+                continue;
+            }
+            // Lifting hotl's own dirs is Tier A self-granted escalation — the
+            // same refusal `writable` applies, for the same reason.
+            if overlaps(&expanded, config_dir) || overlaps(&expanded, data_dir) {
+                warnings.push(readable_refusal(entry));
+                continue;
+            }
+            if !expanded.exists() {
+                warnings.push(format!(
+                    "[sandbox].readable `{entry}` does not exist — entry ignored (nothing \
+                     there is denied, so lifting it is a no-op)"
+                ));
+                continue;
+            }
+            let resolved = match expanded.canonicalize() {
+                Ok(p) => p,
+                Err(e) => {
+                    warnings.push(format!(
+                        "[sandbox].readable `{entry}` cannot be resolved: {e} — entry ignored"
+                    ));
+                    continue;
+                }
+            };
+            // The canonical refusal — symlinks resolved on both sides.
+            if overlaps(&resolved, &canon_or(config_dir))
+                || overlaps(&resolved, &canon_or(data_dir))
+            {
+                warnings.push(readable_refusal(entry));
+                continue;
+            }
+            if let Some(root) = risky_root(&resolved) {
+                warnings.push(format!(
+                    "[sandbox].readable `{entry}` lifts the read-deny under the system root \
+                     {root} — honored, but nothing there is carved out for sandboxed commands"
+                ));
+            }
+            if !readable.contains(&resolved) {
+                readable.push(resolved);
+            }
+        }
+        let always = vec![canon_or(config_dir), canon_or(data_dir)];
+        // A deny entry that sits inside a write grant cannot be honored:
+        // Landlock resolves against the closest matching rule, so the
+        // `from_all` grant on the ancestor re-opens the read. Drop it loudly
+        // rather than shipping a denial the kernel will not deliver.
+        let mut secrets = Vec::new();
+        for path in home
+            .map(hotl_tools::sandbox::credential_read_paths)
+            .unwrap_or_default()
+        {
+            let resolved = canon_or(&path);
+            if readable.iter().any(|r| overlaps(&resolved, r)) {
+                continue; // explicitly lifted by the operator
+            }
+            if let Some(root) = granted.iter().find(|g| resolved.starts_with(g)) {
+                warnings.push(format!(
+                    "[sandbox] cannot deny reads of {} — it sits inside the writable root {} \
+                     and the kernel resolves the closest rule, which grants read there",
+                    resolved.display(),
+                    root.display()
+                ));
+                continue;
+            }
+            secrets.push(resolved);
+        }
+        hotl_tools::sandbox::ReadDeny { always, secrets }
+    }
+}
+
+fn readable_refusal(entry: &str) -> String {
+    format!(
+        "[sandbox].readable `{entry}` would expose hotl's own config/state (allow-rules, \
+         hooks, the session token) to sandboxed commands — entry refused"
+    )
 }
 
 /// Canonical when possible, lexical when the path does not exist (a fresh
@@ -981,6 +1113,7 @@ mod tests {
                 format!("{}/", missing.display()),        // trailing slash
                 link.join("inner").display().to_string(), // via a symlink
             ],
+            readable: Vec::new(),
             file_tools: None,
         };
         let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
@@ -1011,6 +1144,7 @@ mod tests {
                 link_to_config.display().to_string(),         // symlink-smuggled
                 good.display().to_string(),                   // the survivor
             ],
+            readable: Vec::new(),
             file_tools: None,
         };
         let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
@@ -1029,6 +1163,7 @@ mod tests {
         let (_scratch, config_dir, data_dir) = sandbox_dirs();
         let cfg = SandboxCfg {
             writable: vec!["/etc".to_string()],
+            readable: Vec::new(),
             file_tools: None,
         };
         let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
@@ -1052,6 +1187,7 @@ mod tests {
                 "relative/cache".to_string(),
                 "~".to_string(), // bare ~ is not expanded — stays relative
             ],
+            readable: Vec::new(),
             file_tools: None,
         };
         let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
@@ -1070,6 +1206,7 @@ mod tests {
         let with_mode = |mode: Option<&str>, writable: Vec<String>| {
             SandboxCfg {
                 writable,
+                readable: Vec::new(),
                 file_tools: mode.map(String::from),
             }
             .resolve(&config_dir, &data_dir)
@@ -1099,6 +1236,150 @@ mod tests {
         assert_eq!(extras.file_tools, FileToolsMode::Writable);
         assert_eq!(w.len(), 1);
         assert!(w[0].contains("no effect"), "{}", w[0]);
+    }
+
+    /// Drive the read-carve seam with an explicit `$HOME` and write set, so
+    /// the Tier B list is exactly the credential list and nothing depends on
+    /// where the test binary happens to be running.
+    fn read_deny(
+        cfg: &SandboxCfg,
+        config_dir: &Path,
+        data_dir: &Path,
+        home: &Path,
+        granted: &[std::path::PathBuf],
+    ) -> (hotl_tools::sandbox::ReadDeny, Vec<String>) {
+        let mut warnings = Vec::new();
+        let deny = cfg.resolve_read_deny(config_dir, data_dir, granted, Some(home), &mut warnings);
+        (deny, warnings)
+    }
+
+    /// The Tier A / Tier B split, and the fact that Tier A is not config.
+    #[test]
+    fn read_deny_denies_hotls_own_dirs_and_the_credential_class() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let (deny, warnings) = read_deny(
+            &SandboxCfg::default(),
+            &config_dir,
+            &data_dir,
+            &home,
+            &[std::path::PathBuf::from("/dev")],
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Tier A: hotl's own dirs. The run dir lives under the data dir, so
+        // denying the data dir is what covers the session token.
+        assert_eq!(
+            deny.always,
+            vec![
+                config_dir.canonicalize().unwrap(),
+                data_dir.canonicalize().unwrap()
+            ]
+        );
+        // Tier B: every credential entry, whether or not it exists today.
+        for name in [
+            ".ssh",
+            ".aws",
+            ".config/gcloud",
+            ".azure",
+            ".npmrc",
+            ".pypirc",
+            ".netrc",
+            ".dockercfg",
+        ] {
+            assert!(
+                deny.secrets.contains(&home.join(name)),
+                "{name} missing from {:?}",
+                deny.secrets
+            );
+        }
+    }
+
+    #[test]
+    fn readable_entry_touching_hotls_own_dirs_is_refused() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let cfg = SandboxCfg {
+            readable: vec![
+                config_dir.display().to_string(),           // is the config dir
+                data_dir.join("run").display().to_string(), // inside the data dir
+                scratch.path().display().to_string(),       // contains both
+                config_dir.join("x").display().to_string(), // under the config dir
+            ],
+            ..SandboxCfg::default()
+        };
+        let (deny, warnings) = read_deny(&cfg, &config_dir, &data_dir, &home, &[]);
+        assert_eq!(warnings.len(), 4, "{warnings:?}");
+        for w in &warnings {
+            assert!(w.contains("refused"), "{w}");
+        }
+        // Tier A survives every attempt to name it.
+        assert_eq!(deny.always.len(), 2);
+    }
+
+    #[test]
+    fn readable_lifts_only_the_named_subtree() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(home.join(".aws")).unwrap();
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let home = home.canonicalize().unwrap();
+        let cfg = SandboxCfg {
+            readable: vec![home.join(".aws").display().to_string()],
+            ..SandboxCfg::default()
+        };
+        let (deny, warnings) = read_deny(&cfg, &config_dir, &data_dir, &home, &[]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!deny.secrets.contains(&home.join(".aws")), "{deny:?}");
+        assert!(deny.secrets.contains(&home.join(".ssh")), "{deny:?}");
+    }
+
+    /// `writable` creates missing dirs because Landlock can only grant on an
+    /// existing path. `readable` must not: a read-deny for a path that does
+    /// not exist is already a no-op, and conjuring `~/.ssh` out of a config
+    /// parse would be surprising and wrong.
+    #[test]
+    fn readable_does_not_create_missing_directories() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let missing = home.join(".ssh");
+        let cfg = SandboxCfg {
+            readable: vec![missing.display().to_string()],
+            ..SandboxCfg::default()
+        };
+        let (_deny, warnings) = read_deny(&cfg, &config_dir, &data_dir, &home, &[]);
+        assert!(!missing.exists(), "readable must never mkdir");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("does not exist"), "{}", warnings[0]);
+    }
+
+    /// Landlock resolves against the closest matching rule, so a write grant
+    /// on an ancestor re-opens the read. Such an entry is dropped loudly
+    /// rather than shipped as a denial the kernel will not deliver.
+    #[test]
+    fn read_deny_drops_an_entry_that_sits_inside_a_write_grant() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        let home = home.canonicalize().unwrap();
+        // Granting write on $HOME puts every credential path inside it.
+        let (deny, warnings) = read_deny(
+            &SandboxCfg::default(),
+            &config_dir,
+            &data_dir,
+            &home,
+            std::slice::from_ref(&home),
+        );
+        assert!(deny.secrets.is_empty(), "{:?}", deny.secrets);
+        assert!(
+            warnings.iter().any(|w| w.contains("cannot deny reads of")),
+            "{warnings:?}"
+        );
+        // Tier A is unaffected: it is never inside a writable root (refused).
+        assert_eq!(deny.always.len(), 2);
     }
 
     #[test]

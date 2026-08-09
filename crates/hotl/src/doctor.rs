@@ -209,6 +209,14 @@ fn gateway_probe(
     })
 }
 
+fn join_paths(paths: &[std::path::PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Resolves and *installs* the `[sandbox]` extras (set-once) before probing —
 /// the same order agent startup uses — so the verdict certifies the widened
 /// floor, and each refused/dubious entry gets its own warn line.
@@ -222,16 +230,23 @@ fn sandbox_check(config_dir: &Path) -> Vec<Check> {
     let extra_note = if extras.writable.is_empty() {
         String::new()
     } else {
-        format!(
-            " · [sandbox].writable: {}",
-            extras
-                .writable
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
+        format!(" · [sandbox].writable: {}", join_paths(&extras.writable))
     };
+    // The resolved read-carve, printed so `hotl doctor` describes the floor
+    // children actually get rather than the one config asked for (plan 0022).
+    checks.push(if extras.read_deny.is_empty() {
+        warn("sandbox: read-carve empty — sandboxed commands can read everything".into())
+    } else {
+        ok(format!(
+            "sandbox: reads denied · always: {} · credentials: {}",
+            join_paths(&extras.read_deny.always),
+            if extras.read_deny.secrets.is_empty() {
+                "none (all lifted by [sandbox].readable)".to_string()
+            } else {
+                join_paths(&extras.read_deny.secrets)
+            }
+        ))
+    });
     hotl_tools::sandbox::init_extras(extras);
     checks.push(match sandbox::probe() {
         sandbox::SandboxStatus::Enforced(m) => ok(format!("sandbox: enforced ({m}){extra_note}")),

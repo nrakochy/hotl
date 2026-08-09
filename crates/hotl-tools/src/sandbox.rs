@@ -114,6 +114,54 @@ pub struct SandboxExtras {
     pub writable: Vec<PathBuf>,
     /// Whether the mutating file tools also honor `writable`.
     pub file_tools: FileToolsMode,
+    /// Absolute, canonical paths sandboxed children may not read (plan 0022).
+    pub read_deny: ReadDeny,
+}
+
+/// The kernel read-carve, in two tiers.
+///
+/// The split is the whole design: Tier A is what would let a confined child
+/// escalate into hotl itself (the session token drives the socket, which is
+/// the permission gate), so it is never liftable. Tier B is the credential
+/// class — worth denying by default, but an operator with a real need can
+/// lift it per-entry with `[sandbox].readable` or per-command at the ask.
+#[derive(Debug, Default, Clone)]
+pub struct ReadDeny {
+    /// hotl's own config and data dirs. Never liftable, by config or grant.
+    pub always: Vec<PathBuf>,
+    /// The credential class. Already filtered by `[sandbox].readable`; the
+    /// per-command grant drops what remains for one spawn.
+    pub secrets: Vec<PathBuf>,
+}
+
+impl ReadDeny {
+    /// The paths a given spawn must not read. `secret_reads` is the
+    /// per-command grant: it drops Tier B and never touches Tier A.
+    pub(crate) fn for_spawn(&self, secret_reads: bool) -> Vec<PathBuf> {
+        let mut out = self.always.clone();
+        if !secret_reads {
+            out.extend(self.secrets.iter().cloned());
+        }
+        out
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.always.is_empty() && self.secrets.is_empty()
+    }
+}
+
+/// The `$HOME`-relative credential paths the read-carve denies, absolutized
+/// against `home`. Shares `CREDENTIAL_DIRS`/`CREDENTIAL_FILES` with the
+/// execute-later *write* classification so the read set and the write set
+/// cannot drift. Non-existent entries are kept — the kernel layers treat a
+/// missing path as a no-op, and dropping them here would silently un-deny a
+/// directory created later in the session.
+pub fn credential_read_paths(home: &std::path::Path) -> Vec<PathBuf> {
+    crate::CREDENTIAL_DIRS
+        .iter()
+        .map(|d| home.join(d.trim_end_matches('/')))
+        .chain(crate::CREDENTIAL_FILES.iter().map(|f| home.join(f)))
+        .collect()
 }
 
 static EXTRAS: std::sync::OnceLock<SandboxExtras> = std::sync::OnceLock::new();
@@ -137,6 +185,37 @@ pub(crate) fn file_tools_mode() -> FileToolsMode {
     EXTRAS.get().map(|e| e.file_tools).unwrap_or_default()
 }
 
+/// The resolved read-carve. An un-inited process gets the **empty** set —
+/// narrower than configured, never wider, matching the `init_extras`
+/// invariant above. `read_deny_static` exists so callers can hold a
+/// `&'static` without cloning on every spawn.
+pub fn read_deny() -> &'static ReadDeny {
+    static EMPTY: ReadDeny = ReadDeny {
+        always: Vec::new(),
+        secrets: Vec::new(),
+    };
+    EXTRAS.get().map(|e| &e.read_deny).unwrap_or(&EMPTY)
+}
+
+tokio::task_local! {
+    /// Per-command lift of the Tier B read-deny, scoped by `turn.rs` around
+    /// the single `Tool::run` future so it can only ever cover one call
+    /// (plan 0022, decision 3). Deliberately out of band: the model writes
+    /// the tool input, so a grant that lived there would be self-granted.
+    pub static SECRET_READS: bool;
+}
+
+/// Whether the current task carries the per-command secret-read grant.
+/// Absent scope (every path but an approved bash call) means no grant.
+pub(crate) fn secret_reads_granted() -> bool {
+    SECRET_READS.try_with(|g| *g).unwrap_or(false)
+}
+
+/// The deny set for the spawn happening right now.
+pub(crate) fn spawn_read_deny() -> Vec<PathBuf> {
+    read_deny().for_spawn(secret_reads_granted())
+}
+
 /// The complete kernel write set — the single source of truth, consumed by
 /// the Seatbelt profile, the Landlock ruleset, and `probe_dir` alike, so the
 /// enforcement and its confinement proof can never disagree.
@@ -144,7 +223,11 @@ pub(crate) fn write_roots() -> Vec<PathBuf> {
     write_roots_with(extra_writable())
 }
 
-fn write_roots_with(extra: &[PathBuf]) -> Vec<PathBuf> {
+/// Public so the config layer can validate a read-deny entry against the
+/// write grants: Landlock resolves against the *closest* matching rule, so a
+/// `from_all` write grant on an ancestor re-opens the read it is meant to
+/// deny (plan 0022, watch-out 7).
+pub fn write_roots_with(extra: &[PathBuf]) -> Vec<PathBuf> {
     let mut roots = vec![
         canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
         canon(std::env::temp_dir()),
