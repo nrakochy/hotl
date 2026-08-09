@@ -89,6 +89,89 @@ pub(crate) fn granted_extras() -> &'static [std::path::PathBuf] {
     }
 }
 
+/// Tier A of the read-carve (plan 0022): hotl's own config and data dirs.
+/// The kernel carve confines *child processes*; the hotl process itself is
+/// not sandboxed, so the in-process file tools have to enforce this boundary
+/// themselves or `read <data_dir>/hotl/run/<id>.token` walks straight past
+/// it — and the token drives the session socket, which is the permission
+/// gate. `AskProtected` was not enough: a human can approve, and under an
+/// injected prompt they might.
+///
+/// Classified on the *resolved* target as well as the literal path, so a
+/// symlink cannot launder it — the same rule
+/// `file_permission_classifies_the_resolved_target` pins for the write side.
+/// A path that does not exist is normalized lexically against the working
+/// directory rather than skipped: a `write` creates its target.
+pub(crate) fn hotl_own_dir_reason(path: &str) -> Option<String> {
+    let always = &sandbox::read_deny().always;
+    if always.is_empty() {
+        return None;
+    }
+    let literal = std::path::Path::new(path);
+    let absolute = if literal.is_absolute() {
+        lexical_normalize(literal)
+    } else {
+        lexical_normalize(
+            &std::env::current_dir()
+                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                .join(literal),
+        )
+    };
+    let candidates = [resolve_as_far_as_it_exists(&absolute), absolute];
+    let hit = always
+        .iter()
+        .find(|dir| candidates.iter().any(|c| c.starts_with(dir)))?;
+    Some(format!(
+        "`{path}` is inside hotl's own {} — allow-rules, hooks, and the \
+         session token live there, and the token drives the session socket \
+         that *is* the permission gate. This is refused outright, in every \
+         mode; there is no approval that unlocks it. Ask the user directly \
+         for anything you need from it.",
+        hit.display()
+    ))
+}
+
+/// Canonicalize the longest existing prefix and re-append the rest.
+/// `canonicalize` needs the whole path to exist, but a `write` target
+/// usually does not — and the literal form is not comparable against a
+/// canonical deny entry (on macOS `/var/...` vs `/private/var/...` alone
+/// would let every not-yet-created path past).
+fn resolve_as_far_as_it_exists(p: &std::path::Path) -> std::path::PathBuf {
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    let mut head = p;
+    loop {
+        if let Ok(real) = head.canonicalize() {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (head.file_name(), head.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                head = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// `..`/`.` collapsed without touching the filesystem.
+fn lexical_normalize(p: &std::path::Path) -> std::path::PathBuf {
+    let mut out = std::path::PathBuf::new();
+    for part in p.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other),
+        }
+    }
+    out
+}
+
 /// Where a mutating file tool's path lands, for both the permission pick and
 /// the run-time door — one classification, so the two can never disagree.
 pub(crate) enum WriteTarget {
@@ -134,6 +217,11 @@ fn file_permission(verb: &str, input: &Value) -> Permission {
 fn file_permission_with(verb: &str, input: &Value, extras: &[std::path::PathBuf]) -> Permission {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
     let summary = format!("{verb} {path}");
+    // Tier A never reaches a y/n: the run-time door refuses regardless, and
+    // the ask exists only so the human sees what was attempted.
+    if let Some(why) = hotl_own_dir_reason(path) {
+        return Permission::AskProtected { summary, why };
+    }
     let resolved = std::fs::canonicalize(path).ok();
     let target = write_target(fsguard::workspace_root(), extras, path);
     // The write lands on the fsguard-*normalized* path (`Path::components()`
@@ -215,6 +303,14 @@ impl Tool for ReadTool {
     /// Enforced by `read_outside_the_workspace_is_protected_not_free`.
     fn permission(&self, input: &Value) -> Permission {
         let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
+        // Tier A (plan 0022) outranks the workspace check: a symlink *inside*
+        // the tree pointing at the run dir would otherwise be `None`.
+        if let Some(why) = hotl_own_dir_reason(path) {
+            return Permission::AskProtected {
+                summary: format!("read {path}"),
+                why,
+            };
+        }
         match fsguard::classify(fsguard::workspace_root(), path) {
             fsguard::Placement::Inside(_) => Permission::None,
             fsguard::Placement::Outside(_) => Permission::AskProtected {
@@ -275,6 +371,11 @@ pub(crate) fn open_for_read(
     root: &std::path::Path,
     path: &str,
 ) -> Result<std::fs::File, ToolOutcome> {
+    // The run-time door, so the refusal holds even if a permission-layer path
+    // is ever missed — the same belt-and-braces `Placement::Outside` gets.
+    if let Some(why) = hotl_own_dir_reason(path) {
+        return Err(ToolOutcome::err(why));
+    }
     match fsguard::classify(root, path) {
         // Inside: the fd descent is the boundary.
         fsguard::Placement::Inside(rel) => {
@@ -485,6 +586,11 @@ async fn write_in(
 ) -> ToolResult {
     let path = str_arg(input, "path")?;
     let content = str_arg(input, "content")?;
+    // Tier A: rewriting hotl's own allow-rules or hooks is the write-side
+    // form of the same escalation (plan 0022).
+    if let Some(why) = hotl_own_dir_reason(path) {
+        return Err(ToolOutcome::err(why));
+    }
     match write_target(root, extras, path) {
         WriteTarget::Workspace(rel) => guarded_write_bytes(root, &rel, path, content)?,
         WriteTarget::Extra(eroot, rel) => guarded_write_bytes(&eroot, &rel, path, content)?,
@@ -621,6 +727,11 @@ async fn edit_with_hook(
         return Err(ToolOutcome::err(
             "`old_string` is empty. Use `write` to create a file, or provide the exact text to replace.",
         ));
+    }
+    // Tier A (plan 0022): an edit reads *and* writes, so it is the same
+    // refusal on both counts.
+    if let Some(why) = hotl_own_dir_reason(path) {
+        return Err(ToolOutcome::err(why));
     }
     let target = write_target(root, extras, path);
     let content = read_guarded_to_string(root, &target, path)?;
