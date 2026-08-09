@@ -17,10 +17,15 @@
 //! to `Unenforced`: asks are loudly marked and bash allow-rules stop
 //! auto-approving — the same posture as UNSANDBOXED.
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex, OnceLock, PoisonError, RwLock};
+use std::time::Duration;
 
+use futures_util::future::BoxFuture;
+use futures_util::FutureExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::watch;
 
 use crate::sandbox::SandboxStatus;
 
@@ -322,6 +327,221 @@ pub fn host_allowed(host: &str) -> HostVerdict {
     verdict_for(host, policy())
 }
 
+// ---------------------------------------------------------------------------
+// The egress ask (plan 0026)
+//
+// A blocked host used to be a flat 403 whose only recourse was: stop the
+// session, edit config.toml, restart, re-prompt. It is now a question — but a
+// question is only a control if it is rare, so three filters sit in front of
+// the human, in cost order: the static allowlist, the session decision table
+// below, and (engine-side) the shown-hosts rule.
+//
+// INVARIANT: every path that is not a live human answering `y` resolves to a
+// refusal. Headless, sub-agents, cancellation, the deadline, a missing sink, a
+// poisoned lock, a dropped event — all deny. Grep this section for `unwrap_or`
+// before review: each one defaults to deny.
+//
+// The model cannot provoke an egress ask without first clearing the permission
+// gate for the call that opens the connection, and the ask never manufactures
+// an approval — it can only withhold one. But it *is* reachable by
+// model-authored input: an injected model can put unfamiliar hostnames in
+// front of a human. So the prompt names the control and the host, and grants
+// nothing beyond the session.
+// ---------------------------------------------------------------------------
+
+/// The proxy's bridge to the human. A **grant**, unlike `ask_user`'s
+/// `QuestionSink` (`ask.rs`), which explicitly authorizes nothing — hence a
+/// separate type (0026 decision 2). Installed by the binary at startup; absent
+/// means "no human on this surface" and every unmatched host is denied.
+///
+/// No `CancellationToken` parameter: `handle_conn` runs on a task spawned from
+/// a process-lifetime accept loop and has no turn scope to borrow one from
+/// (0026 decision 10). Cancellation is raced engine-side, inside the closure.
+pub type EgressAskSink = Arc<dyn Fn(EgressAsk) -> BoxFuture<'static, EgressDecision> + Send + Sync>;
+
+#[derive(Debug, Clone)]
+pub struct EgressAsk {
+    /// The host the subprocess tried to reach, already normalized. Never a
+    /// URL — the proxy sees only `CONNECT host:port` or a `Host:` header.
+    pub host: String,
+}
+
+/// Three variants; the human sees two (0026 decision 17). `NoAnswer` covers
+/// the deadline, a cancelled turn, a closed channel, and an absent sink: it
+/// refuses the connection exactly like `Deny`, but is never written to
+/// `SESSION_HOSTS`, because a timeout is not a decision and a human who
+/// stepped away should be asked again rather than have silently denied a host
+/// for the session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressDecision {
+    Allow,
+    Deny,
+    NoAnswer,
+}
+
+static ASK_SINK: OnceLock<EgressAskSink> = OnceLock::new();
+
+/// Install the process-wide egress ask sink, once, at startup. Set-once like
+/// `POLICY`: nothing downstream can swap in a more permissive human.
+pub fn init_ask_sink(sink: EgressAskSink) {
+    let _ = ASK_SINK.set(sink);
+}
+
+/// Hosts decided this session, normalized. Additive; never shrinks except at
+/// process end. Separate from `POLICY`, which is set-once by contract — an
+/// "allow" here must never widen the policy child sessions inherit.
+///
+/// `LazyLock`, not a bare `static`: `HashMap::new` is not `const`.
+static SESSION_HOSTS: LazyLock<RwLock<HashMap<String, bool>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Asks in flight, so N concurrent connections to one host produce one prompt.
+/// The first connection inserts and drives; the rest clone the receiver and
+/// await the same answer.
+///
+/// This is a liveness requirement, not an optimization: a blocked connection
+/// holds one of `MAX_PROXY_CONNS` permits while it waits, so without dedup one
+/// `npm install` against a blocked registry wedges every later connection,
+/// including allowed ones.
+static IN_FLIGHT: LazyLock<Mutex<HashMap<String, watch::Receiver<Option<EgressDecision>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// How long a blocked connection waits for a human. Bounded because a pending
+/// ask holds a proxy permit. The engine races the turn's cancellation token
+/// independently; two guards, neither relying on the other.
+const ASK_DEADLINE: Duration = Duration::from_secs(120);
+
+/// Test-only overrides. Production reads `ASK_SINK` and `ASK_DEADLINE`
+/// directly; neither swap compiles into a shipped binary, so the set-once
+/// guarantee is intact while the tests stay independent (0026 watch-out 12).
+#[cfg(test)]
+static TEST_ASK_SINK: LazyLock<RwLock<Option<EgressAskSink>>> = LazyLock::new(|| RwLock::new(None));
+#[cfg(test)]
+static TEST_ASK_DEADLINE: LazyLock<RwLock<Option<Duration>>> = LazyLock::new(|| RwLock::new(None));
+
+fn ask_sink() -> Option<EgressAskSink> {
+    #[cfg(test)]
+    if let Some(sink) = TEST_ASK_SINK
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone()
+    {
+        return Some(sink);
+    }
+    ASK_SINK.get().cloned()
+}
+
+fn ask_deadline() -> Duration {
+    #[cfg(test)]
+    if let Some(deadline) = *TEST_ASK_DEADLINE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+    {
+        return deadline;
+    }
+    ASK_DEADLINE
+}
+
+fn record_decision(host: &str, allow: bool) {
+    SESSION_HOSTS
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .insert(host.to_string(), allow);
+}
+
+/// Removes the in-flight entry however the driver ends — answered, timed out,
+/// panicked, or dropped because the client hung up. Without it a vanished
+/// driver leaves an entry every later connection joins and instantly loses on,
+/// denying the host for the rest of the process with nobody having been asked.
+struct InFlightGuard(String);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        IN_FLIGHT
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+/// Resolve a host the static allowlist did not match. Order: session table →
+/// join an in-flight ask → drive a fresh one.
+async fn resolve_host(host: &str) -> EgressDecision {
+    let host = normalize_host(host);
+
+    // 1. Already decided this session.
+    if let Some(&allow) = SESSION_HOSTS
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(&host)
+    {
+        return if allow {
+            EgressDecision::Allow
+        } else {
+            EgressDecision::Deny
+        };
+    }
+
+    // 2. Join an in-flight ask, or become the driver. One lock, `entry`-style
+    //    — never "check then insert", or two connections both drive and the
+    //    human sees the stampede this whole mechanism exists to prevent.
+    let (mut rx, drive) = {
+        let mut inflight = IN_FLIGHT.lock().unwrap_or_else(PoisonError::into_inner);
+        match inflight.get(&host) {
+            Some(rx) => (rx.clone(), None),
+            None => {
+                let (tx, rx) = watch::channel(None);
+                inflight.insert(host.clone(), rx.clone());
+                (rx, Some(tx))
+            }
+        }
+    };
+
+    let Some(tx) = drive else {
+        // Joiner: wait for the driver's answer. Read before awaiting — the
+        // driver may already have written it. A vanished driver closes the
+        // channel with no value, which denies.
+        loop {
+            if let Some(decision) = *rx.borrow_and_update() {
+                return decision;
+            }
+            if rx.changed().await.is_err() {
+                return EgressDecision::NoAnswer;
+            }
+        }
+    };
+
+    // 3. Driver. The guard clears the in-flight entry on every exit path.
+    let _guard = InFlightGuard(host.clone());
+    let decision = match ask_sink() {
+        // No human on this surface (headless, or startup wiring that
+        // deliberately never installs one) — deny by construction.
+        None => EgressDecision::NoAnswer,
+        Some(sink) => {
+            let ask = EgressAsk { host: host.clone() };
+            // The sink is binary-supplied; a panic in it must deny, not leave
+            // every joiner waiting on a channel that will never be written.
+            let call = std::panic::AssertUnwindSafe(sink(ask)).catch_unwind();
+            match tokio::time::timeout(ask_deadline(), call).await {
+                Ok(Ok(decision)) => decision,
+                Ok(Err(_panicked)) => EgressDecision::NoAnswer,
+                Err(_elapsed) => EgressDecision::NoAnswer,
+            }
+        }
+    };
+
+    // Record only real answers: a deadline, a panic, or a missing sink records
+    // nothing, so the next connection asks again (0026 decision 5).
+    match decision {
+        EgressDecision::Allow => record_decision(&host, true),
+        EgressDecision::Deny => record_decision(&host, false),
+        EgressDecision::NoAnswer => {}
+    }
+
+    let _ = tx.send(Some(decision));
+    decision
+}
+
 /// Lazily start the proxy (once per process) and return its port; `None` if
 /// the listener could not bind.
 async fn proxy_port(patterns: &'static [String]) -> Option<u16> {
@@ -424,8 +644,11 @@ async fn handle_conn(
         let Some((host, port)) = split_host_port(target, None) else {
             return respond(&mut client, "400 Bad Request", "malformed CONNECT target").await;
         };
-        if !host_matches(&host, patterns) {
-            return deny_host(&mut client, &host).await;
+        // Order matters: the 200 below goes out only after the decision, or
+        // the client learns the connection was allowed before the human said
+        // anything.
+        if !host_matches(&host, patterns) && !decide_host(&mut client, &host).await {
+            return;
         }
         let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await else {
             return respond(&mut client, "502 Bad Gateway", "upstream connect failed").await;
@@ -446,8 +669,8 @@ async fn handle_conn(
     let Some((host, port)) = http_target(target, &head) else {
         return respond(&mut client, "400 Bad Request", "no target host in request").await;
     };
-    if !host_matches(&host, patterns) {
-        return deny_host(&mut client, &host).await;
+    if !host_matches(&host, patterns) && !decide_host(&mut client, &host).await {
+        return;
     }
     let Ok(mut upstream) = TcpStream::connect((host.as_str(), port)).await else {
         return respond(&mut client, "502 Bad Gateway", "upstream connect failed").await;
@@ -456,9 +679,25 @@ async fn handle_conn(
     tunnel(&mut client, &mut upstream, &buf).await;
 }
 
-async fn deny_host(client: &mut TcpStream, host: &str) {
-    let body = format!("hotl egress: \"{host}\" is not in [network].allow");
+/// Decide whether a host the allowlist did not match may be reached. Returns
+/// `true` to tunnel; on `false` the 403 has already been written.
+async fn decide_host(client: &mut TcpStream, host: &str) -> bool {
+    if resolve_host(host).await == EgressDecision::Allow {
+        return true;
+    }
+    let body = match ask_sink() {
+        // Byte-identical to the pre-0026 body: existing tests assert on it and
+        // the model reads it as an errors-as-prompt.
+        Some(_) => format!("hotl egress: \"{host}\" is not in [network].allow"),
+        // No human on this surface, so say what the human reading the
+        // transcript can actually do about it.
+        None => format!(
+            "hotl egress: \"{host}\" is not in [network].allow \
+             (no interactive surface — add it to config.toml or run interactively)"
+        ),
+    };
     respond(client, "403 Forbidden", &body).await;
+    false
 }
 
 async fn respond(client: &mut TcpStream, status: &str, body: &str) {
@@ -542,6 +781,85 @@ fn split_host_port(authority: &str, default: Option<u16>) -> Option<(String, u16
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **How the egress-ask tests share process-wide state.** `ASK_SINK` is a
+    /// set-once `OnceLock` in production, so tests install through the
+    /// `#[cfg(test)]` `TEST_ASK_SINK` cell instead (0026 watch-out 12 — the
+    /// "test-only swappable cell" option). That cell is global, so every test
+    /// touching it holds `SINK_LOCK` for its duration, and every test uses
+    /// **its own hostnames**, because `SESSION_HOSTS` never shrinks within a
+    /// process. Do not write a second test that installs a sink without
+    /// taking the lock: it will silently get whichever sink won the race.
+    static SINK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Installs a sink (and a short deadline) for the life of the guard.
+    struct SinkGuard {
+        /// Held, never read: the point is that no other sink test runs while
+        /// this one owns the cell.
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SinkGuard {
+        fn install(sink: EgressAskSink, deadline: Duration) -> Self {
+            let lock = SINK_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            *TEST_ASK_SINK
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(sink);
+            *TEST_ASK_DEADLINE
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = Some(deadline);
+            Self { _lock: lock }
+        }
+
+        /// No sink at all — the headless posture.
+        fn none() -> Self {
+            let lock = SINK_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+            *TEST_ASK_SINK
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            *TEST_ASK_DEADLINE
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for SinkGuard {
+        fn drop(&mut self) {
+            *TEST_ASK_SINK
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+            *TEST_ASK_DEADLINE
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// A sink that answers `decision` for exactly one host and counts how
+    /// often it was consulted about it — the counter is how "one prompt per
+    /// host" is asserted.
+    ///
+    /// Host-scoped on purpose: the cell is process-wide, so a sink that
+    /// answered unconditionally would also answer for whatever host an
+    /// unrelated proxy test happens to be probing at the same moment.
+    /// Everything else gets `NoAnswer`, which refuses and records nothing.
+    fn counting_sink(
+        host: &'static str,
+        decision: EgressDecision,
+    ) -> (EgressAskSink, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = calls.clone();
+        let sink: EgressAskSink = Arc::new(move |ask: EgressAsk| {
+            let answer = if ask.host == host {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                decision
+            } else {
+                EgressDecision::NoAnswer
+            };
+            Box::pin(async move { answer })
+        });
+        (sink, calls)
+    }
 
     fn patterns(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
@@ -847,6 +1165,299 @@ mod tests {
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "got: {reply}");
         assert!(reply.ends_with("ok"));
+    }
+
+    // --- the egress ask (0026 Tasks 2 and 3) -------------------------------
+
+    /// The headless posture: no sink installed. Denies, does not hang, and
+    /// leaves the session table alone so an interactive surface later in the
+    /// same process still gets to ask.
+    #[tokio::test]
+    async fn absent_sink_denies() {
+        let _guard = SinkGuard::none();
+        assert_eq!(
+            resolve_host("absent-sink.example").await,
+            EgressDecision::NoAnswer
+        );
+        assert!(!SESSION_HOSTS
+            .read()
+            .unwrap()
+            .contains_key("absent-sink.example"));
+    }
+
+    /// A timeout is not a decision (0026 decision 5): the connection is
+    /// refused, but nothing is written, so a human who stepped away is asked
+    /// again rather than having silently denied the host for the session.
+    #[tokio::test]
+    async fn deadline_denies_without_recording() {
+        let never: EgressAskSink =
+            Arc::new(|_ask| Box::pin(std::future::pending::<EgressDecision>()));
+        let _guard = SinkGuard::install(never, Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        assert_eq!(
+            resolve_host("deadline.example").await,
+            EgressDecision::NoAnswer
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the deadline did not fire"
+        );
+        assert!(!SESSION_HOSTS
+            .read()
+            .unwrap()
+            .contains_key("deadline.example"));
+    }
+
+    #[tokio::test]
+    async fn answered_deny_is_recorded() {
+        let (sink, calls) = counting_sink("answered-deny.example", EgressDecision::Deny);
+        let _guard = SinkGuard::install(sink, Duration::from_secs(5));
+        assert_eq!(
+            resolve_host("answered-deny.example").await,
+            EgressDecision::Deny
+        );
+        assert_eq!(
+            resolve_host("answered-deny.example").await,
+            EgressDecision::Deny
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a deny is remembered, so a retry loop cannot use the human as a rate limiter"
+        );
+    }
+
+    #[tokio::test]
+    async fn answered_allow_is_recorded() {
+        let (sink, calls) = counting_sink("answered-allow.example", EgressDecision::Allow);
+        let _guard = SinkGuard::install(sink, Duration::from_secs(5));
+        assert_eq!(
+            resolve_host("answered-allow.example").await,
+            EgressDecision::Allow
+        );
+        assert_eq!(
+            resolve_host("answered-allow.example").await,
+            EgressDecision::Allow
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// One `npm install` opens many connections at once. Without the dedup the
+    /// human gets a stampede of identical prompts *and* the proxy semaphore
+    /// fills with blocked handlers — a liveness bug, not just noise.
+    #[tokio::test]
+    async fn concurrent_asks_for_one_host_produce_one_prompt() {
+        let slow: EgressAskSink = Arc::new(|ask: EgressAsk| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                if ask.host == "stampede.example" {
+                    STAMPEDE_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    EgressDecision::Allow
+                } else {
+                    EgressDecision::NoAnswer
+                }
+            })
+        });
+        let _guard = SinkGuard::install(slow, Duration::from_secs(5));
+        let mut tasks = Vec::new();
+        for _ in 0..20 {
+            tasks.push(tokio::spawn(resolve_host("stampede.example")));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), EgressDecision::Allow);
+        }
+        assert_eq!(
+            STAMPEDE_CALLS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "20 concurrent connections must produce exactly one prompt"
+        );
+    }
+
+    static STAMPEDE_CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// A panicking sink must deny — and must not leave the in-flight entry
+    /// behind, or every later connection to that host joins a channel nobody
+    /// will ever write.
+    #[tokio::test]
+    async fn a_panicking_sink_denies() {
+        let boom: EgressAskSink = Arc::new(|ask: EgressAsk| {
+            Box::pin(async move {
+                assert_ne!(ask.host, "panic.example", "deliberate test panic");
+                EgressDecision::NoAnswer
+            })
+        });
+        let _guard = SinkGuard::install(boom, Duration::from_secs(5));
+        assert_eq!(
+            resolve_host("panic.example").await,
+            EgressDecision::NoAnswer
+        );
+        assert!(!IN_FLIGHT.lock().unwrap().contains_key("panic.example"));
+        assert!(!SESSION_HOSTS.read().unwrap().contains_key("panic.example"));
+    }
+
+    /// Watch-out 5: if the table and `host_matches` normalized differently, a
+    /// host could be "allowed" in one and rejected by the other — a bug that
+    /// presents as the prompt reappearing forever.
+    #[tokio::test]
+    async fn host_normalization_is_shared_with_the_matcher() {
+        let (sink, calls) = counting_sink("normalize.example", EgressDecision::Allow);
+        let _guard = SinkGuard::install(sink, Duration::from_secs(5));
+        assert_eq!(
+            resolve_host("Normalize.EXAMPLE.").await,
+            EgressDecision::Allow
+        );
+        assert_eq!(
+            resolve_host("normalize.example").await,
+            EgressDecision::Allow
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(host_matches(
+            "Normalize.EXAMPLE.",
+            &patterns(&["normalize.example"])
+        ));
+    }
+
+    /// Task 3's regression guard for every existing deployment: with nothing
+    /// installed the proxy behaves exactly as it did before 0026.
+    #[tokio::test]
+    async fn unlisted_host_with_no_sink_is_still_403() {
+        let _guard = SinkGuard::none();
+        let proxy = test_proxy(&["127.0.0.1"]).await;
+        let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+        client
+            .write_all(b"CONNECT no-sink.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 403"), "got: {reply}");
+        assert!(
+            reply.contains("hotl egress: \"no-sink.example\" is not in [network].allow"),
+            "got: {reply}"
+        );
+        assert!(
+            reply.contains("no interactive surface"),
+            "with no human to ask, say what the reader can do instead: {reply}"
+        );
+    }
+
+    /// Watch-out 4: the model reads the deny body and adapts. When a sink is
+    /// installed and the human says no, that body must be byte-identical to
+    /// the pre-0026 one.
+    #[tokio::test]
+    async fn the_403_body_is_unchanged_when_a_sink_is_installed() {
+        let (sink, _calls) = counting_sink("body.example", EgressDecision::Deny);
+        let _guard = SinkGuard::install(sink, Duration::from_secs(5));
+        let proxy = test_proxy(&["127.0.0.1"]).await;
+        let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+        client
+            .write_all(b"CONNECT body.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        let body = reply.rsplit("\r\n\r\n").next().unwrap();
+        assert_eq!(
+            body,
+            "hotl egress: \"body.example\" is not in [network].allow"
+        );
+    }
+
+    /// A human `y` tunnels, and the next connection to that host does not ask
+    /// again.
+    #[tokio::test]
+    async fn allow_tunnels_and_the_second_connection_does_not_ask() {
+        // A local origin standing in for the granted host.
+        let origin = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let origin_port = origin.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut s, _) = origin.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4];
+                    let _ = s.read_exact(&mut buf).await;
+                    let _ = s.write_all(b"pong").await;
+                });
+            }
+        });
+        let (sink, calls) = counting_sink("127.0.0.1", EgressDecision::Allow);
+        // Empty allowlist, so 127.0.0.1 reaches the ask rather than matching.
+        let _guard = SinkGuard::install(sink, Duration::from_secs(5));
+        let proxy = test_proxy(&[]).await;
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+            client
+                .write_all(format!("CONNECT 127.0.0.1:{origin_port} HTTP/1.1\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let reply = read_until_head_end(&mut client).await;
+            assert!(reply.starts_with("HTTP/1.1 200"), "got: {reply}");
+            client.write_all(b"ping").await.unwrap();
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"pong");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Do not leak the grant into other tests in this process.
+        SESSION_HOSTS.write().unwrap().remove("127.0.0.1");
+    }
+
+    /// Watch-out 7: the `200 Connection Established` must not go out before
+    /// the human has answered, or the client believes it is already through.
+    #[tokio::test]
+    async fn connect_does_not_send_200_before_the_decision() {
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let blocking: EgressAskSink = Arc::new(move |ask: EgressAsk| {
+            let mut rx = release_rx.clone();
+            Box::pin(async move {
+                if ask.host != "blocking.example" {
+                    return EgressDecision::NoAnswer;
+                }
+                while !*rx.borrow_and_update() {
+                    if rx.changed().await.is_err() {
+                        return EgressDecision::NoAnswer;
+                    }
+                }
+                EgressDecision::Deny
+            })
+        });
+        let _guard = SinkGuard::install(blocking, Duration::from_secs(10));
+        let proxy = test_proxy(&["127.0.0.1"]).await;
+        let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+        client
+            .write_all(b"CONNECT blocking.example:443 HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let peeked = tokio::time::timeout(Duration::from_millis(200), client.read(&mut byte)).await;
+        assert!(
+            peeked.is_err(),
+            "the proxy answered before the human did: {byte:?}"
+        );
+        release_tx.send(true).unwrap();
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert!(reply.starts_with("HTTP/1.1 403"), "got: {reply}");
+    }
+
+    /// A deny is remembered symmetrically with an allow, so a retrying command
+    /// cannot use the human as a rate limiter.
+    #[tokio::test]
+    async fn deny_is_remembered_for_the_session() {
+        let (sink, calls) = counting_sink("remembered.example", EgressDecision::Deny);
+        let _guard = SinkGuard::install(sink, Duration::from_secs(5));
+        let proxy = test_proxy(&["127.0.0.1"]).await;
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(("127.0.0.1", proxy)).await.unwrap();
+            client
+                .write_all(b"CONNECT remembered.example:443 HTTP/1.1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut reply = String::new();
+            client.read_to_string(&mut reply).await.unwrap();
+            assert!(reply.starts_with("HTTP/1.1 403"), "got: {reply}");
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
