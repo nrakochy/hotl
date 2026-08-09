@@ -903,6 +903,7 @@ async fn scaffold(
         model.clone(),
         sandbox_enforced,
         initial_helper_key.clone(),
+        cfg.agents.isolation(),
     );
     // `spawn`'s own registration (agent.rs::spawn_session_with_todos) needs a
     // *clone* of this same instance (shared Arc semaphores) — cloned before
@@ -1455,6 +1456,9 @@ struct HotlChildBuilder {
     /// See `Scaffold::initial_helper_key` — passed down at construction since
     /// a child builder is captured by the spawn tool ahead of any session.
     initial_helper_key: Option<String>,
+    /// `[agents] isolation` — the fallback for defs whose frontmatter is
+    /// silent. A def that names `isolation:` itself always wins.
+    default_isolation: hotl_tools::agents::Isolation,
 }
 
 impl HotlChildBuilder {
@@ -1477,14 +1481,35 @@ impl HotlChildBuilder {
     /// than from the parent's own (already-extended) registry. Depth-1 and
     /// "children stay lean" both hold structurally as a result, for every
     /// def (built-in or user).
-    fn child_registry(&self, def: &hotl_tools::agents::AgentDef) -> Registry {
+    /// `root` is the child's own worktree when it is isolated, and the
+    /// parent's cwd otherwise — the tools resolve every relative path against
+    /// it, which is the entire mechanism (`SessionDeps.cwd` alone reaches only
+    /// nested-AGENTS.md discovery and would change nothing).
+    fn child_registry(
+        &self,
+        def: &hotl_tools::agents::AgentDef,
+        root: &std::path::Path,
+    ) -> Registry {
         let diagnostics = self
             .hooks_toml
             .as_deref()
             .map(hotl_tools::diagnostics::Diagnostics::from_toml)
             .unwrap_or_default();
-        let full = Registry::builtin_with(diagnostics, self.minify.clone());
+        let full = Registry::builtin_with_root(diagnostics, self.minify.clone(), root.into());
         hotl_tools::agents::filter_registry(def, &full)
+    }
+
+    /// Whether this def's child gets a worktree: frontmatter first, then the
+    /// `[agents] isolation` default. Read-only defs never do — `explore` and
+    /// `plan` cannot write, and they are the fan-out hot path where a checkout
+    /// per child would be pure cost.
+    fn wants_isolation(&self, def: &hotl_tools::agents::AgentDef) -> bool {
+        use hotl_tools::agents::Isolation;
+        let asked = match def.isolation {
+            Isolation::Worktree => true,
+            Isolation::None => self.default_isolation == Isolation::Worktree,
+        };
+        asked && !hotl_tools::agents::is_read_only(def)
     }
 
     /// `fork`'s seed shape (index E3, the cost addendum): *byte-identical*
@@ -1549,7 +1574,7 @@ impl HotlChildBuilder {
         def: &hotl_tools::agents::AgentDef,
         initial_items: Vec<hotl_types::Item>,
         lineage: Option<(hotl_store::ParentRef, usize)>,
-    ) -> Result<hotl_engine::SessionHandle, String> {
+    ) -> Result<crate::spawn::Child, String> {
         let inherited = lineage.as_ref().map(|(_, n)| *n);
         let mut log = SessionLog::create(
             &sessions_dir(),
@@ -1566,7 +1591,20 @@ impl HotlChildBuilder {
         if let Some(n) = inherited {
             record_fork_point(&mut log, n, self.clock.now_ms())?;
         }
-        let registry = self.child_registry(def);
+        // Isolation degrades quietly to shared-cwd — same posture as
+        // `Shadow::create` returning `None` — but the spawn tool says so in
+        // the result rather than letting the child look isolated.
+        let isolate = self.wants_isolation(def);
+        let worktree = isolate
+            .then(|| hotl_store::worktree::Worktree::create(&self.cwd, &hotl_types::new_ulid()))
+            .flatten();
+        let isolation_unavailable = isolate && worktree.is_none();
+        let root = worktree
+            .as_ref()
+            .map_or(self.cwd.as_path(), hotl_store::worktree::Worktree::path)
+            .to_path_buf();
+
+        let registry = self.child_registry(def, &root);
         let system = def
             .system_prompt
             .clone()
@@ -1589,7 +1627,7 @@ impl HotlChildBuilder {
         // `def.effort` is parsed but intentionally not applied: hotl's
         // `EngineConfig` has no effort ladder today (only `thinking: bool`)
         // — see `AgentDef::effort`'s doc comment. A future plan wires it.
-        Ok(spawn_session_with_todos(
+        let handle = spawn_session_with_todos(
             registry,
             None, // children never get their own `spawn` tool — depth-1 is structural
             None, // children never get hooks either — see `hooks: None` below
@@ -1601,14 +1639,19 @@ impl HotlChildBuilder {
                 clock: self.clock.clone(),
                 log,
                 system,
-                cwd: self.cwd.clone(),
+                cwd: root.clone(),
                 snapshots: None,
                 hooks: None,
                 initial_items,
                 initial_todos: Vec::new(),
                 config,
             },
-        ))
+        );
+        Ok(crate::spawn::Child {
+            handle,
+            worktree,
+            isolation_unavailable,
+        })
     }
 }
 
@@ -1617,7 +1660,7 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
         &self,
         def: &hotl_tools::agents::AgentDef,
         _brief: &str,
-    ) -> Result<hotl_engine::SessionHandle, String> {
+    ) -> Result<crate::spawn::Child, String> {
         self.spawn_child(def, Vec::new(), None)
     }
 
@@ -1626,7 +1669,7 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
         def: &hotl_tools::agents::AgentDef,
         brief: &str,
         seed: crate::spawn::ForkSeed,
-    ) -> Result<hotl_engine::SessionHandle, String> {
+    ) -> Result<crate::spawn::Child, String> {
         let crate::spawn::ForkSeed {
             history,
             parent_session_id,
@@ -1704,6 +1747,7 @@ fn child_builder(
     model: String,
     sandbox_enforced: bool,
     initial_helper_key: Option<String>,
+    default_isolation: hotl_tools::agents::Isolation,
 ) -> Arc<dyn crate::spawn::ChildBuilder> {
     Arc::new(HotlChildBuilder {
         provider,
@@ -1717,6 +1761,7 @@ fn child_builder(
         model,
         sandbox_enforced,
         initial_helper_key,
+        default_isolation,
     })
 }
 
@@ -3472,7 +3517,36 @@ mod tests {
             model: "parent-model".into(),
             sandbox_enforced: false,
             initial_helper_key: None,
+            default_isolation: hotl_tools::agents::Isolation::None,
         }
+    }
+
+    /// Frontmatter beats config, config covers silent defs, and a read-only
+    /// def is never isolated no matter what either says — `explore`/`plan`
+    /// cannot write, and they are the fan-out hot path where a checkout per
+    /// child would be pure cost.
+    #[test]
+    fn isolation_precedence_is_frontmatter_then_config_then_off() {
+        use hotl_tools::agents::Isolation;
+        let mut cb = test_child_builder();
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let explore = hotl_tools::agents::builtin("explore").unwrap();
+        let worktreed = hotl_tools::agents::parse_def(
+            "---\nname: w\nisolation: worktree\n---\nbody",
+            hotl_tools::agents::AgentSource::User,
+        )
+        .unwrap();
+
+        // def silent + config off
+        assert!(!cb.wants_isolation(&general));
+        // def frontmatter Worktree + config off
+        assert!(cb.wants_isolation(&worktreed));
+
+        cb.default_isolation = Isolation::Worktree;
+        // def silent + config worktree
+        assert!(cb.wants_isolation(&general));
+        // read-only, either way
+        assert!(!cb.wants_isolation(&explore));
     }
 
     /// Task 4's named trap: `child_builder()` captures a *clone* of
@@ -3499,7 +3573,8 @@ mod tests {
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
         let mut handle = cb
             .spawn_child(&general, Vec::new(), None)
-            .expect("child spawns");
+            .expect("child spawns")
+            .handle;
         handle.prompt("go".into()).await;
         loop {
             let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
@@ -3528,14 +3603,14 @@ mod tests {
     fn child_registry_applies_the_defs_tool_scope() {
         let cb = test_child_builder();
         let explore = hotl_tools::agents::builtin("explore").unwrap();
-        let reg = cb.child_registry(&explore);
+        let reg = cb.child_registry(&explore, &cb.cwd);
         assert!(reg.get("read").is_some());
         assert!(reg.get("write").is_none());
         assert!(reg.get("bash").is_none());
         assert!(reg.get("spawn").is_none());
 
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
-        let reg = cb.child_registry(&general);
+        let reg = cb.child_registry(&general, &cb.cwd);
         assert!(reg.get("write").is_some() && reg.get("bash").is_some());
         assert!(reg.get("spawn").is_none(), "children never recurse");
     }
