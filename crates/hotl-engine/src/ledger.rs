@@ -84,7 +84,10 @@ const DELTA_PAIRS: [(Phase, Phase); PHASE_COUNT - 1] = [
 fn now_nanos() -> u64 {
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = START.get_or_init(Instant::now);
-    start.elapsed().as_nanos() as u64
+    // Floored at 1: `0` is the "never stamped" sentinel in `stamp` and
+    // `width`, and the very first caller in a process reads a genuine 0 here
+    // (the epoch is this call). A 1ns floor is noise; the collision is not.
+    (start.elapsed().as_nanos() as u64).max(1)
 }
 
 /// The span between two stamps, or zero-width if either endpoint is absent
@@ -490,6 +493,14 @@ mod tests {
         let a = now_nanos();
         let b = now_nanos();
         assert!(b >= a);
+    }
+
+    #[test]
+    fn now_nanos_never_returns_the_unset_sentinel() {
+        // Whichever test runs first initializes the epoch and reads ~0ns. That
+        // used to collide with `stamp`'s `*slot == 0` "unset" check, so
+        // `first_stamp_wins` failed whenever it won the ordering race.
+        assert_ne!(now_nanos(), 0);
     }
 
     #[test]
