@@ -82,7 +82,7 @@
           # under nix it concludes the floor is enforced, and every subprocess
           # a hook spawns is killed before it can run.
           #
-          # These twenty-one are exactly the tests that need a subprocess to
+          # These twenty-five are exactly the tests that need a subprocess to
           # run *through* the floor and succeed, so they are the ones the
           # nesting kills. Everything else on darwin — 200+ tests — still
           # runs. They are not skipped anywhere else: CI runs them on a real
@@ -90,6 +90,14 @@
           # (the configured-writable seatbelt behaviors and bash-execution
           # pins) joined the original fourteen with the 0.7.0 `[sandbox]`
           # work, enumerated with the sandbox-exec reproduction below.
+          #
+          # Three more joined 2026-08-09, and the reason they took two releases
+          # to land is the trap this comment already warns about: the list fell
+          # behind the code twice and fail-fast showed only the first casualty
+          # each time. `seatbelt_denies_protected_subpaths_under_cwd` was red
+          # from v0.8.0, the two plan-mode tests from v0.9.0, and the plan-mode
+          # binary ran first — so the seatbelt one never even executed in CI.
+          # Add to this list only from a full `--no-fail-fast` enumeration.
           #
           # Enumerated by reproducing the constraint directly rather than by
           # peeling one nix build at a time:
@@ -155,11 +163,16 @@
                 "sandbox::tests::seatbelt_blocks_a_connect_to_a_denied_daemon_socket"
                 "sandbox::tests::seatbelt_confines_writes"
                 "sandbox::tests::seatbelt_denies_apple_events_without_breaking_plain_applescript"
+                "sandbox::tests::seatbelt_denies_protected_subpaths_under_cwd"
                 "sandbox::tests::seatbelt_egress_off_confines_to_loopback"
                 # hotl-tools tests/sandbox_extras.rs — never reached in the nix
                 # macos log (fail-fast stopped at the lib target); caught by the
                 # sandbox-exec reproduction above.
                 "configured_extras_widen_the_floor_and_keep_the_probe_sound"
+                # hotl-engine tests/plan_mode.rs — both assert bash actually
+                # ran (one checks its stdout), so the floor must succeed.
+                "plan_plus_ask_prompts_for_bash"
+                "plan_plus_bypass_still_runs_bash"
                 # hotl-testkit
                 "tests::negative_max_turns_never_caps"
               ]
