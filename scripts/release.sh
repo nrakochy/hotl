@@ -13,6 +13,7 @@
 #   scripts/release.sh minor      # 0.1.0 -> 0.2.0   (breaking, while pre-1.0)
 #   scripts/release.sh major      # 0.1.0 -> 1.0.0
 #   scripts/release.sh 0.4.2      # set an explicit version
+#   scripts/release.sh --tag-only # CI went red; tree already bumped — retry the tag
 #
 # Env:
 #   HOTL_SKIP_LINUX_CHECK=1   accept that a Linux-only break may reach the tag
@@ -21,7 +22,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-[ $# -eq 1 ] || { echo "usage: $0 <patch|minor|major|X.Y.Z>" >&2; exit 1; }
+[ $# -eq 1 ] || { echo "usage: $0 <patch|minor|major|X.Y.Z|--tag-only>" >&2; exit 1; }
 
 # Clean tree required — a release must reflect committed state.
 if [ -n "$(git status --porcelain)" ]; then
@@ -32,13 +33,19 @@ fi
 current="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
 IFS=. read -r major minor patch <<<"$current"
 
-case "$1" in
-  patch) new="$major.$minor.$((patch + 1))" ;;
-  minor) new="$major.$((minor + 1)).0" ;;
-  major) new="$((major + 1)).0.0" ;;
-  [0-9]*.[0-9]*.[0-9]*) new="$1" ;;
-  *) echo "error: expected patch|minor|major|X.Y.Z, got '$1'" >&2; exit 1 ;;
-esac
+if [ "$1" = --tag-only ]; then
+  tag_only=1
+  new="$current"          # the tree is already bumped; tag what it says
+else
+  tag_only=0
+  case "$1" in
+    patch) new="$major.$minor.$((patch + 1))" ;;
+    minor) new="$major.$((minor + 1)).0" ;;
+    major) new="$((major + 1)).0.0" ;;
+    [0-9]*.[0-9]*.[0-9]*) new="$1" ;;
+    *) echo "error: expected patch|minor|major|X.Y.Z|--tag-only, got '$1'" >&2; exit 1 ;;
+  esac
+fi
 
 tag="v$new"
 if git rev-parse "$tag" >/dev/null 2>&1; then
@@ -62,6 +69,36 @@ if [ "${HOTL_SKIP_CI_WAIT:-0}" != 1 ]; then
     echo "      accept a tag that no green CI run vouches for." >&2
     exit 1
   }
+fi
+
+# --tag-only is the recovery path for a red CI: the version bump is committed
+# and pushed but untagged, and re-running a normal release would refuse on its
+# own already-promoted changelog. Mutates nothing — waits, tags, pushes.
+if [ "$tag_only" = 1 ]; then
+  branch="$(git rev-parse --abbrev-ref HEAD)"
+  git fetch -q origin "$branch"
+  remote_head="$(git rev-parse "origin/$branch" 2>/dev/null)" || {
+    echo "error: origin/$branch does not exist; push the release commit first." >&2
+    exit 1
+  }
+  # Gating on evidence the remote can see is the whole point, so HEAD has to be
+  # the commit CI actually ran on.
+  if [ "$(git rev-parse HEAD)" != "$remote_head" ]; then
+    echo "error: HEAD is not what origin/$branch points at, so CI's verdict" >&2
+    echo "       would not be about this commit. Push (or reset to) it first." >&2
+    exit 1
+  fi
+
+  if [ "${HOTL_SKIP_CI_WAIT:-0}" = 1 ]; then
+    echo "skipping the CI wait (HOTL_SKIP_CI_WAIT=1) — publish.yml will refuse if CI is red."
+  else
+    bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"
+  fi
+
+  git tag -a "$tag" -m "$tag"
+  git push origin "$tag"
+  echo "pushed $tag — crates.io publish and release binaries are building."
+  exit 0
 fi
 
 # --- changelog checks, before anything is edited --------------------------
@@ -185,8 +222,10 @@ git push origin "$branch"
 
 if [ "${HOTL_SKIP_CI_WAIT:-0}" = 1 ]; then
   echo "skipping the CI wait (HOTL_SKIP_CI_WAIT=1) — publish.yml will refuse if CI is red."
-else
-  bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"
+elif ! bash scripts/wait-for-ci.sh "$(git rev-parse HEAD)"; then
+  echo "the release commit is pushed but untagged, so nothing is public yet." >&2
+  echo "hint: fix the break, then finish with 'scripts/release.sh --tag-only'." >&2
+  exit 1
 fi
 
 git tag -a "$tag" -m "$tag"
