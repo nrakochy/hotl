@@ -788,10 +788,24 @@ impl Config {
         }
     }
 
-    /// The `[[allow]]` rules as a standalone TOML string (for `Rules::from_toml`),
-    /// or `None` if config.toml has no `allow` section (→ fall back to the file).
-    pub fn allow_toml(&self) -> Option<String> {
-        self.section_as_toml("allow")
+    /// The `[[allow]]` **and `[[deny]]`** rules as one standalone TOML string
+    /// (for `Rules::from_toml`), or `None` if config.toml declares neither.
+    ///
+    /// Both sections, deliberately: lifting only `allow` dropped every user
+    /// `[[deny]]` on the floor, so a rule the owner wrote governed nothing and
+    /// said nothing about it. Only the admin tier could deny.
+    pub fn rules_toml(&self) -> Option<String> {
+        let raw = self.raw.as_ref()?;
+        let mut doc = toml::map::Map::new();
+        for key in ["allow", "deny"] {
+            if let Some(section) = raw.get(key) {
+                doc.insert(key.into(), section.clone());
+            }
+        }
+        if doc.is_empty() {
+            return None;
+        }
+        toml::to_string(&toml::Value::Table(doc)).ok()
     }
 
     /// The `[[mcp]]` servers as a `[[server]]`-shaped TOML string (matching the
@@ -853,13 +867,6 @@ impl Config {
         if let Some(d) = diags {
             doc.insert("diagnostics".into(), d.clone());
         }
-        toml::to_string(&toml::Value::Table(doc)).ok()
-    }
-
-    fn section_as_toml(&self, key: &str) -> Option<String> {
-        let value = self.raw.as_ref()?.get(key)?;
-        let mut doc = toml::map::Map::new();
-        doc.insert(key.into(), value.clone());
         toml::to_string(&toml::Value::Table(doc)).ok()
     }
 }
@@ -1026,7 +1033,7 @@ mod tests {
         assert_eq!(cfg.retention.max_age_days, Some(30));
         assert_eq!(cfg.retention.max_sessions, Some(100));
         // Domain sections reserialize to their loaders' shapes.
-        assert!(cfg.allow_toml().unwrap().contains("prefix = \"cargo \""));
+        assert!(cfg.rules_toml().unwrap().contains("prefix = \"cargo \""));
         assert!(
             cfg.mcp_toml().unwrap().contains("[[server]]")
                 && cfg.mcp_toml().unwrap().contains("docs")
@@ -1069,6 +1076,42 @@ mod tests {
         let t = cfg.retrieval_toml().unwrap();
         assert!(t.contains("[[backend]]") && t.contains("notes"));
         assert!(cfg_with("").retrieval_toml().is_none());
+    }
+
+    /// A user `[[deny]]` used to be lifted out of config.toml by nothing at
+    /// all, so it governed nothing and said nothing about it — only the admin
+    /// tier could deny. Both sections reach `Rules` now.
+    #[test]
+    fn rules_toml_carries_both_allow_and_deny_sections() {
+        let cfg = cfg_with(
+            r#"
+[[allow]]
+tool = "bash"
+prefix = "cargo "
+
+[[deny]]
+tool = "read"
+path_prefix = "/Volumes/secrets"
+"#,
+        );
+        let t = cfg.rules_toml().unwrap();
+        let rules = hotl_tools::rules::Rules::from_toml(&t).unwrap();
+        assert!(
+            rules
+                .denied("read", &serde_json::json!({"path": "/Volumes/secrets/k"}))
+                .is_some(),
+            "a user [[deny]] must reach Rules: {t}"
+        );
+        // Neither section present → nothing, so the caller can fall back.
+        assert!(cfg_with("[provider]\nmodel = \"x\"\n")
+            .rules_toml()
+            .is_none());
+        // Only a deny section is still a rule set.
+        assert!(
+            cfg_with("[[deny]]\ntool = \"read\"\npath_prefix = \"/x\"\n")
+                .rules_toml()
+                .is_some()
+        );
     }
 
     #[test]
@@ -1728,7 +1771,7 @@ mod tests {
         let cfg = Config::load(std::path::Path::new("/no/such/dir"));
         assert!(cfg.provider.model.is_none());
         assert!(
-            cfg.allow_toml().is_none() && cfg.mcp_toml().is_none() && cfg.hooks_toml().is_none()
+            cfg.rules_toml().is_none() && cfg.mcp_toml().is_none() && cfg.hooks_toml().is_none()
         );
         assert!(cfg.retention.max_age_days.is_none());
     }

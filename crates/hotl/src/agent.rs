@@ -1952,7 +1952,7 @@ fn load_rules_with(
     env_plan: Option<&str>,
 ) -> (Arc<Rules>, Vec<String>) {
     let mut warnings = Vec::new();
-    let mut rules = match cfg.allow_toml() {
+    let mut rules = match cfg.rules_toml() {
         Some(t) => Rules::from_toml(&t).unwrap_or_else(|e| {
             warnings.push(format!("config.toml [[allow]] ignored: {e}"));
             Rules::default()

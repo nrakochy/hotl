@@ -379,7 +379,7 @@ fn permissions_check(config_dir: &Path) -> Check {
 }
 
 fn rules_check(config_dir: &Path) -> Check {
-    match crate::config::Config::load(config_dir).allow_toml() {
+    match crate::config::Config::load(config_dir).rules_toml() {
         None => ok("allow rules: none (every gated tool call asks)".into()),
         Some(t) => match hotl_tools::rules::Rules::from_toml(&t) {
             Ok(_) => ok("allow rules: [[allow]] in config.toml loaded".into()),
