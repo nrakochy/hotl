@@ -328,6 +328,12 @@ impl Rules {
         out
     }
 
+    /// Every deny tier, admin first, tagged with the section an owner wrote it
+    /// in. The projection reads these in this order so its output is stable.
+    fn deny_tiers(&self) -> [(&'static str, &Vec<AllowRule>); 2] {
+        [("admin deny", &self.admin_deny), ("deny", &self.deny)]
+    }
+
     /// Install the admin tier (trust-checked by the caller).
     pub fn merge_admin(&mut self, admin: AdminRules) {
         self.admin_allow = admin.allow;
@@ -443,6 +449,146 @@ impl Rules {
     pub fn denied(&self, tool: &str, input: &Value) -> Option<String> {
         match_deny(&self.admin_deny, tool, input, self.home())
             .or_else(|| match_deny(&self.deny, tool, input, self.home()))
+    }
+}
+
+/// What the permission rules imply for the kernel read floor (plan 0025).
+///
+/// The in-process gate enforces every deny rule in full. This is the subset a
+/// kernel can also express, so a `[[deny]]` over a path reaches `bash` and not
+/// just hotl's own file tools. A rule that cannot be expressed at the kernel is
+/// *reported* — never approximated, because an approximation reads as covered
+/// while missing what it does not cover.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Containment {
+    /// Canonical absolute paths sandboxed children must not read, from
+    /// projectable deny rules. Becomes `sandbox::ReadDeny::rules`.
+    pub read_deny: Vec<PathBuf>,
+    /// Rules that could not be projected, each with a reason. Surfaced by
+    /// [`Rules::lint_containment`] and `hotl doctor` — never silently dropped.
+    pub unprojectable: Vec<String>,
+}
+
+/// Project the deny tiers onto the kernel read floor.
+///
+/// `resolve` is the filesystem half (production: `canonicalize`), taken as a
+/// parameter so the tests stay hermetic. A resolver that fails means
+/// unprojectable, not an error — a `path_prefix` on a dead mount must not take
+/// startup down.
+///
+/// Pure otherwise: no filesystem writes, no globals, and no directory is
+/// created for a prefix that names one that does not exist.
+pub fn project(rules: &Rules, resolve: &dyn Fn(&Path) -> Option<PathBuf>) -> Containment {
+    let mut out = Containment::default();
+    for (kind, set) in rules.deny_tiers() {
+        for rule in set {
+            match project_rule(rule, rules.home(), resolve) {
+                Projection::Path(p) => {
+                    if !out.read_deny.contains(&p) {
+                        out.read_deny.push(p);
+                    }
+                }
+                Projection::Report(why) => {
+                    let line = format!("[[{kind}]] {why}");
+                    if !out.unprojectable.contains(&line) {
+                        out.unprojectable.push(line);
+                    }
+                }
+                Projection::Silent => {}
+            }
+        }
+    }
+    out
+}
+
+enum Projection {
+    Path(PathBuf),
+    Report(String),
+    /// Nothing to say: an allow-shaped no-op, or a rule [`Rules::lint`] already
+    /// reports. Two diagnostics for one rule is worse than one.
+    Silent,
+}
+
+fn project_rule(
+    rule: &AllowRule,
+    home: Option<&Path>,
+    resolve: &dyn Fn(&Path) -> Option<PathBuf>,
+) -> Projection {
+    let tool = &rule.tool;
+    if rule.prefix.is_none() && rule.path_prefix.is_none() {
+        return Projection::Silent; // `lint` already calls this out
+    }
+    let kind = SUBJECTS
+        .iter()
+        .find(|(t, _, _)| t == tool)
+        .map(|(_, k, _)| *k);
+    match kind {
+        Some(SubjectKind::Path) => {}
+        Some(SubjectKind::Command) => {
+            let prefix = rule.prefix.as_deref().unwrap_or_default();
+            return Projection::Report(format!(
+                "{tool} prefix = \"{prefix}\" governs a command name, and the kernel sees only \
+                 paths — it cannot reach shell commands and never will. It still governs hotl's \
+                 {tool} tool."
+            ));
+        }
+        _ => {
+            // A URL, a query, a server name. Reported only when the owner wrote
+            // something path-shaped and so might expect kernel reach; a plain
+            // `web_fetch` prefix deny has no business in a read-floor report.
+            return match &rule.path_prefix {
+                Some(pp) => Projection::Report(format!(
+                    "{tool} path_prefix = \"{pp}\" matches a {tool} subject rather than a \
+                     filesystem path, so it does not reach shell commands. It still governs \
+                     hotl's {tool} tool."
+                )),
+                None => Projection::Silent,
+            };
+        }
+    }
+    if let Some(field) = &rule.field {
+        return Projection::Report(format!(
+            "{tool} field = \"{field}\" matches a different input key, whose values are not \
+             necessarily paths, so it does not reach shell commands. It still governs hotl's \
+             {tool} tool. To cover shell commands too, write a separate rule with no `field`."
+        ));
+    }
+    let Some(pp) = &rule.path_prefix else {
+        let prefix = rule.prefix.as_deref().unwrap_or_default();
+        return Projection::Report(format!(
+            "{tool} prefix = \"{prefix}\" uses `prefix`, but `{tool}` is matched on paths — \
+             write path_prefix = \"{prefix}\" instead"
+        ));
+    };
+    let rule_text = format!("{tool} path_prefix = \"{pp}\"");
+    if pp.is_empty() {
+        return Projection::Report(format!(
+            "{rule_text} denies every path, which at the kernel would deny every read and leave \
+             the agent unable to run anything — refused. Name the directory you meant."
+        ));
+    }
+    let expanded = expand_tilde(pp, home);
+    if components(&expanded).is_empty() {
+        return Projection::Report(format!(
+            "{rule_text} is the filesystem root, which at the kernel would deny every read and \
+             leave the agent unable to run anything — refused. Name the directory you meant."
+        ));
+    }
+    if !expanded.starts_with('/') {
+        let suggestion = pp.trim_start_matches("./").trim_end_matches('/');
+        return Projection::Report(format!(
+            "{rule_text} applies at any depth, which no kernel rule can express, so it does not \
+             reach shell commands. It still governs hotl's read/write/edit/glob/grep. To cover \
+             shell commands too, name the directory: path_prefix = \"~/{suggestion}\"."
+        ));
+    }
+    match resolve(Path::new(expanded.as_ref())) {
+        Some(p) => Projection::Path(p),
+        None => Projection::Report(format!(
+            "{rule_text} names {expanded}, which does not resolve to an existing path, so there \
+             is nothing for the kernel to deny. It still governs hotl's own file tools, and it \
+             will reach shell commands once the path exists."
+        )),
     }
 }
 
@@ -2193,6 +2339,197 @@ prefix = "read"
         assert!(warnings.iter().any(|w| w.contains("field")));
         // A well-formed rule set lints clean.
         assert!(rules().lint().is_empty());
+    }
+
+    // ---- plan 0025: the projection ----------------------------------------
+
+    /// A resolver backed by a fixture set rather than the real filesystem, so
+    /// every projection test is hermetic.
+    fn fixture_fs(existing: &'static [&'static str]) -> impl Fn(&Path) -> Option<PathBuf> {
+        move |p: &Path| {
+            existing
+                .iter()
+                .any(|e| *e == p.to_string_lossy())
+                .then(|| p.to_path_buf())
+        }
+    }
+
+    fn projected(toml: &str, home: Option<&str>, existing: &'static [&'static str]) -> Containment {
+        let rules = Rules::from_toml(toml)
+            .unwrap()
+            .with_home(home.map(PathBuf::from));
+        project(&rules, &fixture_fs(existing))
+    }
+
+    fn deny_toml(tool: &str, pred: &str) -> String {
+        format!("[[deny]]\ntool = \"{tool}\"\n{pred}\n")
+    }
+
+    #[test]
+    fn deny_over_an_absolute_directory_projects() {
+        let c = projected(
+            &deny_toml("read", "path_prefix = \"/Volumes/secrets\""),
+            None,
+            &["/Volumes/secrets"],
+        );
+        assert_eq!(c.read_deny, vec![PathBuf::from("/Volumes/secrets")]);
+        assert!(c.unprojectable.is_empty(), "{:#?}", c.unprojectable);
+    }
+
+    #[test]
+    fn deny_over_a_tilde_directory_projects() {
+        let c = projected(
+            &deny_toml("read", "path_prefix = \"~/.aws\""),
+            Some("/fixture/home"),
+            &["/fixture/home/.aws"],
+        );
+        assert_eq!(c.read_deny, vec![PathBuf::from("/fixture/home/.aws")]);
+        assert!(c.unprojectable.is_empty(), "{:#?}", c.unprojectable);
+    }
+
+    #[test]
+    fn deny_with_a_relative_floating_prefix_reports_and_does_not_project() {
+        let c = projected(&deny_toml("read", "path_prefix = \".ssh/\""), None, &[]);
+        assert!(c.read_deny.is_empty());
+        assert_eq!(c.unprojectable.len(), 1, "{:#?}", c.unprojectable);
+        let why = &c.unprojectable[0];
+        assert!(why.contains("any depth"), "{why}");
+        // The reason must name the form that would work.
+        assert!(why.contains("path_prefix = \"~/.ssh\""), "{why}");
+    }
+
+    #[test]
+    fn deny_with_a_command_subject_does_not_project() {
+        let c = projected(&deny_toml("bash", "prefix = \"curl \""), None, &[]);
+        assert!(c.read_deny.is_empty());
+        assert_eq!(c.unprojectable.len(), 1, "{:#?}", c.unprojectable);
+        assert!(c.unprojectable[0].contains("command name"));
+    }
+
+    #[test]
+    fn deny_with_prefix_rather_than_path_prefix_does_not_project() {
+        let c = projected(&deny_toml("read", "prefix = \"/etc\""), None, &["/etc"]);
+        assert!(c.read_deny.is_empty());
+        assert_eq!(c.unprojectable.len(), 1, "{:#?}", c.unprojectable);
+        assert!(c.unprojectable[0].contains("path_prefix = \"/etc\""));
+    }
+
+    #[test]
+    fn deny_with_a_field_override_does_not_project() {
+        let c = projected(
+            &deny_toml(
+                "read",
+                "path_prefix = \"/Volumes/secrets\"\nfield = \"pattern\"",
+            ),
+            None,
+            &["/Volumes/secrets"],
+        );
+        assert!(c.read_deny.is_empty());
+        assert_eq!(c.unprojectable.len(), 1, "{:#?}", c.unprojectable);
+        assert!(c.unprojectable[0].contains("field"));
+    }
+
+    #[test]
+    fn deny_naming_a_nonexistent_path_reports_and_does_not_project() {
+        let c = projected(
+            &deny_toml("read", "path_prefix = \"/Volumes/gone\""),
+            None,
+            &[],
+        );
+        assert!(c.read_deny.is_empty());
+        assert_eq!(c.unprojectable.len(), 1, "{:#?}", c.unprojectable);
+        assert!(c.unprojectable[0].contains("does not resolve"));
+    }
+
+    #[test]
+    fn admin_deny_projects() {
+        let mut rules = Rules::default();
+        rules.merge_admin(
+            toml::from_str::<AdminRules>(&deny_toml("read", "path_prefix = \"/Volumes/secrets\""))
+                .unwrap(),
+        );
+        let c = project(&rules, &fixture_fs(&["/Volumes/secrets"]));
+        assert_eq!(c.read_deny, vec![PathBuf::from("/Volumes/secrets")]);
+    }
+
+    /// Watch-out 4: an allow rule must produce nothing at all — not a
+    /// projection, not a lift, not an `unprojectable` entry.
+    #[test]
+    fn allow_rules_never_project() {
+        for tool in ["read", "write", "glob"] {
+            let c = projected(
+                &format!("[[allow]]\ntool = \"{tool}\"\npath_prefix = \"/Volumes/secrets\"\n"),
+                None,
+                &["/Volumes/secrets"],
+            );
+            assert_eq!(c, Containment::default(), "[[allow]] {tool} projected");
+        }
+    }
+
+    #[test]
+    fn projection_refuses_root_and_the_empty_prefix() {
+        let root = projected(&deny_toml("read", "path_prefix = \"/\""), None, &["/"]);
+        assert!(root.read_deny.is_empty());
+        assert!(
+            root.unprojectable[0].contains("filesystem root"),
+            "{root:#?}"
+        );
+        let empty = projected(&deny_toml("read", "path_prefix = \"\""), None, &["/"]);
+        assert!(empty.read_deny.is_empty());
+        assert!(empty.unprojectable[0].contains("every path"), "{empty:#?}");
+    }
+
+    #[test]
+    fn projection_never_creates_a_directory() {
+        let dir = std::env::temp_dir().join(format!("hotl-0025-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let rules = Rules::from_toml(&deny_toml(
+            "read",
+            &format!("path_prefix = \"{}\"", dir.display()),
+        ))
+        .unwrap();
+        let c = project(&rules, &|p| p.canonicalize().ok());
+        assert!(c.read_deny.is_empty());
+        assert_eq!(c.unprojectable.len(), 1, "{:#?}", c.unprojectable);
+        assert!(!dir.exists(), "projection created {}", dir.display());
+    }
+
+    #[test]
+    fn projection_is_deterministic_and_deduplicated() {
+        let toml = r#"
+[[deny]]
+tool = "read"
+path_prefix = "/Volumes/secrets"
+
+[[deny]]
+tool = "grep"
+path_prefix = "/Volumes/secrets"
+
+[[deny]]
+tool = "read"
+path_prefix = ".ssh/"
+
+[[deny]]
+tool = "write"
+path_prefix = ".ssh/"
+
+[[deny]]
+tool = "edit"
+path_prefix = "/Volumes/other"
+"#;
+        let existing = &["/Volumes/secrets", "/Volumes/other"];
+        let first = projected(toml, None, existing);
+        assert_eq!(
+            first.read_deny,
+            vec![
+                PathBuf::from("/Volumes/secrets"),
+                PathBuf::from("/Volumes/other")
+            ]
+        );
+        // One path for two tools; the reasons stay per-tool because each names
+        // the tool it governs.
+        assert_eq!(first.unprojectable.len(), 2, "{:#?}", first.unprojectable);
+        assert_eq!(first, projected(toml, None, existing));
     }
 
     #[test]
