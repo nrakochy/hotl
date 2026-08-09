@@ -3549,6 +3549,91 @@ mod tests {
         assert!(!cb.wants_isolation(&explore));
     }
 
+    /// The wiring `wants_isolation` alone does not prove: `spawn_child` against
+    /// a **real** dirty repo puts the child in a worktree under `.git/`, seeded
+    /// with the parent's uncommitted work, and roots its tools there.
+    ///
+    /// The unit tests below `hotl_store::worktree` cover the git plumbing and
+    /// the ones in `spawn.rs` cover the merge-back; this is the seam between
+    /// them — the one the plan's manual end-to-end was there to catch, minus
+    /// the model.
+    #[tokio::test]
+    async fn spawn_child_isolates_into_a_worktree_seeded_from_the_live_tree() {
+        if !hotl_store::shadow::git_available() {
+            return;
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .unwrap_or_else(|| panic!("git {args:?}"))
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.path().join("NOTES.md"), "committed\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        // The state that makes this the real case: the parent is dirty and
+        // has an untracked file, exactly as a hotl session always is.
+        std::fs::write(repo.path().join("NOTES.md"), "committed\nPARENT EDIT\n").unwrap();
+        std::fs::write(repo.path().join("scratch.txt"), "untracked\n").unwrap();
+
+        let mut cb = test_child_builder();
+        cb.cwd = repo.path().to_path_buf();
+        cb.default_isolation = hotl_tools::agents::Isolation::Worktree;
+        cb.provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let child = cb
+            .spawn_child(&general, Vec::new(), None)
+            .expect("child spawns");
+        let worktree = child.worktree.expect("the child was isolated");
+        // Canonicalized: `Worktree::create` re-resolves the workspace through
+        // `rev-parse --show-toplevel`, so on macOS this is `/private/var/…`
+        // where the tempdir handle says `/var/…`.
+        let repo_root = repo.path().canonicalize().unwrap();
+        assert!(
+            worktree
+                .path()
+                .starts_with(repo_root.join(".git/hotl-worktrees")),
+            "worktree landed outside .git/: {}",
+            worktree.path().display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(worktree.path().join("NOTES.md")).unwrap(),
+            "committed\nPARENT EDIT\n",
+            "the child was handed HEAD, not the parent's live tree"
+        );
+        assert!(worktree.path().join("scratch.txt").exists());
+
+        // The child's tools resolve relative paths inside the worktree.
+        let out = cb
+            .child_registry(&general, worktree.path())
+            .get("write")
+            .unwrap()
+            .run(
+                serde_json::json!({"path": "made.txt", "content": "child"}),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(worktree.path().join("made.txt").exists());
+        assert!(
+            !repo.path().join("made.txt").exists(),
+            "the child wrote into the parent's tree"
+        );
+
+        worktree.remove();
+    }
+
     /// Task 4's named trap: `child_builder()` captures a *clone* of
     /// `Scaffold::config` inside `scaffold()`, before `acp_factory`/
     /// `serve_main` mutate their own copy to `CacheTtl::OneHour` — so a child
