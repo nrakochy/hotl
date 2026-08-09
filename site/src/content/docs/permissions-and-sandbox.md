@@ -92,15 +92,37 @@ The `ask_user` tool ([configuration.md](../configuration/#built-in-tools)) puts 
 
 Within one model turn the agent often issues several tool calls at once. hotl runs the read-only ones concurrently — a batch of five file reads doesn't queue behind itself — while anything that mutates or executes (`bash`, `write`, `edit`) runs strictly one at a time, in source order, and never overlaps with anything else. Permission asks are unaffected: every approval is still presented to you one at a time, before the calls it gates run. Sub-agents (`spawn`) count as overlap-safe too: each child runs in its own isolated session, so several approved sub-agents work side by side. Concurrency never changes *what* is allowed — only how long the allowed work takes.
 
-## The sandbox floor: write-confinement, *not* a security wall
+## The sandbox floor: mostly write-confinement, *not* a security wall
 
 When you approve a `bash` command, it runs inside a kernel sandbox (Seatbelt on macOS, Landlock on Linux) that confines **writes** to your working directory, the temp dir, `/dev`, and any extra directories you list in [`[sandbox].writable`](../configuration/#sandbox-write-floor-sandbox). A command can't scribble over files elsewhere on disk.
 
-Read this part carefully, because it is the most misunderstood thing about hotl:
+Since 0.10 it also denies a small, fixed set of **reads** — see [the read carve](#the-read-carve) below. Read this part carefully, because it is the most misunderstood thing about hotl:
 
-> **By default, the sandbox does not stop a command from reading your files or using the network.** Reads are open and egress is open, on purpose — the agent legitimately reads your whole tree and fetches dependencies. So an approved command *can* read `~/.ssh/id_rsa` or `~/.aws/credentials` and send it anywhere.
+> **The sandbox still does not stop a command from reading most of your files, or from using the network.** Two carves aside, reads are open and egress is open, on purpose — the agent legitimately reads your whole tree and fetches dependencies. An approved command cannot read `~/.ssh/id_rsa` any more, but it *can* read a `.env` in your project and send it anywhere.
 
-The sandbox stops the agent **tampering with your filesystem outside the project**. It is **not** a data-loss or exfiltration boundary. The thing standing between the agent and your secrets is *your approval of each command* — not the sandbox. So when a command asks to run, read what it actually does. A plausible "run the tests" command that also `curl`s somewhere will exfiltrate freely once you say yes.
+The sandbox stops the agent **tampering with your filesystem outside the project**, and keeps a short list of credential paths out of its reach. It is **not** a data-loss or exfiltration boundary. The thing standing between the agent and your secrets is *your approval of each command* — not the sandbox. So when a command asks to run, read what it actually does. A plausible "run the tests" command that also `curl`s somewhere will exfiltrate freely once you say yes.
+
+### The read carve
+
+Two tiers are denied to every sandboxed child — the `bash` tool, `grep`'s ripgrep, post-edit diagnostic commands, and your shell hooks alike. Three of those four never show you a prompt, which is why the config lever exists.
+
+| Tier | What | Liftable? |
+|---|---|---|
+| **A** | hotl's own config dir (`~/.config/hotl`) and data dir (`~/.local/share/hotl`) | **never** |
+| **B** | `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, and `.netrc` / `.npmrc` / `.pypirc` / `.dockercfg` in `$HOME` | yes, two ways |
+
+Tier A is the important one and the reason there is no override: the session token under the data dir is what drives hotl's own control socket. A sandboxed `bash` runs as *you*, so file permissions do not stop it reading that token — and a command that reads it can approve its own future tool calls. The config dir holds your allow-rules, hooks, and `api_key_helper` for the same reason. The `read`, `write` and `edit` tools refuse those paths outright too, in every mode, with no prompt that unlocks them — which does mean the agent can't read your `config.toml` for you either.
+
+Tier B is the ordinary credential class. **This does not break agent-run `git push` if your keys are in `ssh-agent`** — the agent socket stays reachable, and `ssh` never opens a key file in that case. It *does* break when no agent is loaded, when your cloud session isn't cached, or for a private-registry `npm install`. Two ways out:
+
+```toml
+[sandbox]
+readable = ["~/.aws"]   # standing; needs a session restart
+```
+
+…or press **`s`** instead of `y` at a `bash` ask, which lifts Tier B for **that one command only**. The `s` option appears only where it would do something. Once config has lifted the tier, every ask says `reads:open`; the hardened default stays silent.
+
+**It denies contents, not existence.** `ls ~` and `ls -la ~` keep working — the carve blocks reading file data, not `stat`. One honest platform difference: on Linux `ls ~/.ssh` still lists filenames (Landlock has no sub-path carve-out, so the parent's directory-listing right is hierarchical) where macOS hides them. File contents are denied on both.
 
 *(Opinion:* with the default open egress, the honest rule is: don't run hotl against secrets you wouldn't paste into a terminal command yourself — or close the door: see the next section.*)*
 
@@ -243,7 +265,9 @@ Approval is a judgment call, and judgment is fallible. So hotl photographs your 
 |---|---|---|
 | Agent changes a file you didn't intend | the y/N gate + undo | — |
 | Agent writes outside the project | the sandbox floor (bash) | — |
-| Agent reads a secret and exfiltrates it | **your reading of each approved command**, plus `[network].egress` if you set it | the default sandbox (reads + egress open unless you opt in) |
+| Agent reads `~/.ssh` / `~/.aws` and exfiltrates it | the read carve (default on, at the kernel) | — |
+| Agent reads hotl's session token and approves its own calls | the Tier A carve — kernel for `bash`, flat refusal in the file tools | — |
+| Agent reads an in-tree secret (`.env`) and exfiltrates it | **your reading of each approved command**, plus `[network].egress` if you set it | the read carve (in-tree secrets are out of scope) and the default open egress |
 | A file tool reading or writing outside the project | the workspace boundary, enforced on the fd — out-of-tree `read` is a protected ask, and no file tool follows a symlink | `bash` — an approved command still reads anything you can read |
 | A benign-looking write that runs code later | protected-path escalation | — |
 | Ask-fatigue growing a blanket allowlist | file-only allow-rules, no in-console button | — |

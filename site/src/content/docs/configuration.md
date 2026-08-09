@@ -300,6 +300,22 @@ file_tools = "workspace"   # optional; see below
 
 The startup probe that certifies the sandbox stays honest: its outside-the-floor target is chosen outside the *widened* set, so an `Enforced` verdict always describes the floor your commands actually get. `hotl doctor` prints the resolved list and every validation warning.
 
+#### `readable` — lifting the credential read-deny
+
+Sandboxed commands cannot read `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, or `.netrc` / `.npmrc` / `.pypirc` / `.dockercfg` — see [the read carve](../permissions-and-sandbox/#the-read-carve). `readable` lifts named paths back out of that denial, and is the only lever that reaches diagnostics, hooks, and `grep`, none of which have a prompt.
+
+```toml
+[sandbox]
+readable = ["~/.aws"]
+```
+
+Validation mirrors `writable` — absolute paths, `~/` expands, symlinks resolved, and an entry that is, contains, or sits inside hotl's config or data dir is **refused** (that tier is never liftable, by config or by prompt). Two deliberate differences:
+
+- **Missing directories are not created.** A read-deny on a path that does not exist is already a no-op, and conjuring `~/.ssh` out of parsing your config would be wrong. A missing entry is dropped with a warning.
+- **An entry inside a writable root is dropped, loudly.** Landlock resolves the closest matching rule, so a write grant on an ancestor re-opens the read regardless of what the deny set says; shipping the denial anyway would be a claim the kernel does not honor.
+
+`[sandbox]` is installed once at startup, so changing `readable` needs a session restart. For a one-off, press `s` instead of `y` at the `bash` ask — that lifts the credential tier for that single command. Once `readable` has emptied the tier, every ask is labeled `reads:open`. `hotl doctor` prints the resolved deny set and every warning.
+
 `file_tools` is a separate, deliberate step. By default (`"workspace"`) the `write`/`edit` file tools stay confined to the working directory — `writable` only widens what *spawned processes* (bash, grep, diagnostics, hooks) may write. Set `file_tools = "writable"` to let `write`/`edit` operate under the `writable` roots too: those writes become ordinary asks (the same tier as an in-workspace write, so `mode = "bypass"` approves them), they go through the same symlink-refusing descent as workspace writes, and protected filenames ([protected paths](../permissions-and-sandbox/#protected-paths)) still escalate. An unknown value falls back to `"workspace"` with a warning.
 
 ### Web tools (`web_fetch` / `web_search`, `[web]`)

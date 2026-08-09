@@ -8,6 +8,64 @@ semver promise of their own.
 
 ### Changed
 
+- **The kernel sandbox denies a fixed set of reads. Default on, behavior
+  change.** The floor confined writes; reads were wholly open, which left two
+  live holes. The session token under the data dir is mode 0600 in a 0700
+  directory — but a sandboxed `bash` runs as the *same uid*, so DAC does not
+  stop it, and reading that token lets a command drive hotl's own control
+  socket, which is a complete bypass of the permission gate. And `~/.ssh` /
+  `~/.aws` were readable with egress open by default.
+
+  Two tiers are now denied to every sandboxed child — the `bash` tool,
+  `grep`'s ripgrep, post-edit diagnostics, and shell hooks alike. Three of
+  those four have no y/N prompt, which is why the config lever below exists
+  and is not merely a convenience.
+
+  - **Tier A — hotl's config dir and data dir. Never liftable**, by config or
+    by prompt. The `read`, `write` and `edit` tools refuse those paths
+    outright too, in every mode, on the resolved target — a kernel rule cannot
+    reach in-process tools, and an `AskProtected` a human can approve is an
+    approval of the gate's own removal. The cost is deliberate: the agent
+    cannot read your `config.toml` for you either.
+  - **Tier B — `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.azure`, and
+    `.netrc` / `.npmrc` / `.pypirc` / `.dockercfg`.** Sourced from the same
+    constant as the execute-later *write* classification, so the read set and
+    the write set cannot drift.
+
+  **Agent-run `git push` is unaffected when your keys are in `ssh-agent`** —
+  the profile deliberately keeps the agent socket reachable, and `ssh` never
+  opens a key file in that case. It *does* break with no agent loaded, no
+  cached cloud session, or a private-registry `npm install`. Two ways out:
+  `[sandbox].readable = ["~/.aws"]` is standing (it reaches hooks and
+  diagnostics, and needs a session restart), or press `s` instead of `y` at a
+  `bash` ask to lift Tier B for **that one command only** — scoped around the
+  single tool call, and unreachable headless or from a sub-agent.
+
+  **Contents are denied, not existence:** `ls ~` and `ls -la ~` keep working.
+  macOS denies `file-read-data` rather than `file-read*`, because denying
+  metadata breaks `ls -la` (it stats every child). Landlock has no sub-path
+  carve-out and its rights union across ancestors, so the denial is expressed
+  by not granting read on any ancestor and re-granting every sibling. One
+  measured asymmetry, documented rather than papered over: `ls ~/.ssh` still
+  lists filenames on Linux where macOS hides them. File contents are denied on
+  both.
+
+  The startup probe now tests the carve in the same spawn it already used for
+  the write test — one child per process, still. A host that confines writes
+  but cannot narrow reads stays `Enforced` and is labeled `reads:open`;
+  demoting it would revoke `bash` auto-approval for a restriction nobody
+  opted into. `hotl doctor` prints the resolved deny set and the verdict.
+
+  **Still not covered, and the docs say so:** secrets *inside* the working
+  tree (`.env`), which cannot be carved without breaking the agent's job; MCP
+  servers and `api_key_helper`, both spawned outside this floor; and your own
+  shell, which is never confined. Egress is still open by default. This is
+  confinement, not exfiltration prevention.
+
+- **`hotl doctor` reports the read carve** — the resolved Tier A/Tier B paths,
+  whether the probe certified it, and any directory the carve could not open
+  (fail-closed, but worth naming).
+
 - **Releases are gated on green CI for the exact commit being tagged.**
   `scripts/release.sh` now pushes the release commit, waits for CI, and only
   then creates the tag; `publish.yml` re-checks the same evidence before

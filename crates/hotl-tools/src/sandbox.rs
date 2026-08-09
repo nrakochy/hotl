@@ -1,10 +1,20 @@
 //! The kernel sandbox floor for `bash` (SECURITY.md layer 3).
 //!
-//! Write-confinement: the command (and its whole process tree) can read
-//! everywhere but write only under the working directory, the temp dir, and
-//! /dev. Network egress is open by default (the agent legitimately curls);
-//! `[network].egress` in config.toml opts into confinement (see `net.rs`),
-//! which this module enforces at the kernel when asked to.
+//! Write-confinement: the command (and its whole process tree) writes only
+//! under the working directory, the temp dir, and /dev.
+//!
+//! Read-confinement is narrower and newer (plan 0022). Reads are open
+//! *except* for two carves: hotl's own config and data dirs (the session
+//! token there drives the session socket, which is the permission gate) and
+//! the credential class — `~/.ssh`, `~/.aws`, `~/.config/gcloud`, `~/.azure`
+//! and the credential dotfiles. The first is never liftable; the second is
+//! lifted per-entry by `[sandbox].readable` and per-command by the ask.
+//! Everything else — including secrets *inside* the working tree — is still
+//! readable, and `[network].egress` is still open by default, so this is not
+//! exfiltration-proofing. See `docs/SECURITY.md`.
+//!
+//! `[network].egress` in config.toml opts into egress confinement (see
+//! `net.rs`), which this module enforces at the kernel when asked to.
 //!
 //! - macOS: Seatbelt via `sandbox-exec` (deprecated by Apple, still the
 //!   mechanism its own tooling uses; profile passed inline with parameters).
@@ -385,7 +395,7 @@ fn linux_mechanism() -> Result<&'static str, String> {
 }
 
 /// A directory we can really write to that is **outside** everything the
-/// floor re-allows (`write_roots()`: cwd, `TMPDIR`, `/private/tmp`, `/dev`,
+/// *write* floor re-allows (`write_roots()`: cwd, `TMPDIR`, `/private/tmp`, `/dev`,
 /// and any configured `[sandbox].writable` entry). Returning it is a
 /// positive control: the parent creates and deletes a file here first, so a
 /// later "the file does not exist" assertion cannot pass merely because the
@@ -762,7 +772,9 @@ fn apply_proxy_env(
 
 /// The Seatbelt profile, pure (unit-tested against drift). Write-deny by
 /// default with the working tree, temp, /dev, and any configured
-/// `[sandbox].writable` roots re-allowed; when `confine_network`, deny all
+/// `[sandbox].writable` roots re-allowed; read-deny for the plan-0022 carve
+/// (`file-read-data` only, so `stat` and therefore `ls -la` keep working);
+/// when `confine_network`, deny all
 /// network and re-allow unix-domain sockets and loopback (the mDNSResponder
 /// unix socket means DNS resolution still works — documented in SECURITY.md
 /// as a resolution, not exfil-confinement, limit).
