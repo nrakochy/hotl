@@ -6,6 +6,15 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **Releases are gated on green CI for the exact commit being tagged.**
+  `scripts/release.sh` now pushes the release commit, waits for CI, and only
+  then creates the tag; `publish.yml` re-checks the same evidence before
+  publishing. `scripts/release.sh --tag-only` finishes a release whose CI went
+  red on the first attempt. Maintainer tooling — no change to installed
+  behavior.
+
 ## [0.9.1] - 2026-07-30
 
 ### Added

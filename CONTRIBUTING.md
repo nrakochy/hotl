@@ -18,6 +18,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo audit          # dependency vulnerabilities
 ```
 
+CI is also the release gate: a version tag is not created until CI is green on
+the exact commit being tagged, and the crates.io publish re-checks it.
+
 Local conventions on top of that:
 - **No function over ~60 lines.** Long functions get split; the codebase holds to this.
 - **Errors are prompts.** Every error string a model can see must instruct it what to do next (a tested invariant).

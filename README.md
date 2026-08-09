@@ -206,14 +206,28 @@ system; [`docs/SECURITY.md`](docs/SECURITY.md) is the security stance; and
 
 Cut a release with the helper script — it bumps the workspace version (and
 every internal path-dep pin, which publish in lockstep), promotes the
-changelog's `[Unreleased]` section, commits, tags `vX.Y.Z`, and pushes. The
-tag triggers the crates.io publish and the prebuilt-binary/installer
-workflows.
+changelog's `[Unreleased]` section, and commits.
 
     scripts/release.sh patch    # bug fix
     scripts/release.sh minor    # feature, or breaking pre-1.0
     scripts/release.sh major    # 1.0
     scripts/release.sh 0.4.2    # explicit version
+
+It then **pushes the commit, waits for CI to go green on it, and only then
+creates and pushes the `vX.Y.Z` tag.** The tag triggers three workflows — the
+crates.io publish, the prebuilt-binary/installer release, and the Nix tag
+check — and none of them waits for CI on its own, so holding the tag is what
+keeps a red commit from going out half-published. `publish.yml` re-checks the
+same evidence before it publishes, which covers a tag cut by hand.
+
+If CI goes red, the script stops with the commit pushed and nothing tagged.
+Fix the break, then finish the release without re-bumping anything:
+
+    scripts/release.sh --tag-only
+
+`HOTL_SKIP_CI_WAIT=1` tags without waiting. It is an escape hatch for a CI
+outage, not a shortcut: `publish.yml` still refuses, so the practical result
+is binaries and a GitHub Release without the crates.io publish.
 
 Versions are immutable on crates.io — always go up, never reuse one. The tag
 must match the `[workspace.package]` version (the script keeps them in sync).
