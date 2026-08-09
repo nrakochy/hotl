@@ -897,12 +897,105 @@ pub(crate) fn landlock_net_supported() -> Result<(), String> {
 /// way). Shared by `landlock_command` and `landlock_argv`, via
 /// `apply_landlock_with`.
 ///
-/// `extras` is an explicit seam — behavioral tests drive configured write
-/// roots through here without touching the process-global `EXTRAS`.
+/// Landlock is allowlist-only and its rights **union across ancestors** — the
+/// kernel walks up from the accessed path and allows as soon as any ancestor
+/// rule grants the right. A nested rule therefore cannot narrow a broader
+/// one (measured on 6.8: `/` = from_read plus `~/.ssh` = Execute still reads
+/// `~/.ssh/id_rsa`). The only way to deny a read is to *not* grant it on any
+/// ancestor, which is what this descent does:
+///
+/// - no deny entry at or under `dir` → grant the whole subtree, stop;
+/// - otherwise → grant `ReadDir` on `dir` alone and recurse into every child
+///   that is not itself denied.
+///
+/// The ancestor `ReadDir` is required, not cosmetic: without it no rule
+/// covers `~` and `ls ~` fails. Symlinked children are skipped — `PathFd`
+/// follows links, so granting through one would re-open a denied target by
+/// its real path; the target is granted through its own real path anyway.
+///
+/// Documented asymmetry (measured, not assumed): the ancestor's `ReadDir` is
+/// hierarchical, so filenames *inside* a denied directory stay listable on
+/// Linux while macOS `file-read-data` hides them. Contents are denied on
+/// both. `SECURITY.md` says so rather than papering over it.
+///
+/// A `PathFd::new` failure denies that subtree rather than skipping it — the
+/// fail-closed direction, but an opaque `EACCES` deep inside a grandchild, so
+/// each one is recorded for `read_carve_failures()` to surface.
+#[cfg(target_os = "linux")]
+fn grant_read_except(
+    mut ruleset: landlock::RulesetCreated,
+    dir: &std::path::Path,
+    deny: &[PathBuf],
+    abi: landlock::ABI,
+    failures: &mut Vec<String>,
+) -> Option<landlock::RulesetCreated> {
+    use landlock::{AccessFs, PathBeneath, PathFd, RulesetCreatedAttr};
+
+    if deny.iter().any(|d| d == dir) {
+        return Some(ruleset); // grant nothing: this is the carve
+    }
+    if !deny.iter().any(|d| d.starts_with(dir)) {
+        return match PathFd::new(dir) {
+            Ok(fd) => ruleset
+                .add_rule(PathBeneath::new(fd, AccessFs::from_read(abi)))
+                .ok(),
+            Err(e) => {
+                failures.push(format!("{}: {e}", dir.display()));
+                Some(ruleset)
+            }
+        };
+    }
+    match PathFd::new(dir) {
+        Ok(fd) => {
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(fd, AccessFs::ReadDir))
+                .ok()?
+        }
+        Err(e) => {
+            failures.push(format!("{}: {e}", dir.display()));
+            return Some(ruleset);
+        }
+    }
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) => {
+            failures.push(format!("{}: {e}", dir.display()));
+            return Some(ruleset);
+        }
+    };
+    for entry in entries.flatten() {
+        if entry.file_type().map(|t| t.is_symlink()).unwrap_or(true) {
+            continue;
+        }
+        ruleset = grant_read_except(ruleset, &entry.path(), deny, abi, failures)?;
+    }
+    Some(ruleset)
+}
+
+/// Paths the read-carve descent could not open, so their subtree is denied
+/// without anyone having asked. Populated once, on the first sandboxed spawn
+/// of the process (the ruleset is memoized); `hotl doctor` prints it.
+pub fn read_carve_failures() -> &'static [String] {
+    #[cfg(target_os = "linux")]
+    {
+        return READ_CARVE_FAILURES.get().map(Vec::as_slice).unwrap_or(&[]);
+    }
+    #[cfg(not(target_os = "linux"))]
+    &[]
+}
+
+#[cfg(target_os = "linux")]
+static READ_CARVE_FAILURES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// `extras` and `noread` are explicit seams — behavioral tests drive
+/// configured write roots and read denials through here without touching the
+/// process-global `EXTRAS` or the `SECRET_READS` task-local.
 #[cfg(target_os = "linux")]
 fn build_landlock_ruleset_with(
     egress: &EgressState,
     extras: &[PathBuf],
+    noread: &[PathBuf],
+    failures: &mut Vec<String>,
 ) -> Option<std::os::unix::io::OwnedFd> {
     use landlock::{
         Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathFd, Ruleset,
@@ -937,13 +1030,10 @@ fn build_landlock_ruleset_with(
             .set_compatibility(CompatLevel::BestEffort);
     }
     let mut ruleset = attr.create().ok()?;
-    // Read + execute everywhere.
-    ruleset = ruleset
-        .add_rule(landlock::PathBeneath::new(
-            PathFd::new("/").ok()?,
-            AccessFs::from_read(abi),
-        ))
-        .ok()?;
+    // Read + execute everywhere, minus the plan-0022 carve. With an empty
+    // deny set this is exactly the single `/` from_read rule it replaced —
+    // no descent, no readdir, no extra rules.
+    ruleset = grant_read_except(ruleset, std::path::Path::new("/"), noread, abi, failures)?;
     // Full access under cwd, tmp, /dev, and any configured extra root. A
     // since-deleted extra fails `PathFd::new` and is skipped — writes there
     // simply stay denied (fail closed), matching the /dev handling.
@@ -972,27 +1062,82 @@ fn build_landlock_ruleset_with(
     ruleset.into()
 }
 
-/// Wire the Landlock ruleset onto `cmd` via `pre_exec`. Shared tail of
-/// `landlock_command`/`landlock_argv` — only how `cmd` is constructed
-/// (`sh -c` vs direct argv) differs between the two.
+/// The ruleset is memoized per spawn shape, not rebuilt per spawn: cwd,
+/// `TMPDIR`, the extras and the deny set are all fixed after startup, and a
+/// `Proxy(port)`'s port is fixed once the proxy starts. Without this the
+/// plan-0022 descent would re-`readdir` `$HOME` and re-add a rule per entry
+/// on every `bash` call.
+///
+/// The per-command secret-read grant is part of the key: a lifted ruleset
+/// must never be handed to the *next* command, which did not take the grant.
 #[cfg(target_os = "linux")]
-fn apply_landlock(cmd: tokio::process::Command, egress: &EgressState) -> tokio::process::Command {
-    apply_landlock_with(cmd, egress, extra_writable())
+fn cached_ruleset(egress: &EgressState) -> Option<std::sync::Arc<std::os::unix::io::OwnedFd>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+
+    type Key = (Option<u16>, bool, bool);
+    static CACHE: OnceLock<Mutex<HashMap<Key, Option<Arc<std::os::unix::io::OwnedFd>>>>> =
+        OnceLock::new();
+    let granted = secret_reads_granted();
+    // Everything the built ruleset depends on. `Unenforced` shares `Open`'s
+    // key because it confines no network either — the loud marker and the
+    // allow-rule revocation are `net.rs`'s job, not the ruleset's.
+    let key: Key = match egress {
+        EgressState::Proxy(p) => (Some(*p), true, granted),
+        EgressState::Off => (None, true, granted),
+        EgressState::Open | EgressState::Unenforced(_) => (None, false, granted),
+    };
+    let cache = CACHE.get_or_init(Default::default);
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| {
+            let mut failures = Vec::new();
+            let fd = build_landlock_ruleset_with(
+                egress,
+                extra_writable(),
+                &spawn_read_deny(),
+                &mut failures,
+            );
+            if !failures.is_empty() {
+                let _ = READ_CARVE_FAILURES.set(failures);
+            }
+            fd.map(Arc::new)
+        })
+        .clone()
 }
 
 #[cfg(target_os = "linux")]
+fn apply_landlock(cmd: tokio::process::Command, egress: &EgressState) -> tokio::process::Command {
+    attach_ruleset(cmd, cached_ruleset(egress))
+}
+
+#[cfg(target_os = "linux")]
+// The behavioral-test seam: production spawns go through the memoized
+// `cached_ruleset`, which is what makes the descent affordable per spawn.
+#[allow(dead_code)]
 fn apply_landlock_with(
-    mut cmd: tokio::process::Command,
+    cmd: tokio::process::Command,
     egress: &EgressState,
     extras: &[PathBuf],
+    noread: &[PathBuf],
 ) -> tokio::process::Command {
-    use std::os::unix::io::{AsRawFd, OwnedFd};
+    let mut failures = Vec::new();
+    let fd = build_landlock_ruleset_with(egress, extras, noread, &mut failures);
+    attach_ruleset(cmd, fd.map(std::sync::Arc::new))
+}
 
-    // The OwnedFd is captured by the closure, so it stays open across every
-    // spawn of this Command (pre_exec runs after fork, before exec — a
-    // parent-owned fd is still open in the child there). Fail-closed: with
-    // no usable fd the child refuses to exec rather than run unconfined.
-    let ruleset_fd: Option<OwnedFd> = build_landlock_ruleset_with(egress, extras);
+#[cfg(target_os = "linux")]
+fn attach_ruleset(
+    mut cmd: tokio::process::Command,
+    ruleset_fd: Option<std::sync::Arc<std::os::unix::io::OwnedFd>>,
+) -> tokio::process::Command {
+    use std::os::unix::io::AsRawFd;
+
+    // The fd is captured by the closure, so it stays open across every spawn
+    // of this Command (pre_exec runs after fork, before exec — a parent-owned
+    // fd is still open in the child there). Fail-closed: with no usable fd the
+    // child refuses to exec rather than run unconfined.
     let apply = move || {
         // Async-signal-safe only from here: raw syscalls, no allocation.
         let Some(fd) = ruleset_fd.as_ref().map(|f| f.as_raw_fd()) else {
@@ -1753,8 +1898,130 @@ mod linux_tests {
         );
         assert!(!leaked, "file must not exist outside the sandbox");
 
-        // Reads outside stay allowed (the floor is write-confinement).
+        // Reads outside cwd stay allowed *except* where plan 0022 carves
+        // them. This process installed no extras, so the carve is empty;
+        // `landlock_denies_reading_a_carved_path` owns the negative.
         assert!(run("ls / > /dev/null").await.status.success());
+        assert!(
+            read_deny().is_empty(),
+            "this process must not have installed a carve"
+        );
+    }
+
+    /// Plan 0022. Landlock's rights union across ancestors, so a denial is
+    /// expressed by *not* granting read on any ancestor — the
+    /// `grant_read_except` descent. Driven through the `apply_landlock_with`
+    /// seam, never the process-global EXTRAS.
+    #[tokio::test]
+    async fn landlock_denies_reading_a_carved_path() {
+        let base = probe_dir().expect("a dir outside the floor");
+        let root = base.join(format!("hotl-ll-carve-{}", std::process::id()));
+        let carved = root.join("secret");
+        let open = root.join("ordinary");
+        std::fs::create_dir_all(&carved).unwrap();
+        std::fs::create_dir_all(&open).unwrap();
+        std::fs::write(carved.join("id_probe"), b"canary").unwrap();
+        std::fs::write(open.join("id_probe"), b"canary").unwrap();
+
+        let run_carved = |script: String, noread: Vec<PathBuf>| async move {
+            let mut cmd = tokio::process::Command::new("sh");
+            cmd.arg("-c").arg(script);
+            apply_landlock_with(cmd, &EgressState::Open, &[], &noread)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .output()
+                .await
+                .expect("spawn")
+        };
+        let cat = |p: &std::path::Path| format!("cat {}", p.display());
+
+        // Positive control: with nothing carved, the canary reads. Without
+        // this the negative would pass on a host where nothing is readable.
+        let control = run_carved(cat(&carved.join("id_probe")), vec![]).await;
+        assert!(
+            control.status.success(),
+            "the canary must read without a carve: {}",
+            String::from_utf8_lossy(&control.stderr)
+        );
+
+        let carve = vec![carved.clone()];
+        let denied = run_carved(cat(&carved.join("id_probe")), carve.clone()).await;
+        let sibling = run_carved(cat(&open.join("id_probe")), carve).await;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(!denied.status.success(), "a carved path must not read");
+        assert!(!String::from_utf8_lossy(&denied.stdout).contains("canary"));
+        assert!(
+            sibling.status.success(),
+            "a path outside the carve must still read: {}",
+            String::from_utf8_lossy(&sibling.stderr)
+        );
+    }
+
+    /// The failure this test exists to catch is a missing ancestor `ReadDir`
+    /// rule, which would break every user's shell in one commit: no rule
+    /// covers `~` itself, so `ls ~` fails.
+    #[tokio::test]
+    async fn landlock_narrowing_keeps_ancestor_listing_working() {
+        let base = probe_dir().expect("a dir outside the floor");
+        let root = base.join(format!("hotl-ll-listing-{}", std::process::id()));
+        let carved = root.join(".ssh");
+        std::fs::create_dir_all(&carved).unwrap();
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::write(carved.join("id_probe"), b"canary").unwrap();
+
+        let run_carved = |script: String| {
+            let noread = vec![carved.clone()];
+            async move {
+                let mut cmd = tokio::process::Command::new("sh");
+                cmd.arg("-c").arg(script);
+                apply_landlock_with(cmd, &EgressState::Open, &[], &noread)
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .await
+                    .expect("spawn")
+            }
+        };
+        let list = run_carved(format!("ls {} > /dev/null", root.display())).await;
+        let long = run_carved(format!("ls -la {} > /dev/null", root.display())).await;
+        let read = run_carved(format!("cat {}", carved.join("id_probe").display())).await;
+        std::fs::remove_dir_all(&root).ok();
+        assert!(
+            list.status.success(),
+            "listing the carve's parent must work: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        assert!(
+            long.status.success(),
+            "`ls -la` must work — it stats every child: {}",
+            String::from_utf8_lossy(&long.stderr)
+        );
+        assert!(!read.status.success(), "the carved file must not read");
+    }
+
+    /// The descent readdirs `$HOME` and adds a rule per entry, so it must not
+    /// run per spawn. Two spawns through the global path share one fd.
+    #[test]
+    fn landlock_ruleset_is_built_once_per_process() {
+        use std::os::unix::io::AsRawFd;
+        let first = cached_ruleset(&EgressState::Open);
+        let second = cached_ruleset(&EgressState::Open);
+        match (first, second) {
+            (Some(a), Some(b)) => assert_eq!(
+                a.as_raw_fd(),
+                b.as_raw_fd(),
+                "the ruleset must be memoized, not rebuilt per spawn"
+            ),
+            (None, None) => assert!(
+                landlock_abi().is_none(),
+                "a Landlock host must produce a ruleset"
+            ),
+            (a, b) => panic!(
+                "memoization is not stable: {:?}/{:?}",
+                a.is_some(),
+                b.is_some()
+            ),
+        }
     }
 
     /// The Linux twin of `seatbelt_allows_writes_under_a_configured_extra_dir`.
@@ -1780,7 +2047,7 @@ mod linux_tests {
         // Same write with the extra configured: allowed.
         let mut cmd = tokio::process::Command::new("sh");
         cmd.arg("-c").arg(&script);
-        let ok = apply_landlock_with(cmd, &EgressState::Open, std::slice::from_ref(&extra))
+        let ok = apply_landlock_with(cmd, &EgressState::Open, std::slice::from_ref(&extra), &[])
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .output()

@@ -188,6 +188,8 @@
                 "sandbox::linux_tests::landlock_allows_writes_under_a_configured_extra_dir"
                 "sandbox::linux_tests::landlock_confines_truncate_by_path"
                 "sandbox::linux_tests::landlock_confines_writes"
+                "sandbox::linux_tests::landlock_denies_reading_a_carved_path"
+                "sandbox::linux_tests::landlock_narrowing_keeps_ancestor_listing_working"
                 # hotl-tools tests/ — same witness. Unreached in the failing
                 # log (cargo stops at the lib target); classified by reading
                 # their probe_dir()/verify_confinement_with call paths.
