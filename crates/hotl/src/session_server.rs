@@ -27,11 +27,41 @@ use crate::acp::{outcome_tag, update_payload, UPDATE_SCHEMA_VERSION};
 
 type ClientWriter = AsyncMutex<Option<tokio::net::unix::OwnedWriteHalf>>;
 
+/// What a surface prints after a human allows a host: the grant is
+/// session-scoped, and hotl does not write `config.toml` for you.
+///
+/// A permanent, global, cross-session egress grant reachable by one keypress
+/// would invert the threat model — the durable decision would get *less*
+/// friction than the temporary one. So the prompt prints the line to paste
+/// instead (plan 0026 decision 9).
+pub fn paste_hint(host: &str) -> String {
+    format!(
+        "  allowed \"{host}\" for this session\n  \
+         to make it permanent, add to your config.toml:\n      \
+         [network]\n      allow = [\"{host}\"]"
+    )
+}
+
 struct Shared {
     handle: SessionHandle,
     client: ClientWriter,
     /// Parked permission asks: id → (reply channel, the request frame to re-send).
     pending: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<hotl_engine::AskReply>, Value)>>,
+    /// Parked egress asks (plan 0026), same shape as `pending`.
+    ///
+    /// A separate map, sharing `next_ask`: the two carry different reply types
+    /// (`AskReply` vs `EgressDecision`), so one map could not hold both, and
+    /// the shared counter is what keeps an id from ever meaning two different
+    /// things — the same arrangement `acp.rs`'s `PendingQuestions` documents.
+    pending_egress: Mutex<
+        HashMap<
+            u64,
+            (
+                tokio::sync::oneshot::Sender<hotl_tools::net::EgressDecision>,
+                Value,
+            ),
+        >,
+    >,
     next_ask: AtomicU64,
     session_id: String,
     /// Per-session secret a client must present before it can drive the session
@@ -231,6 +261,7 @@ pub async fn serve_on(
         handle,
         client: AsyncMutex::new(None),
         pending: Mutex::new(HashMap::new()),
+        pending_egress: Mutex::new(HashMap::new()),
         next_ask: AtomicU64::new(1),
         session_id,
         token,
@@ -401,6 +432,25 @@ async fn handle_frame(line: &str, shared: &Arc<Shared>) -> ClientAction {
                 }
             }
         }
+        "egress_reply" => {
+            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                if let Some((reply, _)) = shared
+                    .pending_egress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id)
+                {
+                    // An absent or non-boolean `allow` denies, exactly as
+                    // `ask_reply` above: a malformed answer is not a grant.
+                    let allow = msg.get("allow").and_then(Value::as_bool).unwrap_or(false);
+                    let _ = reply.send(if allow {
+                        hotl_tools::net::EgressDecision::Allow
+                    } else {
+                        hotl_tools::net::EgressDecision::Deny
+                    });
+                }
+            }
+        }
         "detach" => return ClientAction::Detach,
         "shutdown" => return ClientAction::Shutdown,
         _ => {}
@@ -418,7 +468,19 @@ async fn resend_pending(shared: &Arc<Shared>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.retain(|_, (tx, _)| !tx.is_closed());
-        pending.values().map(|(_, f)| f.clone()).collect()
+        let mut egress = shared
+            .pending_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        egress.retain(|_, (tx, _)| !tx.is_closed());
+        // An egress ask raised while the TUI was detached must still be
+        // answerable on reattach, or the blocked connection just waits out the
+        // proxy's deadline.
+        pending
+            .values()
+            .map(|(_, f)| f.clone())
+            .chain(egress.values().map(|(_, f)| f.clone()))
+            .collect()
     };
     // Tell the client the current session id first (a lightweight hello).
     send(
@@ -450,11 +512,26 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                     .insert(id, (reply, frame.clone()));
                 send(&shared, &frame).await; // no-op if detached; re-sent on attach
             }
+            EngineEvent::EgressAsk { host, reply } => {
+                let id = shared.next_ask.fetch_add(1, Ordering::Relaxed);
+                let frame = json!({"t": "egress", "id": id, "host": host});
+                shared
+                    .pending_egress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, (reply, frame.clone()));
+                send(&shared, &frame).await; // no-op if detached; re-sent on attach
+            }
             EngineEvent::TurnDone { outcome, usage } => {
                 // A turn that ended without its asks being answered left dead
                 // reply channels behind — drop them so they never re-issue.
                 shared
                     .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|_, (tx, _)| !tx.is_closed());
+                shared
+                    .pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, (tx, _)| !tx.is_closed());
@@ -569,6 +646,117 @@ mod tests {
     async fn peer_of_our_own_socket_reads_back_as_same_uid() {
         let (ours, _theirs) = UnixStream::pair().unwrap();
         assert!(peer_is_same_uid(&ours));
+    }
+
+    /// Plan 0026's egress prompt through the whole server path: framed on the
+    /// wire, parked for a detached client, answered by id, and swept when the
+    /// turn ends. Driven by feeding the event channel directly — the real
+    /// producer is the proxy, which needs a socket and a blocked connection to
+    /// exercise.
+    #[tokio::test]
+    async fn egress_frames_round_trip_and_a_malformed_reply_denies() {
+        let (client_side, server_side) = UnixStream::pair().unwrap();
+        let (_cr, cw) = client_side.into_split();
+        let (sr, _sw) = server_side.into_split();
+        let mut lines = tokio::io::BufReader::new(sr).lines();
+        let shared = Arc::new(Shared {
+            handle: scripted_session(),
+            client: AsyncMutex::new(Some(cw)),
+            pending: Mutex::new(HashMap::new()),
+            pending_egress: Mutex::new(HashMap::new()),
+            next_ask: AtomicU64::new(1),
+            session_id: "test".into(),
+            token: "tok".into(),
+            model: "m".into(),
+        });
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(drain_events(events_rx, shared.clone()));
+
+        // 1. An allow round-trips.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        events_tx
+            .send(EngineEvent::EgressAsk {
+                host: "registry.npmjs.org".into(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let frame = loop {
+            let f = next(&mut lines).await;
+            if f["t"] == "egress" {
+                break f;
+            }
+        };
+        assert_eq!(frame["host"], "registry.npmjs.org");
+        let id = frame["id"].as_u64().unwrap();
+        // Parked, so a client that reattaches later can still answer.
+        assert!(shared.pending_egress.lock().unwrap().contains_key(&id));
+        handle_frame(
+            &json!({"t": "egress_reply", "id": id, "allow": true}).to_string(),
+            &shared,
+        )
+        .await;
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            hotl_tools::net::EgressDecision::Allow
+        );
+
+        // 2. A reply with no `allow` field denies — asserted, not assumed.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        events_tx
+            .send(EngineEvent::EgressAsk {
+                host: "evil.example".into(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let frame = loop {
+            let f = next(&mut lines).await;
+            if f["t"] == "egress" {
+                break f;
+            }
+        };
+        let id = frame["id"].as_u64().unwrap();
+        handle_frame(&json!({"t": "egress_reply", "id": id}).to_string(), &shared).await;
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            hotl_tools::net::EgressDecision::Deny
+        );
+
+        // 3. A dead reply channel is swept on TurnDone, so it never re-issues
+        //    to a reattaching client.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        events_tx
+            .send(EngineEvent::EgressAsk {
+                host: "stale.example".into(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        loop {
+            if next(&mut lines).await["t"] == "egress" {
+                break;
+            }
+        }
+        drop(reply_rx);
+        events_tx
+            .send(EngineEvent::TurnDone {
+                outcome: hotl_engine::Outcome::Done {
+                    text: String::new(),
+                },
+                usage: Default::default(),
+            })
+            .await
+            .unwrap();
+        loop {
+            if next(&mut lines).await["t"] == "turn_done" {
+                break;
+            }
+        }
+        assert!(
+            shared.pending_egress.lock().unwrap().is_empty(),
+            "a dead egress reply channel must not survive the turn"
+        );
     }
 
     #[tokio::test]

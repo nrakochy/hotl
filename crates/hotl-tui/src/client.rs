@@ -59,6 +59,11 @@ pub enum ServerMsg {
     /// A `session/request_question` reverse-request (`ask_user`, tier-1
     /// gap #4) — NOT a permission gate; answering it never authorizes a tool.
     QuestionRequest { req_id: u64, question: Question },
+    /// A `session/request_egress` reverse-request (plan 0026): a subprocess
+    /// reached a host outside `[network].allow`, and no human-approved call in
+    /// flight had shown it. IS a grant — answering `y` opens the socket — but
+    /// it grants only this host, only this session.
+    EgressRequest { req_id: u64, host: String },
     /// A reply to one of our requests (including the prompt result).
     Response {
         id: u64,
@@ -105,6 +110,14 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
             result["message"] = json!(m);
         }
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
+            .await;
+    }
+
+    /// Answer a `session/request_egress` (plan 0026). Two answers, both
+    /// scoped to this session; hotl never writes `config.toml`, so a
+    /// permanent grant stays a deliberate edit.
+    pub async fn reply_egress(&mut self, req_id: u64, allow: bool) {
+        self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": {"allow": allow}}))
             .await;
     }
 
@@ -186,6 +199,14 @@ fn decode(msg: &Value) -> Option<ServerMsg> {
                 .and_then(Value::as_str)
                 .map(String::from),
             diff: decode_diff(msg.pointer("/params/diff")),
+        }),
+        Some("session/request_egress") => Some(ServerMsg::EgressRequest {
+            req_id: msg.get("id").and_then(Value::as_u64)?,
+            host: msg
+                .pointer("/params/host")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
         }),
         Some("session/request_question") => {
             let options = msg
@@ -273,6 +294,7 @@ pub fn translate(
         ServerMsg::QuestionRequest { req_id, question } => {
             Some(Msg::QuestionRequest { req_id, question })
         }
+        ServerMsg::EgressRequest { req_id, host } => Some(Msg::EgressRequest { req_id, host }),
         ServerMsg::Response { id, result } => {
             if let Some(pos) = prompt_ids.iter().position(|&p| p == id) {
                 prompt_ids.remove(pos);
@@ -369,6 +391,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 .reply_permission(req_id, allow, secret_reads, message)
                 .await
         }
+        Cmd::ReplyEgress { req_id, allow } => client.reply_egress(req_id, allow).await,
         Cmd::ReplyQuestion {
             req_id,
             selected,
@@ -598,6 +621,27 @@ mod tests {
             panic!("not a permission request");
         };
         assert!(diff.is_empty(), "no diff field decodes to no rows");
+    }
+
+    #[tokio::test]
+    async fn read_decodes_an_egress_request() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let feed = concat!(
+            r#"{"jsonrpc":"2.0","id":12,"method":"session/request_egress","params":{"sessionId":"s","host":"registry.npmjs.org"}}"#,
+            "\n",
+        );
+        tokio::io::AsyncWriteExt::write_all(&mut server, feed.as_bytes())
+            .await
+            .unwrap();
+        drop(server);
+        let mut r = BufReader::new(client);
+        assert_eq!(
+            read_server_msg(&mut r).await,
+            Some(ServerMsg::EgressRequest {
+                req_id: 12,
+                host: "registry.npmjs.org".into(),
+            })
+        );
     }
 
     #[tokio::test]

@@ -49,6 +49,19 @@ pub enum Phase {
         options: Vec<QuestionOption>,
         input: String,
     },
+    /// An egress ask (plan 0026): a subprocess reached a host that was not in
+    /// `[network].allow` and was not on screen when the human approved the
+    /// command that opened the connection.
+    ///
+    /// Rendered deliberately unlike `WaitingAsk` — different heading, the host
+    /// on its own line, and the "was not in the approved command" line. A
+    /// human who just approved `npm install` would otherwise read a second
+    /// modal as a duplicate and reflex-key it, which is the failure mode the
+    /// whole feature is trying to avoid.
+    WaitingEgress {
+        req_id: u64,
+        host: String,
+    },
 }
 
 /// One row of a proposed change, as it arrives on the wire. The generator
@@ -319,6 +332,10 @@ pub enum Msg {
         req_id: u64,
         question: Question,
     },
+    EgressRequest {
+        req_id: u64,
+        host: String,
+    },
     PromptResult {
         outcome_kind: String,
         outcome_text: Option<String>,
@@ -394,6 +411,13 @@ pub enum Cmd {
     /// Answer a `session/request_question`. Exactly one of `selected`
     /// (a single label — v1 is single-select even when `multi` was set) or
     /// `free_text` is populated.
+    /// Answer a `session/request_egress`. Two answers only, both scoped to
+    /// this session: hotl does not write `config.toml`, so a permanent grant
+    /// stays a deliberate edit (plan 0026 decision 9).
+    ReplyEgress {
+        req_id: u64,
+        allow: bool,
+    },
     ReplyQuestion {
         req_id: u64,
         selected: Vec<String>,
@@ -468,7 +492,9 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                     return Vec::new();
                 }
             }
-            Msg::PermissionRequest { .. } | Msg::QuestionRequest { .. } => return Vec::new(),
+            Msg::PermissionRequest { .. }
+            | Msg::QuestionRequest { .. }
+            | Msg::EgressRequest { .. } => return Vec::new(),
             Msg::PromptResult { usage, .. } => {
                 state.detached_turns -= 1;
                 state.session_usage.add(usage);
@@ -509,6 +535,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 options: question.options,
                 input: String::new(),
             };
+            // Same reasoning as the ask arm above (tracker #13).
+            state.completion = None;
+            state.editor.clear_search();
+            vec![Cmd::SetTitle(title(state, " — waiting on you"))]
+        }
+        Msg::EgressRequest { req_id, host } => {
+            state.phase = Phase::WaitingEgress { req_id, host };
             // Same reasoning as the ask arm above (tracker #13).
             state.completion = None;
             state.editor.clear_search();
@@ -874,7 +907,7 @@ fn modal_active(state: &State) -> bool {
     state.editor.search_prompt().is_some()
         || matches!(
             state.phase,
-            Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. }
+            Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } | Phase::WaitingEgress { .. }
         )
 }
 
@@ -949,6 +982,9 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     }
     if matches!(state.phase, Phase::WaitingQuestion { .. }) {
         return on_question_key(state, key);
+    }
+    if matches!(state.phase, Phase::WaitingEgress { .. }) {
+        return on_egress_key(state, key);
     }
     // Transcript scrolling, unconditional — not gated on vim mode, which is
     // the whole defect (`vim.rs::vertical` was the only emitter and needs
@@ -1406,6 +1442,44 @@ fn resume_after_question(
     ]
 }
 
+/// The egress modal: two keys, both session-scoped. `y` allows the host for
+/// the rest of the session; anything else denies, which is also the safe
+/// default for a stray keypress. Esc takes the same interrupt-or-detach ladder
+/// the other modals use.
+fn on_egress_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
+    let Phase::WaitingEgress { req_id, host } = &state.phase else {
+        return Vec::new();
+    };
+    let (req_id, host) = (*req_id, host.clone());
+    match key.code {
+        KeyCode::Char('y') | KeyCode::Char('Y') => resume_after_egress(state, req_id, true, &host),
+        KeyCode::Char('n') | KeyCode::Char('N') => resume_after_egress(state, req_id, false, &host),
+        KeyCode::Esc => interrupt_or_detach(state),
+        _ => Vec::new(),
+    }
+}
+
+fn resume_after_egress(state: &mut State, req_id: u64, allow: bool, host: &str) -> Vec<Cmd> {
+    if allow {
+        // The grant is session-scoped, and hotl never writes config.toml for
+        // you — so say what to paste (plan 0026 decision 9).
+        notice(
+            state,
+            format!(
+                "allowed \"{host}\" for this session — to make it permanent, \
+                 add it to [network].allow in config.toml"
+            ),
+        );
+    } else {
+        notice(state, format!("denied \"{host}\" for this session"));
+    }
+    state.phase = Phase::Sampling { ticks: 0 };
+    vec![
+        Cmd::ReplyEgress { req_id, allow },
+        Cmd::SetTitle(title(state, " — working")),
+    ]
+}
+
 fn resume_after_ask(
     state: &mut State,
     req_id: u64,
@@ -1446,7 +1520,10 @@ fn on_tick(state: &mut State) {
                 }
             }
         }
-        Phase::Idle | Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {}
+        Phase::Idle
+        | Phase::WaitingAsk { .. }
+        | Phase::WaitingQuestion { .. }
+        | Phase::WaitingEgress { .. } => {}
     }
 }
 
@@ -2111,6 +2188,68 @@ mod tests {
             if m == "wrong dir")
         );
         assert!(!matches!(s.phase, Phase::WaitingAsk { .. }));
+    }
+
+    /// Plan 0026: two keys, both session-scoped, and anything else is inert
+    /// rather than an accidental grant.
+    #[test]
+    fn egress_modal_answers_y_and_n_and_says_the_grant_is_session_scoped() {
+        let raise = |s: &mut State| {
+            update(
+                s,
+                Msg::EgressRequest {
+                    req_id: 11,
+                    host: "registry.npmjs.org".into(),
+                },
+            );
+        };
+
+        let mut s = State::test_default();
+        raise(&mut s);
+        assert!(matches!(s.phase, Phase::WaitingEgress { req_id: 11, .. }));
+        // A stray key is not an answer.
+        assert!(press(&mut s, KeyCode::Char('q')).is_empty());
+        assert!(matches!(s.phase, Phase::WaitingEgress { .. }));
+
+        let cmds = press(&mut s, KeyCode::Char('y'));
+        assert!(
+            matches!(
+                cmds[..],
+                [
+                    Cmd::ReplyEgress {
+                        req_id: 11,
+                        allow: true
+                    },
+                    ..
+                ]
+            ),
+            "{cmds:?}"
+        );
+        assert!(!matches!(s.phase, Phase::WaitingEgress { .. }));
+        // The grant is session-scoped and hotl does not write config.toml, so
+        // the transcript has to say where a permanent grant goes.
+        let notices = format!("{:?}", s.transcript);
+        assert!(
+            notices.contains("for this session") && notices.contains("[network].allow"),
+            "{notices}"
+        );
+
+        let mut s = State::test_default();
+        raise(&mut s);
+        let cmds = press(&mut s, KeyCode::Char('n'));
+        assert!(
+            matches!(
+                cmds[..],
+                [
+                    Cmd::ReplyEgress {
+                        req_id: 11,
+                        allow: false
+                    },
+                    ..
+                ]
+            ),
+            "{cmds:?}"
+        );
     }
 
     /// Plan 0022: `s` allows *and* lifts the credential read-deny, but only

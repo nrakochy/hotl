@@ -86,8 +86,8 @@ async fn connect(id: &str) -> i32 {
     });
 
     let mut server = BufReader::new(read).lines();
-    // The id of an ask currently awaiting a y/N answer, if any.
-    let mut pending_ask: Option<u64> = None;
+    // The prompt currently awaiting a y/N answer, if any.
+    let mut pending_ask: Option<Parked> = None;
     let mut turn_running = false;
 
     loop {
@@ -127,23 +127,35 @@ enum Input {
 enum Action {
     Stop,
     Nothing,
-    AnswerAsk { id: u64, allow: bool },
+    AnswerAsk { parked: Parked, allow: bool },
     Steer(String),
     Prompt(String),
 }
 
+/// A prompt parked on the human, and which reply method answers it. Tool asks
+/// and egress asks (plan 0026) draw from one id counter but carry different
+/// reply types, so the kind has to travel with the id — answering one through
+/// the other's method would silently mis-route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Parked {
+    id: u64,
+    /// `Some(host)` for an egress ask, `None` for a tool ask. The host rides
+    /// along so the paste-able config line can name it after a `y`.
+    egress: Option<String>,
+}
+
 /// Classify a typed line. A parked ask consumes the next line as its answer —
 /// anything that is not an affirmative denies, which is the safe default.
-fn route(text: &str, turn_running: bool, pending_ask: Option<u64>) -> Action {
+fn route(text: &str, turn_running: bool, pending_ask: Option<&Parked>) -> Action {
     if text == "/stop" {
         return Action::Stop;
     }
     if text.is_empty() {
         return Action::Nothing;
     }
-    if let Some(id) = pending_ask {
+    if let Some(parked) = pending_ask {
         return Action::AnswerAsk {
-            id,
+            parked: parked.clone(),
             allow: matches!(text, "y" | "Y" | "yes"),
         };
     }
@@ -157,18 +169,25 @@ fn route(text: &str, turn_running: bool, pending_ask: Option<u64>) -> Action {
 async fn on_input(
     text: &str,
     write: &mut tokio::net::unix::OwnedWriteHalf,
-    pending_ask: &mut Option<u64>,
+    pending_ask: &mut Option<Parked>,
     turn_running: bool,
 ) -> Input {
-    match route(text, turn_running, *pending_ask) {
+    match route(text, turn_running, pending_ask.as_ref()) {
         Action::Stop => {
             let _ = send(write, json!({"t": "shutdown"})).await;
             Input::Stop
         }
         Action::Nothing => Input::Continue,
-        Action::AnswerAsk { id, allow } => {
+        Action::AnswerAsk { parked, allow } => {
             *pending_ask = None;
-            let _ = send(write, json!({"t": "ask_reply", "id": id, "allow": allow})).await;
+            let method = match &parked.egress {
+                Some(_) => "egress_reply",
+                None => "ask_reply",
+            };
+            let _ = send(write, json!({"t": method, "id": parked.id, "allow": allow})).await;
+            if let (Some(host), true) = (&parked.egress, allow) {
+                eprintln!("{}", crate::session_server::paste_hint(host));
+            }
             Input::Continue
         }
         // Expansion happens here, not in `route`: reading files is I/O, and
@@ -187,7 +206,7 @@ async fn on_input(
 }
 
 /// Render a server frame; returns true if it implies a turn is now running.
-fn render(msg: &Value, pending_ask: &mut Option<u64>, turn_running: &mut bool) -> bool {
+fn render(msg: &Value, pending_ask: &mut Option<Parked>, turn_running: &mut bool) -> bool {
     match msg.get("t").and_then(Value::as_str).unwrap_or("") {
         "hello" => false,
         "ask" => {
@@ -200,7 +219,24 @@ fn render(msg: &Value, pending_ask: &mut Option<u64>, turn_running: &mut bool) -
                     msg.get("summary").and_then(Value::as_str).unwrap_or("?")
                 );
                 let _ = std::io::Write::flush(&mut std::io::stderr());
-                *pending_ask = Some(id);
+                *pending_ask = Some(Parked { id, egress: None });
+            }
+            true
+        }
+        // Deliberately different wording and framing from the tool ask above:
+        // a human who just approved `npm install` must not read this as a
+        // duplicate and reflex-key it.
+        "egress" => {
+            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                let host = msg.get("host").and_then(Value::as_str).unwrap_or("?");
+                eprintln!("\nnetwork: reaching \"{host}\" was not in the approved command");
+                eprintln!("this host is not in [network].allow");
+                eprint!("allow for this session? [y/N] ");
+                let _ = std::io::Write::flush(&mut std::io::stderr());
+                *pending_ask = Some(Parked {
+                    id,
+                    egress: Some(host.to_string()),
+                });
             }
             true
         }
@@ -374,16 +410,36 @@ mod tests {
 
     #[test]
     fn typed_lines_route_correctly() {
+        let ask = Parked {
+            id: 4,
+            egress: None,
+        };
         assert_eq!(route("/stop", false, None), Action::Stop);
         assert_eq!(
-            route("y", false, Some(4)),
-            Action::AnswerAsk { id: 4, allow: true }
+            route("y", false, Some(&ask)),
+            Action::AnswerAsk {
+                parked: ask.clone(),
+                allow: true
+            }
         );
         assert_eq!(
-            route("no", false, Some(4)),
+            route("no", false, Some(&ask)),
             Action::AnswerAsk {
-                id: 4,
+                parked: ask.clone(),
                 allow: false
+            }
+        );
+        // An egress ask routes the same way but answers a different method —
+        // the kind travels with the id so it can never be mis-routed.
+        let egress = Parked {
+            id: 5,
+            egress: Some("registry.npmjs.org".into()),
+        };
+        assert_eq!(
+            route("y", false, Some(&egress)),
+            Action::AnswerAsk {
+                parked: egress,
+                allow: true
             }
         );
         assert_eq!(route("", false, None), Action::Nothing);

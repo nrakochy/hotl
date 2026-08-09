@@ -20,7 +20,9 @@ pub fn loop_glyph(phase: &Phase) -> &'static str {
         Phase::Idle => RESTING,
         Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => draw_then_turn(*ticks),
         Phase::Tool { ticks, .. } => ORBIT[(*ticks % 4) as usize],
-        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => GAP,
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } | Phase::WaitingEgress { .. } => {
+            GAP
+        }
     }
 }
 
@@ -57,6 +59,9 @@ pub fn strip_line(state: &State) -> String {
         Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
             format!("{GAP} waiting on you")
         }
+        // Named on the strip, not just "waiting on you": the difference from
+        // the tool ask is the whole point of the prompt.
+        Phase::WaitingEgress { .. } => format!("{GAP} waiting on you · network"),
     };
     match todos_summary(&state.todos) {
         Some(summary) => format!("{base} · {summary}"),

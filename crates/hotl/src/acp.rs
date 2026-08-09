@@ -29,6 +29,12 @@ type Pending = Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<AskReply>>>>;
 /// counter in `drain_events`, so an id never means two different things.
 type PendingQuestions =
     Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<hotl_types::QuestionAnswer>>>>;
+/// In-flight `session/request_egress` round-trips (plan 0026), parallel to
+/// `Pending` and disjoint from it for the same reason: one `req_id` counter,
+/// one meaning per id, but different reply types, so answering an egress
+/// prompt through the tool-ask path could only mis-route.
+type PendingEgress =
+    Arc<std::sync::Mutex<HashMap<u64, oneshot::Sender<hotl_tools::net::EgressDecision>>>>;
 
 /// Map an ACP client's permission `result` to an `AskReply` (T1/§2b): a client
 /// may `{"allow":true}`, `{"allow":false,"message":"…"}`, provide edited
@@ -58,6 +64,22 @@ fn ask_reply_from_result(result: Option<&Value>) -> AskReply {
     }
     AskReply::Deny {
         message: r.get("message").and_then(Value::as_str).map(String::from),
+    }
+}
+
+/// Map an ACP client's `session/request_egress` `result` (plan 0026) to an
+/// `EgressDecision`: `{"allow": true}` or `{"allow": false}`.
+///
+/// Anything else — a missing result, a client that hung up, a non-boolean —
+/// is `NoAnswer`, which refuses the connection exactly like `Deny` but is not
+/// recorded as the human's decision, so the next connection asks again rather
+/// than inheriting a denial nobody made.
+fn egress_decision_from_result(result: Option<&Value>) -> hotl_tools::net::EgressDecision {
+    use hotl_tools::net::EgressDecision;
+    match result.and_then(|r| r.get("allow")).and_then(Value::as_bool) {
+        Some(true) => EgressDecision::Allow,
+        Some(false) => EgressDecision::Deny,
+        None => EgressDecision::NoAnswer,
     }
 }
 
@@ -210,6 +232,7 @@ pub async fn serve(
     let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
     let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_questions: PendingQuestions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let pending_egress: PendingEgress = Arc::new(std::sync::Mutex::new(HashMap::new()));
     let pending_prompt: PendingPrompt = Arc::new(std::sync::Mutex::new(VecDeque::new()));
     let mut next_id: u64 = 1;
     let mut session: Option<SessionState> = None;
@@ -230,6 +253,12 @@ pub async fn serve(
                     .remove(&id)
                 {
                     let _ = reply.send(question_answer_from_result(msg.get("result")));
+                } else if let Some(reply) = pending_egress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id)
+                {
+                    let _ = reply.send(egress_decision_from_result(msg.get("result")));
                 } else if let Some(reply) = pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -247,6 +276,7 @@ pub async fn serve(
             &mut session,
             &pending,
             &pending_questions,
+            &pending_egress,
             &pending_prompt,
             &mut next_id,
             &mut info,
@@ -274,6 +304,7 @@ async fn handle_request(
     session: &mut Option<SessionState>,
     pending: &Pending,
     pending_questions: &PendingQuestions,
+    pending_egress: &PendingEgress,
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
     info: &mut ServerInfo,
@@ -371,6 +402,7 @@ async fn handle_request(
                         session,
                         pending,
                         pending_questions,
+                        pending_egress,
                         pending_prompt,
                         next_id,
                         &info.model,
@@ -608,6 +640,7 @@ async fn handle_request(
                         session,
                         pending,
                         pending_questions,
+                        pending_egress,
                         pending_prompt,
                         next_id,
                         &info.model,
@@ -708,6 +741,7 @@ fn install_session(
     session: &mut Option<SessionState>,
     pending: &Pending,
     pending_questions: &PendingQuestions,
+    pending_egress: &PendingEgress,
     pending_prompt: &PendingPrompt,
     next_id: &mut u64,
     model: &str,
@@ -723,6 +757,10 @@ fn install_session(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        pending_egress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         pending_prompt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -734,6 +772,7 @@ fn install_session(
         writer.clone(),
         pending.clone(),
         pending_questions.clone(),
+        pending_egress.clone(),
         pending_prompt.clone(),
         next_id,
         model.to_string(),
@@ -750,6 +789,7 @@ fn start_session(
     writer: Writer,
     pending: Pending,
     pending_questions: PendingQuestions,
+    pending_egress: PendingEgress,
     pending_prompt: PendingPrompt,
     next_id: &mut u64,
     model: String,
@@ -766,6 +806,7 @@ fn start_session(
         writer,
         pending,
         pending_questions,
+        pending_egress,
         pending_prompt,
         sid,
         req_id_seed,
@@ -789,6 +830,7 @@ async fn drain_events(
     writer: Writer,
     pending: Pending,
     pending_questions: PendingQuestions,
+    pending_egress: PendingEgress,
     pending_prompt: PendingPrompt,
     session_id: String,
     mut req_id: u64,
@@ -848,6 +890,25 @@ async fn drain_events(
                 )
                 .await;
             }
+            // Plan 0026. Both surfaces already carried a two-way allow/deny
+            // reply and already defaulted to deny, so excluding ACP would only
+            // mean the eventual egress default flip silently breaks every
+            // editor integration with no in-protocol recourse.
+            EngineEvent::EgressAsk { host, reply } => {
+                req_id += 1;
+                pending_egress
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(req_id, reply);
+                send(
+                    &writer,
+                    &json!({
+                        "jsonrpc": "2.0", "id": req_id, "method": "session/request_egress",
+                        "params": {"sessionId": session_id, "host": host},
+                    }),
+                )
+                .await;
+            }
             EngineEvent::TurnDone { outcome, usage } => {
                 // A turn that ended without its asks/questions being answered
                 // left dead reply channels behind — drop them so they can't
@@ -857,6 +918,10 @@ async fn drain_events(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
                 pending_questions
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .retain(|_, tx| !tx.is_closed());
+                pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
@@ -946,6 +1011,37 @@ mod ask_reply_tests {
     /// Plan 0022: the credential-read grant rides the same permission result
     /// the TUI already sends. A client that never heard of it gets `Allow`,
     /// which is the fail-closed direction.
+    /// Plan 0026: two answers, and everything else refuses. An absent result
+    /// — a client that hung up, or one that does not know this method — is
+    /// `NoAnswer`: it denies the connection, but is not recorded as a human's
+    /// decision, so the next connection asks again.
+    #[test]
+    fn acp_egress_maps_two_answers_and_denies_everything_else() {
+        use hotl_tools::net::EgressDecision;
+        assert_eq!(
+            egress_decision_from_result(Some(&json!({"allow": true}))),
+            EgressDecision::Allow
+        );
+        assert_eq!(
+            egress_decision_from_result(Some(&json!({"allow": false}))),
+            EgressDecision::Deny
+        );
+        assert_eq!(
+            egress_decision_from_result(None),
+            EgressDecision::NoAnswer,
+            "a client that never answered is not a client that said no"
+        );
+        assert_eq!(
+            egress_decision_from_result(Some(&json!({}))),
+            EgressDecision::NoAnswer
+        );
+        assert_eq!(
+            egress_decision_from_result(Some(&json!({"allow": "yes"}))),
+            EgressDecision::NoAnswer,
+            "a non-boolean is malformed, never a grant"
+        );
+    }
+
     #[test]
     fn secret_reads_is_opt_in_and_only_on_an_allow() {
         let reply = |v: Value| ask_reply_from_result(Some(&v));

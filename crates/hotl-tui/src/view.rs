@@ -88,6 +88,9 @@ pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     if matches!(state.phase, Phase::WaitingQuestion { .. }) {
         render_question(state, p, frame, transcript);
     }
+    if matches!(state.phase, Phase::WaitingEgress { .. }) {
+        render_egress(state, p, frame, transcript);
+    }
     if state.help_open {
         render_help(p, frame, transcript);
     }
@@ -495,7 +498,7 @@ fn split_summary(name: &str, summary: &str) -> (String, Vec<String>) {
 fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // The band background is the watch look; blocked = "waiting on you".
     let style = match state.phase {
-        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } | Phase::WaitingEgress { .. } => {
             Style::new().fg(p.blocked).bg(p.band).bold()
         }
         Phase::Idle => Style::new().fg(p.muted).bg(p.band),
@@ -678,6 +681,9 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         (Phase::WaitingQuestion { .. }, ..) => {
             "1-9 pick an option · type for free text · enter submit · esc clear/interrupt"
         }
+        (Phase::WaitingEgress { .. }, ..) => {
+            "y allow this host for the session · n deny · esc interrupt · ctrl-c"
+        }
         _ if state.editor.search_prompt().is_some() => {
             "type to search · ctrl-r older · enter accept · esc cancel"
         }
@@ -842,6 +848,44 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The egress modal (plan 0026). Rendered deliberately unlike `render_ask`:
+/// different title, the host on its own line, and a first line that says why
+/// this prompt exists at all. A human who just approved `npm install` must not
+/// read this as a duplicate of the ask they answered a second ago — under the
+/// threat model that reflex is the failure that matters most.
+fn render_egress(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
+    let Phase::WaitingEgress { host, .. } = &state.phase else {
+        return;
+    };
+    let lines = [
+        Line::styled(
+            format!("reaching \"{host}\" was not in the approved command"),
+            Style::new().fg(p.ink).bold(),
+        ),
+        Line::styled(
+            "this host is not in [network].allow".to_string(),
+            Style::new().fg(p.muted),
+        ),
+        Line::raw(""),
+        Line::styled(
+            "y allow for this session · n deny",
+            Style::new().fg(p.faint),
+        ),
+    ];
+    let lines: Vec<Line> = lines
+        .iter()
+        .flat_map(|l| wrap::line(l, centered(over, 60, 0).width.saturating_sub(2) as usize))
+        .collect();
+    let area = centered(over, 60, lines.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .title(" network egress ")
+        .border_style(Style::new().fg(p.blocked));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 /// The `/`-command menu: a bordered list pinned to the bottom-left of the
 /// transcript area, so it reads as rising out of the input box rather than
 /// floating like the ask/question modals do.
@@ -852,7 +896,7 @@ fn render_completion(state: &State, p: &Palette, frame: &mut Frame, over: Rect) 
     // `app::update`).
     if matches!(
         state.phase,
-        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. }
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } | Phase::WaitingEgress { .. }
     ) {
         return;
     }
@@ -1085,6 +1129,54 @@ mod tests {
             diff: Vec::new(),
         };
         assert!(draw(&s)[HINT].contains("y allow"), "{:?}", draw(&s));
+    }
+
+    /// A human who just approved `npm install` must not read the egress modal
+    /// as a duplicate of the ask they answered a second ago. Snapshot-shaped
+    /// so a later refactor cannot quietly merge the two renderings.
+    #[test]
+    fn the_egress_modal_is_visually_distinct_from_a_tool_ask() {
+        let mut ask = State::test_default();
+        ask.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "bash: npm install".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: Vec::new(),
+        };
+        let ask_out = draw(&ask).join("\n");
+
+        let mut egress = State::test_default();
+        egress.phase = Phase::WaitingEgress {
+            req_id: 2,
+            host: "registry.npmjs.org".into(),
+        };
+        let out = draw(&egress).join("\n");
+
+        assert!(out.contains("network egress"), "own title: {out}");
+        assert!(!ask_out.contains("network egress"));
+        // Wrapped across the card's 60 columns, so match the tail of the
+        // sentence rather than the whole of it.
+        assert!(
+            out.contains("approved command"),
+            "the reason this prompt exists at all: {out}"
+        );
+        assert!(out.contains("registry.npmjs.org"), "{out}");
+        assert!(out.contains("[network].allow"), "name the control: {out}");
+        // The tool ask's card title, which this card must not borrow. (The
+        // activity strip still reads "waiting on you · network" — that is the
+        // strip, not the card.)
+        assert!(ask_out.contains("┌ waiting on you"), "{ask_out}");
+        assert!(
+            !out.contains("┌ waiting on you"),
+            "the tool ask's card title must not appear on the egress card: {out}"
+        );
+        assert!(
+            draw(&egress)[HINT].contains("allow this host for the session"),
+            "{:?}",
+            draw(&egress)[HINT]
+        );
     }
 
     #[test]
