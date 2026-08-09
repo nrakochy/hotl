@@ -151,6 +151,11 @@ enum Gate {
         /// it. `execute` scopes it around the single `Tool::run` future, which
         /// is what makes "per command" structural rather than a convention.
         secret_reads: bool,
+        /// The plan-0026 shown-hosts registration for this call. Held until
+        /// `execute` finishes, so the egress ask can tell "the human saw this
+        /// host" from "something reached out on its own". Dropped with the
+        /// gate on every path, including denials and panics.
+        shown: Option<hotl_tools::net::ShownHostsGuard>,
     },
     /// Answered without running. `chargeable` is false for outcomes the model
     /// cannot fix by trying again — a human denial, a hook block, an
@@ -160,6 +165,31 @@ enum Gate {
         outcome: ToolOutcome,
         chargeable: bool,
     },
+}
+
+/// What [`Turn::approve_input`] produces: the reply, plus whether a *human*
+/// produced it.
+///
+/// The second field exists because `Verdict::Auto` and `Verdict::Ask` both
+/// yield `AskReply::Allow`, and plan 0026's shown-hosts rule turns on the
+/// difference. Reported, never inferred: anything that reconstructs "was there
+/// a human?" downstream — checking the mode, checking whether an event was
+/// emitted — is the bug that turns every allow-rule into a standing egress
+/// grant (0026 watch-out 11).
+struct Approval {
+    reply: AskReply,
+    by_human: bool,
+}
+
+impl Approval {
+    /// A rule answered. An allow-rule is not a human and must never count as
+    /// one.
+    fn by_rule(reply: AskReply) -> Self {
+        Self {
+            reply,
+            by_human: false,
+        }
+    }
 }
 
 /// What [`Turn::execute`] produces: the result, plus whether it counts against
@@ -1373,8 +1403,29 @@ impl Turn {
         let display =
             hotl_types::sanitize::safe_summary(&summary.clone().unwrap_or_else(|| tu.name.clone()));
         let mut secret_reads = false;
+        let mut shown = None;
         if let Some(summary) = summary {
-            match self.approve_input(tu, &input, summary, why).await {
+            let Approval { reply, by_human } = self.approve_input(tu, &input, summary, why).await;
+            // Plan 0026: register the hosts the human actually read, and only
+            // those. `display` is `safe_summary(summary)` — byte-for-byte what
+            // `Turn::ask` renders — so the invariant is checkable rather than
+            // asserted: hotl skips the egress ask only for hosts that were on
+            // screen when the human said yes.
+            //
+            // `by_human` is *reported* by `approve_input`, never inferred:
+            // `Verdict::Auto` and `Verdict::Ask` both return `AskReply::Allow`,
+            // and anything that reconstructs "was there a human?" downstream is
+            // the bug that turns every allow-rule into a standing egress grant.
+            //
+            // `AllowEdited` registers nothing: the human edited the input after
+            // reading the summary, so the summary is no longer evidence of what
+            // is about to run.
+            if by_human && matches!(reply, AskReply::Allow | AskReply::AllowWithSecretReads) {
+                shown = Some(hotl_tools::net::show_hosts(
+                    hotl_tools::net::hosts_shown_in(&display),
+                ));
+            }
+            match reply {
                 AskReply::Allow => {}
                 // Plan 0022: approved *and* the credential read-deny lifted,
                 // for this call only. Carried on the Gate rather than in the
@@ -1430,6 +1481,7 @@ impl Turn {
             input,
             summary: display,
             secret_reads,
+            shown,
         }
     }
 
@@ -1439,12 +1491,16 @@ impl Turn {
     async fn execute(&self, tu: &ToolUse, gate: Gate) -> Executed {
         // Exhaustive by construction: a new `Gate` variant is a compile error
         // here, not a runtime panic on a supervised task (T1-5).
-        let (input, summary, secret_reads) = match gate {
+        // `_shown` is held, never read: dropping it at the end of `execute` is
+        // the whole lifetime management for the 0026 shown-hosts rule, and the
+        // egress ask reads the registry it feeds, not this binding.
+        let (input, summary, secret_reads, _shown) = match gate {
             Gate::Ready {
                 input,
                 summary,
                 secret_reads,
-            } => (input, summary, secret_reads),
+                shown,
+            } => (input, summary, secret_reads, shown),
             Gate::Resolved {
                 outcome,
                 chargeable,
@@ -1518,7 +1574,7 @@ impl Turn {
         input: &Value,
         summary: String,
         why: Option<String>,
-    ) -> AskReply {
+    ) -> Approval {
         let tool = self.shared.registry.get(&tu.name);
         let facts = hotl_tools::rules::CallFacts {
             sandbox_enforced: self.shared.sandbox_enforced,
@@ -1539,14 +1595,19 @@ impl Turn {
                     rule,
                 })
                 .await;
-                AskReply::Allow
+                Approval::by_rule(AskReply::Allow)
             }
-            Verdict::Deny { rule } => AskReply::Deny {
+            Verdict::Deny { rule } => Approval::by_rule(AskReply::Deny {
                 message: Some(format!(
                     "a deny rule refused this call ({rule}); do not retry it"
                 )),
+            }),
+            // The only path through `Turn::ask`, and therefore the only path
+            // on which a human read the summary.
+            Verdict::Ask => Approval {
+                reply: self.ask(summary, why).await,
+                by_human: true,
             },
-            Verdict::Ask => self.ask(summary, why).await,
         }
     }
 

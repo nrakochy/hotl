@@ -101,6 +101,13 @@ async fn wait_for_done(handle: &mut SessionHandle) -> Result<String, String> {
             EngineEvent::Ask { reply, .. } => {
                 let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
             }
+            // Headless never installs the egress sink, so this should be
+            // unreachable — answered explicitly anyway, because "unreachable
+            // and therefore fine to drop" is how a fail-closed path turns into
+            // a 120-second hang (0026 Step 4.5).
+            EngineEvent::EgressAsk { reply, .. } => {
+                let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+            }
             EngineEvent::TurnDone { outcome, .. } => {
                 return match outcome {
                     Outcome::Done { text } => Ok(text),

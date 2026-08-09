@@ -71,9 +71,13 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             "overhead_p99_ns": summary.overhead_p99_ns,
             "max_rss_bytes": summary.max_rss_bytes,
         }),
-        EngineEvent::Ask { .. } | EngineEvent::Question { .. } | EngineEvent::TurnDone { .. } => {
-            return None
-        }
+        EngineEvent::Ask { .. }
+        | EngineEvent::Question { .. }
+        // `EgressAsk` is a round-trip like `Ask`, and the JSON stream is the
+        // headless surface, which has no human to answer it — see
+        // `render_json`, where it default-denies.
+        | EngineEvent::EgressAsk { .. }
+        | EngineEvent::TurnDone { .. } => return None,
     })
 }
 

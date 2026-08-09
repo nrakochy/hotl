@@ -315,6 +315,14 @@ async fn drain_child(child: &mut SessionHandle, cancel: &CancellationToken) -> O
                         message: Some("sub-agents cannot ask for permission; do only auto-allowed or read-only work".into()),
                     });
                 }
+                Some(EngineEvent::EgressAsk { host, reply }) => {
+                    // Same reasoning as the ask above, and stated explicitly
+                    // for the same reason: falling through the catch-all below
+                    // would deny too (the dropped sender errors the receiver),
+                    // but only by accident (0026 Step 4.5, watch-out 9).
+                    eprintln!("sub-agent egress denied: {host}");
+                    let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+                }
                 Some(EngineEvent::TurnDone { outcome, .. }) => return outcome,
                 Some(_) => {}
                 None => return Outcome::Error { message: "sub-agent ended without an outcome".into() },

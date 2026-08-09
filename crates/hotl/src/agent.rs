@@ -673,7 +673,7 @@ pub(crate) async fn build_acp() -> Result<
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
         }
-        let handle = spawn_session_with_todos(
+        let handle = spawn_interactive_session(
             (*scaffold.registry).clone(),
             Some(scaffold.spawn_registration(session_id.clone())),
             scaffold.hooks.clone(),
@@ -775,7 +775,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     let (snapshots, initial_items) =
         session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
     record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
-    let handle = spawn_session_with_todos(
+    let handle = spawn_interactive_session(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration(session_id.clone())),
         scaffold.hooks.clone(),
@@ -1208,11 +1208,38 @@ struct SpawnRegistration {
     session_id: String,
 }
 
+/// A session on a surface that can put a question in front of a human, so it
+/// also installs the plan-0026 egress ask sink.
+///
+/// The split is the enforcement: headless (`-p`, `--schema`) and sub-agent
+/// sessions go through [`spawn_session_with_todos`] and never install a sink,
+/// which is what makes them deny egress *by construction* rather than by a
+/// conditional somebody deletes in a refactor.
+fn spawn_interactive_session(
+    registry: Registry,
+    spawn: Option<SpawnRegistration>,
+    hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
+) -> SessionHandle {
+    spawn_session_inner(registry, spawn, hooks, true, build_deps)
+}
+
 #[allow(clippy::type_complexity)]
 fn spawn_session_with_todos(
+    registry: Registry,
+    spawn: Option<SpawnRegistration>,
+    hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
+) -> SessionHandle {
+    spawn_session_inner(registry, spawn, hooks, false, build_deps)
+}
+
+#[allow(clippy::type_complexity)]
+fn spawn_session_inner(
     mut registry: Registry,
     spawn: Option<SpawnRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    egress_ask: bool,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
     let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
@@ -1257,6 +1284,11 @@ fn spawn_session_with_todos(
         ));
     }
     let deps = build_deps(Arc::new(registry));
+    // Taken before the sender moves into the session; only a weak one is kept,
+    // for the same reason `question_sink` keeps weak senders — the egress sink
+    // is process-wide and outlives the session, and a strong sender here would
+    // keep the actor alive forever.
+    let weak_events = event_tx.downgrade();
     let handle = hotl_engine::spawn_session_with_channels(
         deps,
         cmd_tx,
@@ -1265,6 +1297,16 @@ fn spawn_session_with_todos(
         event_rx,
         notifications,
     );
+    if egress_ask {
+        // Set-once and process-wide, like the egress policy itself: the first
+        // interactive session installs the human, and nothing downstream —
+        // including a sub-agent's own session — can swap in a more permissive
+        // one.
+        hotl_tools::net::init_ask_sink(hotl_engine::egress_ask_sink(
+            weak_events,
+            handle.turn_cancel(),
+        ));
+    }
     // Filled the instant the session exists — and always before any turn
     // (and so any `fork`) can run, since a turn only starts on a prompt.
     *head_cell
@@ -2064,6 +2106,14 @@ impl Surface {
                 eprintln!("hotl: denied (headless): {summary}");
                 let _ = reply.send(hotl_engine::AskReply::Deny { message: None });
             }
+            EngineEvent::EgressAsk { host, reply } => {
+                // Same posture as `Ask`, stated explicitly rather than left to
+                // a catch-all: dropping the reply would also deny, but only by
+                // accident, and an accident is one refactor from a 120-second
+                // hang (0026 Step 4.5).
+                eprintln!("hotl: egress denied (headless): {host}");
+                let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+            }
             EngineEvent::Question {
                 question, reply, ..
             } => {
@@ -2150,6 +2200,11 @@ impl Surface {
                     question,
                     reply: dead,
                 }
+            }
+            EngineEvent::EgressAsk { host, reply } => {
+                let (dead, _) = tokio::sync::oneshot::channel();
+                let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+                EngineEvent::EgressAsk { host, reply: dead }
             }
             EngineEvent::TurnDone { .. } => {
                 self.turn_running = false;

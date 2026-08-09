@@ -270,6 +270,18 @@ pub enum EngineEvent {
         question: hotl_types::Question,
         reply: oneshot::Sender<hotl_types::QuestionAnswer>,
     },
+    /// A subprocess tried to reach a host outside `[network].allow`, and no
+    /// human-approved call in flight had shown that host (plan 0026).
+    ///
+    /// A **grant**, unlike `Question`, and a socket rather than a tool, unlike
+    /// `Ask` — hence its own variant rather than a sixth `AskReply` case that
+    /// would be unreachable at every tool-call site that matches `AskReply`
+    /// exhaustively. A dropped `reply` resolves to `NoAnswer`, which refuses
+    /// the connection and records nothing.
+    EgressAsk {
+        host: String,
+        reply: oneshot::Sender<hotl_tools::net::EgressDecision>,
+    },
     TurnDone {
         outcome: Outcome,
         usage: TokenUsage,
@@ -302,6 +314,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::Compacted { degraded } => write!(f, "Compacted({degraded})"),
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),
             Self::Question { question, .. } => write!(f, "Question({})", question.header),
+            Self::EgressAsk { host, .. } => write!(f, "EgressAsk({host})"),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
             Self::TodosChanged { items } => write!(f, "TodosChanged(n={})", items.len()),
             Self::LedgerReport(s) => write!(f, "LedgerReport(samples={})", s.sample_count),
@@ -626,6 +639,21 @@ pub struct SessionDeps {
     pub config: EngineConfig,
 }
 
+/// See [`SessionHandle::turn_cancel`]. Reads the cell, never writes it — only
+/// the actor and `interrupt` may swap or cancel the token.
+#[derive(Clone)]
+pub struct TurnCancel(Arc<Mutex<CancellationToken>>);
+
+impl TurnCancel {
+    /// The token the current turn is racing, right now.
+    pub fn token(&self) -> CancellationToken {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
 pub struct SessionHandle {
     cmd: mpsc::Sender<SessionCmd>,
     pub events: mpsc::Receiver<EngineEvent>,
@@ -702,6 +730,16 @@ impl SessionHandle {
     pub async fn continue_turn(&self) {
         let _ = self.cmd.send(SessionCmd::Continue).await;
     }
+    /// A live view of whatever token the *current* turn is racing — the same
+    /// cell [`SessionHandle::interrupt`] cancels. Handed to the plan-0026
+    /// egress sink, which is built once per session but must not hold a
+    /// connection open across a turn the user already interrupted; a plain
+    /// `CancellationToken` clone would freeze on the turn that happened to be
+    /// current at session start.
+    pub fn turn_cancel(&self) -> TurnCancel {
+        TurnCancel(self.current_turn.clone())
+    }
+
     /// Out-of-band interrupt of the in-flight turn (never queued behind data).
     pub fn interrupt(&self) {
         // A poisoned lock is fine: the token has no invariants to protect.
@@ -956,6 +994,82 @@ pub fn question_sink(
             )
             .await;
             answer
+        })
+    })
+}
+
+/// The production [`hotl_tools::net::EgressAskSink`] (plan 0026): the proxy's
+/// bridge to a human when a subprocess reaches a host `[network].allow` does
+/// not cover.
+///
+/// Three things happen here, in order:
+///
+/// 1. **The shown-hosts rule.** If a human-approved call still in flight had
+///    this host on screen, allow it with no event and no prompt. A human who
+///    approves `curl https://docs.example.com` has read the host; asking again
+///    is the noise that trains people to reflex-key the gate. `Verdict::Auto`
+///    deliberately does not count — an allow-rule is not a human, and a
+///    rule-approved `curl` reaching an unlisted host is precisely the case the
+///    ask exists for.
+/// 2. Otherwise emit [`EngineEvent::EgressAsk`] and await the answer, racing
+///    the session's cancellation token.
+/// 3. Log the decision either way. A suppressed ask is still a decision
+///    (0026 decision 14) — without the line the audit trail shows a connection
+///    nobody appears to have approved.
+///
+/// Every failure resolves to `NoAnswer`: a gone session, a send failure, a
+/// dropped reply, a cancelled turn. `NoAnswer` refuses the connection and is
+/// never written to the session table.
+///
+/// Only *weak* senders are captured, for the same reason [`question_sink`]
+/// captures weak ones: this sink is installed process-wide and outlives the
+/// session, so a strong sender here would keep the actor alive forever.
+///
+/// The sink is built once per session but resolves `cancel` per ask, so an
+/// interrupt lands on the turn that is actually running (see
+/// [`SessionHandle::turn_cancel`]). Cancellation here is the engine-side
+/// guard; the proxy's independent one is its own deadline.
+pub fn egress_ask_sink(
+    events_tx: mpsc::WeakSender<EngineEvent>,
+    cancel: TurnCancel,
+) -> hotl_tools::net::EgressAskSink {
+    use hotl_tools::net::EgressDecision;
+    Arc::new(move |ask: hotl_tools::net::EgressAsk| {
+        let events_tx = events_tx.clone();
+        let cancel = cancel.token();
+        Box::pin(async move {
+            let host = ask.host;
+            if hotl_tools::net::host_was_shown(&host) {
+                eprintln!("egress: allowed \"{host}\" — shown in an approved call");
+                return EgressDecision::Allow;
+            }
+            let Some(events) = events_tx.upgrade() else {
+                eprintln!("egress: denied \"{host}\" — no answer");
+                return EgressDecision::NoAnswer;
+            };
+            let (reply_tx, reply_rx) = oneshot::channel();
+            if events
+                .send(EngineEvent::EgressAsk {
+                    host: host.clone(),
+                    reply: reply_tx,
+                })
+                .await
+                .is_err()
+            {
+                eprintln!("egress: denied \"{host}\" — no answer");
+                return EgressDecision::NoAnswer;
+            }
+            let decision = tokio::select! {
+                biased;
+                _ = cancel.cancelled() => EgressDecision::NoAnswer,
+                reply = reply_rx => reply.unwrap_or(EgressDecision::NoAnswer),
+            };
+            match decision {
+                EgressDecision::Allow => eprintln!("egress: allowed \"{host}\" — human"),
+                EgressDecision::Deny => eprintln!("egress: denied \"{host}\" — human"),
+                EgressDecision::NoAnswer => eprintln!("egress: denied \"{host}\" — no answer"),
+            }
+            decision
         })
     })
 }

@@ -6,6 +6,20 @@
 //! content is data, never instruction, the same defense `spawn`/`recall`
 //! apply.
 //!
+//! A refused host is a question rather than a dead end (plan 0026), resolved
+//! through `net::decide_denied_host` — the same session decision table bash's
+//! proxy uses, so one answer covers both paths. `web_fetch` is
+//! `Permission::Ask` always and its summary always carries the whole URL, so a
+//! human-approved fetch hits the shown-hosts rule and never prompts twice; the
+//! egress ask stays reachable only when an `[[allow]]` rule auto-approved the
+//! fetch, which is precisely when nobody saw the host.
+//!
+//! Which makes this worth saying plainly: a rule-auto-approved `web_fetch` is
+//! the cheapest way for an injected model to put a hostname in front of a
+//! human. It grants nothing — the ask can only withhold an approval, never
+//! manufacture one — but the prompt is model-reachable, and any claim that it
+//! is not would be false.
+//!
 //! `web_fetch` is always registered (it needs no backend); `web_search`
 //! (added alongside it) is backend-pluggable and absent from the registry
 //! unless `[web] search` is configured — nothing phones home by default (the
@@ -466,9 +480,14 @@ impl WebFetchTool {
                 )));
                 continue;
             }
+            // Plan 0026: a refusal is a question, not a dead end — and it goes
+            // through the *same* session table bash's proxy uses, so one `y`
+            // covers both tools.
             if let HostVerdict::Denied(reason) = net::host_allowed(&host) {
-                results[idx] = Some(Err(format!("refused: {reason}")));
-                continue;
+                if !net::decide_denied_host(&host).await {
+                    results[idx] = Some(Err(format!("refused: {reason}")));
+                    continue;
+                }
             }
             let client = client.clone();
             let concurrency = self.concurrency.clone();
@@ -816,7 +835,9 @@ impl WebSearchTool {
         // Egress is authoritative for the search backend host too — the
         // same policy `web_fetch`/bash consult, not a second allowlist.
         if let HostVerdict::Denied(reason) = net::host_allowed(&host) {
-            return ToolOutcome::err(format!("web_search refused: {reason}"));
+            if !net::decide_denied_host(&host).await {
+                return ToolOutcome::err(format!("web_search refused: {reason}"));
+            }
         }
         let mut req = client.get(&self.backend.url).query(&[("q", query)]);
         if let Some(key) = &self.backend.api_key {

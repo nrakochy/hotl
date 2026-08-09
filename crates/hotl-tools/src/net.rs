@@ -349,6 +349,95 @@ pub fn host_allowed(host: &str) -> HostVerdict {
 // nothing beyond the session.
 // ---------------------------------------------------------------------------
 
+/// Hosts a human demonstrably saw in an approval summary.
+///
+/// URL-**parsed**, never substring-matched, and any URL carrying a userinfo
+/// component contributes nothing: `https://good.com@evil.com/` parses to host
+/// `evil.com` while a reader's eye lands on `good.com`, and that mismatch is
+/// exactly what the egress ask exists to surface. This is the one place where
+/// being clever loses and being paranoid wins.
+///
+/// Only URL-shaped tokens count. Prose that merely mentions a hostname must
+/// not pre-authorize it.
+pub fn hosts_shown_in(summary: &str) -> Vec<String> {
+    summary
+        .split_whitespace()
+        .filter_map(|token| {
+            let token = token.trim_matches(|c: char| "\"'`,;()[]{}<>".contains(c));
+            let url = reqwest::Url::parse(token).ok()?;
+            if !url.username().is_empty() || url.password().is_some() {
+                return None;
+            }
+            Some(normalize_host(url.host_str()?))
+        })
+        .collect()
+}
+
+/// Hosts a human approved *and saw* in a tool call that is in flight right
+/// now. The egress ask is skipped for these — a human who approves
+/// `curl https://docs.example.com` has read the host, and prompting again is
+/// the noise that turns a gate into a rubber stamp.
+///
+/// **Say the invariant once:** hotl skips the egress ask only for hosts that
+/// appeared, parsed as a URL host with no userinfo, in a summary a human
+/// approved and that has not finished executing.
+///
+/// Refcounted, not a plain set: parallel tool calls are real (`Turn::execute`
+/// takes `&self` precisely so approved calls in one chunk run concurrently),
+/// so two calls may show the same host and must not un-show it for each other.
+///
+/// TRAP: process-wide `Arc`-shared state, NOT a `tokio::task_local!` like
+/// plan 0022's `SECRET_READS`. The proxy's `handle_conn` runs on a task
+/// spawned from a process-lifetime accept loop, not inside the tool's future,
+/// so a task-local would read its default there and the rule would silently
+/// never fire — a plumbing bug whose symptom (prompts for hosts you just
+/// approved) reads as a logic bug.
+///
+/// Process-wide rather than threaded through the session, deviating from the
+/// plan's `SharedDeps` field: the proxy and `ASK_SINK` are both process-wide
+/// and `ASK_SINK` is set-once, so a per-session registry would be read for the
+/// first session only and silently never fire for a fork or a sub-agent.
+static SHOWN_HOSTS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Register `hosts` as on-screen for as long as the returned guard lives.
+///
+/// RAII rather than a manual remove, for the same reason `SECRET_READS` is a
+/// scope rather than a set/unset pair: the registration must end on every exit
+/// path from the call, including denials, early returns, and panics.
+pub fn show_hosts(hosts: Vec<String>) -> ShownHostsGuard {
+    let mut shown = SHOWN_HOSTS.lock().unwrap_or_else(PoisonError::into_inner);
+    for host in &hosts {
+        *shown.entry(host.clone()).or_insert(0) += 1;
+    }
+    ShownHostsGuard(hosts)
+}
+
+/// Was `host` on screen in a human-approved call that is still running?
+pub fn host_was_shown(host: &str) -> bool {
+    SHOWN_HOSTS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .contains_key(&normalize_host(host))
+}
+
+/// Drops the registration on scope exit. See [`show_hosts`].
+pub struct ShownHostsGuard(Vec<String>);
+
+impl Drop for ShownHostsGuard {
+    fn drop(&mut self) {
+        let mut shown = SHOWN_HOSTS.lock().unwrap_or_else(PoisonError::into_inner);
+        for host in &self.0 {
+            match shown.get_mut(host) {
+                Some(count) if *count > 1 => *count -= 1,
+                _ => {
+                    shown.remove(host);
+                }
+            }
+        }
+    }
+}
+
 /// The proxy's bridge to the human. A **grant**, unlike `ask_user`'s
 /// `QuestionSink` (`ask.rs`), which explicitly authorizes nothing — hence a
 /// separate type (0026 decision 2). Installed by the binary at startup; absent
@@ -449,6 +538,25 @@ fn record_decision(host: &str, allow: bool) {
         .insert(host.to_string(), allow);
 }
 
+/// The `web_fetch`/`web_search` twin of the proxy's `decide_host`. Those tools
+/// check egress *before* opening a socket, with no proxy round-trip, so
+/// without this they would keep a second, private notion of what the human
+/// decided. Returns `true` if the host may be reached after all.
+///
+/// `Off` never asks — the kernel refuses and there is no proxy in the path to
+/// intercept anything, so there is nothing to ask about. Its refusal passes
+/// straight through.
+///
+/// Redirects are deliberately not routed here: `redirect_policy` is a
+/// synchronous reqwest callback with nowhere to await a human, so a redirect
+/// into a denied host stays refused.
+pub async fn decide_denied_host(host: &str) -> bool {
+    if !matches!(policy(), EgressPolicy::Allowlist(_)) {
+        return false;
+    }
+    resolve_host(host).await == EgressDecision::Allow
+}
+
 /// Removes the in-flight entry however the driver ends — answered, timed out,
 /// panicked, or dropped because the client hung up. Without it a vanished
 /// driver leaves an entry every later connection joins and instantly loses on,
@@ -466,7 +574,11 @@ impl Drop for InFlightGuard {
 
 /// Resolve a host the static allowlist did not match. Order: session table →
 /// join an in-flight ask → drive a fresh one.
-async fn resolve_host(host: &str) -> EgressDecision {
+///
+/// Public because `web_fetch`/`web_search` check egress before opening a
+/// socket, with no proxy round-trip: routing their refusals through here is
+/// what gives both paths one session table instead of two.
+pub async fn resolve_host(host: &str) -> EgressDecision {
     let host = normalize_host(host);
 
     // 1. Already decided this session.
@@ -1165,6 +1277,75 @@ mod tests {
         client.read_to_string(&mut reply).await.unwrap();
         assert!(reply.starts_with("HTTP/1.1 200 OK"), "got: {reply}");
         assert!(reply.ends_with("ok"));
+    }
+
+    // --- the shown-hosts rule (0026 Task 4) --------------------------------
+
+    /// Parse-based, never substring-based. The userinfo row is the one that
+    /// matters: a reader's eye lands on `good.com` while the connection goes
+    /// to `evil.com`, so that summary must be worth nothing.
+    #[test]
+    fn hosts_shown_in_is_parse_based() {
+        let cases: &[(&str, &[&str])] = &[
+            ("curl https://docs.example.com/x", &["docs.example.com"]),
+            ("curl https://good.com@evil.com/", &[]),
+            ("curl https://user:pw@x.com/", &[]),
+            ("curl https://EXAMPLE.com./", &["example.com"]),
+            ("curl http://127.0.0.1:8080/", &["127.0.0.1"]),
+            ("echo \"not a url: example.com\"", &[]),
+            ("curl https://a.com https://b.com", &["a.com", "b.com"]),
+            ("curl \"https://x.com#@y.com\"", &["x.com"]),
+            ("curl https://x.com,", &["x.com"]),
+            ("git clone git@github.com:o/r", &[]),
+        ];
+        for (input, expected) in cases {
+            let got = hosts_shown_in(input);
+            assert_eq!(
+                &got.iter().map(String::as_str).collect::<Vec<_>>(),
+                expected,
+                "for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn show_is_refcounted_across_overlapping_guards() {
+        let outer = show_hosts(vec!["refcount.example".into()]);
+        let inner = show_hosts(vec!["refcount.example".into()]);
+        assert!(host_was_shown("refcount.example"));
+        drop(inner);
+        assert!(
+            host_was_shown("refcount.example"),
+            "one of two parallel calls finishing must not un-show the host"
+        );
+        drop(outer);
+        assert!(!host_was_shown("refcount.example"));
+    }
+
+    #[test]
+    fn guard_drop_unshows_even_on_panic() {
+        let caught = std::panic::catch_unwind(|| {
+            let _guard = show_hosts(vec!["panicky.example".into()]);
+            panic!("deliberate");
+        });
+        assert!(caught.is_err());
+        assert!(
+            !host_was_shown("panicky.example"),
+            "a panicking call must not leave a standing egress suppression"
+        );
+    }
+
+    /// The registry is a live-call view, never a grant: nothing it holds is
+    /// written to the session table.
+    #[test]
+    fn shown_hosts_are_matched_normalized() {
+        let _guard = show_hosts(hosts_shown_in("curl https://Normalized.Example./x"));
+        assert!(host_was_shown("normalized.example"));
+        assert!(host_was_shown("NORMALIZED.EXAMPLE."));
+        assert!(!SESSION_HOSTS
+            .read()
+            .unwrap()
+            .contains_key("normalized.example"));
     }
 
     // --- the egress ask (0026 Tasks 2 and 3) -------------------------------
