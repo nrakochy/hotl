@@ -662,7 +662,16 @@ fn apply_proxy_env(
 /// developer-facing generated files (Makefile, package.json, build.rs) and
 /// `.git/config` are *not* here, so ordinary build/git flows are never
 /// hard-denied; those rely on the permission-layer escalation
-/// (`bash_protected_write_reason`) and the deferred Linux work.
+/// (`bash_protected_write_reason`).
+///
+/// **macOS only, and not for want of trying** (plan 0022 task 4 retired this
+/// slot's old "the deferred Linux work" marker). SBPL has real deny rules;
+/// Landlock has none, and its rights union across ancestors, so denying
+/// `<cwd>/.git/hooks` means granting no write on `<cwd>` or `<cwd>/.git`.
+/// Measured on 6.8: that does deny the hook, and also denies creating any
+/// new file at the top of the workspace and `.git/index.lock` — it breaks
+/// ordinary work, so it is not shipped. Linux keeps the permission-layer
+/// escalation alone here; `docs/SECURITY.md` states the gap.
 #[cfg(target_os = "macos")]
 const PROTECTED_SUBPATHS: &[&str] = &[
     ".git/hooks",
@@ -1037,6 +1046,11 @@ fn build_landlock_ruleset_with(
     // Full access under cwd, tmp, /dev, and any configured extra root. A
     // since-deleted extra fails `PathFd::new` and is skipped — writes there
     // simply stay denied (fail closed), matching the /dev handling.
+    //
+    // No `PROTECTED_SUBPATHS` twin here: carving `.git/hooks` back out of a
+    // cwd grant would mean granting no write on cwd itself (rights union
+    // across ancestors), which measurably denies creating any new file at the
+    // top of the workspace. See the const's doc comment.
     let base = [cwd.as_path(), tmp.as_path(), std::path::Path::new("/dev")];
     for p in base
         .iter()
