@@ -147,6 +147,10 @@ enum Gate {
     Ready {
         input: Value,
         summary: String,
+        /// The plan-0022 per-command credential-read grant, if the human gave
+        /// it. `execute` scopes it around the single `Tool::run` future, which
+        /// is what makes "per command" structural rather than a convention.
+        secret_reads: bool,
     },
     /// Answered without running. `chargeable` is false for outcomes the model
     /// cannot fix by trying again — a human denial, a hook block, an
@@ -1368,9 +1372,15 @@ impl Turn {
         };
         let display =
             hotl_types::sanitize::safe_summary(&summary.clone().unwrap_or_else(|| tu.name.clone()));
+        let mut secret_reads = false;
         if let Some(summary) = summary {
             match self.approve_input(tu, &input, summary, why).await {
                 AskReply::Allow => {}
+                // Plan 0022: approved *and* the credential read-deny lifted,
+                // for this call only. Carried on the Gate rather than in the
+                // tool input — the model writes the input, so a grant living
+                // there would be self-granted.
+                AskReply::AllowWithSecretReads => secret_reads = true,
                 AskReply::AllowEdited { input: edited } => input = edited, // §2b
                 AskReply::Respond { content } => {
                     // §2b: the human answered as the tool — skip execution.
@@ -1419,6 +1429,7 @@ impl Turn {
         Gate::Ready {
             input,
             summary: display,
+            secret_reads,
         }
     }
 
@@ -1428,8 +1439,12 @@ impl Turn {
     async fn execute(&self, tu: &ToolUse, gate: Gate) -> Executed {
         // Exhaustive by construction: a new `Gate` variant is a compile error
         // here, not a runtime panic on a supervised task (T1-5).
-        let (input, summary) = match gate {
-            Gate::Ready { input, summary } => (input, summary),
+        let (input, summary, secret_reads) = match gate {
+            Gate::Ready {
+                input,
+                summary,
+                secret_reads,
+            } => (input, summary, secret_reads),
             Gate::Resolved {
                 outcome,
                 chargeable,
@@ -1453,7 +1468,12 @@ impl Turn {
                 chargeable: true,
             };
         };
-        let mut outcome = tool.run(input, self.cancel.clone()).await;
+        // Plan 0022: the grant lives in a task-local scoped around exactly
+        // this future, so `sandbox::build_command` sees it for this spawn and
+        // no other. A later call in the same turn re-enters with `false`.
+        let mut outcome = hotl_tools::sandbox::SECRET_READS
+            .scope(secret_reads, tool.run(input, self.cancel.clone()))
+            .await;
         // PostToolUse: a node-style proposal may replace a successful result.
         // §S1 HookRouter gate: a masked-off (or hook-less) session never
         // reaches `call_post_tool` — no cap copy, no timeout/cancel race.
@@ -2133,7 +2153,10 @@ impl Turn {
         };
         let allowed = matches!(
             reply,
-            AskReply::Allow | AskReply::AllowEdited { .. } | AskReply::Respond { .. }
+            AskReply::Allow
+                | AskReply::AllowWithSecretReads
+                | AskReply::AllowEdited { .. }
+                | AskReply::Respond { .. }
         );
         let _ = self
             .propose(

@@ -194,6 +194,10 @@ pub struct SpecDigest {
 #[derive(Debug, Clone, PartialEq)]
 pub enum AskReply {
     Allow,
+    /// The human approved *and* lifted the credential read-deny for this one
+    /// command (plan 0022). Never reachable headless or from a sub-agent, and
+    /// scoped to the single `Tool::run` future so it cannot outlive the call.
+    AllowWithSecretReads,
     Deny {
         message: Option<String>,
     },

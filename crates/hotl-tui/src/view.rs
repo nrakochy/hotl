@@ -731,8 +731,15 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
             Style::new().fg(p.ink),
         ));
     } else {
+        // Plan 0022: `s` is offered only where it does something — a bash ask
+        // whose label does not already say the credential reads are open.
+        // An option that is a no-op is worse than no option.
         lines.push(Line::styled(
-            "y allow · n deny · type a reason after n",
+            if crate::app::secret_read_grant_applies(summary) {
+                "y allow · s allow + credential reads (this command only) · n deny"
+            } else {
+                "y allow · n deny · type a reason after n"
+            },
             Style::new().fg(p.faint),
         ));
     }

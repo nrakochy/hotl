@@ -48,7 +48,13 @@ fn ask_reply_from_result(result: Option<&Value>) -> AskReply {
         };
     }
     if r.get("allow").and_then(Value::as_bool) == Some(true) {
-        return AskReply::Allow;
+        // Plan 0022: `{"allow":true,"secretReads":true}` also lifts the
+        // credential read-deny, for this one command. A client that does not
+        // send the field gets a plain `Allow` — the fail-closed direction.
+        return match r.get("secretReads").and_then(Value::as_bool) {
+            Some(true) => AskReply::AllowWithSecretReads,
+            _ => AskReply::Allow,
+        };
     }
     AskReply::Deny {
         message: r.get("message").and_then(Value::as_str).map(String::from),
@@ -931,4 +937,35 @@ async fn send(writer: &Writer, msg: &Value) {
     let mut w = writer.lock().await;
     let _ = w.write_all(line.as_bytes()).await;
     let _ = w.flush().await;
+}
+
+#[cfg(test)]
+mod ask_reply_tests {
+    use super::*;
+
+    /// Plan 0022: the credential-read grant rides the same permission result
+    /// the TUI already sends. A client that never heard of it gets `Allow`,
+    /// which is the fail-closed direction.
+    #[test]
+    fn secret_reads_is_opt_in_and_only_on_an_allow() {
+        let reply = |v: Value| ask_reply_from_result(Some(&v));
+        assert_eq!(
+            reply(serde_json::json!({"allow": true, "secretReads": true})),
+            AskReply::AllowWithSecretReads
+        );
+        for result in [
+            serde_json::json!({"allow": true}),
+            serde_json::json!({"allow": true, "secretReads": false}),
+            // A non-boolean is not a grant.
+            serde_json::json!({"allow": true, "secretReads": "yes"}),
+        ] {
+            assert_eq!(reply(result.clone()), AskReply::Allow, "{result}");
+        }
+        // The flag cannot smuggle an approval past a denial.
+        assert!(matches!(
+            reply(serde_json::json!({"allow": false, "secretReads": true})),
+            AskReply::Deny { .. }
+        ));
+        assert!(matches!(ask_reply_from_result(None), AskReply::Deny { .. }));
+    }
 }

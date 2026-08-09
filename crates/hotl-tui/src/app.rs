@@ -386,6 +386,9 @@ pub enum Cmd {
     ReplyPermission {
         req_id: u64,
         allow: bool,
+        /// Plan 0022: approved *and* the credential read-deny lifted for this
+        /// one command. Only ever set from the `s` key on a bash ask.
+        secret_reads: bool,
         message: Option<String>,
     },
     /// Answer a `session/request_question`. Exactly one of `selected`
@@ -1279,6 +1282,7 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
 fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     let Phase::WaitingAsk {
         req_id,
+        summary,
         input,
         denying,
         ..
@@ -1287,6 +1291,7 @@ fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         return Vec::new();
     };
     let req_id = *req_id;
+    let offers_secret_reads = secret_read_grant_applies(summary);
     if *denying {
         match key.code {
             KeyCode::Char(c) => input.push(c),
@@ -1299,14 +1304,20 @@ fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             }
             KeyCode::Enter => {
                 let message = Some(input.clone()).filter(|m| !m.trim().is_empty());
-                return resume_after_ask(state, req_id, false, message);
+                return resume_after_ask(state, req_id, false, false, message);
             }
             _ => {}
         }
         return Vec::new();
     }
     match key.code {
-        KeyCode::Char('y') => resume_after_ask(state, req_id, true, None),
+        KeyCode::Char('y') => resume_after_ask(state, req_id, true, false, None),
+        // Plan 0022: approve *and* lift the credential read-deny, for this one
+        // command. Ignored unless the ask is one the grant can reach, so the
+        // key never silently does nothing.
+        KeyCode::Char('s') if offers_secret_reads => {
+            resume_after_ask(state, req_id, true, true, None)
+        }
         KeyCode::Char('n') => {
             *denying = true;
             Vec::new()
@@ -1316,6 +1327,17 @@ fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         KeyCode::Esc => interrupt_or_detach(state),
         _ => Vec::new(),
     }
+}
+
+/// Does the per-command credential-read grant mean anything for this ask?
+///
+/// Only `bash` spawns a confined child, and only while the credential tier is
+/// still denied — the sandbox label carries `reads:open` once an operator
+/// lifted it via `[sandbox].readable`. Reading the label rather than the
+/// process globals is deliberate: in attach mode the TUI is a *different
+/// process* from the engine, where those globals are un-inited.
+pub(crate) fn secret_read_grant_applies(summary: &str) -> bool {
+    summary.starts_with("bash [") && !summary.contains("reads:open")
 }
 
 /// `ask_user`'s modal (tier-1 gap #4): number keys 1-N pick an option
@@ -1388,6 +1410,7 @@ fn resume_after_ask(
     state: &mut State,
     req_id: u64,
     allow: bool,
+    secret_reads: bool,
     message: Option<String>,
 ) -> Vec<Cmd> {
     state.phase = Phase::Sampling { ticks: 0 };
@@ -1395,6 +1418,7 @@ fn resume_after_ask(
         Cmd::ReplyPermission {
             req_id,
             allow,
+            secret_reads,
             message,
         },
         Cmd::SetTitle(title(state, " — working")),
@@ -2070,6 +2094,7 @@ mod tests {
                 Cmd::ReplyPermission {
                     req_id: 7,
                     allow: true,
+                    secret_reads: false,
                     message: None
                 },
                 ..
@@ -2082,10 +2107,65 @@ mod tests {
         type_str(&mut s, "wrong dir");
         let cmds = press(&mut s, KeyCode::Enter);
         assert!(
-            matches!(&cmds[..], [Cmd::ReplyPermission { req_id: 7, allow: false, message: Some(m) }, ..]
+            matches!(&cmds[..], [Cmd::ReplyPermission { req_id: 7, allow: false, message: Some(m), .. }, ..]
             if m == "wrong dir")
         );
         assert!(!matches!(s.phase, Phase::WaitingAsk { .. }));
+    }
+
+    /// Plan 0022: `s` allows *and* lifts the credential read-deny, but only
+    /// on an ask the grant can reach. Everywhere else the key must fall
+    /// through to the catch-all, because an option that does nothing is worse
+    /// than no option.
+    #[test]
+    fn ask_s_grants_credential_reads_only_where_it_applies() {
+        let ask_with = |s: &mut State, summary: &str| {
+            update(
+                s,
+                Msg::PermissionRequest {
+                    req_id: 7,
+                    summary: summary.into(),
+                    protected_why: None,
+                    diff: Vec::new(),
+                },
+            );
+        };
+        let mut s = State::test_default();
+        ask_with(&mut s, "bash [sandboxed:seatbelt]: cat ~/.ssh/id_ed25519");
+        let cmds = press(&mut s, KeyCode::Char('s'));
+        assert!(
+            matches!(
+                cmds[..],
+                [
+                    Cmd::ReplyPermission {
+                        req_id: 7,
+                        allow: true,
+                        secret_reads: true,
+                        message: None
+                    },
+                    ..
+                ]
+            ),
+            "{cmds:?}"
+        );
+
+        for summary in [
+            // Not bash: nothing spawns, so there is nothing to lift.
+            "write ~/.ssh/config",
+            // Already lifted by [sandbox].readable — the label says so.
+            "bash [sandboxed:landlock reads:open]: cat ~/.ssh/id_ed25519",
+        ] {
+            let mut s = State::test_default();
+            ask_with(&mut s, summary);
+            assert!(
+                press(&mut s, KeyCode::Char('s')).is_empty(),
+                "`s` must be inert for `{summary}`"
+            );
+            assert!(
+                matches!(s.phase, Phase::WaitingAsk { .. }),
+                "`{summary}` must still be waiting"
+            );
+        }
     }
 
     fn question(s: &mut State) {

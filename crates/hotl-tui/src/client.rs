@@ -88,8 +88,19 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         id
     }
 
-    pub async fn reply_permission(&mut self, req_id: u64, allow: bool, message: Option<String>) {
+    pub async fn reply_permission(
+        &mut self,
+        req_id: u64,
+        allow: bool,
+        secret_reads: bool,
+        message: Option<String>,
+    ) {
         let mut result = json!({"allow": allow});
+        // Plan 0022: only ever sent when set, so the ordinary allow stays
+        // byte-identical to the pre-0022 result an ACP client already parses.
+        if secret_reads {
+            result["secretReads"] = json!(true);
+        }
         if let Some(m) = message {
             result["message"] = json!(m);
         }
@@ -351,8 +362,13 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         Cmd::ReplyPermission {
             req_id,
             allow,
+            secret_reads,
             message,
-        } => client.reply_permission(req_id, allow, message).await,
+        } => {
+            client
+                .reply_permission(req_id, allow, secret_reads, message)
+                .await
+        }
         Cmd::ReplyQuestion {
             req_id,
             selected,
@@ -648,10 +664,12 @@ mod tests {
     async fn reply_permission_shape_matches_server_contract() {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
-        client.reply_permission(7, true, None).await;
+        client.reply_permission(7, true, false, None).await;
         client
-            .reply_permission(8, false, Some("wrong dir".into()))
+            .reply_permission(8, false, false, Some("wrong dir".into()))
             .await;
+        // Plan 0022: the grant rides the same result.
+        client.reply_permission(9, true, true, None).await;
         drop(client);
         let mut out = String::new();
         read.read_to_string(&mut out).await.unwrap();
@@ -666,6 +684,12 @@ mod tests {
         assert_eq!(
             lines[1],
             json!({"jsonrpc": "2.0", "id": 8, "result": {"allow": false, "message": "wrong dir"}})
+        );
+        // `secretReads` is present only when taken, so an ordinary allow stays
+        // byte-identical for every ACP client that has never heard of it.
+        assert_eq!(
+            lines[2],
+            json!({"jsonrpc": "2.0", "id": 9, "result": {"allow": true, "secretReads": true}})
         );
     }
 

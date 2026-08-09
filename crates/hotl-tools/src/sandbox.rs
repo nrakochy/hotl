@@ -63,26 +63,54 @@ fn automation_policy() -> Automation {
     }
 }
 
+/// Whether the credential tier of the read-carve is still denied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reads {
+    /// The default: `~/.ssh` and the credential class are unreadable.
+    Carved,
+    /// An operator lifted the whole credential tier via `[sandbox].readable`.
+    Open,
+}
+
 impl SandboxStatus {
     pub fn label(&self) -> String {
         match self {
-            SandboxStatus::Enforced(m) => label_with(m, unix_socket_policy(), automation_policy()),
+            SandboxStatus::Enforced(m) => {
+                label_with(m, unix_socket_policy(), automation_policy(), read_posture())
+            }
             SandboxStatus::Unavailable(_) => "UNSANDBOXED".to_string(),
             SandboxStatus::Disabled => "UNSANDBOXED(by HOTL_SANDBOX=off)".to_string(),
         }
     }
 }
 
+/// A carve was installed (Tier A is present) but its credential tier is
+/// empty — the only way that happens is an operator lifting it. An
+/// un-inited process has *both* tiers empty and gets no marker: silence is
+/// the hardened state, and inventing a marker there would put one on every
+/// unit test.
+fn read_posture() -> Reads {
+    let deny = read_deny();
+    if !deny.always.is_empty() && deny.secrets.is_empty() {
+        Reads::Open
+    } else {
+        Reads::Carved
+    }
+}
+
 /// Pure renderer. Silence is the hardened default; a marker appears only
 /// where the operator opted *out* of a denial — the same convention
 /// `net::label_suffix` uses (no marker under the default Open egress).
-fn label_with(mechanism: &str, unix: UnixSockets, automation: Automation) -> String {
+fn label_with(mechanism: &str, unix: UnixSockets, automation: Automation, reads: Reads) -> String {
     let mut out = format!("sandboxed:{mechanism}");
     if matches!(unix, UnixSockets::Open) {
         out.push_str(" unix:open");
     }
     if matches!(automation, Automation::Allow) {
         out.push_str(" automation:allow");
+    }
+    if matches!(reads, Reads::Open) {
+        out.push_str(" reads:open");
     }
     out
 }
@@ -1378,6 +1406,38 @@ mod write_set_tests {
         assert!(base.contains(&PathBuf::from("/private/tmp")));
     }
 
+    /// Plan 0022 decision 3. The grant lifts Tier B and only Tier B, and it
+    /// exists only inside the task-local scope `turn.rs` wraps around the
+    /// single `Tool::run` future — the next call in the same turn re-enters
+    /// with no scope at all and is denied again.
+    #[tokio::test]
+    async fn the_secret_read_grant_is_scoped_and_never_lifts_tier_a() {
+        let deny = ReadDeny {
+            always: vec![PathBuf::from("/data/hotl")],
+            secrets: vec![PathBuf::from("/home/u/.ssh")],
+        };
+        assert_eq!(
+            deny.for_spawn(false),
+            vec![PathBuf::from("/data/hotl"), PathBuf::from("/home/u/.ssh")]
+        );
+        // Granted: Tier B drops, Tier A does not.
+        assert_eq!(deny.for_spawn(true), vec![PathBuf::from("/data/hotl")]);
+
+        // And the grant really is the task-local, not a flag anyone can set:
+        // outside a scope it reads false, which is what an un-granted call —
+        // and every hook, diagnostic and `grep` spawn — sees.
+        assert!(!secret_reads_granted());
+        SECRET_READS
+            .scope(true, async {
+                assert!(secret_reads_granted());
+            })
+            .await;
+        assert!(
+            !secret_reads_granted(),
+            "the grant must not outlive its call"
+        );
+    }
+
     #[test]
     fn probe_dir_from_skips_candidates_inside_any_allowed_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -1787,9 +1847,27 @@ mod tests {
         // With the opt-out active the marker rides every ask; here assert the
         // pure renderer.
         assert_eq!(
-            label_with("seatbelt", UnixSockets::Open, Automation::Allow),
-            "sandboxed:seatbelt unix:open automation:allow"
+            label_with(
+                "seatbelt",
+                UnixSockets::Open,
+                Automation::Allow,
+                Reads::Open
+            ),
+            "sandboxed:seatbelt unix:open automation:allow reads:open"
         );
+        // The default carve is silent — plan 0022 does not add a marker to
+        // every ask on a hardened host.
+        assert_eq!(
+            label_with(
+                "seatbelt",
+                UnixSockets::DenyDaemons,
+                Automation::Deny,
+                Reads::Carved
+            ),
+            "sandboxed:seatbelt"
+        );
+        // An un-inited process has no carve at all and still says nothing.
+        assert_eq!(read_posture(), Reads::Carved);
     }
 
     #[tokio::test]
