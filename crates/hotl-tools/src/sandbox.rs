@@ -162,13 +162,14 @@ pub struct SandboxExtras {
     pub read_deny: ReadDeny,
 }
 
-/// The kernel read-carve, in two tiers.
+/// The kernel read-carve, in three tiers.
 ///
 /// The split is the whole design: Tier A is what would let a confined child
 /// escalate into hotl itself (the session token drives the socket, which is
 /// the permission gate), so it is never liftable. Tier B is the credential
 /// class — worth denying by default, but an operator with a real need can
 /// lift it per-entry with `[sandbox].readable` or per-command at the ask.
+/// Tier C is what the owner's own `[[deny]]` rules imply (plan 0025).
 #[derive(Debug, Default, Clone)]
 pub struct ReadDeny {
     /// hotl's own config and data dirs. Never liftable, by config or grant.
@@ -176,21 +177,32 @@ pub struct ReadDeny {
     /// The credential class. Already filtered by `[sandbox].readable`; the
     /// per-command grant drops what remains for one spawn.
     pub secrets: Vec<PathBuf>,
+    /// Paths denied by a projected `[[deny]]` rule (plan 0025). Unliftable,
+    /// because `Rules::evaluate` makes deny unconditional in-process and a
+    /// kernel tier that could be lifted while its in-process twin could not is
+    /// exactly the drift 0025 exists to remove.
+    ///
+    /// Deliberately NOT `always`: that field also drives the file-tool refusal
+    /// message (`builtins::hotl_own_dir_reason`) and the read-probe canary
+    /// location, neither of which should follow a user's rule — the canary case
+    /// would have hotl writing files into a directory the owner denied.
+    pub rules: Vec<PathBuf>,
 }
 
 impl ReadDeny {
     /// The paths a given spawn must not read. `secret_reads` is the
-    /// per-command grant: it drops Tier B and never touches Tier A.
+    /// per-command grant: it drops Tier B and never touches Tier A or C.
     pub(crate) fn for_spawn(&self, secret_reads: bool) -> Vec<PathBuf> {
         let mut out = self.always.clone();
         if !secret_reads {
             out.extend(self.secrets.iter().cloned());
         }
+        out.extend(self.rules.iter().cloned());
         out
     }
 
     pub fn is_empty(&self) -> bool {
-        self.always.is_empty() && self.secrets.is_empty()
+        self.always.is_empty() && self.secrets.is_empty() && self.rules.is_empty()
     }
 }
 
@@ -237,6 +249,7 @@ pub fn read_deny() -> &'static ReadDeny {
     static EMPTY: ReadDeny = ReadDeny {
         always: Vec::new(),
         secrets: Vec::new(),
+        rules: Vec::new(),
     };
     EXTRAS.get().map(|e| &e.read_deny).unwrap_or(&EMPTY)
 }
@@ -1514,6 +1527,7 @@ mod write_set_tests {
         let deny = ReadDeny {
             always: vec![PathBuf::from("/data/hotl")],
             secrets: vec![PathBuf::from("/home/u/.ssh")],
+            rules: Vec::new(),
         };
         assert_eq!(
             deny.for_spawn(false),
@@ -1534,6 +1548,32 @@ mod write_set_tests {
         assert!(
             !secret_reads_granted(),
             "the grant must not outlive its call"
+        );
+    }
+
+    /// Plan 0025 decision 6. The grant lifts Tier B and only Tier B — a
+    /// projected `[[deny]]` rule is unliftable, because `Rules::evaluate` makes
+    /// deny unconditional in-process.
+    #[test]
+    fn the_secret_read_grant_does_not_lift_a_projected_rule() {
+        let deny = ReadDeny {
+            always: vec![PathBuf::from("/data/hotl")],
+            secrets: vec![PathBuf::from("/home/u/.ssh")],
+            rules: vec![PathBuf::from("/Volumes/secrets")],
+        };
+        for granted in [false, true] {
+            assert!(
+                deny.for_spawn(granted)
+                    .contains(&PathBuf::from("/Volumes/secrets")),
+                "the grant must not lift Tier C (secret_reads = {granted})"
+            );
+        }
+        assert_eq!(
+            deny.for_spawn(true),
+            vec![
+                PathBuf::from("/data/hotl"),
+                PathBuf::from("/Volumes/secrets")
+            ]
         );
     }
 

@@ -166,11 +166,13 @@
                 "sandbox::tests::seatbelt_denies_protected_subpaths_under_cwd"
                 "sandbox::tests::seatbelt_denies_reading_a_carved_path"
                 "sandbox::tests::seatbelt_egress_off_confines_to_loopback"
-                # hotl-tools tests/sandbox_extras.rs and tests/sandbox_read_carve.rs
-                # — never reached in the nix macos log (fail-fast stopped at the
-                # lib target); caught by the sandbox-exec reproduction above.
+                # hotl-tools tests/sandbox_extras.rs, tests/sandbox_read_carve.rs
+                # and tests/sandbox_rules_carve.rs — never reached in the nix
+                # macos log (fail-fast stopped at the lib target); caught by the
+                # sandbox-exec reproduction above.
                 "configured_extras_widen_the_floor_and_keep_the_probe_sound"
                 "the_carve_denies_hotls_own_run_dir_through_the_process_global_path"
+                "a_projected_deny_rule_denies_reads_to_a_sandboxed_command"
                 # hotl-engine tests/plan_mode.rs — both assert bash actually
                 # ran (one checks its stdout), so the floor must succeed.
                 "plan_plus_ask_prompts_for_bash"
@@ -197,6 +199,7 @@
                 "probe_refuses_a_mechanism_that_does_not_confine"
                 "probe_leaves_no_file_behind_when_the_write_escapes"
                 "the_carve_denies_hotls_own_run_dir_through_the_process_global_path"
+                "a_projected_deny_rule_denies_reads_to_a_sandboxed_command"
               ]
             );
 

@@ -515,10 +515,14 @@ impl SandboxCfg {
     /// forms so a symlink cannot smuggle a protected dir in; the one residue
     /// (documented wart) is that a symlinked *ancestor* can leave a freshly
     /// created empty dir behind before the canonical check refuses the entry.
+    /// `rules` is what the read-carve's third tier is projected from (plan
+    /// 0025). It must be the *fully assembled* set — admin tier merged — or the
+    /// kernel floor is narrower than the rules the gate enforces.
     pub fn resolve(
         &self,
         config_dir: &Path,
         data_dir: &Path,
+        rules: &hotl_tools::rules::Rules,
     ) -> (hotl_tools::sandbox::SandboxExtras, Vec<String>) {
         use hotl_tools::sandbox::FileToolsMode;
         let mut warnings = Vec::new();
@@ -603,11 +607,13 @@ impl SandboxCfg {
                     .to_string(),
             );
         }
+        let containment = hotl_tools::rules::project(rules, &|p| p.canonicalize().ok());
         let read_deny = self.resolve_read_deny(
             config_dir,
             data_dir,
             &hotl_tools::sandbox::write_roots_with(&writable),
             home_dir().as_deref(),
+            &containment,
             &mut warnings,
         );
         (
@@ -620,7 +626,7 @@ impl SandboxCfg {
         )
     }
 
-    /// The two read-carve tiers (plan 0022).
+    /// The three read-carve tiers (plans 0022 and 0025).
     ///
     /// Tier A is hotl's own config and data dirs — the session token under the
     /// data dir drives the session socket, which *is* the permission gate, so
@@ -631,6 +637,11 @@ impl SandboxCfg {
     /// denying the data dir already covers it — that is why it has no entry.
     ///
     /// Tier B is the credential class, minus every `readable` entry.
+    ///
+    /// Tier C is `containment.read_deny` — what the owner's own `[[deny]]`
+    /// rules imply. It goes through the same gauntlet Tier B does, for the same
+    /// reasons, and `containment.unprojectable` joins the warnings so a rule
+    /// that cannot reach the kernel says so rather than looking enforced.
     ///
     /// `granted` (the resolved kernel write set) and `home` are parameters
     /// rather than reads of process state so the unit tests can drive them —
@@ -643,6 +654,7 @@ impl SandboxCfg {
         data_dir: &Path,
         granted: &[std::path::PathBuf],
         home: Option<&Path>,
+        containment: &hotl_tools::rules::Containment,
         warnings: &mut Vec<String>,
     ) -> hotl_tools::sandbox::ReadDeny {
         let mut readable: Vec<std::path::PathBuf> = Vec::new();
@@ -718,7 +730,48 @@ impl SandboxCfg {
             }
             secrets.push(resolved);
         }
-        hotl_tools::sandbox::ReadDeny { always, secrets }
+        // Tier C. Same gauntlet as Tier B, in the same order — a projected rule
+        // is not more privileged than a built-in credential path, and the write
+        // -grant physics are identical.
+        let mut rules = Vec::new();
+        for path in &containment.read_deny {
+            let resolved = canon_or(path);
+            if overlaps(&resolved, &canon_or(config_dir))
+                || overlaps(&resolved, &canon_or(data_dir))
+            {
+                warnings.push(format!(
+                    "[[deny]] over {} is already denied as one of hotl's own dirs — the rule is \
+                     honored, the duplicate entry dropped",
+                    resolved.display()
+                ));
+                continue;
+            }
+            if let Some(root) = granted.iter().find(|g| resolved.starts_with(g)) {
+                warnings.push(format!(
+                    "[sandbox] cannot deny reads of {} — it sits inside the writable root {} \
+                     and the kernel resolves the closest rule, which grants read there",
+                    resolved.display(),
+                    root.display()
+                ));
+                continue;
+            }
+            if let Some(root) = risky_root(&resolved) {
+                warnings.push(format!(
+                    "[[deny]] over {} denies reads under the system root {root} to sandboxed \
+                     commands — honored, but commands that need what lives there will fail",
+                    resolved.display()
+                ));
+            }
+            if !rules.contains(&resolved) && !secrets.contains(&resolved) {
+                rules.push(resolved);
+            }
+        }
+        warnings.extend(containment.unprojectable.iter().cloned());
+        hotl_tools::sandbox::ReadDeny {
+            always,
+            secrets,
+            rules,
+        }
     }
 }
 
@@ -1278,7 +1331,11 @@ path_prefix = "/Volumes/secrets"
         // Absent section: exactly nothing — the floor is byte-identical to
         // an unconfigured hotl, and no warning rides every startup.
         let (_scratch, config_dir, data_dir) = sandbox_dirs();
-        let (extras, warnings) = cfg_with("").sandbox.resolve(&config_dir, &data_dir);
+        let (extras, warnings) = cfg_with("").sandbox.resolve(
+            &config_dir,
+            &data_dir,
+            &hotl_tools::rules::Rules::default(),
+        );
         assert!(extras.writable.is_empty());
         assert_eq!(extras.file_tools, FileToolsMode::Workspace);
         assert!(warnings.is_empty(), "{warnings:?}");
@@ -1300,7 +1357,8 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        let (extras, warnings) =
+            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(missing.is_dir(), "missing entries are created at startup");
         assert_eq!(extras.writable.len(), 2);
@@ -1331,7 +1389,8 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        let (extras, warnings) =
+            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
         // Refusal wins, entry by entry — the good sibling still lands.
         assert_eq!(extras.writable, vec![good.canonicalize().unwrap()]);
         assert_eq!(warnings.len(), 5, "{warnings:?}");
@@ -1350,7 +1409,8 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        let (extras, warnings) =
+            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
         assert_eq!(
             extras.writable,
             vec![std::path::Path::new("/etc").canonicalize().unwrap()]
@@ -1374,7 +1434,8 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) = cfg.resolve(&config_dir, &data_dir);
+        let (extras, warnings) =
+            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
         assert!(extras.writable.is_empty());
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings[0].contains("not a directory"), "{}", warnings[0]);
@@ -1393,7 +1454,7 @@ path_prefix = "/Volumes/secrets"
                 readable: Vec::new(),
                 file_tools: mode.map(String::from),
             }
-            .resolve(&config_dir, &data_dir)
+            .resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default())
         };
         let entry = vec![cache.display().to_string()];
 
@@ -1432,8 +1493,35 @@ path_prefix = "/Volumes/secrets"
         home: &Path,
         granted: &[std::path::PathBuf],
     ) -> (hotl_tools::sandbox::ReadDeny, Vec<String>) {
+        read_deny_projecting(
+            cfg,
+            config_dir,
+            data_dir,
+            home,
+            granted,
+            &hotl_tools::rules::Containment::default(),
+        )
+    }
+
+    /// `read_deny` plus an explicit Tier C (plan 0025), so a projection can be
+    /// driven without a rules file or a real `$HOME`.
+    fn read_deny_projecting(
+        cfg: &SandboxCfg,
+        config_dir: &Path,
+        data_dir: &Path,
+        home: &Path,
+        granted: &[std::path::PathBuf],
+        containment: &hotl_tools::rules::Containment,
+    ) -> (hotl_tools::sandbox::ReadDeny, Vec<String>) {
         let mut warnings = Vec::new();
-        let deny = cfg.resolve_read_deny(config_dir, data_dir, granted, Some(home), &mut warnings);
+        let deny = cfg.resolve_read_deny(
+            config_dir,
+            data_dir,
+            granted,
+            Some(home),
+            containment,
+            &mut warnings,
+        );
         (deny, warnings)
     }
 
@@ -1564,6 +1652,168 @@ path_prefix = "/Volumes/secrets"
         );
         // Tier A is unaffected: it is never inside a writable root (refused).
         assert_eq!(deny.always.len(), 2);
+    }
+
+    /// Tier C (plan 0025): what the owner's own `[[deny]]` rules imply.
+    #[test]
+    fn read_deny_carries_a_projected_rule() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let vault = scratch.path().join("vault");
+        std::fs::create_dir_all(&vault).unwrap();
+        let vault = vault.canonicalize().unwrap();
+        let containment = hotl_tools::rules::Containment {
+            read_deny: vec![vault.clone()],
+            unprojectable: vec!["read path_prefix = \".ssh/\" applies at any depth".into()],
+        };
+        let (deny, warnings) = read_deny_projecting(
+            &SandboxCfg::default(),
+            &config_dir,
+            &data_dir,
+            &home.canonicalize().unwrap(),
+            &[],
+            &containment,
+        );
+        assert_eq!(deny.rules, vec![vault]);
+        // Tier C is its own field — never `always`, which drives the file-tool
+        // refusal message and the read-probe canary location.
+        assert_eq!(deny.always.len(), 2);
+        assert!(!deny.always.contains(&deny.rules[0]));
+        // An unprojectable rule is reported, not dropped.
+        assert!(
+            warnings.iter().any(|w| w.contains("any depth")),
+            "{warnings:?}"
+        );
+    }
+
+    /// The Tier C twin of `read_deny_drops_an_entry_that_sits_inside_a_write_grant`
+    /// — same physics, and skipping the check would ship a denial the kernel
+    /// will not deliver while `doctor` reported it as live.
+    #[test]
+    fn a_projected_rule_inside_a_write_grant_is_dropped_with_a_warning() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let inside = scratch.path().join("work/secrets");
+        std::fs::create_dir_all(&inside).unwrap();
+        let granted = scratch.path().join("work").canonicalize().unwrap();
+        let containment = hotl_tools::rules::Containment {
+            read_deny: vec![inside.canonicalize().unwrap()],
+            unprojectable: Vec::new(),
+        };
+        let (deny, warnings) = read_deny_projecting(
+            &SandboxCfg::default(),
+            &config_dir,
+            &data_dir,
+            &home.canonicalize().unwrap(),
+            std::slice::from_ref(&granted),
+            &containment,
+        );
+        assert!(deny.rules.is_empty(), "{:?}", deny.rules);
+        assert!(
+            warnings.iter().any(|w| w.contains("cannot deny reads of")),
+            "{warnings:?}"
+        );
+    }
+
+    /// Watch-out 5: `doctor` and agent startup must compute one floor. Both
+    /// paths go through `load_rules` + `sandbox.resolve`, so a config with a
+    /// projectable rule yields the same Tier C on both.
+    #[test]
+    fn doctor_and_agent_compute_the_same_containment() {
+        let (scratch, config_dir, _data_dir) = sandbox_dirs();
+        // Outside every write root, or the write-grant check drops the entry
+        // and the test would pass while proving nothing (TMPDIR is granted).
+        let Ok(base) = hotl_tools::sandbox::probe_dir() else {
+            return; // no directory outside the floor on this host
+        };
+        let vault = base.join(format!("hotl-0025-vault-{}", std::process::id()));
+        std::fs::create_dir_all(&vault).unwrap();
+        let vault = vault.canonicalize().unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[[deny]]\ntool = \"read\"\npath_prefix = \"{}\"\n",
+                vault.display()
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(&config_dir);
+        let data_dir = scratch.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        // Both call sites build their rules the same way; the point of the test
+        // is that neither invents a narrower set.
+        let rules = crate::agent::load_rules(&cfg);
+        let (a, _) = cfg.sandbox.resolve(&config_dir, &data_dir, &rules);
+        let (b, _) = cfg.sandbox.resolve(&config_dir, &data_dir, &rules);
+        std::fs::remove_dir_all(&vault).ok();
+        assert_eq!(a.read_deny.rules, b.read_deny.rules);
+        assert_eq!(
+            a.read_deny.rules,
+            vec![vault],
+            "the projected rule must reach the resolved carve"
+        );
+    }
+
+    /// Plan 0025 step 3.3: the admin tier reaches the projection. `merge_admin`
+    /// runs inside `load_rules`, which returns before `sandbox.resolve` is
+    /// called, so the rules the containment is built from already carry it —
+    /// this drives the seam directly, because the `uid == 0` trust gate means no
+    /// non-root test can load a real `/etc/hotl/preapproved.toml`.
+    #[test]
+    fn resolve_projects_an_admin_deny() {
+        let (scratch, config_dir, _) = sandbox_dirs();
+        let Ok(base) = hotl_tools::sandbox::probe_dir() else {
+            return; // no directory outside the write floor on this host
+        };
+        let vault = base.join(format!("hotl-0025-admin-{}", std::process::id()));
+        std::fs::create_dir_all(&vault).unwrap();
+        let vault = vault.canonicalize().unwrap();
+        let data_dir = scratch.path().join("data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let mut rules = hotl_tools::rules::Rules::default();
+        rules.merge_admin(
+            hotl_tools::rules::AdminRules::from_toml(&format!(
+                "[[deny]]\ntool = \"read\"\npath_prefix = \"{}\"\n",
+                vault.display()
+            ))
+            .unwrap(),
+        );
+        let (extras, _) = SandboxCfg::default().resolve(&config_dir, &data_dir, &rules);
+        std::fs::remove_dir_all(&vault).ok();
+        assert_eq!(extras.read_deny.rules, vec![vault]);
+    }
+
+    /// No silent tightening for people who wrote no rules: an empty rule set
+    /// resolves to exactly the 0022 two-tier carve.
+    #[test]
+    fn no_path_deny_rules_leaves_the_carve_untouched() {
+        let (scratch, config_dir, data_dir) = sandbox_dirs();
+        let home = scratch.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let home = home.canonicalize().unwrap();
+        let (base, base_warnings) =
+            read_deny(&SandboxCfg::default(), &config_dir, &data_dir, &home, &[]);
+        assert!(base.rules.is_empty());
+        // And a floating-relative deny adds a lint line, not a denial.
+        let (with_floating, warnings) = read_deny_projecting(
+            &SandboxCfg::default(),
+            &config_dir,
+            &data_dir,
+            &home,
+            &[],
+            &hotl_tools::rules::Containment {
+                read_deny: Vec::new(),
+                unprojectable: vec![
+                    "[[deny]] read path_prefix = \".ssh/\" applies at any depth".into()
+                ],
+            },
+        );
+        assert_eq!(with_floating.always, base.always);
+        assert_eq!(with_floating.secrets, base.secrets);
+        assert!(with_floating.rules.is_empty());
+        assert_eq!(warnings.len(), base_warnings.len() + 1, "{warnings:?}");
     }
 
     #[test]

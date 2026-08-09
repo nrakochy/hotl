@@ -855,7 +855,11 @@ async fn scaffold(
     // [sandbox] extras — installed process-wide (set-once) BEFORE the probe,
     // so the certified floor is the widened floor children actually get, and
     // the probe's outside-the-floor target avoids the configured roots.
-    let (sandbox_extras, sandbox_warnings) = cfg.sandbox.resolve(&config_dir, &data_dir());
+    // `rules` above is fully assembled (the admin tier merged inside
+    // `load_rules`), which is what the read-carve's third tier is projected
+    // from — a narrower set here would ship a kernel floor weaker than the
+    // rules the gate enforces.
+    let (sandbox_extras, sandbox_warnings) = cfg.sandbox.resolve(&config_dir, &data_dir(), &rules);
     for w in &sandbox_warnings {
         warnings.push(format!("WARNING — {w}"));
     }
@@ -1927,7 +1931,7 @@ pub(crate) const ADMIN_RULES_PATH: &str = "/etc/hotl/preapproved.toml";
 /// Allow/deny rules from config.toml plus the admin tier, with the resolved
 /// permission mode. Prints its startup warnings — posture never changes
 /// silently.
-fn load_rules(cfg: &crate::config::Config) -> Arc<Rules> {
+pub(crate) fn load_rules(cfg: &crate::config::Config) -> Arc<Rules> {
     let admin_path = std::env::var("HOTL_PREAPPROVED").unwrap_or_else(|_| ADMIN_RULES_PATH.into());
     let env_mode = std::env::var("HOTL_PERMISSIONS").ok();
     let env_plan = std::env::var("HOTL_PLAN").ok();

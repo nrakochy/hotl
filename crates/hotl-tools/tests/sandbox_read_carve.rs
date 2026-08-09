@@ -40,6 +40,7 @@ async fn the_carve_denies_hotls_own_run_dir_through_the_process_global_path() {
         read_deny: ReadDeny {
             always: vec![run_dir.clone()],
             secrets: Vec::new(),
+            rules: Vec::new(),
         },
     });
 

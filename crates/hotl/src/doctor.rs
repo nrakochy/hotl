@@ -223,7 +223,13 @@ fn join_paths(paths: &[std::path::PathBuf]) -> String {
 /// floor, and each refused/dubious entry gets its own warn line.
 fn sandbox_check(config_dir: &Path) -> Vec<Check> {
     let cfg = crate::config::Config::load(config_dir);
-    let (extras, warnings) = cfg.sandbox.resolve(config_dir, &crate::agent::data_dir());
+    // The same `load_rules` agent startup uses, admin tier included: `doctor`
+    // computing its own weaker rule set would have it confidently describing a
+    // containment floor nobody has (plan 0025 watch-out 5).
+    let rules = crate::agent::load_rules(&cfg);
+    let (extras, warnings) = cfg
+        .sandbox
+        .resolve(config_dir, &crate::agent::data_dir(), &rules);
     let mut checks: Vec<Check> = warnings
         .into_iter()
         .map(|w| warn(format!("sandbox: {w}")))

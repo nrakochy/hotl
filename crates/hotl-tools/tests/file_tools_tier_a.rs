@@ -28,6 +28,7 @@ async fn the_file_tools_refuse_hotls_own_dirs_outright() {
         read_deny: ReadDeny {
             always: vec![run_dir.canonicalize().unwrap()],
             secrets: Vec::new(),
+            rules: Vec::new(),
         },
     });
 
