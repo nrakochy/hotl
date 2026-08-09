@@ -4,11 +4,10 @@ name: Publish to crates.io
 # by ordinary commits (crates.io rejects re-publishing an existing version, so
 # "publish on every commit" would just fail once the version stops changing).
 #
-# To cut a release:
-#   1. Bump `version` in the root Cargo.toml ([workspace.package]).
-#   2. Commit, then tag that commit `vX.Y.Z` (must match the manifest version).
-#   3. `git push --follow-tags` — this workflow verifies the tag, builds, tests,
-#      then publishes every workspace crate in dependency order.
+# To cut a release, run `scripts/release.sh` — it pushes the release commit,
+# waits for CI to go green on it, and only then creates and pushes the tag.
+# This workflow verifies the tag, re-checks that CI was green on the commit,
+# builds, tests, then publishes every workspace crate in dependency order.
 on:
   push:
     tags:
@@ -24,11 +23,15 @@ concurrency:
 
 permissions:
   contents: read
+  checks: read # the gate below reads this commit's check runs
 
 jobs:
   publish:
     runs-on: ubuntu-latest
     environment: crates-io # gate on a protected environment for manual approval
+    # Above HOTL_CI_WAIT_TIMEOUT's 30-minute default, so the script's own
+    # message is the one the operator reads.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -59,6 +62,15 @@ jobs:
             echo "::error::Tag ($version) != Cargo.toml version ($manifest_version). Bump the manifest and re-tag."
             exit 1
           fi
+
+      # ci.yml ignores tags (ci.yml:13), so the only green-CI evidence for this
+      # commit is the run from its branch push. No evidence => refuse: crates.io
+      # publishes are irreversible. Sits with the other cheap refusals, ahead of
+      # the build and test steps.
+      - name: Require green CI for this commit
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash scripts/wait-for-ci.sh "$GITHUB_SHA"
 
       # Same reason as ci.yml: the grep tool spawns `rg`, which the runner
       # image does not ship, and the grep test dies at spawn without it. This
