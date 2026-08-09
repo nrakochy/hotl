@@ -69,9 +69,10 @@ semver promise of their own.
 - **Releases are gated on green CI for the exact commit being tagged.**
   `scripts/release.sh` now pushes the release commit, waits for CI, and only
   then creates the tag; `publish.yml` re-checks the same evidence before
-  publishing. `scripts/release.sh --tag-only` finishes a release whose CI went
-  red on the first attempt. Maintainer tooling — no change to installed
-  behavior.
+  publishing. There is no override — no flag or env var tags without green CI,
+  so a red build cannot reach crates.io, the GitHub Release, or the installer.
+  `scripts/release.sh --tag-only` finishes a release whose CI went red on the
+  first attempt. Maintainer tooling — no change to installed behavior.
 
 ### Fixed
 
