@@ -86,6 +86,11 @@ globset = "0.4"
 # A verbatim root silently never matches a `starts_with` containment check, so
 # the boundary stops matching rather than erroring — see `clippy.toml`.
 dunce = "1"
+# Platform seam deps (hotl-platform). All pure-Rust or import-lib, so
+# `cargo install hotl` still needs no C toolchain (see the `minify` note above).
+getrandom = "0.3"
+dirs = "6"
+windows-sys = "0.61"
 
 [profile.release]
 strip = true

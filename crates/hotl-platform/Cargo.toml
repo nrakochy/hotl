@@ -1,6 +1,6 @@
 [package]
 name = "hotl-platform"
-description = "Internal component of hotl - no semver promise; pin exact or don't depend. Platform seams: Clock, SecretStore (native impls; browser impls at the gated milestone)."
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. Platform seams: one capability trait per concern, one adapter per platform."
 readme = "../INTERNAL.md"
 version.workspace = true
 edition.workspace = true
@@ -10,4 +10,24 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
+[features]
+# Fake adapters for contract tests. Never in the default build: a fake
+# `PrivateFs` reaching production is a worse bug than the one it was written
+# to catch.
+testing = []
+
 [dependencies]
+getrandom = { workspace = true }
+dirs = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# `windows-sys`, not `windows`: these are a handful of flat C calls and the COM
+# machinery in `windows` is a large build cost for nothing.
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+] }
