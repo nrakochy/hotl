@@ -547,6 +547,14 @@ pub enum SessionCmd {
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
     /// only ever forwards a validated `Vec<Todo>` here.
     SetTodos(Vec<Todo>),
+    /// A read-only breakdown of what currently fills the context window
+    /// (plan 0028). The ONLY `SessionCmd` that neither appends to the log nor
+    /// advances the projection: it reads the actor's own head plus two
+    /// `SharedDeps` fields and replies. Safe mid-turn for exactly that reason.
+    /// A dropped `reply` (the client hung up) is not an error.
+    ContextBreakdown {
+        reply: oneshot::Sender<hotl_types::ContextBreakdown>,
+    },
     /// Pre-actor proposal path (durable-ack before reply): the ONLY caller
     /// left is [`question_sink`]'s `PendingQuestion`/`QuestionResolved`
     /// entries, built and sent before the actor (and its masker) exist yet
@@ -725,6 +733,17 @@ impl SessionHandle {
     /// entry point is the `todo_write` tool's sink.
     pub async fn set_todos(&self, items: Vec<Todo>) {
         let _ = self.cmd.send(SessionCmd::SetTodos(items)).await;
+    }
+    /// What currently fills the context window, by source (`/context`).
+    /// `None` if the actor is gone. Appends nothing and publishes nothing, so
+    /// unlike every other command here it is safe to call mid-turn.
+    pub async fn context_breakdown(&self) -> Option<hotl_types::ContextBreakdown> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(SessionCmd::ContextBreakdown { reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok()
     }
     /// Continue an interrupted turn on resume (M4/#8).
     pub async fn continue_turn(&self) {

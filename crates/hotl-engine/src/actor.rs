@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
-use hotl_context::compaction;
+use hotl_context::breakdown::ToolTokens;
+use hotl_context::{compaction, tokens};
 use hotl_platform::Clock;
-use hotl_provider::{Provider, SamplingRequest, StreamEvent};
+use hotl_provider::{Provider, SamplingRequest, StreamEvent, ToolDef};
 use hotl_store::SessionLog;
 use hotl_tools::{
     rules::{PermissionMode, Rules},
@@ -128,12 +129,48 @@ impl ProjectionHead {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             durable: Arc::clone(&self.items),
-            tail: match hotl_tools::todo::render_reminder(&self.todos) {
-                Some(reminder) => Arc::new(vec![reminder]),
-                None => empty_tail(),
-            },
+            tail: tail_for(&self.todos),
         }
     }
+}
+
+/// The ephemeral suffix a set of todos renders to. One definition, shared by
+/// the published head and by the actor's own copy ([`Head::snapshot`]) — two
+/// would be two answers to "what rides after the cache marker".
+fn tail_for(todos: &[Todo]) -> Arc<Vec<Item>> {
+    match hotl_tools::todo::render_reminder(todos) {
+        Some(reminder) => Arc::new(vec![reminder]),
+        None => empty_tail(),
+    }
+}
+
+/// These two carry a whole roster inside `description()` (`skills.rs:470`,
+/// `agents.rs:470`), so `/context` bills them as rows of their own instead of
+/// burying a session's biggest schema line in the tool-schema total.
+const SKILLS_TOOL: &str = "skill";
+const AGENTS_TOOL: &str = "spawn";
+
+/// A tool definition's share of the request: the three strings that go on the
+/// wire, under the same profile-less estimator every other call site uses.
+fn estimate_tool_def(def: &ToolDef) -> u64 {
+    tokens::estimate_text(&def.name)
+        + tokens::estimate_text(&def.description)
+        + tokens::estimate_text(&def.input_schema.to_string())
+}
+
+/// The three tool rows of a `/context` report. Split by name, never by index:
+/// registry order is a registration detail.
+fn tool_tokens(registry: &Registry) -> ToolTokens {
+    let mut out = ToolTokens::default();
+    for def in registry.defs() {
+        let n = estimate_tool_def(&def);
+        match def.name.as_str() {
+            SKILLS_TOOL => out.skills += n,
+            AGENTS_TOOL => out.agents += n,
+            _ => out.schemas += n,
+        }
+    }
+    out
 }
 
 /// One read of the projection head, split by durability.
@@ -213,6 +250,16 @@ impl Head {
 
     fn todos(&self) -> &Arc<Vec<Todo>> {
         &self.todos
+    }
+
+    /// The same two-channel read a turn takes off the published head, taken
+    /// from the actor's own copy — the freshest one there is, and no watch
+    /// round-trip. Read-only: nothing here advances or publishes.
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            durable: Arc::clone(&self.items),
+            tail: tail_for(&self.todos),
+        }
     }
 
     /// Apply one acked item. Deliberately does NOT publish: a commit and the
@@ -909,6 +956,18 @@ pub(crate) async fn run(
                     )
                     .await;
                 let _ = events.send(EngineEvent::TodosChanged { items }).await;
+            }
+            SessionCmd::ContextBreakdown { reply } => {
+                // The one arm that reads and returns. No append, no publish,
+                // no `.await` — that is what makes `/context` safe mid-turn.
+                let snap = head.snapshot();
+                let _ = reply.send(hotl_context::breakdown::breakdown(
+                    &shared.system,
+                    tool_tokens(&shared.registry),
+                    &snap.durable,
+                    &snap.tail,
+                    shared.config.context_window,
+                ));
             }
             SessionCmd::Propose { entries, reply } => {
                 let committed = commit(&shared, &mut log, &mut head, &mut pipeline, entries).await;
