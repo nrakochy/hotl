@@ -41,6 +41,7 @@
 //! prefix = "http://"
 //! ```
 
+use crate::path::{basename, components};
 use serde::Deserialize;
 use serde_json::Value;
 use std::borrow::Cow;
@@ -624,7 +625,7 @@ fn project_rule(
              leave the agent unable to run anything — refused. Name the directory you meant."
         ));
     }
-    if !expanded.starts_with('/') {
+    if !crate::path::is_absolute_str(&expanded) {
         let suggestion = pp.trim_start_matches("./").trim_end_matches('/');
         return Projection::Report(format!(
             "{rule_text} applies at any depth, which no kernel rule can express, so it does not \
@@ -899,6 +900,32 @@ fn probe(tool: &str) -> AllowRule {
     }
 }
 
+/// Case-insensitive where the filesystem is. Default APFS and NTFS both fold,
+/// so a rule written `~/.ssh` must catch `~/.SSH` — otherwise the deny is a
+/// spelling contest. Matches `deny_command_matches` and `execute_later_reason`,
+/// which both folded already; the path side was the odd one out.
+const PATHS_ARE_CASE_INSENSITIVE: bool = cfg!(any(windows, target_os = "macos"));
+
+/// Lower-case a path for matching where the filesystem folds, and leave it
+/// untouched where it does not. ASCII-only, like the two sibling matchers: the
+/// sets these rules protect are ASCII, and a Unicode fold would change which
+/// paths match without closing anything.
+fn fold_path(path: &str) -> Cow<'_, str> {
+    if PATHS_ARE_CASE_INSENSITIVE {
+        Cow::Owned(path.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(path)
+    }
+}
+
+fn fold_home(home: &Path) -> PathBuf {
+    if PATHS_ARE_CASE_INSENSITIVE {
+        PathBuf::from(home.to_string_lossy().to_ascii_lowercase())
+    } else {
+        home.to_path_buf()
+    }
+}
+
 /// Deny-side path matching, component-anchored in both directions.
 ///
 /// An **absolute** `path_prefix` anchors at the filesystem root. A **relative**
@@ -918,6 +945,16 @@ fn probe(tool: &str) -> AllowRule {
 /// the root. Enforced by `deny_path_prefix_matches_absolute_and_relative` and
 /// `tilde_path_prefix_anchors_at_the_root`.
 fn deny_path_matches(path: &str, prefix: &str, home: Option<&Path>) -> bool {
+    // Fold both sides before any comparison below — see `fold_path`. `home`
+    // folds too, or an expanded `~/` prefix carries an unfolded `/Users/You`
+    // into the anchored arm and stops matching the folded path.
+    let path = fold_path(path);
+    let path = path.as_ref();
+    let prefix = fold_path(prefix);
+    let prefix = prefix.as_ref();
+    let home = home.map(fold_home);
+    let home = home.as_deref();
+
     // Legacy raw comparison against the UNEXPANDED prefix: this is the arm
     // that catches a model-written literal `~/.ssh/id_rsa`. Expanding here
     // would remove a denial, and this tier only ever adds them.
@@ -936,8 +973,8 @@ fn deny_path_matches(path: &str, prefix: &str, home: Option<&Path>) -> bool {
     let hay: Vec<&str> = components(&normalized);
     // `expanded`, not `prefix`: an expanded `~/.ssh` must anchor at the root
     // rather than fall through to the floating arm below.
-    if expanded.starts_with('/') {
-        return normalized.starts_with('/')
+    if crate::path::is_absolute_str(&expanded) {
+        return crate::path::is_absolute_str(&normalized)
             && hay.len() >= pat.len()
             && hay[..pat.len()] == pat[..];
     }
@@ -955,13 +992,6 @@ fn expand_tilde<'a>(prefix: &'a str, home: Option<&Path>) -> Cow<'a, str> {
         )),
         _ => Cow::Borrowed(prefix),
     }
-}
-
-/// Path components, with empty/`.` segments dropped.
-fn components(path: &str) -> Vec<&str> {
-    path.split('/')
-        .filter(|s| !s.is_empty() && *s != ".")
-        .collect()
 }
 
 /// `$` and `` ` `` mean the command that runs is not the command in the string:
@@ -1093,10 +1123,6 @@ fn is_env_assignment(tok: &str) -> bool {
     })
 }
 
-fn basename(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
-}
-
 /// Deny-side command matching. The rule's first token is compared against each
 /// executed command's **resolved basename**; its remaining tokens must appear,
 /// in order, as whole tokens in that command's arguments. Whitespace between
@@ -1169,9 +1195,13 @@ fn lexically_contained(path: &str, prefix: &str, home: Option<&Path>) -> Option<
 }
 
 fn lexical_normalize(path: &str) -> String {
-    let absolute = path.starts_with('/');
+    let path = crate::path::normalize_separators(path);
+    // The root is carried as a slice rather than a bool so it can be put back
+    // verbatim: `/x` re-roots as `/`, but a Windows `C:/x` must not become
+    // `/c:/x`.
+    let root = crate::path::root_prefix(&path);
     let mut out: Vec<&str> = Vec::new();
-    for part in path.trim_start_matches("./").split('/') {
+    for part in path[root.len()..].trim_start_matches("./").split('/') {
         match part {
             "" | "." => {}
             ".." => {
@@ -1192,11 +1222,7 @@ fn lexical_normalize(path: &str) -> String {
     // component-wise in both directions.
     // INVARIANT: no absolute path satisfies a relative allow prefix. Enforced
     // by `path_traversal_never_auto_allows`.
-    if absolute {
-        format!("/{}", out.join("/"))
-    } else {
-        out.join("/")
-    }
+    format!("{root}{}", out.join("/"))
 }
 
 #[cfg(test)]
@@ -2316,6 +2342,65 @@ prefix = "payments"
         assert!(!denied("write", "docs/notes.md"));
     }
 
+    /// A live bypass before this landed: default APFS and NTFS fold case, so
+    /// `.SSH/authorized_keys` walked straight past a `.ssh/` deny rule on the
+    /// filesystems most hotl users are on. The rule matched a spelling rather
+    /// than a file.
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn a_deny_path_rule_catches_a_differently_cased_path() {
+        let r = Rules::from_toml("[[deny]]\ntool = \"write\"\npath_prefix = \".ssh/\"\n")
+            .unwrap()
+            .with_mode(PermissionMode::Bypass);
+        let denied = |path: &str| {
+            matches!(
+                r.evaluate(
+                    r.mode(),
+                    false,
+                    "write",
+                    &json!({"path": path}),
+                    facts(true, false, false)
+                ),
+                Verdict::Deny { .. }
+            )
+        };
+
+        for path in [
+            ".SSH/authorized_keys",
+            "/Users/You/.Ssh/id_rsa",
+            "src/../.SSH/config",
+        ] {
+            assert_eq!(
+                denied(path),
+                PATHS_ARE_CASE_INSENSITIVE,
+                "`{path}` must be denied exactly where the filesystem folds"
+            );
+        }
+
+        // Unchanged everywhere: an exact match still denies, and folding does
+        // not turn a different directory into a match.
+        assert!(denied(".ssh/authorized_keys"));
+        assert!(!denied(".sshfs/config"));
+        assert!(!denied(".SSHFS/config"));
+    }
+
+    /// The rule's own casing is not privileged either, and a `~/` prefix folds
+    /// its expanded home with it — otherwise the anchored arm compares a folded
+    /// path against an unfolded `/Users/You`.
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn a_cased_deny_rule_and_a_cased_home_both_fold() {
+        let r = Rules::from_toml("[[deny]]\ntool = \"read\"\npath_prefix = \"~/.SSH\"\n")
+            .unwrap()
+            .with_home(Some(PathBuf::from("/Fixture/Home")));
+        assert_eq!(
+            read_denied(&r, "/fixture/home/.ssh/id_rsa"),
+            PATHS_ARE_CASE_INSENSITIVE
+        );
+        // And the anchoring invariant survives the fold.
+        assert!(!read_denied(&r, "/tmp/fixture/home/.ssh/id_rsa"));
+    }
+
     #[test]
     fn args_must_not_contain_narrows_a_prefix_grant() {
         let r = Rules::from_toml(
@@ -2538,7 +2623,7 @@ prefix = "read"
             &format!("path_prefix = \"{}\"", dir.display()),
         ))
         .unwrap();
-        let c = project(&rules, &|p| p.canonicalize().ok());
+        let c = project(&rules, &|p| dunce::canonicalize(p).ok());
         assert!(c.read_deny.is_empty());
         assert_eq!(c.unprojectable.len(), 1, "{:#?}", c.unprojectable);
         assert!(!dir.exists(), "projection created {}", dir.display());

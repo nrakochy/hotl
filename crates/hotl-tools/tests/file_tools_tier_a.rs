@@ -26,7 +26,7 @@ async fn the_file_tools_refuse_hotls_own_dirs_outright() {
         writable: Vec::new(),
         file_tools: FileToolsMode::Workspace,
         read_deny: ReadDeny {
-            always: vec![run_dir.canonicalize().unwrap()],
+            always: vec![dunce::canonicalize(&run_dir).unwrap()],
             secrets: Vec::new(),
             rules: Vec::new(),
         },

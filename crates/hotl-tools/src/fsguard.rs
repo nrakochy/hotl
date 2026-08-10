@@ -53,7 +53,7 @@ pub(crate) fn workspace_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
         std::env::current_dir()
-            .and_then(|p| p.canonicalize())
+            .and_then(dunce::canonicalize)
             .unwrap_or_else(|_| PathBuf::from("."))
     })
 }
@@ -705,8 +705,8 @@ pub(crate) mod tests {
         // canonicalize: on macOS the tempdir is under a /var -> /private/var link.
         (
             outer,
-            root.canonicalize().unwrap(),
-            home.canonicalize().unwrap(),
+            dunce::canonicalize(root).unwrap(),
+            dunce::canonicalize(home).unwrap(),
         )
     }
 
@@ -861,7 +861,7 @@ pub(crate) mod tests {
         // `sandbox.rs:180`/`:270` both compute `canon(current_dir())` for the
         // kernel write-confinement floor. If the tool boundary named a
         // different directory, one of the two would be decorative.
-        let sandbox_root = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let sandbox_root = dunce::canonicalize(std::env::current_dir().unwrap()).unwrap();
         assert_eq!(workspace_root(), sandbox_root.as_path());
     }
 

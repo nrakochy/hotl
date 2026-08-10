@@ -75,7 +75,7 @@ fn guarded_search_root(
     // happy with a single file.
     if dir_only {
         fsguard::open_dir_beneath(root, &rel).map_err(|e| match e {
-            fsguard::GuardError::Io(ref io) if io.raw_os_error() == Some(libc::ENOTDIR) => {
+            fsguard::GuardError::Io(ref io) if io.kind() == std::io::ErrorKind::NotADirectory => {
                 ToolOutcome::err(format!(
                     "`{given}` is not a directory. `{tool}` lists files *under* a directory — \
                      pass the containing directory, or use `grep` to search one file."
@@ -148,7 +148,7 @@ fn resolve_as_far_as_it_exists(p: &std::path::Path) -> std::path::PathBuf {
     let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
     let mut head = p;
     loop {
-        if let Ok(real) = head.canonicalize() {
+        if let Ok(real) = dunce::canonicalize(head) {
             let mut out = real;
             for part in tail.iter().rev() {
                 out.push(part);
@@ -235,7 +235,7 @@ fn file_permission_with(
     if let Some(why) = hotl_own_dir_reason(path) {
         return Permission::AskProtected { summary, why };
     }
-    let resolved = std::fs::canonicalize(path).ok();
+    let resolved = dunce::canonicalize(path).ok();
     let target = write_target(root, extras, path);
     // The write lands on the fsguard-*normalized* path (`Path::components()`
     // has collapsed `//`, `./`, `..`), so classify the protected floor on that
@@ -343,7 +343,7 @@ impl Tool for ReadTool {
                 // Show the human where it really lands, links resolved.
                 why: format!(
                     "outside the working directory{}: the workspace boundary does not cover it",
-                    match std::fs::canonicalize(path) {
+                    match dunce::canonicalize(path) {
                         Ok(real) if real != std::path::Path::new(path) =>
                             format!(" (resolves to {})", real.display()),
                         _ => String::new(),
@@ -1305,7 +1305,7 @@ fn bash_write_targets(cmd: &str) -> Vec<String> {
             .map(|(t, _)| t)
             .collect();
         let Some(first) = toks.first() else { continue };
-        match first.rsplit('/').next().unwrap_or(first) {
+        match crate::path::basename(first) {
             "tee" => targets.extend(toks[1..].iter().filter(|t| !t.starts_with('-')).cloned()),
             "dd" => targets.extend(
                 toks[1..]
@@ -1437,58 +1437,25 @@ async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> Too
 /// longer distinguishable; that is the right trade, because causal order is
 /// what the model reasons about. Enforced by
 /// `bash_preserves_stdout_stderr_interleaving`.
+/// Both ends are created non-inheritable, which is the property the old
+/// hand-rolled `pipe(2)` + `fcntl(FD_CLOEXEC)` existed to get: any *other*
+/// process spawned concurrently would otherwise inherit a copy of the write end
+/// and hold the pipe open, so this drain would not see EOF until that unrelated
+/// process exited. The dup onto the child's fd 1/2 (or its Windows handle
+/// equivalent) clears that on the copies the child actually gets, so it costs
+/// the child nothing.
 fn merged_pipe() -> std::io::Result<(
     std::process::Stdio,
     std::process::Stdio,
-    tokio::net::unix::pipe::Receiver,
+    std::io::PipeReader,
 )> {
-    use std::os::fd::{FromRawFd, OwnedFd};
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `fds` is a live two-element array, which is what pipe(2) writes.
-    // `pipe2(O_CLOEXEC)` is Linux-only but closes the inherit race outright;
-    // elsewhere the fcntls below run immediately after, leaving only the
-    // window std itself has on those platforms.
-    #[cfg(target_os = "linux")]
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
-    #[cfg(not(target_os = "linux"))]
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if rc < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: both fds are freshly created and owned by nothing else.
-    let (read_end, write_end) =
-        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-    // BOTH ends need CLOEXEC, and the write end is the subtle one: any *other*
-    // process this program spawns concurrently would otherwise inherit a copy
-    // and hold the pipe open, so this drain would not see EOF until that
-    // unrelated process exited. The read end matters for the same reason, one
-    // level closer. `dup2` onto fd 1/2 clears CLOEXEC on the copies the child
-    // actually gets, so setting it here costs the child nothing.
-    set_cloexec(&read_end)?;
-    set_cloexec(&write_end)?;
-    // `try_clone` dups with CLOEXEC already set.
-    let write_end2 = write_end.try_clone()?;
-    // Sets O_NONBLOCK itself; must be called inside the runtime.
-    let rx = tokio::net::unix::pipe::Receiver::from_owned_fd(read_end)?;
+    let (reader, writer) = std::io::pipe()?;
+    let writer2 = writer.try_clone()?;
     Ok((
-        std::process::Stdio::from(write_end),
-        std::process::Stdio::from(write_end2),
-        rx,
+        std::process::Stdio::from(writer),
+        std::process::Stdio::from(writer2),
+        reader,
     ))
-}
-
-fn set_cloexec(fd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: plain fcntl(2) on a fd we own.
-    let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
-    if flags < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: same fd, adding one flag.
-    if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 /// Drain the merged pipe to EOF (capped at `cap` bytes), then reap the child.
@@ -1499,12 +1466,42 @@ fn set_cloexec(fd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
 /// diagnostics runner and is deliberately left alone.
 async fn collect_merged(
     mut child: tokio::process::Child,
-    pipe: tokio::net::unix::pipe::Receiver,
+    pipe: std::io::PipeReader,
     cap: usize,
 ) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
-    let bytes = drain_capped(Some(pipe), cap).await;
+    // `std::io::pipe` has no async reader, so the drain moves to a blocking
+    // thread and `bash_impl`'s `select!` keeps the timeout and cancel arms
+    // responsive around it.
+    //
+    // TRADE, stated because it is a real one: a dropped future used to close
+    // the read end outright. A blocking read cannot be interrupted, so the
+    // thread now lives until every writer is gone. `kill_group` reaps the whole
+    // process group on the timeout and cancel paths, which is what closes them;
+    // a descendant that escaped the group would strand one blocking-pool
+    // thread. That is the same descendant that already escapes the reaper.
+    let bytes = tokio::task::spawn_blocking(move || drain_capped_blocking(pipe, cap))
+        .await
+        .unwrap_or_default();
     let status = child.wait().await?;
     Ok((status, bytes))
+}
+
+/// [`drain_capped`]'s blocking twin, for the one pipe that is not async.
+fn drain_capped_blocking<R: std::io::Read>(mut reader: R, cap: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if buf.len() < cap {
+                    let take = n.min(cap - buf.len());
+                    buf.extend_from_slice(&chunk[..take]);
+                }
+            }
+        }
+    }
+    buf
 }
 
 /// Incrementally read the child's stdout/stderr (capped at `cap` bytes each)

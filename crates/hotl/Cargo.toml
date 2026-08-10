@@ -27,6 +27,7 @@ security-enforced = ["hotl-tools/security-enforced"]
 minify = ["hotl-mcp/minify", "hotl-retrieval/minify", "hotl-engine/minify", "hotl-tui/minify", "hotl-tools/minify"]
 
 [dependencies]
+dunce = { workspace = true }
 hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.11.0", features = ["ratatui"] }
 watch_types = { package = "hotl-watch-types", path = "../watch-types", version = "0.11.0" }
 watch_tmux = { package = "hotl-watch-tmux", path = "../watch-tmux", version = "0.11.0" }

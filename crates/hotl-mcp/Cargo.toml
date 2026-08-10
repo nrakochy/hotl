@@ -18,6 +18,7 @@ default = ["minify"]
 minify = ["hotl-tools/minify"]
 
 [dependencies]
+dunce = { workspace = true }
 hotl-tools = { path = "../hotl-tools", version = "0.11.0", default-features = false }
 hotl-types = { path = "../hotl-types", version = "0.11.0" }
 serde = { workspace = true }

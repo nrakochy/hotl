@@ -61,7 +61,7 @@ impl Fingerprint {
     pub fn has_arg_under(&self, root: &Path) -> bool {
         self.arg_hashes
             .iter()
-            .any(|(arg, _)| std::fs::canonicalize(resolve(arg)).is_ok_and(|p| p.starts_with(root)))
+            .any(|(arg, _)| dunce::canonicalize(resolve(arg)).is_ok_and(|p| p.starts_with(root)))
     }
 
     /// False when the binary could not be read. A grant is never recorded for
@@ -381,7 +381,7 @@ mod tests {
         let script = dir.path().join("s.js");
         std::fs::write(&script, b"x").unwrap();
         let fp = Fingerprint::of(&cfg("/bin/sh", &[script.to_str().unwrap()]));
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         assert!(fp.has_arg_under(&root), "script under root must be flagged");
         assert!(
             !fp.has_arg_under(std::path::Path::new("/no/such/root")),
@@ -515,7 +515,7 @@ mod tests {
         let script = dir.path().join("s.js");
         std::fs::write(&script, b"x").unwrap();
         let ws = Fingerprint::of(&cfg("/bin/sh", &[script.to_str().unwrap()]));
-        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let root = dunce::canonicalize(dir.path()).unwrap();
         assert_eq!(store.state("local", &ws, &root), TrustState::SessionOnly);
     }
 

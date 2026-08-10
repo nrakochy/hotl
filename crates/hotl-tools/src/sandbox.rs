@@ -132,7 +132,7 @@ fn label_with(mechanism: &str, unix: UnixSockets, automation: Automation, reads:
 }
 
 fn canon(p: PathBuf) -> PathBuf {
-    p.canonicalize().unwrap_or(p)
+    dunce::canonicalize(&p).unwrap_or(p)
 }
 
 /// How far the *tool-level* boundary of the mutating file tools (`write`,

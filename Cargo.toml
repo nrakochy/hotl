@@ -82,6 +82,10 @@ tree-sitter-typescript = "=0.23.2"
 # `globset` is a real glob matcher (`*` vs `**`, classes, alternates).
 ignore = "0.4"
 globset = "0.4"
+# Canonicalization that does not hand back a `\\?\` verbatim path on Windows.
+# A verbatim root silently never matches a `starts_with` containment check, so
+# the boundary stops matching rather than erroring — see `clippy.toml`.
+dunce = "1"
 
 [profile.release]
 strip = true

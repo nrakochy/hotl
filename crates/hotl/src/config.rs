@@ -558,7 +558,7 @@ impl SandboxCfg {
                     continue;
                 }
             }
-            let resolved = match expanded.canonicalize() {
+            let resolved = match dunce::canonicalize(expanded) {
                 Ok(p) => p,
                 Err(e) => {
                     warnings.push(format!(
@@ -607,7 +607,7 @@ impl SandboxCfg {
                     .to_string(),
             );
         }
-        let containment = hotl_tools::rules::project(rules, &|p| p.canonicalize().ok());
+        let containment = hotl_tools::rules::project(rules, &|p| dunce::canonicalize(p).ok());
         let read_deny = self.resolve_read_deny(
             config_dir,
             data_dir,
@@ -679,7 +679,7 @@ impl SandboxCfg {
                 ));
                 continue;
             }
-            let resolved = match expanded.canonicalize() {
+            let resolved = match dunce::canonicalize(expanded) {
                 Ok(p) => p,
                 Err(e) => {
                     warnings.push(format!(
@@ -789,7 +789,7 @@ fn readable_refusal(entry: &str) -> String {
 /// Canonical when possible, lexical when the path does not exist (a fresh
 /// config dir before `hotl setup`).
 fn canon_or(p: &Path) -> std::path::PathBuf {
-    p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    dunce::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
 /// Equal, ancestor, or descendant — any of the three lets writes cross into
@@ -1366,12 +1366,12 @@ path_prefix = "/Volumes/secrets"
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(missing.is_dir(), "missing entries are created at startup");
         assert_eq!(extras.writable.len(), 2);
-        assert_eq!(extras.writable[0], missing.canonicalize().unwrap());
+        assert_eq!(extras.writable[0], dunce::canonicalize(missing).unwrap());
         // The symlink is resolved: the grant lands on the target, so the
         // kernel and the tool boundary agree on one canonical name.
         assert_eq!(
             extras.writable[1],
-            real.join("inner").canonicalize().unwrap()
+            dunce::canonicalize(real.join("inner")).unwrap()
         );
     }
 
@@ -1396,7 +1396,7 @@ path_prefix = "/Volumes/secrets"
         let (extras, warnings) =
             cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
         // Refusal wins, entry by entry — the good sibling still lands.
-        assert_eq!(extras.writable, vec![good.canonicalize().unwrap()]);
+        assert_eq!(extras.writable, vec![dunce::canonicalize(good).unwrap()]);
         assert_eq!(warnings.len(), 5, "{warnings:?}");
         for w in &warnings {
             assert!(w.contains("refused"), "{w}");
@@ -1417,7 +1417,7 @@ path_prefix = "/Volumes/secrets"
             cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
         assert_eq!(
             extras.writable,
-            vec![std::path::Path::new("/etc").canonicalize().unwrap()]
+            vec![dunce::canonicalize(std::path::Path::new("/etc")).unwrap()]
         );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("/etc"), "{}", warnings[0]);
@@ -1543,7 +1543,7 @@ path_prefix = "/Volumes/secrets"
         let (scratch, config_dir, data_dir) = sandbox_dirs();
         let home = scratch.path().join("home");
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        let home = home.canonicalize().unwrap();
+        let home = dunce::canonicalize(home).unwrap();
         let (deny, warnings) = read_deny(
             &SandboxCfg::default(),
             &config_dir,
@@ -1557,8 +1557,8 @@ path_prefix = "/Volumes/secrets"
         assert_eq!(
             deny.always,
             vec![
-                config_dir.canonicalize().unwrap(),
-                data_dir.canonicalize().unwrap()
+                dunce::canonicalize(config_dir).unwrap(),
+                dunce::canonicalize(data_dir).unwrap()
             ]
         );
         // Tier B: every credential entry, whether or not it exists today.
@@ -1609,7 +1609,7 @@ path_prefix = "/Volumes/secrets"
         let home = scratch.path().join("home");
         std::fs::create_dir_all(home.join(".aws")).unwrap();
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        let home = home.canonicalize().unwrap();
+        let home = dunce::canonicalize(home).unwrap();
         let cfg = SandboxCfg {
             readable: vec![home.join(".aws").display().to_string()],
             ..SandboxCfg::default()
@@ -1648,7 +1648,7 @@ path_prefix = "/Volumes/secrets"
         let (scratch, config_dir, data_dir) = sandbox_dirs();
         let home = scratch.path().join("home");
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
-        let home = home.canonicalize().unwrap();
+        let home = dunce::canonicalize(home).unwrap();
         // Granting write on $HOME puts every credential path inside it.
         let (deny, warnings) = read_deny(
             &SandboxCfg::default(),
@@ -1674,7 +1674,7 @@ path_prefix = "/Volumes/secrets"
         std::fs::create_dir_all(&home).unwrap();
         let vault = scratch.path().join("vault");
         std::fs::create_dir_all(&vault).unwrap();
-        let vault = vault.canonicalize().unwrap();
+        let vault = dunce::canonicalize(vault).unwrap();
         let containment = hotl_tools::rules::Containment {
             read_deny: vec![projected(&vault)],
             unprojectable: vec!["read path_prefix = \".ssh/\" applies at any depth".into()],
@@ -1683,7 +1683,7 @@ path_prefix = "/Volumes/secrets"
             &SandboxCfg::default(),
             &config_dir,
             &data_dir,
-            &home.canonicalize().unwrap(),
+            &dunce::canonicalize(home).unwrap(),
             &[],
             &containment,
         );
@@ -1708,16 +1708,16 @@ path_prefix = "/Volumes/secrets"
         std::fs::create_dir_all(&home).unwrap();
         let inside = scratch.path().join("work/secrets");
         std::fs::create_dir_all(&inside).unwrap();
-        let granted = scratch.path().join("work").canonicalize().unwrap();
+        let granted = dunce::canonicalize(scratch.path().join("work")).unwrap();
         let containment = hotl_tools::rules::Containment {
-            read_deny: vec![projected(&inside.canonicalize().unwrap())],
+            read_deny: vec![projected(&dunce::canonicalize(inside).unwrap())],
             unprojectable: Vec::new(),
         };
         let (deny, warnings) = read_deny_projecting(
             &SandboxCfg::default(),
             &config_dir,
             &data_dir,
-            &home.canonicalize().unwrap(),
+            &dunce::canonicalize(home).unwrap(),
             std::slice::from_ref(&granted),
             &containment,
         );
@@ -1741,7 +1741,7 @@ path_prefix = "/Volumes/secrets"
         };
         let vault = base.join(format!("hotl-0025-vault-{}", std::process::id()));
         std::fs::create_dir_all(&vault).unwrap();
-        let vault = vault.canonicalize().unwrap();
+        let vault = dunce::canonicalize(vault).unwrap();
         std::fs::write(
             config_dir.join("config.toml"),
             format!(
@@ -1780,7 +1780,7 @@ path_prefix = "/Volumes/secrets"
         };
         let vault = base.join(format!("hotl-0025-admin-{}", std::process::id()));
         std::fs::create_dir_all(&vault).unwrap();
-        let vault = vault.canonicalize().unwrap();
+        let vault = dunce::canonicalize(vault).unwrap();
         let data_dir = scratch.path().join("data");
         std::fs::create_dir_all(&data_dir).unwrap();
         let mut rules = hotl_tools::rules::Rules::default();
@@ -1803,7 +1803,7 @@ path_prefix = "/Volumes/secrets"
         let (scratch, config_dir, data_dir) = sandbox_dirs();
         let home = scratch.path().join("home");
         std::fs::create_dir_all(&home).unwrap();
-        let home = home.canonicalize().unwrap();
+        let home = dunce::canonicalize(home).unwrap();
         let (base, base_warnings) =
             read_deny(&SandboxCfg::default(), &config_dir, &data_dir, &home, &[]);
         assert!(base.rules.is_empty());
@@ -1831,7 +1831,7 @@ path_prefix = "/Volumes/secrets"
             "[[deny]]\ntool = \"read\"\npath_prefix = \".ssh/\"\n",
         )
         .unwrap();
-        let lint = rules.lint_containment(&|p| p.canonicalize().ok());
+        let lint = rules.lint_containment(&|p| dunce::canonicalize(p).ok());
         assert_eq!(lint.len(), 1, "{lint:?}");
         assert!(lint[0].starts_with("note: "), "{}", lint[0]);
         assert!(lint[0].contains("~/.ssh"), "{}", lint[0]);

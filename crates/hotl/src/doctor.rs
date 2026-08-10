@@ -294,7 +294,7 @@ fn sandbox_check(config_dir: &Path, rules: &hotl_tools::rules::Rules) -> Vec<Che
     // The resolved read-carve, printed so `hotl doctor` describes the floor
     // children actually get rather than the one config asked for (plan 0022),
     // and traced back to what put each path there (plan 0025).
-    let containment = hotl_tools::rules::project(rules, &|p| p.canonicalize().ok());
+    let containment = hotl_tools::rules::project(rules, &|p| dunce::canonicalize(p).ok());
     checks.push(if extras.read_deny.is_empty() {
         warn(format!(
             "sandbox: read-carve empty — sandboxed commands can read everything{}",

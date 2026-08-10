@@ -44,10 +44,10 @@ async fn a_projected_deny_rule_denies_reads_to_a_sandboxed_command() {
         vault.display()
     ))
     .unwrap();
-    let containment = rules::project(&rules, &|p| p.canonicalize().ok());
+    let containment = rules::project(&rules, &|p| dunce::canonicalize(p).ok());
     assert_eq!(
         containment.paths(),
-        vec![vault.canonicalize().unwrap()],
+        vec![dunce::canonicalize(&vault).unwrap()],
         "the rule must project: {:#?}",
         containment.unprojectable
     );
@@ -61,7 +61,7 @@ async fn a_projected_deny_rule_denies_reads_to_a_sandboxed_command() {
     .unwrap()
     .with_home(Some(base.clone()));
     assert_eq!(
-        rules::project(&tilde, &|p| p.canonicalize().ok()).paths(),
+        rules::project(&tilde, &|p| dunce::canonicalize(p).ok()).paths(),
         containment.paths(),
         "the ~/-rooted form must project to the same path"
     );

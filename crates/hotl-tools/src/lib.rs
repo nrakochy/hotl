@@ -15,6 +15,7 @@ pub(crate) mod fsguard;
 pub(crate) mod matcher;
 pub(crate) mod minified;
 pub mod net;
+pub mod path;
 pub mod rules;
 pub mod sandbox;
 pub mod skills;
@@ -274,7 +275,7 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     // for an oddly-cased name. Callers pass the fsguard-normalized relative
     // path, so `//` and `./` separator tricks are already collapsed here.
     let p = path.trim_start_matches("./").to_ascii_lowercase();
-    let file = p.rsplit('/').next().unwrap_or(&p);
+    let file = crate::path::basename(&p);
     if p.contains(".git/hooks/") {
         return Some("git hook: runs on your next git command");
     }
@@ -430,7 +431,7 @@ mod tests {
     #[tokio::test]
     async fn a_rooted_registry_resolves_relative_paths_under_its_own_root() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap();
         let rooted = Registry::builtin_with_root(
             diagnostics::Diagnostics::default(),
             MinifyConfig::default(),

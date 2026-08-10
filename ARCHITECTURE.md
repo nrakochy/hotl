@@ -20,6 +20,8 @@ Cross-cutting: in-process hooks primary + Claude-compatible shell-hook adapter *
 
 Compilation targets: **native from day one; WASM (browser) is a deferred future target** — core crates sit behind platform traits (fs/exec/http/clock/storage) throughout so the seam stays clean; browser, when it ships, is a reduced-capability profile where tools requiring unavailable capabilities drop out of the registry.
 
+> **Seam status (plan 0027, in progress).** The "throughout" above is under construction, not yet true: `hotl-platform` is growing one capability trait per concern with one adapter per platform, driven by the native Windows port. Until that plan closes, read the sentence as the target shape. Tech-debt tracker #4 tracks the port; T3-21 tracks the gap between this claim and the code, and closes with the plan's Task 7b.
+
 ## The connective planes
 
 | Plane                       | Protocol                                                               |

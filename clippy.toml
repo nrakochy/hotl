@@ -1,0 +1,14 @@
+# Windows `\\?\` verbatim paths break git and poison path-equality: a canonical
+# root that comes back verbatim silently never matches a `starts_with` check, so
+# a containment boundary stops matching rather than erroring. `fsguard`'s root
+# subset invariant and `sandbox::write_roots` are both `starts_with` comparisons
+# against a canonicalized root, so this is a containment bug, not a cosmetic
+# one. Use `dunce::canonicalize`.
+#
+# RESIDUAL: dunce keeps the verbatim form for paths over 260 chars. Containment
+# code must therefore treat an un-de-verbatim-able path as fail-closed, not as
+# "probably fine" — see `fsguard::GuardError::Unresolvable`.
+disallowed-methods = [
+  { path = "std::fs::canonicalize", reason = "use dunce::canonicalize" },
+  { path = "std::path::Path::canonicalize", reason = "use dunce::canonicalize" },
+]

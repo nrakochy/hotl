@@ -1998,7 +1998,7 @@ fn load_rules_with(
     // After the admin merge, so the lint sees the full set. A rule that matches
     // nothing, or that the kernel cannot reach, used to be silent — and a silent
     // permission rule is the whole shape of T1-7.
-    warnings.extend(rules.lint_containment(&|p| p.canonicalize().ok()));
+    warnings.extend(rules.lint_containment(&|p| dunce::canonicalize(p).ok()));
     (Arc::new(rules), warnings)
 }
 
@@ -3680,7 +3680,7 @@ mod tests {
         // Canonicalized: `Worktree::create` re-resolves the workspace through
         // `rev-parse --show-toplevel`, so on macOS this is `/private/var/…`
         // where the tempdir handle says `/var/…`.
-        let repo_root = repo.path().canonicalize().unwrap();
+        let repo_root = dunce::canonicalize(repo.path()).unwrap();
         assert!(
             worktree
                 .path()

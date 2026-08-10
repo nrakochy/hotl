@@ -428,7 +428,7 @@ async fn run(opts: &Options, releases: &str) -> Result<(), String> {
         std::env::current_exe().map_err(|e| format!("cannot find the running hotl binary: {e}"))?;
     // macOS leaves symlinks unresolved, and `~/.nix-profile/bin` is a symlink
     // chain into the store — classify and write the real file.
-    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    let exe = dunce::canonicalize(&exe).unwrap_or(exe);
     let channel = classify(&exe, cargo_home().as_deref(), crates_toml().as_deref());
 
     let manifest = fetch_manifest(releases, opts.target_version.as_deref()).await?;
