@@ -381,6 +381,11 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         Cmd::ReloadConfig => {
             client.request("session/reload_config", Value::Null).await;
         }
+        // The id is discarded: the report comes back as a `context_report`
+        // broadcast, so there is nothing to correlate it against.
+        Cmd::RequestContext => {
+            client.request("session/context", json!({})).await;
+        }
         Cmd::ReplyPermission {
             req_id,
             allow,

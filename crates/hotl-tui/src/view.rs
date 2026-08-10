@@ -8,11 +8,12 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use hotl_theme::{Density, Palette};
+use hotl_types::ContextKind;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::anim;
-use crate::app::{DiffOp, Phase, Scroll, State, ToolStatus, TranscriptItem};
+use crate::app::{ContextReport, DiffOp, Phase, Scroll, State, ToolStatus, TranscriptItem};
 use crate::vim::Mode;
 use crate::wrap;
 
@@ -185,6 +186,10 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             }
         }
         TranscriptItem::Notice { text } => (5u8, text).hash(&mut h),
+        // A new variant without its own discriminant byte would collide with
+        // `Notice` and render a stale block after the numbers changed — a bug
+        // no unit test catches and every use does.
+        TranscriptItem::Report(r) => (6u8, r).hash(&mut h),
     }
     h.finish()
 }
@@ -361,9 +366,9 @@ fn item_visual_lines<'a>(
     gutter: usize,
     thinking_expanded: bool,
 ) -> Vec<Line<'a>> {
-    let (spine, content) = item_block(item, p, thinking_expanded);
     // `gutter + 2` = the pad plus the one-column glyph and its trailing space.
     let inner = width.saturating_sub(gutter + 2).max(1);
+    let (spine, content) = item_block(item, p, thinking_expanded, inner);
     let mut out = Vec::new();
     for cl in &content {
         for wl in wrap::line(cl, inner) {
@@ -491,6 +496,7 @@ fn item_block<'a>(
     item: &TranscriptItem,
     p: &Palette,
     thinking_expanded: bool,
+    inner: usize,
 ) -> (Spine, Vec<Line<'a>>) {
     match item {
         TranscriptItem::User { text } => (
@@ -606,6 +612,17 @@ fn item_block<'a>(
                 Style::new().fg(p.muted).italic(),
             )],
         ),
+        // A `/context` report. Harness output, so it takes the `Notice` spine
+        // rather than anything that reads as the model speaking.
+        TranscriptItem::Report(r) => (
+            Spine {
+                marker: "·",
+                cont: "·",
+                marker_style: Style::new().fg(p.muted),
+                cont_style: Style::new().fg(p.muted),
+            },
+            report_lines(r, p, inner),
+        ),
         // Reasoning: dimmed italic behind a faint spine, collapsed by default.
         // The trailer names the toggle so it is discoverable without opening
         // the help overlay.
@@ -638,6 +655,110 @@ fn item_block<'a>(
             )
         }
     }
+}
+
+/// Display labels for `/context` rows. The wire tag (`ContextKind`'s
+/// `snake_case` serde name) is never shown — it is a protocol contract, and
+/// this is a table of prose.
+fn label(kind: ContextKind) -> &'static str {
+    match kind {
+        ContextKind::SystemPrompt => "system prompt",
+        ContextKind::ToolSchemas => "tool schemas",
+        ContextKind::SkillsRoster => "skills roster",
+        ContextKind::AgentsRoster => "agents roster",
+        ContextKind::ProjectInstructions => "project instructions",
+        ContextKind::Memory => "memory",
+        ContextKind::Todos => "todos",
+        ContextKind::FoldedHistory => "folded history",
+        ContextKind::Messages => "messages",
+        ContextKind::ToolResults => "tool results",
+        ContextKind::HarnessInjections => "harness injections",
+        ContextKind::Images => "images",
+        // A row from a newer engine. Named for what it is to this binary.
+        ContextKind::Unknown => "other",
+    }
+}
+
+/// Share of the window, as a percentage. A zero window is a misconfigured
+/// engine, not a crash: every share is then 0.
+fn share(n: u64, window: u64) -> f64 {
+    match window {
+        0 => 0.0,
+        w => n as f64 * 100.0 / w as f64,
+    }
+}
+
+/// The free-space row is the only one not on the wire — it is the difference
+/// between the window and whichever total is larger.
+const FREE_LABEL: &str = "free space";
+
+/// The `/context` block: a header, the two totals, and one line per non-zero
+/// row plus free space. Column widths are computed from what is actually
+/// shown, because row visibility varies session to session.
+fn report_lines<'a>(r: &ContextReport, p: &Palette, _inner: usize) -> Vec<Line<'a>> {
+    let mut rows: Vec<(&'static str, u64)> = r.rows.iter().map(|(k, n)| (label(*k), *n)).collect();
+    rows.push((FREE_LABEL, r.free));
+    let lw = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+    let nw = rows
+        .iter()
+        .map(|(_, n)| crate::app::tok(*n).len())
+        .max()
+        .unwrap_or(0);
+
+    let mut out = vec![
+        Line::styled(
+            format!(
+                "Context Usage — {} · {} window",
+                r.model,
+                crate::app::tok(r.window)
+            ),
+            Style::new().fg(p.ink).bold(),
+        ),
+        Line::raw(""),
+    ];
+    // Absent before the first turn: the provider has reported nothing yet, and
+    // an invented zero would read as an empty context.
+    if let Some(reported) = r.reported {
+        out.push(total_line("reported", reported, r.window, "last turn", p));
+    }
+    out.push(total_line(
+        "estimated",
+        r.estimated,
+        r.window,
+        "rows below",
+        p,
+    ));
+    out.push(Line::raw(""));
+    for (l, n) in rows {
+        out.push(Line::styled(
+            format!(
+                "  {l:<lw$}  {n:>nw$}  ({s:>5.1}%)",
+                l = l,
+                lw = lw,
+                n = crate::app::tok(n),
+                nw = nw,
+                s = share(n, r.window),
+            ),
+            Style::new().fg(p.muted),
+        ));
+    }
+    out
+}
+
+/// One of the two totals. Whole-number percentages here, one decimal on the
+/// rows: the totals are the headline, the rows are the accounting.
+fn total_line<'a>(name: &str, n: u64, window: u64, note: &str, p: &Palette) -> Line<'a> {
+    Line::styled(
+        format!(
+            "  {name:<9}  {n:>8} / {w}  ({s:.0}%)  {note}",
+            name = name,
+            n = crate::app::tok(n),
+            w = crate::app::tok(window),
+            s = share(n, window),
+            note = note,
+        ),
+        Style::new().fg(p.ink),
+    )
 }
 
 /// Permission summaries lead with the tool name — "bash [sandboxed:seatbelt]:

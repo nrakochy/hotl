@@ -4,6 +4,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hotl_tools::ask::{Question, QuestionOption};
+use hotl_types::{ContextKind, ContextRow};
 use serde_json::Value;
 
 use crate::complete::{self, Completion};
@@ -129,6 +130,29 @@ pub enum TranscriptItem {
     Notice {
         text: String,
     },
+    /// A multi-line block a command produced — today only `/context`. Raw
+    /// numbers, never formatted strings: `view.rs` owns column alignment, so
+    /// these tests can assert tokens instead of whitespace.
+    Report(ContextReport),
+}
+
+/// A `/context` answer, ready to render. Everything a row needs is here; the
+/// view resolves labels, colors and widths.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ContextReport {
+    pub model: String,
+    pub window: u64,
+    /// The provider's exact figure for the last turn; `None` before the first
+    /// turn, and then the report simply omits that line.
+    pub reported: Option<u64>,
+    /// The sum of ALL rows, including the zeros `rows` drops.
+    pub estimated: u64,
+    /// Canonical order, zero rows already dropped.
+    pub rows: Vec<(ContextKind, u64)>,
+    /// `window - max(estimated, reported)`. Taking the max is what keeps the
+    /// estimator's overcount bias pointing the safe way: `/context` may
+    /// understate your remaining room, never overstate it.
+    pub free: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +242,11 @@ pub struct State {
     /// Model context window in tokens, from the handshake. What the context
     /// gauge divides by; `DEFAULT_CONTEXT_WINDOW` until a server reports one.
     pub context_window: u64,
+    /// What the last turn actually cost the provider — the exact figure a
+    /// `/context` report shows beside its estimate. `on_prompt_result`
+    /// computes it for the strip's `% ctx` segment and used to discard it.
+    /// `None` until the first turn completes.
+    pub live_context: Option<u64>,
     /// Every loadable skill name, from the `initialize` result. `/<name>`
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
@@ -278,6 +307,7 @@ impl State {
             mode: "ask".into(),
             plan: false,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            live_context: None,
             skills: Vec::new(),
             density: hotl_theme::Density::default(),
             todos: Vec::new(),
@@ -426,6 +456,9 @@ pub enum Cmd {
     /// Send `session/reload_config` (fire-and-forget; the engine broadcasts
     /// `config_reloaded`, which is what the client actually acts on).
     ReloadConfig,
+    /// Send `session/context` (fire-and-forget; the ack is noise — the engine
+    /// broadcasts `context_report`, which is what the client acts on).
+    RequestContext,
     /// Re-read the client-side half of `config.toml` — theme, density, vim
     /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
     /// filesystem.
@@ -793,6 +826,10 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 text_of("reason")
             ),
         ),
+        // The answer to `/context`. Arrives as a broadcast, so it can land on
+        // a surface that never asked — harmless, it is read-only information
+        // about a session both surfaces share.
+        "context_report" => push_context_report(state, v),
         "prompt_queued" => clear_newest_queued_steer(state),
         "compacted" => {
             let degraded = v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
@@ -809,6 +846,51 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         _ => {}
     }
     Vec::new()
+}
+
+/// Turn a `context_report` payload into a `TranscriptItem::Report`.
+///
+/// A payload whose `rows` will not deserialize degrades to a notice, never to
+/// an empty table: an empty table reads as "your context is empty", which is a
+/// worse lie than admitting the report could not be read.
+fn push_context_report(state: &mut State, v: &Value) {
+    let Some(rows) = v
+        .get("rows")
+        .cloned()
+        .and_then(|r| serde_json::from_value::<Vec<ContextRow>>(r).ok())
+    else {
+        notice(
+            state,
+            "could not read the context report the engine sent".into(),
+        );
+        return;
+    };
+    // A present `window` is used verbatim, zero included — only an absent one
+    // falls back. The engine's window is the one that governs compaction.
+    let window = v
+        .get("window")
+        .and_then(Value::as_u64)
+        .unwrap_or(state.context_window);
+    // Every row counts toward the total, including the ones the table hides
+    // and the ones this binary does not recognize.
+    let estimated = rows.iter().map(|r| r.tokens).sum::<u64>();
+    let reported = state.live_context;
+    let mut display: Vec<(ContextKind, u64)> = rows
+        .into_iter()
+        .filter(|r| r.tokens > 0)
+        .map(|r| (r.kind, r.tokens))
+        .collect();
+    // Sorted here rather than trusted from the wire: display order is this
+    // client's business.
+    display.sort_by_key(|(kind, _)| *kind);
+    state.transcript.push(TranscriptItem::Report(ContextReport {
+        model: state.model.clone(),
+        window,
+        reported,
+        estimated,
+        free: window.saturating_sub(estimated.max(reported.unwrap_or(0))),
+        rows: display,
+    }));
 }
 
 fn on_prompt_result(
@@ -829,7 +911,13 @@ fn on_prompt_result(
         notice(state, n);
     }
     state.session_usage.add(usage);
-    state.usage_line = Some(format_usage(state, usage));
+    // What the *next* turn starts from: everything resident in this turn's
+    // context. Computed here, not in `format_usage`, so the formatter stays a
+    // formatter — `/context` wants the number, not the string.
+    let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let live = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+    state.live_context = Some(live);
+    state.usage_line = Some(format_usage(state, usage, live));
     state.phase = Phase::Idle;
     state.interrupt_sent = false;
     vec![Cmd::SetTitle(title(state, ""))]
@@ -851,7 +939,7 @@ fn outcome_notice(kind: &str, text: Option<&str>) -> Option<String> {
 
 /// Compact token count: verbatim below 1000, else one decimal with a `k`/`M`
 /// suffix. The strip has one line to spend, so `12.0k` beats `12000`.
-fn tok(n: u64) -> String {
+pub(crate) fn tok(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
         1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),
@@ -870,8 +958,7 @@ fn tok(n: u64) -> String {
 /// `cost_usd` — the UI never estimates prices. R4 owns the catalog that
 /// populates it (see the plan's RQ table). Enforced by
 /// `cost_is_shown_only_when_the_payload_carries_it`.
-fn format_usage(state: &State, usage: &Value) -> String {
-    let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+fn format_usage(state: &State, usage: &Value, live: u64) -> String {
     let u = &state.session_usage;
     let mut parts = vec![
         format!("{} in", tok(u.input)),
@@ -886,9 +973,9 @@ fn format_usage(state: &State, usage: &Value) -> String {
     if let Some(ratio) = usage.get("hit_ratio").and_then(Value::as_f64) {
         parts.push(format!("{:.0}% hit", ratio * 100.0));
     }
-    // What the *next* turn starts from: everything resident in this turn's
-    // context, not the session's running total.
-    let live = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
+    // `live` is what the *next* turn starts from — this turn's resident
+    // context, not the session's running total. The caller computes it: it is
+    // also `State.live_context`, which `/context` reports.
     if let Some(pct) = (live * 100).checked_div(state.context_window) {
         parts.push(format!("{}% ctx", pct.min(100)));
     }
@@ -1253,6 +1340,13 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             );
             Vec::new()
         }
+        // The breakdown `/status` and `/cost` cannot give: what is *in* the
+        // window, by source. Round-trips through the engine — only the actor
+        // can see the system prompt, the tool schemas and the real projection.
+        //
+        // No idle guard, unlike `/reload`: this appends nothing and replaces
+        // nothing, so it is safe mid-turn.
+        "context" => vec![Cmd::RequestContext],
         // The strip shows a compact line; this prints the breakdown without
         // stealing strip width.
         "cost" => {
@@ -2687,8 +2781,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/");
-        // Nine built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(10));
+        // Ten built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(11));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename` and `review` prefix-match; no other built-in
@@ -3110,6 +3204,196 @@ mod tests {
                 cmd.name
             );
         }
+    }
+
+    // --- /context (plan 0028) ------------------------------------------
+
+    /// The report the engine broadcasts, as JSON. Rows not named here are
+    /// absent, which is a shape the client must tolerate even though the real
+    /// engine always emits all twelve.
+    fn context_report(window: u64, rows: &[(&str, u64)]) -> Value {
+        json!({
+            "type": "context_report",
+            "window": window,
+            "rows": rows.iter().map(|(k, n)| json!({"kind": k, "tokens": n}))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    fn last_report(s: &State) -> ContextReport {
+        match s.transcript.last() {
+            Some(TranscriptItem::Report(r)) => r.clone(),
+            other => panic!("expected a report, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slash_context_asks_the_engine() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/context");
+        assert_eq!(cmds, vec![Cmd::RequestContext]);
+        assert!(
+            s.transcript.is_empty(),
+            "the report is the broadcast's job, not the command's"
+        );
+    }
+
+    /// Contrast `slash_reload_is_refused_while_a_turn_runs`: a reload replaces
+    /// the session, a context read touches nothing.
+    #[test]
+    fn slash_context_works_mid_turn() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        assert_eq!(slash(&mut s, "context"), vec![Cmd::RequestContext]);
+        assert_eq!(s.phase, Phase::Sampling { ticks: 0 });
+    }
+
+    #[test]
+    fn a_context_report_becomes_a_report_item() {
+        let mut s = State::test_default();
+        s.model = "claude-opus-5".into();
+        update(
+            &mut s,
+            Msg::Update(context_report(
+                1_000_000,
+                &[
+                    ("system_prompt", 5_312),
+                    ("messages", 102_438),
+                    ("tool_results", 138_800),
+                ],
+            )),
+        );
+        let r = last_report(&s);
+        assert_eq!(r.model, "claude-opus-5");
+        assert_eq!(r.window, 1_000_000);
+        assert_eq!(r.estimated, 5_312 + 102_438 + 138_800);
+        assert_eq!(
+            r.rows,
+            vec![
+                (ContextKind::SystemPrompt, 5_312),
+                (ContextKind::Messages, 102_438),
+                (ContextKind::ToolResults, 138_800),
+            ]
+        );
+        assert_eq!(r.free, 1_000_000 - r.estimated);
+    }
+
+    #[test]
+    fn zero_rows_are_dropped_from_the_report() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::Update(context_report(
+                200_000,
+                &[
+                    ("system_prompt", 100),
+                    ("memory", 0),
+                    ("todos", 0),
+                    ("images", 0),
+                ],
+            )),
+        );
+        let r = last_report(&s);
+        assert_eq!(r.rows, vec![(ContextKind::SystemPrompt, 100)]);
+        assert_eq!(r.estimated, 100, "the zeros still summed, they just add 0");
+    }
+
+    /// Rows arrive out of order from a hand-rolled client; display order is
+    /// this client's business, so it sorts rather than trusts.
+    #[test]
+    fn report_rows_are_sorted_into_canonical_order() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::Update(context_report(
+                200_000,
+                &[("messages", 7), ("system_prompt", 3), ("memory", 5)],
+            )),
+        );
+        assert_eq!(
+            last_report(&s).rows,
+            vec![
+                (ContextKind::SystemPrompt, 3),
+                (ContextKind::Memory, 5),
+                (ContextKind::Messages, 7),
+            ]
+        );
+    }
+
+    #[test]
+    fn free_space_never_overstates_the_room() {
+        let mut s = State::test_default();
+        s.live_context = Some(150_000);
+        update(
+            &mut s,
+            Msg::Update(context_report(200_000, &[("messages", 10_000)])),
+        );
+        let r = last_report(&s);
+        assert_eq!(r.reported, Some(150_000));
+        assert_eq!(r.estimated, 10_000);
+        assert_eq!(
+            r.free, 50_000,
+            "free space comes off the LARGER total, never the smaller"
+        );
+    }
+
+    #[test]
+    fn a_zero_window_does_not_divide() {
+        let mut s = State::test_default();
+        update(&mut s, Msg::Update(context_report(0, &[("messages", 10)])));
+        let r = last_report(&s);
+        assert_eq!(r.window, 0);
+        assert_eq!(r.free, 0);
+    }
+
+    /// A newer engine's row must still be counted. Dropping it would report a
+    /// smaller context than exists — the one direction this codebase refuses.
+    #[test]
+    fn an_unknown_row_kind_is_kept() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::Update(context_report(
+                200_000,
+                &[("messages", 10), ("future_thing", 99)],
+            )),
+        );
+        let r = last_report(&s);
+        assert_eq!(r.estimated, 109);
+        assert!(r.rows.contains(&(ContextKind::Unknown, 99)));
+    }
+
+    #[test]
+    fn a_malformed_context_report_notices_instead_of_panicking() {
+        let mut s = State::test_default();
+        update(&mut s, Msg::Update(json!({"type": "context_report"})));
+        assert!(
+            last_notice(&s).contains("could not read the context report"),
+            "an empty table would read as an empty context"
+        );
+    }
+
+    #[test]
+    fn the_report_carries_the_last_turns_reported_total() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::PromptResult {
+                outcome_kind: "done".into(),
+                outcome_text: None,
+                usage: json!({
+                    "input_tokens": 1_000,
+                    "cache_read_input_tokens": 40_000,
+                    "cache_creation_input_tokens": 300,
+                }),
+            },
+        );
+        assert_eq!(s.live_context, Some(41_300));
+        update(
+            &mut s,
+            Msg::Update(context_report(200_000, &[("messages", 10)])),
+        );
+        assert_eq!(last_report(&s).reported, Some(41_300));
     }
 
     #[test]
