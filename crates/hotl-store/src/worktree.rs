@@ -35,6 +35,13 @@ pub struct Worktree {
     /// Tree OID of the seeded state. The child's diff is taken against this,
     /// never against `HEAD` — see [`Worktree::create`] step 5.
     baseline: String,
+    /// Entries the seed could not carry across, one human-readable line each.
+    ///
+    /// Non-empty means the child started from *less* than the parent's working
+    /// tree, which is a degradation the caller has to be able to say out loud.
+    /// The only current source is a Windows symlink without the privilege to
+    /// create one — see `copy_preserving_symlinks`.
+    skipped: Vec<String>,
 }
 
 impl Worktree {
@@ -78,9 +85,14 @@ impl Worktree {
             path,
             workspace,
             baseline: String::new(),
+            skipped: Vec::new(),
         };
         match wt.seed() {
-            Some(baseline) => Some(Self { baseline, ..wt }),
+            Some((baseline, skipped)) => Some(Self {
+                baseline,
+                skipped,
+                ..wt
+            }),
             None => {
                 wt.remove();
                 None
@@ -90,7 +102,7 @@ impl Worktree {
 
     /// Steps 3–5 of `create`: carry the parent's uncommitted state across, then
     /// record what the child started from.
-    fn seed(&self) -> Option<String> {
+    fn seed(&self) -> Option<(String, Vec<String>)> {
         // 3. Tracked changes — modifications, deletions, and mode changes, all
         //    in one patch. `--binary` is not optional: without it a dirty
         //    binary file fails to seed and the child silently sees the `HEAD`
@@ -110,9 +122,13 @@ impl Worktree {
             &self.workspace,
             &["ls-files", "--others", "--exclude-standard", "-z"],
         )?;
+        let mut skipped = Vec::new();
         for name in others.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
             let rel = Path::new(std::str::from_utf8(name).ok()?);
-            copy_preserving_symlinks(&self.workspace.join(rel), &self.path.join(rel))?;
+            match copy_preserving_symlinks(&self.workspace.join(rel), &self.path.join(rel))? {
+                Seeded::Copied => {}
+                Seeded::Skipped(why) => skipped.push(why),
+            }
         }
         // The worktree lives under `.git/`, which `ls-files --others` never
         // lists — so no self-copy guard is needed. Second dividend of the
@@ -128,11 +144,19 @@ impl Worktree {
         //    cannot tell the child's edits from the seed.
         git_ok(&self.path, &["add", "-A"])?;
         let tree = git_ok(&self.path, &["write-tree"])?;
-        Some(String::from_utf8(tree.stdout).ok()?.trim().to_string())
+        Some((
+            String::from_utf8(tree.stdout).ok()?.trim().to_string(),
+            skipped,
+        ))
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// What the seed could not carry across. Empty on a clean seed.
+    pub fn skipped(&self) -> &[String] {
+        &self.skipped
     }
 
     /// The child's own work as a patch. Staged first, so files the child
@@ -253,11 +277,24 @@ fn apply_patch_args(
     child.wait_with_output()
 }
 
+/// What became of one seeded entry, when the outcome is survivable.
+enum Seeded {
+    Copied,
+    /// The entry was left out of the child and the caller must say so.
+    ///
+    /// There is deliberately **no** variant that falls back to copying a
+    /// symlink's contents: materializing the target's bytes inside the child is
+    /// exactly the out-of-repo smuggling `copy_preserving_symlinks` exists to
+    /// prevent, and doing it quietly would turn a visible degradation into an
+    /// invisible one.
+    Skipped(String),
+}
+
 /// Copy `from` to `to`, creating parent directories. A symlink is recreated as
 /// a symlink: a naive copy would dereference it and materialize the target's
 /// bytes inside the child, which is both wrong and a way to smuggle a file
 /// from outside the repo into the diff.
-fn copy_preserving_symlinks(from: &Path, to: &Path) -> Option<()> {
+fn copy_preserving_symlinks(from: &Path, to: &Path) -> Option<Seeded> {
     let meta = std::fs::symlink_metadata(from).ok()?;
     if let Some(parent) = to.parent() {
         std::fs::create_dir_all(parent).ok()?;
@@ -265,11 +302,50 @@ fn copy_preserving_symlinks(from: &Path, to: &Path) -> Option<()> {
     if meta.file_type().is_symlink() {
         let target = std::fs::read_link(from).ok()?;
         let _ = std::fs::remove_file(to);
-        std::os::unix::fs::symlink(target, to).ok()?;
+        if let Err(e) = create_symlink(&target, to, from) {
+            if is_privilege_not_held(&e) {
+                return Some(Seeded::Skipped(format!(
+                    "{}: not seeded — creating a symlink on Windows needs Developer Mode or \
+                     SeCreateSymbolicLinkPrivilege",
+                    from.display()
+                )));
+            }
+            return None;
+        }
     } else if meta.is_file() {
         std::fs::copy(from, to).ok()?;
     }
-    Some(())
+    Some(Seeded::Copied)
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &Path, to: &Path, _from: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, to)
+}
+
+/// Windows wants the link kind up front, and gets it wrong in a way that
+/// matters: a file symlink pointing at a directory does not resolve. Decide
+/// from what the *source* link resolves to, which is `target` interpreted
+/// relative to the original link's parent.
+#[cfg(windows)]
+fn create_symlink(target: &Path, to: &Path, from: &Path) -> std::io::Result<()> {
+    let resolved = from.parent().map(|p| p.join(target));
+    let is_dir = resolved
+        .and_then(|p| std::fs::metadata(p).ok())
+        .is_some_and(|m| m.is_dir());
+    if is_dir {
+        std::os::windows::fs::symlink_dir(target, to)
+    } else {
+        std::os::windows::fs::symlink_file(target, to)
+    }
+}
+
+/// `ERROR_PRIVILEGE_NOT_HELD`. On a stock Windows install this is the *default*
+/// outcome rather than an exotic one — symlink creation is an administrator
+/// privilege unless Developer Mode is on — which is why it degrades to a
+/// reported skip instead of failing the whole worktree build.
+fn is_privilege_not_held(e: &std::io::Error) -> bool {
+    cfg!(windows) && e.raw_os_error() == Some(1314)
 }
 
 fn first_line(stderr: &[u8]) -> String {
@@ -516,20 +592,52 @@ mod tests {
     /// the filesystem directly rather than through git.
     #[test]
     fn create_removes_the_worktree_when_seeding_fails() {
-        use std::os::unix::fs::PermissionsExt;
         let tmp = repo_or_skip!();
         let root = tmp.path();
         let locked = root.join("locked.txt");
         std::fs::write(&locked, "no\n").unwrap();
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-        if std::fs::read(&locked).is_ok() {
-            return; // running as root: the copy cannot be made to fail here
-        }
+        let Some(guard) = make_uncopyable(&locked) else {
+            return; // running as root, or the platform will not refuse the read
+        };
 
         assert!(Worktree::create(root, "01JTESTK").is_none());
         assert_eq!(worktree_count(root), 1, "a half-seeded worktree leaked");
         assert!(!root.join(WORKTREE_DIR).join("01JTESTK").exists());
 
-        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(guard);
+    }
+
+    /// Make `path` unreadable to the seeding copy, or return `None` if this
+    /// environment will not cooperate. Dropping the returned value undoes it.
+    ///
+    /// Two mechanisms because the platforms refuse for different reasons:
+    /// `0o000` denies by permission, which root ignores, while a Windows share
+    /// mode of 0 denies by *sharing*, which nothing overrides — so the Windows
+    /// twin is actually the more reliable of the two.
+    #[cfg(unix)]
+    fn make_uncopyable(path: &Path) -> Option<impl Sized> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).ok()?;
+        if std::fs::read(path).is_ok() {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644));
+            return None;
+        }
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o644));
+            }
+        }
+        Some(Restore(path.to_path_buf()))
+    }
+
+    #[cfg(windows)]
+    fn make_uncopyable(path: &Path) -> Option<impl Sized> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(path)
+            .ok()
     }
 }

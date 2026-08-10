@@ -1,6 +1,6 @@
 //! `0700`/`0600` at create, via the mode extensions.
 
-use super::{EffectiveAccess, PrivateFs};
+use super::{EffectiveAccess, PrivateFs, Writes};
 use std::fs::{DirBuilder, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -29,15 +29,30 @@ impl PrivateFs for UnixPrivateFs {
         }
     }
 
-    fn create_file_new(&self, path: &Path) -> io::Result<File> {
+    fn create_file_new(&self, path: &Path, writes: Writes) -> io::Result<File> {
         // `create_new` is the `O_EXCL`, `mode` is the at-create restriction —
         // together they leave no window in which the file exists and is
         // readable.
-        OpenOptions::new()
+        let mut opts = OpenOptions::new();
+        opts.create_new(true).mode(0o600);
+        match writes {
+            Writes::FromStart => opts.write(true),
+            Writes::Append => opts.append(true),
+        };
+        opts.open(path)
+    }
+
+    fn create_file_truncate(&self, path: &Path) -> io::Result<File> {
+        let file = OpenOptions::new()
             .write(true)
-            .create_new(true)
+            .create(true)
+            .truncate(true)
             .mode(0o600)
-            .open(path)
+            .open(path)?;
+        // `mode` was ignored if the file already existed, so narrow it now —
+        // the window the trait doc names.
+        self.harden_existing(path)?;
+        Ok(file)
     }
 
     fn harden_existing(&self, path: &Path) -> io::Result<()> {

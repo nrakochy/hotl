@@ -17,7 +17,7 @@
 //! principal to grant, only how to express "the current user, and nobody else"
 //! in Win32.
 
-use super::{EffectiveAccess, PrivateFs};
+use super::{EffectiveAccess, PrivateFs, Writes};
 use std::ffi::c_void;
 use std::fs::File;
 use std::io;
@@ -42,8 +42,8 @@ use windows_sys::Win32::Security::{
     SECURITY_DESCRIPTOR_CONTROL, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateDirectoryW, CreateFileW, CREATE_NEW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL,
-    FILE_GENERIC_READ,
+    CreateDirectoryW, CreateFileW, CREATE_ALWAYS, CREATE_NEW, FILE_ALL_ACCESS,
+    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_DATA,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -86,7 +86,7 @@ impl PrivateFs for WindowsPrivateFs {
         Ok(())
     }
 
-    fn create_file_new(&self, path: &Path) -> io::Result<File> {
+    fn create_file_new(&self, path: &Path, writes: Writes) -> io::Result<File> {
         let sid = current_user_sid()?;
         let acl = one_ace_dacl(sid.as_psid(), FILE_ALL_ACCESS)?;
         let mut sd = protected_descriptor(&acl)?;
@@ -96,12 +96,19 @@ impl PrivateFs for WindowsPrivateFs {
             bInheritHandle: 0,
         };
         let wide = wide(path);
+        // `FILE_GENERIC_WRITE` minus `FILE_WRITE_DATA` is Windows' `O_APPEND`:
+        // what is left includes `FILE_APPEND_DATA`, and without write-data the
+        // handle *cannot* address any offset but the end.
+        let access = match writes {
+            Writes::FromStart => GENERIC_READ | GENERIC_WRITE,
+            Writes::Append => FILE_GENERIC_WRITE & !FILE_WRITE_DATA,
+        };
         // `CREATE_NEW` is the `O_EXCL`, and share mode 0 means no other opener
         // gets in between create and the caller's first write. SAFETY: as above.
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
-                GENERIC_READ | GENERIC_WRITE,
+                access,
                 0,
                 &mut sa,
                 CREATE_NEW,
@@ -112,6 +119,39 @@ impl PrivateFs for WindowsPrivateFs {
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
+        // SAFETY: a fresh handle from `CreateFileW`, owned by nothing else.
+        Ok(unsafe { File::from_raw_handle(handle as _) })
+    }
+
+    fn create_file_truncate(&self, path: &Path) -> io::Result<File> {
+        let sid = current_user_sid()?;
+        let acl = one_ace_dacl(sid.as_psid(), FILE_ALL_ACCESS)?;
+        let mut sd = protected_descriptor(&acl)?;
+        let mut sa = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd.as_mut_ptr(),
+            bInheritHandle: 0,
+        };
+        let wide = wide(path);
+        // SAFETY: NUL-terminated path; `sa` is live for the call and its DACL
+        // is owned by `acl` for the same scope.
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                &mut sa,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // `CREATE_ALWAYS` ignores `sa` when the file already existed, so narrow
+        // it now — the window the trait doc names.
+        self.harden_existing(path)?;
         // SAFETY: a fresh handle from `CreateFileW`, owned by nothing else.
         Ok(unsafe { File::from_raw_handle(handle as _) })
     }
@@ -471,7 +511,11 @@ mod tests {
         assert!(dacl_is_protected(&scratch).unwrap());
 
         let file = scratch.join("secret");
-        drop(crate::PRIVATE_FS.create_file_new(&file).unwrap());
+        drop(
+            crate::PRIVATE_FS
+                .create_file_new(&file, crate::privatefs::Writes::FromStart)
+                .unwrap(),
+        );
         assert!(dacl_is_protected(&file).unwrap());
 
         // And the re-hardening path restores it after inheritance is let back

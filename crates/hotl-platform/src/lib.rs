@@ -46,7 +46,7 @@ pub mod sealed;
 
 pub use entropy::{ActiveEntropy, Entropy};
 pub use paths::{ActiveKnownPaths, KnownPaths};
-pub use privatefs::{ActivePrivateFs, EffectiveAccess, PrivateFs};
+pub use privatefs::{ActivePrivateFs, EffectiveAccess, PrivateFs, Writes};
 
 /// The active adapters. Call sites use these rather than naming a platform
 /// type, which is what keeps rule 10 checkable.

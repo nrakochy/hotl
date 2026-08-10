@@ -373,6 +373,43 @@ mod tests {
         assert!(sessions.join(format!("{fresh}.jsonl")).exists());
     }
 
+    /// Make the session log undeletable, and give the caller a value whose
+    /// drop undoes it.
+    ///
+    /// The behavior under test — that `gc` *reports* a failed delete rather
+    /// than panicking or counting the bytes as freed — is genuinely
+    /// cross-platform, so this is a twin rather than a skip. The mechanism has
+    /// to differ: `0o555` on the parent directory is what stops an unlink on
+    /// Unix, while on Windows the directory ACL does not, and the equivalent
+    /// lever is holding a handle open without `FILE_SHARE_DELETE`.
+    #[cfg(unix)]
+    fn seal_against_deletion(sessions: &std::path::Path, _id: &str) -> impl Sized {
+        use std::os::unix::fs::PermissionsExt;
+        let original = std::fs::metadata(sessions).unwrap().permissions();
+        std::fs::set_permissions(sessions, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        struct Restore(std::path::PathBuf, std::fs::Permissions);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, self.1.clone());
+            }
+        }
+        Restore(sessions.to_path_buf(), original)
+    }
+
+    #[cfg(windows)]
+    fn seal_against_deletion(sessions: &std::path::Path, id: &str) -> impl Sized {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Share mode 0 withholds `FILE_SHARE_DELETE`, and NTFS refuses the
+        // unlink while any handle lacks it. Closing the handle is the undo, so
+        // the returned `File` is the guard.
+        std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(sessions.join(format!("{id}.jsonl")))
+            .unwrap()
+    }
+
     #[test]
     fn a_failed_delete_is_reported_and_not_counted_as_freed() {
         let dir = tempfile::tempdir().unwrap();
@@ -386,18 +423,14 @@ mod tests {
             .unwrap()
             .len();
 
-        // Make the log undeletable by sealing its parent directory.
-        let mut perms = std::fs::metadata(&sessions).unwrap().permissions();
-        let original = perms.clone();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o555);
-        std::fs::set_permissions(&sessions, perms).unwrap();
+        let seal = seal_against_deletion(&sessions, &id);
 
         let policy = RetentionPolicy {
             max_sessions: Some(0),
             max_age: None,
         };
         let report = gc(data, &policy, false);
-        std::fs::set_permissions(&sessions, original).unwrap();
+        drop(seal);
 
         assert_eq!(report.failed.len(), 1, "the failure must surface");
         assert_eq!(report.failed[0].0, id);

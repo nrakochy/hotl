@@ -23,14 +23,14 @@ pub mod shadow;
 pub mod worktree;
 
 use std::borrow::Cow;
-use std::fs::{DirBuilder, File, OpenOptions};
+use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use bytes::Bytes;
+use hotl_platform::PrivateFs as _;
 use hotl_types::{new_ulid, Entry, EntryPayload, SessionHeader, FORMAT_VERSION};
 use serde::Serialize;
 use serde_json::value::RawValue;
@@ -493,14 +493,11 @@ impl SessionLog {
         // Enforced by `log_and_dirs_are_owner_only`.
         // Note: `mode` applies to directories this call *creates*; a pre-existing
         // `sessions/` keeps whatever mode it already had.
-        DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        hotl_platform::PRIVATE_FS.create_dir_all(dir)?;
         let session_id = new_ulid();
         let path = dir.join(format!("{session_id}.jsonl"));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .append(true)
-            .mode(0o600)
-            .open(&path)?;
+        let file =
+            hotl_platform::PRIVATE_FS.create_file_new(&path, hotl_platform::Writes::Append)?;
         let offset = file.metadata()?.len();
         let (tx, rx) = mpsc::channel::<WriterCmd>();
         let sealed = Arc::new(Mutex::new(None));
@@ -1248,13 +1245,8 @@ fn write_blob_file(
     bytes: &[u8],
     sync_noop: &AtomicBool,
 ) -> std::io::Result<PathBuf> {
-    DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)?;
+    hotl_platform::PRIVATE_FS.create_dir_all(dir)?;
+    let mut f = hotl_platform::PRIVATE_FS.create_file_truncate(path)?;
     f.write_all(bytes)?;
     if !sync_noop.load(Ordering::SeqCst) {
         f.sync_data()?;
@@ -2623,31 +2615,33 @@ mod tests {
         );
     }
 
+    /// Asserts on the rights the OS *reports*, not on a mode number.
+    ///
+    /// A mode comparison only ever worked on one platform, and it also only
+    /// ever checked what we asked for. `effective_access` reads back what the
+    /// object actually grants, which is the same rule the sandbox probe
+    /// follows for mechanisms: never certify one you did not observe working.
     #[test]
     fn log_and_dirs_are_owner_only() {
-        use std::os::unix::fs::PermissionsExt;
+        use hotl_platform::PrivateFs as _;
         let dir = tempfile::tempdir().unwrap();
         let sessions = dir.path().join("sessions");
         let log = SessionLog::create(&sessions, "m", None, Masker::empty(), 1).unwrap();
         let blob = log.write_blob("toolu_1", "body").unwrap();
 
-        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode(log.path()),
-            0o600,
-            "the transcript must not be world-readable"
-        );
-        assert_eq!(
-            mode(&sessions),
-            0o700,
-            "the sessions dir must not be world-listable"
-        );
-        assert_eq!(
-            mode(&blob),
-            0o600,
-            "blobs were already 0600 — keep them that way"
-        );
-        assert_eq!(mode(blob.parent().unwrap()), 0o700, "the .blobs dir too");
+        for (path, what) in [
+            (log.path(), "the transcript"),
+            (sessions.as_path(), "the sessions dir"),
+            (blob.as_path(), "a blob"),
+            (blob.parent().unwrap(), "the .blobs dir"),
+        ] {
+            let access = hotl_platform::PRIVATE_FS.effective_access(path).unwrap();
+            assert!(
+                access.owner_only,
+                "{what} is readable by {:?}",
+                access.other_readers
+            );
+        }
     }
 
     #[test]
@@ -3463,7 +3457,7 @@ mod tests {
     /// when driven through the channel, and this is the property that must
     /// be deterministic.
     fn batch_fixture(dir: &Path) -> (File, WriterCtx) {
-        let file = OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create_new(true)
             .append(true)
             .open(dir.join("batch.jsonl"))
