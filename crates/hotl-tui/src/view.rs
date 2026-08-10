@@ -692,16 +692,183 @@ fn share(n: u64, window: u64) -> f64 {
 /// between the window and whichever total is larger.
 const FREE_LABEL: &str = "free space";
 
-/// The `/context` block: a header, the two totals, and one line per non-zero
-/// row plus free space. Column widths are computed from what is actually
-/// shown, because row visibility varies session to session.
-fn report_lines<'a>(r: &ContextReport, p: &Palette, _inner: usize) -> Vec<Line<'a>> {
-    let mut rows: Vec<(&'static str, u64)> = r.rows.iter().map(|(k, n)| (label(*k), *n)).collect();
-    rows.push((FREE_LABEL, r.free));
-    let lw = rows.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+/// Below this share of the window, free space stops being an identity and
+/// becomes a warning. The one place color in this block carries urgency.
+const FREE_ALARM_PCT: f64 = 15.0;
+
+/// A meter narrower than this lies more than it tells — `view.rs` already
+/// treats "too narrow, drop the chip" as the house rule for exactly this.
+const MIN_METER_COLS: usize = 24;
+
+/// Which band of the context a row belongs to. Shape encodes the group so the
+/// grouping survives a monochrome terminal or a colorblind reader; color then
+/// separates rows *within* a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Group {
+    /// Rebuilt identically every turn, cached: the byte-stable prefix.
+    Prefix,
+    /// Assembled once per session from disk and state.
+    Preamble,
+    /// Everything the session itself produced.
+    Conversation,
+}
+
+impl Group {
+    const ALL: [Group; 3] = [Group::Prefix, Group::Preamble, Group::Conversation];
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Group::Prefix => "▣",
+            Group::Preamble => "◆",
+            Group::Conversation => "▪",
+        }
+    }
+
+    /// The hue every row in the group slides away from.
+    fn anchor(self, p: &Palette) -> Color {
+        match self {
+            Group::Prefix => p.accent,
+            Group::Preamble => p.idle,
+            Group::Conversation => p.active,
+        }
+    }
+}
+
+const FREE_GLYPH: &str = "▫";
+
+fn group(kind: ContextKind) -> Group {
+    match kind {
+        ContextKind::SystemPrompt
+        | ContextKind::ToolSchemas
+        | ContextKind::SkillsRoster
+        | ContextKind::AgentsRoster => Group::Prefix,
+        ContextKind::ProjectInstructions | ContextKind::Memory | ContextKind::Todos => {
+            Group::Preamble
+        }
+        ContextKind::FoldedHistory
+        | ContextKind::Messages
+        | ContextKind::ToolResults
+        | ContextKind::HarnessInjections
+        | ContextKind::Images
+        | ContextKind::Unknown => Group::Conversation,
+    }
+}
+
+struct ReportRow {
+    label: &'static str,
+    tokens: u64,
+    glyph: &'static str,
+    color: Color,
+}
+
+/// The display rows, free space last. Eight `Palette` slots cannot give twelve
+/// distinguishable colors, so each group's rows slide from its anchor toward
+/// the ink: `i / n * 0.45`. The 0.45 cap is what stops the last row of a long
+/// group reading as plain text.
+fn report_rows(r: &ContextReport, p: &Palette) -> Vec<ReportRow> {
+    let groups: Vec<Group> = r.rows.iter().map(|(k, _)| group(*k)).collect();
+    let mut seen = [0usize; Group::ALL.len()];
+    let mut out: Vec<ReportRow> = r
+        .rows
+        .iter()
+        .zip(&groups)
+        .map(|((kind, tokens), g)| {
+            let slot = Group::ALL
+                .iter()
+                .position(|x| x == g)
+                .expect("a real group");
+            let i = seen[slot];
+            seen[slot] += 1;
+            // `max(2)` so a lone row in a group keeps its anchor undiluted
+            // rather than jumping the full 0.45 toward the ink.
+            let n = groups.iter().filter(|x| *x == g).count().max(2);
+            ReportRow {
+                label: label(*kind),
+                tokens: *tokens,
+                glyph: g.glyph(),
+                color: hotl_theme::blend(g.anchor(p), p.ink, i as f64 / n as f64 * 0.45),
+            }
+        })
+        .collect();
+    out.push(ReportRow {
+        label: FREE_LABEL,
+        tokens: r.free,
+        glyph: FREE_GLYPH,
+        color: if share(r.free, r.window) < FREE_ALARM_PCT {
+            p.blocked
+        } else {
+            p.faint
+        },
+    });
+    out
+}
+
+/// Largest-remainder apportionment of `cells` across `weights`. Rounding down
+/// and handing the leftovers to the biggest fractions is what stops a 0.4% row
+/// eating a whole cell from a 40% one — and lets a row that rounds to nothing
+/// be genuinely absent rather than rounded up to a lie.
+fn allocate(weights: &[u64], total: u64, cells: usize) -> Vec<usize> {
+    if total == 0 || cells == 0 {
+        return vec![0; weights.len()];
+    }
+    let mut base = Vec::with_capacity(weights.len());
+    let mut fracs: Vec<(f64, usize)> = Vec::with_capacity(weights.len());
+    let mut floor_sum = 0usize;
+    for (i, w) in weights.iter().enumerate() {
+        let exact = *w as f64 * cells as f64 / total as f64;
+        let whole = exact.floor() as usize;
+        base.push(whole);
+        floor_sum += whole;
+        fracs.push((exact - whole as f64, i));
+    }
+    fracs.sort_by(|a, b| b.0.total_cmp(&a.0));
+    for (_, i) in fracs.into_iter().take(cells.saturating_sub(floor_sum)) {
+        base[i] += 1;
+    }
+    base
+}
+
+/// The screenshot's block grid compressed into one row: `▇` per used segment
+/// in row order and row color, `▁` for what is left. The only part of the
+/// block carrying information the table does not.
+fn meter<'a>(r: &ContextReport, rows: &[ReportRow], p: &Palette, cols: usize) -> Line<'a> {
+    // Rows and free space account for `estimated + free`. When the provider
+    // reported MORE than the estimator did, the difference is real occupancy
+    // no row can name — show it rather than silently rescaling everything.
+    let accounted = r.estimated + r.free;
+    let mut weights: Vec<u64> = Vec::with_capacity(rows.len() + 1);
+    let mut styles: Vec<(&'static str, Color)> = Vec::with_capacity(rows.len() + 1);
+    for row in &rows[..rows.len() - 1] {
+        weights.push(row.tokens);
+        styles.push(("▇", row.color));
+    }
+    if r.window > accounted {
+        weights.push(r.window - accounted);
+        styles.push(("▇", p.muted));
+    }
+    let free = rows.last().expect("free space is always a row");
+    weights.push(free.tokens);
+    styles.push(("▁", free.color));
+
+    let cells = allocate(&weights, weights.iter().sum(), cols);
+    let mut spans = vec![Span::raw("  ")];
+    for (n, (glyph, color)) in cells.into_iter().zip(styles) {
+        if n > 0 {
+            spans.push(Span::styled(glyph.repeat(n), Style::new().fg(color)));
+        }
+    }
+    Line::from(spans)
+}
+
+/// The `/context` block: a header, a meter, the two totals, and one line per
+/// non-zero row plus free space. Column widths are computed from what is
+/// actually shown, because row visibility varies session to session.
+fn report_lines<'a>(r: &ContextReport, p: &Palette, inner: usize) -> Vec<Line<'a>> {
+    let rows = report_rows(r, p);
+    let lw = rows.iter().map(|row| row.label.len()).max().unwrap_or(0);
     let nw = rows
         .iter()
-        .map(|(_, n)| crate::app::tok(*n).len())
+        .map(|row| crate::app::tok(row.tokens).len())
         .max()
         .unwrap_or(0);
 
@@ -716,6 +883,11 @@ fn report_lines<'a>(r: &ContextReport, p: &Palette, _inner: usize) -> Vec<Line<'
         ),
         Line::raw(""),
     ];
+    // A two-cell bar would be a worse answer than no bar.
+    if inner >= MIN_METER_COLS {
+        out.push(meter(r, &rows, p, inner - 2));
+        out.push(Line::raw(""));
+    }
     // Absent before the first turn: the provider has reported nothing yet, and
     // an invented zero would read as an empty context.
     if let Some(reported) = r.reported {
@@ -729,18 +901,28 @@ fn report_lines<'a>(r: &ContextReport, p: &Palette, _inner: usize) -> Vec<Line<'
         p,
     ));
     out.push(Line::raw(""));
-    for (l, n) in rows {
-        out.push(Line::styled(
-            format!(
-                "  {l:<lw$}  {n:>nw$}  ({s:>5.1}%)",
-                l = l,
-                lw = lw,
-                n = crate::app::tok(n),
-                nw = nw,
-                s = share(n, r.window),
+    for row in rows {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(row.glyph, Style::new().fg(row.color)),
+            Span::raw(" "),
+            Span::styled(
+                format!("{:<lw$}", row.label, lw = lw),
+                Style::new().fg(row.color),
             ),
-            Style::new().fg(p.muted),
-        ));
+            Span::styled(
+                // The percentage is right-aligned as a whole, so the paren
+                // moves and the digits line up — padding *inside* the parens
+                // would align the digits but read as a typo.
+                format!(
+                    "  {n:>nw$}  {s:>7}",
+                    n = crate::app::tok(row.tokens),
+                    nw = nw,
+                    s = format!("({:.1}%)", share(row.tokens, r.window)),
+                ),
+                Style::new().fg(p.muted),
+            ),
+        ]));
     }
     out
 }
@@ -2511,5 +2693,179 @@ mod tests {
             let hot = draw_cached(&s, &mut warm);
             assert_eq!(hot, cold, "cached render diverged at step {step}");
         }
+    }
+
+    // --- /context render (plan 0028) -----------------------------------
+
+    /// The content width an 80-column terminal hands a transcript item at the
+    /// default density: `80 - gutter(2) - glyph - space`.
+    const REPORT_INNER: usize = 76;
+
+    fn report(window: u64, reported: Option<u64>, rows: Vec<(ContextKind, u64)>) -> ContextReport {
+        let estimated: u64 = rows.iter().map(|(_, n)| n).sum();
+        ContextReport {
+            model: "claude-opus-5".into(),
+            window,
+            reported,
+            estimated,
+            free: window.saturating_sub(estimated.max(reported.unwrap_or(0))),
+            rows,
+        }
+    }
+
+    fn block(r: &ContextReport, inner: usize) -> Vec<Line<'static>> {
+        item_block(
+            &TranscriptItem::Report(r.clone()),
+            &Palette::default(),
+            false,
+            inner,
+        )
+        .1
+    }
+
+    /// Every foreground a one-character `glyph` span was drawn in, in order.
+    fn glyph_colors(lines: &[Line], glyph: &str) -> Vec<Color> {
+        lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|s| s.content == glyph)
+            .map(|s| s.style.fg.expect("a group glyph always carries a color"))
+            .collect()
+    }
+
+    fn three_groups() -> ContextReport {
+        report(
+            1_000_000,
+            Some(241_300),
+            vec![
+                (ContextKind::SystemPrompt, 5_312),
+                (ContextKind::ToolSchemas, 14_401),
+                (ContextKind::Memory, 1_800),
+                (ContextKind::Messages, 102_438),
+                (ContextKind::ToolResults, 138_800),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_context_report_renders_one_line_per_row() {
+        let r = three_groups();
+        let lines = block(&r, REPORT_INNER);
+        // header, blank, meter, blank, reported, estimated, blank, then the
+        // five rows plus free space.
+        assert_eq!(lines.len(), 7 + r.rows.len() + 1);
+        let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+        assert!(text[0].contains("claude-opus-5") && text[0].contains("1.0M window"));
+        assert!(text[4].starts_with("  reported"), "{:?}", text[4]);
+        assert!(text[5].starts_with("  estimated"), "{:?}", text[5]);
+        assert!(text.last().expect("free row").contains("free space"));
+    }
+
+    #[test]
+    fn the_reported_line_is_absent_before_the_first_turn() {
+        let r = report(200_000, None, vec![(ContextKind::Messages, 10_000)]);
+        let text: Vec<String> = block(&r, REPORT_INNER)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            !text.iter().any(|l| l.contains("reported")),
+            "no turn has reported anything yet: {text:?}"
+        );
+        assert!(text.iter().any(|l| l.contains("estimated")));
+    }
+
+    #[test]
+    fn group_colors_differ_across_groups() {
+        let lines = block(&three_groups(), REPORT_INNER);
+        let prefix = glyph_colors(&lines, "▣")[0];
+        let preamble = glyph_colors(&lines, "◆")[0];
+        let conversation = glyph_colors(&lines, "▪")[0];
+        assert_ne!(prefix, preamble);
+        assert_ne!(preamble, conversation);
+        assert_ne!(prefix, conversation);
+    }
+
+    #[test]
+    fn rows_within_a_group_are_distinguishable() {
+        let lines = block(&three_groups(), REPORT_INNER);
+        for glyph in ["▣", "▪"] {
+            let colors = glyph_colors(&lines, glyph);
+            assert_eq!(colors.len(), 2, "{glyph}");
+            assert_ne!(
+                colors[0], colors[1],
+                "two {glyph} rows must not share a color"
+            );
+        }
+    }
+
+    #[test]
+    fn free_space_turns_blocked_when_the_window_is_nearly_full() {
+        let p = Palette::default();
+        let full = report(200_000, None, vec![(ContextKind::Messages, 180_000)]);
+        assert_eq!(
+            glyph_colors(&block(&full, REPORT_INNER), "▫"),
+            vec![p.blocked]
+        );
+        let roomy = report(200_000, None, vec![(ContextKind::Messages, 20_000)]);
+        assert_eq!(
+            glyph_colors(&block(&roomy, REPORT_INNER), "▫"),
+            vec![p.faint]
+        );
+    }
+
+    #[test]
+    fn the_meter_is_dropped_on_a_narrow_terminal() {
+        let text: Vec<String> = block(&three_groups(), 20)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(
+            !text.iter().any(|l| l.contains('▇')),
+            "a two-cell bar lies more than no bar: {text:?}"
+        );
+        // The table itself still renders.
+        assert!(text.iter().any(|l| l.contains("free space")));
+    }
+
+    #[test]
+    fn meter_segments_sum_to_the_bar_width() {
+        // A 0.4% row beside a 40% one is exactly the mix largest-remainder
+        // exists for.
+        let mixes = vec![
+            three_groups(),
+            report(
+                200_000,
+                None,
+                vec![
+                    (ContextKind::Todos, 800),
+                    (ContextKind::Messages, 80_000),
+                    (ContextKind::ToolResults, 1),
+                ],
+            ),
+            report(200_000, Some(199_999), vec![(ContextKind::Messages, 1_000)]),
+        ];
+        for inner in [MIN_METER_COLS, 40, REPORT_INNER] {
+            for r in &mixes {
+                let bar = &block(r, inner)[2];
+                let cells: usize = bar
+                    .spans
+                    .iter()
+                    .skip(1) // the two-space indent
+                    .map(|s| s.content.chars().count())
+                    .sum();
+                assert_eq!(cells, inner - 2, "inner={inner} rows={:?}", r.rows);
+            }
+        }
+    }
+
+    #[test]
+    fn a_zero_window_renders_without_panicking() {
+        let r = report(0, Some(0), vec![(ContextKind::Messages, 10)]);
+        let text: Vec<String> = block(&r, REPORT_INNER)
+            .iter()
+            .map(|l| l.to_string())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("messages")), "{text:?}");
     }
 }

@@ -987,8 +987,23 @@ mod tests {
         hotl_tools::rules::Rules::default().with_mode(hotl_tools::rules::PermissionMode::Bypass)
     }
 
+    /// True when `hotl-tools` was compiled `security-enforced`, the build where
+    /// `Bypass` cannot exist at runtime — `bypass_rules()` above comes back as
+    /// `Ask`, so a "runs without asking" premise is **void**, not violated.
+    ///
+    /// A runtime check rather than `#[cfg(not(feature = ...))]`: this crate has
+    /// no `security-enforced` feature of its own, so a `cfg` here is always
+    /// false — while `cargo test --workspace --all-features` turns hotl-tools'
+    /// on through feature unification.
+    fn bypass_unavailable() -> bool {
+        hotl_tools::rules::enforced_build()
+    }
+
     #[tokio::test]
     async fn bypass_mode_runs_mutating_calls_without_asking() {
+        if bypass_unavailable() {
+            return;
+        }
         // write (not bash): the harness runs unsandboxed, and auto mode
         // deliberately excludes unsandboxed bash — covered by rules tests.
         //
@@ -1059,6 +1074,9 @@ mod tests {
 
     #[tokio::test]
     async fn auto_mode_doom_loop_stops_without_asking() {
+        if bypass_unavailable() {
+            return;
+        }
         // A *relative* path: `read` is only unprompted inside the working
         // directory, and an absolute one is a protected ask that deliberately
         // outranks `mode=auto`. This test is about auto mode not asking for an

@@ -72,6 +72,20 @@ struct Session {
     dir: tempfile::TempDir,
 }
 
+/// True when `hotl-tools` was compiled `security-enforced`, the build where
+/// `Bypass` cannot exist at runtime (`rules::enforced_mode` coerces it to
+/// `Ask`). A test whose premise is "the call auto-allows with no human" is
+/// then **void**, not violated.
+///
+/// Deliberately a runtime check, not `#[cfg(not(feature = ...))]` as
+/// `hotl-tools`' own suite uses: this crate has no `security-enforced` feature
+/// of its own, so a `cfg` here is always false — while `cargo test --workspace
+/// --all-features` turns hotl-tools' on through feature unification, which is
+/// exactly the build that used to fail.
+fn bypass_unavailable() -> bool {
+    hotl_tools::rules::enforced_build()
+}
+
 fn session(cmd: &str, rules: Rules) -> (Session, Arc<AtomicBool>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig::default();
@@ -164,6 +178,9 @@ async fn auto_allowed_call_does_not_suppress_the_ask() {
 /// and it reaches `Verdict::Auto` without any rule at all.
 #[tokio::test]
 async fn bypass_mode_does_not_suppress_the_ask() {
+    if bypass_unavailable() {
+        return;
+    }
     let rules = Rules::default().with_mode(hotl_tools::rules::PermissionMode::Bypass);
     let (mut s, saw) = session("curl https://docs.example.com/x", rules);
     let outcome = run_turn(&mut s, || panic!("bypass mode must not reach the human")).await;

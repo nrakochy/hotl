@@ -188,8 +188,17 @@ async fn set_plan_takes_effect_on_the_running_session() {
 /// `enforced_mode_coerces_auto_to_ask`), so this is the mirror-image
 /// regression check: on a normal (non-enforced) build, `SetMode(Auto)` must
 /// still take effect as `Auto`, end to end through the real actor loop.
+///
+/// "This crate has no `security-enforced` feature of its own" is why the guard
+/// below is a **runtime** check and not a `#[cfg]`: a `cfg` here is always
+/// false, but `cargo test --workspace --all-features` still compiles
+/// `hotl-tools` with the feature through unification, and then the premise —
+/// a normal build — is simply not the build being tested.
 #[tokio::test]
 async fn set_mode_auto_stays_auto_on_a_normal_build() {
+    if hotl_tools::rules::enforced_build() {
+        return;
+    }
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig::default();
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");

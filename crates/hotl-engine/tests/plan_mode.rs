@@ -39,6 +39,18 @@ struct Ran {
     log: String,
 }
 
+/// True when `hotl-tools` was compiled `security-enforced`, the build where
+/// `Bypass` cannot exist at runtime (`rules::enforced_mode` coerces it to
+/// `Ask`). Every bypass-premised test below is then **void**, not violated.
+///
+/// A runtime check rather than `#[cfg(not(feature = ...))]`: this crate has no
+/// `security-enforced` feature of its own, so a `cfg` here is always false —
+/// while `cargo test --workspace --all-features` turns hotl-tools' on through
+/// feature unification.
+fn bypass_unavailable() -> bool {
+    hotl_tools::rules::enforced_build()
+}
+
 async fn run_one(
     mode: PermissionMode,
     plan: bool,
@@ -163,6 +175,9 @@ async fn plan_asks_before_a_write_even_under_bypass() {
 /// The control for the test above: same call, plan off, and it runs unattended.
 #[tokio::test]
 async fn without_plan_bypass_writes_without_asking() {
+    if bypass_unavailable() {
+        return;
+    }
     let (input, target) = write_call("plan-off-bypass-wrote.txt");
     let r = run_one(
         PermissionMode::Bypass,
@@ -211,6 +226,9 @@ async fn plan_plus_dontask_asks_and_a_declined_write_never_lands() {
 /// it works out what to propose.
 #[tokio::test]
 async fn plan_plus_bypass_still_runs_bash() {
+    if bypass_unavailable() {
+        return;
+    }
     let r = run_one(
         PermissionMode::Bypass,
         true,
