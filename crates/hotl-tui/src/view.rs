@@ -1315,7 +1315,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "pgup pgdn scroll · ctrl-home/end jump · mouse wheel",
         "drag to select and copy · shift-drag for the terminal's own select",
         "ctrl-t expand model thinking",
-        "/help /status /cost /clear /quit · /rename /plan /mode /reload",
+        "/help /status /context /cost /clear /quit · /rename /plan /mode /reload",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
         "ctrl-e or :e open $EDITOR · ctrl-c quit (busy: cancel, again quit)",

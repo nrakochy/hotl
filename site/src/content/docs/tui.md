@@ -182,6 +182,7 @@ own.
 | `/reload` | Re-read `config.toml` without losing the session (see [Reloading config](#reloading-config)). |
 | `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. |
 | `/status` | What this session is running: name, model, permission mode and plan state, context window, todo count. |
+| `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
 | `/quit` | Leave the console (the session log is already on disk). |
@@ -193,6 +194,67 @@ it, `Esc` dismisses. The descriptions beside each skill come from its
 roster entry and cost nothing by default: the always-sent tool description
 omits them, and the model only sees one if it explicitly queries the skill
 tool for it.
+
+### The context report
+
+`/context` answers "what is filling my context window, and how much room is
+left?" It prints into the scrollback rather than taking over the screen, and
+it is a **read**: it appends nothing to the session and starts no turn, so
+unlike `/reload` it is safe to run while a turn is running.
+
+```
+· Context Usage — claude-opus-5 · 1.0M window
+·
+·   ▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▇▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+·
+·   reported     241.3k / 1.0M  (24%)  last turn
+·   estimated    262.8k / 1.0M  (26%)  rows below
+·
+·   ▣ system prompt    5.3k   (0.5%)
+·   ▣ tool schemas    14.4k   (1.4%)
+·   ◆ memory           1.8k   (0.2%)
+·   ▪ messages       102.4k  (10.2%)
+·   ▪ tool results   138.8k  (13.9%)
+·   ▫ free space     737.2k  (73.7%)
+```
+
+**Two totals, on purpose.** `reported` is the provider's exact figure for the
+last turn — accurate, but a single number with no breakdown. `estimated` is
+hotl's own per-item accounting, the same ruler that decides when to fold
+history, and it deliberately overcounts so that estimation error causes an
+early fold rather than an overflow. Showing both means the gap between them is
+visible: that gap *is* the overcount margin. Free space is computed from
+whichever total is larger, so the report may understate your remaining room
+but never overstates it. Before the first turn there is no `reported` line.
+
+**The rows** cover everything in the window exactly once — every item lands in
+one row, and the rows sum to the estimate. Zero rows are hidden.
+
+| Group | Rows |
+|---|---|
+| `▣` stable prefix | system prompt, tool schemas, skills roster, agents roster |
+| `◆` session preamble | project instructions, memory, todos |
+| `▪` conversation | messages, tool results, folded history, harness injections, images |
+| `▫` free space | turns red below 15% |
+
+The shape carries the grouping and the color separates rows within a group, so
+the table still reads on a monochrome terminal. `skills roster` and `agents
+roster` get their own rows because the `skill` and `spawn` tools carry their
+whole roster inside the schema hotl sends every turn — they are often the
+largest single line in the prefix. `harness injections` is where system
+reminders, doom-loop nudges, retry feedback and sub-agent results land;
+a large sub-agent result is the single biggest surprise a session can hit,
+which is why it is not folded into `messages`.
+
+The meter is the same numbers as one row, colored per row in table order. On a
+terminal narrower than about 24 content columns it is dropped rather than
+rendered as a misleading two-cell bar.
+
+`/context` is TUI-only. It describes a live session's assembled context, and
+`hotl -p` builds one, runs it and exits — there is no session left to measure.
+Under `hotl acp` the same thing is a `session/context` call: the reply is a
+thin `{"ok": true}` ack and the report itself arrives as a `context_report`
+`session/update`, so every attached surface sees it.
 
 ### Reloading config
 

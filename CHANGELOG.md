@@ -8,6 +8,32 @@ semver promise of their own.
 
 ### Added
 
+- **`/context` — what is filling the context window, by source.** A twelve-row
+  breakdown in the scrollback: system prompt, tool schemas, skills roster,
+  agents roster, project instructions, memory, todos, folded history, messages,
+  tool results, harness injections, images — plus free space, a per-row meter
+  and two totals. Every item in the window lands in exactly one row and the
+  rows sum to the estimate, so nothing is dropped or double-counted (images in
+  particular are lifted out of their owning message rather than billed twice).
+
+  Both totals are shown and labelled: `reported` is the provider's exact figure
+  for the last turn, `estimated` is hotl's own per-item accounting — the same
+  ruler that decides when to fold history, which deliberately overcounts. Free
+  space is computed from whichever is larger, so the report may understate your
+  remaining room and never overstates it. The gap between the two lines is the
+  overcount margin, visible for the first time.
+
+  Shape carries the grouping (`▣` stable prefix, `◆` session preamble, `▪`
+  conversation, `▫` free space) so the table reads on a monochrome terminal;
+  color separates rows *within* a group and is derived from the theme palette,
+  never hardcoded. Free space turns to the `blocked` slot below 15%.
+
+  It is a read — no log entry, no projection advance — so unlike `/reload` it
+  is safe to run mid-turn. Over `hotl acp` it is `session/context`: a thin
+  `{"ok": true}` ack plus a `context_report` `session/update` broadcast, so
+  every attached surface gets the report. Additive: the update schema version
+  is unchanged.
+
 - **The model config resolved to is now on the summary line**, on both
   surfaces: the TUI's idle strip (`⠐⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠂ claude-opus-5 · 120 in · 45
   out · 0% ctx`) and the per-turn footer headless runs print (`[claude-opus-5
