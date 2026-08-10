@@ -129,6 +129,11 @@ fn label_with(mechanism: &str, unix: UnixSockets, automation: Automation, reads:
     if matches!(reads, Reads::Open) {
         out.push_str(" reads:open");
     }
+    // Which shell is running the command is part of what a human is approving
+    // wherever it is not the obvious one. Silent on Unix.
+    if let Ok(spec) = crate::shell::resolve_shell() {
+        out.push_str(&spec.label());
+    }
     out
 }
 
@@ -635,13 +640,25 @@ pub fn build_command(
         SandboxStatus::Enforced("landlock") | SandboxStatus::Enforced("landlock(partial)") => {
             landlock_command(command, egress)
         }
-        _ => {
-            let mut cmd = tokio::process::Command::new("sh");
-            cmd.arg("-c").arg(command);
-            cmd
-        }
+        _ => shell_command(command),
     };
     apply_child_env(cmd, egress)
+}
+
+/// `<resolved sh> -c <command>`.
+///
+/// Resolved by absolute path where the platform needs one — see
+/// `crate::shell`, which also records why `cmd` and PowerShell are not
+/// fallbacks. An unresolvable shell means the `bash` tool is not in the
+/// registry at all, so reaching here with one is a caller bug; the plain `sh`
+/// fallback keeps that bug loud (a spawn failure) rather than silent.
+fn shell_command(command: &str) -> tokio::process::Command {
+    let program = crate::shell::resolve_shell()
+        .map(|s| s.path.clone())
+        .unwrap_or_else(|_| PathBuf::from("sh"));
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.arg("-c").arg(command);
+    cmd
 }
 
 /// Detach a spawned tool child from the terminal or console that hotl is
@@ -756,7 +773,26 @@ fn apply_child_env(
     ) {
         cmd.env_remove(name);
     }
+    apply_shell_env(&mut cmd);
     apply_proxy_env(cmd, egress)
+}
+
+/// Environment the resolved shell needs to behave like the shell hotl's rules
+/// engine assumes.
+///
+/// Git Bash and MSYS2 rewrite bare `/foo` arguments into
+/// `C:/Program Files/Git/foo` on the way to a native child. That mangling is
+/// invisible to `bash_write_targets`, which analyses the *command string*, so a
+/// path the deny rules cleared is not the path that gets written. Turning it
+/// off keeps the string the model wrote and the path the child touches the same
+/// thing.
+///
+/// A no-op on Unix, where there is no translation layer to disable.
+fn apply_shell_env(cmd: &mut tokio::process::Command) {
+    if cfg!(windows) {
+        cmd.env("MSYS_NO_PATHCONV", "1");
+        cmd.env("MSYS2_ARG_CONV_EXCL", "*");
+    }
 }
 
 /// Allowlist mode: cooperating clients (curl, git, pip, cargo — anything

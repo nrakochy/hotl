@@ -304,6 +304,18 @@ fn sandbox_check(config_dir: &Path, rules: &hotl_tools::rules::Rules) -> Vec<Che
         ok(containment_section(&extras.read_deny, &containment))
     });
     hotl_tools::sandbox::init_extras(extras);
+    // Which shell runs bash commands, and how it was found — the "how" is what
+    // tells a user what to install when it is missing.
+    checks.push(match hotl_tools::shell::resolve_shell() {
+        Ok(spec) => ok(format!(
+            "shell: {} (found via {})",
+            spec.path.display(),
+            spec.how
+        )),
+        Err(why) => warn(format!(
+            "shell: none — the `bash` tool is absent from the registry. {why}"
+        )),
+    });
     checks.push(match sandbox::probe() {
         sandbox::SandboxStatus::Enforced(m) => ok(format!("sandbox: enforced ({m}){extra_note}")),
         sandbox::SandboxStatus::Disabled => {

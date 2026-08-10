@@ -75,6 +75,35 @@ fn has_drive_letter(path: &str) -> bool {
     matches!((c.next(), c.next()), (Some(d), Some(':')) if d.is_ascii_alphabetic())
 }
 
+/// Rewrite an MSYS drive path (`/c/Users/you`) into a native one (`C:/Users/you`).
+///
+/// Model-authored commands under Git Bash mix both spellings freely, and the
+/// write classifier has to see one file where the shell sees one file: without
+/// this, `/c/Users/you/.ssh/id_rsa` and `C:/Users/you/.ssh/id_rsa` are two
+/// different strings to `execute_later_reason` and only one of them matches.
+///
+/// A no-op on Unix, where `/c/...` is an ordinary absolute path and rewriting
+/// it would invent a drive that does not exist.
+pub fn from_msys_drive(path: &str) -> Cow<'_, str> {
+    if !cfg!(windows) {
+        return Cow::Borrowed(path);
+    }
+    // `/c/x` and `/c` alone; not `/computed/x`, which only shares a prefix.
+    let rest = match path.strip_prefix('/') {
+        Some(r) => r,
+        None => return Cow::Borrowed(path),
+    };
+    let mut chars = rest.chars();
+    let Some(drive) = chars.next().filter(|c| c.is_ascii_alphabetic()) else {
+        return Cow::Borrowed(path);
+    };
+    match chars.next() {
+        None => Cow::Owned(format!("{}:/", drive.to_ascii_uppercase())),
+        Some('/') => Cow::Owned(format!("{}:/{}", drive.to_ascii_uppercase(), &rest[2..])),
+        Some(_) => Cow::Borrowed(path),
+    }
+}
+
 /// Path components, with empty and `.` segments dropped.
 ///
 /// The root is *not* stripped, so `C:/x` yields `["C:", "x"]`. Both sides of
@@ -117,6 +146,24 @@ mod tests {
         } else {
             assert_eq!(folded, r"a\b");
             assert_eq!(basename(r"a\b"), r"a\b");
+        }
+    }
+
+    /// The two spellings a Git Bash command line mixes must name one file to
+    /// the write classifier, or a deny rule matches only one of them.
+    #[test]
+    fn an_msys_drive_path_becomes_a_native_one_only_on_windows() {
+        let got = from_msys_drive("/c/Users/you/.ssh/id_rsa");
+        if cfg!(windows) {
+            assert_eq!(got, "C:/Users/you/.ssh/id_rsa");
+            assert_eq!(from_msys_drive("/c"), "C:/");
+            // Not a drive: an ordinary path that happens to start with one
+            // letter must be left alone.
+            assert_eq!(from_msys_drive("/computed/x"), "/computed/x");
+        } else {
+            // `/c/...` is a real absolute path here; rewriting it would invent
+            // a drive.
+            assert_eq!(got, "/c/Users/you/.ssh/id_rsa");
         }
     }
 

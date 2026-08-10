@@ -1335,7 +1335,7 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &str {
-        "Run a shell command (`sh -c`). Default timeout 120s (`timeout_ms` overrides, max 600s); \
+        "Run a shell command (`sh -c`, POSIX). Default timeout 120s (`timeout_ms` overrides, max 600s); \
          the whole process group is killed on timeout or cancel. stdout and stderr share one pipe, \
          so output arrives in the order the command actually wrote it (as a terminal shows it) and \
          the two are not distinguishable. Truncated at 50KB. A failure ends with a structured \

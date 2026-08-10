@@ -1478,6 +1478,16 @@ fn build_registry(
             search_concurrency,
         )));
     }
+    // Capability subtraction, last: with no POSIX shell the `bash` tool leaves
+    // the registry entirely, so the model is told it is unavailable rather than
+    // handed a shell whose grammar the deny rules cannot analyze.
+    let registry = match hotl_tools::shell::resolve_shell() {
+        Ok(_) => registry,
+        Err(why) => {
+            discovery_warnings.push(format!("the `bash` tool is unavailable: {why}"));
+            hotl_tools::filter_for_shell(registry, false)
+        }
+    };
     (registry, skills_catalog, discovery_warnings)
 }
 

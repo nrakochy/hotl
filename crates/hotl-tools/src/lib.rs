@@ -18,6 +18,7 @@ pub mod net;
 pub mod path;
 pub mod rules;
 pub mod sandbox;
+pub mod shell;
 pub mod skills;
 #[cfg(test)]
 pub(crate) mod testsupport;
@@ -265,6 +266,20 @@ pub(crate) const CREDENTIAL_DIRS: &[&str] = &[".ssh/", ".aws/", ".config/gcloud/
 /// The `$HOME` dotfiles in the same class — matched on the basename.
 pub(crate) const CREDENTIAL_FILES: &[&str] = &[".npmrc", ".pypirc", ".netrc", ".dockercfg"];
 
+/// Drop the `bash` tool when no POSIX shell resolves.
+///
+/// This is capability *subtraction* through the existing `Registry::filtered`
+/// — the same mechanism `ARCHITECTURE.md` promises for the browser profile,
+/// used here rather than described. The model is **told** bash is unavailable
+/// instead of being handed a shell whose grammar the deny rules cannot
+/// analyze; see `shell` for why `cmd` and PowerShell are not fallbacks.
+pub fn filter_for_shell(registry: Registry, have_shell: bool) -> Registry {
+    if have_shell {
+        return registry;
+    }
+    registry.filtered(|t| t.name() != "bash")
+}
+
 /// The execute-later class: files whose *write* is benign-looking but
 /// whose later effect —
 /// execution, authentication, or credential theft — happens outside any gate.
@@ -276,6 +291,10 @@ pub fn execute_later_reason(path: &str) -> Option<&'static str> {
     // free; on a case-sensitive volume the only effect is a harmless extra ask
     // for an oddly-cased name. Callers pass the fsguard-normalized relative
     // path, so `//` and `./` separator tricks are already collapsed here.
+    // Normalize before matching, so the two spellings a Git Bash command line
+    // mixes (`/c/Users/...` and `C:\Users\...`) reach the same verdict.
+    let path = crate::path::normalize_separators(path);
+    let path = crate::path::from_msys_drive(&path);
     let p = path.trim_start_matches("./").to_ascii_lowercase();
     let file = crate::path::basename(&p);
     if p.contains(".git/hooks/") {
