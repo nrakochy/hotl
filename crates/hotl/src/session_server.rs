@@ -13,19 +13,28 @@
 //! and is deliberately out of scope; this parks in memory, in the live server.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hotl_engine::{EngineEvent, SessionHandle};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixListener;
 use tokio::sync::Mutex as AsyncMutex;
+
+use hotl_platform::{Ipc as _, IpcListener as _};
+
+/// The session transport, bound in one place: a unix socket on Unix, a named
+/// pipe on Windows. `tokio::io::split` rather than a transport-specific
+/// `into_split`, because it is the one spelling both have.
+type Stream = <hotl_platform::ActiveIpc as hotl_platform::Ipc>::Stream;
+type Listener = <hotl_platform::ActiveIpc as hotl_platform::Ipc>::Listener;
+type ReadHalf = tokio::io::ReadHalf<Stream>;
+type WriteHalf = tokio::io::WriteHalf<Stream>;
 
 use crate::acp::{outcome_tag, update_payload, UPDATE_SCHEMA_VERSION};
 
-type ClientWriter = AsyncMutex<Option<tokio::net::unix::OwnedWriteHalf>>;
+type ClientWriter = AsyncMutex<Option<WriteHalf>>;
 
 /// What a surface prints after a human allows a host: the grant is
 /// session-scoped, and hotl does not write `config.toml` for you.
@@ -87,13 +96,12 @@ pub fn token_path(id: &str) -> PathBuf {
     run_dir().join(format!("{id}.token"))
 }
 
-/// 256-bit hex secret from the OS CSPRNG. hotl is unix-only, so `/dev/urandom`
-/// is always present; a read failure fails the serve rather than minting a weak
-/// token.
+/// 256-bit hex secret from the OS CSPRNG. A failure fails the serve rather
+/// than minting a weak token — `Entropy` forbids a PRNG fallback for exactly
+/// this consumer.
 fn mint_token() -> std::io::Result<String> {
-    use std::io::Read;
-    let mut buf = [0u8; 32];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    use hotl_platform::Entropy as _;
+    let buf: [u8; 32] = hotl_platform::ENTROPY.token_bytes()?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
@@ -107,16 +115,16 @@ fn tokens_match(a: &str, b: &str) -> bool {
 /// socket) and present the session token as its first frame. Returns the reader
 /// half to promote, or None (rejected — the caller leaves the incumbent alone).
 async fn authenticate(
-    stream: tokio::net::UnixStream,
+    stream: Stream,
     token: &str,
-) -> Option<(
-    tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
-    tokio::net::unix::OwnedWriteHalf,
-)> {
-    if !peer_is_same_uid(&stream) {
+) -> Option<(tokio::io::Lines<BufReader<ReadHalf>>, WriteHalf)> {
+    if let Err(why) = hotl_platform::IPC.authenticate_peer(&stream) {
+        // Defence in depth behind the endpoint's own access control, which is
+        // the actual boundary — a `0600` socket mode or the pipe's DACL.
+        let _ = why;
         return None;
     }
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = tokio::io::split(stream);
     let mut lines = BufReader::new(read).lines();
     // Bound the handshake so a silent connect cannot stall the accept loop.
     let ok = matches!(
@@ -143,26 +151,9 @@ fn auth_frame_ok(line: &str, token: &str) -> bool {
             .is_some_and(|t| tokens_match(t, token))
 }
 
-fn peer_is_same_uid(stream: &tokio::net::UnixStream) -> bool {
-    // peer_cred is the portable spelling: SO_PEERCRED on Linux, getpeereid on
-    // the BSDs. Calling `libc::getpeereid` directly does not build on Linux.
-    stream
-        .peer_cred()
-        .is_ok_and(|cred| cred.uid() == unsafe { libc::getuid() })
-}
-
-/// Live backgrounded sessions (their socket ids), from the run dir.
+/// Live backgrounded sessions, by id.
 pub fn list_live() -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(run_dir()) else {
-        return Vec::new();
-    };
-    let mut ids: Vec<String> = entries
-        .flatten()
-        .filter_map(|e| {
-            let p = e.path();
-            (p.extension()? == "sock").then(|| p.file_stem()?.to_str().map(String::from))?
-        })
-        .collect();
+    let mut ids = hotl_platform::IPC.list_live();
     ids.sort();
     ids
 }
@@ -176,41 +167,20 @@ pub async fn serve(
     handle: SessionHandle,
     prompt: Option<String>,
 ) -> i32 {
-    use std::os::unix::fs::PermissionsExt;
-    let dir = run_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("hotl serve: cannot create {}: {e}", dir.display());
+    // A *live* endpoint means this id collides with a running session (pid
+    // reuse, a repeated --id) — refuse rather than silently steal it. A dead
+    // one is cleared by `bind_private`.
+    if hotl_platform::IPC.liveness(&session_id) == hotl_platform::Liveness::Live {
+        eprintln!("hotl serve: session `{session_id}` is already running");
         return 1;
     }
-    // Owner-only run dir: the socket and token file live here (Vuln 1).
-    let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    let sock = dir.join(format!("{session_id}.sock"));
-    // A stale socket from a dead server is cleared; a *live* one means this
-    // id collides with a running session (pid reuse, repeated --id) — refuse
-    // rather than silently steal its socket out from under it.
-    if sock.exists() {
-        match std::os::unix::net::UnixStream::connect(&sock) {
-            Ok(_) => {
-                eprintln!(
-                    "hotl serve: session `{session_id}` is already running ({})",
-                    sock.display()
-                );
-                return 1;
-            }
-            Err(_) => {
-                let _ = std::fs::remove_file(&sock);
-            }
-        }
-    }
-    let listener = match UnixListener::bind(&sock) {
+    let listener = match hotl_platform::IPC.bind_private(&session_id) {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("hotl serve: cannot bind {}: {e}", sock.display());
+            eprintln!("hotl serve: cannot bind session `{session_id}`: {e}");
             return 1;
         }
     };
-    // Owner-only socket: only this uid can connect, even on a shared host.
-    let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
     let token = match mint_token().and_then(|t| write_token(&session_id, &t).map(|_| t)) {
         Ok(t) => t,
         Err(e) => {
@@ -218,7 +188,7 @@ pub async fn serve(
             return 1;
         }
     };
-    let _guard = SockGuard::new(sock);
+    let _guard = EndpointGuard::new(&session_id);
     let _token_guard = TokenGuard(token_path(&session_id));
     serve_on(listener, session_id, model, handle, prompt, token).await;
     0
@@ -233,15 +203,15 @@ impl Drop for TokenGuard {
 }
 
 fn write_token(id: &str, token: &str) -> std::io::Result<()> {
+    use hotl_platform::PrivateFs as _;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
     let path = token_path(id);
+    if let Some(dir) = path.parent() {
+        hotl_platform::PRIVATE_FS.create_dir_all(dir)?;
+    }
     let _ = std::fs::remove_file(&path); // clear any stale token first
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)?
+    hotl_platform::PRIVATE_FS
+        .create_file_new(&path, hotl_platform::Writes::FromStart)?
         .write_all(token.as_bytes())
 }
 
@@ -249,7 +219,7 @@ fn write_token(id: &str, token: &str) -> std::io::Result<()> {
 /// filesystem run-dir): spawn the drain, submit the opening prompt, then serve
 /// clients one at a time — the session lives across attach/detach.
 pub async fn serve_on(
-    listener: UnixListener,
+    listener: Listener,
     session_id: String,
     model: String,
     mut handle: SessionHandle,
@@ -274,28 +244,35 @@ pub async fn serve_on(
     accept_loop(listener, shared).await;
 }
 
-/// Removes the socket file when the server exits — but only if the path
-/// still refers to the socket *this* server bound (matched by inode), so a
-/// stale guard can never delete a successor's live socket.
-struct SockGuard {
-    path: PathBuf,
-    ino: Option<u64>,
+/// Removes the endpoint's on-disk artifact when the server exits — but only
+/// if the path still refers to the object *this* server bound (matched by
+/// identity), so a stale guard can never delete a successor's live socket.
+///
+/// A **documented no-op** where the platform leaves no artifact: a named pipe
+/// is a kernel object that vanishes with its last handle, which is strictly
+/// better than the Unix behavior. `Ipc::LEAVES_STALE_ARTIFACT` is what says so,
+/// rather than dead machinery ported for symmetry.
+struct EndpointGuard {
+    path: Option<PathBuf>,
+    id: Option<hotl_platform::NodeId>,
 }
 
-impl SockGuard {
-    fn new(path: PathBuf) -> Self {
-        use std::os::unix::fs::MetadataExt;
-        let ino = std::fs::symlink_metadata(&path).ok().map(|m| m.ino());
-        Self { path, ino }
+impl EndpointGuard {
+    fn new(session_id: &str) -> Self {
+        let path = hotl_platform::IPC.artifact_path(session_id);
+        let id = path
+            .as_deref()
+            .and_then(|p| hotl_platform::openat::identity_at(p).ok());
+        Self { path, id }
     }
 }
 
-impl Drop for SockGuard {
+impl Drop for EndpointGuard {
     fn drop(&mut self) {
-        use std::os::unix::fs::MetadataExt;
-        let current = std::fs::symlink_metadata(&self.path).ok().map(|m| m.ino());
-        if self.ino.is_none() || current == self.ino {
-            let _ = std::fs::remove_file(&self.path);
+        let Some(path) = &self.path else { return };
+        let current = hotl_platform::openat::identity_at(path).ok();
+        if self.id.is_none() || current == self.id {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
@@ -310,12 +287,12 @@ enum ClientAction {
 /// Accepting stays live while a client is attached — a second `hotl attach`
 /// takes over (the previous client is told and dropped) instead of hanging
 /// unread in the listener backlog.
-async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
-    let mut reader: Option<tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>> = None;
+async fn accept_loop(mut listener: Listener, shared: Arc<Shared>) {
+    let mut reader: Option<tokio::io::Lines<BufReader<ReadHalf>>> = None;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
-                let Ok((stream, _)) = accepted else {
+                let Ok(stream) = accepted else {
                     // A persistent accept failure (fd exhaustion) must not
                     // busy-spin the core; back off briefly and retry.
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -360,9 +337,7 @@ async fn accept_loop(listener: UnixListener, shared: Arc<Shared>) {
     }
 }
 
-async fn next_line(
-    reader: &mut Option<tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>>,
-) -> Option<String> {
+async fn next_line(reader: &mut Option<tokio::io::Lines<BufReader<ReadHalf>>>) -> Option<String> {
     match reader {
         Some(lines) => lines.next_line().await.ok().flatten(),
         // Unreachable behind the select guard; never resolve regardless.
@@ -574,15 +549,6 @@ fn str_field(v: &Value, field: &str) -> String {
         .to_string()
 }
 
-/// The socket path for a session id (used by the attach client).
-pub fn socket_path(id: &str) -> PathBuf {
-    run_dir().join(format!("{id}.sock"))
-}
-
-pub fn socket_exists(id: &str) -> bool {
-    Path::new(&socket_path(id)).exists()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,7 +558,39 @@ mod tests {
     use hotl_store::{Masker, SessionLog};
     use hotl_tools::{rules::Rules, Registry};
     use tokio::io::AsyncRead;
-    use tokio::net::UnixStream;
+
+    /// A unique endpoint id per test, so two tests never collide on the
+    /// machine-wide pipe namespace Windows has and Unix does not.
+    fn endpoint_id(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        format!(
+            "test-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    /// A connected `(client, server)` pair through the platform seam, so the
+    /// same test body exercises a unix socket or a named pipe.
+    ///
+    /// The listener is dropped once both ends exist — the pair is the point,
+    /// not the accept loop. Tests that want a live server hand the listener to
+    /// `serve_on` instead.
+    async fn connected_pair(tag: &str) -> (Stream, Stream) {
+        let id = endpoint_id(tag);
+        let mut listener = hotl_platform::IPC.bind_private(&id).unwrap();
+        let connecting = {
+            let id = id.clone();
+            tokio::spawn(async move { hotl_platform::IPC.connect(&id).await.unwrap() })
+        };
+        let server = listener.accept().await.unwrap();
+        let client = connecting.await.unwrap();
+        if let Some(p) = hotl_platform::IPC.artifact_path(&id) {
+            let _ = std::fs::remove_file(p);
+        }
+        (client, server)
+    }
 
     fn scripted_session() -> SessionHandle {
         let dir = tempfile::tempdir().unwrap();
@@ -640,12 +638,27 @@ mod tests {
         w.flush().await.unwrap();
     }
 
-    // Guards the portable spelling of the peer check: a socket we opened
-    // ourselves must read back as our own uid on every supported platform.
+    /// Guards the peer check on every supported transport: an endpoint we
+    /// bound and connected to ourselves must authenticate as us.
+    ///
+    /// It is defence in depth — the boundary is the endpoint's own access
+    /// control, a `0600` socket mode or the pipe's DACL — but a peer check that
+    /// silently always passed would be worse than none, because it reads as a
+    /// second layer while being none.
     #[tokio::test]
-    async fn peer_of_our_own_socket_reads_back_as_same_uid() {
-        let (ours, _theirs) = UnixStream::pair().unwrap();
-        assert!(peer_is_same_uid(&ours));
+    async fn a_peer_we_opened_ourselves_authenticates() {
+        let id = endpoint_id("peer");
+        let mut listener = hotl_platform::IPC.bind_private(&id).unwrap();
+        let connecting = {
+            let id = id.clone();
+            tokio::spawn(async move { hotl_platform::IPC.connect(&id).await.unwrap() })
+        };
+        let server_side = listener.accept().await.unwrap();
+        let _client = connecting.await.unwrap();
+        assert!(hotl_platform::IPC.authenticate_peer(&server_side).is_ok());
+        if let Some(p) = hotl_platform::IPC.artifact_path(&id) {
+            let _ = std::fs::remove_file(p);
+        }
     }
 
     /// Plan 0026's egress prompt through the whole server path: framed on the
@@ -655,9 +668,9 @@ mod tests {
     /// exercise.
     #[tokio::test]
     async fn egress_frames_round_trip_and_a_malformed_reply_denies() {
-        let (client_side, server_side) = UnixStream::pair().unwrap();
-        let (_cr, cw) = client_side.into_split();
-        let (sr, _sw) = server_side.into_split();
+        let (client_side, server_side) = connected_pair("egress").await;
+        let (_cr, cw) = tokio::io::split(client_side);
+        let (sr, _sw) = tokio::io::split(server_side);
         let mut lines = tokio::io::BufReader::new(sr).lines();
         let shared = Arc::new(Shared {
             handle: scripted_session(),
@@ -761,9 +774,8 @@ mod tests {
 
     #[tokio::test]
     async fn detach_while_asking_then_reattach_reissues_the_ask() {
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("s.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let id = endpoint_id("serve");
+        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
         tokio::spawn(serve_on(
             listener,
             "test".into(),
@@ -774,7 +786,7 @@ mod tests {
         ));
 
         // Attach (authenticate first), prompt; the scripted bash call is gated.
-        let (r, mut w) = UnixStream::connect(&sock).await.unwrap().into_split();
+        let (r, mut w) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
         let mut lines = tokio::io::BufReader::new(r).lines();
         send(&mut w, json!({"t":"auth","token":"tok"})).await;
         send(&mut w, json!({"t":"prompt","text":"go"})).await;
@@ -791,7 +803,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         // Reattach: the parked ask is re-issued (the whole point).
-        let (r2, mut w2) = UnixStream::connect(&sock).await.unwrap().into_split();
+        let (r2, mut w2) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
         let mut lines2 = tokio::io::BufReader::new(r2).lines();
         send(&mut w2, json!({"t":"auth","token":"tok"})).await;
         let reissued = loop {
@@ -821,9 +833,8 @@ mod tests {
     async fn unauthenticated_connect_is_rejected_and_keeps_the_incumbent() {
         // Vuln 1: a connect that fails auth is refused and must not evict the
         // attached human or drive the session.
-        let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("s.sock");
-        let listener = UnixListener::bind(&sock).unwrap();
+        let id = endpoint_id("serve");
+        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
         tokio::spawn(serve_on(
             listener,
             "test".into(),
@@ -834,7 +845,7 @@ mod tests {
         ));
 
         // Authenticated client A drives to a parked ask.
-        let (r, mut w) = UnixStream::connect(&sock).await.unwrap().into_split();
+        let (r, mut w) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
         let mut a = tokio::io::BufReader::new(r).lines();
         send(&mut w, json!({"t":"auth","token":"tok"})).await;
         send(&mut w, json!({"t":"prompt","text":"go"})).await;
@@ -846,7 +857,7 @@ mod tests {
         };
 
         // Client B connects with the WRONG token: rejected outright.
-        let (rb, mut wb) = UnixStream::connect(&sock).await.unwrap().into_split();
+        let (rb, mut wb) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
         let mut b = tokio::io::BufReader::new(rb).lines();
         send(&mut wb, json!({"t":"auth","token":"WRONG"})).await;
         assert_eq!(

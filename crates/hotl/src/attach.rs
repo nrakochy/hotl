@@ -6,16 +6,18 @@
 
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
-use crate::session_server::{list_live, socket_exists, socket_path};
+use crate::session_server::list_live;
+use hotl_platform::Ipc as _;
+
+type WriteHalf = tokio::io::WriteHalf<<hotl_platform::ActiveIpc as hotl_platform::Ipc>::Stream>;
 
 pub async fn attach_main(id: Option<&str>) -> i32 {
     let Some(id) = id else {
         return list_sessions();
     };
-    if !socket_exists(id) {
+    if hotl_platform::IPC.liveness(id) != hotl_platform::Liveness::Live {
         // Allow a prefix, like `hotl resume`.
         match list_live().into_iter().find(|s| s.starts_with(id)) {
             Some(full) => return connect(&full).await,
@@ -42,14 +44,14 @@ fn list_sessions() -> i32 {
 }
 
 async fn connect(id: &str) -> i32 {
-    let stream = match UnixStream::connect(socket_path(id)).await {
+    let stream = match hotl_platform::IPC.connect(id).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("hotl attach: could not connect to `{id}`: {e} (is it still running?)");
             return 1;
         }
     };
-    let (read, mut write) = stream.into_split();
+    let (read, mut write) = tokio::io::split(stream);
     // Authenticate with the per-session token before anything else (Vuln 1).
     match std::fs::read_to_string(crate::session_server::token_path(id)) {
         Ok(token) => {
@@ -168,7 +170,7 @@ fn route(text: &str, turn_running: bool, pending_ask: Option<&Parked>) -> Action
 
 async fn on_input(
     text: &str,
-    write: &mut tokio::net::unix::OwnedWriteHalf,
+    write: &mut WriteHalf,
     pending_ask: &mut Option<Parked>,
     turn_running: bool,
 ) -> Input {
@@ -327,13 +329,13 @@ fn render_update(update: &Value) {
     }
 }
 
-async fn detach(write: &mut tokio::net::unix::OwnedWriteHalf) -> i32 {
+async fn detach(write: &mut WriteHalf) -> i32 {
     let _ = send(write, json!({"t": "detach"})).await;
     println!("\n(detached — session still running; `hotl attach` to return)");
     0
 }
 
-async fn send(write: &mut tokio::net::unix::OwnedWriteHalf, frame: Value) -> std::io::Result<()> {
+async fn send(write: &mut WriteHalf, frame: Value) -> std::io::Result<()> {
     let mut line = frame.to_string();
     line.push('\n');
     write.write_all(line.as_bytes()).await?;

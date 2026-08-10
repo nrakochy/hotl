@@ -19,6 +19,9 @@ testing = []
 [dependencies]
 getrandom = { workspace = true }
 dirs = { workspace = true }
+# `process` for Command/Child in the ProcessControl seam; no runtime is started
+# here, only commands shaped and handles adopted.
+tokio = { workspace = true, features = ["process", "net", "io-util", "rt", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -32,7 +35,10 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Memory",
+    "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
     "Win32_System_Threading",
     "Wdk_Foundation",
     "Wdk_Storage_FileSystem",

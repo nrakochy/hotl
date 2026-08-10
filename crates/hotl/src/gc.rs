@@ -3,6 +3,7 @@
 //! from `[retention]` in config.toml (see `crate::config`), overridable by
 //! flags; with no policy configured and no flags, GC is a no-op that says so.
 
+use hotl_platform::Ipc as _;
 use std::time::Duration;
 
 use hotl_store::retention::{gc, RetentionPolicy};
@@ -65,7 +66,12 @@ fn sweep_dead_sockets(dry_run: bool) -> usize {
         if p.extension().is_none_or(|x| x != "sock") {
             continue;
         }
-        if std::os::unix::net::UnixStream::connect(&p).is_err() {
+        let Some(id) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        // Tri-state on purpose — see `Ipc::liveness`. Treating "busy" as dead
+        // is how a sweep deletes a running session's endpoint.
+        if hotl_platform::IPC.liveness(id) == hotl_platform::Liveness::Dead {
             if !dry_run {
                 let _ = std::fs::remove_file(&p);
                 let _ = std::fs::remove_file(p.with_extension("log"));

@@ -107,11 +107,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.msrv.outputs.v }}
+          targets: x86_64-pc-windows-msvc
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
       - name: Check at the declared MSRV
         run: cargo check --workspace --locked --all-targets
+      # Cross-*check* needs no Windows runner and no linker — only
+      # `rustup target add` — so this catches a Windows-breaking change on
+      # every PR at zero marginal cost, long before the full windows-latest
+      # leg would. The cheapest guard in the port.
+      - name: Check for Windows
+        run: cargo check --workspace --locked --all-targets --target x86_64-pc-windows-msvc
 
   # Docs-site build guard: catches a broken page, link, or config in site/
   # before release day (docs.yml deploys the site on `release: published`).

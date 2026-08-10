@@ -39,22 +39,31 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+pub mod console;
 pub mod entropy;
+pub mod ipc;
 pub mod openat;
 pub mod paths;
 pub mod privatefs;
+pub mod process;
 pub mod sealed;
 
+pub use console::{ActiveConsoleControl, ConsoleControl, HandlerContract};
 pub use entropy::{ActiveEntropy, Entropy};
+pub use ipc::{ActiveIpc, Ipc, IpcListener, Liveness, PeerReject};
 pub use openat::{ActiveDirHandle, DirHandle, Excl, GuardIo, NodeId, NodeKind, OpenMode};
 pub use paths::{ActiveKnownPaths, KnownPaths};
 pub use privatefs::{ActivePrivateFs, EffectiveAccess, PrivateFs, Writes};
+pub use process::{ActiveProcessControl, ProcessControl, TreeReaper};
 
 /// The active adapters. Call sites use these rather than naming a platform
 /// type, which is what keeps rule 10 checkable.
 pub const PRIVATE_FS: ActivePrivateFs = ActivePrivateFs::new();
 pub const KNOWN_PATHS: ActiveKnownPaths = ActiveKnownPaths::new();
 pub const ENTROPY: ActiveEntropy = ActiveEntropy::new();
+pub const PROCESS_CONTROL: ActiveProcessControl = ActiveProcessControl::new();
+pub const IPC: ActiveIpc = ActiveIpc::new();
+pub const CONSOLE: ActiveConsoleControl = ActiveConsoleControl::new();
 
 /// A capability this platform does not have.
 ///

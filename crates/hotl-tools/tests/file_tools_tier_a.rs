@@ -20,7 +20,14 @@ async fn the_file_tools_refuse_hotls_own_dirs_outright() {
     // A symlink *outside* Tier A whose target is inside it: the classification
     // has to run on the resolved path or this laundering works.
     let laundered = scratch.path().join("innocent");
+    // Windows needs Developer Mode or an administrator privilege to make a
+    // symlink; without one there is no laundering path to test.
+    #[cfg(unix)]
     std::os::unix::fs::symlink(&run_dir, &laundered).unwrap();
+    #[cfg(windows)]
+    if std::os::windows::fs::symlink_dir(&run_dir, &laundered).is_err() {
+        return;
+    }
 
     sandbox::init_extras(SandboxExtras {
         writable: Vec::new(),

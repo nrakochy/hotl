@@ -28,6 +28,7 @@
 use std::path::PathBuf;
 
 use crate::net::EgressState;
+use hotl_platform::ProcessControl as _;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
@@ -192,6 +193,13 @@ pub struct ReadDeny {
 impl ReadDeny {
     /// The paths a given spawn must not read. `secret_reads` is the
     /// per-command grant: it drops Tier B and never touches Tier A or C.
+    ///
+    /// Unix-only, and permanently so rather than pending: the read carve is
+    /// not expressible under a `WRITE_RESTRICTED` token, which narrows only
+    /// the *write* access check. On Windows this whole lever grants nothing
+    /// and denies nothing, and offering a dead affordance is worse than not
+    /// offering one — see `docs/SECURITY.md` on `reads:open`.
+    #[cfg(unix)]
     pub(crate) fn for_spawn(&self, secret_reads: bool) -> Vec<PathBuf> {
         let mut out = self.always.clone();
         if !secret_reads {
@@ -264,11 +272,15 @@ tokio::task_local! {
 
 /// Whether the current task carries the per-command secret-read grant.
 /// Absent scope (every path but an approved bash call) means no grant.
+///
+/// Unix-only for the same reason as [`ReadDeny::for_spawn`].
+#[cfg(unix)]
 pub(crate) fn secret_reads_granted() -> bool {
     SECRET_READS.try_with(|g| *g).unwrap_or(false)
 }
 
 /// The deny set for the spawn happening right now.
+#[cfg(unix)]
 pub(crate) fn spawn_read_deny() -> Vec<PathBuf> {
     read_deny().for_spawn(secret_reads_granted())
 }
@@ -632,23 +644,18 @@ pub fn build_command(
     apply_child_env(cmd, egress)
 }
 
-/// Put a spawned tool child in its own session (Vuln 2): with no controlling
-/// terminal it cannot `ioctl(TIOCSTI)` keystrokes into hotl's approval prompt
-/// or paint spoofed UI onto `/dev/tty`. `setsid` also makes the child a
-/// process-group leader with pgid == pid, preserving the `kill(-pid)` group
-/// reap that `.process_group(0)` used to provide (see `builtins::kill_group`).
-/// Stacks after any Landlock `pre_exec` already installed by the builders.
+/// Detach a spawned tool child from the terminal or console that hotl is
+/// attached to (Vuln 2), so it cannot inject keystrokes into an approval
+/// prompt or paint spoofed UI.
+///
+/// The mechanism is per-platform and lives in `hotl_platform::ProcessControl`:
+/// `setsid` on Unix, which also makes the child a process-group leader so the
+/// reaper's `kill(-pid)` reaches the whole group; `DETACHED_PROCESS` on
+/// Windows, which closes the `WriteConsoleInput`-on-`CONIN$` shape of the same
+/// attack. Stacks after any Landlock `pre_exec` already installed by the
+/// builders.
 pub fn detach_session(cmd: &mut tokio::process::Command) {
-    // SAFETY: `setsid` is async-signal-safe and touches no shared state; it is
-    // the only work done between fork and exec here.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    hotl_platform::PROCESS_CONTROL.detach(cmd);
 }
 
 /// Build a direct `program arg...` invocation (no shell) under the active
@@ -1523,6 +1530,7 @@ mod write_set_tests {
     /// single `Tool::run` future — the next call in the same turn re-enters
     /// with no scope at all and is denied again.
     #[tokio::test]
+    #[cfg(unix)]
     async fn the_secret_read_grant_is_scoped_and_never_lifts_tier_a() {
         let deny = ReadDeny {
             always: vec![PathBuf::from("/data/hotl")],
@@ -1555,6 +1563,7 @@ mod write_set_tests {
     /// projected `[[deny]]` rule is unliftable, because `Rules::evaluate` makes
     /// deny unconditional in-process.
     #[test]
+    #[cfg(unix)]
     fn the_secret_read_grant_does_not_lift_a_projected_rule() {
         let deny = ReadDeny {
             always: vec![PathBuf::from("/data/hotl")],

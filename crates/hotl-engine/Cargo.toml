@@ -32,10 +32,19 @@ tokio-util = { workspace = true }
 thiserror = { workspace = true }
 # LoopLedger's RSS column (§S1): `getrusage(RUSAGE_SELF)` — not a workspace
 # dependency yet outside hotl-tools/hotl, so pinned locally here too.
-libc = { workspace = true }
 
 [dev-dependencies]
 hotl-retrieval = { path = "../hotl-retrieval", version = "0.11.0", default-features = false }
 tempfile = { workspace = true }
 # test-util: paused-clock tests measure summarize/sample overlap deterministically.
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

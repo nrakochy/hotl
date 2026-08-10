@@ -266,23 +266,54 @@ impl LoopLedger {
     }
 }
 
-/// Max resident set size in bytes (`getrusage(RUSAGE_SELF).ru_maxrss`,
-/// normalized — macOS reports bytes, Linux/BSD report kilobytes). `0` if the
-/// syscall fails; a broken RSS reading is never a reason to fail the flush.
+/// Peak resident set size in bytes. `0` if the OS will not say; a broken RSS
+/// reading is never a reason to fail the flush.
+///
+/// Three units, not two: `getrusage`'s `ru_maxrss` is **bytes** on macOS and
+/// **kilobytes** on Linux and BSD, and Windows has no `getrusage` at all —
+/// `GetProcessMemoryInfo` reports `PeakWorkingSetSize` in bytes.
+#[cfg(unix)]
 pub fn max_rss_bytes() -> u64 {
+    // SAFETY: `rusage` is a plain repr(C) struct; all-zero is a valid instance.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: a live out-param of the right type.
     if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
         return 0;
     }
     normalize_rss(usage.ru_maxrss.max(0) as u64)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(windows)]
+pub fn max_rss_bytes() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: zeroed is a valid instance; the call fills it in.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: a pseudo-handle for our own process and a live, correctly-sized
+    // out-param.
+    let ok = unsafe {
+        GetProcessMemoryInfo(
+            GetCurrentProcess(),
+            &mut counters,
+            size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
+        )
+    };
+    if ok == 0 {
+        return 0;
+    }
+    normalize_rss(counters.PeakWorkingSetSize as u64)
+}
+
+/// Bytes on macOS and Windows, kilobytes everywhere else.
+#[cfg(any(target_os = "macos", windows))]
 fn normalize_rss(raw: u64) -> u64 {
     raw
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn normalize_rss(raw: u64) -> u64 {
     raw * 1024
 }

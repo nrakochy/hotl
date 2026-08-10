@@ -95,14 +95,15 @@ impl Diagnostics {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        // Own session + process group (pgid == pid): detaches the controlling
-        // terminal (Vuln 2), preserving the kill(-pid) group reap.
+        // Detached from our terminal/console (Vuln 2), and adopted by a reaper
+        // that reaches descendants rather than just the direct child.
         sandbox::detach_session(&mut cmd);
+        let reaper = crate::builtins::new_reaper();
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return Outcome::Failed(e.to_string()),
         };
-        let pid = child.id();
+        crate::builtins::adopt(&reaper, &child);
         let wait = crate::builtins::collect_output(child, MAX_CAPTURE_BYTES);
         tokio::pin!(wait);
         tokio::select! {
@@ -115,7 +116,7 @@ impl Diagnostics {
                 Err(e) => Outcome::Failed(e.to_string()),
             },
             _ = tokio::time::sleep(std::time::Duration::from_secs(TIMEOUT_SECS)) => {
-                crate::builtins::kill_group(pid);
+                crate::builtins::kill_tree(&reaper);
                 Outcome::TimedOut
             }
         }

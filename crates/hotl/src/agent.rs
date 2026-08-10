@@ -14,7 +14,6 @@ use hotl_provider::CacheTtl;
 use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, sandbox, Registry};
-use tokio::signal::unix::{signal, SignalKind};
 
 // The `-p --json` stream's schema version and every frame's shape live
 // together in `crate::wire` — `JSON_STREAM_SCHEMA_VERSION` moved there so the
@@ -2003,6 +2002,7 @@ fn load_rules_with(
 }
 
 /// Read + trust-check the admin file. `Ok(None)` = file absent (normal).
+#[cfg(unix)]
 pub(crate) fn load_admin(
     path: &std::path::Path,
 ) -> Result<Option<hotl_tools::rules::AdminRules>, String> {
@@ -2017,6 +2017,26 @@ pub(crate) fn load_admin(
         .map_err(|e| e.to_string())
 }
 
+/// **The admin tier is absent on Windows**, not approximated.
+///
+/// `admin_file_trusted` asks a Unix-shaped question — owned by root, not
+/// group- or world-writable. The Windows analogue ("owned by SYSTEM or
+/// Administrators *and* not writable by Users", via `GetNamedSecurityInfoW`)
+/// is a genuinely different predicate, not a translation, and a **weaker**
+/// trust check on a pre-approval file is worse than no tier at all: it would
+/// let a file nobody vetted pre-approve tool calls.
+///
+/// The precedent is in-tree — `config.rs` reasons identically about a missing
+/// `$HOME`: no home simply means no Tier B, narrower and never wider.
+/// `%ProgramData%\hotl\preapproved.toml` with a correct DACL predicate is a
+/// follow-up, not a gap to paper over here.
+#[cfg(windows)]
+pub(crate) fn load_admin(
+    _path: &std::path::Path,
+) -> Result<Option<hotl_tools::rules::AdminRules>, String> {
+    Ok(None)
+}
+
 struct Surface {
     handle: SessionHandle,
     json: bool,
@@ -2029,9 +2049,9 @@ struct Surface {
     /// `--json` stream (Task 5). A fallback model used mid-turn is priced as
     /// this one anyway; see `wire::usage_frame`.
     model: String,
-    /// One SIGINT stream for the surface's lifetime — registered once, not
-    /// per select iteration.
-    sigint: tokio::signal::unix::Signal,
+    /// One interrupt stream for the surface's lifetime — registered once,
+    /// not per select iteration.
+    sigint: crate::signals::Interrupt,
 }
 
 impl Surface {
@@ -2043,7 +2063,7 @@ impl Surface {
             saw_text: false,
             max_turns,
             model,
-            sigint: signal(SignalKind::interrupt()).expect("SIGINT handler"),
+            sigint: crate::signals::Interrupt::new().expect("interrupt handler"),
         }
     }
 
@@ -4228,13 +4248,27 @@ mod tests {
         let admin = dir.path().join("preapproved.toml");
         std::fs::write(&admin, "[[allow]]\ntool = \"bash\"\nprefix = \"git \"\n").unwrap();
         // World-writable → refused with a warning naming the file.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o666)).unwrap();
+        //
+        // Unix-only, and not because of a missing API: the admin tier is
+        // **absent** on Windows (see `load_admin`), so there is no trust
+        // predicate to test. A Windows twin would have to assert the tier is
+        // missing, which is what the `#[cfg(windows)] load_admin` body is.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&admin, std::fs::Permissions::from_mode(0o666)).unwrap();
+        }
         let (rules, warnings) =
             load_rules_with(&crate::config::Config::default(), Some(&admin), None, None);
+        #[cfg(unix)]
         assert!(
             warnings.iter().any(|w| w.contains("preapproved")),
             "warnings: {warnings:?}"
+        );
+        #[cfg(windows)]
+        assert!(
+            warnings.is_empty(),
+            "Windows has no admin tier, so there is nothing to warn about: {warnings:?}"
         );
         // Refused file contributes nothing; the bypass default still applies.
         assert!(matches!(

@@ -6,8 +6,27 @@
 //!
 //! Not tmux, not a nested session — a real background process you attach to.
 
-use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
+
+/// Detach the spawned server from this shell, so it outlives the launcher.
+///
+/// Unix: its own process group, so a shell's job-control signals stop at us.
+/// Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`, which additionally
+/// gives it no console at all — the launcher's console is about to go away and
+/// a server holding a handle to it would die with the terminal window.
+#[cfg(unix)]
+fn detach(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+}
+
+#[cfg(windows)]
+fn detach(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+}
 
 /// A session id unique to this invocation (the launcher's pid; it exits right
 /// after spawning, so the id won't collide with a live server's pid).
@@ -47,8 +66,8 @@ pub fn bg_main(prompt: Option<&str>, name: Option<&str>) -> i32 {
                 .map(Stdio::from)
                 .unwrap_or_else(Stdio::null),
         )
-        .stderr(logfile.map(Stdio::from).unwrap_or_else(Stdio::null))
-        .process_group(0);
+        .stderr(logfile.map(Stdio::from).unwrap_or_else(Stdio::null));
+    detach(&mut cmd);
 
     match cmd.spawn() {
         Ok(_) => {

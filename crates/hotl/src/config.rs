@@ -1352,7 +1352,7 @@ path_prefix = "/Volumes/secrets"
         let real = scratch.path().join("real");
         std::fs::create_dir_all(&real).unwrap();
         let link = scratch.path().join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
+        crate::testsupport::symlink_or_skip!(&real, &link);
         let cfg = SandboxCfg {
             writable: vec![
                 format!("{}/", missing.display()),        // trailing slash
@@ -1380,7 +1380,7 @@ path_prefix = "/Volumes/secrets"
         let (scratch, config_dir, data_dir) = sandbox_dirs();
         let good = scratch.path().join("cache");
         let link_to_config = scratch.path().join("innocent");
-        std::os::unix::fs::symlink(&config_dir, &link_to_config).unwrap();
+        crate::testsupport::symlink_or_skip!(&config_dir, &link_to_config);
         let cfg = SandboxCfg {
             writable: vec![
                 config_dir.display().to_string(),             // is the config dir

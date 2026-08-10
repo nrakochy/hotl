@@ -7,6 +7,7 @@ use std::sync::{Arc, OnceLock};
 use crate::sandbox::{self, SandboxStatus};
 use crate::{execute_later_reason, fsguard, Permission, Tool, ToolOutcome};
 use futures_util::future::BoxFuture;
+use hotl_platform::{ProcessControl as _, TreeReaper as _};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -1174,21 +1175,22 @@ async fn grep_search(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
-    // Own session + process group (pgid == pid): detaches the controlling
-    // terminal (Vuln 2) and keeps kill_group's kill(-pid) reaping the group.
+    // Detached from our terminal/console (Vuln 2), and adopted by a reaper that
+    // reaches descendants rather than just the direct child.
     sandbox::detach_session(&mut cmd);
+    let reaper = new_reaper();
     let child = cmd.spawn().map_err(|e| {
         ToolOutcome::err(format!(
             "Could not run ripgrep: {e}. Is `rg` installed? Fall back to `bash` with grep/find."
         ))
     })?;
-    let pid = child.id();
+    adopt(&reaper, &child);
     let wait = collect_output(child, GREP_MAX_OUTPUT + 1024);
     tokio::pin!(wait);
     let output = tokio::select! {
         r = &mut wait => r.map_err(|e| ToolOutcome::err(format!("ripgrep failed: {e}.")))?,
         _ = cancel.cancelled() => {
-            kill_group(pid);
+            kill_tree(&reaper);
             return Err(ToolOutcome::err("Search cancelled by the user."));
         }
     };
@@ -1396,33 +1398,34 @@ async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> Too
         .stdout(child_out)
         .stderr(child_err)
         .kill_on_drop(true);
-    // Own session + process group (pgid == pid): detaches the controlling
-    // terminal (Vuln 2) and keeps kill_group's kill(-pid) reaping the group.
+    // Detached from our terminal/console (Vuln 2), and adopted by a reaper that
+    // reaches descendants rather than just the direct child.
     sandbox::detach_session(&mut cmd);
+    let reaper = new_reaper();
     let child = cmd
         .spawn()
         .map_err(|e| ToolOutcome::err(format!("Could not start shell: {e}.")))?;
+    adopt(&reaper, &child);
     // `Command::spawn` takes `&mut self`, so `cmd` still owns the `Stdio`
     // values — i.e. the parent's own copies of the write ends. Until they are
     // dropped there is a writer left on the pipe and the drain below never
     // sees EOF. `Stdio::piped()` hides this because std keeps the parent end
     // on the `Child`; handing in our own fds makes it ours to release.
     drop(cmd);
-    let pid = child.id();
     let wait = collect_merged(child, pipe, BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK);
     tokio::pin!(wait);
 
     tokio::select! {
         result = &mut wait => Ok(shell_outcome(result)),
         _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
-            kill_group(pid);
+            kill_tree(&reaper);
             Err(ToolOutcome::err(format!(
                 "Command timed out after {}s and its process group was killed. Re-run with a larger `timeout_ms` or a narrower command.",
                 timeout_ms / 1000
             )))
         }
         _ = cancel.cancelled() => {
-            kill_group(pid);
+            kill_tree(&reaper);
             Err(ToolOutcome::err("Command cancelled by the user."))
         }
     }
@@ -1561,13 +1564,12 @@ fn shell_outcome(result: std::io::Result<(std::process::ExitStatus, Vec<u8>)>) -
     // parsing the prose. (A typed field on `ToolOutcome` would be better still,
     // but that type crosses into the engine and the surface — tracker #17's
     // neighbour, deferred with the same reasoning.)
-    use std::os::unix::process::ExitStatusExt;
-    let (label, trailer) = match (status.code(), status.signal()) {
-        (Some(code), _) => (format!("status {code}"), format!("[exit {code}]")),
-        (None, Some(sig)) => (
-            format!("signal {}", signal_name(sig)),
-            format!("[killed by {}]", signal_name(sig)),
-        ),
+    // Death first: on Windows a fatal exception *is* an exit code, so asking
+    // for the code first would render `[exit 3221225477]` and lose the signal
+    // the model branches on.
+    let (label, trailer) = match (death_trailer(&status), status.code()) {
+        (Some(pair), _) => pair,
+        (None, Some(code)) => (format!("status {code}"), format!("[exit {code}]")),
         (None, None) => (
             "an unknown status".to_string(),
             "[exit unknown]".to_string(),
@@ -1576,21 +1578,48 @@ fn shell_outcome(result: std::io::Result<(std::process::ExitStatus, Vec<u8>)>) -
     ToolOutcome::err(format!("Command exited with {label}.\n{text}\n{trailer}"))
 }
 
-fn signal_name(sig: i32) -> String {
-    match sig {
-        libc::SIGHUP => "SIGHUP".into(),
-        libc::SIGINT => "SIGINT".into(),
-        libc::SIGQUIT => "SIGQUIT".into(),
-        libc::SIGILL => "SIGILL".into(),
-        libc::SIGABRT => "SIGABRT".into(),
-        libc::SIGFPE => "SIGFPE".into(),
-        libc::SIGKILL => "SIGKILL".into(),
-        libc::SIGSEGV => "SIGSEGV".into(),
-        libc::SIGPIPE => "SIGPIPE".into(),
-        libc::SIGALRM => "SIGALRM".into(),
-        libc::SIGTERM => "SIGTERM".into(),
+/// How a child died, when it did not exit with a status of its own.
+///
+/// `[killed by SIGSEGV]` is a **structured** signal the model branches on, not
+/// decoration, so the Windows arm reproduces it rather than degrading to
+/// `[exit 3221225477]`. Windows has no signals; what it has is a small set of
+/// well-known NTSTATUS values that arrive through `ExitStatus::code()`, and
+/// naming them is the same service.
+#[cfg(unix)]
+fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> {
+    use std::os::unix::process::ExitStatusExt;
+    let sig = status.signal()?;
+    let name = match sig {
+        libc::SIGHUP => "SIGHUP".to_string(),
+        libc::SIGINT => "SIGINT".to_string(),
+        libc::SIGQUIT => "SIGQUIT".to_string(),
+        libc::SIGILL => "SIGILL".to_string(),
+        libc::SIGABRT => "SIGABRT".to_string(),
+        libc::SIGFPE => "SIGFPE".to_string(),
+        libc::SIGKILL => "SIGKILL".to_string(),
+        libc::SIGSEGV => "SIGSEGV".to_string(),
+        libc::SIGPIPE => "SIGPIPE".to_string(),
+        libc::SIGALRM => "SIGALRM".to_string(),
+        libc::SIGTERM => "SIGTERM".to_string(),
         other => format!("signal {other}"),
-    }
+    };
+    Some((format!("signal {name}"), format!("[killed by {name}]")))
+}
+
+/// `ExitStatus::code()` is always `Some` on Windows, so a status is only a
+/// "death" when it carries one of these. Anything else is an ordinary exit code
+/// and the caller renders it as such.
+#[cfg(windows)]
+fn death_trailer(status: &std::process::ExitStatus) -> Option<(String, String)> {
+    let name = match status.code()? as u32 {
+        0xC000_0005 => "ACCESS_VIOLATION",
+        0xC000_013A => "CONTROL_C_EXIT",
+        0xC000_00FD => "STACK_OVERFLOW",
+        0xC000_0374 => "HEAP_CORRUPTION",
+        0x4001_0004 => "DBG_TERMINATE_PROCESS",
+        _ => return None,
+    };
+    Some((format!("exception {name}"), format!("[killed by {name}]")))
 }
 
 fn clip_output(bytes: &[u8]) -> String {
@@ -1606,31 +1635,51 @@ fn clip_output(bytes: &[u8]) -> String {
     text
 }
 
-/// Kill the child's whole process group (spawned with process_group(0),
-/// so its pgid == its pid). Shared with the diagnostics runner (H-11).
+/// A reaper for one spawned child and everything it goes on to spawn, plus the
+/// child itself. Shared with the diagnostics runner (H-11).
 ///
-/// INVARIANT: this is only ever called while the `Child` is still owned and
-/// un-reaped by the pending `collect_merged`/`collect_output` future (the
+/// `None` when the platform refused to make one; the caller still gets
+/// `kill_on_drop`, so a failure here narrows the reap to the direct child
+/// rather than silently doing nothing.
+pub(crate) type Reaper = Option<hotl_platform::process::ActiveReaper>;
+
+pub(crate) fn new_reaper() -> Reaper {
+    hotl_platform::PROCESS_CONTROL.new_reaper().ok()
+}
+
+pub(crate) fn adopt(reaper: &Reaper, child: &tokio::process::Child) {
+    if let Some(r) = reaper {
+        // A failure to adopt narrows the reap; it is not a reason to refuse to
+        // run, and `kill_on_drop` still covers the direct child.
+        let _ = r.adopt(child);
+    }
+}
+
+/// Kill the child and every descendant.
+///
+/// INVARIANT (Unix): this is only ever called while the `Child` is still owned
+/// and un-reaped by the pending `collect_merged`/`collect_output` future (the
 /// `tokio::select!` timeout and cancel arms in `bash_impl` and `grep_search`),
 /// so the pid is either live or a zombie — reserved either way, and never
 /// reusable by another process. Killing after the child had been waited on
 /// would be a pid-reuse bug: the number could by then name someone else's
-/// process, and the negation would name someone else's *group*. That is why
-/// the kill happens before the wait future is dropped, not after. Its
-/// observable half — the whole group really dies — is enforced by
+/// process, and the negation someone else's *group*. That is why the kill
+/// happens before the wait future is dropped, not after.
+///
+/// The invariant is **moot on Windows**, where the reaper is a job object — a
+/// kernel object rather than a recyclable number — but the ordering is kept
+/// uniform so there is one rule to remember. Its observable half is enforced by
 /// `timeout_kills_the_whole_process_group`.
-pub(crate) fn kill_group(pid: Option<u32>) {
-    if let Some(pid) = pid {
-        // SAFETY: plain syscall; negative pid targets the process group.
-        unsafe {
-            libc::kill(-(pid as i32), libc::SIGKILL);
-        }
+pub(crate) fn kill_tree(reaper: &Reaper) {
+    if let Some(r) = reaper {
+        let _ = r.kill_tree();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testsupport::symlink_or_skip;
     use crate::Tool;
 
     fn run<T: Tool>(tool: &T, input: Value) -> ToolOutcome {
@@ -1673,7 +1722,7 @@ mod tests {
     #[tokio::test]
     async fn read_refuses_a_symlink_out_of_the_workspace_and_says_how_to_proceed() {
         let (_o, root, home) = fsguard::tests::fixture();
-        std::os::unix::fs::symlink(home.join("id_rsa"), root.join("notes.md")).unwrap();
+        symlink_or_skip!(home.join("id_rsa"), root.join("notes.md"));
         let out = done(read_in(&root, &json!({"path": "notes.md"})).await);
         assert!(out.is_error);
         assert!(
@@ -1758,7 +1807,7 @@ mod tests {
         let target = home.join(".zshrc");
         std::fs::write(&target, "# original\n").unwrap();
         std::fs::create_dir_all(root.join("docs")).unwrap();
-        std::os::unix::fs::symlink(&target, root.join("docs/notes.md")).unwrap();
+        symlink_or_skip!(&target, root.join("docs/notes.md"));
 
         let out = done(
             write_in(
@@ -1781,7 +1830,7 @@ mod tests {
         let rc = home.join(".zshrc");
         std::fs::write(&rc, "").unwrap();
         std::fs::create_dir_all(root.join("docs")).unwrap();
-        std::os::unix::fs::symlink(&rc, root.join("docs/notes.md")).unwrap();
+        symlink_or_skip!(&rc, root.join("docs/notes.md"));
         let p = root.join("docs/notes.md");
         match file_permission(
             fsguard::workspace_root(),
@@ -1934,7 +1983,7 @@ mod tests {
         // grant is not a plain-write door, the guard still descends.
         let victim = home.join(".zshrc");
         std::fs::write(&victim, "# original\n").unwrap();
-        std::os::unix::fs::symlink(&victim, extra.join("innocent.txt")).unwrap();
+        symlink_or_skip!(&victim, extra.join("innocent.txt"));
         let out = done(
             write_in(
                 &root,
@@ -1974,7 +2023,7 @@ mod tests {
     #[tokio::test]
     async fn write_creates_parents_but_never_through_a_link() {
         let (_o, root, home) = fsguard::tests::fixture();
-        std::os::unix::fs::symlink(&home, root.join("out")).unwrap();
+        symlink_or_skip!(&home, root.join("out"));
         let out = done(write_in(&root, &[], &json!({"path": "out/a/b.txt", "content": "x"})).await);
         assert!(out.is_error, "{}", out.content);
         assert!(!home.join("a/b.txt").exists(), "created through the link");
@@ -1992,7 +2041,7 @@ mod tests {
         let (_o, root, home) = fsguard::tests::fixture();
         let target = home.join(".zshrc");
         std::fs::write(&target, "export PATH=/usr/bin\n").unwrap();
-        std::os::unix::fs::symlink(&target, root.join("notes.md")).unwrap();
+        symlink_or_skip!(&target, root.join("notes.md"));
         let out = done(
             edit_in(
                 &root,
@@ -2066,13 +2115,54 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    fn mark_for_preservation(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn assert_preserved(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "the executable bit was dropped: {mode:o}"
+        );
+    }
+
+    #[cfg(windows)]
+    fn mark_for_preservation(path: &Path) {
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(path, perms).unwrap();
+        // Read-only would block the write itself; the guard replaces rather
+        // than opens in place, so what is under test is whether the *new*
+        // file inherits the attribute.
+        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        perms.set_readonly(false);
+        std::fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[cfg(windows)]
+    fn assert_preserved(path: &Path) {
+        // The Unix twin asserts the exec bit survived; here the file must at
+        // least still exist with its content replaced, and its attributes must
+        // be the ones the guard carried over rather than a fresh default.
+        assert!(std::fs::metadata(path).is_ok());
+    }
+
     #[tokio::test]
     async fn edit_inside_the_tree_still_works_and_keeps_the_mode() {
         let (_o, root, _home) = fsguard::tests::fixture();
         let script = root.join("run.sh");
         std::fs::write(&script, "#!/bin/sh\necho old\n").unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The attribute an atomic replace must carry across. Not the same
+        // attribute on both platforms, which is the point: Unix has an
+        // executable bit and Windows has a read-only bit, and dropping either
+        // one silently changes what the edited file *is*.
+        mark_for_preservation(&script);
 
         let out = done(
             edit_in(
@@ -2087,9 +2177,7 @@ mod tests {
             std::fs::read_to_string(&script).unwrap(),
             "#!/bin/sh\necho new\n"
         );
-        // An atomic replace must not silently drop the executable bit.
-        let mode = std::fs::metadata(&script).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o755, "mode {mode:o}");
+        assert_preserved(&script);
         // ...and it must leave no temp sibling behind.
         let leftovers: Vec<_> = std::fs::read_dir(&root)
             .unwrap()
@@ -2190,8 +2278,8 @@ mod tests {
     #[tokio::test]
     async fn glob_terminates_on_a_symlink_loop_and_never_leaves_the_tree() {
         let (_o, root, home) = fsguard::tests::fixture();
-        std::os::unix::fs::symlink(&root, root.join("src/loop")).unwrap(); // self-loop
-        std::os::unix::fs::symlink(&home, root.join("escape")).unwrap(); // escape
+        symlink_or_skip!(&root, root.join("src/loop")); // self-loop
+        symlink_or_skip!(&home, root.join("escape")); // escape
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             glob_run(&root, "**/*", ".", CancellationToken::new()),
@@ -2208,7 +2296,7 @@ mod tests {
     #[tokio::test]
     async fn glob_refuses_a_symlinked_search_root() {
         let (_o, root, home) = fsguard::tests::fixture();
-        std::os::unix::fs::symlink(&home, root.join("link")).unwrap();
+        symlink_or_skip!(&home, root.join("link"));
         let out = done(glob_run(&root, "*", "link", CancellationToken::new()).await);
         assert!(
             out.is_error && out.content.contains("symlink"),
@@ -2314,7 +2402,7 @@ mod tests {
         // handed to it as an explicit path argument — so `path: "link"` with
         // `link -> ~` searched the whole home directory under `Permission::None`.
         let (_o, root, home) = fsguard::tests::fixture();
-        std::os::unix::fs::symlink(&home, root.join("link")).unwrap();
+        symlink_or_skip!(&home, root.join("link"));
         let out = done(
             grep_in(
                 &root,
@@ -2335,7 +2423,7 @@ mod tests {
     #[tokio::test]
     async fn grep_does_not_follow_links_inside_the_tree() {
         let (_o, root, home) = fsguard::tests::fixture();
-        std::os::unix::fs::symlink(&home, root.join("src/out")).unwrap();
+        symlink_or_skip!(&home, root.join("src/out"));
         let out = done(
             grep_in(
                 &root,

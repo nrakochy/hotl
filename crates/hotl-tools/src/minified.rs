@@ -290,6 +290,7 @@ mod enabled {
     mod tests {
         use super::*;
         use crate::fsguard;
+        use crate::testsupport::symlink_or_skip;
         use serde_json::json;
 
         fn write(root: &Path, rel: &str, body: &str) {
@@ -431,7 +432,7 @@ mod enabled {
             // The guard is shared with the plain read, and this pins that it is
             // actually on the minified path too.
             let (_o, root, home) = fsguard::tests::fixture();
-            std::os::unix::fs::symlink(home.join("id_rsa"), root.join("src/link.rs")).unwrap();
+            symlink_or_skip!(home.join("id_rsa"), root.join("src/link.rs"));
             let err = read_minified_in(
                 &root,
                 &json!({"path": "src/link.rs", "minified": true}),
@@ -743,7 +744,7 @@ mod enabled {
             let (_o, root, home) = fsguard::tests::fixture();
             let secret = home.join("secret.rs");
             std::fs::write(&secret, "fn s() -> u32 { 1 }\n").unwrap();
-            std::os::unix::fs::symlink(&secret, root.join("src/link.rs")).unwrap();
+            symlink_or_skip!(&secret, root.join("src/link.rs"));
             let _ = edit_minified_in(
                 &root,
                 &[],

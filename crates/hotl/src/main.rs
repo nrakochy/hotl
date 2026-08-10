@@ -37,10 +37,13 @@ mod mcp_cli;
 mod session_server;
 mod setup;
 mod shell_hooks;
+mod signals;
 mod skills_cli;
 mod spawn;
 mod structured;
 mod term;
+#[cfg(test)]
+mod testsupport;
 mod tui;
 mod update;
 mod watch;

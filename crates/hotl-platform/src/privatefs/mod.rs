@@ -14,6 +14,8 @@ pub type ActivePrivateFs = UnixPrivateFs;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
+pub(crate) use windows::owner_only_attributes;
+#[cfg(windows)]
 pub use windows::WindowsPrivateFs;
 #[cfg(windows)]
 pub type ActivePrivateFs = WindowsPrivateFs;

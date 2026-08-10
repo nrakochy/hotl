@@ -415,6 +415,42 @@ fn protected_descriptor(acl: &OwnedAcl) -> io::Result<Descriptor> {
     Ok(Descriptor(sd))
 }
 
+/// An owner-only `SECURITY_ATTRIBUTES`, for the Win32 create calls outside this
+/// module that take one.
+///
+/// The named-pipe server's DACL is the same authorization boundary a `0600`
+/// mode is for a unix socket, so it is built by the same code rather than by a
+/// second hand-rolled descriptor that could drift from this one.
+pub(crate) struct OwnerOnlyAttributes {
+    // Declaration order is drop order, and it is load-bearing: `sa` points into
+    // `sd`, which points into `acl`.
+    sa: Box<SECURITY_ATTRIBUTES>,
+    _sd: Descriptor,
+    _acl: OwnedAcl,
+}
+
+impl OwnerOnlyAttributes {
+    pub(crate) fn as_ptr(&mut self) -> *mut c_void {
+        (&raw mut *self.sa).cast()
+    }
+}
+
+pub(crate) fn owner_only_attributes() -> io::Result<OwnerOnlyAttributes> {
+    let sid = current_user_sid()?;
+    let acl = one_ace_dacl(sid.as_psid(), FILE_ALL_ACCESS)?;
+    let mut sd = protected_descriptor(&acl)?;
+    let sa = Box::new(SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: sd.as_mut_ptr(),
+        bInheritHandle: 0,
+    });
+    Ok(OwnerOnlyAttributes {
+        sa,
+        _sd: sd,
+        _acl: acl,
+    })
+}
+
 /// `LocalFree` on drop, for the descriptors `GetNamedSecurityInfoW` allocates.
 struct LocalOwned(*mut c_void);
 

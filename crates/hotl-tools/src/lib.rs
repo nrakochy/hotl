@@ -19,6 +19,8 @@ pub mod path;
 pub mod rules;
 pub mod sandbox;
 pub mod skills;
+#[cfg(test)]
+pub(crate) mod testsupport;
 pub mod todo;
 pub mod web;
 

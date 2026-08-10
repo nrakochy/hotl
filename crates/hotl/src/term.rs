@@ -22,7 +22,10 @@
 //! crossterm's mutex.
 
 use std::io::{self, Stdout};
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+use hotl_platform::ConsoleControl;
 
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
@@ -148,28 +151,27 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// The signals that kill a foreground TUI outright. SIGQUIT is left alone:
-/// it is the deliberate "core-dump this" escape hatch.
-const TRAPPED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
-
 /// Set while a guard owns the screen. The teardown that clears it does the
 /// restore; every other one is a no-op.
 static ARMED: AtomicBool = AtomicBool::new(false);
 
-/// The terminal's modes from before raw mode, leaked once so the signal
-/// handler can read them without allocating or locking.
-static ORIGINAL: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
+/// The terminal's modes from before raw mode.
+///
+/// A `OnceLock` rather than the leaked `AtomicPtr` this used to be: the modes
+/// are now an opaque `Copy` type owned by the caller, so there is nothing to
+/// leak and the handler can still read them without allocating or locking.
+static ORIGINAL: OnceLock<<hotl_platform::ActiveConsoleControl as ConsoleControl>::Saved> =
+    OnceLock::new();
 
 /// Remember the cooked modes. Call before the first `enable_raw_mode`; later
 /// calls are ignored so an `$EDITOR` round-trip can't save raw modes as the
 /// thing to restore to.
 pub(crate) fn capture() {
-    if !ORIGINAL.load(Ordering::SeqCst).is_null() {
+    if ORIGINAL.get().is_some() {
         return;
     }
-    let mut modes: libc::termios = unsafe { std::mem::zeroed() };
-    if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut modes) } == 0 {
-        ORIGINAL.store(Box::into_raw(Box::new(modes)), Ordering::SeqCst);
+    if let Ok(modes) = hotl_platform::CONSOLE.capture() {
+        let _ = ORIGINAL.set(modes);
     }
 }
 
@@ -194,39 +196,28 @@ pub(crate) fn restore() -> bool {
     true
 }
 
-/// The whole restore in async-signal-safe calls: no allocation, no locks.
+/// The whole restore, in calls the handler is allowed to make.
+///
+/// On Unix that means async-signal-safe and nothing else — no allocation, no
+/// locks, which is why this reaches for `ConsoleControl` rather than crossterm.
+/// Windows runs the handler on its own thread and would tolerate more, but one
+/// body for both is what keeps the two from drifting.
 fn reset() {
-    let original = ORIGINAL.load(Ordering::SeqCst);
-    if !original.is_null() {
-        unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, original) };
+    if let Some(original) = ORIGINAL.get() {
+        let _ = hotl_platform::CONSOLE.restore(original);
     }
-    unsafe { libc::write(libc::STDOUT_FILENO, RESTORE.as_ptr().cast(), RESTORE.len()) };
+    hotl_platform::CONSOLE.write_raw(RESTORE);
 }
 
-/// What the shell reports for "killed by this signal".
-fn exit_code(signal: libc::c_int) -> libc::c_int {
-    128 + signal
-}
-
-extern "C" fn on_signal(signal: libc::c_int) {
-    if ARMED.swap(false, Ordering::SeqCst) {
-        reset();
-    }
-    unsafe { libc::_exit(exit_code(signal)) };
-}
-
-/// Catch the signals that would otherwise skip every destructor. Handlers are
-/// reset across `exec`, so spawned tools still get the default disposition.
+/// Catch the interrupt-class events that would otherwise skip every
+/// destructor. Unix handlers are reset across `exec`, so spawned tools still
+/// get the default disposition.
 pub(crate) fn trap_signals() {
-    for signal in TRAPPED {
-        unsafe {
-            let mut action: libc::sigaction = std::mem::zeroed();
-            action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
-            libc::sigemptyset(&mut action.sa_mask);
-            action.sa_flags = libc::SA_RESTART;
-            libc::sigaction(signal, &action, std::ptr::null_mut());
+    let _ = hotl_platform::CONSOLE.trap(|| {
+        if ARMED.swap(false, Ordering::SeqCst) {
+            reset();
         }
-    }
+    });
 }
 
 /// Restore before the panic message prints, so it lands on a live screen
@@ -298,16 +289,33 @@ mod tests {
 
     #[test]
     fn signals_report_the_shell_convention() {
-        assert_eq!(exit_code(libc::SIGINT), 130);
-        assert_eq!(exit_code(libc::SIGTERM), 143);
-        assert_eq!(exit_code(libc::SIGHUP), 129);
+        // 130 = 128 + SIGINT. Asserted on every platform: it is a POSIX *shell*
+        // convention with no Windows meaning, kept there anyway because scripts
+        // and CI check for it, and a test is what stops that from looking like
+        // an accident later.
+        assert_eq!(hotl_platform::CONSOLE.interrupt_exit_code(), 130);
+        #[cfg(unix)]
+        {
+            assert_eq!(128 + libc::SIGTERM, 143);
+            assert_eq!(128 + libc::SIGHUP, 129);
+        }
     }
 
     /// The regression: a trapped signal must leave through the handler (an
     /// ordinary exit) instead of killing the process with every destructor,
     /// terminal restore included, unrun. Forked so the assertion survives it.
+    ///
+    /// Unix-only because `fork` is. The Windows twin — re-exec `current_exe()`
+    /// with a marker env var under `CREATE_NEW_PROCESS_GROUP`, then
+    /// `GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)` at it — is owed and is
+    /// tracked in plan 0027; it needs a console, which no CI-safe fake
+    /// provides, so it has to be written against a real one rather than
+    /// guessed at here.
     #[test]
+    #[cfg(unix)]
     fn a_trapped_signal_exits_instead_of_killing_us() {
+        const TRAPPED: [libc::c_int; 3] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP];
+        let exit_code = |signal: libc::c_int| 128 + signal;
         for signal in TRAPPED {
             let child = unsafe { libc::fork() };
             assert!(child >= 0, "fork failed");

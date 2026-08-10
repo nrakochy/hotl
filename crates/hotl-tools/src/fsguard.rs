@@ -485,7 +485,7 @@ fn next_tmp_seq() -> u64 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
+    use crate::testsupport::symlink_or_skip;
 
     /// A workspace with an out-of-tree "home" beside it.
     pub(crate) fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
@@ -599,7 +599,7 @@ pub(crate) mod tests {
     #[test]
     fn symlinked_dir_is_lexically_inside_but_refused_by_the_guard() {
         let (_o, root, home) = fixture();
-        symlink(&home, root.join("link")).unwrap();
+        symlink_or_skip!(&home, root.join("link"));
         // The tier1 lexical check passes it — this is the bug, reproduced.
         assert!(matches!(classify(&root, "link"), Placement::Inside(_)));
         // The fd check refuses it. No race, no timing, no retry.
@@ -610,7 +610,7 @@ pub(crate) mod tests {
     #[test]
     fn symlinked_leaf_is_refused() {
         let (_o, root, home) = fixture();
-        symlink(home.join("id_rsa"), root.join("notes.md")).unwrap();
+        symlink_or_skip!(home.join("id_rsa"), root.join("notes.md"));
         let err = open_beneath(&root, std::path::Path::new("notes.md")).unwrap_err();
         assert!(matches!(err, GuardError::Escape { .. }), "{err:?}");
     }
@@ -619,7 +619,7 @@ pub(crate) mod tests {
     fn symlinked_intermediate_component_is_refused() {
         let (_o, root, home) = fixture();
         std::fs::write(home.join("secret.txt"), "s").unwrap();
-        symlink(&home, root.join("src/out")).unwrap();
+        symlink_or_skip!(&home, root.join("src/out"));
         let err = open_beneath(&root, std::path::Path::new("src/out/secret.txt")).unwrap_err();
         assert!(matches!(err, GuardError::Escape { .. }), "{err:?}");
     }
@@ -631,7 +631,7 @@ pub(crate) mod tests {
         // a name-based check; refusing every symlink keeps the rule "the fd chain
         // never traversed a link", which is checkable with no second resolution.
         let (_o, root, _home) = fixture();
-        symlink(root.join("src/lib.rs"), root.join("alias.rs")).unwrap();
+        symlink_or_skip!(root.join("src/lib.rs"), root.join("alias.rs"));
         let err = open_beneath(&root, std::path::Path::new("alias.rs")).unwrap_err();
         assert!(matches!(err, GuardError::Escape { .. }), "{err:?}");
         // The refusal is a prompt: it names the offending component and says
@@ -657,7 +657,12 @@ pub(crate) mod tests {
         assert!(open_beneath(&root, std::path::Path::new("hard.rs")).is_ok());
     }
 
+    /// Unix-only because a FIFO is. The generalization — a non-regular file is
+    /// refused rather than read — is covered on Windows by the reserved
+    /// device-name refusal (`NUL`, `CON`), which is where that class actually
+    /// shows up there.
     #[test]
+    #[cfg(unix)]
     fn a_fifo_is_not_a_readable_file() {
         // A hostile (or merely unusual) repo containing a FIFO must not hang the
         // turn: we fstat the fd we hold and require a regular file.
@@ -699,7 +704,7 @@ pub(crate) mod tests {
         // A symlinked leaf is refused before anything is staged: the link is
         // neither followed (the target keeps its bytes) nor clobbered (the
         // link is still a link), and no debris is left behind.
-        symlink(home.join("id_rsa"), root.join("notes.md")).unwrap();
+        symlink_or_skip!(home.join("id_rsa"), root.join("notes.md"));
         assert!(matches!(
             replace_beneath(&root, std::path::Path::new("notes.md"), b"evil"),
             Err(GuardError::Escape { .. })
@@ -781,21 +786,23 @@ pub(crate) mod tests {
         let (_o, root, home) = fixture();
         let joined = resolve_beneath(&root, std::path::Path::new("src/lib.rs")).unwrap();
         assert_eq!(joined, root.join("src/lib.rs"));
-        // Same inode by name and by the fd the guard validated.
-        use std::os::unix::fs::MetadataExt;
-        let by_name = std::fs::symlink_metadata(&joined).unwrap();
-        let by_fd = open_beneath(&root, std::path::Path::new("src/lib.rs"))
-            .unwrap()
-            .metadata()
-            .unwrap();
-        assert_eq!((by_name.dev(), by_name.ino()), (by_fd.dev(), by_fd.ino()));
+        // Same object by name and by the handle the guard validated. Goes
+        // through the platform seam rather than `MetadataExt`, so this is the
+        // `FILE_ID_INFO` twin on Windows and the `(dev, ino)` one on Unix —
+        // one assertion, two identity schemes.
+        let by_name = hotl_platform::openat::identity_at(&joined).unwrap();
+        let by_handle = hotl_platform::openat::identity_of(
+            &open_beneath(&root, std::path::Path::new("src/lib.rs")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(by_name, by_handle);
         // `.` resolves to the root itself, not `root/.`.
         assert_eq!(
             resolve_beneath(&root, std::path::Path::new(".")).unwrap(),
             root
         );
         // And a symlinked component never resolves at all.
-        symlink(&home, root.join("link")).unwrap();
+        symlink_or_skip!(&home, root.join("link"));
         assert!(matches!(
             resolve_beneath(&root, std::path::Path::new("link/id_rsa")),
             Err(GuardError::Escape { .. })
