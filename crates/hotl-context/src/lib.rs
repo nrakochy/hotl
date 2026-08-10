@@ -5,6 +5,7 @@
 //! files load inside the untrusted-content envelope from the milestone that
 //! first loads them — this one.
 
+pub mod breakdown;
 pub mod compaction;
 pub mod tokens;
 

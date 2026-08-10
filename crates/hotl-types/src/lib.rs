@@ -96,6 +96,48 @@ pub struct UserImage {
     pub data: Arc<str>,
 }
 
+/// What fills the context window, by source (`/context`, plan 0028).
+///
+/// Declaration order IS display order — `Ord` is derived, and both the engine
+/// and the TUI sort by it, so reordering these variants reorders the report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextKind {
+    SystemPrompt,
+    ToolSchemas,
+    SkillsRoster,
+    AgentsRoster,
+    ProjectInstructions,
+    Memory,
+    Todos,
+    FoldedHistory,
+    Messages,
+    ToolResults,
+    HarnessInjections,
+    Images,
+    /// A row this binary does not know. Absorbs a future engine's new kind
+    /// without dropping its tokens on the floor — dropping them would
+    /// undercount, the one direction this codebase treats as unacceptable.
+    #[serde(other)]
+    Unknown,
+}
+
+/// One row of a `/context` breakdown. `kind` is a stable wire tag, never a
+/// display string — the client owns the label.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContextRow {
+    pub kind: ContextKind,
+    pub tokens: u64,
+}
+
+/// The whole `/context` payload. `window` rides along so the client never has
+/// to reconcile its handshake value against the engine's live config.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ContextBreakdown {
+    pub window: u64,
+    pub rows: Vec<ContextRow>,
+}
+
 /// Per-prompt ceiling on total DECODED image bytes.
 pub const MAX_PROMPT_DECODED_BYTES: usize = 16 * 1024 * 1024;
 
