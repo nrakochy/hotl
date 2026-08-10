@@ -269,9 +269,58 @@ mod palette {
             Palette::from(&Theme::default())
         }
     }
+
+    /// sRGB → linear light. Blending in gamma-encoded bytes darkens the middle
+    /// of a ramp (the classic muddy midpoint); decoding first is what keeps a
+    /// faint→accent sweep reading as one hue moving, not as a dip.
+    fn to_linear(c: u8) -> f64 {
+        let c = c as f64 / 255.0;
+        if c <= 0.040_45 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+
+    fn to_srgb(c: f64) -> u8 {
+        let c = c.clamp(0.0, 1.0);
+        let v = if c <= 0.003_130_8 {
+            c * 12.92
+        } else {
+            1.055 * c.powf(1.0 / 2.4) - 0.055
+        };
+        (v * 255.0).round() as u8
+    }
+
+    /// Blend two colors in linear light, `t` clamped to `0.0..=1.0`.
+    ///
+    /// Only `Color::Rgb` can be interpolated. Every `Palette` slot is `Rgb` by
+    /// construction, but `Color` is a wider enum than the palette can produce,
+    /// so a non-`Rgb` input degrades to a hard switch at the midpoint rather
+    /// than to a panic or a wrong color.
+    pub fn blend(a: Color, b: Color, t: f64) -> Color {
+        let t = t.clamp(0.0, 1.0);
+        let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) = (a, b) else {
+            return if t < 0.5 { a } else { b };
+        };
+        let mix = |x: u8, y: u8| to_srgb(to_linear(x) * (1.0 - t) + to_linear(y) * t);
+        Color::Rgb(mix(ar, br), mix(ag, bg), mix(ab, bb))
+    }
+
+    /// `n` colors stepping evenly from `a` to `b`, both endpoints included.
+    /// `n == 1` yields `a` alone (no midpoint to speak of); `n == 0` yields
+    /// nothing.
+    pub fn ramp(a: Color, b: Color, n: usize) -> Vec<Color> {
+        if n <= 1 {
+            return Vec::from_iter((n == 1).then_some(a));
+        }
+        (0..n)
+            .map(|i| blend(a, b, i as f64 / (n - 1) as f64))
+            .collect()
+    }
 }
 #[cfg(feature = "ratatui")]
-pub use palette::Palette;
+pub use palette::{blend, ramp, Palette};
 
 #[cfg(test)]
 mod tests {

@@ -8,7 +8,7 @@
 
 use hotl_theme::Palette;
 use hotl_tui::app::{update, Cmd, Msg, State, TranscriptItem};
-use hotl_tui::view::view;
+use hotl_tui::view::{view, TranscriptCache};
 use hotl_types::{Question, QuestionOption};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
@@ -29,7 +29,14 @@ fn pane_title(cmds: &[Cmd]) -> String {
 fn captured_tail(state: &State) -> String {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
-        .draw(|f| view(state, &Palette::default(), f))
+        .draw(|f| {
+            view(
+                state,
+                &Palette::default(),
+                &mut TranscriptCache::default(),
+                f,
+            )
+        })
         .unwrap();
     let buffer = terminal.backend().buffer().clone();
     let rows: Vec<String> = (0..buffer.area.height)

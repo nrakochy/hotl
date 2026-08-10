@@ -427,6 +427,16 @@ pub fn new_ulid() -> String {
     ulid::Ulid::new().to_string()
 }
 
+/// A model id with its `provider/` prefix dropped, for display only.
+///
+/// Config spells models `provider/model` (`anthropic/claude-opus-5`), and the
+/// prefix is dead width on a one-line strip. Only `/` is cut — Bedrock's
+/// `anthropic.claude-…` keeps its dot, because no display rule is worth a
+/// helper that could bite a version number off some future `o3.5`.
+pub fn bare_model(model: &str) -> &str {
+    model.split_once('/').map_or(model, |(_, rest)| rest)
+}
+
 /// A session display name: trimmed, non-empty, at most 64 chars.
 /// The one validator every entry point (CLI, ACP, TUI) funnels through.
 pub fn normalize_session_name(raw: &str) -> Option<String> {
@@ -816,5 +826,21 @@ mod tests {
         assert_eq!(normalize_session_name(&long), None);
         let max = "é".repeat(64); // chars, not bytes
         assert_eq!(normalize_session_name(&max), Some(max.clone()));
+    }
+
+    #[test]
+    fn bare_model_drops_only_the_provider_prefix() {
+        assert_eq!(bare_model("anthropic/claude-opus-5"), "claude-opus-5");
+        assert_eq!(bare_model("openai/gpt-5"), "gpt-5");
+        assert_eq!(bare_model("claude-opus-5"), "claude-opus-5");
+        assert_eq!(bare_model(""), "");
+        // Only the first segment goes: an OpenAI-compatible endpoint whose
+        // model name itself contains a slash keeps the rest intact.
+        assert_eq!(bare_model("openai/org/model-1"), "org/model-1");
+        // Bedrock's dotted spelling is left whole — see the doc comment.
+        assert_eq!(
+            bare_model("anthropic.claude-opus-5"),
+            "anthropic.claude-opus-5"
+        );
     }
 }

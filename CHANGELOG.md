@@ -6,6 +6,57 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **The model config resolved to is now on the summary line**, on both
+  surfaces: the TUI's idle strip (`⠐⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠂ claude-opus-5 · 120 in · 45
+  out · 0% ctx`) and the per-turn footer headless runs print (`[claude-opus-5
+  · in 120 out 45 cache-read 0]`). A model comes from `config.toml`,
+  `HOTL_MODEL` or a flag, and until now the only way to see which one won was
+  `/status`. The `provider/` prefix is trimmed for width; a mid-session
+  fallback re-seeds the strip, so the name shown is the model the next turn
+  will use.
+
+### Changed
+
+- **The activity strip is a braille snake now, at 30fps, gradient-lit from the
+  theme.** The loop motif (`╭─╮╰─╯` and friends, 8 frames/sec) is gone. In its
+  place a snake swims a fixed wave across 12 cells — two dots thick at the
+  head, thinning to one at the tail, advancing one sub-column per tick, so it
+  crosses the strip in about four fifths of a second. At rest it lies flat
+  (`⠐⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠂`), which is the old resting line in the new alphabet.
+
+  Phase is now carried by **color rather than shape**: one motion everywhere,
+  lit by a two-slot gradient the theme owns. Idle rests on `faint → idle`,
+  thinking climbs `faint → accent`, writing runs `accent → ink`, a tool warms
+  `accent → active`, and anything waiting on you lands on `faint → blocked`.
+  Every endpoint is a palette slot, so a preset or a single-slot override in
+  `[theme]` recolors the animation along with everything else.
+
+  Phases that are not running a turn show the **resting** shape rather than a
+  frozen frame of the animation: idle still schedules no wakeups at all, and a
+  permission prompt that kept moving would read as progress when the point is
+  that nothing happens until you answer.
+
+  Every frame is integer arithmetic on the tick count — no floats — so the
+  animation is bit-identical on every platform and its frames can be pinned in
+  tests. The rate lives in one place (`hotl_tui::anim::TICK_HZ`); the ticker
+  interval and both elapsed-seconds displays derive from it.
+
+- **The running-tool card's spinner is pinned to 8fps.** It used to be indexed
+  by the raw tick, so raising the strip to 30fps would have spun this 4-frame
+  glyph seven times a second — a strobe. It keeps the rate it always had.
+
+- **The transcript is wrapped once per change instead of once per frame.**
+  Wrapping the session is the most expensive thing the view does, and at 30fps
+  it was being redone 30 times a second so an animation could move. Rows are
+  now memoized per item, keyed by a hash of what actually reaches the screen,
+  and re-wrapped only for items that changed — during a turn that is exactly
+  one: the assistant text growing, or the tool card ticking. Scrolling reuses
+  the rows it already has; a resize, a density change, `ctrl-t`, or a new theme
+  drops the memo wholesale. Measured on a 601-item / 326KB session: 1.99ms →
+  0.16ms per frame.
+
 ## [0.10.0] - 2026-08-10
 
 ### Added

@@ -4,7 +4,10 @@
 //! `[settings.theme]` — the same palette `hotl watch` wears. Status slots keep
 //! watch's semantics: active = working, blocked = needs you, idle = settled.
 
-use hotl_theme::Palette;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
+use hotl_theme::{Density, Palette};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
@@ -14,6 +17,20 @@ use crate::vim::Mode;
 use crate::wrap;
 
 const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
+
+/// How fast the running-tool card's spinner turns, in frames per second.
+///
+/// Deliberately *not* `anim::TICK_HZ`. This is a 4-frame spinner: at the
+/// strip's 30 ticks/sec it would turn over seven times a second and read as a
+/// strobe, where the strip's 10-frame wave reads as smooth. 8/sec is the rate
+/// it turned at before the strip sped up, and it is also what keeps a running
+/// card from invalidating its cached rows on every frame.
+const SPIN_HZ: u64 = 8;
+
+/// Which spinner frame a card at `ticks` shows.
+fn spin_frame(ticks: u64) -> usize {
+    (ticks * SPIN_HZ / anim::TICK_HZ) as usize % SPIN.len()
+}
 
 /// How tall the input box may grow before it scrolls instead. Past this the
 /// buffer is long enough that `ctrl-e` is the better tool anyway.
@@ -74,10 +91,108 @@ fn highlight(sel: &crate::select::Selection, frame: &mut Frame) {
     }
 }
 
-pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
+/// Wrapped transcript rows, memoized per item across frames.
+///
+/// Wrapping the session is by far the most expensive thing the view does, and
+/// the animation ticks at `anim::TICK_HZ` — without a cache, a moving wave
+/// would re-wrap and re-allocate every row of a long session 30 times a
+/// second.
+///
+/// The memo is **per item**, not per transcript, because during a turn there
+/// is always exactly one item changing: the assistant text growing by a delta,
+/// or the running tool card's spinner and elapsed. A whole-transcript key
+/// would be invalidated by that one item and re-wrap the entire session
+/// anyway, which is the same cost it was meant to avoid. Per item, a frame
+/// costs a hash of each item plus a re-wrap of only what moved.
+///
+/// Owned by the caller rather than by `State`: this is render state, and the
+/// Elm model stays a pure description of the session. A fresh cache is always
+/// correct — it just misses once.
+#[derive(Default)]
+pub struct TranscriptCache {
+    geometry: Option<Geometry>,
+    items: Vec<CachedItem>,
+    rewraps: u64,
+}
+
+impl TranscriptCache {
+    /// How many individual items have been wrapped over this cache's life.
+    /// Tests assert on it; nothing in the view reads it.
+    pub fn rewraps(&self) -> u64 {
+        self.rewraps
+    }
+}
+
+struct CachedItem {
+    fingerprint: u64,
+    rows: Vec<Line<'static>>,
+}
+
+/// What every item's rows depend on beyond the item itself. A change here
+/// drops the whole memo — all of it is stale at once.
+///
+/// Scroll position is deliberately absent: it picks the window out of the
+/// cached rows, so scrolling never re-wraps anything.
+#[derive(PartialEq)]
+struct Geometry {
+    width: u16,
+    density: Density,
+    thinking_expanded: bool,
+    palette: Palette,
+}
+
+/// A hash of everything about one item that reaches the screen.
+///
+/// Deriving this from content rather than from a hand-maintained revision
+/// counter is the point: a new mutation site anywhere in `app` cannot forget
+/// to invalidate the cache, because there is nothing to remember.
+///
+/// INVARIANT: every field `item_block` reads is hashed here, at the same
+/// resolution it is rendered. Enforced by
+/// `cached_rows_are_identical_to_a_fresh_render`, which walks a turn's worth
+/// of mutations comparing a warm cache against a cold one.
+fn item_fingerprint(item: &TranscriptItem) -> u64 {
+    let mut h = DefaultHasher::new();
+    match item {
+        TranscriptItem::User { text } => (0u8, text).hash(&mut h),
+        TranscriptItem::Steer { text, queued } => (1u8, text, queued).hash(&mut h),
+        TranscriptItem::Assistant { text } => (2u8, text).hash(&mut h),
+        TranscriptItem::Thinking { text } => (3u8, text).hash(&mut h),
+        TranscriptItem::Tool {
+            name,
+            summary,
+            status,
+            ticks,
+        } => {
+            // Ticks are hashed at the two resolutions they are *rendered* at
+            // — the spinner's frame and the whole seconds of elapsed — not
+            // raw. Hashing raw ticks would re-wrap the card on every frame of
+            // a running tool, which is exactly when the cache has to hold.
+            (
+                4u8,
+                name,
+                summary,
+                ticks / anim::TICK_HZ,
+                spin_frame(*ticks),
+            )
+                .hash(&mut h);
+            match status {
+                ToolStatus::Running => 0u8.hash(&mut h),
+                ToolStatus::Done => 1u8.hash(&mut h),
+                ToolStatus::Failed => 2u8.hash(&mut h),
+                ToolStatus::Denied => 3u8.hash(&mut h),
+                ToolStatus::AutoAllowed { rule } => (4u8, rule).hash(&mut h),
+            }
+        }
+        TranscriptItem::Notice { text } => (5u8, text).hash(&mut h),
+    }
+    h.finish()
+}
+
+pub fn view(state: &State, p: &Palette, cache: &mut TranscriptCache, frame: &mut Frame) {
     let area = frame.area();
     let [transcript, strip, input, hint] = regions(state, area);
-    render_transcript(state, p, frame, transcript);
+    render_transcript(state, p, cache, frame, transcript);
     render_strip(state, p, frame, strip);
     render_input(state, p, frame, input);
     render_hint(state, p, frame, hint);
@@ -99,48 +214,104 @@ pub fn view(state: &State, p: &Palette, frame: &mut Frame) {
     }
 }
 
-fn render_transcript(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
+fn render_transcript(
+    state: &State,
+    p: &Palette,
+    cache: &mut TranscriptCache,
+    frame: &mut Frame,
+    area: Rect,
+) {
     // Wrapping up front (rather than via `Paragraph::wrap`) is what keeps the
     // scroll arithmetic honest: an item that overflows counts as the several
-    // rows it really occupies, so Follow still lands on the last one. Building
-    // the whole buffer in a loop (not a flat_map) lets a blank-line separator
-    // sit *between* turns and records where each item starts for At-scroll.
+    // rows it really occupies, so Follow still lands on the last one. A
+    // blank-line separator sits *between* items, and each item's start row is
+    // derived from the rows above it for At-scroll.
+    let geometry = Geometry {
+        width: area.width,
+        density: state.density,
+        thinking_expanded: state.thinking_expanded,
+        palette: *p,
+    };
+    if cache.geometry.as_ref() != Some(&geometry) {
+        cache.items.clear();
+        cache.geometry = Some(geometry);
+    }
     let width = area.width as usize;
     let gutter = state.density.gutter();
     let blanks = state.density.blank_lines();
-    let mut lines: Vec<Line> = Vec::new();
-    let mut item_starts: Vec<usize> = Vec::with_capacity(state.transcript.len());
+    // A shorter transcript (`/clear`) drops the tail; the survivors keep their
+    // rows, and any whose content changed is caught by its fingerprint below.
+    cache.items.truncate(state.transcript.len());
     for (i, item) in state.transcript.iter().enumerate() {
-        if i > 0 {
-            for _ in 0..blanks {
-                lines.push(Line::raw(""));
-            }
+        let fingerprint = item_fingerprint(item);
+        if cache
+            .items
+            .get(i)
+            .is_some_and(|c| c.fingerprint == fingerprint)
+        {
+            continue;
         }
-        item_starts.push(lines.len());
-        lines.extend(item_visual_lines(
-            item,
-            p,
-            width,
-            gutter,
-            state.thinking_expanded,
-        ));
+        let entry = CachedItem {
+            fingerprint,
+            rows: item_visual_lines(item, p, width, gutter, state.thinking_expanded),
+        };
+        match cache.items.get_mut(i) {
+            Some(slot) => *slot = entry,
+            None => cache.items.push(entry),
+        }
+        cache.rewraps += 1;
     }
-    let total = lines.len();
-    let skip = match state.scroll {
-        Scroll::Follow => total.saturating_sub(area.height as usize),
-        Scroll::At(item) => item_starts
-            .get(item)
-            .copied()
-            .unwrap_or(total)
-            .min(total.saturating_sub(1)),
+
+    let height = area.height as usize;
+    let rows: usize = cache.items.iter().map(|c| c.rows.len()).sum();
+    let total = rows + blanks * cache.items.len().saturating_sub(1);
+    // Each item above `idx` contributes its own rows plus the blank run that
+    // follows it.
+    let start_of = |idx: usize| -> usize {
+        cache
+            .items
+            .iter()
+            .take(idx)
+            .map(|c| c.rows.len() + blanks)
+            .sum()
     };
-    // Slicing beats `Paragraph::scroll`, whose offset is a u16 a long session
-    // would overflow.
-    let visible: Vec<Line> = lines
-        .into_iter()
-        .skip(skip)
-        .take(area.height as usize)
-        .collect();
+    let skip = match state.scroll {
+        Scroll::Follow => total.saturating_sub(height),
+        Scroll::At(item) if item < cache.items.len() => start_of(item),
+        Scroll::At(_) => total,
+    }
+    .min(total.saturating_sub(1));
+    // Walking to the window beats `Paragraph::scroll`, whose offset is a u16 a
+    // long session would overflow. Only the rows actually on screen are
+    // cloned, so the per-frame cost is bounded by the terminal, not by the
+    // session.
+    let mut visible: Vec<Line> = Vec::with_capacity(height);
+    let mut row = 0usize;
+    'rows: for (i, cached) in cache.items.iter().enumerate() {
+        for _ in 0..(if i > 0 { blanks } else { 0 }) {
+            if visible.len() == height {
+                break 'rows;
+            }
+            if row >= skip {
+                visible.push(Line::raw(""));
+            }
+            row += 1;
+        }
+        // Items entirely above the window are counted, never cloned.
+        if row + cached.rows.len() <= skip {
+            row += cached.rows.len();
+            continue;
+        }
+        for line in &cached.rows {
+            if visible.len() == height {
+                break 'rows;
+            }
+            if row >= skip {
+                visible.push(line.clone());
+            }
+            row += 1;
+        }
+    }
     frame.render_widget(Paragraph::new(visible), area);
 }
 
@@ -388,7 +559,7 @@ fn item_block<'a>(
         } => {
             let (marker, color) = match status {
                 ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
-                    (SPIN[(*ticks % 4) as usize], p.active)
+                    (SPIN[spin_frame(*ticks)], p.active)
                 }
                 ToolStatus::Done => ("✓", p.idle),
                 ToolStatus::Failed => ("✗", p.blocked),
@@ -399,7 +570,7 @@ fn item_block<'a>(
                 details.push(format!("auto-allowed: {rule}"));
             }
             if !matches!(status, ToolStatus::Denied) {
-                details.push(format!("{}s", ticks / 8));
+                details.push(format!("{}s", ticks / anim::TICK_HZ));
             }
             // Name in the status color (so it stays identifiable now the
             // marker moved to the spine), body ink, details muted.
@@ -504,7 +675,19 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         Phase::Idle => Style::new().fg(p.muted).bg(p.band),
         _ => Style::new().fg(p.ink).bg(p.band),
     };
-    frame.render_widget(Paragraph::new(anim::strip_line(state)).style(style), area);
+    // The wave is per-column color, so it cannot ride the paragraph's single
+    // style: one span per column, each carrying only a foreground so the band
+    // background still comes from `style` below.
+    let mut spans: Vec<Span> = anim::snake(&state.phase)
+        .chars()
+        .zip(anim::snake_ramp(&state.phase, p))
+        .map(|(c, color)| Span::styled(c.to_string(), Style::new().fg(color)))
+        .collect();
+    let text = anim::strip_text(state);
+    if !text.is_empty() {
+        spans.push(Span::raw(format!(" {text}")));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(style), area);
 
     // Session-name chip, right-aligned on the strip (the Claude-style badge
     // just above the input). The left side stays reserved for the activity
@@ -989,9 +1172,35 @@ mod tests {
     fn draw_buffer(state: &State) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| view(state, &Palette::default(), f))
+            .draw(|f| {
+                view(
+                    state,
+                    &Palette::default(),
+                    &mut TranscriptCache::default(),
+                    f,
+                )
+            })
             .unwrap();
         terminal.backend().buffer().clone()
+    }
+
+    /// Draw twice through one cache and return the rows plus how many times
+    /// the transcript was actually re-wrapped. The rows come from the *second*
+    /// pass, so a cached render that differs from a fresh one fails whatever
+    /// assertion the caller makes.
+    fn draw_cached(state: &State, cache: &mut TranscriptCache) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| view(state, &Palette::default(), cache, f))
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect()
     }
 
     fn draw(state: &State) -> Vec<String> {
@@ -1309,12 +1518,18 @@ mod tests {
         }
     }
 
+    /// The snake at rest — what idle shows, and what these layout tests look
+    /// for on the left of the strip.
+    fn still() -> String {
+        anim::at_rest()
+    }
+
     #[test]
-    fn idle_layout_shows_resting_glyph_and_hint_row() {
+    fn idle_layout_shows_resting_wave_and_hint_row() {
         let rows = draw(&State::new(true, "m".into()));
         assert!(
-            rows[STRIP].contains("· ─ ·"),
-            "resting glyph: {}",
+            rows[STRIP].contains(&still()),
+            "resting wave: {}",
             rows[STRIP]
         );
         assert!(rows[HINT].contains("? help"), "hint row: {}", rows[HINT]);
@@ -1433,11 +1648,11 @@ mod tests {
             name: "bash".into(),
             summary: "echo hi".into(),
             status: ToolStatus::Running,
-            ticks: 16,
+            ticks: 2 * anim::TICK_HZ,
         });
         s.phase = Phase::Tool {
             name: "bash".into(),
-            ticks: 16,
+            ticks: 2 * anim::TICK_HZ,
         };
         let rows = draw(&s);
         assert!(
@@ -1480,7 +1695,7 @@ mod tests {
             name: "bash".into(),
             summary: "bash [sandboxed:seatbelt]: echo hi".into(),
             status: ToolStatus::Done,
-            ticks: 8,
+            ticks: anim::TICK_HZ,
         });
         let rows = draw(&s);
         // Comfortable gutter (2) + the ✓ spine glyph; the name is no longer
@@ -1576,9 +1791,9 @@ mod tests {
             "badge right-aligned: {:?}",
             rows[STRIP]
         );
-        // The resting glyph still renders on the left.
+        // The resting wave still renders on the left.
         assert!(
-            rows[STRIP].contains("· ─ ·"),
+            rows[STRIP].contains(&still()),
             "strip glyphs: {}",
             rows[STRIP]
         );
@@ -1627,7 +1842,14 @@ mod tests {
     fn draw_cursor(state: &State) -> (u16, u16) {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| view(state, &Palette::default(), f))
+            .draw(|f| {
+                view(
+                    state,
+                    &Palette::default(),
+                    &mut TranscriptCache::default(),
+                    f,
+                )
+            })
             .unwrap();
         let p = terminal.get_cursor_position().unwrap();
         (p.x, p.y)
@@ -2014,5 +2236,159 @@ mod tests {
             "hint row: {}",
             rows[HINT]
         );
+    }
+
+    /// A session with a running tool card and more prose than fits on screen
+    /// — long enough that `Scroll::At` and `Follow` land on different rows.
+    fn cacheable_state() -> State {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::User {
+            text: "explain the cache".into(),
+        });
+        s.transcript.push(TranscriptItem::Assistant {
+            text: "a ".repeat(1200),
+        });
+        s.transcript.push(TranscriptItem::Tool {
+            name: "bash".into(),
+            summary: "echo hi".into(),
+            status: ToolStatus::Running,
+            ticks: 0,
+        });
+        s
+    }
+
+    fn bump_tool_ticks(s: &mut State, to: u64) {
+        let Some(TranscriptItem::Tool { ticks, .. }) = s.transcript.last_mut() else {
+            unreachable!("the fixture ends with a tool card")
+        };
+        *ticks = to;
+    }
+
+    #[test]
+    fn a_static_transcript_never_rewraps_however_long_the_wave_runs() {
+        // The thinking phase: nothing in the transcript moves, only the strip.
+        // Whatever TICK_HZ is, this must stay at the cost of the first frame.
+        let mut s = cacheable_state();
+        s.transcript.pop(); // drop the running card — nothing left that changes
+        let mut cache = TranscriptCache::default();
+        let first = draw_cached(&s, &mut cache);
+        let after_first = cache.rewraps();
+        assert_eq!(after_first, 2, "the first draw wraps every item once");
+
+        for _ in 0..(5 * anim::TICK_HZ) {
+            assert_eq!(draw_cached(&s, &mut cache), first, "rows drifted");
+        }
+        assert_eq!(
+            cache.rewraps(),
+            after_first,
+            "five seconds of animation must not re-wrap a static transcript"
+        );
+    }
+
+    #[test]
+    fn a_running_turn_rewraps_only_the_item_that_moved() {
+        let mut s = cacheable_state();
+        let mut cache = TranscriptCache::default();
+        draw_cached(&s, &mut cache);
+        assert_eq!(cache.rewraps(), 3, "three items, wrapped once each");
+
+        // A second of a running tool. The card's spinner and elapsed do
+        // change, so *it* re-wraps — but the prose above it never does. Bound:
+        // the spinner's own rate plus the one-second boundary, nowhere near
+        // the 3 × TICK_HZ a whole-transcript cache would have cost.
+        for t in 1..=anim::TICK_HZ {
+            bump_tool_ticks(&mut s, t);
+            draw_cached(&s, &mut cache);
+        }
+        let card_rewraps = cache.rewraps() - 3;
+        assert!(
+            card_rewraps <= SPIN_HZ + 1,
+            "a second of tool spin re-wrapped {card_rewraps} times, want <= {}",
+            SPIN_HZ + 1
+        );
+
+        // Streaming text: only the assistant item is touched per delta.
+        let before = cache.rewraps();
+        for _ in 0..10 {
+            if let Some(TranscriptItem::Assistant { text }) = s.transcript.get_mut(1) {
+                text.push_str(" delta");
+            }
+            draw_cached(&s, &mut cache);
+        }
+        assert_eq!(
+            cache.rewraps() - before,
+            10,
+            "one re-wrap per delta — the user turn and the tool card must not move"
+        );
+    }
+
+    #[test]
+    fn scrolling_reuses_the_rows_it_already_has() {
+        let mut s = cacheable_state();
+        let mut cache = TranscriptCache::default();
+        let follow = draw_cached(&s, &mut cache);
+        let settled = cache.rewraps();
+
+        s.scroll = Scroll::At(0);
+        let top = draw_cached(&s, &mut cache);
+        assert_eq!(cache.rewraps(), settled, "scrolling re-wrapped");
+        assert_ne!(top, follow, "…but it did move the window");
+
+        s.scroll = Scroll::Follow;
+        assert_eq!(
+            draw_cached(&s, &mut cache),
+            follow,
+            "scrolling back differs"
+        );
+        assert_eq!(cache.rewraps(), settled, "scrolling back re-wrapped");
+    }
+
+    #[test]
+    fn geometry_and_theme_changes_drop_the_whole_memo() {
+        let mut s = cacheable_state();
+        let mut cache = TranscriptCache::default();
+        let at = |s: &State, w: u16, cache: &mut TranscriptCache| {
+            let mut terminal = Terminal::new(TestBackend::new(w, 24)).unwrap();
+            terminal
+                .draw(|f| view(s, &Palette::default(), cache, f))
+                .unwrap();
+        };
+        at(&s, 80, &mut cache);
+        at(&s, 80, &mut cache);
+        assert_eq!(cache.rewraps(), 3, "same width must reuse every row");
+
+        // Wrap width changed: every item's rows are stale at once.
+        at(&s, 60, &mut cache);
+        assert_eq!(cache.rewraps(), 6, "a resize must re-wrap all three");
+
+        // So are the two other things every item's rows are a function of.
+        s.thinking_expanded = !s.thinking_expanded;
+        at(&s, 60, &mut cache);
+        assert_eq!(cache.rewraps(), 9, "ctrl-t must re-wrap all three");
+        s.density = hotl_theme::Density::Compact;
+        at(&s, 60, &mut cache);
+        assert_eq!(cache.rewraps(), 12, "density must re-wrap all three");
+    }
+
+    #[test]
+    fn cached_rows_are_identical_to_a_fresh_render() {
+        // The cache is only ever correct if a reused one and a cold one agree.
+        // Walks the same mutations a real turn makes, comparing every frame.
+        let mut s = cacheable_state();
+        let mut warm = TranscriptCache::default();
+        for step in 0..40u64 {
+            bump_tool_ticks(&mut s, step * 7);
+            if step % 5 == 0 {
+                if let Some(TranscriptItem::Assistant { text }) = s.transcript.get_mut(1) {
+                    text.push_str(" delta");
+                }
+            }
+            if step == 20 {
+                s.scroll = Scroll::At(1);
+            }
+            let cold = draw_cached(&s, &mut TranscriptCache::default());
+            let hot = draw_cached(&s, &mut warm);
+            assert_eq!(hot, cold, "cached render diverged at step {step}");
+        }
     }
 }

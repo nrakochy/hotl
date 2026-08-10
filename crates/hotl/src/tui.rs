@@ -16,7 +16,7 @@ use crossterm::terminal::SetTitle;
 use hotl_theme::Palette;
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
 use hotl_tui::client::{exec_wire_cmd, read_server_msg, translate, AcpClient, ServerMsg};
-use hotl_tui::view::view;
+use hotl_tui::view::{view, TranscriptCache};
 
 use crate::term::TerminalGuard;
 use serde_json::{json, Value};
@@ -287,11 +287,17 @@ async fn run_loop(
 ) -> io::Result<i32> {
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
-    // 8 ticks/sec, armed only while a turn runs — idle schedules no wakeups.
-    let mut ticker = tokio::time::interval(Duration::from_millis(125));
+    // The animation's own rate, armed only while a turn runs — idle schedules
+    // no wakeups, which is also why the idle wave is a frozen frame.
+    let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
+    // Lives for the whole loop: an animation tick redraws the strip without
+    // re-wrapping a transcript that did not change.
+    let mut cache = TranscriptCache::default();
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        guard.terminal.draw(|f| view(&state, &palette, f))?;
+        guard
+            .terminal
+            .draw(|f| view(&state, &palette, &mut cache, f))?;
         let msg = tokio::select! {
             ev = keys.recv() => match ev {
                 Some(ev) => terminal_msg(ev, copy_on_select), // `None` = redraw-only (resize, mouse motion)
@@ -324,7 +330,7 @@ async fn run_loop(
                 }
                 Cmd::AppendHistory(text) => history.append(&text),
                 Cmd::CopySelection(sel) => {
-                    let lines = copy_region(guard, &state, &palette, &sel)?;
+                    let lines = copy_region(guard, &state, &palette, &mut cache, &sel)?;
                     queue.extend(update(&mut state, Msg::Copied { lines }));
                 }
                 Cmd::OpenEditor(text) => {
@@ -489,10 +495,11 @@ fn copy_region(
     guard: &mut TerminalGuard,
     state: &State,
     palette: &Palette,
+    cache: &mut TranscriptCache,
     sel: &hotl_tui::select::Selection,
 ) -> io::Result<usize> {
     use std::io::Write;
-    let frame = guard.terminal.draw(|f| view(state, palette, f))?;
+    let frame = guard.terminal.draw(|f| view(state, palette, cache, f))?;
     let text = hotl_tui::view::selection_text(state, frame.buffer, sel);
     if text.is_empty() {
         return Ok(0);

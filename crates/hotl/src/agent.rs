@@ -2175,8 +2175,17 @@ impl Surface {
             }
             Outcome::Error { message } => eprintln!("\nhotl: {message}"),
         }
+        // The model leads the line: a headless run's config is resolved from
+        // file, env and flags, and the token counts mean nothing until you
+        // know which model produced them.
+        let model = hotl_types::bare_model(&self.model);
+        let named = if model.is_empty() {
+            String::new()
+        } else {
+            format!("{model} · ")
+        };
         eprintln!(
-            "[in {} out {} cache-read {}]",
+            "[{named}in {} out {} cache-read {}]",
             usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
         );
     }

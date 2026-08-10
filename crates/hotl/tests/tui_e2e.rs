@@ -14,7 +14,7 @@ use hotl_theme::Palette;
 use hotl_tools::{rules::Rules, Registry};
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
 use hotl_tui::client::{exec_wire_cmd, read_server_msg, translate, AcpClient, ServerMsg};
-use hotl_tui::view::view;
+use hotl_tui::view::{view, TranscriptCache};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use serde_json::{json, Value};
@@ -222,7 +222,14 @@ fn the_e2e_harness_uses_the_real_dispatch() {
 fn draw_buffer(state: &State) -> ratatui::buffer::Buffer {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal
-        .draw(|f| view(state, &Palette::default(), f))
+        .draw(|f| {
+            view(
+                state,
+                &Palette::default(),
+                &mut TranscriptCache::default(),
+                f,
+            )
+        })
         .unwrap();
     terminal.backend().buffer().clone()
 }
@@ -239,6 +246,13 @@ fn draw(state: &State) -> Vec<String> {
 }
 
 const STRIP: usize = 19;
+
+/// The snake at rest — what every phase that is *not* running a turn shows.
+/// `anim` owns the shape; this test only cares that a halted loop looks
+/// halted.
+fn frozen_wave() -> String {
+    hotl_tui::anim::at_rest()
+}
 
 fn press(state: &mut State, code: KeyCode) -> Vec<Cmd> {
     update(state, Msg::Key(KeyEvent::new(code, KeyModifiers::NONE)))
@@ -295,8 +309,8 @@ async fn prompt_stream_ask_allow_done_golden() {
                 "modal names the tool"
             );
             assert!(
-                rows[STRIP].contains("╭─╮╰ ╯ waiting on you"),
-                "halted gap glyph: {}",
+                rows[STRIP].contains(&format!("{} waiting on you", frozen_wave())),
+                "halted wave: {}",
                 rows[STRIP]
             );
             // Allow it — the real server maps this to AskReply::Allow and the
@@ -340,8 +354,8 @@ async fn prompt_stream_ask_allow_done_golden() {
     );
     assert!(state.usage_line.is_some(), "real usage on the result");
     assert!(
-        rows[STRIP].contains("· ─ ·"),
-        "back to resting: {}",
+        rows[STRIP].starts_with(&frozen_wave()),
+        "back to resting — the wave stops moving: {}",
         rows[STRIP]
     );
 }
