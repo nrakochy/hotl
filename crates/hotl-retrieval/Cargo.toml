@@ -18,8 +18,8 @@ default = ["minify"]
 minify = ["hotl-mcp/minify", "hotl-tools/minify"]
 
 [dependencies]
-hotl-tools = { path = "../hotl-tools", version = "0.9.1", default-features = false }
-hotl-mcp = { path = "../hotl-mcp", version = "0.9.1", default-features = false }
+hotl-tools = { path = "../hotl-tools", version = "0.10.0", default-features = false }
+hotl-mcp = { path = "../hotl-mcp", version = "0.10.0", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

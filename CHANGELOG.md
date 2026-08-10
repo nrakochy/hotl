@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-08-10
+
 ### Added
 
 - **`egress = "allowlist"` is usable now: it starts with a list, and a blocked
