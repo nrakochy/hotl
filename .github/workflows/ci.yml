@@ -87,6 +87,55 @@ jobs:
           cargo test -p hotl --no-default-features --locked
           ! cargo tree -p hotl --no-default-features -e normal | grep -q tree-sitter
 
+  # The Windows twin of `harness`. Real execution, not a cross-check: the
+  # `msrv` job already catches Windows-breaking *compilation* on every PR, and
+  # this is the only place the reparse-point refusals, the job-object reaper
+  # and the named-pipe session actually run.
+  #
+  # Clippy with `-D warnings` on this leg is what keeps the inactive `#[cfg]`
+  # arm honest — a split generates `unused_imports`/`dead_code` on the other
+  # arm constantly, and nothing else in CI compiles that arm.
+  harness-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: harness-windows
+      # Same reason as the Linux leg: the grep tool spawns `rg`, and a test
+      # that evaporates at spawn is not coverage.
+      - name: Install ripgrep
+        run: choco install ripgrep -y --no-progress
+      - name: Clippy (harness crates + binary)
+        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
+      - name: Test (harness crates + binary)
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked
+      - name: Test (security-enforced feature)
+        run: |
+          cargo test -p hotl-tools --features security-enforced --locked
+          cargo test -p hotl --features security-enforced --locked
+      # windows-latest ships MSVC Build Tools, so the six tree-sitter grammars
+      # compile with no extra setup — but the feature-unification guard still
+      # has to run here, because a crate forgetting `default-features = false`
+      # breaks the pure-Rust build on every platform at once.
+      - name: Build without the minify feature (no C toolchain)
+        run: |
+          cargo test -p hotl --no-default-features --locked
+          if (cargo tree -p hotl --no-default-features -e normal | Select-String -Quiet tree-sitter) { exit 1 }
+      # Git for Windows puts `sh.exe` on the runner, so the leg above exercises
+      # the bash tool for real. This one removes it from PATH and asserts the
+      # tool drops out of the registry cleanly rather than falling back to a
+      # different language — the fail-closed row that matters most on Windows.
+      - name: Test with no POSIX shell on PATH
+        shell: pwsh
+        run: |
+          $env:PATH = ($env:PATH -split ';' | Where-Object { -not (Test-Path (Join-Path $_ 'sh.exe')) }) -join ';'
+          $env:HOTL_SHELL = ''
+          cargo test -p hotl-tools --locked shell_
+
   # MSRV floor gate. `rust-version` in Cargo.toml was declared but unverified —
   # every other job is @stable, so nothing caught the floor drifting upward.
   # This matters beyond tidiness: if MSRV climbs past what a nixpkgs stable

@@ -2384,6 +2384,66 @@ prefix = "payments"
         assert!(!denied(".SSHFS/config"));
     }
 
+    /// The cross-platform verdict table for `deny_path_matches`.
+    ///
+    /// This is the invariant `rust-style-platform-unsafe.md` prescribes —
+    /// *when two platforms implement one behavior differently, write the test
+    /// that proves they agree* — and it is what would have caught the
+    /// case-folding bypass this module carried for months. Each row states its
+    /// expectation as a **function of the filesystem property**, not as a
+    /// constant, so the one place the three OSes legitimately diverge is
+    /// written down rather than discovered.
+    ///
+    /// A row that reads `Same(..)` is a claim that all three agree. A row that
+    /// reads `Folds(..)` is a claim that they must *not*, and why.
+    #[test]
+    #[cfg(not(feature = "security-enforced"))]
+    fn every_platform_agrees_about_deny_path_matching() {
+        enum Expect {
+            /// Same verdict on macOS, Linux and Windows.
+            Same(bool),
+            /// Denied exactly where the filesystem folds case. Not a bug: a
+            /// case-sensitive volume really does have two different files.
+            Folds,
+        }
+        use Expect::*;
+
+        // (path, prefix, expectation)
+        let table: &[(&str, &str, Expect)] = &[
+            // Component anchoring, identical everywhere.
+            (".ssh/id_rsa", ".ssh/", Same(true)),
+            (".sshfs/config", ".ssh/", Same(false)),
+            ("/Users/you/.ssh/authorized_keys", ".ssh/", Same(true)),
+            ("src/../.ssh/config", ".ssh/", Same(true)),
+            ("docs/notes.md", ".ssh/", Same(false)),
+            // Absolute prefixes anchor at the root; relative ones float.
+            ("/etc/cron.d/x", "/etc/", Same(true)),
+            ("/home/you/etc/notes.md", "/etc/", Same(false)),
+            // Separator handling. A backslash is a filename character on Unix
+            // and a separator on Windows, so these are genuinely different
+            // paths — and `deny_path_matches` compares components, so neither
+            // platform matches this against a `.ssh/` rule by accident.
+            (r".ssh\id_rsa", ".ssh/", Same(cfg!(windows))),
+            // The divergence, stated once: case.
+            (".SSH/id_rsa", ".ssh/", Folds),
+            (".ssh/ID_RSA", ".ssh/", Folds),
+            ("/Users/You/.Ssh/id_rsa", ".ssh/", Folds),
+            (".SSHFS/config", ".ssh/", Same(false)),
+        ];
+
+        for (path, prefix, expect) in table {
+            let want = match expect {
+                Same(v) => *v,
+                Folds => PATHS_ARE_CASE_INSENSITIVE,
+            };
+            assert_eq!(
+                deny_path_matches(path, prefix, None),
+                want,
+                "`{path}` vs `{prefix}`"
+            );
+        }
+    }
+
     /// The rule's own casing is not privileged either, and a `~/` prefix folds
     /// its expanded home with it — otherwise the anchored arm compares a folded
     /// path against an unfolded `/Users/You`.
