@@ -30,8 +30,14 @@ use serde_json::{json, Value};
 /// `web_fetch`'s) and which, while running, records whether the shown-hosts
 /// registry has the host in it.
 struct ProbeTool {
-    /// Set during `run` to `host_was_shown("docs.example.com")`.
+    /// Set during `run` to `host_was_shown(&self.host)`.
     saw: Arc<AtomicBool>,
+    /// The host this probe asks about. Per-test, never shared: `SHOWN_HOSTS`
+    /// is a process-wide registry keyed by host (`hotl-tools/src/net.rs`) and
+    /// these tests run in parallel in one process, so a single shared hostname
+    /// let the one test that legitimately registers it flip every *other*
+    /// test's `saw` for the width of its call — a real, load-dependent flake.
+    host: String,
 }
 
 impl Tool for ProbeTool {
@@ -59,7 +65,7 @@ impl Tool for ProbeTool {
         _cancel: tokio_util::sync::CancellationToken,
     ) -> BoxFuture<'a, ToolOutcome> {
         self.saw.store(
-            hotl_tools::net::host_was_shown("docs.example.com"),
+            hotl_tools::net::host_was_shown(&self.host),
             Ordering::SeqCst,
         );
         Box::pin(std::future::ready(ToolOutcome::ok("ran")))
@@ -86,13 +92,18 @@ fn bypass_unavailable() -> bool {
     hotl_tools::rules::enforced_build()
 }
 
-fn session(cmd: &str, rules: Rules) -> (Session, Arc<AtomicBool>) {
+/// `host` is the one this test asks the registry about, and it must be unique
+/// to the test — see [`ProbeTool::host`].
+fn session(cmd: &str, host: &str, rules: Rules) -> (Session, Arc<AtomicBool>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig::default();
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
     let saw = Arc::new(AtomicBool::new(false));
     let mut registry = Registry::builtin();
-    registry.register(Box::new(ProbeTool { saw: saw.clone() }));
+    registry.register(Box::new(ProbeTool {
+        saw: saw.clone(),
+        host: host.to_string(),
+    }));
     let provider = Arc::new(ScriptedProvider::new(vec![
         ScriptedProvider::tool_call("t1", "probe", json!({"cmd": cmd})),
         ScriptedProvider::text_reply("done"),
@@ -139,7 +150,11 @@ async fn run_turn(session: &mut Session, reply_with: impl Fn() -> AskReply) -> O
 
 #[tokio::test]
 async fn human_approved_host_is_shown_while_the_call_runs() {
-    let (mut s, saw) = session("curl https://docs.example.com/x", Rules::default());
+    let (mut s, saw) = session(
+        "curl https://approved.example.com/x",
+        "approved.example.com",
+        Rules::default(),
+    );
     let outcome = run_turn(&mut s, || AskReply::Allow).await;
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
     assert!(
@@ -147,7 +162,7 @@ async fn human_approved_host_is_shown_while_the_call_runs() {
         "a host the human read in the approval summary must not prompt again"
     );
     assert!(
-        !hotl_tools::net::host_was_shown("docs.example.com"),
+        !hotl_tools::net::host_was_shown("approved.example.com"),
         "the registration is scoped to the call, never a durable grant"
     );
 }
@@ -161,7 +176,7 @@ async fn auto_allowed_call_does_not_suppress_the_ask() {
     let rules =
         Rules::from_toml("[[allow]]\ntool = \"probe\"\nfield = \"cmd\"\nprefix = \"curl \"\n")
             .expect("rules");
-    let (mut s, saw) = session("curl https://docs.example.com/x", rules);
+    let (mut s, saw) = session("curl https://auto.example.com/x", "auto.example.com", rules);
     let outcome = run_turn(&mut s, || {
         panic!("an auto-allowed call must not reach the human")
     })
@@ -182,7 +197,11 @@ async fn bypass_mode_does_not_suppress_the_ask() {
         return;
     }
     let rules = Rules::default().with_mode(hotl_tools::rules::PermissionMode::Bypass);
-    let (mut s, saw) = session("curl https://docs.example.com/x", rules);
+    let (mut s, saw) = session(
+        "curl https://bypass.example.com/x",
+        "bypass.example.com",
+        rules,
+    );
     let outcome = run_turn(&mut s, || panic!("bypass mode must not reach the human")).await;
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
     assert!(!saw.load(Ordering::SeqCst));
@@ -193,7 +212,9 @@ async fn bypass_mode_does_not_suppress_the_ask() {
 #[tokio::test]
 async fn a_userinfo_url_shows_nothing() {
     let (mut s, saw) = session(
-        "curl https://docs.example.com@evil.example/",
+        "curl https://userinfo.example.com@evil.example/",
+        // The host the *eye* reads, which is the one that must NOT register.
+        "userinfo.example.com",
         Rules::default(),
     );
     let outcome = run_turn(&mut s, || AskReply::Allow).await;
@@ -208,9 +229,13 @@ async fn a_userinfo_url_shows_nothing() {
 /// stale and no longer evidence of what is about to run.
 #[tokio::test]
 async fn allow_edited_does_not_suppress() {
-    let (mut s, saw) = session("curl https://docs.example.com/x", Rules::default());
+    let (mut s, saw) = session(
+        "curl https://edited.example.com/x",
+        "edited.example.com",
+        Rules::default(),
+    );
     let outcome = run_turn(&mut s, || AskReply::AllowEdited {
-        input: json!({"cmd": "curl https://docs.example.com/y"}),
+        input: json!({"cmd": "curl https://edited.example.com/y"}),
     })
     .await;
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
@@ -221,7 +246,11 @@ async fn allow_edited_does_not_suppress() {
 /// URL-shaped tokens count, and they are parsed, never substring-matched.
 #[tokio::test]
 async fn a_bare_hostname_in_prose_shows_nothing() {
-    let (mut s, saw) = session("echo talking about docs.example.com", Rules::default());
+    let (mut s, saw) = session(
+        "echo talking about prose.example.com",
+        "prose.example.com",
+        Rules::default(),
+    );
     let outcome = run_turn(&mut s, || AskReply::Allow).await;
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
     assert!(!saw.load(Ordering::SeqCst));
@@ -230,7 +259,11 @@ async fn a_bare_hostname_in_prose_shows_nothing() {
 /// A denial registers nothing: there is no approval to reuse.
 #[tokio::test]
 async fn a_denied_call_shows_nothing() {
-    let (mut s, saw) = session("curl https://docs.example.com/x", Rules::default());
+    let (mut s, saw) = session(
+        "curl https://denied.example.com/x",
+        "denied.example.com",
+        Rules::default(),
+    );
     let outcome = run_turn(&mut s, || AskReply::Deny { message: None }).await;
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
     assert!(!saw.load(Ordering::SeqCst));
