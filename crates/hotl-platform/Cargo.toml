@@ -20,6 +20,9 @@ testing = []
 getrandom = { workspace = true }
 dirs = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [target.'cfg(windows)'.dependencies]
 # `windows-sys`, not `windows`: these are a handful of flat C calls and the COM
 # machinery in `windows` is a large build cost for nothing.
@@ -29,5 +32,8 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Memory",
+    "Win32_System_IO",
     "Win32_System_Threading",
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
 ] }

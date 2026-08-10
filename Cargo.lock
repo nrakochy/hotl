@@ -957,6 +957,7 @@ version = "0.11.0"
 dependencies = [
  "dirs",
  "getrandom 0.3.4",
+ "libc",
  "windows-sys 0.61.2",
 ]
 
@@ -1064,6 +1065,7 @@ dependencies = [
  "globset",
  "hotl-context",
  "hotl-minify",
+ "hotl-platform",
  "hotl-provider",
  "hotl-types",
  "ignore",

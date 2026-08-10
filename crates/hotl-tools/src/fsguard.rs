@@ -20,16 +20,15 @@
 //! 3. Portable: component-wise `openat` from the root fd, every component
 //!    `O_NOFOLLOW`, then `fstat` on the fd you hold.
 //!
-//! hotl is unix-only today (`libc::kill` in `builtins.rs`, `process_group(0)`,
-//! Landlock/Seatbelt in `sandbox.rs`); `fsguard` follows the same posture. A
-//! Windows port is reserved in the tech-debt tracker.
+//! The syscall layer lives behind `hotl_platform::DirHandle`, so the descent
+//! above is written once and compiled for every platform. That trait is
+//! deliberately narrow: **no method on it accepts an absolute or
+//! multi-component path**, so code handed a handle cannot reach outside it. The
+//! one-door property is enforced by the type rather than by review, which is
+//! stronger than the free functions this module used when it had one platform.
 
-use std::ffi::{CString, OsStr};
+use std::ffi::OsStr;
 use std::fs::File;
-use std::os::unix::ffi::OsStrExt;
-#[cfg(target_os = "linux")]
-use std::os::unix::io::RawFd;
-use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -155,6 +154,21 @@ pub(crate) enum GuardError {
     /// Opened, but not a regular file (FIFO, device, socket) — reading it
     /// could block the turn forever.
     NotRegular,
+    /// A component the filesystem and hotl's own matchers would disagree
+    /// about: an alternate data stream, a trailing dot or space, a reserved
+    /// device name. Refused before any syscall — see
+    /// `hotl_platform::openat::refuse_component`.
+    BadName {
+        at: PathBuf,
+        why: &'static str,
+    },
+    /// The descent succeeded, but the OS's normalized name for the handle is
+    /// not the path we were about to hand out — an 8.3 short name, or a
+    /// verbatim form too long to shorten. Fail closed rather than pass on a
+    /// name that means something else to the next matcher.
+    Unnormalized {
+        at: PathBuf,
+    },
     Io(std::io::Error),
 }
 
@@ -172,6 +186,17 @@ impl GuardError {
                 "`{path}` is not a regular file (it is a FIFO, device, or socket); reading it \
                  could block forever. Pick a real file."
             ),
+            GuardError::BadName { at, why } => format!(
+                "`{path}` cannot be used: the component `{}` {why}. Windows resolves names like \
+                 that to a different file than the one written, so hotl refuses them on every \
+                 platform. Rename it and try again.",
+                at.display()
+            ),
+            GuardError::Unnormalized { at } => format!(
+                "`{path}` resolved to a different name than `{}` — a short name, or a path too \
+                 long to express plainly. Re-issue the call with the name the filesystem reports.",
+                at.display()
+            ),
             GuardError::Io(e) => {
                 format!("Could not open `{path}`: {e}. Check the path with `glob` and try again.")
             }
@@ -179,82 +204,152 @@ impl GuardError {
     }
 }
 
-/// Read flags for a guarded open.
+/// The active syscall backend. Bound in exactly one place, so the descent
+/// algorithm below is written once and compiled for every platform — and so a
+/// future port implements a trait rather than editing this file.
+type Dir = hotl_platform::ActiveDirHandle;
+
+use hotl_platform::{DirHandle as _, Excl, GuardIo, NodeKind, OpenMode};
+
+/// A failed syscall, at a known point in the descent.
 ///
-/// `O_NONBLOCK` is not decoration: `open(2)` on a FIFO blocks until a writer
-/// appears, so without it the guard would hang *before* `fstat` ever got the
-/// chance to refuse the FIFO. It is cleared again once the fd is known to be
-/// a regular file. Enforced by `a_fifo_is_not_a_readable_file`.
-const OPEN_RD: libc::c_int = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+/// The adapter already decided *whether* the OS refused because of a link (it
+/// alone knows its own errno quirks); this decides what that means, which is
+/// policy and belongs here.
+fn at(e: GuardIo, walked: &Path) -> GuardError {
+    if e.refused_a_link {
+        GuardError::Escape {
+            at: walked.to_path_buf(),
+        }
+    } else {
+        GuardError::Io(e.error)
+    }
+}
+
+/// `rel`'s components, refusing anything that is not a plain name.
+///
+/// Two refusals, both fail-closed. `..` and a root never reach here (`classify`
+/// strips them) and are rejected again defensively — sound on the *component
+/// stream*, because there is no second resolution to disagree with. And every
+/// component runs the lexical filter, so an alternate data stream, a trailing
+/// dot, or a reserved device name is refused before the OS ever sees it.
+fn components_of(rel: &Path) -> Result<Vec<&OsStr>, GuardError> {
+    let mut out = Vec::new();
+    for c in rel.components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(s) => {
+                if let Some(why) = hotl_platform::openat::refuse_component(s) {
+                    return Err(GuardError::BadName {
+                        at: PathBuf::from(s),
+                        why,
+                    });
+                }
+                out.push(s);
+            }
+            _ => {
+                return Err(GuardError::Escape {
+                    at: rel.to_path_buf(),
+                })
+            }
+        }
+    }
+    Ok(out)
+}
 
 /// Open `rel` (root-relative, `..`-free) for reading with no symlink
-/// traversal. Linux takes one atomic `openat2`; everything else descends.
+/// traversal. Layer 2 first where the kernel has it, then the descent.
 pub(crate) fn open_beneath(root: &Path, rel: &Path) -> Result<File, GuardError> {
-    let file = open_leaf(root, rel, OPEN_RD)?;
+    let file = open_leaf(root, rel, OpenMode::File)?;
     let meta = file.metadata().map_err(GuardError::Io)?;
     if !meta.is_file() {
         return Err(GuardError::NotRegular);
     }
-    clear_nonblock(&file)?;
+    hotl_platform::openat::unblock(&file).map_err(GuardError::Io)?;
     Ok(file)
 }
 
-/// Same, for a directory (`O_DIRECTORY`). `glob` uses this on its search root:
-/// a walk root that is not a directory is a mistake worth naming, and one
-/// reached through a symlink is an escape.
+/// Same, for a directory. `glob` uses this on its search root: a walk root that
+/// is not a directory is a mistake worth naming, and one reached through a
+/// symlink is an escape.
 pub(crate) fn open_dir_beneath(root: &Path, rel: &Path) -> Result<File, GuardError> {
-    open_leaf(root, rel, OPEN_RD | libc::O_DIRECTORY)
+    open_leaf(root, rel, OpenMode::Dir)
 }
 
 /// Confirm `rel` is beneath `root` and hand back the joined path.
 ///
-/// INVARIANT: after a successful `O_NOFOLLOW` descent, `root.join(rel)` and
-/// the kernel's own resolution name the same object — no component was a
-/// link, so the lexical join *is* the real path. That is what makes it safe
-/// to hand the joined path to an external walker (`ignore`, `rg`) that takes
-/// a path rather than an fd. Enforced by `resolved_path_is_the_same_object`.
+/// INVARIANT: after a successful no-follow descent, `root.join(rel)` and the
+/// kernel's own resolution name the same object — no component was a link, so
+/// the lexical join *is* the real path. That is what makes it safe to hand the
+/// joined path to an external walker (`ignore`, `rg`) that takes a path rather
+/// than a handle. Enforced by `resolved_path_is_the_same_object`.
 pub(crate) fn resolve_beneath(root: &Path, rel: &Path) -> Result<PathBuf, GuardError> {
-    let fd = open_leaf(root, rel, OPEN_RD)?;
+    let handle = open_leaf(root, rel, OpenMode::File)?;
     let joined = join_beneath(root, rel);
-    // Belt-and-braces: the fd we validated and the path we return are the
-    // same inode on the same device.
-    let by_fd = fd.metadata().map_err(GuardError::Io)?;
-    let by_name = std::fs::symlink_metadata(&joined).map_err(GuardError::Io)?;
-    use std::os::unix::fs::MetadataExt;
-    if by_fd.dev() != by_name.dev() || by_fd.ino() != by_name.ino() {
+    // Belt-and-braces: the handle we validated and the path we return are the
+    // same object on the same volume.
+    let by_handle = hotl_platform::openat::identity_of(&handle).map_err(GuardError::Io)?;
+    let by_name = hotl_platform::openat::identity_at(&joined).map_err(GuardError::Io)?;
+    if by_handle != by_name {
         return Err(GuardError::Escape {
             at: rel.to_path_buf(),
         });
     }
+    // Where the OS will tell us its own normalized name for the handle, require
+    // it to agree with the path we are about to hand out. This is what catches
+    // 8.3 short names, case folding, and trailing dot/space forms in one call —
+    // all cases where a matcher and the filesystem would name different files.
+    // Living in the shared algorithm rather than an adapter means Unix gets the
+    // check for free the day a Unix answer exists.
+    if let Some(normalized) =
+        hotl_platform::openat::normalized_name(&handle).map_err(GuardError::Io)?
+    {
+        let expected = dunce::canonicalize(&joined).map_err(GuardError::Io)?;
+        if !same_path(&normalized, &expected) {
+            return Err(GuardError::Unnormalized {
+                at: rel.to_path_buf(),
+            });
+        }
+    }
     Ok(joined)
 }
 
-/// Create (or truncate) `rel` beneath `root`. The parent is reached by the
-/// same `O_NOFOLLOW` descent; the leaf is created with `O_NOFOLLOW` so an
-/// existing symlink there fails with `ELOOP` instead of writing its target.
+/// Compare two OS-normalized paths.
 ///
-/// INVARIANT: a write never follows a symlink, at any component, including
-/// the final one. Enforced by
-/// `write_through_a_symlink_does_not_touch_the_target` and
-/// `write_creates_parents_but_never_through_a_link`.
-pub(crate) fn create_beneath(root: &Path, rel: &Path, mkparents: bool) -> Result<File, GuardError> {
-    let (dir, leaf) = split_parent(root, rel, mkparents)?;
-    openat_leaf(
-        &dir,
-        &leaf,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        0o644,
-    )
+/// A `\\?\` verbatim form `dunce` could not shorten (over 260 characters) will
+/// not compare equal to the joined path, and that refusal is deliberate: an
+/// un-de-verbatim-able path is fail-closed, not "probably fine".
+fn same_path(a: &Path, b: &Path) -> bool {
+    if cfg!(windows) {
+        a.as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&b.as_os_str().to_string_lossy())
+    } else {
+        a == b
+    }
 }
 
-/// Atomically replace `rel`'s contents: write a sibling temp file, `fsync`
-/// it, `renameat` over the target, then `fsync` the parent directory.
+/// Create (or truncate) `rel` beneath `root`. The parent is reached by the same
+/// no-follow descent; the leaf is created without following, so an existing
+/// symlink there fails instead of writing through to its target.
+///
+/// INVARIANT: a write never follows a symlink, at any component, including the
+/// final one. Enforced by `write_through_a_symlink_does_not_touch_the_target`
+/// and `write_creates_parents_but_never_through_a_link`.
+pub(crate) fn create_beneath(root: &Path, rel: &Path, mkparents: bool) -> Result<File, GuardError> {
+    let (dir, leaf) = split_parent(root, rel, mkparents)?;
+    dir.create_child_file(&leaf, Excl::Truncate)
+        .map_err(|e| at(e, rel))
+}
+
+/// Atomically replace `rel`'s contents: write a sibling temp file, sync it,
+/// rename over the target, then make the *name* durable.
 ///
 /// INVARIANT: a crash mid-write leaves either the old file or the new one,
-/// never a truncated one; the target's mode survives the swap; and a symlink
-/// standing where the target should be is refused rather than followed *or*
-/// silently replaced (`renameat` does not follow links, so without the check
-/// an atomic replace would quietly delete the link). Enforced by
+/// never a truncated one; the target's attributes survive the swap; and a
+/// symlink standing where the target should be is refused rather than followed
+/// *or* silently replaced (the rename does not follow links, so without the
+/// check an atomic replace would quietly delete the link). Enforced by
 /// `replace_is_atomic_and_durable` and
 /// `edit_inside_the_tree_still_works_and_keeps_the_mode`.
 pub(crate) fn replace_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> Result<(), GuardError> {
@@ -262,79 +357,66 @@ pub(crate) fn replace_beneath(root: &Path, rel: &Path, bytes: &[u8]) -> Result<(
     let (dir, leaf) = split_parent(root, rel, false)?;
     // What is standing there now, if anything — checked before a byte is
     // staged, so a refusal leaves no debris.
-    let existing = stat_mode_at(&dir, &leaf);
-    if let Some(mode) = existing {
-        match mode & libc::S_IFMT {
-            libc::S_IFREG => {}
-            libc::S_IFLNK => {
-                return Err(GuardError::Escape {
-                    at: rel.to_path_buf(),
-                })
-            }
-            _ => return Err(GuardError::NotRegular),
+    match dir.child_kind(&leaf) {
+        None | Some(NodeKind::RegularFile) => {}
+        Some(NodeKind::NotFollowable { .. }) => {
+            return Err(GuardError::Escape {
+                at: rel.to_path_buf(),
+            })
         }
+        // Catch-all refuses, per `NodeKind`'s contract: a variant added later
+        // must fail closed here rather than fall through to a replace.
+        Some(_) => return Err(GuardError::NotRegular),
     }
+    let existing = dir.child_attrs(&leaf);
     let tmp = std::ffi::OsString::from(format!(
         ".hotl-tmp-{}-{}",
         std::process::id(),
         next_tmp_seq()
     ));
-    let mut f = openat_leaf(
-        &dir,
-        &tmp,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-        0o644,
-    )?;
-    // Carry the target's mode across, or an atomic replace would silently
+    let mut f = dir
+        .create_child_file(&tmp, Excl::MustNotExist)
+        .map_err(|e| at(e, rel))?;
+    // Carry the target's attributes across, or an atomic replace would silently
     // drop the executable bit off every script it edits.
     let staged = (|| {
-        if let Some(mode) = existing {
-            fchmod(&f, mode & 0o7777)?;
+        if let Some(attrs) = existing {
+            dir.apply_attrs(&f, attrs)?;
         }
         f.write_all(bytes)?;
         f.sync_all()
     })();
     if let Err(e) = staged {
-        unlinkat(&dir, &tmp);
+        dir.unlink_child(&tmp);
         return Err(GuardError::Io(e));
     }
     drop(f);
-    if let Err(e) = renameat(&dir, &tmp, &dir, &leaf) {
-        unlinkat(&dir, &tmp);
-        return Err(GuardError::Io(e));
+    if let Err(e) = dir.rename_child(&tmp, &leaf) {
+        dir.unlink_child(&tmp);
+        return Err(GuardError::Io(e.error));
     }
-    // Durability of the *name*: without this the rename can be lost even
-    // though the data was synced.
-    dir.sync_all().map_err(GuardError::Io)
+    // Durability of the *name*: without this the rename can be lost on a
+    // platform that does not journal it, even though the data was synced.
+    dir.sync_name_durability().map_err(|e| at(e, rel))
 }
 
-/// Descend to `rel`'s parent and hand back `(parent dir fd, leaf name)`.
-/// Missing intermediates are created with `mkdirat` when `mkparents`, and
-/// every one that already exists is re-opened `O_NOFOLLOW|O_DIRECTORY`, so a
-/// symlinked intermediate is refused rather than descended through.
+/// Descend to `rel`'s parent and hand back `(parent handle, leaf name)`.
+/// Missing intermediates are created when `mkparents`, and every one that
+/// already exists is re-opened without following, so a symlinked intermediate
+/// is refused rather than descended through.
 fn split_parent(
     root: &Path,
     rel: &Path,
     mkparents: bool,
-) -> Result<(File, std::ffi::OsString), GuardError> {
-    let comps: Vec<&OsStr> = rel
-        .components()
-        .filter_map(|c| match c {
-            Component::CurDir => None,
-            Component::Normal(s) => Some(Ok(s)),
-            _ => Some(Err(())),
-        })
-        .collect::<Result<Vec<_>, ()>>()
-        .map_err(|_| GuardError::Escape {
-            at: rel.to_path_buf(),
-        })?;
+) -> Result<(Dir, std::ffi::OsString), GuardError> {
+    let comps = components_of(rel)?;
     // A bare `.` names the root directory, which is not a file to write.
     let Some((leaf, parents)) = comps.split_last() else {
         return Err(GuardError::Escape {
             at: rel.to_path_buf(),
         });
     };
-    let mut dir = open_root(root)?;
+    let mut dir = Dir::open_root(root).map_err(|e| at(e, root))?;
     let mut walked = PathBuf::new();
     for comp in parents {
         walked.push(comp);
@@ -344,154 +426,24 @@ fn split_parent(
 }
 
 fn open_or_make_dir(
-    dir: &File,
+    dir: &Dir,
     comp: &OsStr,
     mkparents: bool,
     walked: &Path,
-) -> Result<File, GuardError> {
-    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY;
-    let c = CString::new(comp.as_bytes()).map_err(|_| GuardError::Escape {
-        at: walked.to_path_buf(),
-    })?;
-    // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
-    if fd >= 0 {
-        // SAFETY: freshly opened fd, owned by nothing else.
-        return Ok(unsafe { File::from_raw_fd(fd) });
-    }
-    let err = std::io::Error::last_os_error();
-    if mkparents && err.raw_os_error() == Some(libc::ENOENT) {
-        // SAFETY: plain mkdirat(2) on a fd we own.
-        if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.raw_os_error() != Some(libc::EEXIST) {
-                return Err(GuardError::Io(e));
-            }
+) -> Result<Dir, GuardError> {
+    match dir.open_child_dir(comp) {
+        Ok(d) => Ok(d),
+        Err(e) if mkparents && e.error.kind() == std::io::ErrorKind::NotFound => {
+            // Racing creators are fine — the re-open below is what decides.
+            let _ = dir.make_child_dir(comp);
+            dir.open_child_dir(comp).map_err(|e| at(e, walked))
         }
-        // SAFETY: same, re-opening what we just created.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
-        if fd >= 0 {
-            // SAFETY: freshly opened fd, owned by nothing else.
-            return Ok(unsafe { File::from_raw_fd(fd) });
-        }
-        return Err(GuardError::Io(std::io::Error::last_os_error()));
-    }
-    // Same classification as `descend`: a link is an escape, anything else is
-    // an ordinary I/O error.
-    Err(
-        if matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
-            && is_symlink_at(dir, comp)
-        {
-            GuardError::Escape {
-                at: walked.to_path_buf(),
-            }
-        } else {
-            GuardError::Io(err)
-        },
-    )
-}
-
-fn openat_leaf(
-    dir: &File,
-    leaf: &OsStr,
-    flags: libc::c_int,
-    mode: libc::mode_t,
-) -> Result<File, GuardError> {
-    let c = CString::new(leaf.as_bytes()).map_err(|_| GuardError::Escape {
-        at: PathBuf::from(leaf),
-    })?;
-    // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated;
-    // `openat` is variadic and takes the mode as its third argument when
-    // `O_CREAT` is set.
-    let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags, mode as libc::c_uint) };
-    if fd >= 0 {
-        // SAFETY: freshly opened fd, owned by nothing else.
-        return Ok(unsafe { File::from_raw_fd(fd) });
-    }
-    let err = std::io::Error::last_os_error();
-    Err(
-        if matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
-            && is_symlink_at(dir, leaf)
-        {
-            GuardError::Escape {
-                at: PathBuf::from(leaf),
-            }
-        } else {
-            GuardError::Io(err)
-        },
-    )
-}
-
-/// The full `st_mode` of `name` in `dir` without following a final symlink,
-/// or `None` if it does not exist.
-fn stat_mode_at(dir: &File, name: &OsStr) -> Option<libc::mode_t> {
-    let c = CString::new(name.as_bytes()).ok()?;
-    // SAFETY: `stat` is a plain repr(C) struct; all-zero is a valid instance.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated.
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            c.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    Some(st.st_mode)
-}
-
-fn fchmod(f: &File, mode: libc::mode_t) -> std::io::Result<()> {
-    // SAFETY: plain fchmod(2) on a fd we own.
-    if unsafe { libc::fchmod(f.as_raw_fd(), mode) } < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-fn unlinkat(dir: &File, name: &OsStr) {
-    let Ok(c) = CString::new(name.as_bytes()) else {
-        return;
-    };
-    // SAFETY: plain unlinkat(2) on a fd we own. Best-effort cleanup of our
-    // own temp file; a failure here has nothing to report.
-    unsafe {
-        libc::unlinkat(dir.as_raw_fd(), c.as_ptr(), 0);
+        Err(e) => Err(at(e, walked)),
     }
 }
 
-fn renameat(olddir: &File, oldname: &OsStr, newdir: &File, newname: &OsStr) -> std::io::Result<()> {
-    let old = CString::new(oldname.as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let new = CString::new(newname.as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    // SAFETY: both fds are open directories we own; both names are
-    // NUL-terminated.
-    if unsafe {
-        libc::renameat(
-            olddir.as_raw_fd(),
-            old.as_ptr(),
-            newdir.as_raw_fd(),
-            new.as_ptr(),
-        )
-    } < 0
-    {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// Per-process counter so two concurrent replaces cannot pick the same temp
-/// name (the pid alone is not enough).
-fn next_tmp_seq() -> u64 {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// `root.join(rel)` with the lone `.` collapsed, so a caller handing the
-/// result to an external walker gets `root` rather than `root/.`.
+/// `root.join(rel)` with the lone `.` collapsed, so a caller handing the result
+/// to an external walker gets `root` rather than `root/.`.
 pub(crate) fn join_beneath(root: &Path, rel: &Path) -> PathBuf {
     if rel.as_os_str() == "." {
         root.to_path_buf()
@@ -500,192 +452,34 @@ pub(crate) fn join_beneath(root: &Path, rel: &Path) -> PathBuf {
     }
 }
 
-fn open_leaf(root: &Path, rel: &Path, flags: libc::c_int) -> Result<File, GuardError> {
-    let rootfd = open_root(root)?;
-    #[cfg(target_os = "linux")]
-    if !force_descend() {
-        if let Some(f) = openat2_beneath(rootfd.as_raw_fd(), rel, flags)? {
-            return Ok(f);
-        }
+fn open_leaf(root: &Path, rel: &Path, mode: OpenMode) -> Result<File, GuardError> {
+    // Run the lexical refusals before any syscall, so layer 2 cannot resolve a
+    // name layer 3 would have rejected.
+    let comps = components_of(rel)?;
+    let rootdir = Dir::open_root(root).map_err(|e| at(e, root))?;
+    // Layer 2 — one syscall, one resolution, kernel-enforced beneath-ness.
+    if let Some(f) = rootdir.resolve_beneath(rel, mode).map_err(|e| at(e, rel))? {
+        return Ok(f);
     }
-    descend(rootfd, rel, flags)
-}
-
-fn open_root(root: &Path) -> Result<File, GuardError> {
-    let c = CString::new(root.as_os_str().as_bytes()).map_err(|_| GuardError::Escape {
-        at: root.to_path_buf(),
-    })?;
-    // The root itself is opened by name (it is ours, not the model's) but
-    // with O_DIRECTORY so a swapped-out root fails loudly rather than
-    // silently rebasing the whole guard.
-    // SAFETY: plain open(2) on a NUL-terminated path we own.
-    let fd = unsafe {
-        libc::open(
-            c.as_ptr(),
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
-        )
+    // Layer 3 — portable: walk the components, refusing a link at every step.
+    let Some((last, parents)) = comps.split_last() else {
+        return Ok(rootdir.into_file()); // "." — the root handle itself
     };
-    if fd < 0 {
-        return Err(GuardError::Io(std::io::Error::last_os_error()));
-    }
-    // SAFETY: `fd` was just opened and is owned by nothing else.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-/// Innovation #1: force layer 3 even where layer 2 exists, so CI exercises the
-/// portable descent on Linux too. Without it the fallback — the layer that runs
-/// on every pre-5.6 kernel and every seccomp-restricted container — would only
-/// ever be tested on macOS runners, and would rot.
-#[cfg(target_os = "linux")]
-fn force_descend() -> bool {
-    static FORCE: OnceLock<bool> = OnceLock::new();
-    *FORCE.get_or_init(|| {
-        std::env::var("HOTL_FSGUARD_FORCE_DESCEND").is_ok_and(|v| !v.is_empty() && v != "0")
-    })
-}
-
-/// Layer 2 — Linux >= 5.6. One syscall, one resolution, kernel-enforced.
-/// `RESOLVE_BENEATH` refuses any escape above `dirfd`; `RESOLVE_NO_SYMLINKS`
-/// refuses every link, matching layer 3's rule exactly;
-/// `RESOLVE_NO_MAGICLINKS` refuses `/proc/*/fd` style re-entry.
-#[cfg(target_os = "linux")]
-fn openat2_beneath(
-    dirfd: RawFd,
-    rel: &Path,
-    flags: libc::c_int,
-) -> Result<Option<File>, GuardError> {
-    let c = CString::new(rel.as_os_str().as_bytes()).map_err(|_| GuardError::Escape {
-        at: rel.to_path_buf(),
-    })?;
-    // `libc::open_how` is `#[non_exhaustive]`: it cannot be built with a
-    // struct literal outside libc, so zero it and set the three fields.
-    // SAFETY: `open_how` is a plain repr(C) struct of integers; all-zero is a
-    // valid instance of it.
-    let mut how: libc::open_how = unsafe { std::mem::zeroed() };
-    how.flags = (flags & !libc::O_NOFOLLOW) as u64;
-    how.resolve = libc::RESOLVE_BENEATH | libc::RESOLVE_NO_MAGICLINKS | libc::RESOLVE_NO_SYMLINKS;
-    // SAFETY: raw syscall with a valid dirfd, a NUL-terminated path, and a
-    // correctly-sized `open_how` we own.
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            dirfd,
-            c.as_ptr(),
-            &how as *const libc::open_how,
-            std::mem::size_of::<libc::open_how>(),
-        )
-    };
-    if ret >= 0 {
-        // SAFETY: the syscall returned a fresh fd owned by nothing else.
-        return Ok(Some(unsafe { File::from_raw_fd(ret as RawFd) }));
-    }
-    let err = std::io::Error::last_os_error();
-    match err.raw_os_error() {
-        // Pre-5.6 kernel, or a seccomp filter that blocks unknown syscalls.
-        // Fall through to the portable descent, which is equally safe — it
-        // just costs one syscall per component.
-        Some(libc::ENOSYS) | Some(libc::EPERM) => Ok(None),
-        Some(libc::ELOOP) | Some(libc::EXDEV) => Err(GuardError::Escape {
-            at: rel.to_path_buf(),
-        }),
-        _ => Err(GuardError::Io(err)),
-    }
-}
-
-/// Layer 3 — portable. Walk the components from the root fd, refusing a
-/// symlink at every step. `..` never reaches here (`classify` strips it) and
-/// is refused again defensively: rejecting it on the *component stream* is
-/// sound because there is no second resolution to disagree with.
-fn descend(root: File, rel: &Path, leaf_flags: libc::c_int) -> Result<File, GuardError> {
-    let mut dir = root;
-    let comps: Vec<&OsStr> = rel
-        .components()
-        .filter_map(|c| match c {
-            Component::CurDir => None,
-            Component::Normal(s) => Some(Ok(s)),
-            _ => Some(Err(())),
-        })
-        .collect::<Result<Vec<_>, ()>>()
-        .map_err(|_| GuardError::Escape {
-            at: rel.to_path_buf(),
-        })?;
-    if comps.is_empty() {
-        return Ok(dir); // "." — the root fd itself
-    }
-    let last = comps.len() - 1;
+    let mut dir = rootdir;
     let mut walked = PathBuf::new();
-    for (i, comp) in comps.into_iter().enumerate() {
+    for comp in parents {
         walked.push(comp);
-        let flags = if i == last {
-            leaf_flags | libc::O_NOFOLLOW
-        } else {
-            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY
-        };
-        let c =
-            CString::new(comp.as_bytes()).map_err(|_| GuardError::Escape { at: walked.clone() })?;
-        // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated.
-        let fd = unsafe { libc::openat(dir.as_raw_fd(), c.as_ptr(), flags) };
-        if fd < 0 {
-            let err = std::io::Error::last_os_error();
-            // POSIX says `O_NOFOLLOW` on a symlink is ELOOP, but macOS returns
-            // ENOTDIR whenever `O_DIRECTORY` is also set, and an intermediate
-            // link can surface either. So classify by asking the *same dirfd*
-            // whether the component is a link. The open has already failed —
-            // this only picks the error message, and nothing is ever opened on
-            // its strength, so it is not a check-then-open.
-            let refused_a_link =
-                matches!(err.raw_os_error(), Some(libc::ELOOP) | Some(libc::ENOTDIR))
-                    && is_symlink_at(&dir, comp);
-            return Err(if refused_a_link {
-                GuardError::Escape { at: walked }
-            } else {
-                GuardError::Io(err)
-            });
-        }
-        // SAFETY: `fd` was just opened and is owned by nothing else.
-        dir = unsafe { File::from_raw_fd(fd) };
+        dir = dir.open_child_dir(comp).map_err(|e| at(e, &walked))?;
     }
-    Ok(dir)
+    walked.push(last);
+    dir.open_child_file(last, mode).map_err(|e| at(e, &walked))
 }
 
-/// Is `comp` a symlink, relative to the directory `dir` names? Used only to
-/// classify an `openat` that already failed (see `descend`).
-fn is_symlink_at(dir: &File, comp: &OsStr) -> bool {
-    let Ok(c) = CString::new(comp.as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `stat` is a plain repr(C) struct; all-zero is a valid instance.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `dir` is an open directory fd we own; `c` is NUL-terminated;
-    // `st` is a live, correctly-typed out-parameter.
-    let rc = unsafe {
-        libc::fstatat(
-            dir.as_raw_fd(),
-            c.as_ptr(),
-            &mut st,
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    };
-    rc == 0 && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
-}
-
-/// Drop the `O_NONBLOCK` that `OPEN_RD` needed to survive a FIFO. On a regular
-/// file the flag is inert, but leaving it set would leak an odd fd mode into
-/// `tokio::fs::File`.
-fn clear_nonblock(f: &File) -> Result<(), GuardError> {
-    // SAFETY: plain fcntl(2) on a fd we own.
-    let flags = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_GETFL) };
-    if flags < 0 {
-        return Err(GuardError::Io(std::io::Error::last_os_error()));
-    }
-    if flags & libc::O_NONBLOCK == 0 {
-        return Ok(());
-    }
-    // SAFETY: same fd, clearing one flag we set ourselves.
-    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) } < 0 {
-        return Err(GuardError::Io(std::io::Error::last_os_error()));
-    }
-    Ok(())
+/// Per-process counter so two concurrent replaces cannot pick the same temp
+/// name (the pid alone is not enough).
+fn next_tmp_seq() -> u64 {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[cfg(test)]
@@ -708,6 +502,71 @@ pub(crate) mod tests {
             dunce::canonicalize(root).unwrap(),
             dunce::canonicalize(home).unwrap(),
         )
+    }
+
+    /// The four anchored Windows forms. `classify` already refuses every one
+    /// of them — `Component::RootDir | Component::Prefix(_) => Outside` catches
+    /// them on Windows, including `C:foo`, which `is_absolute()` calls false
+    /// but which still yields a `Prefix`. This test pins that behavior rather
+    /// than changing it, and covers the Unix side too, where the `:` filter is
+    /// what refuses them.
+    #[test]
+    fn anchored_windows_forms_never_resolve_to_something_inside() {
+        let (_o, root, _home) = fixture();
+        for path in [
+            r"C:foo",                  // drive-relative: resolves against a cwd that is not ours
+            r"C:\Windows\notepad.exe", // drive-absolute
+            r"\\srv\share\x",          // UNC
+            r"\\?\C:\x",               // verbatim
+            r"\\.\PIPE\x",             // device namespace
+        ] {
+            let placed = classify(&root, path);
+            if let Placement::Inside(rel) = placed {
+                // On Unix these are ordinary (if odd) relative names, so the
+                // guard must still refuse them at the door.
+                let err = open_beneath(&root, &rel).unwrap_err();
+                assert!(
+                    matches!(err, GuardError::BadName { .. } | GuardError::Io(_)),
+                    "`{path}` classified Inside and then opened: {err:?}"
+                );
+            }
+        }
+    }
+
+    /// The lexical refusals, exercised through the guard rather than through
+    /// the platform crate, and on **create** as well as read — `create_beneath`
+    /// and `replace_beneath` had no such check when the guard was Unix-only,
+    /// and a reserved device name only bites on the way in.
+    #[test]
+    fn names_windows_would_resolve_differently_are_refused_on_read_and_on_create() {
+        let (_o, root, _home) = fixture();
+        for name in ["notes.md:evil", "notes.md.", "notes.md ", "CON", "nul.txt"] {
+            let rel = Path::new(name);
+            assert!(
+                matches!(open_beneath(&root, rel), Err(GuardError::BadName { .. })),
+                "read of `{name}` must be refused"
+            );
+            assert!(
+                matches!(
+                    create_beneath(&root, rel, false),
+                    Err(GuardError::BadName { .. })
+                ),
+                "create of `{name}` must be refused"
+            );
+            assert!(
+                matches!(
+                    replace_beneath(&root, rel, b"x"),
+                    Err(GuardError::BadName { .. })
+                ),
+                "replace of `{name}` must be refused"
+            );
+            assert!(
+                !root.join(name).exists(),
+                "`{name}` was refused but something was created anyway"
+            );
+        }
+        // And an ordinary name still works, so the filter is not a blanket.
+        assert!(create_beneath(&root, Path::new("notes.md"), false).is_ok());
     }
 
     #[test]

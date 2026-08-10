@@ -40,11 +40,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub mod entropy;
+pub mod openat;
 pub mod paths;
 pub mod privatefs;
 pub mod sealed;
 
 pub use entropy::{ActiveEntropy, Entropy};
+pub use openat::{ActiveDirHandle, DirHandle, Excl, GuardIo, NodeId, NodeKind, OpenMode};
 pub use paths::{ActiveKnownPaths, KnownPaths};
 pub use privatefs::{ActivePrivateFs, EffectiveAccess, PrivateFs, Writes};
 
