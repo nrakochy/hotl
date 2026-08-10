@@ -371,6 +371,139 @@ async fn initialize_advertises_skill_names_and_descriptions() {
     );
 }
 
+/// `session/context` (plan 0028): a thin ack on the id, the report itself as
+/// a broadcast. The reply carries no payload on purpose — a correlated one
+/// would need a third id queue in the TUI client's `translate`.
+#[tokio::test]
+async fn session_context_returns_an_ack_and_broadcasts_a_report() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}),
+    )
+    .await;
+    next(&mut lines).await;
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/context","params":{}}),
+    )
+    .await;
+    let ack = next_matching(&mut lines, |m| m["id"] == 3).await;
+    assert_eq!(ack["result"], json!({"ok": true}));
+
+    let report = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "context_report"
+    })
+    .await;
+    let update = &report["params"]["update"];
+    assert_eq!(report["params"]["schemaVersion"], 1);
+    assert_eq!(update["window"], 200_000);
+    let rows = update["rows"].as_array().expect("rows");
+    assert_eq!(rows.len(), 12, "every row is emitted, zeros included");
+    // The system prompt is the one row a brand-new session cannot have at 0.
+    let system = rows
+        .iter()
+        .find(|r| r["kind"] == "system_prompt")
+        .expect("system_prompt row");
+    assert!(system["tokens"].as_u64().expect("u64") > 0);
+}
+
+#[tokio::test]
+async fn session_context_without_a_session_is_an_error() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/context","params":{}}),
+    )
+    .await;
+    let reply = next_matching(&mut lines, |m| m["id"] == 2).await;
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("requires an open session"),
+        "{reply}"
+    );
+}
+
+/// The wire tags are `snake_case` and stay that way: they are a protocol
+/// contract, and the TUI's display labels are a separate table.
+#[tokio::test]
+async fn the_context_report_kinds_are_snake_case() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new","params":{}}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/context","params":{}}),
+    )
+    .await;
+    let report = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "context_report"
+    })
+    .await;
+    for row in report["params"]["update"]["rows"].as_array().expect("rows") {
+        let kind = row["kind"].as_str().expect("kind is a string");
+        assert!(
+            !kind.is_empty() && kind.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "kind `{kind}` is not snake_case"
+        );
+    }
+}
+
 #[tokio::test]
 async fn initialize_new_prompt_permission_and_result() {
     let (client, server) = tokio::io::duplex(64 * 1024);

@@ -696,6 +696,35 @@ async fn handle_request(
                 }
             }
         }
+        // What currently fills the context window, by source. A read: it
+        // appends nothing and publishes nothing, so unlike `reload_config`
+        // there is no idle guard and no session rebuild.
+        "session/context" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "session/context requires an open session").await;
+            };
+            let sid = state.id.clone();
+            match state.handle.context_breakdown().await {
+                Some(b) => {
+                    // Thin ack, payload broadcast — the `config_reloaded`
+                    // shape, for the same reason: a client's loop needs no
+                    // id-plumbing to get it. Additive, so
+                    // `UPDATE_SCHEMA_VERSION` stands.
+                    reply_ok(writer, id, json!({"ok": true})).await;
+                    notify(
+                        writer,
+                        &sid,
+                        json!({
+                            "type": "context_report",
+                            "window": b.window,
+                            "rows": b.rows,
+                        }),
+                    )
+                    .await;
+                }
+                None => reply_err(writer, id, "session/context: the session is gone").await,
+            }
+        }
         other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
     }
 }
