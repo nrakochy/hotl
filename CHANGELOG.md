@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-08-10
+
 ### Added
 
 - **`/context` — what is filling the context window, by source.** A twelve-row
