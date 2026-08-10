@@ -1127,7 +1127,7 @@ fn grant_read_except(
 pub fn read_carve_failures() -> &'static [String] {
     #[cfg(target_os = "linux")]
     {
-        return READ_CARVE_FAILURES.get().map(Vec::as_slice).unwrap_or(&[]);
+        READ_CARVE_FAILURES.get().map(Vec::as_slice).unwrap_or(&[])
     }
     #[cfg(not(target_os = "linux"))]
     &[]
