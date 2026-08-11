@@ -38,6 +38,7 @@ model = "openai/gpt-5"                      # provider/model
 base_url = "http://localhost:11434/v1"      # endpoint for the active provider
 auth = "api_key"                            # or "subscription": hotl holds no credential (requires base_url)
 fast_model = "..."                          # cheap model for compaction summaries
+effort = "high"                             # low | medium | high | xhigh | max; absent = the provider's default
 api_key_helper = "..."                      # command whose trimmed stdout is the API key; beats static key env vars; 5s timeout, 64KB cap
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
 
@@ -237,6 +238,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. Leave unset to get the [per-model window](#context-window-context-window). |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
+| `HOTL_EFFORT` | `[provider].effort` | Reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Unset sends no depth field at all. An unrecognized value warns and is ignored. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `bypass` (default: no per-action asks) \| `ask` \| `dontask`; `auto` still parses as `bypass`, and a typo fails closed to `ask`. |
 | `HOTL_PLAN` | `[permissions].plan` | Any value but `0`/`false`/empty turns plan mode on. |
@@ -491,6 +493,25 @@ window = 8192   # only needed for a model hotl doesn't recognize, or a
 ```
 
 Setting this too high overflows the model mid-turn; too low burns a summarize call and discards context you were still paying to keep.
+
+### Reasoning effort (`[provider] effort`)
+
+One neutral ladder — `low | medium | high | xhigh | max` — that each provider spells its own way. Anthropic gets `output_config.effort`; OpenAI-compatible endpoints get a top-level `reasoning_effort`. You set the rung once and hotl projects it.
+
+Precedence, highest first: `/effort` mid-session → `HOTL_EFFORT` → `[provider] effort` → unset.
+
+```toml
+[provider]
+effort = "high"
+```
+
+**Unset sends no depth field at all**, so an unconfigured session's requests are byte-for-byte what they were before this setting existed — no warm prompt cache invalidated on upgrade, and no unknown key sent to a local server that might reject it.
+
+A model that accepts fewer rungs clamps to its nearest one rather than erroring, and ties clamp **downward**, toward the cheaper rung: guessing upward spends your money on an inference hotl cannot justify. A model with no effort support at all (today: `claude-haiku-4-5`) simply gets no field. A model hotl does not recognize is never *refused* an effort — hotl allowlists no model names, so the field goes out and the provider's own answer is what you see.
+
+`effort` and `thinking` stay two knobs. `HOTL_THINKING=0` turns extended thinking off; on an OpenAI-compatible endpoint that is spelled `reasoning_effort: "none"` and wins over any rung you set.
+
+`/effort` in the console changes the rung mid-session and is recorded durably, so `hotl resume` keeps it. Sub-agents take their own rung from an `effort:` line in the agent def — see [agents.md](../agents/). Compaction never inherits the session's rung: folding your own history at `max` rates is a cost nobody opts into.
 
 ### Concurrency (`[concurrency]`)
 

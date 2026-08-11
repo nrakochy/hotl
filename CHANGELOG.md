@@ -8,6 +8,26 @@ semver promise of their own.
 
 ### Added
 
+- **A reasoning-effort ladder.** One provider-neutral set of rungs —
+  `low | medium | high | xhigh | max` — that each dialect spells its own way:
+  `output_config.effort` on Anthropic, a flattened top-level `reasoning_effort`
+  on OpenAI-compatible endpoints. Four surfaces set it: `[provider] effort` in
+  `config.toml`, `HOTL_EFFORT`, an `effort:` line in an agent def (which
+  replaces the parent's for that child only), and `/effort` in the console —
+  the last recorded durably, so `hotl resume` keeps it. ACP clients get
+  `session/set_effort`, whose change is broadcast to every attached surface.
+
+  A model that accepts fewer rungs **clamps to its nearest one** rather than
+  erroring, and ties clamp downward, toward the cheaper rung. A model with no
+  effort support (`claude-haiku-4-5` today) gets no field; a model hotl does not
+  recognize is never refused one, because hotl allowlists no model names.
+  Compaction is pinned off regardless of the session's setting.
+
+  **An unconfigured session's requests are unchanged, byte for byte.** Unset
+  emits no field on either wire — no warm prompt cache invalidated on upgrade,
+  and no unknown key sent to a local server that might reject it. `thinking`
+  stays its own independent off-switch.
+
 - **Native Windows builds, runs, and is tested.** The whole workspace compiles
   for `x86_64-pc-windows-msvc` with no warnings, and the harness suite runs on
   `windows-latest` in CI. The file tools, the session server, the process

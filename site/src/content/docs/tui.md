@@ -179,9 +179,10 @@ own.
 | `/rename <name>` | Rename the session (1–64 chars); the badge and terminal title follow. |
 | `/plan [on\|off]` | Toggle plan mode: `write`/`edit` always ask, everything else follows the mode (see [permissions-and-sandbox.md](../permissions-and-sandbox/)). Bare `/plan` toggles; `on`/`off` are for scripted input. |
 | `/mode <ask\|bypass\|dontask>` | Switch to that permission mode. An unknown name prints usage and changes nothing; `/mode plan` points you at `/plan`. |
+| `/effort [level]` | Set the reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`, or `default` to hand it back to the provider. Bare `/effort` reports the current rung rather than cycling — five rungs are not a toggle. Recorded durably, so `hotl resume` keeps it. See [configuration.md](../configuration/#reasoning-effort-provider-effort). |
 | `/reload` | Re-read `config.toml` without losing the session (see [Reloading config](#reloading-config)). |
 | `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. |
-| `/status` | What this session is running: name, model, permission mode and plan state, context window, todo count. |
+| `/status` | What this session is running: name, model, permission mode and plan state, reasoning effort, context window, todo count. |
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |

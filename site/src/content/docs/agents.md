@@ -45,8 +45,24 @@ Frontmatter fields:
 | `description` | Shown to the model alongside the built-ins when it's choosing an `agent_type`. |
 | `tools` | `all` (default) \| `read-only` \| a comma list of tool names (`read, grep, bash`). |
 | `model` | Override the child's model. Omit to inherit the parent's. |
-| `effort` | Parsed, not yet applied — hotl has no effort ladder today (only a thinking on/off switch). Reserved for a future release. |
+| `effort` | Reasoning depth for this child: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Replaces the parent's for that child only. Omit to inherit. An unrecognized value warns and the def still loads. |
 | `isolation` | `worktree` gives this def's children their own git worktree to work in; `none` (default) shares your working directory. See [Worktree isolation](#worktree-isolation) below. Beats the `[agents] isolation` default. |
+
+A def's `effort` is what makes the depth ladder compose with fan-out: a
+read-only searcher can run cheap under a parent thinking hard.
+
+    ---
+    name: explore-cheap
+    description: Fast read-only search, at the bottom of the ladder.
+    tools: read-only
+    effort: low
+    ---
+    Locate the code and report file:line. Do not analyze.
+
+Spawn that from a session at `effort = "high"` and the parent keeps its depth
+while every child it fans out runs at `low`. See
+[configuration.md](../configuration/#reasoning-effort-provider-effort) for the
+ladder itself and how each provider spells it.
 
 The body after the `---` fence is the child's system prompt. Omit it to
 inherit the parent's system prompt unchanged (useful for a def that only
