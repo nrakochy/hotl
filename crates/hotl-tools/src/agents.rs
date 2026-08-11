@@ -19,7 +19,11 @@
 use std::path::{Path, PathBuf};
 
 use hotl_provider::effort::EFFORT_LEVELS;
-use hotl_provider::Effort;
+
+/// Re-exported so surfaces that already reach this crate for `PermissionMode`
+/// parse an effort through the *same* type the wire uses, rather than growing
+/// a second spelling list.
+pub use hotl_provider::Effort;
 
 use crate::Registry;
 

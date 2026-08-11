@@ -551,6 +551,50 @@ async fn handle_request(
             )
             .await;
         }
+        "session/set_effort" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let Some(raw) = msg.pointer("/params/effort").and_then(Value::as_str) else {
+                return reply_err(
+                    writer,
+                    id,
+                    "session/set_effort requires params.effort \
+                     (low | medium | high | xhigh | max | default)",
+                )
+                .await;
+            };
+            // Four spellings of "back to the provider's own default", because
+            // a client should not have to guess which one this server took.
+            let effort = match raw.trim() {
+                "" | "default" | "unset" | "none" => None,
+                other => match other.parse::<hotl_provider::Effort>() {
+                    Ok(e) => Some(e),
+                    Err(_) => {
+                        return reply_err(
+                            writer,
+                            id,
+                            "session/set_effort requires params.effort \
+                             (low | medium | high | xhigh | max | default)",
+                        )
+                        .await;
+                    }
+                },
+            };
+            // No `enforced_mode` counterpart: no build tightens effort.
+            state.handle.set_effort(effort).await;
+            let session_id = state.id.clone();
+            let wire = effort.map(|e| e.as_str());
+            reply_ok(writer, id, json!({"ok": true, "effort": wire})).await;
+            // Broadcast for the same reason as `mode_changed`: a change made
+            // by any client must reach every attached surface.
+            notify(
+                writer,
+                &session_id,
+                json!({"type": "effort_changed", "effort": wire}),
+            )
+            .await;
+        }
         "session/steer" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(writer, id, "no session — call session/new first").await;

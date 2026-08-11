@@ -375,6 +375,12 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 .request("session/set_plan", json!({"plan": plan}))
                 .await;
         }
+        Cmd::SetEffort(effort) => {
+            let wire = effort.as_deref().unwrap_or("default");
+            client
+                .request("session/set_effort", json!({"effort": wire}))
+                .await;
+        }
         // The ack is noise like rename/set_mode: the engine broadcasts
         // `config_reloaded` (or `config_reload_failed`), and that is what the
         // client acts on — no id-plumbing in the runtime's loop.

@@ -239,6 +239,10 @@ pub struct State {
     /// Same seed-then-correct shape, via `plan_changed`. No coercion exists
     /// for it, so the optimistic update is always the one that sticks.
     pub plan: bool,
+    /// Reasoning depth. `None` = the provider's own default, which is a real
+    /// setting and not merely "unknown" — `/effort default` restores it. Same
+    /// seed-then-correct shape as `plan`, via `effort_changed`.
+    pub effort: Option<String>,
     /// Model context window in tokens, from the handshake. What the context
     /// gauge divides by; `DEFAULT_CONTEXT_WINDOW` until a server reports one.
     pub context_window: u64,
@@ -306,6 +310,7 @@ impl State {
             session_name: None,
             mode: "ask".into(),
             plan: false,
+            effort: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
             live_context: None,
             skills: Vec::new(),
@@ -429,6 +434,9 @@ pub enum Cmd {
     SetMode(String),
     /// Send `session/set_plan` (fire-and-forget). The other permission axis.
     SetPlan(bool),
+    /// Send `session/set_effort` (fire-and-forget). `None` = back to the
+    /// provider's default, sent as the wire word `"default"`.
+    SetEffort(Option<String>),
     Cancel,
     ReplyPermission {
         req_id: u64,
@@ -520,7 +528,11 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 // model and the skill roster describing an engine that is gone.
                 if !matches!(
                     kind,
-                    "mode_changed" | "todos_changed" | "config_reloaded" | "config_reload_failed"
+                    "mode_changed"
+                        | "effort_changed"
+                        | "todos_changed"
+                        | "config_reloaded"
+                        | "config_reload_failed"
                 ) {
                     return Vec::new();
                 }
@@ -780,6 +792,11 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // confirms the optimistic update — or carries a change another
         // attached surface made.
         "plan_changed" => state.plan = v.get("plan").and_then(Value::as_bool).unwrap_or(false),
+        // Null is meaningful here, not missing: it is "the provider's own
+        // default", which is exactly what `/effort default` sets.
+        "effort_changed" => {
+            state.effort = v.get("effort").and_then(Value::as_str).map(str::to_string)
+        }
         // `/reload` landed: the engine now runs a scaffold built from the
         // config on disk, and the session was re-opened onto it. Everything
         // here is server-side truth — the client re-seeds rather than guesses,
@@ -1299,6 +1316,28 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             };
             set_mode(state, mode.as_str())
         }
+        // Reports rather than cycles when bare: a five-rung cycle is
+        // unguessable, unlike `/plan`'s two-state toggle.
+        "effort" => match arg.trim() {
+            "" => {
+                notice(
+                    state,
+                    format!("effort {}", state.effort.as_deref().unwrap_or("default")),
+                );
+                Vec::new()
+            }
+            "default" | "unset" | "none" => set_effort(state, None),
+            other => match other.parse::<hotl_tools::agents::Effort>() {
+                Ok(e) => set_effort(state, Some(e.as_str())),
+                Err(_) => {
+                    notice(
+                        state,
+                        "usage: /effort <low|medium|high|xhigh|max|default>".into(),
+                    );
+                    Vec::new()
+                }
+            },
+        },
         // Re-read `config.toml` without losing the session. The settings half
         // goes first so the theme flips at once while the engine rebuild — a
         // provider handshake and a skill walk — is still in flight.
@@ -1334,8 +1373,12 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             notice(
                 state,
                 format!(
-                    "{name} · model {} · mode {}{plan} · context {} tok · {todos} todo(s)",
-                    state.model, state.mode, state.context_window
+                    "{name} · model {} · mode {}{plan} · effort {} · context {} tok · \
+                     {todos} todo(s)",
+                    state.model,
+                    state.mode,
+                    state.effort.as_deref().unwrap_or("default"),
+                    state.context_window
                 ),
             );
             Vec::new()
@@ -1693,6 +1736,20 @@ fn set_mode(state: &mut State, mode: &str) -> Vec<Cmd> {
     state.mode = mode.to_string();
     notice(state, format!("permission mode set to {mode}"));
     vec![Cmd::SetMode(mode.to_string())]
+}
+
+/// `/effort <level>`: optimistic local update plus the durable `SetEffort`.
+/// Never starts a turn — same session-bookkeeping shape as `/mode`.
+fn set_effort(state: &mut State, effort: Option<&str>) -> Vec<Cmd> {
+    state.effort = effort.map(str::to_string);
+    notice(
+        state,
+        match effort {
+            Some(e) => format!("effort set to {e}"),
+            None => "effort cleared — the provider's own default applies".into(),
+        },
+    );
+    vec![Cmd::SetEffort(effort.map(str::to_string))]
 }
 
 /// `/plan`: same shape on the other axis.
@@ -3094,6 +3151,86 @@ mod tests {
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("usage"))
         );
+    }
+
+    #[test]
+    fn slash_effort_sets_the_level() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/effort xhigh");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetEffort(Some(e))] if e == "xhigh"),
+            "got {cmds:?}"
+        );
+        assert_eq!(s.effort.as_deref(), Some("xhigh"));
+        assert_eq!(s.phase, Phase::Idle);
+        // The alias goes through the same parser the wire uses, and the
+        // canonical spelling is what gets stored and sent.
+        let cmds = type_and_submit(&mut s, "/effort x-high");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetEffort(Some(e))] if e == "xhigh"),
+            "got {cmds:?}"
+        );
+    }
+
+    /// No cycling: five rungs are unguessable, unlike `/plan`'s two states.
+    #[test]
+    fn slash_effort_bare_reports_and_emits_no_cmd() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/effort");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("default"))
+        );
+    }
+
+    #[test]
+    fn slash_effort_default_clears_it() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "/effort max");
+        let cmds = type_and_submit(&mut s, "/effort default");
+        assert!(matches!(&cmds[..], [Cmd::SetEffort(None)]), "got {cmds:?}");
+        assert_eq!(s.effort, None);
+    }
+
+    /// `ultra` is the word someone arriving from another harness will try —
+    /// the usage line naming the five rungs is what makes that recoverable.
+    #[test]
+    fn slash_effort_unknown_shows_usage_and_never_reaches_model() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/effort ultra");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.effort, None);
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("usage"))
+        );
+    }
+
+    #[test]
+    fn status_line_shows_the_effort() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "/status");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("effort default")),
+            "got {:?}",
+            s.transcript.last()
+        );
+        type_and_submit(&mut s, "/effort high");
+        type_and_submit(&mut s, "/status");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("effort high"))
+        );
+    }
+
+    /// A change made by another attached surface reaches this one.
+    #[test]
+    fn effort_changed_updates_the_state() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type": "effort_changed", "effort": "max"}));
+        assert_eq!(s.effort.as_deref(), Some("max"));
+        // Null is "the provider's own default", not "missing".
+        upd(&mut s, json!({"type": "effort_changed", "effort": null}));
+        assert_eq!(s.effort, None);
     }
 
     #[test]

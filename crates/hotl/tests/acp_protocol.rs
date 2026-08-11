@@ -1303,6 +1303,88 @@ async fn set_plan_is_its_own_axis_and_the_legacy_plan_mode_word_still_works() {
     );
 }
 
+/// `session/set_effort` acks with the effective level, broadcasts
+/// `effort_changed`, round-trips the cleared case as JSON `null`, and rejects
+/// a rung it does not carry.
+#[tokio::test]
+async fn set_effort_acks_broadcasts_and_rejects_unknown_levels() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 2).await;
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_effort","params":{"effort":"xhigh"}}),
+    )
+    .await;
+    let mut saw = false;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "effort_changed" {
+            assert_eq!(m["params"]["update"]["effort"], "xhigh");
+            saw = true;
+            break;
+        }
+        if m["id"] == json!(3) {
+            assert_eq!(m["result"]["effort"], "xhigh", "the ack carries the level");
+        }
+    }
+    assert!(saw, "set_effort must broadcast effort_changed");
+
+    // Clearing is its own act, and reaches the wire as an explicit null.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_effort","params":{"effort":"default"}}),
+    )
+    .await;
+    let mut saw_clear = false;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "effort_changed" {
+            assert_eq!(m["params"]["update"]["effort"], Value::Null);
+            saw_clear = true;
+            break;
+        }
+        if m["id"] == json!(4) {
+            assert_eq!(m["result"]["effort"], Value::Null);
+        }
+    }
+    assert!(
+        saw_clear,
+        "clearing must broadcast effort_changed with null"
+    );
+
+    // `ultra` is another harness's orchestration opt-in, not a rung here.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/set_effort","params":{"effort":"ultra"}}),
+    )
+    .await;
+    let m = read_until_id(&mut lines, 5).await;
+    assert!(m.get("error").is_some(), "an unknown rung must error: {m}");
+}
+
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {
     let line = tokio::time::timeout(std::time::Duration::from_secs(5), lines.next_line())
         .await
