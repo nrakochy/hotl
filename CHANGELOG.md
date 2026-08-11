@@ -6,6 +6,47 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **Native Windows builds, runs, and is tested.** The whole workspace compiles
+  for `x86_64-pc-windows-msvc` with no warnings, and the harness suite runs on
+  `windows-latest` in CI. The file tools, the session server, the process
+  reaper, `hotl bg`/`attach`, and the `bash` tool all work.
+
+  It is **not yet a confined platform**. The `win-writerestricted` write floor
+  is implemented but has never been executed on real hardware, so `probe()`
+  reports `Unavailable` and native Windows behaves exactly like an old Linux
+  kernel: every exec individually human-gated, `UNSANDBOXED` in the ask, no
+  allow-rule persistence. WSL2 remains the confined Windows path. See
+  `docs/SECURITY.md` for what the designed floor can and cannot express — in
+  particular that the read carve is **absent** there rather than degraded.
+
+- **`hotl-platform` grew capability traits**, one adapter per platform:
+  `PrivateFs`, `KnownPaths`, `Entropy`, `DirHandle`, `ProcessControl`, `Ipc`,
+  `ConsoleControl`. Statically dispatched, so nothing lands on the hot path of
+  a bash call. `ARCHITECTURE.md`'s claim that core crates sit behind platform
+  traits is now most of the way to true.
+
+- **The `bash` tool resolves a POSIX shell, or leaves the registry.** With no
+  `sh` on Windows the tool is absent and the model is told why, rather than
+  being handed `cmd` or PowerShell — neither of whose grammar the deny rules
+  can analyze, so a rule would silently stop applying.
+
+### Fixed
+
+- **A deny path rule now matches case-insensitively where the filesystem
+  does.** `deny_path_matches` compared bytes while its two siblings folded
+  case, so on default APFS — and on NTFS — `~/.SSH/id_rsa` walked straight
+  past a `~/.ssh` deny rule. The rule matched a spelling rather than a file.
+  Linux behavior is unchanged.
+
+- **The file tools refuse filenames Windows resolves differently from every
+  path matcher**: alternate data streams (`AGENTS.md:evil`), trailing dots and
+  spaces, and reserved device names (`CON`, `NUL`, `COM1`). Refused on
+  **create** as well as read, and on every platform — these are names where
+  Win32 opens one file while a deny rule, a glob and the write classifier all
+  match another.
+
 ## [0.11.0] - 2026-08-10
 
 ### Added

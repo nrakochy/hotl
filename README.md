@@ -37,7 +37,9 @@ any of them: `/plan` makes `write` and `edit` always ask while leaving the
 shell and the network to the mode, so the agent can research a change without
 being able to casually make one. Underneath, regardless of mode: `bash` (and hooks, and diagnostics)
 runs confined by the kernel — Seatbelt on macOS, Landlock on Linux ≥ 6.2
-including WSL2 — with writes limited to the working directory, temp, and any
+including WSL2 (native Windows builds and runs, but its floor is not yet
+certified — every exec is individually gated there) — with writes limited to
+the working directory, temp, and any
 `[sandbox].writable` directories the owner listed (never widenable from
 inside: entries exposing hotl's own config are refused);
 writes to execute-later and credential paths (git hooks, shell rc, Makefiles,
@@ -174,7 +176,7 @@ and per-session git snapshots under `~/.local/share/hotl/shadow/`.
 
 ## Watch — quick start
 
-**Requirements:** [tmux](https://github.com/tmux/tmux) on your `PATH` (run it from inside a tmux session) and `ps` (standard on macOS/Linux).
+**Requirements:** [tmux](https://github.com/tmux/tmux) on your `PATH` (run it from inside a tmux session) and `ps` (standard on macOS/Linux). Not available on native Windows — there is no tmux and no pane-capture protocol to port to; use WSL2.
 
 From inside tmux, open a pane and run it:
 

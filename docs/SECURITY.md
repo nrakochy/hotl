@@ -104,7 +104,43 @@ Two levers lift Tier B, and neither reaches Tier C. `[sandbox].readable = ["~/.s
 
 **Child environment.** Provider credentials (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_ADMIN_KEY`, `OPENAI_API_KEY`, `HOTL_API_KEY_HELPER`) are removed from every child process — `bash`, `grep`'s ripgrep, diagnostics, and owner shell hooks share one chokepoint, so there is no second spawn path to forget. The list is deliberately narrow: the `KEY`/`TOKEN`/`SECRET` heuristic the ingestion masker uses would also strip `GITHUB_TOKEN`/`CARGO_REGISTRY_TOKEN`/`NPM_TOKEN` and break `gh`, `cargo publish` and `npm publish` silently. `HOTL_SCRUB_ENV=A,B,C` adds names; `HOTL_SCRUB_ENV_STRICT=1` applies the broad heuristic.
 
-Hosts where the floor is unavailable (older Linux kernels) **degrade fail-closed**: every exec is individually human-gated with an `UNSANDBOXED` banner in the ask, and `bash` allow-rules stop applying — auto-approval of commands exists only while the sandbox is enforced. `HOTL_SANDBOX=off` is an explicit escape hatch and is labeled as such in every ask. Windows native is unsupported (no floor designed); WSL2 is the Windows path.
+Hosts where the floor is unavailable (older Linux kernels) **degrade fail-closed**: every exec is individually human-gated with an `UNSANDBOXED` banner in the ask, and `bash` allow-rules stop applying — auto-approval of commands exists only while the sandbox is enforced. `HOTL_SANDBOX=off` is an explicit escape hatch and is labeled as such in every ask.
+
+### Native Windows
+
+hotl **compiles, runs and is tested on native Windows**, and the file tools, the session server, the process reaper and the `bash` tool all work there. It is not yet a *confined* platform: the write floor is implemented but has never been executed, so `probe()` reports `Unavailable` and native Windows behaves exactly like an old Linux kernel — every exec individually human-gated, `UNSANDBOXED` in the ask, no allow-rule persistence. **WSL2 remains the confined Windows path.**
+
+Three things about the designed floor are worth stating now, because they do not change when it is certified:
+
+**The read carve is not expressible on Windows — it is absent, not degraded.** The designed mechanism is `CreateRestrictedToken` with `WRITE_RESTRICTED`, which narrows the token's *second* access check to write access and leaves reads untouched. That is the right shape for a write floor and it means `~/.ssh`, `~/.aws`, `%APPDATA%\gcloud`, `~/.azure` and hotl's own config and data directories will be **readable** by `bash`, `rg`, hooks and diagnostics. Every ask says `reads:open`. Do not read that marker as partial protection; there is none.
+
+There is a partial compensation and it is worth stating precisely, because it is easy to overclaim. Tier A's actual threat is *read the session token, then drive the session*. On Windows the session endpoint is a **named pipe**, and issuing a request to a pipe is a write, so a write-restricted child is denied. The token becomes readable but useless. That is not the carve, and it does not cover anything else in Tier A.
+
+**Egress is permanently unenforced.** `[network].egress = "off"` and `"allowlist"` cannot be backed by a restricted token — it confines objects, not packets — so both report `NET:UNENFORCED`, and per the existing rule an unbacked restriction also stops `bash` allow-rules from auto-approving. Nothing in `net.rs` special-cases the floor; its catch-all already produces this answer, which is the correct one.
+
+**The protected-subpath gate that Linux cannot express, Windows can.** A `.git\hooks` write is blocked on macOS by an SBPL deny and **cannot** be blocked on Linux, because Landlock unions rights across ancestors. NTFS checks one object's own DACL in canonical order — explicit deny before inherited allow — so an explicit deny on `.git\hooks` beats the allow it inherits from the workspace root. The Windows floor is designed to use that.
+
+Mechanisms considered and rejected, recorded because each will be proposed again:
+
+| Mechanism | Why rejected |
+|---|---|
+| AppContainer / LowBox | Default-deny on **reads**. Letting the child read the workspace, `%USERPROFILE%\.cargo`, git, node, python and MSVC would mean ACE-granting read across effectively the whole user profile. The shortcut — granting `ALL APPLICATION PACKAGES` — is actively harmful: it opens those paths to *every* AppContainer on the machine, browser renderers included, leaving the box less safe than before hotl was installed. |
+| Plain restricted token (no `WRITE_RESTRICTED`) | Restricting SIDs then apply to reads too, hitting the same wall. `WRITE_RESTRICTED` exists precisely to avoid it. |
+| Server silos / "Process Containers" | `SetInformationJobObject(JobObjectCreateSilo)` requires **administrator at run time**, and the silo info classes are not documented Win32. |
+| WFP user-mode filters | Admin-only by default. An administrator *could* delegate, but that grants the user machine-wide packet filtering forever — a larger privilege than the one being contained. |
+| Minifilter driver | Kernel driver: WHQL/EV signing, admin install, reboot, and an entirely new supply-chain story for a tool shipped by `cargo install`. Not proportionate. |
+| Windows Sandbox / MDAG | A VM boot per exec, against a 2s probe timeout on the hot path of every bash call. |
+| Job objects as the floor | They give process-tree grouping, kill-on-close and UI limits. They give **no filesystem policy**. hotl uses one as the reaper; it is never the containment claim. |
+| Proxy env vars for egress | The proxy is not the control; the kernel is. |
+
+Two residual holes in the design, neither with a clean fix:
+
+1. **NULL-DACL objects** grant everything to everyone in *both* access checks. `DISABLE_MAX_PRIVILEGE` deliberately keeps `SeChangeNotifyPrivilege` (so bypass-traverse-checking survives and ancestor traverse rights never become a compatibility problem), which is exactly why the usual traverse-checking mitigation does not apply. Do not "fix" one of these without re-reading the other.
+2. **The confused-deputy surface is larger than on Unix**: DCOM/RPC, WMI (Microsoft documents that `Win32_Process.Create` children escape job objects), Task Scheduler, the SCM, and every local service's named pipe. The write restriction should deny all of them, but the set is far bigger than macOS's Apple Events and the failure mode is a **full escape**, not a leak. This is one of the three experiments that gate certification.
+
+Also unlike Seatbelt and Landlock, which leave no trace: enabling the Windows floor **mutates the user's filesystem**, writing inert ACEs into the workspace. It needs an explicit `hotl sandbox prepare`, takes tens of seconds on a large repo, and is reversible. The ACEs grant nothing to anybody — a restricting SID can only restrain access a principal already has, never broaden it — but "inert" is a claim the user has to trust rather than see, which is why it is opt-in.
+
+Two behavior differences to expect once it is on: a file **moved** into the tree keeps its old DACL (rename within a volume does not re-inherit; copy does) and will be unwritable, and a child that hardcodes `C:\Users\x\AppData\Local\Temp\foo` is denied, because hotl narrows the child's temp to a session directory rather than ACEing the shared one.
 
 Owner-configured shell hooks run under the same floor.
 
