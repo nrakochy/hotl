@@ -18,6 +18,9 @@
 
 use std::path::{Path, PathBuf};
 
+use hotl_provider::effort::EFFORT_LEVELS;
+use hotl_provider::Effort;
+
 use crate::Registry;
 
 /// Where an [`AgentDef`] came from — provenance only, not a trust signal by
@@ -72,6 +75,24 @@ pub fn parse_isolation(raw: &str, whose: &str) -> Isolation {
     }
 }
 
+/// `low | medium | high | xhigh | max`. Warns and yields `None` on anything
+/// else — the same posture as [`parse_isolation`]: a typo in a def must not
+/// take the def down with it, and `ultra` (which this ladder deliberately does
+/// not carry) is exactly the word someone will try.
+pub fn parse_effort(raw: &str, whose: &str) -> Option<Effort> {
+    match raw.trim().parse::<Effort>() {
+        Ok(e) => Some(e),
+        Err(_) => {
+            eprintln!(
+                "hotl: {whose} sets `effort: {}`, which is not a known level \
+                 ({EFFORT_LEVELS}) — inheriting instead.",
+                raw.trim()
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct AgentDef {
     pub name: String,
@@ -81,10 +102,12 @@ pub struct AgentDef {
     pub system_prompt: Option<String>,
     pub tools: ToolScope,
     pub model: Option<String>,
-    /// Parsed but not yet applied: hotl's `EngineConfig` has no effort ladder
-    /// today (only a `thinking: bool`), so this rides along for a future
-    /// plan rather than being silently dropped.
-    pub effort: Option<String>,
+    /// Reasoning depth for this child only, replacing the parent's. Validated
+    /// here at parse time (see [`parse_effort`]) so
+    /// `hotl::agent::HotlChildBuilder::spawn_child` has nothing left to reject
+    /// — it runs inside the TUI process, where a warning would land on the
+    /// alternate screen (T3-23).
+    pub effort: Option<Effort>,
     /// Whether this def's children get their own git worktree. `None` here
     /// means "unset", not "off": the `[agents] isolation` default still
     /// applies (`hotl::agent::HotlChildBuilder::spawn_child`).
@@ -196,7 +219,7 @@ pub fn parse_def_or_named(
         .map(|s| parse_tool_scope(&s))
         .unwrap_or(ToolScope::All);
     let model = get("model:");
-    let effort = get("effort:");
+    let effort = get("effort:").and_then(|raw| parse_effort(&raw, &format!("agent def `{name}`")));
     let isolation = get("isolation:")
         .map(|raw| parse_isolation(&raw, &format!("agent def `{name}`")))
         .unwrap_or_default();
@@ -565,5 +588,39 @@ mod tests {
         let d = parse_def(md, AgentSource::User).unwrap();
         assert_eq!(d.isolation, Isolation::None);
         assert_eq!(parse_isolation("container", "test"), Isolation::None);
+    }
+
+    #[test]
+    fn parse_def_stores_the_effort_ladder_rung() {
+        let d = parse_def(
+            "---\nname: deep\neffort: xhigh\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        assert_eq!(d.effort, Some(Effort::XHigh));
+        // The aliases the ladder tolerates reach the def too.
+        let alias = parse_def(
+            "---\nname: deep\neffort: x-high\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        assert_eq!(alias.effort, Some(Effort::XHigh));
+        let silent = parse_def("---\nname: plain\n---\nbody", AgentSource::User).unwrap();
+        assert_eq!(silent.effort, None);
+    }
+
+    /// `ultra` is the word someone arriving from another harness will try, and
+    /// the rung this ladder deliberately does not carry. It warns and the def
+    /// still loads — a typo must not cost the whole agent.
+    #[test]
+    fn an_unknown_effort_drops_to_none_and_the_def_still_loads() {
+        let d = parse_def(
+            "---\nname: typo\neffort: ultra\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        assert_eq!(d.name, "typo");
+        assert_eq!(d.effort, None);
+        assert_eq!(parse_effort("ultra", "test"), None);
     }
 }

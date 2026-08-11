@@ -1680,9 +1680,13 @@ impl HotlChildBuilder {
         // future refactor (or an `engine_config()` default change) silently
         // breaks.
         config.cache_ttl = CacheTtl::FiveMinutes;
-        // `def.effort` is parsed but intentionally not applied: hotl's
-        // `EngineConfig` has no effort ladder today (only `thinking: bool`)
-        // — see `AgentDef::effort`'s doc comment. A future plan wires it.
+        // A def's effort replaces the parent's for this child only, exactly
+        // like `model`. Already validated at parse time (`parse_effort`), so
+        // there is nothing to reject here — this code runs inside the TUI
+        // process, where a warning would land on the alternate screen (T3-23).
+        if let Some(e) = def.effort {
+            config.effort = Some(e);
+        }
         let handle = spawn_session_with_todos(
             registry,
             None, // children never get their own `spawn` tool — depth-1 is structural
@@ -3804,6 +3808,77 @@ mod tests {
                 prefix_ttl: CacheTtl::FiveMinutes
             },
             "a child must never inherit the parent's 1h TTL — short-lived, no human pauses"
+        );
+    }
+
+    /// Spawn one child from `def` under a parent at `parent_effort`, run its
+    /// single turn, and report the effort that actually reached the wire.
+    async fn child_wire_effort(
+        def: &hotl_tools::agents::AgentDef,
+        parent_effort: Option<Effort>,
+    ) -> Option<Effort> {
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("child result"),
+        ]));
+        let mut cb = test_child_builder();
+        cb.provider = provider.clone();
+        cb.config.effort = parent_effort;
+        let mut handle = cb
+            .spawn_child(def, Vec::new(), None)
+            .expect("child spawns")
+            .handle;
+        handle.prompt("go".into()).await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                break;
+            }
+        }
+        provider.last_request().expect("one request").effort
+    }
+
+    /// Built through the real frontmatter parse, so the parse-time validation
+    /// in `parse_effort` is part of what these tests exercise.
+    fn def_with_effort(raw: Option<&str>) -> hotl_tools::agents::AgentDef {
+        let line = raw.map(|r| format!("effort: {r}\n")).unwrap_or_default();
+        hotl_tools::agents::parse_def(
+            &format!("---\nname: kid\n{line}---\nbe brief\n"),
+            hotl_tools::agents::AgentSource::User,
+        )
+        .expect("def parses")
+    }
+
+    #[tokio::test]
+    async fn a_def_effort_overrides_the_parent() {
+        let def = def_with_effort(Some("low"));
+        assert_eq!(
+            child_wire_effort(&def, Some(Effort::High)).await,
+            Some(Effort::Low)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_def_without_effort_inherits() {
+        let def = def_with_effort(None);
+        assert_eq!(
+            child_wire_effort(&def, Some(Effort::High)).await,
+            Some(Effort::High)
+        );
+    }
+
+    /// `ultra` is exactly the word someone arriving from another harness will
+    /// reach for, and exactly the rung this ladder does not carry — so the
+    /// recoverable outcome is inheriting, not failing. The warning is emitted
+    /// at parse time (`parse_effort`); only the inheritance is asserted here.
+    #[tokio::test]
+    async fn an_unparseable_def_effort_inherits_and_warns() {
+        let def = def_with_effort(Some("ultra"));
+        assert_eq!(
+            child_wire_effort(&def, Some(Effort::High)).await,
+            Some(Effort::High)
         );
     }
 
