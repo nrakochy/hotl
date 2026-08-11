@@ -13,6 +13,7 @@ use std::time::{Duration, SystemTime};
 use crossterm::event::{Event, KeyEventKind};
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
+use hotl_platform::KnownPaths as _;
 use hotl_theme::Palette;
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
 use hotl_tui::client::{exec_wire_cmd, read_server_msg, translate, AcpClient, ServerMsg};
@@ -434,8 +435,8 @@ async fn outbound(p: hotl_tui::paste::PromptPayload) -> hotl_tui::paste::PromptP
 /// stays unpolled for the `.await`'s duration either way.
 fn load_image(path: &str, cap: u64) -> Result<(String, usize), String> {
     let expanded = match path.strip_prefix("~/") {
-        Some(rest) => match std::env::var_os("HOME") {
-            Some(home) => std::path::PathBuf::from(home).join(rest),
+        Some(rest) => match hotl_platform::KNOWN_PATHS.home() {
+            Some(home) => home.join(rest),
             None => std::path::PathBuf::from(path),
         },
         None => std::path::PathBuf::from(path),

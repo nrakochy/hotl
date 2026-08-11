@@ -124,18 +124,24 @@ pub fn is_git_url(source: &str) -> bool {
         || source.ends_with(".git")
 }
 
-/// `$HOME`, or `None` where the environment does not name one (a daemon with
-/// a scrubbed env). The credential read-carve is `$HOME`-relative, so no home
-/// simply means no Tier B — narrower, never wider.
+/// The user's home, or `None` where the environment does not name one (a
+/// daemon with a scrubbed env). The credential read-carve is home-relative, so
+/// no home simply means no Tier B — narrower, never wider.
+///
+/// Through the platform seam: on Windows this is `HOME` → `USERPROFILE` →
+/// `FOLDERID_Profile`, and reading only `HOME` there returned `None` for
+/// everyone not launched from Git Bash — silently dropping Tier B for the
+/// common case rather than the exotic one.
 pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
+    use hotl_platform::KnownPaths as _;
+    hotl_platform::KNOWN_PATHS.home()
 }
 
 /// Expand a leading `~/` against `$HOME`.
 fn expand_home(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return std::path::PathBuf::from(home).join(rest);
+        if let Some(home) = home_dir() {
+            return home.join(rest);
         }
     }
     std::path::PathBuf::from(path)

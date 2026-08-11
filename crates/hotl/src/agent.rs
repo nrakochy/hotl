@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use hotl_context::{load_memory, load_system_prompt, project_instructions};
 use hotl_engine::{EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
+use hotl_platform::KnownPaths as _;
 use hotl_platform::{Clock, EnvSecrets, SecretStore, SystemClock};
 use hotl_provider::effort::EFFORT_LEVELS;
 use hotl_provider::{CacheTtl, Effort};
@@ -2980,22 +2981,30 @@ fn host_of(authority: &str) -> &str {
     authority.split(':').next().unwrap_or("")
 }
 
+/// `<xdg-config>/hotl`, or `%LOCALAPPDATA%\hotl\config` where there is no XDG.
+///
+/// Through the platform seam, not a hand-rolled `HOME` lookup: Windows does not
+/// set `HOME`, so the old fallback chain landed on `"."` and put hotl's config
+/// **in the current working directory**. The `"."` last resort survives for the
+/// genuinely home-less case (a daemon with a scrubbed env) because a config in
+/// the cwd still beats a panic.
 pub(crate) fn config_dir() -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("hotl")
+    hotl_platform::KNOWN_PATHS
+        .config()
+        .unwrap_or_else(|| PathBuf::from(".").join("hotl"))
 }
 
-/// `<xdg-data>/hotl` — the state/data root (sessions, shadows, history),
-/// falling back to `~/.local/share/hotl`.
+/// `<xdg-data>/hotl` — the state/data root (sessions, shadows, history) —
+/// falling back to `~/.local/share/hotl` or `%LOCALAPPDATA%\hotl\data`.
+///
+/// The same seam, and it matters more here than for the config: this is where
+/// session logs go, and the old `HOME`-only chain put them in the **cwd** on
+/// Windows — inside the workspace, inside the sandbox write root, and readable
+/// by the agent whose transcripts they are.
 pub(crate) fn data_dir() -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("hotl")
+    hotl_platform::KNOWN_PATHS
+        .data()
+        .unwrap_or_else(|| PathBuf::from(".").join("hotl"))
 }
 
 pub(crate) fn sessions_dir() -> PathBuf {

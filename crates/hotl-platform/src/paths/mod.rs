@@ -45,6 +45,24 @@ pub(crate) fn env_path(name: &str) -> Option<PathBuf> {
 
 #[cfg(test)]
 pub(crate) fn assert_known_paths_contract<P: KnownPaths>(paths: &P) {
+    // The bug this trait exists to prevent, stated as an assertion: a
+    // hand-rolled `HOME` lookup returns nothing on Windows, and every caller's
+    // fallback chain then lands on a *relative* path — putting hotl's config
+    // and its session logs in whatever directory it was launched from. Inside
+    // the workspace, inside the sandbox write root, and readable by the agent
+    // whose transcripts they are.
+    for (what, dir) in [
+        ("home", paths.home()),
+        ("config", paths.config()),
+        ("data", paths.data()),
+    ] {
+        if let Some(dir) = dir {
+            assert!(
+                dir.is_absolute(),
+                "{what}() must be absolute or None, never a cwd-relative path: {dir:?}"
+            );
+        }
+    }
     if let Some(data) = paths.data() {
         assert!(data.is_absolute(), "data() must be absolute, got {data:?}");
     }

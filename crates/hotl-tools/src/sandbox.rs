@@ -28,7 +28,7 @@
 use std::path::PathBuf;
 
 use crate::net::EgressState;
-use hotl_platform::ProcessControl as _;
+use hotl_platform::{KnownPaths as _, ProcessControl as _};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SandboxStatus {
@@ -445,9 +445,18 @@ pub fn probe_dir() -> Result<PathBuf, String> {
     if let Some(dir) = std::env::var_os("HOTL_SANDBOX_PROBE_DIR") {
         return writable(&canon(PathBuf::from(dir)));
     }
-    let mut candidates: Vec<PathBuf> = vec![PathBuf::from("/var/tmp")];
-    if let Some(home) = std::env::var_os("HOME") {
-        candidates.push(PathBuf::from(home));
+    // `/var/tmp` does not exist on Windows; the home directory is the portable
+    // candidate, and `%PUBLIC%` is the Windows-only second chance.
+    let mut candidates: Vec<PathBuf> = if cfg!(windows) {
+        Vec::new()
+    } else {
+        vec![PathBuf::from("/var/tmp")]
+    };
+    if let Some(home) = hotl_platform::KNOWN_PATHS.home() {
+        candidates.push(home);
+    }
+    if let Some(public) = std::env::var_os("PUBLIC") {
+        candidates.push(PathBuf::from(public));
     }
     probe_dir_from(&write_roots(), candidates)
 }

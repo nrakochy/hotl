@@ -193,10 +193,11 @@ fn source_tier(source: &str) -> u8 {
     }
 }
 
+/// Home through the platform seam — see `agents::claude_agents_root` for why
+/// the bare `HOME` lookup was wrong on Windows.
 fn claude_roots() -> (PathBuf, PathBuf) {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    use hotl_platform::KnownPaths as _;
+    let home = hotl_platform::KNOWN_PATHS.home().unwrap_or_default();
     (
         home.join(".claude/skills"),
         home.join(".claude/plugins/cache"),

@@ -267,9 +267,14 @@ fn user_agents_root(config_dir: &Path) -> PathBuf {
 }
 
 /// `~/.claude/agents` (Claude-compat root; opt-out via `include_claude`).
+///
+/// Home comes from the platform seam, because Windows does not set `HOME` and
+/// the bare lookup then produced a *relative* root — making the workspace's own
+/// `.claude/agents` masquerade as the user-level one.
 fn claude_agents_root() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
+    use hotl_platform::KnownPaths as _;
+    hotl_platform::KNOWN_PATHS
+        .home()
         .unwrap_or_default()
         .join(".claude/agents")
 }
