@@ -19,8 +19,8 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{
-    ArmGuard, CachePolicy, CacheTtl, Provider, ProviderError, SamplingRequest, StreamEvent,
-    ToolDef, Warmable,
+    ArmGuard, CachePolicy, CacheTtl, Effort, EffortLadder, Provider, ProviderError,
+    SamplingRequest, StreamEvent, ToolDef, Warmable, ALL_EFFORTS,
 };
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
@@ -90,6 +90,23 @@ pub struct AnthropicProvider {
     /// (not per-`ArmGuard`) because idempotency is a property of the
     /// provider's pool, not of any one caller's guard.
     armed: Arc<AtomicU64>,
+}
+
+/// Anthropic's five rungs, gated on the catalog's `caps.effort`.
+pub struct AnthropicLadder;
+
+impl EffortLadder for AnthropicLadder {
+    fn rungs(&self, model: &str) -> &'static [Effort] {
+        match hotl_provider::catalog::lookup(model) {
+            Some(m) if m.caps.effort => ALL_EFFORTS,
+            Some(_) => &[],
+            // Uncatalogued: fail open, exactly like `supports_images`. A model
+            // that rejects the field answers with its own 400, which is
+            // surfaced honestly; silently dropping the user's setting is the
+            // worse lie.
+            None => ALL_EFFORTS,
+        }
+    }
 }
 
 impl AnthropicProvider {
@@ -202,6 +219,14 @@ impl AnthropicProvider {
             // the stream still bills reasoning tokens and every
             // `thinking_delta` arrives empty (T3-15).
             body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+        }
+        if let Some(e) = req
+            .effort
+            .and_then(|e| AnthropicLadder.resolve(&req.model, e))
+        {
+            // Created-if-absent, not overwritten: `output_config` is also where
+            // a future `task_budget` lives.
+            body["output_config"]["effort"] = json!(e.as_str());
         }
         // The API rejects a fifth `cache_control`, and the budget is spent by
         // two independent pieces of code (the prefix marker here, the plan in
@@ -734,6 +759,69 @@ mod tests {
             cache: CachePolicy::Off,
             turn_context: None,
         }
+    }
+
+    #[test]
+    fn effort_rides_in_output_config() {
+        let mut req = sampling_req();
+        req.model = "claude-opus-4-8".into();
+        req.effort = Some(Effort::High);
+        let body = AnthropicProvider::build_body(&req);
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    /// The byte-identity guard: an unconfigured session's wire shape is
+    /// exactly what it was before the ladder existed.
+    #[test]
+    fn an_unset_effort_emits_no_output_config() {
+        let mut req = sampling_req();
+        req.model = "claude-opus-4-8".into();
+        let body = AnthropicProvider::build_body(&req);
+        assert!(body.get("output_config").is_none());
+    }
+
+    /// `claude-haiku-4-5` is the one catalogued row with `caps: NO_EFFORT`
+    /// (`hotl-provider/src/catalog.rs`). A catalog edit that flips it shows up
+    /// here.
+    #[test]
+    fn a_model_without_the_cap_omits_the_field() {
+        let mut req = sampling_req();
+        req.model = "claude-haiku-4-5".into();
+        req.effort = Some(Effort::Max);
+        let body = AnthropicProvider::build_body(&req);
+        assert!(body.get("output_config").is_none());
+    }
+
+    /// Fails open on an unknown model, the same posture `supports_images`
+    /// takes: hotl never allowlists model names.
+    #[test]
+    fn an_uncatalogued_model_fails_open() {
+        let mut req = sampling_req();
+        req.model = "llama3".into();
+        req.effort = Some(Effort::Low);
+        let body = AnthropicProvider::build_body(&req);
+        assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    #[test]
+    fn effort_and_thinking_are_independent() {
+        let mut req = sampling_req();
+        req.model = "claude-opus-4-8".into();
+        req.thinking = true;
+        req.effort = Some(Effort::Low);
+        let body = AnthropicProvider::build_body(&req);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "low");
+    }
+
+    /// Guards against a five-rung ladder being written as four.
+    #[test]
+    fn xhigh_reaches_the_wire_unclamped() {
+        let mut req = sampling_req();
+        req.model = "claude-opus-4-8".into();
+        req.effort = Some(Effort::XHigh);
+        let body = AnthropicProvider::build_body(&req);
+        assert_eq!(body["output_config"]["effort"], "xhigh");
     }
 
     /// INVARIANT (T1-4): the HTTP client is never the default one.
