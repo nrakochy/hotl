@@ -103,7 +103,12 @@ fn dirs_config_path() -> Option<std::path::PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
-            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config"))
+            // `HOME` is unset on Windows. `hotl watch` is Windows-unsupported
+            // (no tmux, no pane-capture protocol), but resolving its config to
+            // a *relative* path there would silently read one out of the cwd.
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .map(|h| std::path::PathBuf::from(h).join(".config"))
         })?;
     Some(base.join("hotl").join("config.toml"))
 }

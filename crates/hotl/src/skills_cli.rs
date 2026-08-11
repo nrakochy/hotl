@@ -246,8 +246,8 @@ mod tests {
             dir.path().join("config.toml"),
             format!(
                 "[skills]\nclaude = false\n\n[skills.marketplaces]\n\
-                 acme = \"{}\"\nghost = \"https://example.com/ghost.git\"\n",
-                mkt.display()
+                 acme = {}\nghost = \"https://example.com/ghost.git\"\n",
+                crate::config::toml_path(mkt.as_path())
             ),
         )
         .unwrap();

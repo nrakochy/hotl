@@ -43,12 +43,34 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateDirectoryW, CreateFileW, CREATE_ALWAYS, CREATE_NEW, FILE_ALL_ACCESS,
-    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_WRITE_DATA,
+    FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE,
+    FILE_SHARE_MODE, FILE_SHARE_READ, FILE_WRITE_DATA,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// The ACE type that grants. Anything else in a DACL cannot widen a read.
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+
+/// What a **second** opener may do while we hold the file open for writing.
+///
+/// Share mode is not an access control — the DACL already decided *who* can
+/// open this file, and it is only ever the owner. Share mode decides whether
+/// the owner's own other handles may coexist, and a mode of `0` says no,
+/// including to hotl itself.
+///
+/// That is not hypothetical: the session log is append-only and is read
+/// **while it is being written** — by `replay` for resume and fork, by
+/// `list_sessions`, and by `hotl attach` following a live session. Denying
+/// `FILE_SHARE_READ` turns every one of those into
+/// `ERROR_SHARING_VIOLATION`, which has no Unix counterpart at all, where an
+/// open file is freely readable.
+///
+/// `FILE_SHARE_DELETE` for the same reason: on Unix an `unlink` of an open
+/// file always succeeds, and without this flag retention could not prune a log
+/// any handle still held. Deliberately **not** `FILE_SHARE_WRITE` — the log has
+/// exactly one writer by design, and a second one is a real hazard rather than
+/// a compatibility gap.
+const SHARE_WHILE_WRITING: FILE_SHARE_MODE = FILE_SHARE_READ | FILE_SHARE_DELETE;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WindowsPrivateFs;
@@ -103,13 +125,12 @@ impl PrivateFs for WindowsPrivateFs {
             Writes::FromStart => GENERIC_READ | GENERIC_WRITE,
             Writes::Append => FILE_GENERIC_WRITE & !FILE_WRITE_DATA,
         };
-        // `CREATE_NEW` is the `O_EXCL`, and share mode 0 means no other opener
-        // gets in between create and the caller's first write. SAFETY: as above.
+        // `CREATE_NEW` is the `O_EXCL`. SAFETY: as above.
         let handle = unsafe {
             CreateFileW(
                 wide.as_ptr(),
                 access,
-                0,
+                SHARE_WHILE_WRITING,
                 &sa,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
@@ -139,7 +160,7 @@ impl PrivateFs for WindowsPrivateFs {
             CreateFileW(
                 wide.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
-                0,
+                SHARE_WHILE_WRITING,
                 &sa,
                 CREATE_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,

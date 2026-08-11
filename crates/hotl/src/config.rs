@@ -147,6 +147,19 @@ fn expand_home(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// A path as a TOML **literal** string.
+///
+/// A Windows path in a basic string is a parse error, not a quoting nit:
+/// `"C:\Users\..."` makes TOML read `\U` as an 8-digit unicode escape and
+/// reject the file. Production never hits this because it writes through
+/// `toml_edit::value`, which escapes; hand-built test fixtures have to say so
+/// themselves. Literal strings take no escapes at all, and a path cannot
+/// contain the single quote that would end one.
+#[cfg(test)]
+pub(crate) fn toml_path(p: &std::path::Path) -> String {
+    format!("'{}'", p.display())
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub struct PermissionsCfg {
     /// `"bypass"` (default — no ordinary prompts) | `"ask"` | `"dontask"`.
@@ -1795,8 +1808,8 @@ path_prefix = "/Volumes/secrets"
         std::fs::write(
             config_dir.join("config.toml"),
             format!(
-                "[[deny]]\ntool = \"read\"\npath_prefix = \"{}\"\n",
-                vault.display()
+                "[[deny]]\ntool = \"read\"\npath_prefix = {}\n",
+                toml_path(vault.as_path())
             ),
         )
         .unwrap();
@@ -1836,8 +1849,8 @@ path_prefix = "/Volumes/secrets"
         let mut rules = hotl_tools::rules::Rules::default();
         rules.merge_admin(
             hotl_tools::rules::AdminRules::from_toml(&format!(
-                "[[deny]]\ntool = \"read\"\npath_prefix = \"{}\"\n",
-                vault.display()
+                "[[deny]]\ntool = \"read\"\npath_prefix = {}\n",
+                toml_path(vault.as_path())
             ))
             .unwrap(),
         );
@@ -2036,7 +2049,10 @@ path_prefix = "/Volumes/secrets"
         );
         // A `~/`-path expands against HOME.
         let cfg = cfg_with("[history]\npath = \"~/notes/h.jsonl\"\n");
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        // Through the same seam the code under test uses: `HOME` is unset on
+        // Windows, so reading it directly makes the test assert against a
+        // different home than `expand_home` resolved.
+        let home = home_dir().expect("a home directory");
         assert_eq!(cfg.history.resolved_path(data), home.join("notes/h.jsonl"));
     }
 
@@ -2066,7 +2082,10 @@ path_prefix = "/Volumes/secrets"
         // `~/` expands against HOME; absent section resolves empty.
         let cfg = cfg_with("[skills.marketplaces]\nhome = \"~/team-skills\"\n");
         let (roots, _) = cfg.skills.marketplace_roots(dir);
-        let home = std::path::PathBuf::from(std::env::var_os("HOME").unwrap());
+        // Through the same seam the code under test uses: `HOME` is unset on
+        // Windows, so reading it directly makes the test assert against a
+        // different home than `expand_home` resolved.
+        let home = home_dir().expect("a home directory");
         assert_eq!(roots, vec![("home".to_string(), home.join("team-skills"))]);
         assert!(cfg_with("").skills.marketplace_roots(dir).0.is_empty());
     }

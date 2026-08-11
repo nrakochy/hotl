@@ -13,7 +13,11 @@ async fn configured_extras_widen_the_floor_and_keep_the_probe_sound() {
     // An extra outside the default floor (a tempdir would sit under TMPDIR,
     // which is already writable — vacuous). $HOME is the documented probe
     // candidate, so a subdir of it is guaranteed outside cwd/TMPDIR here.
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME"));
+    // `HOME` is unset on Windows; the seam knows to try `USERPROFILE`.
+    let home = {
+        use hotl_platform::KnownPaths as _;
+        hotl_platform::KNOWN_PATHS.home().expect("a home directory")
+    };
     let extra = home.join(format!(".hotl-extras-itest-{}", std::process::id()));
     std::fs::create_dir_all(&extra).unwrap();
 

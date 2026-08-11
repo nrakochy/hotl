@@ -2426,7 +2426,10 @@ prefix = "payments"
             (r".ssh\id_rsa", ".ssh/", Same(cfg!(windows))),
             // The divergence, stated once: case.
             (".SSH/id_rsa", ".ssh/", Folds),
-            (".ssh/ID_RSA", ".ssh/", Folds),
+            // NOT a folding case, and the table caught me getting this wrong:
+            // the prefix names only the *directory*, so the filename's case is
+            // never compared and this is denied everywhere.
+            (".ssh/ID_RSA", ".ssh/", Same(true)),
             ("/Users/You/.Ssh/id_rsa", ".ssh/", Folds),
             (".SSHFS/config", ".ssh/", Same(false)),
         ];

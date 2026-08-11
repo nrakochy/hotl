@@ -2114,7 +2114,11 @@ mod tests {
         );
 
         // Write outside (HOME): denied by the floor.
-        let home = std::env::var("HOME").expect("HOME");
+        let home = hotl_platform::KNOWN_PATHS
+            .home()
+            .expect("a home directory")
+            .display()
+            .to_string();
         let target = format!("{home}/.hotl-sbx-denied-{}", std::process::id());
         let outside = format!("touch {target}");
         let denied = run(&outside).await;

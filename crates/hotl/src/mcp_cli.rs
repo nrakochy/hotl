@@ -336,8 +336,8 @@ mod tests {
         std::fs::write(
             dir.join("config.toml"),
             format!(
-                "[[mcp]]\nname = \"{name}\"\ncommand = \"{}\"\ndescription = \"d\"\n",
-                bin.display()
+                "[[mcp]]\nname = \"{name}\"\ncommand = {}\ndescription = \"d\"\n",
+                crate::config::toml_path(&bin)
             ),
         )
         .unwrap();
