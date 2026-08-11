@@ -532,7 +532,10 @@ mod tests {
 
         // The cycle is exactly CYCLE ticks: a full loop lands on itself.
         assert_eq!(snake(&run, CYCLE), snake(&run, 0));
-        assert_eq!(snake(&run, CYCLE + TRAVEL + RISE), snake(&run, TRAVEL + RISE));
+        assert_eq!(
+            snake(&run, CYCLE + TRAVEL + RISE),
+            snake(&run, TRAVEL + RISE)
+        );
     }
 
     #[test]
