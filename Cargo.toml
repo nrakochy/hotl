@@ -101,18 +101,43 @@ strip = true
 cargo-dist-version = "0.32.0"
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell"]
-# Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu"]
+# The installers to generate for each app. `powershell` is the Windows
+# counterpart of `shell` — it is what makes `irm <url> | iex` work, the same
+# shape as the `curl | sh` line in the README.
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax).
+#
+# Windows ships **unconfined and labeled as such**: its write floor is written
+# but uncertified, so `probe()` reports `Unavailable` and every exec is
+# individually human-gated with an UNSANDBOXED banner. That is not a new
+# posture — it is exactly what an old-kernel Linux box already gets, through
+# the same machinery, and there is no principled line that admits one and
+# excludes the other. `docs/SECURITY.md` carries the honest statement.
+#
+# arm64 Windows is deliberately absent: no CI runner, so the floor would be
+# unverified there in a second, unexamined way.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
 # gzip, not the xz default: `hotl update` decodes in-process, and pure-Rust xz
 # decoders are far narrower crates than flate2. Read at runtime by `dist plan`,
-# so release.yml needs no regeneration.
+# so release.yml needs no regeneration — the same is true of `targets` and
+# `installers` above, because the build matrix is `${{ matrix.* }}` throughout
+# and release.yml names no target triple at all.
 unix-archive = ".tar.gz"
+# Deliberately NOT `windows-archive = ".zip"`, and this is the third time
+# someone will want to "fix" it: gzip is what `update.rs` decodes in-process
+# via flate2. A zip would need a second decoder for no user-visible gain, since
+# the PowerShell installer unpacks either form. Consistency with other Windows
+# tools is not worth a new unpack path in the self-updater.
 
 # dist builds releases with the release profile plus thin LTO.
 [profile.dist]

@@ -349,3 +349,25 @@ mod imp {
         std::io::Error::last_os_error()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// This binary has to reach the user's disk *next to* `hotl`, because
+    /// `winfloor::shim_path()` resolves it from `current_exe().parent()` by
+    /// absolute path and never through `PATH`. `dist` packages what cargo
+    /// metadata reports, so the declaration is what makes that happen — and
+    /// dropping it would not break any build, only the archive.
+    #[test]
+    fn the_package_declares_this_binary_so_dist_ships_it() {
+        let manifest = include_str!("../../Cargo.toml");
+        assert!(
+            manifest.contains("name = \"hotl-sbx\""),
+            "the [[bin]] declaration is gone; `dist` would ship `hotl` alone and the floor \
+             would report Unavailable for a reason that reads like a bug"
+        );
+        assert!(
+            manifest.contains("name = \"hotl\""),
+            "the primary binary must stay declared alongside it"
+        );
+    }
+}

@@ -97,6 +97,27 @@ Prebuilt binary — no toolchain needed (macOS / Linux):
 
     curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
 
+Windows (PowerShell):
+
+    irm https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.ps1 | iex
+
+Run it from PowerShell, cmd, or Windows Terminal — the TUI works in all three.
+Two things to know first:
+
+- **The `bash` tool needs a POSIX `sh.exe`.** [Git for
+  Windows](https://gitforwindows.org/) ships one and hotl finds it
+  automatically, so if you have git you are already set. Without one, `bash`
+  drops out of the tool list and says so; `read`/`write`/`edit`/`glob`/`grep`
+  keep working. Point `$HOTL_SHELL` at an `sh.exe` if yours lives somewhere
+  unusual. hotl will not fall back to cmd or PowerShell for model-authored
+  commands — neither can be analyzed by your deny rules, so a rule would
+  silently stop applying.
+- **The kernel sandbox is not yet enforced on native Windows.** Every command
+  is individually approved by you, with an `UNSANDBOXED` banner, and no
+  allow-rule persists. Use WSL2 for a confined session. See
+  [SECURITY.md](docs/SECURITY.md#native-windows) for what is and is not
+  protected.
+
 Or with Rust ≥ 1.88 installed:
 
     cargo install hotl

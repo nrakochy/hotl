@@ -73,18 +73,28 @@ pub trait ConsoleControl: crate::sealed::Sealed {
 mod tests {
     use super::*;
 
-    /// Capture and restore round-trip without error, on whatever this build
-    /// selected. Deliberately does *not* assert on the modes themselves: under
-    /// a test harness stdin may not be a terminal at all, and the contract is
-    /// that the calls are honest about failing, not that a tty exists.
+    /// Capture and restore round-trip, on whatever this build selected.
+    ///
+    /// Deliberately does *not* assert a terminal exists: under a test harness
+    /// stdin may or may not be one, and a test whose verdict depends on how it
+    /// was invoked is worse than no test. What is asserted is the rule that
+    /// holds either way — an adapter that cannot capture reports the OS's own
+    /// error rather than inventing one.
+    ///
+    /// `raw_os_error()` is the discriminator, not `kind()`: a real errno always
+    /// carries one, and a synthesized `Error::new(Unsupported, "…")` never
+    /// does. Testing `kind()` was the first version of this and it was wrong —
+    /// errno-to-kind mapping is a std implementation detail that can land on
+    /// `Unsupported` legitimately, which made the test fail whenever stdin was
+    /// not a tty.
     #[test]
-    fn capture_and_restore_agree_about_whether_there_is_a_terminal() {
+    fn a_console_that_cannot_be_captured_reports_the_os_error_rather_than_inventing_one() {
         let ctl = crate::CONSOLE;
         match ctl.capture() {
             Ok(saved) => ctl.restore(&saved).expect("captured modes must restore"),
             Err(e) => assert!(
-                !matches!(e.kind(), std::io::ErrorKind::Unsupported),
-                "a platform without a console must still report a real errno, not Unsupported"
+                e.raw_os_error().is_some(),
+                "the failure must carry a real errno, not a synthesized one: {e:?}"
             ),
         }
     }

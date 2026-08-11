@@ -17,6 +17,21 @@ categories = ["command-line-utilities", "development-tools"]
 name = "hotl"
 path = "src/main.rs"
 
+# The Windows floor's launcher. Declared explicitly rather than left to cargo's
+# `src/bin/` auto-discovery, because it is load-bearing for distribution: `dist`
+# packages what cargo metadata reports, and `winfloor::shim_path()` resolves
+# this binary *beside* `hotl` by absolute path. An archive that shipped `hotl`
+# without it would report the floor `Unavailable` for a reason that reads like
+# a bug rather than a missing file.
+#
+# It builds on every platform. The non-Windows arm is a stub that explains
+# itself and exits — a few KB in the Unix archives, in exchange for
+# `cargo check --workspace` covering the file everywhere, which caught real
+# errors during the port.
+[[bin]]
+name = "hotl-sbx"
+path = "src/bin/hotl-sbx.rs"
+
 [features]
 default = ["minify"]
 # Forwarded compile-time permission enforcement: per-action asks cannot be
