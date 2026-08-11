@@ -485,6 +485,26 @@ impl Tool for SkillTool {
         // Reading the owner's own config needs no gate.
         Permission::None
     }
+    /// Name the skill on the card so a load reads `skill <name>`, not a bare
+    /// `skill`. The `skill ` prefix is what the view's `split_summary` strips.
+    fn display_summary(&self, input: &Value) -> Option<String> {
+        let arg = |k: &str| {
+            input
+                .get(k)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        };
+        Some(if let Some(name) = arg("name") {
+            format!("skill {name}")
+        } else if let Some(query) = arg("query") {
+            format!("skill search: {query}")
+        } else if let Some(source) = arg("source") {
+            format!("skill list: {source}")
+        } else {
+            "skill list".into()
+        })
+    }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move { self.run_impl(&input) })
     }
@@ -835,6 +855,43 @@ mod tests {
         // Expanding the source lists every collapsed skill.
         let expanded = tool.run_impl(&json!({"source": "big"}));
         assert_eq!(expanded.content.lines().count(), 300);
+    }
+
+    /// The card names the skill, so loads aren't an indistinguishable `skill`.
+    #[test]
+    fn display_summary_names_the_loaded_skill_or_action() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("skills");
+        std::fs::create_dir_all(&flat).unwrap();
+        std::fs::write(flat.join("deploy.md"), "# Deploy\nsteps\n").unwrap();
+        let none = dir.path().join("none");
+        let tool = SkillTool::with_roots(&flat, &[], &none, &none, false).unwrap();
+
+        assert_eq!(
+            tool.display_summary(&json!({"name": "system-shape"}))
+                .as_deref(),
+            Some("skill system-shape")
+        );
+        assert_eq!(
+            tool.display_summary(&json!({"query": "review a PR"}))
+                .as_deref(),
+            Some("skill search: review a PR")
+        );
+        assert_eq!(
+            tool.display_summary(&json!({"source": "claude"}))
+                .as_deref(),
+            Some("skill list: claude")
+        );
+        // No argument is the list-everything call.
+        assert_eq!(
+            tool.display_summary(&json!({})).as_deref(),
+            Some("skill list")
+        );
+        // Blank/whitespace args are treated as absent, same as run_impl.
+        assert_eq!(
+            tool.display_summary(&json!({"name": "  "})).as_deref(),
+            Some("skill list")
+        );
     }
 
     #[test]

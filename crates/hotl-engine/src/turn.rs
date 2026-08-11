@@ -1400,8 +1400,14 @@ impl Turn {
             Permission::Ask { summary } => (Some(summary), None),
             Permission::AskProtected { summary, why } => (Some(summary), Some(why)),
         };
-        let display =
-            hotl_types::sanitize::safe_summary(&summary.clone().unwrap_or_else(|| tu.name.clone()));
+        // A gate-free tool has no permission summary; let it name the call
+        // (`skill <name>`) so its card is not a bare, identical `skill`.
+        let display = hotl_types::sanitize::safe_summary(
+            &summary
+                .clone()
+                .or_else(|| tool.display_summary(&input))
+                .unwrap_or_else(|| tu.name.clone()),
+        );
         let mut secret_reads = false;
         let mut shown = None;
         if let Some(summary) = summary {

@@ -77,6 +77,11 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn schema(&self) -> Value;
     fn permission(&self, input: &Value) -> Permission;
+    /// Card label for a gate-free (`Permission::None`) call, whose card would
+    /// otherwise show only the bare tool name. Cosmetic: never a gate.
+    fn display_summary(&self, _input: &Value) -> Option<String> {
+        None
+    }
     /// May calls to this tool run concurrently with other parallel-safe calls
     /// in the same assistant batch? Only for tools whose calls cannot observe
     /// or affect each other (pure reads, isolated child sessions). Mutating or

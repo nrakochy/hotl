@@ -126,8 +126,13 @@ pub enum TranscriptItem {
         status: ToolStatus,
         ticks: u64,
     },
-    /// Retrying / fallback / compacted / outcome errors.
+    /// Retrying / fallback / compacted / controlled stops.
     Notice {
+        text: String,
+    },
+    /// A turn that failed outright (provider/transport error, sealed log, panic).
+    /// Its own variant, not a `Notice`: an error must not read as muted chatter.
+    Error {
         text: String,
     },
     /// A multi-line block a command produced — today only `/context`. Raw
@@ -263,6 +268,10 @@ pub struct State {
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
     pub skills: Vec<String>,
+    /// The skill the human requested via `/<name>`, held until the turn ends.
+    /// If no successful `skill` load names it by then, the model silently
+    /// skipped it — the one skill failure the per-load cards cannot show.
+    pub pending_skill: Option<String>,
     /// Transcript spacing, from `[settings] density`. Drives the blank line
     /// between turns and the left-gutter width the role spine lives in.
     pub density: hotl_theme::Density,
@@ -323,6 +332,7 @@ impl State {
             context_window: DEFAULT_CONTEXT_WINDOW,
             live_context: None,
             skills: Vec::new(),
+            pending_skill: None,
             density: hotl_theme::Density::default(),
             todos: Vec::new(),
             commands: complete::builtins(),
@@ -940,8 +950,28 @@ fn on_prompt_result(
             });
         }
     }
-    if let Some(n) = outcome_notice(kind, text.as_deref()) {
+    // A real execution error gets its own loud item; controlled stops
+    // (cancelled / turn_limit / refused / …) stay muted notices.
+    if kind == "error" {
+        let msg = text.as_deref().map(str::trim).filter(|t| !t.is_empty());
+        state.transcript.push(TranscriptItem::Error {
+            text: msg.unwrap_or("the turn failed").to_string(),
+        });
+    } else if let Some(n) = outcome_notice(kind, text.as_deref()) {
         notice(state, n);
+    }
+    // Warn only when the model never called the tool — a ✓/✗ card is its own
+    // feedback — and only on a clean finish.
+    if let Some(requested) = state.pending_skill.take() {
+        if kind == "done" && !skill_addressed_this_turn(&state.transcript, &requested) {
+            notice(
+                state,
+                format!(
+                    "skill `{requested}` was not loaded — the model didn't call the skill \
+                     tool this turn. Re-run /{requested}, or ask it to load the skill."
+                ),
+            );
+        }
     }
     state.session_usage.add(usage);
     // What the *next* turn starts from: everything resident in this turn's
@@ -955,6 +985,37 @@ fn on_prompt_result(
     state.work_ticks = 0;
     state.interrupt_sent = false;
     vec![Cmd::SetTitle(title(state, ""))]
+}
+
+/// Did any `skill` card name `requested` this turn (the trailing run since the
+/// last user prompt)? Only its absence is worth a warning.
+fn skill_addressed_this_turn(transcript: &[TranscriptItem], requested: &str) -> bool {
+    transcript
+        .iter()
+        .rev()
+        .take_while(|i| !matches!(i, TranscriptItem::User { .. }))
+        .any(|i| {
+            matches!(i, TranscriptItem::Tool { name, summary, .. }
+                if name == "skill" && skill_summary_loads(summary, requested))
+        })
+}
+
+/// A `skill` summary that *loads* `requested`, not a `search:`/`list:` browse.
+/// Leaf-name compare, so bare `/brainstorming` matches `superpowers:brainstorming`.
+fn skill_summary_loads(summary: &str, requested: &str) -> bool {
+    let Some(body) = summary.strip_prefix("skill ") else {
+        return false;
+    };
+    let body = body.trim();
+    if body.starts_with("search:") || body.starts_with("list:") || body == "list" {
+        return false;
+    }
+    skill_leaf(body) == skill_leaf(requested)
+}
+
+/// A skill name without its `source:` qualifier.
+fn skill_leaf(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name).trim()
 }
 
 fn outcome_notice(kind: &str, text: Option<&str>) -> Option<String> {
@@ -1461,6 +1522,11 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 text: text.clone(),
                 images: payload.images,
             };
+            // Record the request to confirm it loaded — only a fresh turn's;
+            // a queued skill is that turn's to verify, not this one's.
+            if state.phase == Phase::Idle {
+                state.pending_skill = Some(other.to_string());
+            }
             submit(state, text, payload)
         }
         other => {
@@ -1853,6 +1919,99 @@ mod tests {
                 usage: usage.clone(),
             },
         )
+    }
+
+    /// A provider/transport failure must land as a loud `Error` item, never
+    /// the muted `Notice` used for routine chatter — that is the whole point
+    /// of surfacing it. Controlled stops stay notices.
+    #[test]
+    fn a_provider_error_is_a_loud_error_item_not_a_muted_notice() {
+        let mut s = State::test_default();
+        on_result(
+            &mut s,
+            "error",
+            Some("HTTP 400: invalid_request_error: dangling tool_calls".into()),
+            &json!({}),
+        );
+        assert!(
+            matches!(
+                s.transcript.last(),
+                Some(TranscriptItem::Error { text }) if text.contains("HTTP 400")
+            ),
+            "an execution error must be an Error item: {:?}",
+            s.transcript.last()
+        );
+
+        // A controlled stop is still a muted notice, not an error.
+        let mut s = State::test_default();
+        on_result(&mut s, "turn_limit", None, &json!({}));
+        assert!(matches!(
+            s.transcript.last(),
+            Some(TranscriptItem::Notice { .. })
+        ));
+    }
+
+    fn skill_card(summary: &str, status: ToolStatus) -> TranscriptItem {
+        TranscriptItem::Tool {
+            name: "skill".into(),
+            summary: summary.into(),
+            status,
+            ticks: 0,
+        }
+    }
+
+    // A recorded `/<skill>` dispatch: the turn's user item plus the request.
+    fn requested_skill(s: &mut State, name: &str) {
+        s.transcript.push(TranscriptItem::User {
+            text: format!("Load the skill `{name}`"),
+        });
+        s.pending_skill = Some(name.into());
+    }
+
+    fn warned_unloaded(s: &State) -> bool {
+        matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("not loaded"))
+    }
+
+    #[test]
+    fn a_requested_skill_that_never_loaded_warns_and_is_forgotten() {
+        let mut s = State::test_default();
+        requested_skill(&mut s, "brainstorming");
+        on_result(&mut s, "done", None, &json!({}));
+        assert!(warned_unloaded(&s), "{:?}", s.transcript.last());
+        assert_eq!(s.pending_skill, None);
+    }
+
+    #[test]
+    fn a_loaded_skill_is_not_warned_even_when_qualified() {
+        // Bare /brainstorming, model loads the plugin form — leaf-name match.
+        let mut s = State::test_default();
+        requested_skill(&mut s, "brainstorming");
+        s.transcript.push(skill_card(
+            "skill superpowers:brainstorming",
+            ToolStatus::Done,
+        ));
+        on_result(&mut s, "done", None, &json!({}));
+        assert!(!warned_unloaded(&s), "{:?}", s.transcript.last());
+    }
+
+    #[test]
+    fn a_failed_skill_load_is_not_double_reported() {
+        // The ✗ card is the feedback; a warning on top would be noise.
+        let mut s = State::test_default();
+        requested_skill(&mut s, "brainstorming");
+        s.transcript
+            .push(skill_card("skill brainstorming", ToolStatus::Failed));
+        on_result(&mut s, "done", None, &json!({}));
+        assert!(!warned_unloaded(&s), "{:?}", s.transcript.last());
+    }
+
+    #[test]
+    fn an_interrupted_skill_turn_is_forgotten_without_a_warning() {
+        let mut s = State::test_default();
+        requested_skill(&mut s, "brainstorming");
+        on_result(&mut s, "cancelled", None, &json!({}));
+        assert!(!warned_unloaded(&s));
+        assert_eq!(s.pending_skill, None);
     }
 
     #[test]

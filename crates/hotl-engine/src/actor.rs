@@ -812,8 +812,10 @@ pub(crate) async fn run(
     notifications: crate::hooks::NotificationDrain,
     head_tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
 ) {
-    // Resumed history is repaired on the way in: a log written by a build that
-    // let a steer land mid-batch would otherwise fail every request forever.
+    // Resumed history is repaired on the way in, both for a steer that landed
+    // mid-batch (`pair_tool_results`) and for a crash that persisted an
+    // assistant's tool calls without their results (`close_dangling_batches`)
+    // — either would otherwise fail every request on the session forever.
     //
     // The `todo_write` checklist (M4/tier-1 gap #3) is actor-owned, ephemeral
     // session context: it never lives in the durable projection — it is
@@ -824,7 +826,7 @@ pub(crate) async fn run(
     let head_rx = head_tx.subscribe();
     let mut head = Head::new(
         head_tx,
-        pair_tool_results(std::mem::take(&mut deps.initial_items)),
+        close_dangling_batches(pair_tool_results(std::mem::take(&mut deps.initial_items))),
         std::mem::take(&mut deps.initial_todos),
     );
     let mut running = false;
@@ -1537,6 +1539,19 @@ async fn release_steers(
     }
 }
 
+/// The error results a batch nothing will ever answer gets, so the request
+/// built from it is well-formed. Empty when the blocks hold no tool_use.
+fn unanswered_results(blocks: &[serde_json::Value]) -> Vec<hotl_types::ToolResultItem> {
+    hotl_types::assistant_tool_uses(blocks)
+        .iter()
+        .map(|tu| hotl_types::ToolResultItem {
+            tool_use_id: tu.id.clone(),
+            content: "Not executed (the turn ended first).".into(),
+            is_error: true,
+        })
+        .collect()
+}
+
 /// Answer a batch nothing will answer any more. A turn that dies before it can
 /// report leaves calls hanging; the next request would be rejected for the
 /// missing results, so the protocol gets completed here instead.
@@ -1549,21 +1564,12 @@ async fn close_open_batch(
     let Some(Item::Assistant { blocks }) = head.items().last() else {
         return;
     };
-    let uses = hotl_types::assistant_tool_uses(blocks);
-    if uses.is_empty() {
+    let results = unanswered_results(blocks);
+    if results.is_empty() {
         return;
     }
     let payload = EntryPayload::Item {
-        item: Item::ToolResults {
-            results: uses
-                .iter()
-                .map(|tu| hotl_types::ToolResultItem {
-                    tool_use_id: tu.id.clone(),
-                    content: "Not executed (the turn ended first).".into(),
-                    is_error: true,
-                })
-                .collect(),
-        },
+        item: Item::ToolResults { results },
     };
     shared.append(log, pipeline, head, payload).await;
 }
@@ -1596,6 +1602,28 @@ pub(crate) fn pair_tool_results(items: Vec<Item>) -> Vec<Item> {
         }
     }
     out.append(&mut stranded);
+    out
+}
+
+/// Answer every unanswered assistant tool_use, not just the tail: a later
+/// prompt can shove a crash-orphaned call into mid-history. Runs after
+/// `pair_tool_results`, so real results are already adjacent. In-memory only
+/// (an append-only log has no mid-history edit) — re-runs each resume, no-ops
+/// on an answered history.
+pub(crate) fn close_dangling_batches(items: Vec<Item>) -> Vec<Item> {
+    let mut out: Vec<Item> = Vec::with_capacity(items.len() + 1);
+    let mut it = items.into_iter().peekable();
+    while let Some(item) = it.next() {
+        if let Item::Assistant { blocks } = &item {
+            let results = unanswered_results(blocks);
+            if !results.is_empty() && !matches!(it.peek(), Some(Item::ToolResults { .. })) {
+                out.push(item);
+                out.push(Item::ToolResults { results });
+                continue;
+            }
+        }
+        out.push(item);
+    }
     out
 }
 
@@ -2136,9 +2164,10 @@ fn respawn_turn(
 mod tests {
     use super::COMPACT_SUMMARIZE_TIMEOUT;
     use super::{
-        awaiting_tool_results, commit_prepared, compact, fold_images, fold_into, pair_tool_results,
-        push_or_fold_steer, release_steers, summarize_bounded, Head, HeldSteer, Pipeline,
-        ProjectionHead, Resolution, SharedDeps, FOLD_MARK, HELD_BYTES_MAX, HELD_IMAGE_B64_MAX,
+        awaiting_tool_results, close_dangling_batches, commit_prepared, compact, fold_images,
+        fold_into, pair_tool_results, push_or_fold_steer, release_steers, summarize_bounded, Head,
+        HeldSteer, Pipeline, ProjectionHead, Resolution, SharedDeps, FOLD_MARK, HELD_BYTES_MAX,
+        HELD_IMAGE_B64_MAX,
     };
     use hotl_store::SessionLog;
     use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
@@ -2404,6 +2433,60 @@ mod tests {
     fn a_trailing_gap_survives_repair() {
         let trailing = vec![calls("t1"), user("last word")];
         assert_eq!(pair_tool_results(trailing.clone()), trailing);
+    }
+
+    /// The synthesized answer `close_dangling_batches` inserts — same shape
+    /// as `close_open_batch`'s, so the two repair paths stay identical.
+    fn unanswered(id: &str) -> Item {
+        Item::ToolResults {
+            results: vec![ToolResultItem {
+                tool_use_id: id.into(),
+                content: "Not executed (the turn ended first).".into(),
+                is_error: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_dangling_tail_batch_is_answered() {
+        // The reported crash shape: the log ends on an unanswered assistant
+        // tool_use. Left alone it is the resume HTTP 400.
+        let repaired = close_dangling_batches(vec![calls("t1")]);
+        assert_eq!(repaired, vec![calls("t1"), unanswered("t1")]);
+        // ...and the answered tail is now a turn worth continuing on resume.
+        assert!(crate::needs_continuation(&repaired));
+    }
+
+    #[test]
+    fn a_dangling_mid_history_batch_is_answered() {
+        // A prompt typed after resume shoved the dangling call into
+        // mid-history (start_turn appends unconditionally), where a tail-only
+        // repair would miss it and the 400 would persist across restarts.
+        let repaired = close_dangling_batches(vec![calls("t1"), user("typed after resume")]);
+        assert_eq!(
+            repaired,
+            vec![calls("t1"), unanswered("t1"), user("typed after resume")]
+        );
+    }
+
+    #[test]
+    fn every_dangling_batch_is_answered_not_just_one() {
+        let repaired = close_dangling_batches(vec![calls("t1"), calls("t2")]);
+        assert_eq!(
+            repaired,
+            vec![calls("t1"), unanswered("t1"), calls("t2"), unanswered("t2")]
+        );
+    }
+
+    #[test]
+    fn an_answered_history_is_left_alone_and_repair_is_idempotent() {
+        let good = vec![user("start"), calls("t1"), answers("t1"), says("done")];
+        assert_eq!(close_dangling_batches(good.clone()), good);
+        // A plain assistant turn (no tool_use) is never touched.
+        assert_eq!(close_dangling_batches(vec![says("hi")]), vec![says("hi")]);
+        // Re-running over a repaired history changes nothing.
+        let once = close_dangling_batches(vec![calls("t1"), user("x")]);
+        assert_eq!(close_dangling_batches(once.clone()), once);
     }
 
     // --- Task 8 (S2a PreparedPayload) --------------------------------

@@ -174,6 +174,58 @@ async fn resumed_history_repairs_results_stranded_by_an_older_build() {
     );
 }
 
+/// The index of an assistant turn that called tools but is not immediately
+/// followed by their results — the dangling call both APIs reject.
+fn dangling_call(items: &[Item]) -> Option<usize> {
+    items.iter().enumerate().position(|(i, item)| {
+        matches!(item, Item::Assistant { blocks } if !assistant_tool_uses(blocks).is_empty())
+            && !matches!(items.get(i + 1), Some(Item::ToolResults { .. }))
+    })
+}
+
+/// The reported crash: a turn died after its tool calls were committed but
+/// before their results, so the log ends on an unanswered assistant turn. On
+/// resume the auto-continue used to send that dangling call straight to the
+/// provider — the HTTP 400 "tool_calls must be followed by tool messages".
+/// The projection is answered as it loads, so the continued request is
+/// well-formed.
+#[tokio::test]
+async fn a_resumed_dangling_batch_is_answered_not_rejected() {
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "ok",
+    )]));
+    let crashed = vec![
+        Item::User {
+            text: "do a thing".into(),
+            synthetic: None,
+            images: Vec::new(),
+        },
+        // Called a tool; the results were never committed before the crash.
+        assistant("t1"),
+    ];
+    assert_eq!(
+        dangling_call(&crashed),
+        Some(1),
+        "fixture must reproduce the crash shape"
+    );
+
+    let mut s = session(Arc::clone(&provider) as Arc<dyn Provider>, crashed);
+    // Exactly what `session/load` does on resume — no new prompt.
+    s.handle.continue_turn().await;
+    loop {
+        if let EngineEvent::TurnDone { .. } = next_event(&mut s).await {
+            break;
+        }
+    }
+
+    let items = &provider.last_request().expect("a request").items;
+    assert_eq!(
+        dangling_call(items),
+        None,
+        "resume must answer the crash-orphaned call: {items:#?}"
+    );
+}
+
 /// Every assistant turn that called tools is answered by exactly one results
 /// item, holding exactly one result per call — the count the APIs compare.
 #[tokio::test]

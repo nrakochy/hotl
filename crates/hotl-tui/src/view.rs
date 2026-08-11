@@ -190,6 +190,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
         // `Notice` and render a stale block after the numbers changed — a bug
         // no unit test catches and every use does.
         TranscriptItem::Report(r) => (6u8, r).hash(&mut h),
+        TranscriptItem::Error { text } => (7u8, text).hash(&mut h),
     }
     h.finish()
 }
@@ -610,6 +611,20 @@ fn item_block<'a>(
             vec![Line::styled(
                 text.to_string(),
                 Style::new().fg(p.muted).italic(),
+            )],
+        ),
+        // A failed turn: red with a ✗, never the muted notice spine, so an
+        // execution error cannot be mistaken for the routine chatter near it.
+        TranscriptItem::Error { text } => (
+            Spine {
+                marker: "✗",
+                cont: " ",
+                marker_style: Style::new().fg(p.blocked).bold(),
+                cont_style: Style::new(),
+            },
+            vec![Line::styled(
+                text.to_string(),
+                Style::new().fg(p.blocked).bold(),
             )],
         ),
         // A `/context` report. Harness output, so it takes the `Notice` spine
@@ -2693,6 +2708,37 @@ mod tests {
             let hot = draw_cached(&s, &mut warm);
             assert_eq!(hot, cold, "cached render diverged at step {step}");
         }
+    }
+
+    /// A failed turn must be unmistakable: a ✗ and the blocked (error) color on
+    /// both spine and body, so it never reads as a muted notice.
+    #[test]
+    fn an_error_item_renders_red_with_a_cross() {
+        let p = Palette::default();
+        let (spine, lines) = item_block(
+            &TranscriptItem::Error {
+                text: "HTTP 400: invalid_request_error: boom".into(),
+            },
+            &p,
+            false,
+            76,
+        );
+        assert_eq!(spine.marker, "✗");
+        assert_eq!(spine.marker_style.fg, Some(p.blocked));
+        let shown: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(
+            shown.contains("HTTP 400"),
+            "the message must be shown: {shown}"
+        );
+        // `Line::styled` carries the color on the line, not its spans.
+        assert!(
+            lines.iter().all(|l| l.style.fg == Some(p.blocked)),
+            "the error body is the blocked color, not muted: {lines:?}"
+        );
     }
 
     // --- /context render (plan 0028) -----------------------------------
