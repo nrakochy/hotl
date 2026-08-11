@@ -206,6 +206,14 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 200_000;
 #[derive(Debug)]
 pub struct State {
     pub phase: Phase,
+    /// Whole-turn clock for the activity animation. Unlike `Phase::*.ticks`
+    /// (which reset on every sub-phase change), this advances on every tick the
+    /// turn is actually moving — thinking, writing, *and* tool sub-phases alike
+    /// — and pauses while a prompt is blocked on you. Reset to 0 at every turn
+    /// end (→ `Idle`), so each new working turn restarts the animation's cycle
+    /// from the beginning. This is what drives the travel→look→reverse cycle in
+    /// `anim`; the per-phase `ticks` still drive the "· 3s ·" elapsed readouts.
+    pub work_ticks: u64,
     pub transcript: Vec<TranscriptItem>,
     pub scroll: Scroll,
     pub editor: Editor,
@@ -296,6 +304,7 @@ impl State {
     pub fn new(vim_mode: bool, model: String) -> Self {
         State {
             phase: Phase::Idle,
+            work_ticks: 0,
             transcript: Vec::new(),
             scroll: Scroll::Follow,
             editor: Editor::new(vim_mode),
@@ -943,6 +952,7 @@ fn on_prompt_result(
     state.live_context = Some(live);
     state.usage_line = Some(format_usage(state, usage, live));
     state.phase = Phase::Idle;
+    state.work_ticks = 0;
     state.interrupt_sent = false;
     vec![Cmd::SetTitle(title(state, ""))]
 }
@@ -1226,6 +1236,7 @@ fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
     }
     state.detached_turns += 1;
     state.phase = Phase::Idle;
+    state.work_ticks = 0;
     state.interrupt_sent = false;
     notice(
         state,
@@ -1668,6 +1679,15 @@ fn on_tick(state: &mut State) {
         | Phase::WaitingAsk { .. }
         | Phase::WaitingQuestion { .. }
         | Phase::WaitingEgress { .. } => {}
+    }
+    // The animation's whole-turn clock advances only while the turn is moving —
+    // the same phases that animate. A blocked prompt pauses the cycle where it
+    // stood; a fresh turn restarts it from 0 (reset on entry to `Idle`).
+    if matches!(
+        state.phase,
+        Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
+    ) {
+        state.work_ticks += 1;
     }
 }
 
@@ -2813,6 +2833,50 @@ mod tests {
         s.phase = Phase::Sampling { ticks: 0 };
         update(&mut s, Msg::Tick);
         assert!(matches!(s.phase, Phase::Sampling { ticks: 1 }));
+    }
+
+    #[test]
+    fn work_ticks_advances_running_pauses_blocked_and_resets_at_turn_end() {
+        // The whole-turn clock the activity animation rides (`anim::snake`).
+        let mut s = State::test_default();
+
+        // Idle does not advance it.
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.work_ticks, 0, "idle must not advance the animation clock");
+
+        // A running turn advances it — and keeps advancing across a
+        // thinking → tool switch, which resets the *per-phase* ticks but not
+        // this clock. That continuity is the whole reason it exists.
+        s.phase = Phase::Sampling { ticks: 0 };
+        update(&mut s, Msg::Tick);
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.work_ticks, 2);
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 0,
+        };
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.work_ticks, 3, "the clock survives a sub-phase change");
+
+        // Blocked on the user: the cycle freezes where it stood.
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "s".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: Vec::new(),
+        };
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.work_ticks, 3, "a blocked prompt freezes the cycle");
+
+        // Turn end restarts the cycle from 0 — here via the esc-detach ladder
+        // (the other reset is on a normal prompt result).
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.interrupt_sent = true; // first esc already sent
+        press(&mut s, KeyCode::Esc); // second esc abandons the turn
+        assert_eq!(s.phase, Phase::Idle);
+        assert_eq!(s.work_ticks, 0, "a new turn restarts the animation cycle");
     }
 
     #[test]

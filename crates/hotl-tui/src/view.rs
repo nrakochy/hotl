@@ -981,7 +981,7 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // The wave is per-column color, so it cannot ride the paragraph's single
     // style: one span per column, each carrying only a foreground so the band
     // background still comes from `style` below.
-    let mut spans: Vec<Span> = anim::snake(&state.phase)
+    let mut spans: Vec<Span> = anim::snake(&state.phase, state.work_ticks)
         .chars()
         .zip(anim::snake_ramp(&state.phase, p))
         .map(|(c, color)| Span::styled(c.to_string(), Style::new().fg(color)))

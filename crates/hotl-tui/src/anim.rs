@@ -40,6 +40,31 @@ const BODY: usize = 14;
 /// undulates gently instead of buzzing.
 const WAVELENGTH: usize = 16;
 
+// The activity cycle, driven by the whole-turn clock (`State::work_ticks`), in
+// order: swim one way for `TRAVEL`; rear the head up in the middle and glance
+// both ways (`RISE` up, two `LOOK` holds, `FALL` back); swim back the other way
+// for `TRAVEL`; glance again with the look order inverted. Durations are cut
+// from `TICK_HZ`, not hard-coded frame counts, so they track the tick rate.
+
+/// Ticks spent swimming across the strip in one direction (10s).
+const TRAVEL: u64 = 10 * TICK_HZ;
+/// Ticks the head holds a single glance (1s), once each way.
+const LOOK: u64 = TICK_HZ;
+/// Ticks for the head to spring up out of the middle (~0.33s).
+const RISE: u64 = 10;
+/// Ticks for the head to drop back down and resume swimming (~0.27s).
+const FALL: u64 = 8;
+/// One head-up interlude: rise, two glances, fall.
+const INTERLUDE: u64 = RISE + 2 * LOOK + FALL;
+/// The full loop: travel, glance, travel the other way, glance inverted.
+const CYCLE: u64 = 2 * (TRAVEL + INTERLUDE);
+
+/// A frame under construction: dot on/off at `[row][sub-column]`, `row` 0 (top)
+/// to 3 (bottom), sub-column 0 (left) to `COLUMNS-1` (right). Built here, then
+/// packed into braille cells by `cells_of`. Working in dots rather than cells
+/// keeps the pose helpers readable and makes `mirror` a one-liner.
+type Grid = [[bool; COLUMNS]; 4];
+
 /// Braille dot bits by row, for the left and right sub-column of a cell.
 /// Rows 0-2 are the historic 6-dot block; row 3 is the 8-dot extension, which
 /// is why the fourth entry is not adjacent to the others.
@@ -88,40 +113,212 @@ pub fn at_rest() -> String {
     render(cells)
 }
 
+/// Light the dot at (`row`, `col`); out-of-range dots are dropped, which lets a
+/// pose reach a snout one column past the head without bounds-checking itself.
+fn dot(g: &mut Grid, row: usize, col: usize) {
+    if row < 4 && col < COLUMNS {
+        g[row][col] = true;
+    }
+}
+
+/// Light a vertical run in one sub-column, rows `r0..=r1` — a neck.
+fn vrun(g: &mut Grid, col: usize, r0: usize, r1: usize) {
+    for r in r0..=r1 {
+        dot(g, r, col);
+    }
+}
+
+/// The frame reflected left↔right about the strip's center. "Look left" is
+/// exactly "look right" mirrored, so the two glances are guaranteed symmetric.
+fn mirror(g: &Grid) -> Grid {
+    let mut m = [[false; COLUMNS]; 4];
+    for (r, row) in g.iter().enumerate() {
+        for (c, &lit) in row.iter().enumerate() {
+            if lit {
+                m[r][COLUMNS - 1 - c] = true;
+            }
+        }
+    }
+    m
+}
+
+/// Pack a dot grid into the `WIDTH` braille cells it spells.
+fn cells_of(g: &Grid) -> [u8; WIDTH] {
+    let mut cells = [0u8; WIDTH];
+    for (r, row) in g.iter().enumerate() {
+        for (c, &lit) in row.iter().enumerate() {
+            if lit {
+                let bits = if c.is_multiple_of(2) { LEFT } else { RIGHT };
+                cells[c / 2] |= bits[r];
+            }
+        }
+    }
+    cells
+}
+
+/// The swimming snake at `step`, heading `leftward` (head toward the low edge)
+/// or rightward. The wave is fixed; the body slides along it head-first,
+/// thinning to a single dot at the tail. `leftward` is the mirror traversal of
+/// the rightward one, so both directions ride the same crest.
+fn travel(step: u64, leftward: bool) -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    let s = (step % COLUMNS as u64) as usize;
+    let head = if leftward { COLUMNS - 1 - s } else { s };
+    for segment in 0..BODY {
+        // Walking back from the head wraps the body around the strip's end, so
+        // the snake leaves one edge as it enters the other.
+        let x = if leftward {
+            (head + segment) % COLUMNS
+        } else {
+            (head + COLUMNS - segment) % COLUMNS
+        };
+        let row = path_row(x);
+        // The front half is two dots thick and the tail one, which is what
+        // gives the body a direction to travel in.
+        let thickness = if segment < BODY / 2 { 2 } else { 1 };
+        for d in 0..thickness {
+            dot(&mut g, row + d, x);
+        }
+    }
+    g
+}
+
+// The head, reared up in the middle: a periscope that springs straight up out
+// of the strip (`pose_nub`→`pose_center`) and swivels to glance (`look`). No
+// flat resting body — it rises from the center and drops back to swimming.
+
+fn pose_nub() -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    dot(&mut g, 3, 11);
+    dot(&mut g, 3, 12);
+    g
+}
+fn pose_rise1() -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    vrun(&mut g, 11, 2, 3);
+    vrun(&mut g, 12, 2, 3);
+    g
+}
+fn pose_rise2() -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    vrun(&mut g, 11, 1, 3);
+    vrun(&mut g, 12, 2, 3);
+    dot(&mut g, 0, 11);
+    dot(&mut g, 0, 12);
+    g
+}
+fn pose_rise3() -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    vrun(&mut g, 11, 1, 3);
+    dot(&mut g, 0, 11);
+    dot(&mut g, 0, 12);
+    dot(&mut g, 1, 11);
+    g
+}
+/// The peak of the spring — a touch of overshoot before it settles.
+fn pose_peak() -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    vrun(&mut g, 11, 2, 3);
+    dot(&mut g, 0, 11);
+    dot(&mut g, 0, 12);
+    g
+}
+/// Head up, facing forward — the settle between the spring and the first glance.
+fn pose_center() -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    vrun(&mut g, 11, 2, 3);
+    dot(&mut g, 0, 11);
+    dot(&mut g, 0, 12);
+    dot(&mut g, 1, 11);
+    dot(&mut g, 1, 12);
+    g
+}
+/// The head cocked to glance right; `look(false)` mirrors it to glance left.
+fn look(right: bool) -> Grid {
+    let mut g = [[false; COLUMNS]; 4];
+    vrun(&mut g, 11, 2, 3);
+    dot(&mut g, 1, 12);
+    dot(&mut g, 0, 13);
+    dot(&mut g, 0, 14);
+    dot(&mut g, 1, 13);
+    dot(&mut g, 1, 14);
+    if right {
+        g
+    } else {
+        mirror(&g)
+    }
+}
+
+/// The spring-up, frame by frame (`0..RISE`): nub breaks the surface, the neck
+/// climbs, the head overshoots and settles.
+fn rise(i: u64) -> Grid {
+    match i {
+        0 | 1 => pose_nub(),
+        2 | 3 => pose_rise1(),
+        4 | 5 => pose_rise2(),
+        6 | 7 => pose_rise3(),
+        8 => pose_peak(),
+        _ => pose_center(),
+    }
+}
+
+/// The drop back down (`0..FALL`): the spring-up run in reverse, to the nub.
+fn fall(j: u64) -> Grid {
+    match j {
+        0 | 1 => pose_rise3(),
+        2 | 3 => pose_rise2(),
+        4 | 5 => pose_rise1(),
+        _ => pose_nub(),
+    }
+}
+
+/// One head-up interlude at local tick `i` (`0..INTERLUDE`): spring up, hold the
+/// first glance a second, hold the second glance a second, drop back down.
+/// `right_first` chooses which way it looks first — right after the leftward
+/// swim, left after the rightward one (the inverse the second time round).
+fn interlude(i: u64, right_first: bool) -> Grid {
+    if i < RISE {
+        rise(i)
+    } else if i < RISE + LOOK {
+        look(right_first)
+    } else if i < RISE + 2 * LOOK {
+        look(!right_first)
+    } else {
+        fall(i - (RISE + 2 * LOOK))
+    }
+}
+
+/// The frame for the whole-turn clock `work`: where we are in the `CYCLE`.
+fn frame(work: u64) -> Grid {
+    let c = work % CYCLE;
+    if c < TRAVEL {
+        travel(c, true) // swim right → left
+    } else if c < TRAVEL + INTERLUDE {
+        interlude(c - TRAVEL, true) // glance right, then left
+    } else if c < 2 * TRAVEL + INTERLUDE {
+        travel(c - (TRAVEL + INTERLUDE), false) // swim left → right
+    } else {
+        interlude(c - (2 * TRAVEL + INTERLUDE), false) // glance left, then right
+    }
+}
+
 /// The animation's current frame: `WIDTH` braille chars.
 ///
 /// Phases that are *not* running a turn show `at_rest` rather than animating.
 /// Idle deliberately schedules no wakeups (see `hotl::tui`), and a blocked
 /// prompt that kept moving would read as progress when the whole point is that
-/// nothing is happening until you answer.
-pub fn snake(phase: &Phase) -> String {
-    let step = match phase {
-        Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } | Phase::Tool { ticks, .. } => {
-            *ticks
-        }
-        Phase::Idle
-        | Phase::WaitingAsk { .. }
-        | Phase::WaitingQuestion { .. }
-        | Phase::WaitingEgress { .. } => return at_rest(),
-    };
-    let mut cells = [0u8; WIDTH];
-    let head = (step % COLUMNS as u64) as usize;
-    for segment in 0..BODY {
-        // Walking back from the head wraps the body around the strip's end,
-        // so the snake leaves one edge as it enters the other.
-        let x = (head + COLUMNS - segment) % COLUMNS;
-        let row = path_row(x);
-        let col = if x.is_multiple_of(2) { LEFT } else { RIGHT };
-        // The front half is two dots thick and the tail one, which is what
-        // gives the body a direction to travel in.
-        let thickness = if segment < BODY / 2 { 2 } else { 1 };
-        for dot in 0..thickness {
-            if let Some(bit) = col.get(row + dot) {
-                cells[x / 2] |= bit;
-            }
-        }
+/// nothing is happening until you answer. `work` is the whole-turn clock
+/// (`State::work_ticks`), which advances across every running sub-phase, so the
+/// cycle is unbroken by the thinking→writing→tool churn and restarts each turn.
+pub fn snake(phase: &Phase, work: u64) -> String {
+    let running = matches!(
+        phase,
+        Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
+    );
+    if !running {
+        return at_rest();
     }
-    render(cells)
+    render(cells_of(&frame(work)))
 }
 
 /// The phase's gradient, as the two theme slots it sweeps between.
@@ -194,7 +391,7 @@ pub fn strip_text(state: &State) -> String {
 /// The view renders the two parts separately (only the snake is gradient-lit);
 /// this is the form tests pin and the form any non-styled consumer wants.
 pub fn strip_line(state: &State) -> String {
-    let snake = snake(&state.phase);
+    let snake = snake(&state.phase, state.work_ticks);
     match strip_text(state) {
         t if t.is_empty() => snake,
         t => format!("{snake} {t}"),
@@ -303,76 +500,81 @@ mod tests {
     }
 
     #[test]
-    fn the_snake_rests_flat_and_travels_when_a_turn_runs() {
-        // The exact shapes, pinned once. At rest the body lies flat along one
-        // dot row, ends dark; running, it undulates and moves one sub-column
-        // per tick, which is half a cell — so consecutive frames share a lot.
+    fn the_snake_rests_and_runs_the_travel_look_cycle() {
+        // The whole-turn clock drives one cycle; its landmarks pinned once.
+        // `Sampling`'s own `ticks` no longer feed the animation — the second
+        // argument (the work clock) does — so it stays 0 here throughout.
+        let run = Phase::Sampling { ticks: 0 };
+
+        // Rest is unchanged: a flat body along one dot row, ends dark.
         assert_eq!(at_rest(), "⠐⠒⠒⠒⠒⠒⠒⠒⠒⠒⠒⠂");
-        assert_eq!(snake(&Phase::Sampling { ticks: 0 }), "⠃⠀⠀⠀⠀⠐⠊⠉⠉⠳⢦⣄");
-        assert_eq!(snake(&Phase::Sampling { ticks: 1 }), "⠛⠀⠀⠀⠀⠀⠊⠉⠉⠱⢦⣄");
-        assert_eq!(snake(&Phase::Sampling { ticks: 2 }), "⠛⠃⠀⠀⠀⠀⠈⠉⠉⠑⢦⣄");
+
+        // Swim right → left …
+        assert_eq!(snake(&run, 0), "⠛⠳⢦⢄⡠⠔⠂⠀⠀⠀⠀⢀");
+        assert_eq!(snake(&run, 1), "⠛⠳⠦⢄⡠⠔⠀⠀⠀⠀⠀⣄");
+        // … then the head springs up in the middle and glances right, then left …
+        assert_eq!(snake(&run, TRAVEL), "⠀⠀⠀⠀⠀⢀⡀⠀⠀⠀⠀⠀");
+        assert_eq!(snake(&run, TRAVEL + RISE), "⠀⠀⠀⠀⠀⢠⠚⠃⠀⠀⠀⠀");
+        assert_eq!(snake(&run, TRAVEL + RISE + LOOK), "⠀⠀⠀⠀⠘⠓⡄⠀⠀⠀⠀⠀");
+        // … then swims back left → right …
+        assert_eq!(snake(&run, TRAVEL + INTERLUDE), "⠃⠀⠀⠀⠀⠐⠊⠉⠉⠳⢦⣄");
+        // … and glances in the inverse order the second time: left, then right.
+        let second = 2 * TRAVEL + INTERLUDE;
+        assert_eq!(snake(&run, second + RISE), "⠀⠀⠀⠀⠘⠓⡄⠀⠀⠀⠀⠀");
+        assert_eq!(snake(&run, second + RISE + LOOK), "⠀⠀⠀⠀⠀⢠⠚⠃⠀⠀⠀⠀");
 
         // Every frame is exactly WIDTH cells — the strip's text never shifts
-        // left or right as the body wraps around the end.
-        for ticks in [0u64, 1, 7, 23, 24, 29, 30, 1_000] {
-            let f = snake(&Phase::Sampling { ticks });
-            assert_eq!(f.chars().count(), WIDTH, "width at {ticks}: {f}");
+        // left or right, at any point in the cycle.
+        for work in [0u64, 1, TRAVEL - 1, TRAVEL, TRAVEL + 5, CYCLE - 1, 10_000] {
+            let f = snake(&run, work);
+            assert_eq!(f.chars().count(), WIDTH, "width at {work}: {f}");
         }
 
-        // The head laps the strip every COLUMNS ticks, and the path it walks
-        // is fixed, so a full lap lands on exactly the same picture.
-        assert_eq!(
-            snake(&Phase::Sampling {
-                ticks: COLUMNS as u64
-            }),
-            snake(&Phase::Sampling { ticks: 0 })
-        );
+        // The cycle is exactly CYCLE ticks: a full loop lands on itself.
+        assert_eq!(snake(&run, CYCLE), snake(&run, 0));
+        assert_eq!(snake(&run, CYCLE + TRAVEL + RISE), snake(&run, TRAVEL + RISE));
     }
 
     #[test]
     fn only_a_running_turn_animates() {
-        // Idle and every blocked prompt lie flat no matter the tick, so motion
+        // Idle and every blocked prompt lie flat no matter the clock, so motion
         // on the strip always means the turn is moving.
-        let ask = |ticks| Phase::WaitingAsk {
-            req_id: ticks,
+        let ask = |req_id| Phase::WaitingAsk {
+            req_id,
             summary: "s".into(),
             protected_why: None,
             input: String::new(),
             denying: false,
             diff: Vec::new(),
         };
-        for ticks in [0u64, 3, 99] {
-            assert_eq!(snake(&ask(ticks)), still(), "a halted loop never moves");
+        for work in [0u64, 3, TRAVEL, 99_999] {
+            assert_eq!(snake(&ask(1), work), still(), "a halted loop never moves");
+            assert_eq!(snake(&Phase::Idle, work), still());
         }
-        assert_eq!(snake(&Phase::Idle), still());
         assert_ne!(
             still(),
-            snake(&Phase::Sampling { ticks: 0 }),
+            snake(&Phase::Sampling { ticks: 0 }, 0),
             "resting must not be mistakable for the first frame of working"
         );
 
-        // …and a running turn does move: consecutive ticks differ.
+        // …and a running turn does move: consecutive travel ticks differ.
         assert_ne!(
-            snake(&Phase::Sampling { ticks: 4 }),
-            snake(&Phase::Sampling { ticks: 5 })
+            snake(&Phase::Sampling { ticks: 0 }, 4),
+            snake(&Phase::Sampling { ticks: 0 }, 5)
         );
     }
 
     #[test]
-    fn the_body_is_continuous_and_has_a_head_and_a_tail() {
-        // A snake, not a ripple: every frame lights some cells and leaves
-        // others dark, so the body reads as one creature with a gap behind it.
-        for ticks in 0..COLUMNS as u64 {
-            let f = snake(&Phase::Sampling { ticks });
+    fn every_frame_reads_as_a_creature_not_a_full_or_empty_strip() {
+        // A snake, not a ripple and not a blank: across the whole cycle every
+        // frame lights some cells and leaves some dark — a body with a gap, or a
+        // head with room around it — never the full strip and never nothing.
+        let run = Phase::Sampling { ticks: 0 };
+        for work in 0..CYCLE {
+            let f = snake(&run, work);
             let dark = f.chars().filter(|c| *c == '\u{2800}').count();
-            assert!(
-                dark > 0,
-                "frame {ticks} fills the whole strip — no tail to see: {f}"
-            );
-            assert!(
-                dark < WIDTH,
-                "frame {ticks} is entirely blank: nothing to see"
-            );
+            assert!(dark > 0, "frame {work} fills the whole strip: {f}");
+            assert!(dark < WIDTH, "frame {work} is entirely blank");
         }
     }
 
@@ -430,13 +632,14 @@ mod tests {
         s.usage_line = Some("120 in · 45 out tok".into());
         assert_eq!(strip_line(&s), format!("{w} m · 120 in · 45 out tok"));
 
-        // Seconds come off TICK_HZ, so these tick counts are rates, not magic.
+        // The per-phase `ticks` still drive the "· 1s ·" elapsed readout (off
+        // TICK_HZ), while the animation rides the separate work clock.
         s.phase = Phase::Sampling { ticks: TICK_HZ };
         assert_eq!(
             strip_line(&s),
             format!(
                 "{} thinking · 1s · esc to interrupt",
-                snake(&Phase::Sampling { ticks: TICK_HZ })
+                snake(&s.phase, s.work_ticks)
             )
         );
         s.phase = Phase::Streaming {
