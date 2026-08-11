@@ -790,6 +790,9 @@ mod tests {
         git(&["init", "-q", "-b", "main"])?;
         git(&["config", "user.email", "t@example.com"])?;
         git(&["config", "user.name", "t"])?;
+        // Git for Windows defaults autocrlf on; without this the seeded
+        // worktree and the merged-back files come back CRLF.
+        git(&["config", "core.autocrlf", "false"])?;
         std::fs::write(tmp.path().join("a.txt"), "a1\na2\na3\n").ok()?;
         git(&["add", "-A"])?;
         git(&["commit", "-qm", "init"])?;
@@ -897,8 +900,9 @@ mod tests {
             .await;
 
         assert!(out.content.contains("Not applied"), "{}", out.content);
+        // Separator-agnostic: the reported worktree path uses `\` on Windows.
         assert!(
-            out.content.contains(".git/hotl-worktrees/"),
+            out.content.contains("hotl-worktrees"),
             "the human needs the path to the surviving work: {}",
             out.content
         );

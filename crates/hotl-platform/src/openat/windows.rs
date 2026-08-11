@@ -174,8 +174,14 @@ impl DirHandle for WindowsDirHandle {
 
     fn open_root(path: &Path) -> Result<Self, GuardIo> {
         // The NT namespace wants `\??\C:\...` rather than a Win32 path, and the
-        // root is the one full path this module resolves.
-        let mut name = wide(OsStr::new(&format!(r"\??\{}", path.display())));
+        // root is the one full path this module resolves. NT paths are
+        // backslash-only, but a Win32 path may reach us with forward slashes
+        // (`git rev-parse --show-toplevel` reports them, and that path seeds a
+        // worktree floor) — the object manager would read those as literal
+        // filename characters and fail with ERROR_PATH_NOT_FOUND. Normalize
+        // before prefixing.
+        let native = path.display().to_string().replace('/', "\\");
+        let mut name = wide(OsStr::new(&format!(r"\??\{native}")));
         let h = nt_open(
             None,
             &mut name,

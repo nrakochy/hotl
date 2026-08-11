@@ -1455,6 +1455,10 @@ path_prefix = "/Volumes/secrets"
         assert!(!config_dir.join("sub").exists());
     }
 
+    // `/etc` and the rest of `risky_root`'s list are Unix system paths; the
+    // concept has no Windows entries, and `/etc` is neither absolute nor
+    // present there.
+    #[cfg(unix)]
     #[test]
     fn sandbox_writable_warns_but_honors_risky_roots() {
         let (_scratch, config_dir, data_dir) = sandbox_dirs();

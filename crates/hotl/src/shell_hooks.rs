@@ -783,11 +783,13 @@ env = { HOTL_HOOK_EVENT = "spoofed-should-not-win" }
         let dir = tempfile::tempdir().unwrap();
         let notif_capture = dir.path().join("notification.json");
         let stop_capture = dir.path().join("stop.json");
+        // Windows paths carry backslashes, which are escape characters inside a
+        // TOML basic string; forward slashes parse cleanly and still resolve.
+        let notif = notif_capture.display().to_string().replace('\\', "/");
+        let stop = stop_capture.display().to_string().replace('\\', "/");
         let toml = format!(
-            "[[hook]]\nevent = \"notification\"\ncommand = \"cat > {}\"\n\
-             [[hook]]\nevent = \"stop\"\ncommand = \"cat > {}; echo '{{}}'\"\n",
-            notif_capture.display(),
-            stop_capture.display(),
+            "[[hook]]\nevent = \"notification\"\ncommand = \"cat > {notif}\"\n\
+             [[hook]]\nevent = \"stop\"\ncommand = \"cat > {stop}; echo '{{}}'\"\n",
         );
         let hooks = load_str(&toml, concurrency()).unwrap();
         hooks

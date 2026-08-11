@@ -3312,6 +3312,9 @@ mod fork_tests {
         );
 
         let path = log.path().to_path_buf();
+        // The live SessionLog keeps an exclusive write handle on Windows; a
+        // second writable open collides (os error 32) until it is dropped.
+        drop(log);
         let f = std::fs::File::options().write(true).open(&path).unwrap();
         f.set_times(
             std::fs::FileTimes::new()
@@ -3776,6 +3779,9 @@ mod tests {
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@example.com"]);
         git(&["config", "user.name", "t"]);
+        // Git for Windows defaults autocrlf on, which would rewrite the
+        // checked-out worktree to CRLF and fail the byte-exact comparison below.
+        git(&["config", "core.autocrlf", "false"]);
         std::fs::write(repo.path().join("NOTES.md"), "committed\n").unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);
@@ -4889,11 +4895,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let notif_sentinel = dir.path().join("notification.done");
         let end_sentinel = dir.path().join("session_end.done");
+        // Windows paths carry backslashes, which are escape characters inside a
+        // TOML basic string; forward slashes parse cleanly and still resolve.
+        let notif = notif_sentinel.display().to_string().replace('\\', "/");
+        let end = end_sentinel.display().to_string().replace('\\', "/");
         let toml = format!(
-            "[[hook]]\nevent = \"notification\"\ncommand = \"touch {}\"\n\
-             [[hook]]\nevent = \"session_end\"\ncommand = \"touch {}\"\n",
-            notif_sentinel.display(),
-            end_sentinel.display(),
+            "[[hook]]\nevent = \"notification\"\ncommand = \"touch {notif}\"\n\
+             [[hook]]\nevent = \"session_end\"\ncommand = \"touch {end}\"\n",
         );
         let hooks: Arc<dyn hotl_engine::hooks::Hooks> =
             Arc::new(crate::shell_hooks::load_str(&toml, test_concurrency()).unwrap());
