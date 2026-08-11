@@ -6,10 +6,14 @@ description: Install hotl, point it at a model, and complete one approved agent 
 From nothing installed to a completed agent task. Every command is copy-runnable and paired with the output you should see; the why behind things lives in [permissions-and-sandbox.md](../permissions-and-sandbox/) and [configuration.md](../configuration/).
 
 **Preconditions:**
-- macOS or Linux, a terminal, and `git`.
+- macOS, Linux, or Windows; a terminal; and `git`.
+- On Windows, `git` is doubly worth having: [Git for
+  Windows](https://gitforwindows.org/) ships the POSIX `sh.exe` that hotl's
+  `bash` tool runs commands in, and hotl finds it automatically. Without one,
+  `bash` drops out of the tool list and says so — the file tools keep working.
 - A model to talk to — one of: a local [Ollama](https://ollama.com) server, or an API key for any OpenAI-compatible endpoint. You do **not** need an Anthropic key for this tutorial.
 
-`mutates:` this installs the `hotl` binary, creates config files under `~/.config/hotl/` and a session log under `~/.local/share/hotl/`, and (in the last step) makes one approved edit in a git repo of your choosing.
+`mutates:` this installs the `hotl` binary, creates config files under `~/.config/hotl/` and a session log under `~/.local/share/hotl/`, and (in the last step) makes one approved edit in a git repo of your choosing. On Windows read those two paths as `%LOCALAPPDATA%\hotl\config\` and `%LOCALAPPDATA%\hotl\data\` throughout this page.
 
 ## 1. Install the binary
 
@@ -17,6 +21,12 @@ Prebuilt, no toolchain needed:
 
 ```
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.sh | sh
+```
+
+On Windows, from PowerShell:
+
+```powershell
+irm https://github.com/nrakochy/hotl/releases/latest/download/hotl-installer.ps1 | iex
 ```
 
 (Or, with a Rust toolchain ≥ 1.88: `cargo install hotl`. Building from a checkout — `cargo build --release -p hotl` — works too; then substitute your `target/release/hotl` path for `hotl` below.)

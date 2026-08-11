@@ -195,6 +195,15 @@ settings file — permissions, MCP, hooks, and retrieval are all sections in
 it), append-only session logs at `~/.local/share/hotl/sessions/<ulid>.jsonl`,
 and per-session git snapshots under `~/.local/share/hotl/shadow/`.
 
+On Windows those live under `%LOCALAPPDATA%\hotl\` —
+`%LOCALAPPDATA%\hotl\config\config.toml` and
+`%LOCALAPPDATA%\hotl\data\sessions\`. Set `XDG_CONFIG_HOME` or
+`XDG_DATA_HOME` and hotl honors them there too, which is what keeps a Git Bash
+session and a PowerShell session looking at the same files. Local, never
+roaming `%APPDATA%`: `config.toml` names machine-specific writable directories,
+and roaming them to a second machine would silently widen or break the sandbox
+floor there.
+
 ## Watch — quick start
 
 **Requirements:** [tmux](https://github.com/tmux/tmux) on your `PATH` (run it from inside a tmux session) and `ps` (standard on macOS/Linux). Not available on native Windows — there is no tmux and no pane-capture protocol to port to; use WSL2.

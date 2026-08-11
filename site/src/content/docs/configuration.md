@@ -30,7 +30,7 @@ Reference for the command surface, config files, and environment variables of th
 
 ## One config file: `config.toml`
 
-Everything hand-editable lives in **`~/.config/hotl/config.toml`** (or `$XDG_CONFIG_HOME/hotl/config.toml`). `hotl setup` writes a commented starter. It's the only settings file — there is no `permissions.toml`/`mcp.toml`/`hooks.toml`; those are sections here now. A malformed file is ignored with a warning, never half-applied.
+Everything hand-editable lives in **`~/.config/hotl/config.toml`** (or `$XDG_CONFIG_HOME/hotl/config.toml`; on Windows, **`%LOCALAPPDATA%\hotl\config\config.toml`**, and `XDG_CONFIG_HOME` is honored there too — which is what keeps a Git Bash session and a PowerShell session pointed at one file. Local rather than roaming `%APPDATA%` on purpose: this file names machine-specific writable directories, and roaming them would silently widen or break the sandbox floor on the other machine). `hotl setup` writes a commented starter. It's the only settings file — there is no `permissions.toml`/`mcp.toml`/`hooks.toml`; those are sections here now. A malformed file is ignored with a warning, never half-applied.
 
 ```toml
 [provider]
@@ -370,7 +370,7 @@ file_tools = "workspace"   # optional; see below
 
 `writable` entries are absolute paths (`~/` expands). Each is created if missing (Landlock can only grant access to a directory that exists when the sandbox is built), canonicalized (symlinks resolved), and validated:
 
-- **Refused — hotl's own directories.** An entry that is, contains, or sits inside the config dir (`~/.config/hotl`) or data dir (`~/.local/share/hotl`) is dropped with a warning, and the rest are honored. A writable config dir would let a sandboxed command rewrite the allow-rules, hooks, and `api_key_helper` that govern it — self-granted privilege escalation. This is also why `~` and `/` can never be listed: they contain the config dir.
+- **Refused — hotl's own directories.** An entry that is, contains, or sits inside the config dir (`~/.config/hotl`, or `%LOCALAPPDATA%\hotl\config`) or data dir (`~/.local/share/hotl`, or `%LOCALAPPDATA%\hotl\data`) is dropped with a warning, and the rest are honored. A writable config dir would let a sandboxed command rewrite the allow-rules, hooks, and `api_key_helper` that govern it — self-granted privilege escalation. This is also why `~` and `/` can never be listed: they contain the config dir.
 - **Warned but honored — system roots.** `/etc`, `/usr`, `/bin`, `/opt`, `/Library`, and similar are accepted with a loud warning: binaries and configuration living there become writable to every sandboxed command.
 - **Skipped** — relative paths, entries that are files, entries that cannot be created or resolved. Each with its own warning; a bad entry never takes the rest down.
 
