@@ -1733,7 +1733,7 @@ impl Turn {
             ephemeral_tail: Arc::clone(&snapshot.tail),
             tools: Arc::clone(&self.tool_defs),
             thinking: self.shared.config.thinking,
-            effort: None,
+            effort: self.shared.config.effort,
             cache: if self.shared.config.cache_static {
                 CachePolicy::Static {
                     prefix_ttl: self.shared.config.cache_ttl,

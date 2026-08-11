@@ -1837,6 +1837,9 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
         ephemeral_tail: empty_tail(),
         tools: Vec::new().into(),
         thinking: false,
+        // Compaction summarizes; it does not reason. Both depth knobs stay off
+        // regardless of the session's setting — a `max`-effort session should
+        // not pay `max` to fold its own history.
         effort: None,
         cache: hotl_provider::CachePolicy::Off,
         turn_context: None,

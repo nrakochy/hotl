@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hotl_platform::Clock;
-use hotl_provider::{CacheTtl, Provider};
+use hotl_provider::{CacheTtl, Effort, Provider};
 use hotl_store::SessionLog;
 use hotl_tools::{
     rules::{PermissionMode, Rules},
@@ -71,6 +71,9 @@ pub struct EngineConfig {
     /// it should be a choice, never a default.
     pub max_turns: i64,
     pub thinking: bool,
+    /// Reasoning depth for every sample this session takes. `None` = the
+    /// provider's own default; the dialect decides the wire spelling.
+    pub effort: Option<Effort>,
     pub cache_static: bool,
     /// The lifetime `compose_request` asks explicit-cache breakpoints for
     /// when `cache_static` is set (`CachePolicy::Static { prefix_ttl }` —
@@ -120,6 +123,7 @@ impl Default for EngineConfig {
             // a work ceiling. Sub-agent call sites set their own, tighter.
             max_turns: 100,
             thinking: true,
+            effort: None,
             cache_static: true,
             cache_ttl: CacheTtl::FiveMinutes,
             fallback_models: Vec::new(),
