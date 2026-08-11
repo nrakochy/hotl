@@ -220,7 +220,7 @@ mod imp {
                 EXTENDED_STARTUPINFO_PRESENT | DETACHED_PROCESS | CREATE_UNICODE_ENVIRONMENT,
                 ptr::null(),
                 ptr::null(),
-                &mut si.StartupInfo,
+                &si.StartupInfo,
                 &mut pi,
             )
         };

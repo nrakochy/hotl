@@ -66,7 +66,7 @@ impl PrivateFs for WindowsPrivateFs {
         let sid = current_user_sid()?;
         let acl = one_ace_dacl(sid.as_psid(), FILE_ALL_ACCESS)?;
         let mut sd = protected_descriptor(&acl)?;
-        let mut sa = SECURITY_ATTRIBUTES {
+        let sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.as_mut_ptr(),
             bInheritHandle: 0,
@@ -74,7 +74,7 @@ impl PrivateFs for WindowsPrivateFs {
         let wide = wide(path);
         // SAFETY: `wide` is NUL-terminated and outlives the call; `sa` points at
         // a descriptor whose DACL is owned by `acl` for the same scope.
-        if unsafe { CreateDirectoryW(wide.as_ptr(), &mut sa) } == 0 {
+        if unsafe { CreateDirectoryW(wide.as_ptr(), &sa) } == 0 {
             let err = io::Error::last_os_error();
             if err.kind() == io::ErrorKind::AlreadyExists {
                 // A pre-existing directory keeps whatever it had — there is no
@@ -90,7 +90,7 @@ impl PrivateFs for WindowsPrivateFs {
         let sid = current_user_sid()?;
         let acl = one_ace_dacl(sid.as_psid(), FILE_ALL_ACCESS)?;
         let mut sd = protected_descriptor(&acl)?;
-        let mut sa = SECURITY_ATTRIBUTES {
+        let sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.as_mut_ptr(),
             bInheritHandle: 0,
@@ -110,7 +110,7 @@ impl PrivateFs for WindowsPrivateFs {
                 wide.as_ptr(),
                 access,
                 0,
-                &mut sa,
+                &sa,
                 CREATE_NEW,
                 FILE_ATTRIBUTE_NORMAL,
                 ptr::null_mut(),
@@ -127,7 +127,7 @@ impl PrivateFs for WindowsPrivateFs {
         let sid = current_user_sid()?;
         let acl = one_ace_dacl(sid.as_psid(), FILE_ALL_ACCESS)?;
         let mut sd = protected_descriptor(&acl)?;
-        let mut sa = SECURITY_ATTRIBUTES {
+        let sa = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.as_mut_ptr(),
             bInheritHandle: 0,
@@ -140,7 +140,7 @@ impl PrivateFs for WindowsPrivateFs {
                 wide.as_ptr(),
                 GENERIC_READ | GENERIC_WRITE,
                 0,
-                &mut sa,
+                &sa,
                 CREATE_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
                 ptr::null_mut(),
@@ -204,7 +204,7 @@ impl PrivateFs for WindowsPrivateFs {
         if rc != 0 {
             return Err(io::Error::from_raw_os_error(rc as i32));
         }
-        let owned = LocalOwned(sd as *mut c_void);
+        let owned = LocalOwned(sd);
         let other_readers = read_grants_other_than(dacl, &me)?;
         drop(owned);
         Ok(EffectiveAccess {
@@ -354,7 +354,7 @@ impl Drop for OwnedAcl {
 }
 
 fn one_ace_dacl(sid: PSID, access: u32) -> io::Result<OwnedAcl> {
-    let mut ea = EXPLICIT_ACCESS_W {
+    let ea = EXPLICIT_ACCESS_W {
         grfAccessPermissions: access,
         grfAccessMode: SET_ACCESS,
         grfInheritance: NO_INHERITANCE,
@@ -369,7 +369,7 @@ fn one_ace_dacl(sid: PSID, access: u32) -> io::Result<OwnedAcl> {
     let mut acl: *mut ACL = ptr::null_mut();
     // SAFETY: one live entry, a null "existing ACL" meaning "build from
     // scratch", and a live out-param.
-    let rc = unsafe { SetEntriesInAclW(1, &mut ea, ptr::null(), &mut acl) };
+    let rc = unsafe { SetEntriesInAclW(1, &ea, ptr::null(), &mut acl) };
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
@@ -494,7 +494,7 @@ pub(crate) fn dacl_is_protected(path: &Path) -> io::Result<bool> {
     if rc != 0 {
         return Err(io::Error::from_raw_os_error(rc as i32));
     }
-    let owned = LocalOwned(sd as *mut c_void);
+    let owned = LocalOwned(sd);
     let mut control: SECURITY_DESCRIPTOR_CONTROL = 0;
     let mut revision = 0u32;
     // SAFETY: `sd` is a valid descriptor for the duration of `owned`.

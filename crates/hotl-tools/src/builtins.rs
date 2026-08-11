@@ -2132,25 +2132,48 @@ mod tests {
         );
     }
 
+    /// Hidden, not read-only. Read-only would block the replace itself, and
+    /// clearing it again is a clippy-denied footgun (`set_readonly(false)`
+    /// clears *every* permission bit, not the one you set). Hidden is an
+    /// attribute an atomic replace can plausibly drop, which is the property
+    /// under test.
     #[cfg(windows)]
     fn mark_for_preservation(path: &Path) {
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_readonly(true);
-        std::fs::set_permissions(path, perms).unwrap();
-        // Read-only would block the write itself; the guard replaces rather
-        // than opens in place, so what is under test is whether the *new*
-        // file inherits the attribute.
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
-        perms.set_readonly(false);
-        std::fs::set_permissions(path, perms).unwrap();
+        set_attributes(path, FILE_ATTRIBUTE_HIDDEN);
     }
 
     #[cfg(windows)]
     fn assert_preserved(path: &Path) {
-        // The Unix twin asserts the exec bit survived; here the file must at
-        // least still exist with its content replaced, and its attributes must
-        // be the ones the guard carried over rather than a fresh default.
-        assert!(std::fs::metadata(path).is_ok());
+        assert!(
+            attributes(path) & FILE_ATTRIBUTE_HIDDEN != 0,
+            "the atomic replace dropped the hidden attribute"
+        );
+    }
+
+    #[cfg(windows)]
+    const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+
+    #[cfg(windows)]
+    fn wide(path: &Path) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt as _;
+        path.as_os_str().encode_wide().chain(Some(0)).collect()
+    }
+
+    #[cfg(windows)]
+    fn set_attributes(path: &Path, attrs: u32) {
+        let w = wide(path);
+        // SAFETY: a NUL-terminated path we own.
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::SetFileAttributesW(w.as_ptr(), attrs)
+        };
+        assert_ne!(ok, 0, "could not set attributes on {}", path.display());
+    }
+
+    #[cfg(windows)]
+    fn attributes(path: &Path) -> u32 {
+        let w = wide(path);
+        // SAFETY: a NUL-terminated path we own.
+        unsafe { windows_sys::Win32::Storage::FileSystem::GetFileAttributesW(w.as_ptr()) }
     }
 
     #[tokio::test]
