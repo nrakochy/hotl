@@ -529,6 +529,23 @@ impl SandboxCfg {
         data_dir: &Path,
         rules: &hotl_tools::rules::Rules,
     ) -> (hotl_tools::sandbox::SandboxExtras, Vec<String>) {
+        self.resolve_with_home(config_dir, data_dir, rules, home_dir().as_deref())
+    }
+
+    /// The body of [`SandboxCfg::resolve`], with the credential-home seam
+    /// exposed. Production passes the real `$HOME`; tests that only exercise
+    /// writable/file_tools parsing pass `None`, so an ambient `$HOME` sitting
+    /// inside a write root — the Nix builder puts `$HOME` under `TMPDIR` —
+    /// cannot inject credential-deny warnings into their assertions. The
+    /// credential behavior itself is covered through the `resolve_read_deny`
+    /// seam below.
+    fn resolve_with_home(
+        &self,
+        config_dir: &Path,
+        data_dir: &Path,
+        rules: &hotl_tools::rules::Rules,
+        home: Option<&Path>,
+    ) -> (hotl_tools::sandbox::SandboxExtras, Vec<String>) {
         use hotl_tools::sandbox::FileToolsMode;
         let mut warnings = Vec::new();
         let mut writable: Vec<std::path::PathBuf> = Vec::new();
@@ -617,7 +634,7 @@ impl SandboxCfg {
             config_dir,
             data_dir,
             &hotl_tools::sandbox::write_roots_with(&writable),
-            home_dir().as_deref(),
+            home,
             &containment,
             &mut warnings,
         );
@@ -1340,10 +1357,11 @@ path_prefix = "/Volumes/secrets"
         // Absent section: exactly nothing — the floor is byte-identical to
         // an unconfigured hotl, and no warning rides every startup.
         let (_scratch, config_dir, data_dir) = sandbox_dirs();
-        let (extras, warnings) = cfg_with("").sandbox.resolve(
+        let (extras, warnings) = cfg_with("").sandbox.resolve_with_home(
             &config_dir,
             &data_dir,
             &hotl_tools::rules::Rules::default(),
+            None,
         );
         assert!(extras.writable.is_empty());
         assert_eq!(extras.file_tools, FileToolsMode::Workspace);
@@ -1366,8 +1384,12 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) =
-            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
+        let (extras, warnings) = cfg.resolve_with_home(
+            &config_dir,
+            &data_dir,
+            &hotl_tools::rules::Rules::default(),
+            None,
+        );
         assert!(warnings.is_empty(), "{warnings:?}");
         assert!(missing.is_dir(), "missing entries are created at startup");
         assert_eq!(extras.writable.len(), 2);
@@ -1398,8 +1420,12 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) =
-            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
+        let (extras, warnings) = cfg.resolve_with_home(
+            &config_dir,
+            &data_dir,
+            &hotl_tools::rules::Rules::default(),
+            None,
+        );
         // Refusal wins, entry by entry — the good sibling still lands.
         assert_eq!(extras.writable, vec![dunce::canonicalize(good).unwrap()]);
         assert_eq!(warnings.len(), 5, "{warnings:?}");
@@ -1418,8 +1444,12 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) =
-            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
+        let (extras, warnings) = cfg.resolve_with_home(
+            &config_dir,
+            &data_dir,
+            &hotl_tools::rules::Rules::default(),
+            None,
+        );
         assert_eq!(
             extras.writable,
             vec![dunce::canonicalize(std::path::Path::new("/etc")).unwrap()]
@@ -1443,8 +1473,12 @@ path_prefix = "/Volumes/secrets"
             readable: Vec::new(),
             file_tools: None,
         };
-        let (extras, warnings) =
-            cfg.resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default());
+        let (extras, warnings) = cfg.resolve_with_home(
+            &config_dir,
+            &data_dir,
+            &hotl_tools::rules::Rules::default(),
+            None,
+        );
         assert!(extras.writable.is_empty());
         assert_eq!(warnings.len(), 3, "{warnings:?}");
         assert!(warnings[0].contains("not a directory"), "{}", warnings[0]);
@@ -1463,7 +1497,12 @@ path_prefix = "/Volumes/secrets"
                 readable: Vec::new(),
                 file_tools: mode.map(String::from),
             }
-            .resolve(&config_dir, &data_dir, &hotl_tools::rules::Rules::default())
+            .resolve_with_home(
+                &config_dir,
+                &data_dir,
+                &hotl_tools::rules::Rules::default(),
+                None,
+            )
         };
         let entry = vec![cache.display().to_string()];
 
