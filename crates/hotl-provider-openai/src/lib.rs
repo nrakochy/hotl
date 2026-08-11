@@ -691,6 +691,7 @@ mod tests {
             ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
             thinking: false,
+            effort: None,
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
         };
@@ -755,6 +756,7 @@ mod tests {
             }]
             .into(),
             thinking: true,
+            effort: None,
             cache: hotl_provider::CachePolicy::Static {
                 prefix_ttl: hotl_provider::CacheTtl::FiveMinutes,
             },
@@ -1254,6 +1256,7 @@ mod tests {
             ephemeral_tail: std::sync::Arc::new(Vec::new()),
             tools: std::sync::Arc::from(Vec::<ToolDef>::new()),
             thinking: false,
+            effort: None,
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
         }

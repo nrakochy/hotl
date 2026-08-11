@@ -1837,6 +1837,7 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
         ephemeral_tail: empty_tail(),
         tools: Vec::new().into(),
         thinking: false,
+        effort: None,
         cache: hotl_provider::CachePolicy::Off,
         turn_context: None,
     };

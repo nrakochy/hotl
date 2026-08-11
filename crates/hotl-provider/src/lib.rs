@@ -67,6 +67,9 @@ pub struct SamplingRequest {
     pub tools: Arc<[ToolDef]>,
     /// Adaptive thinking on models that support it.
     pub thinking: bool,
+    /// Reasoning depth, projected per dialect by [`EffortLadder`]. `None` puts
+    /// nothing on the wire — the provider's own default applies.
+    pub effort: Option<Effort>,
     /// Cache-breakpoint placement for explicit-cache providers.
     pub cache: CachePolicy,
     /// MOIM (M2): ephemeral per-turn context, sent as a trailing user block
@@ -1211,7 +1214,10 @@ pub mod repair {
 
 pub mod api_error;
 pub mod catalog;
+pub mod effort;
 pub mod key;
+
+pub use effort::{Effort, EffortLadder, ALL_EFFORTS};
 
 /// Highest block index any assembler will materialize. Wire indices are
 /// attacker-controlled `u64`s; without a bound, `blocks.resize(index + 1, …)`
