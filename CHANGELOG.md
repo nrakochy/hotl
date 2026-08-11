@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.12.0] - 2026-08-11
+
 ### Added
 
 - **A reasoning-effort ladder.** One provider-neutral set of rungs —

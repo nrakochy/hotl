@@ -20,11 +20,11 @@ default = ["minify"]
 minify = ["hotl-tools/minify"]
 
 [dependencies]
-hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.11.0", features = ["ratatui"] }
-hotl-tools = { path = "../hotl-tools", version = "0.11.0", default-features = false }
+hotl_theme = { package = "hotl-theme", path = "../hotl-theme", version = "0.12.0", features = ["ratatui"] }
+hotl-tools = { path = "../hotl-tools", version = "0.12.0", default-features = false }
 # A leaf crate with no I/O — added to *remove* a hand-copied
 # `normalize_session_name`, not to reach the engine (§7).
-hotl-types = { path = "../hotl-types", version = "0.11.0" }
+hotl-types = { path = "../hotl-types", version = "0.12.0" }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 serde_json = { workspace = true }
