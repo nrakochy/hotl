@@ -10,7 +10,8 @@ use std::sync::Arc;
 use hotl_context::{load_memory, load_system_prompt, project_instructions};
 use hotl_engine::{EngineConfig, EngineEvent, Outcome, SessionDeps, SessionHandle};
 use hotl_platform::{Clock, EnvSecrets, SecretStore, SystemClock};
-use hotl_provider::CacheTtl;
+use hotl_provider::effort::EFFORT_LEVELS;
+use hotl_provider::{CacheTtl, Effort};
 use hotl_provider_anthropic::{AnthropicProvider, DEFAULT_MODEL};
 use hotl_store::{Masker, SessionLog};
 use hotl_tools::{rules::Rules, sandbox, Registry};
@@ -2506,6 +2507,20 @@ fn engine_config(
     if secrets.get("HOTL_THINKING").as_deref() == Some("0") {
         config.thinking = false;
     }
+    // Env beats config, like every other scalar here. A typo warns and is
+    // ignored rather than refusing to start — same posture as `parse_isolation`.
+    config.effort = secrets
+        .get("HOTL_EFFORT")
+        .or_else(|| cfg.provider.effort.clone())
+        .and_then(|raw| match raw.trim().parse::<Effort>() {
+            Ok(e) => Some(e),
+            Err(_) => {
+                eprintln!(
+                    "hotl: effort `{raw}` is not a known level ({EFFORT_LEVELS}) — ignoring."
+                );
+                None
+            }
+        });
     config
 }
 
@@ -4344,6 +4359,42 @@ mod tests {
         assert_eq!(
             engine_config("m", &MapSecrets::default(), &config_from_toml("")).max_turns,
             100
+        );
+    }
+
+    #[test]
+    fn effort_parses_from_the_provider_table() {
+        let cfg = config_from_toml("[provider]\neffort = \"xhigh\"\n");
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &cfg).effort,
+            Some(Effort::XHigh)
+        );
+    }
+
+    /// A typo in a config file is not worth refusing to start over — and
+    /// `ultra` is exactly the word someone arriving from another harness will
+    /// try, since this ladder deliberately does not carry it.
+    #[test]
+    fn an_unknown_effort_is_ignored_not_fatal() {
+        let cfg = config_from_toml("[provider]\neffort = \"ultra\"\n");
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &cfg).effort,
+            None
+        );
+    }
+
+    #[test]
+    fn env_beats_the_config_file_for_effort() {
+        let cfg = config_from_toml("[provider]\neffort = \"low\"\n");
+        let secrets = MapSecrets::from([("HOTL_EFFORT", "max")]);
+        assert_eq!(engine_config("m", &secrets, &cfg).effort, Some(Effort::Max));
+    }
+
+    #[test]
+    fn an_unset_effort_stays_unset() {
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &config_from_toml("")).effort,
+            None
         );
     }
 

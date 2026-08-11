@@ -212,6 +212,11 @@ pub struct ProviderCfg {
     pub auth: Option<String>,
     /// Cheap model for compaction summaries.
     pub fast_model: Option<String>,
+    /// Reasoning depth: `low | medium | high | xhigh | max`. Absent = the
+    /// provider's default. Text, not a typed enum: an unrecognized value warns
+    /// and is ignored rather than refusing to load the whole file (which would
+    /// take the `[[deny]]` rules down with it).
+    pub effort: Option<String>,
     /// Command whose stdout (trimmed) is the API key. When set, it beats the
     /// static key env vars: configuring a helper is a deliberate act.
     pub api_key_helper: Option<String>,
