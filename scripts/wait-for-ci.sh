@@ -20,7 +20,10 @@ set -euo pipefail
 #
 # ci.yml job ids. The nix legs are deliberately absent: master-only, often
 # skipped, chronically red on darwin, and re-verified by nix-tag.yml (non-fatal).
-REQUIRED=(fmt watch harness msrv docs audit)
+# harness-windows runs on every push and is the only leg that exercises the
+# platform's real syscalls, so a red Windows suite must block a release — it was
+# missing here, which is how v0.12.0 shipped with it failing.
+REQUIRED=(fmt watch harness harness-windows msrv docs audit)
 
 timeout="${HOTL_CI_WAIT_TIMEOUT:-1800}"
 interval="${HOTL_CI_POLL_INTERVAL:-15}"
