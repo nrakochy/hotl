@@ -2782,11 +2782,19 @@ pub(crate) fn auth_mode(
     }
 }
 
-/// The active endpoint, if one is configured. `HOTL_ANTHROPIC_BASE_URL` is the
-/// Anthropic-side twin of the long-standing `HOTL_OPENAI_BASE_URL`.
-fn anthropic_base_url(cfg: &crate::config::Config, secrets: &dyn SecretStore) -> Option<String> {
+/// Endpoint override for the active provider. Precedence, specific-beats-general:
+///   HOTL_<VENDOR>_BASE_URL   (legacy alias — still honored, so nothing breaks)
+///     → HOTL_PROVIDER_BASE_URL   (neutral; mirrors [provider].base_url and pairs
+///                                 with HOTL_PROVIDER_AUTH)
+///       → [provider].base_url
+fn provider_base_url(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+    legacy_env: &str,
+) -> Option<String> {
     secrets
-        .get("HOTL_ANTHROPIC_BASE_URL")
+        .get(legacy_env)
+        .or_else(|| secrets.get("HOTL_PROVIDER_BASE_URL"))
         .or_else(|| cfg.provider.base_url.clone())
 }
 
@@ -2810,20 +2818,17 @@ pub(crate) fn active_endpoint(
     secrets: &dyn SecretStore,
 ) -> Option<String> {
     match selected_model(cfg, secrets).0.as_str() {
-        "openai" | "oai" => secrets
-            .get("HOTL_OPENAI_BASE_URL")
-            .or_else(|| cfg.provider.base_url.clone())
+        "openai" | "oai" => provider_base_url(cfg, secrets, "HOTL_OPENAI_BASE_URL")
             .filter(|b| b != hotl_provider_openai::DEFAULT_BASE_URL),
-        _ => anthropic_base_url(cfg, secrets),
+        _ => provider_base_url(cfg, secrets, "HOTL_ANTHROPIC_BASE_URL"),
     }
 }
 
-fn subscription_needs_base_url(env_var: &str) -> String {
-    format!(
-        "[provider] auth = \"subscription\" requires base_url — hotl holds no credential in \
-         this mode, so it needs an endpoint that authenticates on its own. Set [provider] \
-         base_url (or {env_var}) to that endpoint, or use auth = \"api_key\"."
-    )
+fn subscription_needs_base_url() -> String {
+    "[provider] auth = \"subscription\" requires base_url — hotl holds no credential in \
+     this mode, so it needs an endpoint that authenticates on its own. Set [provider] \
+     base_url (or HOTL_PROVIDER_BASE_URL) to that endpoint, or use auth = \"api_key\"."
+        .to_string()
 }
 
 /// Warn when traffic crosses the network in the clear. Which exposure matters
@@ -2853,9 +2858,9 @@ fn resolve_anthropic(
     secrets: &dyn SecretStore,
     auth: AuthMode,
 ) -> Result<ProviderAndSource, String> {
-    let base = anthropic_base_url(cfg, secrets);
+    let base = provider_base_url(cfg, secrets, "HOTL_ANTHROPIC_BASE_URL");
     if auth == AuthMode::Subscription {
-        let base = base.ok_or_else(|| subscription_needs_base_url("HOTL_ANTHROPIC_BASE_URL"))?;
+        let base = base.ok_or_else(subscription_needs_base_url)?;
         warn_cleartext(&base, auth, false);
         // A keyless source, deliberately: selection refuses to hand the
         // provider a credential, and the provider refuses to consult one.
@@ -2894,11 +2899,9 @@ fn resolve_openai(
     secrets: &dyn SecretStore,
     auth: AuthMode,
 ) -> Result<ProviderAndSource, String> {
-    let configured = secrets
-        .get("HOTL_OPENAI_BASE_URL")
-        .or_else(|| cfg.provider.base_url.clone());
+    let configured = provider_base_url(cfg, secrets, "HOTL_OPENAI_BASE_URL");
     if auth == AuthMode::Subscription {
-        let base = configured.ok_or_else(|| subscription_needs_base_url("HOTL_OPENAI_BASE_URL"))?;
+        let base = configured.ok_or_else(subscription_needs_base_url)?;
         warn_cleartext(&base, auth, false);
         let source: Arc<dyn hotl_provider::key::KeySource> =
             Arc::new(hotl_provider::key::StaticKey(None));
@@ -4590,6 +4593,17 @@ mod tests {
         assert!(err.contains("base_url"), "{err}");
     }
 
+    /// The error steers to the neutral env var, not a vendor-specific one —
+    /// matching the promoted [provider].base_url / HOTL_PROVIDER_BASE_URL.
+    #[test]
+    fn subscription_base_url_error_names_the_neutral_env_var() {
+        let cfg = config_from_toml("[provider]\nauth = \"subscription\"\n");
+        let secrets = MapSecrets::from([("HOTL_MODEL", "anthropic/m")]);
+        let err = select_provider(&cfg, &secrets).err().unwrap();
+        assert!(err.contains("HOTL_PROVIDER_BASE_URL"), "{err}");
+        assert!(!err.contains("HOTL_ANTHROPIC_BASE_URL"), "{err}");
+    }
+
     #[test]
     fn subscription_auth_needs_no_key() {
         let cfg = config_from_toml(
@@ -4656,6 +4670,67 @@ mod tests {
         ]);
         // Selection must succeed; the env value is what the provider gets.
         assert!(select_provider(&cfg, &secrets).is_ok());
+    }
+
+    /// The neutral env var mirrors `[provider].base_url` and pairs with
+    /// `HOTL_PROVIDER_AUTH`, so it must resolve for the anthropic provider.
+    #[test]
+    fn neutral_provider_base_url_applies_to_anthropic() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "anthropic/m"),
+            ("HOTL_PROVIDER_BASE_URL", "http://127.0.0.1:9001"),
+        ]);
+        assert_eq!(
+            active_endpoint(&cfg, &secrets).as_deref(),
+            Some("http://127.0.0.1:9001")
+        );
+    }
+
+    /// The same neutral var resolves for openai — one knob, whichever provider
+    /// is active.
+    #[test]
+    fn neutral_provider_base_url_applies_to_openai() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "openai/m"),
+            ("HOTL_PROVIDER_BASE_URL", "http://127.0.0.1:9002/v1"),
+        ]);
+        assert_eq!(
+            active_endpoint(&cfg, &secrets).as_deref(),
+            Some("http://127.0.0.1:9002/v1")
+        );
+    }
+
+    /// Back-compat: the vendor-prefixed alias still wins when both are set, so
+    /// no existing HOTL_ANTHROPIC_BASE_URL user sees a change (specific > general).
+    #[test]
+    fn vendor_alias_wins_over_neutral_for_anthropic() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "anthropic/m"),
+            ("HOTL_ANTHROPIC_BASE_URL", "http://vendor.anthropic"),
+            ("HOTL_PROVIDER_BASE_URL", "http://neutral"),
+        ]);
+        assert_eq!(
+            active_endpoint(&cfg, &secrets).as_deref(),
+            Some("http://vendor.anthropic")
+        );
+    }
+
+    /// Same back-compat guarantee on the long-standing openai alias.
+    #[test]
+    fn vendor_alias_wins_over_neutral_for_openai() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "openai/m"),
+            ("HOTL_OPENAI_BASE_URL", "http://vendor.openai/v1"),
+            ("HOTL_PROVIDER_BASE_URL", "http://neutral/v1"),
+        ]);
+        assert_eq!(
+            active_endpoint(&cfg, &secrets).as_deref(),
+            Some("http://vendor.openai/v1")
+        );
     }
 
     /// The predicate behind every cleartext warning. `https://` is always

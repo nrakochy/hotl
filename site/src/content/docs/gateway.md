@@ -119,7 +119,7 @@ base_url = "http://127.0.0.1:4000/v1"
 auth     = "subscription"
 ```
 
-Per-shell: `export HOTL_PROVIDER_AUTH=subscription HOTL_ANTHROPIC_BASE_URL=http://127.0.0.1:3456`.
+Per-shell: `export HOTL_PROVIDER_AUTH=subscription HOTL_PROVIDER_BASE_URL=http://127.0.0.1:3456`. (The vendor-specific `HOTL_ANTHROPIC_BASE_URL` / `HOTL_OPENAI_BASE_URL` still work as aliases.)
 
 Three things worth knowing:
 

@@ -231,8 +231,8 @@ A refusal is a prompt: it names the offending component and tells the model to r
 |---|---|---|
 | `HOTL_MODEL` | `[provider].model` | `provider/model`; `openai/…` covers any OpenAI-compatible endpoint. |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | Provider keys (never put keys in config.toml). |
-| `HOTL_OPENAI_BASE_URL` | `[provider].base_url` | OpenAI-compatible endpoint. A non-loopback `http://` URL with a key set warns (cleartext). |
-| `HOTL_ANTHROPIC_BASE_URL` | `[provider].base_url` | Anthropic-shaped endpoint. Both `https://host/v1` and the bare `https://host` resolve. |
+| `HOTL_PROVIDER_BASE_URL` | `[provider].base_url` | Endpoint for the active provider (any provider). Both `https://host/v1` and the bare `https://host` resolve. A non-loopback `http://` URL with a key set warns (cleartext). |
+| `HOTL_OPENAI_BASE_URL` / `HOTL_ANTHROPIC_BASE_URL` | `[provider].base_url` | Legacy vendor-specific aliases for the row above; still honored, and win over the neutral name when both are set. |
 | `HOTL_PROVIDER_AUTH` | `[provider].auth` | `api_key` (default) or `subscription` — see [endpoints that authenticate for you](../gateway/#endpoints-that-authenticate-for-you). |
 | `HOTL_API_KEY_HELPER` | `[provider].api_key_helper` | Overrides the config.toml key of the same name. |
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |

@@ -28,6 +28,13 @@ semver promise of their own.
   and no unknown key sent to a local server that might reject it. `thinking`
   stays its own independent off-switch.
 
+- **A provider-neutral endpoint env var: `HOTL_PROVIDER_BASE_URL`.** It mirrors
+  `[provider].base_url` and pairs with `HOTL_PROVIDER_AUTH`, so the endpoint knob
+  no longer names a vendor. The vendor-specific `HOTL_OPENAI_BASE_URL` and
+  `HOTL_ANTHROPIC_BASE_URL` remain honored as legacy aliases and still win when
+  both are set (specific beats general), so nothing breaks. The
+  `auth = "subscription"` "requires base_url" error now names the neutral var.
+
 - **Native Windows builds, runs, and is tested.** The whole workspace compiles
   for `x86_64-pc-windows-msvc` with no warnings, and the harness suite runs on
   `windows-latest` in CI. The file tools, the session server, the process

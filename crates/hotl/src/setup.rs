@@ -14,8 +14,8 @@ pub const DEFAULT_CONFIG: &str = "\
 # ~/.config/hotl/config.toml — the single hotl config file.
 # Docs: https://nrakochy.github.io/hotl/
 # Every hand-editable setting lives here. Env vars override these (HOTL_MODEL,
-# ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_OPENAI_BASE_URL,
-# HOTL_ANTHROPIC_BASE_URL, HOTL_PROVIDER_AUTH, HOTL_SANDBOX=off).
+# ANTHROPIC_API_KEY / OPENAI_API_KEY, HOTL_PROVIDER_BASE_URL,
+# HOTL_PROVIDER_AUTH, HOTL_SANDBOX=off).
 
 [provider]
 # provider/model. `openai/…` covers any OpenAI-compatible endpoint.
