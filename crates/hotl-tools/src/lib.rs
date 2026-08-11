@@ -24,6 +24,7 @@ pub mod skills;
 pub(crate) mod testsupport;
 pub mod todo;
 pub mod web;
+pub mod winfloor;
 
 pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};

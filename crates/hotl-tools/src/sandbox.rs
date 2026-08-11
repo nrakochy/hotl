@@ -302,8 +302,15 @@ pub(crate) fn write_roots() -> Vec<PathBuf> {
 /// `from_all` write grant on an ancestor re-opens the read it is meant to
 /// deny (plan 0022, watch-out 7).
 pub fn write_roots_with(extra: &[PathBuf]) -> Vec<PathBuf> {
+    let cwd = canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    if cfg!(windows) {
+        // A different set, not a translation: `/private/tmp` and `/dev` do not
+        // exist, and the shared `%TEMP%` is narrowed to a session directory
+        // rather than adopted wholesale. See `winfloor::write_roots`.
+        return crate::winfloor::write_roots(cwd, extra);
+    }
     let mut roots = vec![
-        canon(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))),
+        cwd,
         canon(std::env::temp_dir()),
         PathBuf::from("/private/tmp"),
         PathBuf::from("/dev"),
@@ -363,6 +370,10 @@ fn mechanism_available() -> Result<&'static str, String> {
     #[cfg(target_os = "linux")]
     {
         return linux_mechanism();
+    }
+    #[cfg(windows)]
+    {
+        return crate::winfloor::mechanism_available();
     }
     #[allow(unreachable_code)]
     Err("no sandbox mechanism for this OS".into())
