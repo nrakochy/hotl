@@ -299,11 +299,12 @@ fn token_len_at(s: &str) -> Option<usize> {
 /// - single-quoted, `'` escaped as `'\''`: `'/a/My Shot.png'`
 /// - double-quoted with `\" \\ \$ \`` escapes: `"/a/My Shot.png"`
 ///
-/// Two gates keep prose honest: the unescaped candidate must LOOK like a path
-/// (starts `/`, `~`, `./`, `../` — drops are always absolute, so a bare
-/// `logo.png` mentioned in a sentence stays literal), and must end in a known
-/// image extension. In the bare form an unescaped space is the discriminator
-/// between a dropped path and a sentence that happens to mention one.
+/// Two gates keep prose honest: the candidate must LOOK like a path (starts
+/// `/`, `~`, `./`, `../` — drops are always absolute, so a bare `logo.png`
+/// mentioned in a sentence stays literal), and its final component must end in
+/// a known image extension. Spaces inside the filename are fine (drops arrive
+/// with them literal); a space immediately before a `/` is the tell that a
+/// second path was appended, and keeps `/a/b.png /a/c.png` literal.
 fn dropped_path(text: &str) -> Option<(String, String)> {
     let t = text.trim();
     if t.is_empty() || t.contains('\n') {
@@ -314,7 +315,15 @@ fn dropped_path(text: &str) -> Option<(String, String)> {
     } else if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
         unescape_double_quoted(&t[1..t.len() - 1])?
     } else {
-        unescape_bare(t)?
+        // Bare drop: unescape backslashes, keep literal spaces. A space right
+        // before a '/' means a second absolute path was appended (a multi-file
+        // drop, or prose like "/a/b.png /a/c.png") — we only compact a single
+        // file, so leave those literal.
+        let c = unescape_bare(t);
+        if c.contains(" /") {
+            return None;
+        }
+        c
     };
     if !(candidate.starts_with('/')
         || candidate.starts_with('~')
@@ -350,9 +359,10 @@ fn unescape_double_quoted(inner: &str) -> Option<String> {
     Some(out)
 }
 
-/// Undo bare backslash escaping. Unescaped whitespace disqualifies: a real
-/// dropped path arrives with its spaces escaped, prose does not.
-fn unescape_bare(t: &str) -> Option<String> {
+/// Undo bare backslash escaping, keeping literal interior spaces. A terminal
+/// that sends a drag-and-drop as a bracketed paste delivers the path with its
+/// spaces intact, not shell-escaped — `unescape_bare("a\\ b") == unescape_bare("a b")`.
+fn unescape_bare(t: &str) -> String {
     let mut out = String::with_capacity(t.len());
     let mut chars = t.chars();
     while let Some(c) = chars.next() {
@@ -361,11 +371,10 @@ fn unescape_bare(t: &str) -> Option<String> {
                 Some(e) => out.push(e),
                 None => out.push('\\'),
             },
-            c if c.is_whitespace() => return None,
             _ => out.push(c),
         }
     }
-    Some(out)
+    out
 }
 
 /// Media type for a path whose final component has a known image extension
@@ -410,6 +419,26 @@ mod tests {
             ("/a/b.JPG", "/a/b.JPG", "image/jpeg"),
         ] {
             assert_eq!(classify(paste), image(want_path, want_mt), "{paste:?}");
+        }
+    }
+
+    #[test]
+    fn a_dropped_path_with_literal_spaces_is_an_image() {
+        // A terminal that sends a drag-and-drop as a bracketed paste delivers
+        // the path with literal (not backslash-escaped) spaces — the macOS
+        // screenshot default name is the canonical case.
+        for (paste, want_path) in [
+            (
+                "/Users/me/Desktop/Screenshot 2026-08-10 at 11.52.46 AM.png",
+                "/Users/me/Desktop/Screenshot 2026-08-10 at 11.52.46 AM.png",
+            ),
+            // A space in a directory component too.
+            (
+                "/Users/me/My Shots/shot 1.png",
+                "/Users/me/My Shots/shot 1.png",
+            ),
+        ] {
+            assert_eq!(classify(paste), image(want_path, "image/png"), "{paste:?}");
         }
     }
 
