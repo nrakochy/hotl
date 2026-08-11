@@ -284,7 +284,12 @@ pub(crate) fn open_dir_beneath(root: &Path, rel: &Path) -> Result<File, GuardErr
 /// joined path to an external walker (`ignore`, `rg`) that takes a path rather
 /// than a handle. Enforced by `resolved_path_is_the_same_object`.
 pub(crate) fn resolve_beneath(root: &Path, rel: &Path) -> Result<PathBuf, GuardError> {
-    let handle = open_leaf(root, rel, OpenMode::File)?;
+    // A directory cannot be opened in File mode on Windows (unix tolerates it),
+    // and resolve_beneath must handle both — glob's search root is a directory.
+    let handle = match open_leaf(root, rel, OpenMode::File) {
+        Ok(h) => h,
+        Err(_) => open_leaf(root, rel, OpenMode::Dir)?,
+    };
     let joined = join_beneath(root, rel);
     // Belt-and-braces: the handle we validated and the path we return are the
     // same object on the same volume.
@@ -305,7 +310,11 @@ pub(crate) fn resolve_beneath(root: &Path, rel: &Path) -> Result<PathBuf, GuardE
         hotl_platform::openat::normalized_name(&handle).map_err(GuardError::Io)?
     {
         let expected = dunce::canonicalize(&joined).map_err(GuardError::Io)?;
-        if !same_path(&normalized, &expected) {
+        // `GetFinalPathNameByHandle` hands back a `\\?\`-verbatim path; strip it
+        // to match `dunce::canonicalize`'s de-verbatim'd form, or every Windows
+        // path mismatches on the prefix alone. (A >260-char path dunce cannot
+        // shorten stays verbatim on both sides, preserving the fail-closed case.)
+        if !same_path(dunce::simplified(&normalized), &expected) {
             return Err(GuardError::Unnormalized {
                 at: rel.to_path_buf(),
             });
@@ -338,6 +347,19 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// and `write_creates_parents_but_never_through_a_link`.
 pub(crate) fn create_beneath(root: &Path, rel: &Path, mkparents: bool) -> Result<File, GuardError> {
     let (dir, leaf) = split_parent(root, rel, mkparents)?;
+    // A symlink standing where the leaf should be is refused, never truncated
+    // through: on Windows FILE_OVERWRITE_IF supersedes the link before the
+    // reparse check runs, so guard the final component here as replace_beneath
+    // does. (Unix's O_NOFOLLOW already refuses, harmlessly, one layer down.)
+    match dir.child_kind(&leaf) {
+        None | Some(NodeKind::RegularFile) => {}
+        Some(NodeKind::NotFollowable { .. }) => {
+            return Err(GuardError::Escape {
+                at: rel.to_path_buf(),
+            })
+        }
+        Some(_) => return Err(GuardError::NotRegular),
+    }
     dir.create_child_file(&leaf, Excl::Truncate)
         .map_err(|e| at(e, rel))
 }
@@ -749,6 +771,9 @@ pub(crate) mod tests {
         );
     }
 
+    // POSIX absolute paths like `/srv/cache` are not `is_absolute()` on Windows
+    // (no drive prefix), so the guard rejects them before the prefix match.
+    #[cfg(unix)]
     #[test]
     fn extra_root_for_matches_absolute_paths_by_longest_prefix() {
         let outer = PathBuf::from("/srv/cache");

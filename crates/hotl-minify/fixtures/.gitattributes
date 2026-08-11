@@ -1,0 +1,3 @@
+# Byte-exact minify fixtures loaded via include_str!: keep LF on every platform
+# so Git for Windows' autocrlf cannot rewrite them to CRLF and break the tests.
+* text eol=lf

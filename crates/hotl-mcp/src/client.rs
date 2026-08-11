@@ -737,6 +737,9 @@ mod tests {
         assert!(client.is_dead());
     }
 
+    // Spawns a real `/bin/sh`; the portable stderr-tail path (EPIPE on write)
+    // is covered by `a_failed_write_still_carries_the_stderr_tail` below.
+    #[cfg(unix)]
     #[tokio::test]
     async fn stderr_tail_reaches_the_disconnect_error() {
         // T2-13e: a crashing server's own diagnostics used to go to /dev/null.

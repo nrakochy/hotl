@@ -101,6 +101,9 @@ mod tests {
     /// frame, and see the endpoint go from live to dead.
     #[test]
     fn active_adapter_upholds_the_contract() {
+        // Hold the env lock: this test derives its socket path from `data()`,
+        // which a sibling test rewrites via `XDG_DATA_HOME`. See `ENV_GUARD`.
+        let _env = crate::ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

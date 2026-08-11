@@ -498,8 +498,13 @@ impl SessionLog {
         hotl_platform::PRIVATE_FS.create_dir_all(dir)?;
         let session_id = new_ulid();
         let path = dir.join(format!("{session_id}.jsonl"));
+        // FromStart, not Append: a fresh, single-writer, never-reopened log
+        // written strictly sequentially — append semantics add nothing here. And
+        // on Windows an append handle lacks FILE_WRITE_DATA, so the seal path's
+        // set_len() truncation of a torn line fails silently; FromStart can
+        // truncate on both platforms. (See seal_and_truncate.)
         let file =
-            hotl_platform::PRIVATE_FS.create_file_new(&path, hotl_platform::Writes::Append)?;
+            hotl_platform::PRIVATE_FS.create_file_new(&path, hotl_platform::Writes::FromStart)?;
         let offset = file.metadata()?.len();
         let (tx, rx) = mpsc::channel::<WriterCmd>();
         let sealed = Arc::new(Mutex::new(None));
@@ -3515,7 +3520,9 @@ mod tests {
     fn batch_fixture(dir: &Path) -> (File, WriterCtx) {
         let file = std::fs::OpenOptions::new()
             .create_new(true)
-            .append(true)
+            // write, not append: mirror SessionLog's FromStart so the seal
+            // path's set_len() can truncate a torn line on Windows too.
+            .write(true)
             .open(dir.join("batch.jsonl"))
             .unwrap();
         (

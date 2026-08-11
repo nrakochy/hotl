@@ -72,7 +72,9 @@ jobs:
       - name: Clippy (harness crates + binary)
         run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked
+        # `--no-fail-fast`: run every crate's tests even after one fails, so a
+        # single run surfaces the whole failure set instead of one-per-round.
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked --no-fail-fast
       - name: Test (security-enforced feature)
         run: |
           cargo test -p hotl-tools --features security-enforced --locked
@@ -106,13 +108,33 @@ jobs:
         with:
           key: harness-windows
       # Same reason as the Linux leg: the grep tool spawns `rg`, and a test
-      # that evaporates at spawn is not coverage.
+      # that evaporates at spawn is not coverage. Chocolatey exits 0 even when
+      # its feed 503s and installs nothing, so retry until `rg` is actually
+      # resolvable rather than trusting the exit code.
       - name: Install ripgrep
-        run: choco install ripgrep -y --no-progress
+        shell: pwsh
+        run: |
+          Import-Module "$env:ChocolateyInstall\helpers\chocolateyProfile.psm1" -ErrorAction SilentlyContinue
+          for ($i = 1; $i -le 5; $i++) {
+            choco install ripgrep -y --no-progress
+            Update-SessionEnvironment
+            if (Get-Command rg -ErrorAction SilentlyContinue) { break }
+            Write-Host "ripgrep not resolvable yet (attempt $i/5); retrying in 15s..."
+            Start-Sleep -Seconds 15
+          }
+          # Put the native rg.exe ahead of Chocolatey's shim on PATH: the shim's
+          # stdout does not reach a *detached* child's pipe (the grep tool
+          # detaches its session), so grep would see empty output through it.
+          $rg = Get-ChildItem "$env:ChocolateyInstall\lib\ripgrep" -Recurse -Filter rg.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($rg) { Add-Content -Path $env:GITHUB_PATH -Value $rg.DirectoryName }
+          if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw "ripgrep is not installed after 5 attempts" }
+          rg --version
       - name: Clippy (harness crates + binary)
         run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked
+        # `--no-fail-fast`: run every crate's tests even after one fails, so a
+        # single run surfaces the whole failure set instead of one-per-round.
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked --no-fail-fast
       - name: Test (security-enforced feature)
         run: |
           cargo test -p hotl-tools --features security-enforced --locked

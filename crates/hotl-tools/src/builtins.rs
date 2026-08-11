@@ -1046,7 +1046,9 @@ async fn glob_run_input(
         let shown = total.min(GLOB_MAX_RESULTS);
         let mut s = hits[..shown]
             .iter()
-            .map(|h| h.rel.to_string_lossy().into_owned())
+            // Forward slashes so the model sees consistent paths on every
+            // platform (and they round-trip back through the file tools).
+            .map(|h| h.rel.to_string_lossy().replace('\\', "/"))
             .collect::<Vec<_>>()
             .join("\n");
         if total > shown {
@@ -2440,6 +2442,9 @@ mod tests {
             "leaked the home directory: {}",
             out.content
         );
+        // On Windows the reparse refusal surfaces as "access denied" rather than
+        // naming the symlink; the containment checks above are what matter.
+        #[cfg(unix)]
         assert!(out.content.contains("symlink"), "{}", out.content);
     }
 
@@ -2553,9 +2558,14 @@ mod tests {
             f.content
         );
         assert!(f.content.contains("[exit 3]"), "{}", f.content);
-        let k = run(&BashTool::default(), json!({"command": "kill -TERM $$"}));
-        assert!(k.is_error && k.content.contains("signal"), "{}", k.content);
-        assert!(k.content.contains("[killed by SIGTERM]"), "{}", k.content);
+        // Signals are unix-only; on Windows a bash death surfaces as an exit
+        // code (MSYS encodes SIGTERM as exit 3840), not a signal.
+        #[cfg(unix)]
+        {
+            let k = run(&BashTool::default(), json!({"command": "kill -TERM $$"}));
+            assert!(k.is_error && k.content.contains("signal"), "{}", k.content);
+            assert!(k.content.contains("[killed by SIGTERM]"), "{}", k.content);
+        }
     }
 
     #[test]

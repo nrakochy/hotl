@@ -972,7 +972,10 @@ mod tests {
             format!("http://{addr}/"),
             armed.clone(),
         );
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        // Windows refuses a connection to a dropped-listener port slowly, so
+        // bound this well above ARM_TIMEOUT rather than at 1s (as the sibling
+        // black-holed test already does).
+        tokio::time::timeout(ARM_TIMEOUT + std::time::Duration::from_secs(3), async {
             while armed.load(Ordering::Acquire) != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
@@ -1018,7 +1021,10 @@ mod tests {
         let armed = Arc::new(AtomicU64::new(0));
         let client = http_client(std::time::Duration::from_secs(1));
         let g1 = spawn_arm(client.clone(), format!("http://{addr}/"), armed.clone());
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        // Windows refuses a connection to a dropped-listener port slowly, so
+        // bound this well above ARM_TIMEOUT rather than at 1s (as the sibling
+        // black-holed test already does).
+        tokio::time::timeout(ARM_TIMEOUT + std::time::Duration::from_secs(3), async {
             while armed.load(Ordering::Acquire) != 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }

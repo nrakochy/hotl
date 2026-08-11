@@ -1401,9 +1401,11 @@ mod env_tests {
     /// and a non-empty credential when auth is on — rather than re-deriving
     /// the token, which would make the assertion a tautology.
     fn assert_proxy_url(envs: &[(String, Option<String>)], key: &str, port: u16) {
+        // Case-insensitive: Windows env names collapse `HTTP_PROXY`/`http_proxy`
+        // into one entry, so an exact-case lookup would miss it.
         let value = envs
             .iter()
-            .find(|(k, _)| k == key)
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
             .and_then(|(_, v)| v.clone())
             .unwrap_or_else(|| panic!("{key} must be set"));
         let authority = format!("@127.0.0.1:{port}");
@@ -1452,8 +1454,11 @@ mod env_tests {
             assert_proxy_url(&envs, key, 9123);
         }
         for key in ["NO_PROXY", "no_proxy"] {
+            // Case-insensitive: Windows collapses NO_PROXY/no_proxy into one env
+            // entry, so an exact tuple match would miss the other casing.
             assert!(
-                envs.contains(&(key.to_string(), Some("localhost,127.0.0.1,::1".to_string()))),
+                envs.iter().any(|(k, v)| k.eq_ignore_ascii_case(key)
+                    && v.as_deref() == Some("localhost,127.0.0.1,::1")),
                 "{key} must exempt loopback"
             );
         }
@@ -1464,8 +1469,13 @@ mod env_tests {
         for egress in [EgressState::Off, EgressState::Open] {
             let cmd = build_command("true", &status, &egress);
             assert!(
-                cmd.as_std().get_envs().all(|(_, v)| v.is_none()),
-                "{egress:?} must only remove variables, never set one"
+                cmd.as_std().get_envs().all(|(k, v)| {
+                    // Windows legitimately sets the MSYS path-conversion shims on
+                    // every path; everything else must be a removal.
+                    v.is_none()
+                        || matches!(k.to_str(), Some("MSYS_NO_PATHCONV" | "MSYS2_ARG_CONV_EXCL"))
+                }),
+                "{egress:?} must only remove variables (bar the Windows MSYS shims)"
             );
         }
     }
@@ -1576,9 +1586,13 @@ mod write_set_tests {
         assert_eq!(roots.len(), base.len() + 1);
         assert_eq!(roots[..base.len()], base[..]);
         assert_eq!(roots.last(), Some(&extra));
-        // The base set is exactly today's floor.
-        assert!(base.contains(&PathBuf::from("/dev")));
-        assert!(base.contains(&PathBuf::from("/private/tmp")));
+        // The base set is exactly today's floor (these entries are unix-only;
+        // Windows carries winfloor's own set).
+        #[cfg(unix)]
+        {
+            assert!(base.contains(&PathBuf::from("/dev")));
+            assert!(base.contains(&PathBuf::from("/private/tmp")));
+        }
     }
 
     /// Plan 0022 decision 3. The grant lifts Tier B and only Tier B, and it

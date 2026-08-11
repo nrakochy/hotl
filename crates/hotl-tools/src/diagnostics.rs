@@ -178,6 +178,9 @@ mod tests {
     /// Replaces `runs_under_the_sandbox_floor`, which returned (passing) when
     /// no floor existed and whose only assertion — a file's non-existence —
     /// also held if the command never ran (two vacuous-pass routes).
+    // Exercises the unix sandbox floor and a POSIX-shell probe command
+    // (`… > f 2>/dev/null; true`); the confinement mechanism is unix-only.
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_diagnostic_is_confined_and_we_can_tell_it_actually_ran() {
         use crate::sandbox::{self, SandboxStatus};

@@ -2683,7 +2683,12 @@ prefix = "read"
         let _ = std::fs::remove_dir_all(&dir);
         let rules = Rules::from_toml(&deny_toml(
             "read",
-            &format!("path_prefix = \"{}\"", dir.display()),
+            // Forward-slash: a Windows path's backslashes are invalid escapes in
+            // a double-quoted TOML string, and `/` still canonicalizes fine.
+            &format!(
+                "path_prefix = \"{}\"",
+                dir.display().to_string().replace('\\', "/")
+            ),
         ))
         .unwrap();
         let c = project(&rules, &|p| dunce::canonicalize(p).ok());

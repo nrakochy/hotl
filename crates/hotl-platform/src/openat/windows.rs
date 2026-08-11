@@ -27,15 +27,16 @@ use std::ptr;
 
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
 use windows_sys::Wdk::Storage::FileSystem::{
-    NtCreateFile, FILE_CREATE, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN,
-    FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF, FILE_SYNCHRONOUS_IO_NONALERT,
+    FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE, FILE_DIRECTORY_FILE,
+    FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_REPARSE_POINT, FILE_OVERWRITE_IF,
+    FILE_SYNCHRONOUS_IO_NONALERT,
 };
 use windows_sys::Win32::Foundation::{
     RtlNtStatusToDosError, GENERIC_READ, GENERIC_WRITE, HANDLE, OBJ_CASE_INSENSITIVE,
     OBJ_DONT_REPARSE, STATUS_SUCCESS, UNICODE_STRING,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FileBasicInfo, FileDispositionInfo, FileIdInfo, FileRenameInfo, GetFileInformationByHandle,
+    FileBasicInfo, FileDispositionInfo, FileIdInfo, GetFileInformationByHandle,
     GetFileInformationByHandleEx, GetFinalPathNameByHandleW, SetFileInformationByHandle,
     BY_HANDLE_FILE_INFORMATION, DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_BASIC_INFO, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
@@ -288,18 +289,25 @@ impl DirHandle for WindowsDirHandle {
         unsafe {
             ptr::copy_nonoverlapping(target.as_ptr(), info.FileName.as_mut_ptr(), target.len());
         }
-        // SAFETY: `src` is a handle we own opened with DELETE; `buf` is live
-        // and its length is what we pass.
-        let ok = unsafe {
-            SetFileInformationByHandle(
+        // The Win32 `SetFileInformationByHandle(FileRenameInfo, …)` rejects a
+        // non-NULL `RootDirectory` with ERROR_INVALID_PARAMETER (87); only the
+        // native `NtSetInformationFile(FileRenameInformation, …)` honours a
+        // handle-relative rename. Same buffer, correct entry point.
+        // SAFETY: zeroed is a valid `IO_STATUS_BLOCK`; the kernel fills it in.
+        let mut iosb = unsafe { std::mem::zeroed() };
+        // SAFETY: `src` is a handle we own opened with DELETE; `buf` is live and
+        // its length is what we pass.
+        let status = unsafe {
+            NtSetInformationFile(
                 src.as_raw_handle() as HANDLE,
-                FileRenameInfo,
+                &mut iosb,
                 buf.as_ptr().cast(),
                 bytes as u32,
+                FileRenameInformation,
             )
         };
-        if ok == 0 {
-            return Err(GuardIo::last_os_error());
+        if status != STATUS_SUCCESS {
+            return Err(nt_error(status));
         }
         Ok(())
     }
@@ -395,10 +403,21 @@ impl DirHandle for WindowsDirHandle {
         // component is a reparse point — a genuine `RESOLVE_NO_SYMLINKS`
         // analogue. `..` never reaches here; the caller strips it lexically
         // first, exactly as on Linux.
-        let mut n = wide(rel.as_os_str());
-        if n.is_empty() {
+        // NT treats `/` as a literal filename char and rejects `.`, so
+        // translate the portable rel path (which may use `/`, matching the Unix
+        // `openat2` twin) into a `\`-separated native name. A `.`/root path
+        // collapses to empty, which resolves to this handle itself.
+        let native: PathBuf = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .collect();
+        if native.as_os_str().is_empty() {
             return Ok(None);
         }
+        let mut n = wide(native.as_os_str());
         let options = match mode {
             OpenMode::File => FILE_NON_DIRECTORY_FILE,
             OpenMode::Dir => FILE_DIRECTORY_FILE,

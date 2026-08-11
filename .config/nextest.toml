@@ -1,0 +1,12 @@
+# cargo-nextest configuration.
+#
+# nextest schedules every test from every crate into one process pool sized to
+# the machine's cores, instead of `cargo test`'s one-binary-at-a-time run. On
+# this workspace — ~67 test binaries, many latency-bound on sleeps and real
+# `git` subprocesses — that oversubscription is a large wall-clock win.
+#
+# Run with:  cargo nextest run --workspace
+[profile.default]
+# Warn on any test past 30s (none should be), and terminate one still running
+# past ~2min — a backstop for the tests that spawn real git / network work.
+slow-timeout = { period = "30s", terminate-after = 4 }

@@ -512,9 +512,12 @@ mod tests {
         );
 
         // A script under the workspace is never durably trusted (Vuln 5).
+        // Use a hashable command (`bin`, written above): an unreadable one like
+        // `/bin/sh` short-circuits to Unhashable before the workspace check,
+        // and `/bin/sh` does not exist on Windows anyway.
         let script = dir.path().join("s.js");
         std::fs::write(&script, b"x").unwrap();
-        let ws = Fingerprint::of(&cfg("/bin/sh", &[script.to_str().unwrap()]));
+        let ws = Fingerprint::of(&cfg(bin.to_str().unwrap(), &[script.to_str().unwrap()]));
         let root = dunce::canonicalize(dir.path()).unwrap();
         assert_eq!(store.state("local", &ws, &root), TrustState::SessionOnly);
     }

@@ -84,8 +84,10 @@ mod tests {
     /// `XDG_DATA_HOME` wins, on Windows too.
     #[test]
     fn an_explicit_xdg_var_wins_on_every_platform() {
-        // Serialized against the sibling env test by running in one body — the
-        // process env is shared, and a parallel test harness would race.
+        // Serialized against every `data()` reader (e.g. the ipc socket test)
+        // via the shared lock — the process env is shared, and `set_var` below
+        // is a data race against a parallel harness.
+        let _env = crate::ENV_GUARD.lock().unwrap_or_else(|e| e.into_inner());
         let key = "XDG_DATA_HOME";
         let restore = std::env::var_os(key);
         let want = if cfg!(windows) { r"C:\xdg" } else { "/xdg" };

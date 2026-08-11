@@ -71,6 +71,10 @@ fn existing_binary(dir: &Path) -> std::path::PathBuf {
     target
 }
 
+// Needs the fake `#!/bin/sh` binary to actually run under the probe —
+// unrunnable on Windows (os error 193); the two failure-path tests below
+// still exercise the install on Windows.
+#[cfg(unix)]
 #[tokio::test]
 async fn downloads_verifies_and_replaces_the_binary() {
     let archive = targz(&fake_binary("0.8.0"));

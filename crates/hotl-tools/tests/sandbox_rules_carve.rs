@@ -6,6 +6,7 @@
 //! `EXTRAS` and the probe verdict are process-wide (set-once / memoized), so no
 //! other test may share the process, and one test fn so nothing races the
 //! init-before-probe ordering the production wiring promises.
+#![cfg(unix)] // the sandbox carve (Landlock / sandbox-exec) is unix-only
 
 use hotl_tools::net::EgressState;
 use hotl_tools::rules::{self, Rules};

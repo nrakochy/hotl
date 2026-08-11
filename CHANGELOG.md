@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-08-11
+
 ### Changed
 
 - **The activity snake rears up to glance between travels.** While a turn is

@@ -372,6 +372,9 @@ mod tests {
         git_ok(dir, &["init", "-q", "-b", "main"])?;
         git_ok(dir, &["config", "user.email", "t@example.com"])?;
         git_ok(dir, &["config", "user.name", "t"])?;
+        // Git for Windows defaults core.autocrlf on, which rewrites seeded and
+        // merged-back files to CRLF and breaks the byte-exact compares below.
+        git_ok(dir, &["config", "core.autocrlf", "false"])?;
         std::fs::write(dir.join("a.txt"), "a1\na2\na3\n").unwrap();
         std::fs::write(dir.join("b.txt"), "b1\n").unwrap();
         std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();

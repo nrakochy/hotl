@@ -172,9 +172,27 @@ impl Ipc for WindowsIpc {
         // to read our SID and no further. We control both ends, so this is the
         // narrowest level that still allows `authenticate_peer` to work.
         const SECURITY_IDENTIFICATION: u32 = 0x0001_0000;
-        let client = ClientOptions::new()
-            .security_qos_flags(SECURITY_IDENTIFICATION)
-            .open(pipe_name(id))?;
+        let name = pipe_name(id);
+        // A live server can have every instance momentarily busy between accept
+        // iterations; Win32 returns ERROR_PIPE_BUSY, which the docs say to wait
+        // out and retry (the same fact `liveness` already trusts). Bounded so a
+        // wedged server surfaces the busy error rather than hanging forever.
+        let client = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match ClientOptions::new()
+                    .security_qos_flags(SECURITY_IDENTIFICATION)
+                    .open(&name)
+                {
+                    Ok(c) => return Ok::<_, io::Error>(c),
+                    Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        })
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the named pipe stayed busy"))??;
         Ok(NamedPipeServerOrClient::Client(client))
     }
 

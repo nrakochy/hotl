@@ -232,7 +232,12 @@ mod tests {
         std::fs::write(cwd.join("web/AGENTS.md"), "web rules").unwrap();
 
         let (marker, item) = nested_instructions(&cwd, &sub.join("page.tsx")).expect("hint");
-        assert!(marker.contains("web/AGENTS.md"), "marker was {marker}");
+        // The marker echoes an OS path, so match separator-agnostically: it is
+        // `web\AGENTS.md` on Windows.
+        assert!(
+            marker.replace('\\', "/").contains("web/AGENTS.md"),
+            "marker was {marker}"
+        );
         let Item::User {
             text, synthetic, ..
         } = item

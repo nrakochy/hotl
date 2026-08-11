@@ -65,6 +65,14 @@ pub const PROCESS_CONTROL: ActiveProcessControl = ActiveProcessControl::new();
 pub const IPC: ActiveIpc = ActiveIpc::new();
 pub const CONSOLE: ActiveConsoleControl = ActiveConsoleControl::new();
 
+/// Serializes tests that touch process-global env: the paths tests flip
+/// `XDG_DATA_HOME` with `set_var`, and `data()` readers (the ipc socket test)
+/// derive real paths from it mid-run. Without this lock a parallel harness
+/// races and reads a half-changed env, landing the socket under a root that
+/// does not exist (ENOENT on bind or connect).
+#[cfg(test)]
+pub(crate) static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A capability this platform does not have.
 ///
 /// Adapters return this rather than quietly succeeding: a no-op adapter is
