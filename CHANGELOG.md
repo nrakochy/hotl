@@ -6,6 +6,54 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **The activity snake rears up to glance between travels.** While a turn is
+  working, the status-strip snake now swims one way for ten seconds, springs its
+  head up in the middle to glance right then left, swims back, and glances in the
+  inverse order — a cycle that restarts at the start of each working turn. It is
+  driven by a new per-turn work-tick clock that advances across the
+  thinking/writing/tool sub-phases and pauses while a prompt is blocked, so every
+  frame stays a pure function of the tick count and remains golden-testable.
+
+### Fixed
+
+- **A turn that crashed mid-batch bricked every later resume.** A turn that died
+  after committing its `tool_use` calls but before their results left an
+  unanswered assistant batch in the log; on resume the provider rejected the
+  request with HTTP 400 (`tool_calls must be followed by tool messages`), and
+  because the log is append-only it failed on *every* resume forever — the old
+  repair only closed the tail, so a prompt typed after resume stranded the
+  dangling call mid-history. Resume now synthesizes an error result for every
+  unanswered batch, in memory only (the log is never rewritten) and idempotently.
+  Two UI companions land with it: an outright turn failure renders as a loud
+  `Error` item (blocked color, ✗) instead of a muted notice, and a requested
+  `/<skill>` that finishes a turn without ever loading now warns.
+
+- **A dropped image path with spaces in the filename is recognized again.** A
+  terminal that delivers a drag-and-drop as a bracketed paste (iTerm2, tmux, and
+  others) sends the path with literal spaces, not shell-escaped ones, so a name
+  like `Screenshot 2026-08-10 at 11.52.46 AM.png` failed the path-shape gate and
+  was inserted as plain text instead of compacting to an `[Image #N]` token.
+  Literal interior spaces are kept now; a space immediately before a `/` still
+  keeps a multi-path paste (`/a/b.png /a/c.png`) literal.
+
+- **Windows: a worktree-isolated child could not write to its own floor.**
+  fsguard's NT-namespace `open_root` built a backslash-only `\??\<path>`, but
+  `git rev-parse --show-toplevel` reports forward slashes, so every
+  worktree-isolated child write failed with `ERROR_PATH_NOT_FOUND`. Separators
+  are normalized before the NT prefix now. Surfaced while repairing the seven
+  harness tests that never passed on the Windows leg — backslashes escaping in a
+  TOML hook `command`, `core.autocrlf` rewriting seeded worktrees, an exclusive
+  log write handle blocking an mtime backdate, and separator-keyed assertions.
+
+- **The release gate now covers the Windows suite.** `wait-for-ci.sh` checks a
+  named allowlist of jobs rather than CI's overall conclusion, and
+  `harness-windows` — added to `ci.yml` after the gate's `REQUIRED` set was
+  written — was missing from it, which is how v0.12.0 published to crates.io with
+  the Windows suite red. It is in `REQUIRED` now. Maintainer tooling; no change to
+  installed behavior.
+
 ## [0.12.0] - 2026-08-11
 
 ### Added
