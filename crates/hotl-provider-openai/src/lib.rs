@@ -25,8 +25,8 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{
-    ArmGuard, Provider, ProviderError, SamplingRequest, SseAssembler, StreamEvent, ToolDef,
-    Warmable,
+    ArmGuard, Effort, EffortLadder, Provider, ProviderError, SamplingRequest, SseAssembler,
+    StreamEvent, ToolDef, Warmable, ALL_EFFORTS,
 };
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
@@ -172,10 +172,41 @@ impl OpenAiCompatProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools.iter().map(tool_json).collect::<Vec<_>>());
         }
-        // `thinking` / `cache` are Anthropic-surface knobs: reasoning models
-        // decide depth server-side here, and caching is implicit — this
-        // dialect emits no breakpoints under ANY `CachePolicy`.
+        // `cache` stays an Anthropic-surface knob: caching is implicit here and
+        // this dialect emits no breakpoints under ANY `CachePolicy`. Depth does
+        // not — Chat Completions carries a flattened top-level
+        // `reasoning_effort`, and `thinking: false` has an exact spelling here
+        // (`none`) that the Anthropic dialect has no equivalent for.
+        //
+        // Only spoken when the session opted into the ladder: an unconfigured
+        // request keeps its old bytes even with `thinking: false`, because
+        // OpenAI-compatible servers vary in how they greet an unknown key.
+        if req.effort.is_some() {
+            // `thinking: false` wins: it is the explicit off-switch, and `none`
+            // is the rung the neutral ladder deliberately does not carry.
+            let level = if !req.thinking {
+                Some("none")
+            } else {
+                req.effort
+                    .and_then(|e| OpenAiLadder.resolve(&req.model, e))
+                    .map(Effort::as_str)
+            };
+            if let Some(level) = level {
+                body["reasoning_effort"] = json!(level);
+            }
+        }
         body
+    }
+}
+
+/// OpenAI's ladder is a superset of hotl's five rungs, so every rung maps
+/// through unclamped. The family is deliberately uncatalogued, so there is no
+/// per-model gating to do.
+pub struct OpenAiLadder;
+
+impl EffortLadder for OpenAiLadder {
+    fn rungs(&self, _model: &str) -> &'static [Effort] {
+        ALL_EFFORTS
     }
 }
 
@@ -1260,6 +1291,57 @@ mod tests {
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
         }
+    }
+
+    #[test]
+    fn effort_rides_top_level_as_reasoning_effort() {
+        let mut req = sampling_req();
+        req.thinking = true;
+        req.effort = Some(Effort::XHigh);
+        let body = OpenAiCompatProvider::build_body(&req);
+        assert_eq!(body["reasoning_effort"], "xhigh");
+    }
+
+    /// The byte-identity guard.
+    #[test]
+    fn an_unset_effort_with_thinking_on_emits_nothing() {
+        let mut req = sampling_req();
+        req.thinking = true;
+        let body = OpenAiCompatProvider::build_body(&req);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// The shipped narrowing of the plan's 3.3: depth is only spoken about at
+    /// all once the session opted into the ladder, so a `thinking: false`
+    /// request that never set an effort keeps its pre-ladder bytes.
+    #[test]
+    fn thinking_off_alone_still_emits_nothing() {
+        let req = sampling_req();
+        assert!(!req.thinking && req.effort.is_none());
+        let body = OpenAiCompatProvider::build_body(&req);
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    /// The off-switch wins: `none` is the rung the neutral ladder does not
+    /// carry, and this dialect is the only one with a word for it.
+    #[test]
+    fn thinking_off_beats_a_set_effort() {
+        let mut req = sampling_req();
+        req.thinking = false;
+        req.effort = Some(Effort::Max);
+        let body = OpenAiCompatProvider::build_body(&req);
+        assert_eq!(body["reasoning_effort"], "none");
+    }
+
+    /// The compat family is uncatalogued by design, so nothing gates the field.
+    #[test]
+    fn a_local_model_gets_the_field_too() {
+        let mut req = sampling_req();
+        req.model = "llama3".into();
+        req.thinking = true;
+        req.effort = Some(Effort::Low);
+        let body = OpenAiCompatProvider::build_body(&req);
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     /// INVARIANT (T1-4): the HTTP client is never the default one.
