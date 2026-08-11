@@ -41,7 +41,17 @@ impl HelperKey {
     }
 
     async fn run_helper(&self) -> Result<String, KeyError> {
-        let run = tokio::process::Command::new("sh")
+        // The resolved POSIX shell, not the literal name `sh`: on Windows there
+        // is usually no `sh` on PATH, and spawning one by name would fail with
+        // "program not found" — which reads as a broken helper rather than a
+        // missing shell.
+        let shell = hotl_tools::shell::resolve_shell().map_err(|why| {
+            KeyError(format!(
+                "api_key_helper `{}` needs a POSIX shell to run in, and none resolved: {why}",
+                self.command
+            ))
+        })?;
+        let run = tokio::process::Command::new(&shell.path)
             .arg("-c")
             .arg(&self.command)
             .stdin(std::process::Stdio::null())

@@ -391,7 +391,10 @@ pub enum Msg {
     Scroll(crate::scroll::Intent),
     Tick,
     /// `$EDITOR` result; `None` = unchanged/aborted.
-    EditorDone(Option<String>),
+    /// `Ok(None)` = unchanged or aborted; `Err` = the editor never ran, which
+    /// is a different thing and has to be said out loud rather than look like
+    /// a no-op.
+    EditorDone(Result<Option<String>, String>),
     /// Left button pressed: anchor a new selection at this cell.
     SelectStart {
         col: u16,
@@ -651,9 +654,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::EditorDone(content) => {
-            if let Some(text) = content {
-                state.editor.set_text(text.trim_end_matches('\n'));
-                refresh(state);
+            match content {
+                Ok(Some(text)) => {
+                    state.editor.set_text(text.trim_end_matches('\n'));
+                    refresh(state);
+                }
+                Ok(None) => {}
+                Err(why) => notice(state, why),
             }
             Vec::new()
         }
@@ -2164,7 +2171,7 @@ mod tests {
         // attachment still ships at submit.
         let cmds = update(
             &mut s,
-            Msg::EditorDone(Some("look: [Image #1] please".into())),
+            Msg::EditorDone(Ok(Some("look: [Image #1] please".into()))),
         );
         assert!(cmds.is_empty(), "{cmds:?}");
         let cmds = press(&mut s, KeyCode::Enter);
@@ -3009,7 +3016,7 @@ mod tests {
             s.completion.is_some(),
             "popup open before the editor round trip"
         );
-        update(&mut s, Msg::EditorDone(Some("explain the bug".into())));
+        update(&mut s, Msg::EditorDone(Ok(Some("explain the bug".into()))));
         assert!(
             s.completion.is_none(),
             "the popup must not survive a buffer replaced out from under it"
@@ -3023,6 +3030,38 @@ mod tests {
                     if h == "explain the bug" && p.text == "explain the bug"
             ),
             "the editor's real content must reach the model unchanged, got {cmds:?}"
+        );
+    }
+
+    /// The regression the `Result` exists for: an editor that never started
+    /// must not look like an editor the user closed without changing anything.
+    ///
+    /// Both used to be `None`, so on a box with no POSIX shell the key did
+    /// nothing at all and said nothing — indistinguishable from a no-op, every
+    /// time, forever.
+    #[test]
+    fn an_editor_that_never_ran_says_so_instead_of_looking_like_a_no_op() {
+        let mut s = State::new(false, "m".into());
+
+        // Aborted or unchanged: silent, and the draft is untouched.
+        update(&mut s, Msg::EditorDone(Ok(None)));
+        assert!(
+            !matches!(s.transcript.last(), Some(TranscriptItem::Notice { .. })),
+            "an abort must stay silent"
+        );
+
+        // Never started: the reason reaches the transcript.
+        update(
+            &mut s,
+            Msg::EditorDone(Err("cannot open $EDITOR: no POSIX shell resolved".into())),
+        );
+        assert!(
+            matches!(
+                s.transcript.last(),
+                Some(TranscriptItem::Notice { text }) if text.contains("no POSIX shell")
+            ),
+            "a failure must name itself: {:?}",
+            s.transcript.last()
         );
     }
 

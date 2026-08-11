@@ -593,7 +593,7 @@ fn suspended_editor(
     guard: &mut TerminalGuard,
     suspended: &AtomicBool,
     text: &str,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     suspended.store(true, Ordering::Relaxed);
     guard.suspend();
     let content = run_external_editor(text);
@@ -602,21 +602,34 @@ fn suspended_editor(
     content
 }
 
-/// Blocking is fine — the TUI is suspended. `None` = unchanged or aborted.
-fn run_external_editor(text: &str) -> Option<String> {
+/// Blocking is fine — the TUI is suspended.
+///
+/// `Ok(None)` is "nothing changed": the file came back identical, or the editor
+/// was aborted. `Err` is "the editor never ran", and the two used to be
+/// indistinguishable — both collapsed to `None`, so on a box with no POSIX
+/// shell the key did nothing at all, silently, forever. A user cannot tell a
+/// no-op from a missing shell, so the failure has to say so.
+fn run_external_editor(text: &str) -> Result<Option<String>, String> {
+    // The resolved shell, not the literal name `sh`.
+    let shell = hotl_tools::shell::resolve_shell()
+        .map_err(|why| format!("cannot open $EDITOR: no POSIX shell resolved — {why}"))?;
     let path = std::env::temp_dir().join(format!("hotl-tui-{}.md", std::process::id()));
-    std::fs::write(&path, text).ok()?;
+    std::fs::write(&path, text)
+        .map_err(|e| format!("cannot stage the draft at {}: {e}", path.display()))?;
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".into());
-    let status = std::process::Command::new("sh")
+    let status = std::process::Command::new(&shell.path)
         .arg("-c")
         .arg(format!("{editor} '{}'", path.display()))
         .status();
     let content = match status {
-        Ok(s) if s.success() => std::fs::read_to_string(&path).ok(),
-        _ => None,
+        Ok(s) if s.success() => Ok(std::fs::read_to_string(&path).ok()),
+        // A non-zero exit is how `vi`'s `:cq` says "discard this" — an abort,
+        // not a failure. Only a spawn failure means the editor never ran.
+        Ok(_) => Ok(None),
+        Err(e) => Err(format!("could not start `{editor}`: {e}")),
     };
     let _ = std::fs::remove_file(&path);
-    content.filter(|c| c.trim_end() != text.trim_end())
+    content.map(|c| c.filter(|c| c.trim_end() != text.trim_end()))
 }
 
 #[derive(Debug)]
