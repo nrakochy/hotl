@@ -114,24 +114,36 @@ mod tests {
             assert_eq!(ipc.liveness(&id), Liveness::Live);
             assert!(ipc.list_live().contains(&id), "a bound endpoint is listed");
 
-            // Accept in a loop, skipping peers that fail authentication —
-            // which is what a real server does, and what it must do here: the
-            // `liveness` probe above connected and dropped, leaving a dead
-            // connection queued in the backlog ahead of the real client.
+            // A real accept loop tolerates a peer that connects and vanishes,
+            // and it must here: the two `liveness` probes above each left a
+            // dead connection queued in the backlog ahead of the real client.
+            //
+            // Authentication alone cannot be the filter, and that is a platform
+            // difference worth stating: macOS's `getpeereid` *fails* on a peer
+            // that already closed, so a dead connection is rejected there by
+            // accident. Linux's `SO_PEERCRED` still reports the credentials of
+            // the peer that connected, so the same dead connection
+            // authenticates fine and is only distinguishable by the fact that
+            // it never says anything. Discard on either signal and keep
+            // accepting — which is exactly what `session_server::authenticate`
+            // does with its bounded handshake read.
             let server = tokio::spawn(async move {
-                let stream = loop {
+                loop {
                     let s = listener.accept().await.unwrap();
-                    if crate::IPC.authenticate_peer(&s).is_ok() {
-                        break s;
+                    if crate::IPC.authenticate_peer(&s).is_err() {
+                        continue;
                     }
-                };
-                let (r, mut w) = tokio::io::split(stream);
-                let mut lines = BufReader::new(r).lines();
-                let got = lines.next_line().await.unwrap().unwrap();
-                w.write_all(format!("echo:{got}\n").as_bytes())
-                    .await
-                    .unwrap();
-                w.flush().await.unwrap();
+                    let (r, mut w) = tokio::io::split(s);
+                    let mut lines = BufReader::new(r).lines();
+                    let Ok(Some(got)) = lines.next_line().await else {
+                        continue; // connected and vanished — a probe, not a client
+                    };
+                    w.write_all(format!("echo:{got}\n").as_bytes())
+                        .await
+                        .unwrap();
+                    w.flush().await.unwrap();
+                    return;
+                }
             });
 
             let client = ipc.connect(&id).await.unwrap();
