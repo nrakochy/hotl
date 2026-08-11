@@ -546,6 +546,10 @@ pub enum SessionCmd {
     /// Toggle plan mode, the second permission axis (durable: appended to the
     /// log as `PlanSet`; takes effect immediately, same shape as `SetMode`).
     SetPlan(bool),
+    /// Set the session's reasoning depth (durable: appended to the log as
+    /// `EffortSet`; takes effect on the next request). `None` = the provider's
+    /// own default, which must round-trip so a user can clear the setting.
+    SetEffort(Option<Effort>),
     /// Full-state replace of the `todo_write` checklist (durable: appended
     /// to the log as `Todos`, last-wins on replay — same shape as
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
@@ -731,6 +735,12 @@ impl SessionHandle {
     /// Immediate, atomic-backed, same as [`Self::set_mode`].
     pub async fn set_plan(&self, plan: bool) {
         let _ = self.cmd.send(SessionCmd::SetPlan(plan)).await;
+    }
+    /// Set the session's reasoning depth durably (an `effort_set` log entry;
+    /// last one wins). Immediate, atomic-backed, same as [`Self::set_mode`];
+    /// `None` restores the provider's own default.
+    pub async fn set_effort(&self, effort: Option<Effort>) {
+        let _ = self.cmd.send(SessionCmd::SetEffort(effort)).await;
     }
     /// Full-state replace of the todo checklist (a durable `todos` log
     /// entry). Exposed mainly for tests that pre-seed a list; the real

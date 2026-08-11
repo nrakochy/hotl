@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use hotl_context::breakdown::ToolTokens;
 use hotl_context::{compaction, tokens};
 use hotl_platform::Clock;
-use hotl_provider::{Provider, SamplingRequest, StreamEvent, ToolDef};
+use hotl_provider::{Effort, Provider, SamplingRequest, StreamEvent, ToolDef};
 use hotl_store::SessionLog;
 use hotl_tools::{
     rules::{PermissionMode, Rules},
@@ -511,6 +511,12 @@ pub(crate) struct SharedDeps {
     /// invariant couples them, so there is nothing to keep consistent across
     /// a single load. Seeded from `rules.plan()` at session start.
     plan: AtomicBool,
+    /// The session's current effort, separate from `config.effort` (the
+    /// startup default) so `SetEffort` can flip it without rebuilding
+    /// `EngineConfig`. Encoded `0` = unset (provider default), `1..=5` = the
+    /// ladder ascending — the sentinel is why this is an `AtomicU8` and not a
+    /// packed `Option`, and it keeps the same shape as `mode`'s codec.
+    effort: AtomicU8,
     pub sandbox_enforced: bool,
     pub clock: Arc<dyn Clock>,
     pub system: Arc<str>,
@@ -572,6 +578,30 @@ fn u8_to_mode(v: u8) -> PermissionMode {
     }
 }
 
+/// `0` is "unset", not a rung — the ladder starts at 1 so "the provider's own
+/// default" stays representable.
+fn effort_to_u8(effort: Option<Effort>) -> u8 {
+    match effort {
+        None => 0,
+        Some(Effort::Low) => 1,
+        Some(Effort::Medium) => 2,
+        Some(Effort::High) => 3,
+        Some(Effort::XHigh) => 4,
+        Some(Effort::Max) => 5,
+    }
+}
+
+fn u8_to_effort(v: u8) -> Option<Effort> {
+    match v {
+        1 => Some(Effort::Low),
+        2 => Some(Effort::Medium),
+        3 => Some(Effort::High),
+        4 => Some(Effort::XHigh),
+        5 => Some(Effort::Max),
+        _ => None,
+    }
+}
+
 impl SharedDeps {
     fn new(
         deps: SessionDeps,
@@ -580,6 +610,7 @@ impl SharedDeps {
     ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
         let plan = AtomicBool::new(deps.rules.plan());
+        let effort = AtomicU8::new(effort_to_u8(deps.config.effort));
         let hook_mask = deps
             .hooks
             .as_ref()
@@ -602,6 +633,7 @@ impl SharedDeps {
             rules: deps.rules,
             mode,
             plan,
+            effort,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,
             system: deps.system.into(),
@@ -661,6 +693,19 @@ impl SharedDeps {
     /// counterpart: the overlay only ever adds an ask, so no build tightens it.
     fn set_plan(&self, plan: bool) {
         self.plan.store(plan, Ordering::Relaxed);
+    }
+
+    /// The depth the next request should carry — not `config.effort`, which is
+    /// only ever the startup default.
+    pub(crate) fn effective_effort(&self) -> Option<Effort> {
+        u8_to_effort(self.effort.load(Ordering::Relaxed))
+    }
+
+    /// Runtime effort-mutation entry point (`SessionCmd::SetEffort`, reachable
+    /// via ACP `session/set_effort` and the TUI `/effort` command). No
+    /// `enforced_mode` counterpart: no build tightens effort.
+    fn set_effort(&self, effort: Option<Effort>) {
+        self.effort.store(effort_to_u8(effort), Ordering::Relaxed);
     }
 
     /// Commit one entry: forward it to the writer at the `Durable` tier and
@@ -939,6 +984,24 @@ pub(crate) async fn run(
                         &mut pipeline,
                         &mut head,
                         EntryPayload::PlanSet { on: plan },
+                    )
+                    .await;
+            }
+            SessionCmd::SetEffort(effort) => {
+                // Same shape as `SetPlan`: atomic first so the next request
+                // carries it, then the durable entry `hotl resume` replays.
+                // Without the entry a resumed session would silently revert to
+                // the config default while the status line still showed what
+                // the user set.
+                shared.set_effort(effort);
+                let _ = shared
+                    .append(
+                        &mut log,
+                        &mut pipeline,
+                        &mut head,
+                        EntryPayload::EffortSet {
+                            effort: effort.map(|e| e.as_str().to_string()),
+                        },
                     )
                     .await;
             }

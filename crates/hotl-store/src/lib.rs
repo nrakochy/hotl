@@ -140,6 +140,7 @@ pub enum EntryKind {
     Rename,
     ModeSet,
     PlanSet,
+    EffortSet,
     PendingQuestion,
     QuestionResolved,
     Todos,
@@ -161,6 +162,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::Rename { .. } => EntryKind::Rename,
             EntryPayload::ModeSet { .. } => EntryKind::ModeSet,
             EntryPayload::PlanSet { .. } => EntryKind::PlanSet,
+            EntryPayload::EffortSet { .. } => EntryKind::EffortSet,
             EntryPayload::PendingQuestion { .. } => EntryKind::PendingQuestion,
             EntryPayload::QuestionResolved { .. } => EntryKind::QuestionResolved,
             EntryPayload::Todos { .. } => EntryKind::Todos,
@@ -1283,6 +1285,12 @@ pub struct Replayed {
     /// Plan mode (last `PlanSet` in the chain, child wins) — the axis
     /// orthogonal to `mode`. `None` = never set (use the process default).
     pub plan: Option<bool>,
+    /// Reasoning depth (last `EffortSet` in the chain, child wins) — a raw
+    /// string, forward-compat, like `mode`. **Doubly optional on purpose:**
+    /// the outer `None` is "never set", the inner `None` is "explicitly
+    /// cleared back to the provider's default", and collapsing them would make
+    /// clearing a setting indistinguishable from never having made one.
+    pub effort: Option<Option<String>>,
     /// The session's todo checklist (last `Todos` entry in the chain, child
     /// wins) — same last-wins, log-only shape as `mode`/`name`. Empty = no
     /// list was ever set (a resumed session starts with none, same as fresh).
@@ -1304,6 +1312,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut name = None;
     let mut mode = None;
     let mut plan = None;
+    let mut effort = None;
     let mut todos = Vec::new();
     let applied = apply_log(
         path,
@@ -1312,6 +1321,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut name,
         &mut mode,
         &mut plan,
+        &mut effort,
         &mut todos,
         None,
     )?;
@@ -1321,6 +1331,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         name,
         mode,
         plan,
+        effort,
         todos,
         warnings,
         tip_entry_id: applied.last_entry_id,
@@ -1433,6 +1444,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut name = None;
     let mut mode = None;
     let mut plan = None;
+    let mut effort = None;
     let mut todos = Vec::new();
     let mut tip_entry_id = None;
     for (depth, (path, _)) in lineage.iter().enumerate().rev() {
@@ -1448,6 +1460,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut name,
             &mut mode,
             &mut plan,
+            &mut effort,
             &mut todos,
             stop_after,
         )?;
@@ -1461,6 +1474,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         name,
         mode,
         plan,
+        effort,
         todos,
         warnings,
         tip_entry_id,
@@ -1498,6 +1512,7 @@ fn apply_log(
     name: &mut Option<String>,
     mode: &mut Option<String>,
     plan: &mut Option<bool>,
+    effort: &mut Option<Option<String>>,
     todos: &mut Vec<hotl_types::Todo>,
     stop_after: Option<&str>,
 ) -> Result<Applied, String> {
@@ -1604,6 +1619,9 @@ fn apply_log(
             EntryPayload::ModeSet { mode: m } => *mode = Some(m),
             // The other permission axis, same log-only last-one-wins shape.
             EntryPayload::PlanSet { on } => *plan = Some(on),
+            // Same log-only last-one-wins shape; see `Replayed::effort` for
+            // why the "cleared" case is its own value rather than an absence.
+            EntryPayload::EffortSet { effort: e } => *effort = Some(e),
             // Log-only durable snapshot of the todo checklist (tier-1 gap
             // #3), exactly like `Rename`/`ModeSet`: never rides the
             // projection, last one wins. The resumed actor's *starting* list
@@ -2120,6 +2138,44 @@ mod tests {
             replayed.items.is_empty(),
             "plan_set is not a projection item"
         );
+        assert_eq!(replayed.effort, None, "neither axis touches the effort");
+    }
+
+    /// The effort survives resume — a `/effort` that silently reverted while
+    /// the status line still showed it is the §5.7 lie in a new costume.
+    /// Last-one-wins, and "cleared" is a distinct outcome from "never set".
+    #[test]
+    fn effort_set_replays_last_one_wins_and_clearing_is_its_own_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(
+            &EntryPayload::EffortSet {
+                effort: Some("low".into()),
+            },
+            2,
+        )
+        .unwrap();
+        log.append(
+            &EntryPayload::EffortSet {
+                effort: Some("max".into()),
+            },
+            3,
+        )
+        .unwrap();
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.effort, Some(Some("max".into())));
+        assert!(
+            replayed.items.is_empty(),
+            "effort_set is not a projection item"
+        );
+        assert_eq!(replayed.mode, None, "effort never sets the mode axis");
+
+        log.append(&EntryPayload::EffortSet { effort: None }, 4)
+            .unwrap();
+        // `Some(None)` — cleared — not `None`, which would mean the session
+        // never set an effort at all and should keep its config default.
+        assert_eq!(replay(&path).unwrap().effort, Some(None));
     }
 
     /// A log written before plan became its own axis carries `mode: "plan"`

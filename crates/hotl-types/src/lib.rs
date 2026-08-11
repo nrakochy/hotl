@@ -398,6 +398,13 @@ pub enum EntryPayload {
     PlanSet {
         on: bool,
     },
+    /// Sets the session's reasoning depth (`/effort`, `session/set_effort`).
+    /// Log-only, last one wins, exactly like `ModeSet`. `None` means "the
+    /// provider's own default" and must round-trip: clearing the setting is a
+    /// distinct act from never having set one.
+    EffortSet {
+        effort: Option<String>,
+    },
     /// A structured question (`ask_user`, tier-1 gap #4) committed durably
     /// **before** it surfaces — mirrors `PendingAsk`/`AskResolved` exactly:
     /// if the process dies before a matching `question_resolved`, replay
@@ -729,6 +736,26 @@ mod tests {
                 mode: "plan".into()
             }
         );
+    }
+
+    #[test]
+    fn effort_set_entry_roundtrips_including_the_unset_case() {
+        let j = serde_json::to_string(&EntryPayload::EffortSet {
+            effort: Some("xhigh".into()),
+        })
+        .unwrap();
+        assert!(j.contains("\"kind\":\"effort_set\""), "wire kind: {j}");
+        let back: EntryPayload = serde_json::from_str(&j).unwrap();
+        assert_eq!(
+            back,
+            EntryPayload::EffortSet {
+                effort: Some("xhigh".into())
+            }
+        );
+        // "cleared" must survive the round trip as its own value.
+        let cleared = serde_json::to_string(&EntryPayload::EffortSet { effort: None }).unwrap();
+        let back: EntryPayload = serde_json::from_str(&cleared).unwrap();
+        assert_eq!(back, EntryPayload::EffortSet { effort: None });
     }
 
     #[test]

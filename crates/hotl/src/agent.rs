@@ -43,6 +43,10 @@ pub(crate) struct Resumed {
     /// inheritance shape. `None` = never set, so the resumed session falls
     /// back to a legacy `mode: "plan"` if present, else its own default.
     pub plan: Option<bool>,
+    /// The parent's last `EffortSet`, if any. Doubly optional like
+    /// `hotl_store::Replayed::effort`: outer `None` = never set, inner `None`
+    /// = deliberately cleared back to the provider's default.
+    pub effort: Option<Option<String>>,
     /// The parent's last `Todos` snapshot, if any (durable, last-wins —
     /// same inheritance shape as `mode`/`name`). Empty = the parent never
     /// had a list, so the resumed session starts with none, same as fresh.
@@ -50,6 +54,18 @@ pub(crate) struct Resumed {
 }
 
 use crate::acp::KeepSpec;
+
+/// What a resumed session carries over from its own log, resolved. Grouped
+/// because the three travel together everywhere and are meaningless apart.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct Inherited {
+    pub mode: Option<hotl_tools::rules::PermissionMode>,
+    pub plan: Option<bool>,
+    /// Doubly optional like `hotl_store::Replayed::effort`: outer `None` =
+    /// never set (keep the configured default), inner `None` = deliberately
+    /// cleared back to the provider's default.
+    pub effort: Option<Option<Effort>>,
+}
 
 /// Resolve a [`KeepSpec`] to a projection length, rejecting anything that is
 /// not a turn boundary (D-A10).
@@ -139,6 +155,7 @@ pub(crate) fn load_lineage(
         name,
         mode,
         plan,
+        effort,
         todos,
         tip_entry_id,
         ..
@@ -153,6 +170,7 @@ pub(crate) fn load_lineage(
         items,
         mode,
         plan,
+        effort,
         // D-A11: todos describe the parent's *final* state. A fork cut back to
         // an earlier prefix would inherit a checklist about work its own
         // history no longer contains — actively misleading, so drop it.
@@ -456,7 +474,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         Some(scaffold.spawn_registration(session_id)),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, None, items, None, None, Vec::new());
+            let mut deps = scaffold.deps(log, None, items, Inherited::default(), Vec::new());
             deps.registry = registry;
             deps
         },
@@ -647,6 +665,22 @@ pub(crate) async fn build_acp() -> Result<
                 scaffold.clock.now_ms(),
             );
         }
+        // Copy-forward the inherited effort, same shape as the mode: this log
+        // is the single-file source of truth for `hotl resume`. An
+        // unrecognized level (a future build's rung) copies forward as history
+        // but leaves this session on its configured default.
+        let effort_override = resumed
+            .as_ref()
+            .and_then(|r| r.effort.clone())
+            .map(|raw| raw.and_then(|s| s.parse::<Effort>().ok()));
+        if let Some(e) = effort_override {
+            let _ = log.append(
+                &hotl_types::EntryPayload::EffortSet {
+                    effort: e.map(|e| e.as_str().to_string()),
+                },
+                scaffold.clock.now_ms(),
+            );
+        }
         // Unlike name/mode, the inherited todos are *not* copy-forwarded
         // into this log: `hotl_store::replay`/`session_name` never need a
         // single-file todos scan the way listing needs the name, and
@@ -682,8 +716,11 @@ pub(crate) async fn build_acp() -> Result<
                     log,
                     snapshots,
                     initial,
-                    mode_override,
-                    plan_override,
+                    Inherited {
+                        mode: mode_override,
+                        plan: plan_override,
+                        effort: effort_override,
+                    },
                     inherited_todos,
                 );
                 deps.registry = registry;
@@ -780,7 +817,13 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         Some(scaffold.spawn_registration(session_id.clone())),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, snapshots, initial_items, None, None, Vec::new());
+            let mut deps = scaffold.deps(
+                log,
+                snapshots,
+                initial_items,
+                Inherited::default(),
+                Vec::new(),
+            );
             deps.registry = registry;
             deps
         },
@@ -984,10 +1027,14 @@ impl Scaffold {
         log: SessionLog,
         snapshots: Option<Arc<dyn hotl_engine::Snapshotter>>,
         initial_items: Vec<hotl_types::Item>,
-        mode_override: Option<hotl_tools::rules::PermissionMode>,
-        plan_override: Option<bool>,
+        inherited: Inherited,
         initial_todos: Vec<hotl_types::Todo>,
     ) -> SessionDeps {
+        let Inherited {
+            mode: mode_override,
+            plan: plan_override,
+            effort: effort_override,
+        } = inherited;
         let rules = match (mode_override, plan_override) {
             (None, None) => self.rules.clone(),
             (m, p) => {
@@ -1001,6 +1048,10 @@ impl Scaffold {
                 Arc::new(r)
             }
         };
+        let mut config = self.config.clone();
+        if let Some(e) = effort_override {
+            config.effort = e;
+        }
         SessionDeps {
             provider: self.provider.clone(),
             registry: self.registry.clone(),
@@ -1014,7 +1065,7 @@ impl Scaffold {
             hooks: self.hooks.clone(),
             initial_items,
             initial_todos,
-            config: self.config.clone(),
+            config,
         }
     }
 }
@@ -1125,6 +1176,10 @@ async fn run_session(
         .and_then(|l| l.mode.as_deref())
         .and_then(hotl_tools::rules::PermissionMode::from_str);
     let plan_override = lineage.as_ref().and_then(|l| l.plan);
+    let effort_override = lineage
+        .as_ref()
+        .and_then(|l| l.effort.clone())
+        .map(|raw| raw.and_then(|s| s.parse::<Effort>().ok()));
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration(session_id.clone())),
@@ -1134,8 +1189,11 @@ async fn run_session(
                 log,
                 snapshots,
                 initial_items,
-                mode_override,
-                plan_override,
+                Inherited {
+                    mode: mode_override,
+                    plan: plan_override,
+                    effort: effort_override,
+                },
                 initial_todos,
             );
             deps.registry = registry;
