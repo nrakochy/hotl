@@ -2,11 +2,29 @@
 #
 # nextest schedules every test from every crate into one process pool sized to
 # the machine's cores, instead of `cargo test`'s one-binary-at-a-time run. On
-# this workspace — ~67 test binaries, many latency-bound on sleeps and real
-# `git` subprocesses — that oversubscription is a large wall-clock win.
+# this workspace — ~68 test binaries, many latency-bound on sleeps and real
+# `git` subprocesses — that oversubscription cuts the warm run from >10min
+# (cargo test, never finished) to a couple of minutes.
 #
 # Run with:  cargo nextest run --workspace
 [profile.default]
 # Warn on any test past 30s (none should be), and terminate one still running
 # past ~2min — a backstop for the tests that spawn real git / network work.
 slow-timeout = { period = "30s", terminate-after = 4 }
+
+# A handful of tests can't share the machine with full oversubscription:
+# concurrent CPU load inflates latency measurements and starves child
+# processes. Reserve threads so they get room (or the whole pool) to run.
+
+[[profile.default.overrides]]
+# The §S1 loop-overhead gate measures async scheduling latency against a
+# sub-millisecond baseline. Any concurrent test load inflates the reading, so
+# it must run with the machine to itself.
+filter = 'test(loop_overhead_stays_within_the_regression_band)'
+threads-required = 'num-test-threads'
+
+[[profile.default.overrides]]
+# update_offline builds/spawns a real binary and waits on `--version`; under a
+# saturated core pool the child gets starved and the probe times out.
+filter = 'binary(update_offline)'
+threads-required = 4
