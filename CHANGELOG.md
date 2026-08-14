@@ -6,6 +6,47 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **Sessions spend fewer round trips — and cheaper ones — on the same task.**
+  Four levers, all aimed at wall-clock parity with other harnesses on the
+  identical model: a bash command that fails on a sandbox write-denial now
+  says so in the result, naming `[sandbox].writable` as the remedy instead of
+  leaving the model to diagnose a bare "Operation not permitted" (the docs
+  carry a ready-to-paste block for the common toolchain caches — `~/.cargo`,
+  `~/.npm`, `~/.cache` and friends; the confined-by-default posture is
+  unchanged); a successful `edit` echoes the edited region in its new form
+  (numbered, ±3 lines, capped at 40) so verifying the splice no longer costs
+  a follow-up read; session start hands the model the orientation it used to
+  re-derive every time — branch and dirt count, recent commit subjects,
+  porcelain status, top-level listing — as one untrusted-enveloped item
+  (repo-derived text can never authorize tool use); and the default system
+  prompt now says when to fan investigation out to parallel explore agents
+  instead of leaving delegation to chance.
+- **Compaction digests default to Haiku on catalogued Anthropic models.** An
+  unset `fast_model` ran every digest — including the speculative one racing
+  the live turn for rate limit — on the main model at full price. Haiku
+  sessions keep Haiku, uncatalogued and OpenAI-compat sessions keep the
+  session model, and `HOTL_FAST_MODEL` / `[provider] fast_model` still win.
+
+### Added
+
+- **`/cost` shows recent cache health.** A new `cache N% last turn` segment
+  reports the last completed turn's read split, overwritten each turn — so a
+  cache-bust regression (the single biggest latency multiplier available)
+  shows up immediately instead of hiding inside the ever-growing cumulative
+  counter.
+- **`scripts/ab-wallclock.sh` profiles a `hotl -p` run** — wall-clock, sample
+  count, per-sample cache hit %, inter-sample gaps, tool calls, and
+  denial-smelling results from the session log. Run it once per binary to A/B
+  a change's round-trip behavior.
+
+### Fixed
+
+- Unit tests that spawn scripted child sessions no longer write their logs
+  into the real `~/.local/share/hotl/sessions` store — the child store is
+  injected, and the test builder points it at a tempdir.
+
 ## [0.14.0] - 2026-08-14
 
 ### Changed
