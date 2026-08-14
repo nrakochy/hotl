@@ -60,7 +60,15 @@ fn assistant_payload() -> EntryPayload {
 #[tokio::test]
 async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = EngineConfig::default();
+    // `Sync` admission, matching the proposals below: under the `Pipelined`
+    // default the prompt speculates, and its ack settle releases a held steer
+    // by design (adoption refuses the moved leaf and rebuilds — covered by
+    // testkit's admission_speculation) — which races this test's held-steer
+    // premise on a slow-fsync runner.
+    let config = EngineConfig {
+        ack_mode: hotl_engine::AckMode::Sync,
+        ..EngineConfig::default()
+    };
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
     let log_path = log.path().to_path_buf();
 
