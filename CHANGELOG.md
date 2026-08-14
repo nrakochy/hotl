@@ -6,6 +6,20 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Quitting no longer needs a second ctrl-c after a bash descendant escaped
+  its process group.** A command whose descendant left the process group (a
+  daemonizing tool: gpg-agent, an ssh ControlMaster, sccache, …) keeps the
+  merged output pipe open, which parks the drain thread on tokio's blocking
+  pool for the rest of the session — an accepted trade. What was not accepted:
+  dropping the runtime on exit waited on that thread *forever*, after the
+  terminal guard had already restored the screen, so ctrl-c looked like it quit
+  while the process sat there until a second ctrl-c (a real SIGINT once raw
+  mode is off) killed it. Runtime shutdown is now bounded (500ms grace);
+  pending async tasks still drop and flush, only stuck blocking threads are
+  abandoned on the way out.
+
 ## [0.13.0] - 2026-08-11
 
 ### Changed

@@ -261,7 +261,19 @@ fn block_on(f: impl std::future::Future<Output = i32>) -> i32 {
     if let Some(n) = resolve_blocking_threads() {
         builder.max_blocking_threads(n);
     }
-    builder.build().expect("tokio runtime").block_on(f)
+    let runtime = builder.build().expect("tokio runtime");
+    let code = runtime.block_on(f);
+    // Bounded, not `Drop`: dropping the runtime waits forever for running
+    // blocking-pool tasks, and `drain_capped_blocking` strands one whenever a
+    // bash descendant escapes its process group and keeps the output pipe
+    // open (the trade builtins.rs states). By now the terminal guard has
+    // already restored the screen, so that wait reads as "ctrl-c exited the
+    // TUI but the process is still here" until a second ctrl-c — a real
+    // SIGINT once raw mode is off — ends it. Pending async tasks are still
+    // dropped (session-log flush included); only stuck blocking threads are
+    // abandoned, and `main` exits the process right after.
+    runtime.shutdown_timeout(std::time::Duration::from_millis(500));
+    code
 }
 
 /// `[concurrency].blocking_threads` (env `HOTL_CONCURRENCY_BLOCKING_THREADS`
@@ -340,5 +352,36 @@ mod tests {
         // (which exits 2 without a terminal) or to agent_main.
         assert!(!super::is_headless(&v(&["--version"])));
         assert!(!super::is_headless(&v(&["-V"])));
+    }
+
+    #[test]
+    fn exit_is_not_held_hostage_by_a_stranded_blocking_task() {
+        // A bash descendant that escapes its process group keeps the merged
+        // output pipe open, so `drain_capped_blocking` parks a blocking-pool
+        // thread forever (the trade builtins.rs states). Runtime teardown must
+        // abandon that thread, not wait on it: with raw mode already restored,
+        // the wait reads as "ctrl-c quit the TUI but the process is still
+        // here", and only a second ctrl-c (now a real SIGINT) ends it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let code = super::block_on(async {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                tokio::task::spawn_blocking(move || {
+                    let _ = started_tx.send(());
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(600));
+                    }
+                });
+                // The strand must be *running* before the future returns — a
+                // queued-but-unstarted task would be dropped and prove nothing.
+                let _ = started_rx.await;
+                0
+            });
+            let _ = tx.send(code);
+        });
+        let code = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("block_on must return despite a stranded blocking task");
+        assert_eq!(code, 0);
     }
 }
