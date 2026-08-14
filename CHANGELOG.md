@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-14
+
 ### Changed
 
 - **The client hot path sheds its avoidable milliseconds** (plan 0033). What
