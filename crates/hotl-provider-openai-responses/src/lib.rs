@@ -20,8 +20,11 @@
 //! `reasoning` in turn (`hotl_provider::transform::strip_foreign_reasoning`
 //! and the Anthropic converter's own filter).
 
-use hotl_provider::{Effort, EffortLadder, SamplingRequest, ToolDef, ALL_EFFORTS};
-use hotl_types::Item;
+use hotl_provider::{
+    Effort, EffortLadder, ProviderError, SamplingRequest, SseAssembler, StreamEvent, ToolDef,
+    ALL_EFFORTS,
+};
+use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -199,6 +202,442 @@ fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool) {
                 }));
             }
         }
+    }
+}
+
+/// What one wire output item folds into.
+enum SlotKind {
+    Message {
+        text: String,
+    },
+    FunctionCall {
+        call_id: String,
+        name: String,
+        args: String,
+    },
+    /// The verbatim item arrives whole at `response.output_item.done`;
+    /// summary deltas stream through as `ThinkingDelta` without accumulating.
+    Reasoning {
+        item: Option<Value>,
+    },
+    /// An item type this assembler does not know: opens no block, streams
+    /// nothing, contributes no final block (forward compat).
+    Ignored,
+}
+
+/// One wire output item, keyed by its `output_index`.
+struct Slot {
+    /// Our block index (running count of opened blocks). `usize::MAX` for
+    /// `Ignored` slots, which open no block — never read for them.
+    block: usize,
+    closed: bool,
+    kind: SlotKind,
+}
+
+/// INVARIANT (T2-9 twin): every wire `output_index` is bounded before it
+/// reaches a `Vec`. Enforced by
+/// `an_absurd_output_index_is_a_parse_error_not_an_allocation`.
+fn index_of(v: &Value) -> Result<usize, ProviderError> {
+    let raw = v.get("output_index").and_then(Value::as_u64).unwrap_or(0);
+    let index = usize::try_from(raw).unwrap_or(usize::MAX);
+    if index > hotl_provider::MAX_BLOCK_INDEX {
+        return Err(ProviderError::Parse(format!(
+            "output_index {raw} exceeds the {} block limit",
+            hotl_provider::MAX_BLOCK_INDEX
+        )));
+    }
+    Ok(index)
+}
+
+fn str_at(v: &Value, field: &str) -> String {
+    v.get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Fold a complete wire item into its slot. Shared by
+/// `response.output_item.done` and the terminal sweep, so a sloppy gateway
+/// that skips per-item terminators still seals identically.
+fn seal_slot(slot: &mut Slot, item: &Value) {
+    match &mut slot.kind {
+        SlotKind::FunctionCall {
+            call_id,
+            name,
+            args,
+        } => {
+            // A non-empty complete `arguments` REPLACES accumulated deltas:
+            // it is the authoritative whole JSON, not another fragment.
+            if let Some(a) = item.get("arguments").and_then(Value::as_str) {
+                if !a.is_empty() {
+                    *args = a.to_string();
+                }
+            }
+            // Backfill identity if `output_item.added` lacked it.
+            if call_id.is_empty() {
+                *call_id = str_at(item, "call_id");
+            }
+            if name.is_empty() {
+                *name = str_at(item, "name");
+            }
+        }
+        SlotKind::Reasoning { item: captured } => {
+            // Verbatim, minus `status`: response-lifecycle state, not part
+            // of the replayable item (replaying it is a 400 on some
+            // gateways and noise on the rest).
+            if !item.is_null() {
+                let mut it = item.clone();
+                if let Some(obj) = it.as_object_mut() {
+                    obj.remove("status");
+                }
+                *captured = Some(it);
+            }
+        }
+        // Message: the accumulated delta buffers are what the UI saw, and
+        // T2-11 says what the UI saw is what history keeps.
+        SlotKind::Message { .. } | SlotKind::Ignored => {}
+    }
+}
+
+/// Folds Responses-API stream events into canonical blocks.
+///
+/// The shared `SseParser` strips `event:` lines and filters `[DONE]`, so
+/// dispatch is on the payload's `"type"` field — every Responses payload
+/// carries one. T3-14 holds per item: this dialect has per-item terminators
+/// (`response.output_item.done`), so `BlockEnd` is emitted there rather than
+/// synthesized at finish like the chat dialect — plus a terminal sweep so
+/// every opened block closes even against a gateway that drops terminators.
+#[derive(Default)]
+pub struct ResponsesAssembler {
+    /// Keyed by wire `output_index`.
+    slots: Vec<Option<Slot>>,
+    /// Our block index = running count of opened blocks (`Ignored` slots
+    /// open none).
+    next_block: usize,
+    /// A refusal streamed: the deltas ride the message text (the human must
+    /// see the refusal live; text-shaped keeps blocks canonical) and the
+    /// terminal stop becomes `Refusal`.
+    refused: bool,
+    usage: TokenUsage,
+    stop: Option<StopReason>,
+    done: bool,
+}
+
+impl SseAssembler for ResponsesAssembler {
+    fn handle(&mut self, data: &str) -> Result<Vec<StreamEvent>, ProviderError> {
+        let v: Value = serde_json::from_str(data)
+            .map_err(|e| ProviderError::Parse(format!("bad Responses SSE json: {e}")))?;
+        match v.get("type").and_then(Value::as_str).unwrap_or("") {
+            "response.output_item.added" => self.on_item_added(&v),
+            "response.output_text.delta" => self.on_text_delta(&v, false),
+            "response.refusal.delta" => self.on_text_delta(&v, true),
+            "response.function_call_arguments.delta" => self.on_args_delta(&v),
+            "response.reasoning_summary_text.delta" => self.on_summary_delta(&v),
+            "response.output_item.done" => self.on_item_done(&v),
+            "response.completed" => self.on_terminal(&v, None),
+            "response.incomplete" => {
+                let stop = match v
+                    .pointer("/response/incomplete_details/reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                {
+                    "max_output_tokens" => StopReason::MaxTokens,
+                    "content_filter" => StopReason::Refusal,
+                    _ => StopReason::Other,
+                };
+                self.on_terminal(&v, Some(stop))
+            }
+            // Mirror the Anthropic error arm: map the wire code to the
+            // status it would have carried pre-stream, so an in-stream
+            // failure classifies exactly like an HTTP-level one and
+            // `retry::is_availability` / the fallback-model chain stay
+            // reachable.
+            "response.failed" | "error" => {
+                let err = v.pointer("/response/error").unwrap_or(&v);
+                let msg = err
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let status = match err.get("code").and_then(Value::as_str) {
+                    Some("rate_limit_exceeded") => 429,
+                    Some("server_error") => 500,
+                    _ => 400,
+                };
+                Err(ProviderError::Http {
+                    status,
+                    message: format!("in-stream error: {msg}"),
+                    retry_after: None,
+                })
+            }
+            // response.created / response.in_progress / content_part.* /
+            // *_text.done / *_arguments.done / reasoning_summary_part.* and
+            // anything newer: ignored (forward compat).
+            _ => Ok(vec![]),
+        }
+    }
+
+    fn finish(self) -> Result<StreamEvent, ProviderError> {
+        if !self.done {
+            // Truncation is an honest error, never a silent empty result.
+            return Err(ProviderError::Parse(
+                "Responses stream ended before response.completed".into(),
+            ));
+        }
+        // Opened-block order = wire output order, so a reasoning item stays
+        // before the function_call it justified.
+        let mut opened: Vec<&Slot> = self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|s| !matches!(s.kind, SlotKind::Ignored))
+            .collect();
+        opened.sort_by_key(|s| s.block);
+        let mut blocks = Vec::new();
+        for slot in opened {
+            match &slot.kind {
+                SlotKind::Message { text } => {
+                    if !text.is_empty() {
+                        blocks.push(json!({"type": "text", "text": text}));
+                    }
+                }
+                SlotKind::FunctionCall {
+                    call_id,
+                    name,
+                    args,
+                } => {
+                    let input: Value = if args.trim().is_empty() {
+                        json!({})
+                    } else {
+                        // Arg healing (M3a): conservative repair before
+                        // giving up.
+                        hotl_provider::repair::parse_or_repair(args).ok_or_else(|| {
+                            ProviderError::Parse(format!("tool args for `{name}` didn't parse"))
+                        })?
+                    };
+                    // Exactly {type,id,name,input} with id = call_id:
+                    // Anthropic echoes Assistant blocks verbatim and
+                    // validates byte-for-byte; no extra fields (the `fc_`
+                    // item id is deliberately not stored — see plan 0031 M2).
+                    blocks.push(
+                        json!({"type": "tool_use", "id": call_id, "name": name, "input": input}),
+                    );
+                }
+                SlotKind::Reasoning { item } => {
+                    // A reasoning slot still empty after the sweep would
+                    // poison the next request's replay — fail loudly now.
+                    let item = item.clone().ok_or_else(|| {
+                        ProviderError::Parse(
+                            "reasoning item never delivered (no output_item.done, absent \
+                             from response.completed); its replay would be rejected"
+                                .into(),
+                        )
+                    })?;
+                    blocks.push(item);
+                }
+                SlotKind::Ignored => unreachable!("filtered above"),
+            }
+        }
+        Ok(StreamEvent::Completed {
+            stop: self.stop.unwrap_or(StopReason::EndTurn),
+            usage: self.usage,
+            blocks,
+        })
+    }
+}
+
+impl ResponsesAssembler {
+    /// INVARIANT (T2-11 twin): a delta the assembler cannot place is a parse
+    /// error, never a silent drop — the user would read text the model never
+    /// sees again.
+    fn slot_mut(&mut self, index: usize) -> Result<&mut Slot, ProviderError> {
+        self.slots
+            .get_mut(index)
+            .and_then(Option::as_mut)
+            .ok_or_else(|| {
+                ProviderError::Parse(format!(
+                    "delta for output_index {index} arrived before its \
+                     response.output_item.added; the stream is malformed"
+                ))
+            })
+    }
+
+    fn on_item_added(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = index_of(v)?;
+        let item = v.get("item").cloned().unwrap_or(Value::Null);
+        let (kind, stream_kind) = match item.get("type").and_then(Value::as_str).unwrap_or("") {
+            "message" => (
+                SlotKind::Message {
+                    text: String::new(),
+                },
+                Some("text"),
+            ),
+            "function_call" => (
+                SlotKind::FunctionCall {
+                    call_id: str_at(&item, "call_id"),
+                    name: str_at(&item, "name"),
+                    args: String::new(),
+                },
+                Some("tool_use"),
+            ),
+            // "thinking" is the kind the Anthropic dialect already emits;
+            // the TUI folds any thinking deltas into one collapsible item.
+            "reasoning" => (SlotKind::Reasoning { item: None }, Some("thinking")),
+            _ => (SlotKind::Ignored, None),
+        };
+        if self.slots.len() <= index {
+            self.slots.resize_with(index + 1, || None);
+        }
+        let Some(stream_kind) = stream_kind else {
+            self.slots[index] = Some(Slot {
+                block: usize::MAX,
+                closed: false,
+                kind,
+            });
+            return Ok(vec![]);
+        };
+        let block = self.next_block;
+        self.next_block += 1;
+        self.slots[index] = Some(Slot {
+            block,
+            closed: false,
+            kind,
+        });
+        Ok(vec![StreamEvent::BlockStart {
+            index: block,
+            kind: stream_kind.into(),
+        }])
+    }
+
+    fn on_text_delta(
+        &mut self,
+        v: &Value,
+        refusal: bool,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = index_of(v)?;
+        let delta = str_at(v, "delta");
+        if refusal {
+            self.refused = true;
+        }
+        let slot = self.slot_mut(index)?;
+        let SlotKind::Message { text } = &mut slot.kind else {
+            return Err(ProviderError::Parse(format!(
+                "text delta for output_index {index} targets a non-message item"
+            )));
+        };
+        if delta.is_empty() {
+            return Ok(vec![]);
+        }
+        text.push_str(&delta);
+        Ok(vec![StreamEvent::TextDelta {
+            index: slot.block,
+            text: delta,
+        }])
+    }
+
+    fn on_args_delta(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = index_of(v)?;
+        let delta = str_at(v, "delta");
+        let slot = self.slot_mut(index)?;
+        let SlotKind::FunctionCall { args, .. } = &mut slot.kind else {
+            return Err(ProviderError::Parse(format!(
+                "function_call arguments delta for output_index {index} targets a \
+                 non-function_call item"
+            )));
+        };
+        args.push_str(&delta);
+        Ok(vec![StreamEvent::ToolInputDelta {
+            index: slot.block,
+            json: delta,
+        }])
+    }
+
+    fn on_summary_delta(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = index_of(v)?;
+        let delta = str_at(v, "delta");
+        let slot = self.slot_mut(index)?;
+        let SlotKind::Reasoning { .. } = &slot.kind else {
+            return Err(ProviderError::Parse(format!(
+                "reasoning summary delta for output_index {index} targets a \
+                 non-reasoning item"
+            )));
+        };
+        // Nothing accumulated: the verbatim item (summary included) arrives
+        // whole at `response.output_item.done`.
+        Ok(vec![StreamEvent::ThinkingDelta {
+            index: slot.block,
+            text: delta,
+        }])
+    }
+
+    fn on_item_done(&mut self, v: &Value) -> Result<Vec<StreamEvent>, ProviderError> {
+        let index = index_of(v)?;
+        let item = v.get("item").cloned().unwrap_or(Value::Null);
+        let slot = self.slot_mut(index)?;
+        if slot.closed {
+            return Ok(vec![]);
+        }
+        seal_slot(slot, &item);
+        slot.closed = true;
+        if matches!(slot.kind, SlotKind::Ignored) {
+            return Ok(vec![]);
+        }
+        Ok(vec![StreamEvent::BlockEnd { index: slot.block }])
+    }
+
+    /// `response.completed` / `response.incomplete`: merge final usage,
+    /// sweep-close every opened slot, fix the stop reason, mark done.
+    fn on_terminal(
+        &mut self,
+        v: &Value,
+        stop: Option<StopReason>,
+    ) -> Result<Vec<StreamEvent>, ProviderError> {
+        if let Some(u) = v.pointer("/response/usage") {
+            if let Some(n) = u.get("input_tokens").and_then(Value::as_u64) {
+                self.usage.input_tokens = n;
+            }
+            if let Some(n) = u.get("output_tokens").and_then(Value::as_u64) {
+                self.usage.output_tokens = n;
+            }
+            if let Some(n) = u
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+            {
+                self.usage.cache_read_input_tokens = n;
+            }
+        }
+        // INVARIANT (T3-14): every opened block closes, even against a
+        // gateway that never sent `output_item.done`. Unclosed slots are
+        // backfilled from the terminal event's own copy of the output.
+        let mut out = Vec::new();
+        for (wire_idx, entry) in self.slots.iter_mut().enumerate() {
+            let Some(slot) = entry else { continue };
+            if slot.closed {
+                continue;
+            }
+            if let Some(item) = v.pointer(&format!("/response/output/{wire_idx}")) {
+                seal_slot(slot, item);
+            }
+            slot.closed = true;
+            if !matches!(slot.kind, SlotKind::Ignored) {
+                out.push(StreamEvent::BlockEnd { index: slot.block });
+            }
+        }
+        self.stop = Some(stop.unwrap_or_else(|| {
+            if self.refused {
+                StopReason::Refusal
+            } else if self
+                .slots
+                .iter()
+                .flatten()
+                .any(|s| matches!(s.kind, SlotKind::FunctionCall { .. }))
+            {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            }
+        }));
+        self.done = true;
+        Ok(out)
     }
 }
 
@@ -446,5 +885,362 @@ mod tests {
         for &e in ALL_EFFORTS {
             assert_eq!(ResponsesLadder.resolve("gpt-5.6-luna-1", e), Some(e));
         }
+    }
+
+    // ───────────────────────── assembler ─────────────────────────
+
+    /// Feed every event, then finish. Panics on any handle error.
+    fn run(events: &[&str]) -> (Vec<StreamEvent>, StreamEvent) {
+        let mut a = ResponsesAssembler::default();
+        let mut streamed = Vec::new();
+        for e in events {
+            streamed.extend(a.handle(e).unwrap());
+        }
+        (streamed, a.finish().unwrap())
+    }
+
+    /// R3's first golden test, resurrected on the current wire (per-item
+    /// terminators, `output_item.added` for every item): a different event
+    /// vocabulary folds into the *same* verbatim assistant blocks and
+    /// `Completed` terminal event, with no engine change.
+    #[test]
+    fn responses_dialect_folds_into_the_same_blocks() {
+        let events = [
+            r#"{"type":"response.created","response":{}}"#,
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","role":"assistant"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"I'll read "}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"the file."}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_9","name":"read"}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"path\":"}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":1,"delta":"\"a.rs\"}"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_9","name":"read","arguments":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":42,"output_tokens":8,"input_tokens_details":{"cached_tokens":30}}}}"#,
+        ];
+        let (streamed, done) = run(&events);
+        let StreamEvent::Completed {
+            stop,
+            usage,
+            blocks,
+        } = done
+        else {
+            panic!("wrong terminal event")
+        };
+        // Same contract as every other dialect: verbatim blocks + usage + stop.
+        assert_eq!(stop, StopReason::ToolUse);
+        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.output_tokens, 8);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(blocks[0]["type"], "text");
+        assert_eq!(blocks[0]["text"], "I'll read the file.");
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "call_9");
+        assert_eq!(blocks[1]["name"], "read");
+        assert_eq!(blocks[1]["input"]["path"], "a.rs");
+        // Canonical tool_use blocks stay exactly {type,id,name,input} —
+        // Anthropic validates echoed blocks byte-for-byte.
+        assert_eq!(blocks[1].as_object().unwrap().len(), 4);
+        // Deltas surfaced for live display, just like the other dialects.
+        assert!(streamed
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { .. })));
+        assert!(streamed
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolInputDelta { .. })));
+    }
+
+    /// R3's second golden test, resurrected: truncation is an honest error.
+    #[test]
+    fn truncated_stream_is_an_honest_error() {
+        let mut a = ResponsesAssembler::default();
+        a.handle(
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+        )
+        .unwrap();
+        a.handle(r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#)
+            .unwrap();
+        assert!(
+            a.finish().is_err(),
+            "no response.completed → error, not a silent empty result"
+        );
+    }
+
+    /// INVARIANT (T3-14): every opened block closes — including via the
+    /// terminal sweep when a sloppy gateway never sent `output_item.done`.
+    /// The swept function_call is backfilled from `response.completed`'s own
+    /// copy of the output.
+    #[test]
+    fn every_block_start_has_a_matching_block_end_including_the_sweep() {
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"hi"}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call"}}"#,
+            r#"{"type":"response.completed","response":{"output":[{"type":"message"},{"type":"function_call","call_id":"call_1","name":"glob","arguments":"{\"pat\":\"*.rs\"}"}],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        ];
+        let (streamed, done) = run(&events);
+        let starts: Vec<usize> = streamed
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::BlockStart { index, .. } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        let ends: Vec<usize> = streamed
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::BlockEnd { index } => Some(*index),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(starts, vec![0, 1]);
+        assert_eq!(ends, vec![0, 1], "every opened block must be closed");
+        for i in &starts {
+            let s = streamed
+                .iter()
+                .position(|e| matches!(e, StreamEvent::BlockStart { index, .. } if index == i))
+                .unwrap();
+            let e = streamed
+                .iter()
+                .position(|e| matches!(e, StreamEvent::BlockEnd { index } if index == i))
+                .unwrap();
+            assert!(s < e, "BlockEnd {i} preceded its BlockStart");
+        }
+        let StreamEvent::Completed { blocks, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        // The sweep's backfill sealed the never-terminated function_call.
+        assert_eq!(blocks[1]["id"], "call_1");
+        assert_eq!(blocks[1]["name"], "glob");
+        assert_eq!(blocks[1]["input"]["pat"], "*.rs");
+    }
+
+    /// The reasoning item rides back verbatim (encrypted content and all)
+    /// minus the response-lifecycle `status` field, and its summary streams
+    /// live as `ThinkingDelta` — display parity with the Anthropic dialect.
+    #[test]
+    fn a_reasoning_item_is_captured_verbatim_with_status_stripped() {
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"weighing "}"#,
+            r#"{"type":"response.reasoning_summary_text.delta","output_index":0,"summary_index":0,"delta":"options"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"gAAA==","summary":[{"type":"summary_text","text":"weighing options"}],"status":"completed"}}"#,
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        ];
+        let (streamed, done) = run(&events);
+        assert!(
+            streamed
+                .iter()
+                .any(|e| matches!(e, StreamEvent::BlockStart { kind, .. } if kind == "thinking")),
+            "reasoning opens as the thinking kind the TUI already handles"
+        );
+        let thinking: String = streamed
+            .iter()
+            .filter_map(|e| match e {
+                StreamEvent::ThinkingDelta { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, "weighing options");
+        let StreamEvent::Completed { blocks, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(blocks[0]["type"], "reasoning");
+        assert_eq!(blocks[0]["encrypted_content"], "gAAA==");
+        assert_eq!(blocks[0]["summary"][0]["text"], "weighing options");
+        assert!(
+            blocks[0].get("status").is_none(),
+            "status is lifecycle state, not part of the replayable item"
+        );
+    }
+
+    /// `output_item.done`'s complete `arguments` string is authoritative: it
+    /// replaces accumulated deltas rather than appending to them.
+    #[test]
+    fn complete_arguments_on_done_beat_accumulated_deltas() {
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","name":"read"}}"#,
+            r#"{"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"pa"}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c","name":"read","arguments":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"response.completed","response":{}}"#,
+        ];
+        let (_, done) = run(&events);
+        let StreamEvent::Completed { blocks, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(blocks[0]["input"]["path"], "a.rs");
+    }
+
+    /// A call with no arguments at all ships `input: {}`, not a parse error.
+    #[test]
+    fn empty_arguments_become_an_empty_object_input() {
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"c","name":"list"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"c","name":"list","arguments":""}}"#,
+            r#"{"type":"response.completed","response":{}}"#,
+        ];
+        let (_, done) = run(&events);
+        let StreamEvent::Completed { blocks, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(blocks[0]["input"], json!({}));
+    }
+
+    /// `response.incomplete` closes partial blocks and maps its reason:
+    /// `max_output_tokens` → MaxTokens, `content_filter` → Refusal.
+    #[test]
+    fn incomplete_maps_reasons_and_closes_partial_blocks() {
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":0,"delta":"par"}"#,
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":5,"output_tokens":16}}}"#,
+        ];
+        let (streamed, done) = run(&events);
+        assert!(
+            streamed
+                .iter()
+                .any(|e| matches!(e, StreamEvent::BlockEnd { index: 0 })),
+            "T3-14 holds on the incomplete path too"
+        );
+        let StreamEvent::Completed {
+            stop,
+            usage,
+            blocks,
+        } = done
+        else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(stop, StopReason::MaxTokens);
+        assert_eq!(usage.output_tokens, 16);
+        assert_eq!(blocks[0]["text"], "par", "partial text survives");
+
+        let events = [
+            r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"content_filter"}}}"#,
+        ];
+        let (_, done) = run(&events);
+        let StreamEvent::Completed { stop, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(stop, StopReason::Refusal);
+    }
+
+    /// Refusal deltas reach the human live as text (blocks stay canonical),
+    /// and the terminal stop is Refusal.
+    #[test]
+    fn refusal_deltas_stream_as_text_and_stop_is_refusal() {
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.refusal.delta","output_index":0,"delta":"I can't help with that."}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"message"}}"#,
+            r#"{"type":"response.completed","response":{}}"#,
+        ];
+        let (streamed, done) = run(&events);
+        assert!(streamed.iter().any(
+            |e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "I can't help with that.")
+        ));
+        let StreamEvent::Completed { stop, blocks, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(stop, StopReason::Refusal);
+        assert_eq!(blocks[0]["text"], "I can't help with that.");
+    }
+
+    /// In-stream failures map to the statuses their codes would have carried
+    /// pre-stream, so `retry::is_availability` and the fallback-model chain
+    /// stay reachable — the Anthropic error-arm twin.
+    #[test]
+    fn failed_and_error_events_carry_availability_statuses() {
+        let cases = [
+            (
+                r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#,
+                429,
+            ),
+            (
+                r#"{"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}"#,
+                500,
+            ),
+            (
+                r#"{"type":"response.failed","response":{"error":{"code":"invalid_prompt","message":"no"}}}"#,
+                400,
+            ),
+        ];
+        for (data, want) in cases {
+            let mut a = ResponsesAssembler::default();
+            let Err(err) = a.handle(data) else {
+                panic!("expected an error for {data}");
+            };
+            let ProviderError::Http { status, .. } = &err else {
+                panic!("expected Http, got {err:?}");
+            };
+            assert_eq!(*status, want, "{data}");
+            if want != 400 {
+                assert!(hotl_provider::retry::is_availability(&err), "{data}");
+            }
+        }
+    }
+
+    /// INVARIANT (T2-9 twin): a wire `output_index` above `MAX_BLOCK_INDEX`
+    /// is a parse error, never an allocation.
+    #[test]
+    fn an_absurd_output_index_is_a_parse_error_not_an_allocation() {
+        let mut a = ResponsesAssembler::default();
+        let data = r#"{"type":"response.output_item.added","output_index":4000000000,"item":{"type":"message"}}"#;
+        match a.handle(data) {
+            Err(ProviderError::Parse(m)) => assert!(m.contains("output_index"), "{m}"),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    /// INVARIANT (T2-11 twin): a delta for a slot that never opened is a
+    /// parse error, never a silent drop.
+    #[test]
+    fn a_delta_before_its_output_item_added_is_a_parse_error() {
+        let mut a = ResponsesAssembler::default();
+        let data = r#"{"type":"response.output_text.delta","output_index":0,"delta":"orphan"}"#;
+        match a.handle(data) {
+            Err(ProviderError::Parse(m)) => assert!(m.contains("output_index 0"), "{m}"),
+            other => panic!("expected a parse error, got {other:?}"),
+        }
+    }
+
+    /// A reasoning slot still empty after the sweep is a parse error: an
+    /// un-replayable reasoning item would poison the next request.
+    #[test]
+    fn a_reasoning_item_never_delivered_is_a_parse_error() {
+        let mut a = ResponsesAssembler::default();
+        a.handle(r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#)
+            .unwrap();
+        // completed carries no /response/output to backfill from.
+        a.handle(r#"{"type":"response.completed","response":{}}"#)
+            .unwrap();
+        assert!(matches!(a.finish(), Err(ProviderError::Parse(_))));
+    }
+
+    /// Unknown item types open no block, stream nothing, and contribute no
+    /// final block — forward compat with tool types hotl does not speak.
+    #[test]
+    fn unknown_item_types_open_no_block() {
+        let events = [
+            r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"web_search_call","id":"ws_1"}}"#,
+            r#"{"type":"response.output_item.done","output_index":0,"item":{"type":"web_search_call","id":"ws_1"}}"#,
+            r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"message"}}"#,
+            r#"{"type":"response.output_text.delta","output_index":1,"delta":"hi"}"#,
+            r#"{"type":"response.output_item.done","output_index":1,"item":{"type":"message"}}"#,
+            r#"{"type":"response.completed","response":{}}"#,
+        ];
+        let (streamed, done) = run(&events);
+        let starts: Vec<_> = streamed
+            .iter()
+            .filter(|e| matches!(e, StreamEvent::BlockStart { .. }))
+            .collect();
+        assert_eq!(starts.len(), 1, "only the message opened a block");
+        assert!(
+            matches!(starts[0], StreamEvent::BlockStart { index: 0, .. }),
+            "the ignored item consumed no block index"
+        );
+        let StreamEvent::Completed { blocks, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["text"], "hi");
     }
 }
