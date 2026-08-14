@@ -1107,14 +1107,18 @@ mod tests {
     /// 0030 Task 7: an identical call repeated across batches whose results
     /// keep changing is polling, not a doom loop — the turn runs to its
     /// scripted end. The command reads a file it also appends to, so each
-    /// repeat's output genuinely differs.
+    /// repeat's output genuinely differs. Absolute path: bash runs in the
+    /// test process's own cwd, and a bare `c` would litter the repo.
     #[tokio::test]
     async fn polling_with_changing_results_is_not_a_doom_loop() {
-        let poll = "cat c; echo x >> c";
+        let dir = tempfile::tempdir().unwrap();
+        let c = dir.path().join("c");
+        let c = c.to_str().unwrap();
+        let poll = format!("cat {c}; echo x >> {c}");
         let mut scripts = vec![ScriptedProvider::tool_call(
             "t0",
             "bash",
-            json!({"command": "echo start > c"}),
+            json!({"command": format!("echo start > {c}")}),
         )];
         scripts.extend((1..=4).map(|i| {
             ScriptedProvider::tool_call(&format!("t{i}"), "bash", json!({"command": poll}))
