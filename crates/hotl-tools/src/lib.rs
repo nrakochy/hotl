@@ -16,6 +16,7 @@ pub(crate) mod matcher;
 pub(crate) mod minified;
 pub mod net;
 pub mod path;
+pub mod plugins;
 pub mod rules;
 pub mod sandbox;
 pub mod shell;
