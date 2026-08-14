@@ -183,6 +183,11 @@ pub struct SessionUsage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
+    /// Last completed turn's split, for the /cost hit-rate line — a cold
+    /// cache mid-session is the biggest latency bug we can have and the
+    /// cumulative counter hides it. Overwritten, never accumulated.
+    pub last_input: u64,
+    pub last_cache_read: u64,
     /// Accumulated only across turns that reported a price. `None` means no
     /// turn ever did — the UI must then show nothing rather than `$0.00`.
     pub cost_usd: Option<f64>,
@@ -196,6 +201,8 @@ impl SessionUsage {
         self.input += n("input_tokens");
         self.output += n("output_tokens");
         self.cache_read += n("cache_read_input_tokens");
+        self.last_input = n("input_tokens") + n("cache_creation_input_tokens");
+        self.last_cache_read = n("cache_read_input_tokens");
         if let Some(c) = usage.get("cost_usd").and_then(Value::as_f64) {
             *self.cost_usd.get_or_insert(0.0) += c;
         }
@@ -1488,6 +1495,12 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 tok(u.output),
                 tok(u.cache_read)
             );
+            // Recent, not averaged: a session-wide ratio would blur a cold
+            // cache mid-session into the warm turns before it (0032).
+            let denom = u.last_input + u.last_cache_read;
+            if let Some(pct) = (u.last_cache_read * 100).checked_div(denom) {
+                text.push_str(&format!(" · cache {pct}% last turn"));
+            }
             match u.cost_usd {
                 Some(c) => text.push_str(&format!(" · ${c:.2}")),
                 // R4 owns the price catalog; inventing a number here would be
@@ -2093,6 +2106,53 @@ mod tests {
             "no cache activity in the payload, no hit-ratio segment: {:?}",
             s.usage_line
         );
+    }
+
+    #[test]
+    fn cost_shows_the_last_turns_cache_split() {
+        let mut s = State::test_default();
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({
+                "input_tokens": 5, "output_tokens": 1,
+                "cache_read_input_tokens": 90, "cache_creation_input_tokens": 5,
+            }),
+        );
+        slash(&mut s, "cost");
+        let text = last_notice(&s);
+        assert!(text.contains("cache 90% last turn"), "{text}");
+    }
+
+    #[test]
+    fn cost_omits_cache_health_with_no_denominator() {
+        let mut s = State::test_default();
+        slash(&mut s, "cost");
+        let text = last_notice(&s);
+        assert!(!text.contains("% last turn"), "{text}");
+    }
+
+    #[test]
+    fn the_last_turn_split_overwrites_not_accumulates() {
+        let mut s = State::test_default();
+        // A cold first turn followed by a warm one: the pair must describe
+        // the warm turn alone, or the health line blurs exactly the
+        // regression it exists to catch.
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({"input_tokens": 100, "cache_read_input_tokens": 0}),
+        );
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({"input_tokens": 10, "cache_read_input_tokens": 90}),
+        );
+        assert_eq!(s.session_usage.last_input, 10);
+        assert_eq!(s.session_usage.last_cache_read, 90);
     }
 
     #[test]
