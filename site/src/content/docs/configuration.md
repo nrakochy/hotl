@@ -43,7 +43,7 @@ model = "openai/gpt-5"                      # provider/model; openai/ covers any
 base_url = "http://localhost:11434/v1"      # endpoint for the active provider
 auth = "api_key"                            # or "subscription": hotl holds no credential (requires base_url)
 fast_model = "..."                          # cheap model for compaction summaries
-effort = "high"                             # low | medium | high | xhigh | max; absent = the provider's default
+effort = "high"                             # low | medium | high | xhigh | max; absent = xhigh on catalogued Anthropic models, else the provider's default
 api_key_helper = "..."                      # command whose trimmed stdout is the API key; beats static key env vars; 5s timeout, 64KB cap
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
 
@@ -244,7 +244,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. Leave unset to get the [per-model window](#context-window-context-window). |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
-| `HOTL_EFFORT` | `[provider].effort` | Reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Unset sends no depth field at all. An unrecognized value warns and is ignored. |
+| `HOTL_EFFORT` | `[provider].effort` | Reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Unset defaults to `xhigh` on catalogued Anthropic models with effort support; other models get no depth field. An unrecognized value warns and is ignored. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `bypass` (default: no per-action asks) \| `ask` \| `dontask`; `auto` still parses as `bypass`, and a typo fails closed to `ask`. |
 | `HOTL_PLAN` | `[permissions].plan` | Any value but `0`/`false`/empty turns plan mode on. |
@@ -504,16 +504,18 @@ Setting this too high overflows the model mid-turn; too low burns a summarize ca
 
 One neutral ladder — `low | medium | high | xhigh | max` — that each provider spells its own way. Anthropic gets `output_config.effort`; OpenAI-compatible endpoints get a top-level `reasoning_effort`. You set the rung once and hotl projects it.
 
-Precedence, highest first: `/effort` mid-session → `HOTL_EFFORT` → `[provider] effort` → unset.
+Precedence, highest first: `/effort` mid-session → `HOTL_EFFORT` → `[provider] effort` → **`xhigh` (catalogued Anthropic models with effort support)** → the provider's own default.
 
 ```toml
 [provider]
 effort = "high"
 ```
 
-**Unset sends no depth field at all**, so an unconfigured session's requests are byte-for-byte what they were before this setting existed — no warm prompt cache invalidated on upgrade, and no unknown key sent to a local server that might reject it.
+**An unconfigured session on a catalogued Anthropic model with effort support runs at `xhigh`** — the agentic default, matching what coding harnesses ship for Opus-class models. Every other model — Haiku, the whole OpenAI-compatible family, gateway aliases — gets no depth field at all, so those requests are byte-for-byte what they were before this setting existed: no warm prompt cache invalidated on upgrade, and no unknown key sent to a local server that might reject it.
 
-A model that accepts fewer rungs clamps to its nearest one rather than erroring, and ties clamp **downward**, toward the cheaper rung: guessing upward spends your money on an inference hotl cannot justify. A model with no effort support at all (today: `claude-haiku-4-5`) simply gets no field. A model hotl does not recognize is never *refused* an effort — hotl allowlists no model names, so the field goes out and the provider's own answer is what you see.
+`/effort default` (or `unset`/`none`) clears your rung to the **provider's** default (`high` on Anthropic today) — which since the `xhigh` session default is *not* the same as never having set one. The console says so when you clear it.
+
+A model that accepts fewer rungs clamps to its nearest one rather than erroring, and ties clamp **downward**, toward the cheaper rung: guessing upward spends your money on an inference hotl cannot justify. The OpenAI-compatible dialect accepts only `low | medium | high` on the wire, so `xhigh`/`max` clamp to `high` there. A model with no effort support at all (today: `claude-haiku-4-5`) simply gets no field. A model hotl does not recognize is never *refused* an effort — hotl allowlists no model names, so the field goes out and the provider's own answer is what you see.
 
 `effort` and `thinking` stay two knobs. `HOTL_THINKING=0` turns extended thinking off; on an OpenAI-compatible endpoint that is spelled `reasoning_effort: "none"` and wins over any rung you set.
 

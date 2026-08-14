@@ -103,6 +103,8 @@ async fn a_configured_effort_reaches_the_request() {
     assert_eq!(req.effort, Some(Effort::High));
 }
 
+// Engine contract only: since 0030 the CLI layer injects a session default
+// (`xhigh` on catalogued Anthropic), so `None` here is not the product behavior.
 #[tokio::test]
 async fn an_unconfigured_session_sends_no_effort() {
     let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(

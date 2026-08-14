@@ -2519,6 +2519,11 @@ fn initial_items(config_dir: &std::path::Path, cwd: &std::path::Path) -> Vec<hot
     items
 }
 
+/// Session default when the user sets nothing (0030; revises 0029 decision 1).
+/// `xhigh` is Claude Code's coding/agentic default; the server default is
+/// already `high`, so wiring `high` would change bytes for zero behavior.
+const DEFAULT_EFFORT: Effort = Effort::XHigh;
+
 /// Engine knobs from the environment: HOTL_CONTEXT_WINDOW (tokens) and
 /// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
 /// Build the engine config from `config.toml` (`[context]`, plus `[behavior]
@@ -2584,6 +2589,14 @@ fn engine_config(
                 None
             }
         });
+    // Catalogued Anthropic models with effort support get the agentic default;
+    // Haiku (caps.effort=false) and every uncatalogued model (the whole
+    // OpenAI-compat family, gateway aliases) keep the provider's own default.
+    if config.effort.is_none()
+        && hotl_provider::catalog::lookup(model).is_some_and(|m| m.caps.effort)
+    {
+        config.effort = Some(DEFAULT_EFFORT);
+    }
     config
 }
 
@@ -4599,11 +4612,51 @@ mod tests {
         assert_eq!(engine_config("m", &secrets, &cfg).effort, Some(Effort::Max));
     }
 
+    // `"m"` is uncatalogued, so this doubles as the proof the 0030 session
+    // default never reaches models the catalog does not vouch for.
     #[test]
     fn an_unset_effort_stays_unset() {
         assert_eq!(
             engine_config("m", &MapSecrets::default(), &config_from_toml("")).effort,
             None
+        );
+    }
+
+    #[test]
+    fn unset_effort_defaults_to_xhigh_for_catalogued_anthropic() {
+        assert_eq!(
+            engine_config(
+                "claude-opus-4-8",
+                &MapSecrets::default(),
+                &config_from_toml("")
+            )
+            .effort,
+            Some(Effort::XHigh)
+        );
+    }
+
+    #[test]
+    fn haiku_gets_no_effort_default() {
+        // Catalogued with caps.effort == false — the provider default applies.
+        assert_eq!(
+            engine_config(
+                "claude-haiku-4-5",
+                &MapSecrets::default(),
+                &config_from_toml("")
+            )
+            .effort,
+            None
+        );
+    }
+
+    #[test]
+    fn a_typo_on_a_catalogued_model_falls_to_the_default() {
+        // Warns, yields None, then composes with the session default — the
+        // same outcome as absent. ("ultra" is 0029's unparseable fixture.)
+        let secrets = MapSecrets::from([("HOTL_EFFORT", "ultra")]);
+        assert_eq!(
+            engine_config("claude-opus-4-8", &secrets, &config_from_toml("")).effort,
+            Some(Effort::XHigh)
         );
     }
 
