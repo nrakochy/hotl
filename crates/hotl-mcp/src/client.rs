@@ -128,10 +128,20 @@ pub struct RemoteTool {
 }
 
 impl Client {
-    /// Spawn the server process and connect over its stdio.
+    /// Spawn the server process and connect over its stdio. Plain
+    /// command+args — servers with an env overlay or cwd come through
+    /// [`Self::connect_command`] with `ServerConfig::build_command`.
     pub fn connect(command: &str, args: &[String]) -> Result<Arc<Self>, String> {
-        let mut child = tokio::process::Command::new(command)
-            .args(args)
+        let mut cmd = tokio::process::Command::new(command);
+        cmd.args(args);
+        Self::connect_command(cmd)
+    }
+
+    /// Spawn a prepared command (program/args/env/cwd already applied)
+    /// and connect over its stdio.
+    pub fn connect_command(mut cmd: tokio::process::Command) -> Result<Arc<Self>, String> {
+        let command = cmd.as_std().get_program().to_string_lossy().into_owned();
+        let mut child = cmd
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             // T2-13e: a crashing server's own error output is the most useful

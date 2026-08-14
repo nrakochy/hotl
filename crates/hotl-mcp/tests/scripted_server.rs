@@ -101,6 +101,8 @@ fn scripted_tool(trust_dir: &std::path::Path) -> McpTool {
         command: "/fake/docs-server".into(),
         args: vec![],
         description: "test server".into(),
+        env: Vec::new(),
+        cwd: None,
     };
     McpTool::with_connector(vec![cfg], TrustStore::load(trust_dir), connect_scripted())
 }
@@ -111,6 +113,8 @@ fn docs_cfg_for(bin: &std::path::Path) -> ServerConfig {
         command: bin.to_str().expect("utf-8 tempdir").into(),
         args: vec![],
         description: "test server".into(),
+        env: Vec::new(),
+        cwd: None,
     }
 }
 

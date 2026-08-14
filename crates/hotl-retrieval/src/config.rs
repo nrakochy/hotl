@@ -63,6 +63,8 @@ pub fn build(
                         command,
                         args: b.args,
                         description: b.description,
+                        env: Vec::new(),
+                        cwd: None,
                     },
                     b.tool.unwrap_or_else(|| "search".into()),
                     trust,

@@ -284,6 +284,8 @@ mod tests {
             command: bin.to_str().expect("utf-8 tempdir").into(),
             args: vec![],
             description: "doc search".into(),
+            env: Vec::new(),
+            cwd: None,
         };
         McpRetriever::with_connector(
             cfg,
@@ -382,6 +384,8 @@ mod tests {
             command: dir.path().join("docs-server").to_str().unwrap().into(),
             args: vec![],
             description: "doc search".into(),
+            env: Vec::new(),
+            cwd: None,
         });
         assert!(
             !store.is_trusted("docs", &fp),
@@ -421,6 +425,8 @@ mod tests {
             command: dir.path().join("docs-server").to_str().unwrap().into(),
             args: vec![],
             description: "doc search".into(),
+            env: Vec::new(),
+            cwd: None,
         });
         assert!(
             why.contains(&fp.to_string()),

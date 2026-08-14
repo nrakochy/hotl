@@ -307,7 +307,7 @@ fn probe(cfg: &ServerConfig) -> Result<Vec<(String, String)>, String> {
         .build()
         .map_err(|e| format!("could not build a runtime ({e})"))?;
     rt.block_on(async {
-        let client = hotl_mcp::client::Client::connect(&cfg.command, &cfg.args)?;
+        let client = hotl_mcp::client::Client::connect_command(cfg.build_command())?;
         client.initialize().await?;
         let tools = client.list_tools().await?;
         Ok(tools.into_iter().map(|t| (t.name, t.description)).collect())
@@ -351,6 +351,8 @@ mod tests {
             command: bin.to_string_lossy().into(),
             args: vec![],
             description: String::new(),
+            env: Vec::new(),
+            cwd: None,
         }
     }
 
@@ -394,7 +396,7 @@ mod tests {
         fixture(dir.path(), "docs");
         let out = show(dir.path(), "docs").unwrap();
         assert!(out.contains("binary:") && out.contains("sha256:"), "{out}");
-        assert!(out.contains("key: fp2:"), "{out}");
+        assert!(out.contains("key: fp3:"), "{out}");
         // Errors are prompts: name the known servers and the next command.
         let err = show(dir.path(), "nope").unwrap_err();
         assert!(

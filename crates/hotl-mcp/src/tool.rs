@@ -115,7 +115,7 @@ impl McpTool {
             trust,
             Box::new(|cfg| {
                 Box::pin(async move {
-                    let client = Client::connect(&cfg.command, &cfg.args)?;
+                    let client = Client::connect_command(cfg.build_command())?;
                     client.initialize().await?;
                     Ok(client)
                 })
@@ -460,6 +460,8 @@ mod tests {
             command: "/fake/docs-server".into(),
             args: vec![],
             description: "test server".into(),
+            env: Vec::new(),
+            cwd: None,
         };
         McpTool::with_connector(
             vec![cfg],
@@ -507,6 +509,8 @@ mod tests {
             command: "/fake/docs-server".into(),
             args: vec![],
             description: "test server".into(),
+            env: Vec::new(),
+            cwd: None,
         };
         McpTool::with_connector(
             vec![cfg],

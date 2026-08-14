@@ -33,6 +33,14 @@ pub struct Fingerprint {
     /// changes) left the real code outside the fingerprint (Vuln 5). Empty for
     /// args that name no local file (`-m pkg`, `npx @pkg`, a `docker` image).
     arg_hashes: Vec<(String, String)>,
+    /// The configured env overlay. Part of the fingerprint because a
+    /// configured env is a code-execution channel through an already-trusted
+    /// binary (`NODE_OPTIONS`, `PYTHONPATH`, `LD_PRELOAD`) — changing it must
+    /// re-raise the protected ask exactly like changing the args.
+    env: Vec<(String, String)>,
+    /// The configured working directory — it decides what relative paths the
+    /// server reads and writes, so it is screened and recorded too.
+    cwd: Option<PathBuf>,
 }
 
 impl Fingerprint {
@@ -51,6 +59,8 @@ impl Fingerprint {
             args: cfg.args.clone(),
             hash: binary_hash(&cfg.command),
             arg_hashes,
+            env: cfg.env.clone(),
+            cwd: cfg.cwd.clone(),
         }
     }
 
@@ -70,9 +80,10 @@ impl Fingerprint {
         self.hash.starts_with("sha256:")
     }
 
-    /// The recorded value. Versioned (`fp2:`) so a future scheme change
+    /// The recorded value. Versioned (`fp3:`) so a future scheme change
     /// invalidates old grants by construction rather than by accident. NUL
-    /// cannot appear in an argv element, so the encoding is injective.
+    /// cannot appear in an argv element or env pair, so the encoding is
+    /// injective.
     pub fn key(&self) -> String {
         let mut hasher = Sha256::new();
         hasher.update(self.command.as_bytes());
@@ -83,16 +94,31 @@ impl Fingerprint {
         }
         hasher.update(self.hash.as_bytes());
         hasher.update([0]);
-        // fp2: the scheme now folds in the content hash of any file-resolving
-        // arg. Old `fp1:` grants no longer match — the safe direction (they
-        // re-raise the screen once).
         for (arg, h) in &self.arg_hashes {
             hasher.update(arg.as_bytes());
             hasher.update([0]);
             hasher.update(h.as_bytes());
             hasher.update([0]);
         }
-        format!("fp2:{:x}", hasher.finalize())
+        // fp3: the scheme now folds in the configured env overlay and cwd
+        // (0032) — env reaches code execution through NODE_OPTIONS-class
+        // variables, so it must re-raise the screen like args do. Old
+        // `fp2:` grants no longer match — the safe direction (they
+        // re-raise the screen once; changelog-noted).
+        for (key, value) in &self.env {
+            hasher.update(key.as_bytes());
+            hasher.update([0]);
+            hasher.update(value.as_bytes());
+            hasher.update([0]);
+        }
+        match &self.cwd {
+            Some(cwd) => {
+                hasher.update([1]);
+                hasher.update(cwd.as_os_str().as_encoded_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        format!("fp3:{:x}", hasher.finalize())
     }
 }
 
@@ -103,6 +129,16 @@ impl fmt::Display for Fingerprint {
         write!(f, "binary: {}", self.command)?;
         if !self.args.is_empty() {
             write!(f, "\nargs: {:?}", self.args)?;
+        }
+        // Everything `key()` records is shown: the screen and the grant
+        // come from one read (H-07). An env entry is a code-execution
+        // channel, so it is screened exactly like an argument.
+        if !self.env.is_empty() {
+            let pairs: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            write!(f, "\nenv: {}", pairs.join(" "))?;
+        }
+        if let Some(cwd) = &self.cwd {
+            write!(f, "\ncwd: {}", cwd.display())?;
         }
         write!(f, "\n  {}", self.hash)?;
         // Show the script/module each interpreter arg actually runs, so the
@@ -352,7 +388,50 @@ mod tests {
             command: command.into(),
             args: args.iter().map(|s| s.to_string()).collect(),
             description: String::new(),
+            env: Vec::new(),
+            cwd: None,
         }
+    }
+
+    /// 0032: a configured env or cwd is part of what the human approved —
+    /// changing either re-raises the screen, and both render into the
+    /// screen text the grant is recorded from.
+    #[test]
+    fn env_and_cwd_are_part_of_the_trust_key_and_the_screen() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("server");
+        std::fs::write(&bin, b"x").unwrap();
+        let plain = cfg(bin.to_str().unwrap(), &[]);
+        let mut with_env = plain.clone();
+        with_env.env = vec![("NODE_OPTIONS".into(), "--require /tmp/evil.js".into())];
+        let mut with_cwd = plain.clone();
+        with_cwd.cwd = Some(dir.path().join("elsewhere"));
+
+        let base = Fingerprint::of(&plain);
+        let env_fp = Fingerprint::of(&with_env);
+        let cwd_fp = Fingerprint::of(&with_cwd);
+        assert!(base.key().starts_with("fp3:"), "{}", base.key());
+        assert_ne!(base.key(), env_fp.key(), "env must change the key");
+        assert_ne!(base.key(), cwd_fp.key(), "cwd must change the key");
+        assert_ne!(env_fp.key(), cwd_fp.key());
+
+        // Shown == recorded: what the key folds in, the screen displays.
+        let screen = env_fp.to_string();
+        assert!(
+            screen.contains("NODE_OPTIONS=--require /tmp/evil.js"),
+            "{screen}"
+        );
+        let screen = cwd_fp.to_string();
+        assert!(screen.contains("cwd: "), "{screen}");
+        assert!(!base.to_string().contains("env:"), "{base}");
+
+        // A recorded grant for one env does not cover another (the same
+        // repointing property `args_are_part_of_the_trust_key` proves for
+        // args).
+        let mut store = TrustStore::load(dir.path());
+        store.record("docs", &env_fp).unwrap();
+        assert!(store.is_trusted("docs", &env_fp));
+        assert!(!store.is_trusted("docs", &base));
     }
 
     #[test]
