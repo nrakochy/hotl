@@ -935,6 +935,7 @@ pub(crate) async fn run(
                     &cmd_tx,
                     &events,
                     &current_turn,
+                    !held_steers.is_empty(),
                 )
                 .await;
             }
@@ -954,12 +955,13 @@ pub(crate) async fn run(
                     &cmd_tx,
                     &events,
                     &current_turn,
+                    !held_steers.is_empty(),
                 )
                 .await;
             }
             SessionCmd::Continue => {
                 if !running && crate::needs_continuation(head.items()) {
-                    spawn_turn(&shared, &cmd_tx, &events, &current_turn);
+                    spawn_turn(&shared, &cmd_tx, &events, &current_turn, None);
                     running = true;
                 }
             }
@@ -1134,6 +1136,7 @@ pub(crate) async fn run(
                 on_turn_finished(
                     TurnFinishedCtx {
                         shared: &shared,
+                        steers_held: !held_steers.is_empty(),
                         log: &mut log,
                         head: &mut head,
                         pipeline: &mut pipeline,
@@ -1179,6 +1182,9 @@ pub(crate) async fn run(
 /// The mutable session state `on_turn_finished` threads back into the loop.
 struct TurnFinishedCtx<'a> {
     shared: &'a Arc<SharedDeps>,
+    /// Whether steers are held for release right now — a gate clause of the
+    /// fast admission path (0033 Task 10).
+    steers_held: bool,
     log: &'a mut SessionLog,
     head: &'a mut Head,
     pipeline: &'a mut Pipeline,
@@ -1229,6 +1235,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
             ctx.cmd_tx,
             ctx.events,
             ctx.current_turn,
+            ctx.steers_held,
         )
         .await;
     }
@@ -1282,7 +1289,7 @@ async fn try_compact(
             if cancel.is_cancelled() {
                 return Some(Outcome::Cancelled);
             }
-            respawn_turn(shared, cmd_tx, events, cancel, *cont);
+            respawn_turn(shared, cmd_tx, events, cancel, *cont, None);
             None // still running: same logical turn continues
         }
         Err(message) => Some(Outcome::Error { message }),
@@ -1303,6 +1310,7 @@ async fn end_turn(
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
+    steers_held: bool,
 ) -> bool {
     annotate(shared, log, head, pipeline, &outcome).await;
     // Notification: the turn completed — fire-and-forget, computed before
@@ -1334,6 +1342,7 @@ async fn end_turn(
                 cmd_tx,
                 events,
                 current_turn,
+                steers_held,
             )
             .await
         }
@@ -2012,6 +2021,7 @@ async fn admit_prompt(
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
+    steers_held: bool,
 ) -> bool {
     if running {
         let full = queue.len() >= QUEUE_MAX;
@@ -2053,8 +2063,30 @@ async fn admit_prompt(
         cmd_tx,
         events,
         current_turn,
+        steers_held,
     )
     .await
+}
+
+/// 0033 Task 10: whether prompt admission may take the ticketed fast path —
+/// forward the prompt, spawn the turn immediately, and let it dispatch
+/// sample 1 speculatively while the fsync resolves. ALL clauses must hold,
+/// else the awaited path runs unchanged:
+/// - `Pipelined` ack mode: a `Sync` session issues no tickets (the same
+///   predicate that keeps `Turn::speculate` off the `Sync` comparison run);
+/// - no `USER_PROMPT` hook unmasked: a hook may append a reminder entry,
+///   which would move the leaf and turn every admission dispatch into a
+///   billed mispredict;
+/// - no steer held for release at this admission: its release commits an
+///   entry for the same reason.
+fn admission_may_speculate(
+    ack_mode: crate::AckMode,
+    hook_mask: crate::hooks::EventMask,
+    steers_held: bool,
+) -> bool {
+    ack_mode == crate::AckMode::Pipelined
+        && !hook_mask.contains(crate::hooks::EventMask::USER_PROMPT)
+        && !steers_held
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2067,19 +2099,82 @@ async fn start_turn(
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
+    steers_held: bool,
 ) -> bool {
     // Captured before `text` moves into the committed item — `UserPromptSubmit`
     // hooks (tier-1 gap #7) see the prompt exactly as submitted. Text only:
     // images are not exposed to hooks (v1) — the inline `[Image #N]` markers
     // still tell a hook one was attached.
     let prompt_for_hooks = prompt.text.clone();
-    let payload = EntryPayload::Item {
-        item: Item::User {
-            text: prompt.text,
-            synthetic: prompt.synthetic,
-            images: prompt.images,
-        },
+    let item = Item::User {
+        text: prompt.text,
+        synthetic: prompt.synthetic,
+        images: prompt.images,
     };
+    // The fast path (0033 Task 10): the prompt rides the same ticketed
+    // forward every proposal takes, the turn spawns with the ticket plus a
+    // predicted snapshot, and the fsync resolves during TLS + TTFB. Any
+    // intervening entry moves the leaf and refuses adoption (sequential
+    // rebuild, byte-identical); a crash after dispatch but before the fsync
+    // loses a prompt whose only effect was an un-adopted provider call —
+    // exactly the exposure §Causal groups (b) already accepts, and barrier
+    // (a) still guarantees no tool runs first.
+    if admission_may_speculate(shared.config.ack_mode, shared.hook_mask(), steers_held) {
+        let payload = EntryPayload::Item { item: item.clone() };
+        if let Ok(entry) =
+            crate::turn::prepare_entry(&payload, shared.masker(), shared.rules_epoch()).await
+        {
+            let (prepared, _) = entry.into_parts();
+            let seq = pipeline.next_seq();
+            match shared.forward_prepared(log, prepared) {
+                Ok(forwarded) => {
+                    let ticket = push_pending(
+                        pipeline,
+                        forwarded,
+                        vec![item.clone()],
+                        seq,
+                        crate::SampleStage::AtBoundary,
+                    );
+                    // The next head, predicted: cheap pointer clones after
+                    // Task 5. The head applies the real prompt on ack, as
+                    // pending items always do — the projection invariant is
+                    // untouched.
+                    let mut durable: Vec<Arc<Item>> = (**head.items()).clone();
+                    let durable_estimate = head.estimated + tokens::estimate_item(&item);
+                    durable.push(Arc::new(item));
+                    let predicted = Snapshot {
+                        durable: Arc::new(durable),
+                        durable_estimate,
+                        tail: tail_for(head.todos()),
+                    };
+                    spawn_turn(
+                        shared,
+                        cmd_tx,
+                        events,
+                        current_turn,
+                        Some(crate::Admission { ticket, predicted }),
+                    );
+                    return true;
+                }
+                // Sealed at forward time: the same failure surface the
+                // awaited path reports below.
+                Err(_) => {
+                    let _ = events
+                        .send(EngineEvent::TurnDone {
+                            outcome: Outcome::Error {
+                                message: "session log is sealed".into(),
+                            },
+                            usage: TokenUsage::default(),
+                        })
+                        .await;
+                    return false;
+                }
+            }
+        }
+        // Prepare failed (serialization) — fall through to the awaited path,
+        // which will surface the same failure through `append`.
+    }
+    let payload = EntryPayload::Item { item };
     if !shared.append(log, pipeline, head, payload).await {
         let _ = events
             .send(EngineEvent::TurnDone {
@@ -2115,7 +2210,7 @@ async fn start_turn(
         },
         else {}
     );
-    spawn_turn(shared, cmd_tx, events, current_turn);
+    spawn_turn(shared, cmd_tx, events, current_turn, None);
     true
 }
 
@@ -2126,6 +2221,7 @@ fn spawn_turn(
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
+    admission: Option<crate::Admission>,
 ) {
     let token = CancellationToken::new();
     *current_turn
@@ -2138,6 +2234,7 @@ fn spawn_turn(
         events,
         token,
         crate::TurnContinuation::default(),
+        admission,
     );
 }
 
@@ -2154,6 +2251,7 @@ fn respawn_turn(
     events: &mpsc::Sender<EngineEvent>,
     token: CancellationToken,
     cont: crate::TurnContinuation,
+    admission: Option<crate::Admission>,
 ) {
     // The turn task holds a strong sender for its lifetime; a failed upgrade
     // means the handle is gone and there is nobody left to run for.
@@ -2167,6 +2265,7 @@ fn respawn_turn(
         events.clone(),
         token,
         cont,
+        admission,
     ));
     // INVARIANT: exactly one `TurnFinished` per spawned turn, panic included —
     // `running` is cleared and the prompt queue drains on every exit path.
@@ -2198,6 +2297,41 @@ mod tests {
         HeldSteer, Pipeline, ProjectionHead, Resolution, SharedDeps, FOLD_MARK, HELD_BYTES_MAX,
         HELD_IMAGE_B64_MAX,
     };
+
+    /// 0033 Task 10: each gate clause refuses the fast admission path on its
+    /// own — `Sync` sessions issue no tickets, an unmasked `USER_PROMPT`
+    /// hook may append a leaf-moving reminder, and a held steer's release
+    /// commits an entry for the same reason.
+    #[test]
+    fn admission_speculates_only_when_every_gate_clause_holds() {
+        use super::admission_may_speculate;
+        use crate::hooks::EventMask;
+        assert!(admission_may_speculate(
+            crate::AckMode::Pipelined,
+            EventMask::NONE,
+            false
+        ));
+        assert!(
+            !admission_may_speculate(crate::AckMode::Sync, EventMask::NONE, false),
+            "a Sync session issues no tickets"
+        );
+        assert!(
+            !admission_may_speculate(crate::AckMode::Pipelined, EventMask::USER_PROMPT, false),
+            "an unmasked USER_PROMPT hook may move the leaf"
+        );
+        assert!(
+            !admission_may_speculate(crate::AckMode::Pipelined, EventMask::ALL, false),
+            "USER_PROMPT inside a wider mask still gates"
+        );
+        assert!(
+            !admission_may_speculate(crate::AckMode::Pipelined, EventMask::NONE, true),
+            "a held steer's release would move the leaf"
+        );
+        assert!(
+            admission_may_speculate(crate::AckMode::Pipelined, EventMask::NOTIFICATION, false),
+            "hooks that never write entries do not gate"
+        );
+    }
 
     /// 0033 Task 7: the projection's running estimate must equal a
     /// from-scratch `estimate_items` walk after every mutation the projection

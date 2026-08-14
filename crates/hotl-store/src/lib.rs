@@ -415,6 +415,8 @@ pub struct SessionLog {
     fsyncs: Arc<AtomicU64>,
     fault: Arc<AtomicU8>,
     sync_noop: Arc<AtomicBool>,
+    /// Test-only ack gate — see [`SessionLog::pause_ack_handle`].
+    pause_acks: Arc<AtomicBool>,
     pub session_id: String,
 }
 
@@ -511,16 +513,22 @@ impl SessionLog {
         let fsyncs = Arc::new(AtomicU64::new(0));
         let fault = Arc::new(AtomicU8::new(0));
         let sync_noop = Arc::new(AtomicBool::new(false));
+        let pause_acks = Arc::new(AtomicBool::new(false));
         let writer = std::thread::Builder::new()
             .name(format!("hotl-log-{session_id}"))
             .spawn({
-                let (sealed, fsyncs, fault, sync_noop) = (
+                let (sealed, fsyncs, fault, sync_noop, pause_acks) = (
                     Arc::clone(&sealed),
                     Arc::clone(&fsyncs),
                     Arc::clone(&fault),
                     Arc::clone(&sync_noop),
+                    Arc::clone(&pause_acks),
                 );
-                move || writer_loop(file, offset, rx, sealed, fsyncs, fault, sync_noop)
+                move || {
+                    writer_loop(
+                        file, offset, rx, sealed, fsyncs, fault, sync_noop, pause_acks,
+                    )
+                }
             })?;
         let mut log = Self {
             tx,
@@ -532,6 +540,7 @@ impl SessionLog {
             fsyncs,
             fault,
             sync_noop,
+            pause_acks,
             session_id: session_id.clone(),
         };
         let (parent_session_id, parent_tip_entry_id) = match parent {
@@ -920,6 +929,18 @@ impl SessionLog {
     pub fn set_sync_noop(&self, enabled: bool) {
         self.sync_noop.store(enabled, Ordering::SeqCst);
     }
+
+    /// Test-only (0033 Task 10): a gate the writer holds *after* a durable
+    /// group's write+sync but *before* sending its acks — never on the
+    /// `Buffered` arm, whose acks precede the write by design. While closed,
+    /// forwarded entries are durable on disk but nobody has been told;
+    /// exactly the window a speculative admission dispatch must overlap.
+    /// Detachable for the same reason [`SessionLog::fsync_counter`] is.
+    /// Defaults open; production code never calls this.
+    #[doc(hidden)]
+    pub fn pause_ack_handle(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.pause_acks)
+    }
 }
 
 /// Mint one entry id and splice already-serialized-and-masked payload bytes
@@ -1018,6 +1039,7 @@ struct WriterCtx {
     fsyncs: Arc<AtomicU64>,
     fault: Arc<AtomicU8>,
     sync_noop: Arc<AtomicBool>,
+    pause_acks: Arc<AtomicBool>,
 }
 
 impl WriterCtx {
@@ -1069,6 +1091,7 @@ fn sealed_error(reason: &str) -> std::io::Error {
 /// tokio task, so the `sync_data` stall never lands on an executor worker
 /// (T1-3). That much is a property of how `create` spawns it rather than one a
 /// test asserts; for what an ack *means*, see `SessionLog`'s INVARIANT.
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
     mut file: File,
     mut offset: u64,
@@ -1077,12 +1100,14 @@ fn writer_loop(
     fsyncs: Arc<AtomicU64>,
     fault: Arc<AtomicU8>,
     sync_noop: Arc<AtomicBool>,
+    pause_acks: Arc<AtomicBool>,
 ) {
     let ctx = WriterCtx {
         sealed,
         fsyncs,
         fault,
         sync_noop,
+        pause_acks,
     };
     let mut batch: Vec<QueuedAppend> = Vec::new();
     while let Ok(cmd) = rx.recv() {
@@ -1222,6 +1247,12 @@ fn commit_batch(
         // not syscalls, so counter-based assertions stay meaningful under the
         // seam (see `set_sync_noop`).
         ctx.fsyncs.fetch_add(1, Ordering::SeqCst);
+        // Test-only gate (0033 Task 10): the group is durable on disk, but
+        // the acks are withheld until the gate opens. Never reached by the
+        // `Buffered` arm — its acks went out before the write, by design.
+        while ctx.pause_acks.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
     }
     *offset = written;
     for (ack, end) in acks {
@@ -2396,6 +2427,41 @@ mod tests {
         );
     }
 
+    /// 0033 Task 10 seam: a paused writer holds a durable group's acks —
+    /// the bytes are written and synced, but nobody is told — and releases
+    /// them the moment the gate opens. The admission-overlap scenarios in
+    /// hotl-testkit stand on exactly this window.
+    #[test]
+    fn a_paused_writer_withholds_acks_and_releases_them_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
+        let gate = log.pause_ack_handle();
+        gate.store(true, Ordering::SeqCst);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = log.append(
+                &EntryPayload::Rename {
+                    name: "held".into(),
+                },
+                0,
+            );
+            let _ = done_tx.send(result.is_ok());
+        });
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(300))
+                .is_err(),
+            "a closed gate must withhold the ack"
+        );
+        gate.store(false, Ordering::SeqCst);
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("the ack must release once the gate opens"),
+            "the released append must have succeeded"
+        );
+    }
+
     /// §S1 loop-overhead gate seam: with the sync no-op'd, `fsync_count()`
     /// must still increment once per Durable append — the counter tracks
     /// sync *points*, not completed syscalls, so a benchmark that disables
@@ -3532,6 +3598,7 @@ mod tests {
                 fsyncs: Arc::new(AtomicU64::new(0)),
                 fault: Arc::new(AtomicU8::new(0)),
                 sync_noop: Arc::new(AtomicBool::new(false)),
+                pause_acks: Arc::new(AtomicBool::new(false)),
             },
         )
     }

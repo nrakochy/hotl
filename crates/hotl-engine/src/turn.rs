@@ -107,8 +107,12 @@ pub(crate) async fn run(
     events: mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
     cont: crate::TurnContinuation,
+    admission: Option<crate::Admission>,
 ) {
     let mut turn = Turn::new(shared, cmd_tx.clone(), events, cancel, cont);
+    if let Some(admission) = admission {
+        turn.admit(admission).await;
+    }
     let end = turn.drive().await;
     // Barrier (c) (commit-protocol.md §Pipelined commits): "a turn does not
     // finish while it still holds an unresolved claim on the log." Every exit
@@ -375,7 +379,7 @@ fn value_size_estimate(value: &Value) -> usize {
 /// build must not panic the turn task, so they are surfaced as `Commit::Gone`
 /// rather than unwrapped.
 #[derive(Debug)]
-enum PrepareError {
+pub(crate) enum PrepareError {
     /// `serde_json::to_string` on an `EntryPayload` errored — none of this
     /// crate's payload shapes contain non-finite floats or non-string map
     /// keys, so this should never actually happen (hence the `debug_assert`
@@ -402,7 +406,7 @@ impl From<serde_json::Error> for PrepareError {
 /// commit-protocol.md §Proposal payloads. A free function (not `&Turn`), so
 /// it is directly unit-testable (masking correctness, the epoch stamp, the
 /// offload threshold) without spinning up a session.
-async fn prepare_entry(
+pub(crate) async fn prepare_entry(
     payload: &EntryPayload,
     masker: &Arc<hotl_store::Masker>,
     rules_epoch: u32,
@@ -2084,10 +2088,29 @@ impl Turn {
         if self.cancel.is_cancelled() || self.speculative.is_some() || !will_sample_again {
             return;
         }
-        let Some(expected_leaf) = self.pipeline.leaf().map(str::to_string) else {
+        let Some(predicted) = self.predicted_snapshot() else {
             return;
         };
-        let Some(predicted) = self.predicted_snapshot() else {
+        self.dispatch_speculative(predicted);
+    }
+
+    /// 0033 Task 10: the admission handoff. Park the prompt's ticket (the
+    /// window is empty — never blocks) and dispatch sample 1 speculatively;
+    /// the first `boundary()` then does everything else unmodified — waits
+    /// this turn's own `ack_seq`, refreshes the head (which applied the
+    /// prompt on ack), and the existing leaf-equality filter in `sample()`
+    /// adopts or drops.
+    async fn admit(&mut self, admission: crate::Admission) {
+        let _ = self.pipeline.submit(admission.ticket).await;
+        self.dispatch_speculative(admission.predicted);
+    }
+
+    /// The shared dispatch tail of [`Turn::speculate`] and the admission
+    /// path: build the predicted request and put it on the wire un-adopted.
+    /// `expected_leaf` is the pipeline's newest committed unit in both —
+    /// at admission, that names the prompt entry itself.
+    fn dispatch_speculative(&mut self, predicted: crate::actor::Snapshot) {
+        let Some(expected_leaf) = self.pipeline.leaf().map(str::to_string) else {
             return;
         };
         let Some(request) = self.speculative_request(&predicted) else {

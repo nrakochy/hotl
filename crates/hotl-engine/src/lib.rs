@@ -497,6 +497,17 @@ pub struct CommitTicket {
     pub ack: oneshot::Receiver<Result<CommitAck, CommitFailed>>,
 }
 
+/// 0033 Task 10: a prompt admitted through the ticketed path — the fast
+/// admission's handoff from the actor to the turn it spawns. The ticket is
+/// the prompt entry's (its ack resolves during TLS + TTFB instead of before
+/// request-building starts); `predicted` is the snapshot the head will
+/// publish when that ack lands: head items + the prompt item. Adoption,
+/// mismatch and crash semantics are identical to mid-turn speculation.
+pub(crate) struct Admission {
+    pub(crate) ticket: CommitTicket,
+    pub(crate) predicted: actor::Snapshot,
+}
+
 /// What [`SessionCmd::ProposePrepared`] answers with — plain `bool` has no
 /// room for the rules-epoch guard's distinction (commit-protocol.md
 /// §Proposal payloads): a stale epoch means "rebuild under the current

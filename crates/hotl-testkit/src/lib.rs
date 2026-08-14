@@ -50,6 +50,12 @@ pub struct Harness {
     /// counter assertions (commit-protocol.md §Test obligations) read it
     /// after the log itself has moved into the session.
     fsyncs: Arc<std::sync::atomic::AtomicU64>,
+    /// The writer's test-only ack gate (0033 Task 10): closed = durable
+    /// groups are written+synced but their acks are withheld. Detached
+    /// before the log moves into the session, like `fsyncs`.
+    pub pause_acks: Arc<std::sync::atomic::AtomicBool>,
+    /// Detached fault injector — seals the log on the next write.
+    fault: Box<dyn Fn(hotl_store::WriteFault) + Send + Sync>,
 }
 
 /// Wraps the scripted provider so every stream stalls for `pause` right
@@ -387,6 +393,8 @@ impl Harness {
             log.set_sync_noop(true);
         }
         let fsyncs = log.fsync_counter();
+        let pause_acks = log.pause_ack_handle();
+        let fault = Box::new(log.fault_injector());
         let log_path = log.path().to_path_buf();
         // Mirror the binary's `record_fresh_seed`: a session's seed is part of
         // the projection it runs with, so it has to be part of the log too —
@@ -433,12 +441,26 @@ impl Harness {
             snapshots,
             ledger_reports: Vec::new(),
             fsyncs,
+            pause_acks,
+            fault,
         }
     }
 
     /// `sync_data()` calls the session's writer has completed so far.
     pub fn fsync_count(&self) -> u64 {
         self.fsyncs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Close (`true`) or open (`false`) the writer's ack gate — see
+    /// [`Harness::pause_acks`].
+    pub fn pause_writer(&self, paused: bool) {
+        self.pause_acks
+            .store(paused, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Inject a one-shot write fault at the session's writer.
+    pub fn inject_fault(&self, fault: hotl_store::WriteFault) {
+        (self.fault)(fault);
     }
 
     /// Send a prompt and drain events until the turn finishes.
