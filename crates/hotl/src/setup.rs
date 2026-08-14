@@ -18,7 +18,9 @@ pub const DEFAULT_CONFIG: &str = "\
 # HOTL_PROVIDER_AUTH, HOTL_SANDBOX=off).
 
 [provider]
-# provider/model. `openai/…` covers any OpenAI-compatible endpoint.
+# provider/model. `openai/…` covers any OpenAI-compatible endpoint;
+# `openai-responses/…` speaks the OpenAI Responses API (required for effort
+# on OpenAI's reasoning models; same key + base_url).
 # model = \"openai/gpt-5\"
 # base_url = \"http://localhost:11434/v1\"   # endpoint for the active provider
 # auth = \"subscription\"                    # endpoint authenticates for you;

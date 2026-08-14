@@ -34,7 +34,12 @@ Everything hand-editable lives in **`~/.config/hotl/config.toml`** (or `$XDG_CON
 
 ```toml
 [provider]
-model = "openai/gpt-5"                      # provider/model
+model = "openai/gpt-5"                      # provider/model; openai/ covers any
+                                            # OpenAI-compatible endpoint, and
+                                            # openai-responses/<model> speaks the
+                                            # OpenAI Responses API (required for
+                                            # effort on OpenAI's reasoning models;
+                                            # same key + base_url)
 base_url = "http://localhost:11434/v1"      # endpoint for the active provider
 auth = "api_key"                            # or "subscription": hotl holds no credential (requires base_url)
 fast_model = "..."                          # cheap model for compaction summaries
@@ -229,7 +234,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 
 | Variable | Overrides | Meaning |
 |---|---|---|
-| `HOTL_MODEL` | `[provider].model` | `provider/model`; `openai/…` covers any OpenAI-compatible endpoint. |
+| `HOTL_MODEL` | `[provider].model` | `provider/model`; `openai/…` covers any OpenAI-compatible endpoint, and `openai-responses/…` speaks the OpenAI Responses API — required for effort on OpenAI's reasoning models (they refuse `reasoning_effort` next to tools on chat/completions); same key and base URL sources as `openai/…`. |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | — | Provider keys (never put keys in config.toml). |
 | `HOTL_PROVIDER_BASE_URL` | `[provider].base_url` | Endpoint for the active provider (any provider). Both `https://host/v1` and the bare `https://host` resolve. A non-loopback `http://` URL with a key set warns (cleartext). |
 | `HOTL_OPENAI_BASE_URL` / `HOTL_ANTHROPIC_BASE_URL` | `[provider].base_url` | Legacy vendor-specific aliases for the row above; still honored, and win over the neutral name when both are set. |
