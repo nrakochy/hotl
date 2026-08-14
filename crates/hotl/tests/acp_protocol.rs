@@ -115,6 +115,9 @@ fn scripted_factory_recording(
             name,
             mode: mode.to_string(),
             plan: false,
+            // A resolved session default, so the handshake test can pin that
+            // it rides the open reply (0030 Task 8).
+            default_effort: Some("xhigh".into()),
             session_id,
         })
     })
@@ -171,6 +174,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             name: None,
             mode: "auto".to_string(),
             plan: false,
+            default_effort: None,
             session_id,
         })
     })
@@ -635,6 +639,7 @@ async fn overlapping_prompts_resolve_in_order() {
             name: None,
             mode: "ask".into(),
             plan: false,
+            default_effort: None,
             session_id,
         })
     });
@@ -844,6 +849,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             name,
             mode: "ask".into(),
             plan: false,
+            default_effort: None,
             session_id,
         })
     });
@@ -1039,6 +1045,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             name: None,
             mode: "ask".into(),
             plan: false,
+            default_effort: None,
             session_id,
         })
     });
@@ -1198,6 +1205,10 @@ async fn the_session_reports_its_effective_mode() {
     assert_eq!(
         opened["result"]["mode"], "auto",
         "session/new must report the mode"
+    );
+    assert_eq!(
+        opened["result"]["defaultEffort"], "xhigh",
+        "session/new must report the resolved session default effort"
     );
 
     // A mode change is broadcast, not just acked — any attached surface updates.

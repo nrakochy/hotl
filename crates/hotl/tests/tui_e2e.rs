@@ -73,6 +73,7 @@ fn scripted_factory() -> acp::SessionFactory {
             name: None,
             mode: "ask".into(),
             plan: false,
+            default_effort: None,
             session_id,
         })
     })
@@ -138,6 +139,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             name: None,
             mode: "ask".into(),
             plan: false,
+            default_effort: None,
             session_id,
         })
     })

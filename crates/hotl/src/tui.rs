@@ -101,6 +101,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         skills,
         mode,
         plan,
+        default_effort,
         context_window,
     } = opened;
     let mut state = State::new(settings.vim_mode, model);
@@ -109,6 +110,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     // render a mode the session is not actually running (evaluation §5.7).
     state.mode = mode;
     state.plan = plan;
+    state.default_effort = default_effort;
     state.context_window = context_window;
     state.set_skills(skills);
     state.density = settings.density;
@@ -211,6 +213,9 @@ struct Opened {
     skills: Vec<(String, String)>,
     mode: String,
     plan: bool,
+    /// The session's resolved starting effort — display-only, what a bare
+    /// `/effort` reports when the user has set nothing (0030 Task 8).
+    default_effort: Option<String>,
     context_window: u64,
 }
 
@@ -260,6 +265,10 @@ async fn handshake(
         skills,
         mode,
         plan,
+        default_effort: v
+            .get("defaultEffort")
+            .and_then(Value::as_str)
+            .map(String::from),
         context_window,
     })
 }

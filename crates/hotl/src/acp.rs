@@ -160,6 +160,11 @@ pub struct SessionOpen {
     /// resumed chain (a `PlanSet`, or a legacy `mode: "plan"`) else the config
     /// default.
     pub plan: bool,
+    /// The session's resolved starting effort (env > config > the 0030
+    /// `xhigh` default on catalogued Anthropic), display-only: what a bare
+    /// `/effort` reports when the user has set nothing. `None` = the model
+    /// gets no depth field (uncatalogued model, nothing configured).
+    pub default_effort: Option<String>,
     /// The **store** session id — what `hotl_store::replay_chain` resolves and
     /// what `SessionSpec::Load` takes, as distinct from the `acp-N` handle
     /// this connection hands clients. `session/reload_config` resumes through
@@ -395,6 +400,7 @@ async fn handle_request(
                     // Captured before `open.handle` moves into `install_session`.
                     let mode = open.mode.clone();
                     let plan = open.plan;
+                    let default_effort = open.default_effort.clone();
                     let name = open.name.clone();
                     let sid = install_session(
                         open,
@@ -433,7 +439,8 @@ async fn handle_request(
                     reply_ok(
                         writer,
                         id,
-                        json!({"sessionId": sid, "name": name, "mode": mode, "plan": plan, "images": true}),
+                        json!({"sessionId": sid, "name": name, "mode": mode, "plan": plan,
+                               "defaultEffort": default_effort, "images": true}),
                     )
                     .await;
                 }

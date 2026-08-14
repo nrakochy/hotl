@@ -256,6 +256,11 @@ pub struct State {
     /// setting and not merely "unknown" — `/effort default` restores it. Same
     /// seed-then-correct shape as `plan`, via `effort_changed`.
     pub effort: Option<String>,
+    /// The session's resolved starting effort from the open handshake
+    /// (0030 Task 8), display-only: a bare `/effort` with nothing explicitly
+    /// set reports this instead of the lie "default". Never sent anywhere —
+    /// the engine already holds the same resolved value.
+    pub default_effort: Option<String>,
     /// Model context window in tokens, from the handshake. What the context
     /// gauge divides by; `DEFAULT_CONTEXT_WINDOW` until a server reports one.
     pub context_window: u64,
@@ -329,6 +334,7 @@ impl State {
             mode: "ask".into(),
             plan: false,
             effort: None,
+            default_effort: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
             live_context: None,
             skills: Vec::new(),
@@ -821,7 +827,12 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // Null is meaningful here, not missing: it is "the provider's own
         // default", which is exactly what `/effort default` sets.
         "effort_changed" => {
-            state.effort = v.get("effort").and_then(Value::as_str).map(str::to_string)
+            state.effort = v.get("effort").and_then(Value::as_str).map(str::to_string);
+            if state.effort.is_none() {
+                // Cleared (here or on another attached surface): the session
+                // default no longer describes this session — see `set_effort`.
+                state.default_effort = None;
+            }
         }
         // `/reload` landed: the engine now runs a scaffold built from the
         // config on disk, and the session was re-opened onto it. Everything
@@ -1399,10 +1410,8 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // unguessable, unlike `/plan`'s two-state toggle.
         "effort" => match arg.trim() {
             "" => {
-                notice(
-                    state,
-                    format!("effort {}", state.effort.as_deref().unwrap_or("default")),
-                );
+                let report = format!("effort {}", effort_report(state));
+                notice(state, report);
                 Vec::new()
             }
             "default" | "unset" | "none" => set_effort(state, None),
@@ -1456,7 +1465,7 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                      {todos} todo(s)",
                     state.model,
                     state.mode,
-                    state.effort.as_deref().unwrap_or("default"),
+                    effort_report(state),
                     state.context_window
                 ),
             );
@@ -1831,15 +1840,34 @@ fn set_mode(state: &mut State, mode: &str) -> Vec<Cmd> {
     vec![Cmd::SetMode(mode.to_string())]
 }
 
+/// What a bare `/effort` (and `/status`) reports (0030 Task 8): the explicit
+/// setting, else the session's resolved default marked as such, else the
+/// bare word for "the provider decides".
+fn effort_report(state: &State) -> String {
+    match (&state.effort, &state.default_effort) {
+        (Some(e), _) => e.clone(),
+        (None, Some(d)) => format!("{d} (default)"),
+        (None, None) => "default".into(),
+    }
+}
+
 /// `/effort <level>`: optimistic local update plus the durable `SetEffort`.
 /// Never starts a turn — same session-bookkeeping shape as `/mode`.
 fn set_effort(state: &mut State, effort: Option<&str>) -> Vec<Cmd> {
     state.effort = effort.map(str::to_string);
+    if effort.is_none() {
+        // Cleared ≠ the session default: the provider's own default governs
+        // from here on, so the handshake-seeded default no longer describes
+        // this session.
+        state.default_effort = None;
+    }
     notice(
         state,
         match effort {
             Some(e) => format!("effort set to {e}"),
-            None => "effort cleared — the provider's own default applies".into(),
+            None => "effort cleared — the provider's own default applies \
+                     (not the session default a fresh session starts with)"
+                .into(),
         },
     );
     vec![Cmd::SetEffort(effort.map(str::to_string))]
@@ -3443,6 +3471,46 @@ mod tests {
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("default"))
         );
+    }
+
+    /// 0030 Task 8: bare `/effort` reports the resolved value, never the lie
+    /// "default" when the session genuinely runs at the seeded default.
+    #[test]
+    fn slash_effort_bare_reports_the_session_default_honestly() {
+        // Unset with a known session default: named, and marked as a default.
+        let mut s = State::test_default();
+        s.default_effort = Some("xhigh".into());
+        type_and_submit(&mut s, "/effort");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("effort xhigh (default)")),
+            "got {:?}",
+            s.transcript.last()
+        );
+        // An explicit set wins, with no default marker.
+        type_and_submit(&mut s, "/effort max");
+        type_and_submit(&mut s, "/effort");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("effort max") && !text.contains("(default)"))
+        );
+        // An explicit clear means the provider default — NOT the session
+        // default the handshake seeded.
+        type_and_submit(&mut s, "/effort default");
+        type_and_submit(&mut s, "/effort");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("effort default") && !text.contains("xhigh")),
+            "got {:?}",
+            s.transcript.last()
+        );
+    }
+
+    /// The other surface's clear also stops the default being reported.
+    #[test]
+    fn effort_changed_null_drops_the_session_default() {
+        let mut s = State::test_default();
+        s.default_effort = Some("xhigh".into());
+        upd(&mut s, json!({"type": "effort_changed", "effort": null}));
+        assert_eq!(s.effort, None);
+        assert_eq!(s.default_effort, None);
     }
 
     #[test]

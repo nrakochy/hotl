@@ -737,6 +737,9 @@ pub(crate) async fn build_acp() -> Result<
             name: requested,
             mode,
             plan,
+            // Display-only: what a bare `/effort` reports as the session
+            // default. The engine already holds the same resolved value.
+            default_effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
             // This log's own id — the one a later `session/load` (and so
             // `session/reload_config`) must name to replay this chain.
             session_id,
