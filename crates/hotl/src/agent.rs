@@ -2525,6 +2525,9 @@ fn initial_items(
     date: &str,
 ) -> Vec<hotl_types::Item> {
     let mut items = vec![hotl_context::environment(cwd, model, date)];
+    if let Some(orientation) = workspace_orientation_item(cwd) {
+        items.push(orientation);
+    }
     if let Some(memory) = load_memory(config_dir) {
         items.push(memory);
     }
@@ -2532,6 +2535,53 @@ fn initial_items(
         items.push(instructions);
     }
     items
+}
+
+/// Gather branch/status/commits/top-level for the orientation item (0032);
+/// hotl-context stays pure, so the git runs live here. Any failure is an
+/// empty input. Local metadata reads, so no timeout machinery — a
+/// pathological repo making session start slow earns a tracker row first.
+fn workspace_orientation_item(cwd: &std::path::Path) -> Option<hotl_types::Item> {
+    let git = |args: &[&str]| -> Vec<String> {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            // Orientation is about `cwd`; an inherited GIT_DIR would describe
+            // some other repo entirely (and has corrupted one before).
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter(|l| !l.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
+        .into_iter()
+        .next();
+    let status = git(&["status", "--porcelain"]);
+    let commits = git(&["log", "-5", "--format=%s"]);
+    let mut top: Vec<String> = std::fs::read_dir(cwd)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .map(|e| {
+                    let mut name = e.file_name().to_string_lossy().into_owned();
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        name.push('/');
+                    }
+                    name
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    top.sort();
+    hotl_context::workspace_orientation(branch.as_deref(), &status, &commits, &top)
 }
 
 /// Session default when the user sets nothing (0030; revises 0029 decision 1).
@@ -4622,6 +4672,61 @@ mod tests {
         assert!(text.contains("<env platform=") && text.contains("is_git_repo="));
         // Instructions still load, after it.
         assert!(items.len() > 1);
+    }
+
+    #[test]
+    fn workspace_orientation_rides_second_in_a_git_repo() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return; // no git on this host; the orientation item simply won't ride
+        }
+        let config_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(cwd.path())
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init"]);
+        // Pin the branch name; `init`'s default varies across git versions.
+        git(&["symbolic-ref", "HEAD", "refs/heads/trunk"]);
+        std::fs::write(cwd.path().join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "first subject"]);
+        std::fs::write(cwd.path().join("b.txt"), "y").unwrap();
+        let items = initial_items(config_dir.path(), cwd.path(), "m", "2026-08-14");
+        let hotl_types::Item::User {
+            text, synthetic, ..
+        } = &items[1]
+        else {
+            panic!("the orientation item rides second");
+        };
+        assert_eq!(*synthetic, Some(hotl_types::SyntheticReason::Environment));
+        assert!(text.contains("branch: trunk (1 change)"), "{text}");
+        assert!(text.contains("first subject"), "{text}");
+        assert!(text.contains("?? b.txt"), "{text}");
+        assert!(text.contains("top-level:"), "{text}");
+        assert!(text.contains("trust=\"untrusted\""), "{text}");
+    }
+
+    #[test]
+    fn no_orientation_item_for_an_empty_non_git_dir() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let items = initial_items(config_dir.path(), cwd.path(), "m", "2026-08-14");
+        assert_eq!(items.len(), 1, "just the env block");
     }
 
     #[test]

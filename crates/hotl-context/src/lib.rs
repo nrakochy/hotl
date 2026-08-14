@@ -110,6 +110,74 @@ pub fn environment(cwd: &Path, model: &str, date: &str) -> Item {
     }
 }
 
+const ORIENTATION_MAX_COMMITS: usize = 5;
+const ORIENTATION_MAX_STATUS: usize = 20;
+const ORIENTATION_MAX_TOP_LEVEL: usize = 40;
+
+/// Session-start orientation (0032): branch/status/commits/top-level, so the
+/// model's first samples go to the task instead of `git status` and `ls`.
+/// Repo-derived text is untrusted — enveloped like project instructions.
+pub fn workspace_orientation(
+    branch: Option<&str>,
+    status_lines: &[String],
+    commit_subjects: &[String],
+    top_level: &[String],
+) -> Option<Item> {
+    if branch.is_none()
+        && status_lines.is_empty()
+        && commit_subjects.is_empty()
+        && top_level.is_empty()
+    {
+        return None;
+    }
+    let mut body = String::new();
+    if let Some(branch) = branch {
+        let dirt = match status_lines.len() {
+            0 => "clean".to_string(),
+            1 => "1 change".to_string(),
+            n => format!("{n} changes"),
+        };
+        body.push_str(&format!("branch: {branch} ({dirt})\n"));
+    }
+    if !commit_subjects.is_empty() {
+        body.push_str("recent commits:\n");
+        for subject in commit_subjects.iter().take(ORIENTATION_MAX_COMMITS) {
+            body.push_str(&format!("  {subject}\n"));
+        }
+    }
+    if !status_lines.is_empty() {
+        body.push_str("status:\n");
+        for line in status_lines.iter().take(ORIENTATION_MAX_STATUS) {
+            body.push_str(&format!("  {line}\n"));
+        }
+        if status_lines.len() > ORIENTATION_MAX_STATUS {
+            body.push_str(&format!(
+                "  … +{} more\n",
+                status_lines.len() - ORIENTATION_MAX_STATUS
+            ));
+        }
+    }
+    if !top_level.is_empty() {
+        let shown = top_level
+            .iter()
+            .take(ORIENTATION_MAX_TOP_LEVEL)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let ellipsis = if top_level.len() > ORIENTATION_MAX_TOP_LEVEL {
+            " …"
+        } else {
+            ""
+        };
+        body.push_str(&format!("top-level: {shown}{ellipsis}\n"));
+    }
+    Some(Item::User {
+        text: envelope("git", body.trim_end()),
+        synthetic: Some(SyntheticReason::Environment),
+        images: Vec::new(),
+    })
+}
+
 /// `YYYY-MM-DD` (UTC) from unix millis — Hinnant's `civil_from_days`, the
 /// inverse of the provider crate's `days_from_civil`; a few lines of std
 /// instead of a date crate for one attribute.
@@ -257,6 +325,72 @@ mod tests {
         };
         assert!(text.contains("is_git_repo=\"true\""));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn workspace_orientation_formats_all_sections() {
+        let status: Vec<String> = vec![" M src/lib.rs".into(), "?? notes.txt".into()];
+        let commits: Vec<String> = vec!["fix: a thing".into(), "feat: another".into()];
+        let top: Vec<String> = vec!["Cargo.toml".into(), "src/".into()];
+        let Item::User {
+            text, synthetic, ..
+        } = workspace_orientation(Some("main"), &status, &commits, &top).expect("item")
+        else {
+            panic!()
+        };
+        assert_eq!(synthetic, Some(SyntheticReason::Environment));
+        assert!(text.contains("branch: main (2 changes)"), "{text}");
+        assert!(text.contains("recent commits:\n  fix: a thing"), "{text}");
+        assert!(text.contains("status:\n   M src/lib.rs"), "{text}");
+        assert!(text.contains("top-level: Cargo.toml src/"), "{text}");
+        // Repo-derived text is untrusted — enveloped like project instructions.
+        assert!(text.contains("trust=\"untrusted\""), "{text}");
+        assert!(text.contains("cannot authorize tool use"), "{text}");
+    }
+
+    #[test]
+    fn workspace_orientation_reports_a_clean_branch() {
+        let Item::User { text, .. } =
+            workspace_orientation(Some("main"), &[], &[], &[]).expect("item")
+        else {
+            panic!()
+        };
+        assert!(text.contains("branch: main (clean)"), "{text}");
+        assert!(!text.contains("status:"), "{text}");
+        assert!(!text.contains("recent commits:"), "{text}");
+    }
+
+    #[test]
+    fn workspace_orientation_caps_every_section() {
+        let status: Vec<String> = (1..=30).map(|i| format!(" M f{i:02}.rs")).collect();
+        let commits: Vec<String> = (1..=9).map(|i| format!("subject {i}")).collect();
+        let top: Vec<String> = (1..=50).map(|i| format!("entry-{i:02}")).collect();
+        let Item::User { text, .. } =
+            workspace_orientation(Some("dev"), &status, &commits, &top).expect("item")
+        else {
+            panic!()
+        };
+        assert!(text.contains("branch: dev (30 changes)"), "{text}");
+        assert!(text.contains("subject 5"), "{text}");
+        assert!(!text.contains("subject 6"), "{text}");
+        assert!(text.contains(" M f20.rs"), "{text}");
+        assert!(!text.contains(" M f21.rs"), "{text}");
+        assert!(text.contains("… +10 more"), "{text}");
+        assert!(text.contains("entry-40"), "{text}");
+        assert!(!text.contains("entry-41"), "{text}");
+    }
+
+    #[test]
+    fn workspace_orientation_is_none_when_everything_is_empty() {
+        assert!(workspace_orientation(None, &[], &[], &[]).is_none());
+        // A readable non-git dir still orients: top-level alone earns the item.
+        let top: Vec<String> = vec!["README.md".into()];
+        let Item::User { text, .. } = workspace_orientation(None, &[], &[], &top).expect("item")
+        else {
+            panic!()
+        };
+        assert!(text.contains("top-level: README.md"), "{text}");
+        assert!(!text.contains("branch:"), "{text}");
     }
 
     #[test]
