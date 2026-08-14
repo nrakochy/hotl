@@ -35,6 +35,7 @@ mod history;
 mod images;
 mod keysource;
 mod mcp_cli;
+mod plugins_cli;
 mod session_server;
 mod setup;
 mod shell_hooks;
@@ -108,6 +109,7 @@ fn main() {
         }
         Some("gc") => std::process::exit(gc::gc_main(&args)),
         Some("mcp") => std::process::exit(mcp_cli::mcp_main(&args)),
+        Some("plugins") => std::process::exit(plugins_cli::plugins_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
         Some("update") => std::process::exit(block_on(update::update_main(&args, &version_line()))),
         Some("init") => {
@@ -155,6 +157,7 @@ fn print_help() {
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
+         hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
          hotl mcp             list MCP servers and trust state; show/add/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
          hotl update          install the latest release (--check to only look)\n  \

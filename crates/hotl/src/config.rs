@@ -263,7 +263,7 @@ pub(crate) fn home_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Expand a leading `~/` against `$HOME`.
-fn expand_home(path: &str) -> std::path::PathBuf {
+pub(crate) fn expand_home(path: &str) -> std::path::PathBuf {
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = home_dir() {
             return home.join(rest);
