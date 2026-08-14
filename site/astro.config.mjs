@@ -75,6 +75,7 @@ export default defineConfig({
 				{
 					label: 'Extending',
 					items: [
+						{ label: 'Plugins (Agent Plugins)', slug: 'plugins' },
 						{ label: 'Skills', slug: 'skills' },
 						{ label: 'MCP servers', slug: 'mcp' },
 						{ label: 'Retrieval (recall)', slug: 'retrieval' },

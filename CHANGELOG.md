@@ -31,6 +31,28 @@ semver promise of their own.
 
 ### Added
 
+- **Agent Plugins 1.0.0 is hotl's primary extension package.** One directory
+  bundling skills and MCP servers under a `plugin.json` manifest, in the
+  portable [Agent Plugins](https://github.com/agentplugins/agent-plugins-spec)
+  format — a plugin written for any conformant client loads in hotl
+  unchanged. Register packages in `[plugins.sources]` and manage them with
+  the new `hotl plugins list/add/update/remove` (git runs only on explicit
+  add/update; `add` validates the fresh checkout and prints its reports, so
+  a broken plugin is visible at install time; `remove` always preserves the
+  plugin's data directory). Plugin skills slot in right after your own flat
+  skills — ahead of marketplaces and the Claude roots — and are always also
+  addressable as `<plugin>:<skill>`; plugin MCP servers register as
+  `<plugin>:<server>` beside `[[mcp]]` entries and pass through the same
+  first-use trust screen. Spec conformance (path containment, per-component
+  failure isolation, `${PLUGIN_ROOT}`/`${PLUGIN_DATA}` expansion, the
+  reserved-variable overlay order) is pinned by a per-checklist-row
+  conformance suite. Remote (`streamable-http`/`sse`) server entries are
+  validated but skipped as unsupported transports for now. The existing
+  marketplace and Claude-cache lanes keep working unchanged.
+- **`[[mcp]]` servers can now set `env` and `cwd`.** An ordered
+  `env = [["KEY", "value"], …]` overlays the inherited environment (later
+  duplicates win) and `cwd` sets the working directory — what plugin servers
+  use under the hood, and available to hand-configured servers too.
 - **`/cost` shows recent cache health.** A new `cache N% last turn` segment
   reports the last completed turn's read split, overwritten each turn — so a
   cache-bust regression (the single biggest latency multiplier available)
@@ -40,6 +62,16 @@ semver promise of their own.
   count, per-sample cache hit %, inter-sample gaps, tool calls, and
   denial-smelling results from the session log. Run it once per binary to A/B
   a change's round-trip behavior.
+
+### Security
+
+- **A server's `env` and `cwd` are part of its trust fingerprint.** A
+  configured environment reaches code execution through variables like
+  `NODE_OPTIONS`, `PYTHONPATH`, or `LD_PRELOAD`, so both fields now fold
+  into the MCP trust key (new `fp3:` scheme) and render on the approval
+  screen — shown equals recorded. **Existing MCP trust grants re-screen
+  once** after this update; approve the same server again and the new grant
+  sticks.
 
 ### Fixed
 

@@ -65,6 +65,12 @@ mode = \"bypass\"   # no per-action y/N; protected paths + sandbox still guard.
 # acme = \"https://github.com/acme/skills.git\"   # managed: hotl skills add/update
 # team = \"~/work/team-skills\"                   # local path: read in place
 
+# [plugins.sources]           # Agent Plugins packages (skills + MCP servers
+                              # under one plugin.json): handle = git URL or
+                              # local path — hotl plugins add/update/remove.
+# team = \"https://github.com/acme/team-plugin.git\"
+# local = \"~/work/my-plugin\"
+
 [network]
 # Egress for bash commands: \"open\" (default), \"off\" (loopback + unix sockets
 # only), or \"allowlist\" (loopback + the hosts below, via a local proxy).

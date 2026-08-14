@@ -9,6 +9,8 @@ Give the `hotl` agent extra tools from an MCP server. Assumes you have a working
 
 An MCP (Model Context Protocol) server is a separate program that exposes tools — documentation search, a database query, a web API. Once configured, the agent can call them through a single `mcp` tool. hotl speaks the **stdio** transport (a server it launches as a child process).
 
+Servers can also arrive bundled inside an [Agent Plugin](../plugins/) — they register as `<plugin>:<server>` beside your `[[mcp]]` entries and follow everything on this page (the roster, the trust screen, `hotl mcp test`) unchanged.
+
 ## 1. Declare the server
 
 Create the `[[mcp]]` section of `~/.config/hotl/config.toml`:
@@ -22,6 +24,8 @@ description = "project documentation search"
 ```
 
 Add one `[[mcp]]` block per server. A malformed file is ignored **whole** (fail-closed) with a warning — no servers load until it parses.
+
+Two optional keys shape the server's process: `env = [["KEY", "value"], …]` overlays the inherited environment in order (a later duplicate wins), and `cwd = "/some/dir"` sets its working directory. Both are part of the trust fingerprint — a configured env can reach code execution through variables like `NODE_OPTIONS`, so changing either re-raises the approval screen exactly like changing `args`.
 
 `hotl mcp add <name> <command> [args...]` prints a correctly-shaped block for you to paste. It deliberately does not write `config.toml` itself — see [Managing servers](#managing-servers).
 

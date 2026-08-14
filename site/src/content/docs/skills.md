@@ -11,11 +11,12 @@ text enters the conversation only at the moment the agent loads it.
 
 ## Where skills come from
 
-Four kinds of root, read in place:
+Five kinds of root, read in place:
 
 | Root | What it is |
 |---|---|
 | `~/.config/hotl/skills/*.md` | Your own flat files — one procedure per file. |
+| `[plugins.sources]` entries | [Agent Plugins](../plugins/) — each plugin's `skills/*/SKILL.md`, the primary package lane. |
 | `[skills.marketplaces]` entries | Registered git checkouts or local dirs, walked for `SKILL.md` (see [marketplaces](#skill-marketplaces)). |
 | `~/.claude/skills/<name>/SKILL.md` | Your Claude Code skills. |
 | `~/.claude/plugins/cache/…/skills/<name>/SKILL.md` | Claude Code plugin skills — highest installed version per plugin. |
@@ -24,9 +25,10 @@ Claude-format skills load **in place** — no porting, no copying. The body
 loads on demand prefixed with its base directory so `references/` and
 `scripts/` paths resolve (scripts still run through the normal bash gate and
 sandbox). Bare names resolve by precedence — hotl's own skills, then your
-marketplaces, then your Claude skills, then plugins — and a marketplace or
-plugin skill is always *also* addressable as `source:skill`, which is the
-only form when its bare name is taken. Opt out of the Claude roots with:
+plugins, then your marketplaces, then your Claude skills, then Claude
+plugins — and a plugin or marketplace skill is always *also* addressable as
+`source:skill`, which is the only form when its bare name is taken. Opt out
+of the Claude roots with:
 
     [skills]
     claude = false
