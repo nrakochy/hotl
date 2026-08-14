@@ -271,6 +271,17 @@ fn ttl_marker(ttl: CacheTtl) -> Value {
     }
 }
 
+/// A Responses-dialect `reasoning` item riding in canonical assistant
+/// blocks: foreign to this wire (its encrypted content is another
+/// provider's), so it is dropped at render. Exactly `"reasoning"`, nothing
+/// else — this dialect's own signed `thinking`/`redacted_thinking` must keep
+/// round-tripping untouched. Shared with `cache_plan::item_blocks` so the
+/// plan's block arithmetic and the rendered wire can never disagree about
+/// how many blocks an assistant item contributes.
+pub(crate) fn is_foreign_reasoning(b: &Value) -> bool {
+    b.get("type").and_then(Value::as_str) == Some("reasoning")
+}
+
 /// Render `items` as Anthropic messages, placing a cache breakpoint on every
 /// block `plan` names.
 ///
@@ -346,9 +357,16 @@ fn build_messages(
                 out.push(json!({"role": "user", "content": content}));
             }
             // Echoed verbatim, never marked: these blocks carry thinking
-            // signatures the API validates byte for byte.
+            // signatures the API validates byte for byte. The one exception
+            // is the Responses dialect's `reasoning` items (a session can
+            // cross dialects via /reload) — dropped here by the narrow
+            // [`is_foreign_reasoning`], never by the broader
+            // `strip_foreign_reasoning`, which would also strip this
+            // dialect's own signed thinking.
             Item::Assistant { blocks } => {
-                out.push(json!({"role": "assistant", "content": blocks}));
+                let content: Vec<&Value> =
+                    blocks.iter().filter(|b| !is_foreign_reasoning(b)).collect();
+                out.push(json!({"role": "assistant", "content": content}));
             }
             Item::ToolResults { results } => {
                 let content: Vec<Value> = results
@@ -1406,6 +1424,39 @@ mod tests {
                 .map(|i| serde_json::json!({"type": "text", "text": format!("b{i}")}))
                 .collect(),
         }
+    }
+
+    /// Cross-dialect hygiene: a Responses-dialect `reasoning` item in the
+    /// history (a session crossed dialects via /reload) never reaches this
+    /// wire — while this dialect's own signed thinking keeps round-tripping
+    /// verbatim, which is why the filter is narrower than
+    /// `strip_foreign_reasoning`.
+    #[test]
+    fn foreign_reasoning_items_are_dropped_but_signed_thinking_survives() {
+        let thinking =
+            serde_json::json!({"type": "thinking", "thinking": "chain", "signature": "sig=="});
+        let req = SamplingRequest {
+            items: std::sync::Arc::new(vec![Item::Assistant {
+                blocks: vec![
+                    serde_json::json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "gAAA=="}),
+                    thinking.clone(),
+                    serde_json::json!({"type": "text", "text": "ok"}),
+                ],
+            }]),
+            ..sampling_req()
+        };
+        let body = wire_body(&req);
+        assert!(
+            !body.to_string().contains("encrypted_content"),
+            "a foreign reasoning item must not reach the Anthropic wire"
+        );
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(
+            content[0], thinking,
+            "signed thinking round-trips untouched"
+        );
+        assert_eq!(content[1]["type"], "text");
     }
 
     fn static_req(system: &str, items: Vec<Item>) -> SamplingRequest {

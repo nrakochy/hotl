@@ -1041,15 +1041,23 @@ pub mod transform {
         ))
     }
 
-    /// Drop blocks that are provider-bound (signed/redacted thinking) when
+    /// Drop blocks that are provider-bound — signed/redacted thinking
+    /// (Anthropic) and `reasoning` items (the Responses dialect) — when
     /// sending history to a foreign dialect. Text and tool_use always pass.
+    ///
+    /// Neither dialect that *owns* one of these types may call this: the
+    /// Anthropic converter must keep its own signed thinking round-tripping
+    /// (it filters exactly `reasoning` itself), and the Responses dialect
+    /// must keep its own `reasoning` items (it filters exactly
+    /// thinking/redacted_thinking itself). Only a dialect foreign to all of
+    /// them — the chat-completions one — routes through here.
     pub fn strip_foreign_reasoning(blocks: &[Value]) -> Vec<Value> {
         blocks
             .iter()
             .filter(|b| {
                 !matches!(
                     b.get("type").and_then(Value::as_str),
-                    Some("thinking") | Some("redacted_thinking")
+                    Some("thinking") | Some("redacted_thinking") | Some("reasoning")
                 )
             })
             .cloned()
@@ -1073,6 +1081,20 @@ pub mod transform {
             assert_eq!(out.len(), 2);
             assert_eq!(out[0]["type"], "text");
             assert_eq!(out[1]["type"], "tool_use");
+        }
+
+        /// The Responses dialect's `reasoning` items are provider-bound the
+        /// same way signed thinking is: replayable only on the wire that
+        /// produced them (encrypted content another provider cannot read).
+        #[test]
+        fn strips_the_responses_dialects_reasoning_items_too() {
+            let blocks = vec![
+                json!({"type":"reasoning","id":"rs_1","encrypted_content":"gAAA=="}),
+                json!({"type":"tool_use","id":"1","name":"read","input":{}}),
+            ];
+            let out = strip_foreign_reasoning(&blocks);
+            assert_eq!(out.len(), 1);
+            assert_eq!(out[0]["type"], "tool_use");
         }
 
         #[test]

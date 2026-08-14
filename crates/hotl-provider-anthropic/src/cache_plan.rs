@@ -85,7 +85,12 @@ fn item_blocks(item: &Item, send_images: bool) -> usize {
         // travels in the request's `system` field.
         Item::System { .. } | Item::Unknown => 0,
         Item::User { images, .. } => 1 + if send_images { images.len() } else { 0 },
-        Item::Assistant { blocks } => blocks.len(),
+        // Foreign `reasoning` items are dropped at render
+        // (`build_messages`), so they must not be counted here either.
+        Item::Assistant { blocks } => blocks
+            .iter()
+            .filter(|b| !crate::is_foreign_reasoning(b))
+            .count(),
         Item::ToolResults { results } => results.len(),
     }
 }
