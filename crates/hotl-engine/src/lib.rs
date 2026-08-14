@@ -176,6 +176,8 @@ pub struct TurnContinuation {
     pub(crate) consecutive_failures: std::collections::HashMap<String, u32>,
     /// The shared per-prompt "reminder and continue" budget.
     pub(crate) turn_extensions: u32,
+    /// Truncation-recovery continues already spent (MAX_TOKENS_CONTINUE_MAX).
+    pub(crate) max_tokens_continues: u32,
     /// Completed samples since the last fold — the compaction streak's
     /// "intervening completed sample" (T2-3). Read by `actor::try_compact`;
     /// a fresh continuation restarts the count at zero.

@@ -96,6 +96,10 @@ const TURN_EXTENSION_MAX: u32 = 3;
 /// this — a gate that can wedge one is a bug. Enforced by
 /// `the_gate_fires_at_most_twice_then_lets_the_turn_end`.
 const TODO_GATE_MAX: u32 = 2;
+/// Truncation-recovery budget, separate from `TURN_EXTENSION_MAX` — that
+/// budget's invariant is "end-turn intercept gates", and truncation recovery
+/// must not starve the TodoGate (or vice versa).
+const MAX_TOKENS_CONTINUE_MAX: u32 = 3;
 
 pub(crate) async fn run(
     shared: Arc<SharedDeps>,
@@ -711,6 +715,9 @@ struct Turn {
     /// *prompt*, not one `drive()` call); the TodoGate is the only consumer
     /// today, bounded further by [`TODO_GATE_MAX`].
     turn_extensions: u32,
+    /// Truncation-recovery continues spent ([`MAX_TOKENS_CONTINUE_MAX`]);
+    /// crosses folds like `turn_extensions`.
+    max_tokens_continues: u32,
     /// Steps spent against `EngineConfig::max_turns`. A `Turn` field rather
     /// than a `drive()` local precisely so it can cross a fold (T2-2).
     spent: i64,
@@ -786,6 +793,7 @@ impl Turn {
             last_snapshot: None,
             speculation: None,
             turn_extensions: cont.turn_extensions,
+            max_tokens_continues: cont.max_tokens_continues,
             spent: cont.spent,
             // A continuation starts a fresh progress count: the value it
             // inherited was already read by `try_compact`, and re-carrying it
@@ -809,6 +817,7 @@ impl Turn {
             call_sigs: std::mem::take(&mut self.call_sigs),
             consecutive_failures: std::mem::take(&mut self.consecutive_failures),
             turn_extensions: self.turn_extensions,
+            max_tokens_continues: self.max_tokens_continues,
             samples_since_compact: self.samples_since_compact,
         }
     }
@@ -863,6 +872,40 @@ impl Turn {
                 StopReason::Refusal => {
                     self.ledger.stamp(Phase::BoundaryEnd);
                     return TurnEnd::Outcome(Outcome::Refused);
+                }
+                StopReason::MaxTokens => {
+                    // Truncated AFTER complete tool calls: run them — the
+                    // results are the natural continuation.
+                    if !assistant_tool_uses(&blocks).is_empty() {
+                        let outcome = self.run_tool_phase(&blocks).await;
+                        self.ledger.stamp(Phase::BoundaryEnd);
+                        if let Some(outcome) = outcome {
+                            return TurnEnd::Outcome(outcome);
+                        }
+                    } else if self.max_tokens_continues < MAX_TOKENS_CONTINUE_MAX {
+                        self.max_tokens_continues += 1;
+                        let commit = self
+                            .inject_reminder(
+                                "Your previous response was cut off at the \
+                                 output-token limit. Continue exactly where \
+                                 you left off."
+                                    .into(),
+                            )
+                            .await;
+                        if !commit.ok() {
+                            self.ledger.stamp(Phase::BoundaryEnd);
+                            return TurnEnd::Outcome(commit.outcome());
+                        }
+                        self.ledger.stamp(Phase::BoundaryEnd);
+                        continue;
+                    } else {
+                        // Bounded: accept the truncated text as done rather
+                        // than looping forever on an output the cap can't fit.
+                        self.ledger.stamp(Phase::BoundaryEnd);
+                        return TurnEnd::Outcome(Outcome::Done {
+                            text: assistant_text(&blocks),
+                        });
+                    }
                 }
                 _ => {
                     // Done branch (index E4): the TodoGate and a `Stop` hook
@@ -960,6 +1003,12 @@ impl Turn {
             }
             body.push_str(&reason);
         }
+        self.inject_reminder(body).await
+    }
+
+    /// Commit one tagged `SystemReminder` user item at the sample boundary —
+    /// the shared shape under the gate nudge and truncation recovery.
+    async fn inject_reminder(&mut self, body: String) -> Commit {
         self.propose_pipelined(
             vec![EntryPayload::Item {
                 item: Item::User {
@@ -1027,10 +1076,13 @@ impl Turn {
         self.last_snapshot = Some(snapshot.clone());
         self.projected_tail.clear();
 
-        let (stop, usage, blocks) = match self.collect_stream(stream).await {
+        let (stop, usage, mut blocks) = match self.collect_stream(stream).await {
             Ok(completed) => completed,
             Err(end) => return end,
         };
+        if stop == StopReason::MaxTokens {
+            prune_unsigned_trailing_thinking(&mut blocks);
+        }
         self.usage += usage;
         // A completed sample is the "intervening progress" the compaction
         // streak is defined against (T2-3).
@@ -2402,6 +2454,16 @@ fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
     None
 }
 
+/// A MaxTokens stream can end inside a thinking block, leaving it unsigned;
+/// echoed verbatim next request that is a 400. Signed blocks always pass.
+fn prune_unsigned_trailing_thinking(blocks: &mut Vec<Value>) {
+    if blocks.last().is_some_and(|b| {
+        b.get("type").and_then(Value::as_str) == Some("thinking") && b.get("signature").is_none()
+    }) {
+        blocks.pop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2413,6 +2475,27 @@ mod tests {
             name: name.into(),
             input,
         })
+    }
+
+    #[test]
+    fn prune_drops_only_an_unsigned_trailing_thinking_block() {
+        let unsigned = json!({"type": "thinking", "thinking": "partial"});
+        let signed = json!({"type": "thinking", "thinking": "done", "signature": "sig"});
+        let text = json!({"type": "text", "text": "hi"});
+
+        let mut blocks = vec![text.clone(), unsigned.clone()];
+        prune_unsigned_trailing_thinking(&mut blocks);
+        assert_eq!(blocks, vec![text.clone()]);
+
+        let mut blocks = vec![text.clone(), signed.clone()];
+        prune_unsigned_trailing_thinking(&mut blocks);
+        assert_eq!(blocks, vec![text.clone(), signed]);
+
+        // Non-thinking last block survives even when truncated.
+        let mut blocks = vec![unsigned, text.clone()];
+        prune_unsigned_trailing_thinking(&mut blocks);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[1], text);
     }
 
     #[test]

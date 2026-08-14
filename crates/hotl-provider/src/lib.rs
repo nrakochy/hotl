@@ -396,6 +396,15 @@ impl ScriptedProvider {
 
     /// Convenience: a one-sample script that answers with plain text.
     pub fn text_reply(text: &str) -> Vec<Result<StreamEvent, ProviderError>> {
+        Self::text_reply_with_stop(text, StopReason::EndTurn)
+    }
+
+    /// [`Self::text_reply`] with the final stop reason chosen by the test —
+    /// the same events, ended however the scenario needs (MaxTokens, …).
+    pub fn text_reply_with_stop(
+        text: &str,
+        stop: StopReason,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
         vec![
             Ok(StreamEvent::Started),
             Ok(StreamEvent::BlockStart {
@@ -408,7 +417,7 @@ impl ScriptedProvider {
             }),
             Ok(StreamEvent::BlockEnd { index: 0 }),
             Ok(StreamEvent::Completed {
-                stop: StopReason::EndTurn,
+                stop,
                 usage: TokenUsage {
                     input_tokens: 10,
                     output_tokens: 5,
