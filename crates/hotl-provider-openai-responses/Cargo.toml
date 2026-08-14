@@ -1,0 +1,23 @@
+[package]
+name = "hotl-provider-openai-responses"
+description = "Internal component of hotl - no semver promise; pin exact or don't depend. OpenAI Responses-API provider (reasoning models whose effort control needs /v1/responses)."
+readme = "../INTERNAL.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+hotl-types = { path = "../hotl-types", version = "0.13.0" }
+hotl-provider = { path = "../hotl-provider", version = "0.13.0" }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+futures-util = { workspace = true }
+async-stream = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "macros", "rt"] }

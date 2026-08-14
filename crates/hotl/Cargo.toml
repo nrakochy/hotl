@@ -55,6 +55,7 @@ hotl-platform = { path = "../hotl-platform", version = "0.13.0" }
 hotl-provider = { path = "../hotl-provider", version = "0.13.0" }
 hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.13.0" }
 hotl-provider-openai = { path = "../hotl-provider-openai", version = "0.13.0" }
+hotl-provider-openai-responses = { path = "../hotl-provider-openai-responses", version = "0.13.0" }
 hotl-tools = { path = "../hotl-tools", version = "0.13.0", default-features = false }
 hotl-mcp = { path = "../hotl-mcp", version = "0.13.0", default-features = false }
 hotl-retrieval = { path = "../hotl-retrieval", version = "0.13.0", default-features = false }

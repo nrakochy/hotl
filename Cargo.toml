@@ -11,6 +11,7 @@ members = [
     "crates/hotl-provider",
     "crates/hotl-provider-anthropic",
     "crates/hotl-provider-openai",
+    "crates/hotl-provider-openai-responses",
     "crates/hotl-minify",
     "crates/hotl-tools",
     "crates/hotl-mcp",
