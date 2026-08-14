@@ -21,6 +21,7 @@ mod acp;
 mod agent;
 mod attach;
 mod bg;
+mod clipboard;
 mod config;
 // Built and tested, not yet reachable from the ask path: `EngineEvent::Ask`
 // carries no `tool`/`input` for `acp.rs` to diff (RQ-2 to R2 — see

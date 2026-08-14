@@ -481,17 +481,11 @@ fn load_image(path: &str, cap: u64) -> Result<(String, usize), String> {
 /// frame per button release and yields exactly what the user is looking at,
 /// highlight included.
 ///
-/// Transport is OSC 52 — no clipboard crate, and it works over SSH. A
-/// screen-bounded region is far under every terminal's payload cap, so it goes
-/// in one write. Terminals that refuse OSC 52 (or tmux without
-/// `set-clipboard on`) simply drop it; there is no reply to check.
-/// The OSC 52 clipboard write: `ESC ] 52 ; c ; <base64> BEL`. Base64 is what
-/// makes the payload safe to embed — newlines and control bytes in the copied
-/// text cannot terminate the sequence early.
-fn osc52(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", hotl_tools::b64::encode(text.as_bytes()))
-}
-
+/// Delivery is `clipboard::copy`, which fans out to every transport that
+/// applies — the OSC 52 escape for SSH and OSC-52-capable terminals, a tmux
+/// route that survives the `set-clipboard`/`allow-passthrough` defaults that
+/// drop a bare escape, and a native program for terminals that never spoke
+/// OSC 52. A screen-bounded region is far under every sink's payload cap.
 fn copy_region(
     guard: &mut TerminalGuard,
     state: &State,
@@ -499,15 +493,12 @@ fn copy_region(
     cache: &mut TranscriptCache,
     sel: &hotl_tui::select::Selection,
 ) -> io::Result<usize> {
-    use std::io::Write;
     let frame = guard.terminal.draw(|f| view(state, palette, cache, f))?;
     let text = hotl_tui::view::selection_text(state, frame.buffer, sel);
     if text.is_empty() {
         return Ok(0);
     }
-    let mut out = io::stdout();
-    let _ = write!(out, "{}", osc52(&text));
-    let _ = out.flush();
+    crate::clipboard::copy(&mut io::stdout(), &text);
     Ok(text.lines().count())
 }
 
@@ -891,7 +882,7 @@ fn age(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        osc52, parse_tui_args, parse_tui_flags, resolve_mouse, resolve_session_arg, terminal_msg,
+        parse_tui_args, parse_tui_flags, resolve_mouse, resolve_session_arg, terminal_msg,
         WHEEL_LINES,
     };
     use crossterm::event::{Event, KeyModifiers};
@@ -1074,15 +1065,6 @@ mod tests {
                 None
             );
         }
-    }
-
-    #[test]
-    fn the_clipboard_escape_is_a_well_formed_osc_52() {
-        // `ESC ] 52 ; c ; <base64> BEL` — `c` is the clipboard selection.
-        assert_eq!(osc52("hi"), "\x1b]52;c;aGk=\x07");
-        // Newlines are payload, not terminators: a multi-line copy must not
-        // truncate at the first one.
-        assert_eq!(osc52("a\nb"), "\x1b]52;c;YQpi\x07");
     }
 
     #[test]
