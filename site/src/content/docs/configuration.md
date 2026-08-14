@@ -42,7 +42,7 @@ model = "openai/gpt-5"                      # provider/model; openai/ covers any
                                             # same key + base_url)
 base_url = "http://localhost:11434/v1"      # endpoint for the active provider
 auth = "api_key"                            # or "subscription": hotl holds no credential (requires base_url)
-fast_model = "..."                          # cheap model for compaction summaries
+fast_model = "..."                          # cheap model for compaction summaries; absent = claude-haiku-4-5 on catalogued Anthropic models, else the session model
 effort = "high"                             # low | medium | high | xhigh | max; absent = xhigh on catalogued Anthropic models, else the provider's default
 api_key_helper = "..."                      # command whose trimmed stdout is the API key; beats static key env vars; 5s timeout, 64KB cap
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
@@ -244,7 +244,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_API_KEY_HELPER` | `[provider].api_key_helper` | Overrides the config.toml key of the same name. |
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. Leave unset to get the [per-model window](#context-window-context-window). |
-| `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. |
+| `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. Absent everywhere: catalogued Anthropic sessions digest on `claude-haiku-4-5`; anything else keeps the session model. |
 | `HOTL_EFFORT` | `[provider].effort` | Reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Unset defaults to `xhigh` on catalogued Anthropic models with effort support; other models get no depth field. An unrecognized value warns and is ignored. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `bypass` (default: no per-action asks) \| `ask` \| `dontask`; `auto` still parses as `bypass`, and a typo fails closed to `ask`. |

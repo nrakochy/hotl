@@ -2589,6 +2589,11 @@ fn workspace_orientation_item(cwd: &std::path::Path) -> Option<hotl_types::Item>
 /// already `high`, so wiring `high` would change bytes for zero behavior.
 const DEFAULT_EFFORT: Effort = Effort::XHigh;
 
+/// Digest summaries are mechanical; the main model at session effort is the
+/// most expensive possible choice (0032). Catalogued effort-capable sessions
+/// default their digests to Haiku; everything else keeps the main model.
+const DEFAULT_FAST_MODEL: &str = "claude-haiku-4-5";
+
 /// Engine knobs from the environment: HOTL_CONTEXT_WINDOW (tokens) and
 /// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
 /// Build the engine config from `config.toml` (`[context]`, plus `[behavior]
@@ -2630,6 +2635,14 @@ fn engine_config(
     config.fast_model = secrets
         .get("HOTL_FAST_MODEL")
         .or_else(|| cfg.provider.fast_model.clone());
+    // Same catalog gate as the effort default below: exactly the big
+    // catalogued Anthropic models. Haiku keeps Haiku; an uncatalogued or
+    // OpenAI-compat session is untouched (its gateway may not serve the id).
+    if config.fast_model.is_none()
+        && hotl_provider::catalog::lookup(model).is_some_and(|m| m.caps.effort)
+    {
+        config.fast_model = Some(DEFAULT_FAST_MODEL.into());
+    }
     if let Some(t) = secrets
         .get("HOTL_EVICT_TOKENS")
         .and_then(|v| v.parse().ok())
@@ -4821,6 +4834,57 @@ mod tests {
             )
             .effort,
             None
+        );
+    }
+
+    #[test]
+    fn unset_fast_model_defaults_to_haiku_for_catalogued_anthropic() {
+        assert_eq!(
+            engine_config(
+                "claude-opus-4-8",
+                &MapSecrets::default(),
+                &config_from_toml("")
+            )
+            .fast_model
+            .as_deref(),
+            Some(DEFAULT_FAST_MODEL)
+        );
+    }
+
+    #[test]
+    fn haiku_and_uncatalogued_sessions_get_no_fast_model_default() {
+        // Haiku is catalogued with caps.effort == false: its digests stay on
+        // Haiku itself. Uncatalogued "m": the gateway may not serve the id.
+        assert_eq!(
+            engine_config(
+                "claude-haiku-4-5",
+                &MapSecrets::default(),
+                &config_from_toml("")
+            )
+            .fast_model,
+            None
+        );
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &config_from_toml("")).fast_model,
+            None
+        );
+    }
+
+    #[test]
+    fn an_explicit_fast_model_is_never_overridden() {
+        let cfg = config_from_toml("[provider]\nfast_model = \"my-own\"\n");
+        assert_eq!(
+            engine_config("claude-opus-4-8", &MapSecrets::default(), &cfg)
+                .fast_model
+                .as_deref(),
+            Some("my-own")
+        );
+        let secrets = MapSecrets::from([("HOTL_FAST_MODEL", "env-pick")]);
+        assert_eq!(
+            engine_config("claude-opus-4-8", &secrets, &cfg)
+                .fast_model
+                .as_deref(),
+            Some("env-pick")
         );
     }
 
