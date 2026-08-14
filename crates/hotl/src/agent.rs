@@ -2729,6 +2729,9 @@ type SelectedProvider = (
 ///   openai/gpt-…         needs OPENAI_API_KEY (or api_key_helper), or
 ///                        HOTL_OPENAI_BASE_URL for keyless OpenAI-compatible
 ///                        endpoints (Ollama etc.)
+///   openai-responses/gpt-… the same key/base sources, speaking the Responses
+///                        API — the dialect OpenAI's reasoning models require
+///                        for effort control next to function tools
 /// A bare model string means Anthropic; unset means the Anthropic default.
 /// Returns the provider, the selected model, and the key source that backs
 /// it (so a caller can validate/refresh it once at startup).
@@ -2742,11 +2745,13 @@ pub(crate) fn select_provider(
     let (provider, source) = match provider_name.as_str() {
         "anthropic" => resolve_anthropic(cfg, secrets, auth)?,
         "openai" | "oai" => resolve_openai(cfg, secrets, auth)?,
+        "openai-responses" => resolve_openai_responses(cfg, secrets, auth)?,
         other => {
             return Err(format!(
                 "unknown provider `{other}` in HOTL_MODEL. Supported: anthropic/<model>, \
                  openai/<model> (openai covers any OpenAI-compatible endpoint via \
-                 HOTL_OPENAI_BASE_URL)."
+                 HOTL_OPENAI_BASE_URL), openai-responses/<model> (the OpenAI Responses \
+                 API dialect, for reasoning models whose effort control needs it)."
             ))
         }
     };
@@ -2819,8 +2824,13 @@ pub(crate) fn active_endpoint(
     secrets: &dyn SecretStore,
 ) -> Option<String> {
     match selected_model(cfg, secrets).0.as_str() {
-        "openai" | "oai" => provider_base_url(cfg, secrets, "HOTL_OPENAI_BASE_URL")
-            .filter(|b| b != hotl_provider_openai::DEFAULT_BASE_URL),
+        // Both OpenAI dialects share the base (and DEFAULT_BASE_URL compares
+        // equal for both crates), so `hotl doctor`'s v1_base probe works
+        // unchanged for openai-responses.
+        "openai" | "oai" | "openai-responses" => {
+            provider_base_url(cfg, secrets, "HOTL_OPENAI_BASE_URL")
+                .filter(|b| b != hotl_provider_openai::DEFAULT_BASE_URL)
+        }
         _ => provider_base_url(cfg, secrets, "HOTL_ANTHROPIC_BASE_URL"),
     }
 }
@@ -2937,6 +2947,54 @@ fn resolve_openai(
             base,
             source.clone(),
         )),
+        source,
+    ))
+}
+
+/// Twin of [`resolve_openai`] for the Responses dialect: the same base-URL
+/// precedence (`HOTL_OPENAI_BASE_URL` deliberately reused — a proxy that
+/// serves `/v1/chat/completions` at a base serves `/v1/responses` at the
+/// same base) and the same key sources, differing only in the provider
+/// constructed.
+fn resolve_openai_responses(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+    auth: AuthMode,
+) -> Result<ProviderAndSource, String> {
+    let configured = provider_base_url(cfg, secrets, "HOTL_OPENAI_BASE_URL");
+    if auth == AuthMode::Subscription {
+        let base = configured.ok_or_else(subscription_needs_base_url)?;
+        warn_cleartext(&base, auth, false);
+        let source: Arc<dyn hotl_provider::key::KeySource> =
+            Arc::new(hotl_provider::key::StaticKey(None));
+        return Ok((
+            Arc::new(
+                hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source.clone()),
+            ),
+            source,
+        ));
+    }
+    let base =
+        configured.unwrap_or_else(|| hotl_provider_openai_responses::DEFAULT_BASE_URL.to_string());
+    let key = secrets.get("OPENAI_API_KEY");
+    let source = key_source_for(cfg, secrets, key.clone());
+    if !source.refreshable()
+        && key.is_none()
+        && base == hotl_provider_openai_responses::DEFAULT_BASE_URL
+    {
+        return Err(
+            "OPENAI_API_KEY is not set (required for api.openai.com; keyless works \
+                     only with HOTL_OPENAI_BASE_URL pointing at a local/compatible endpoint \
+                     that serves /v1/responses), or configure [provider] api_key_helper."
+                .to_string(),
+        );
+    }
+    // H-09 twin: see resolve_openai for the cleartext-bearer rationale.
+    warn_cleartext(&base, auth, key.is_some() || source.refreshable());
+    Ok((
+        Arc::new(
+            hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source.clone()),
+        ),
         source,
     ))
 }
@@ -4808,6 +4866,53 @@ mod tests {
         // the Ok side to be `Debug` for its panic message) doesn't apply.
         let err = select_provider(&cfg, &secrets).err().unwrap();
         assert!(err.contains("api_key_helper"), "{err}");
+    }
+
+    /// The new prefix resolves, reusing the openai key/base sources —
+    /// including the keyless-on-custom-base allowance.
+    #[test]
+    fn openai_responses_prefix_resolves_the_new_provider() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "openai-responses/gpt-5.6-luna-1"),
+            ("HOTL_OPENAI_BASE_URL", "http://localhost:11434/v1"),
+        ]);
+        let (_p, m, _s) = select_provider(&cfg, &secrets).unwrap();
+        assert_eq!(m, "gpt-5.6-luna-1");
+    }
+
+    /// Keyless against the vendor default base fails with the same guidance
+    /// as the chat dialect.
+    #[test]
+    fn keyless_openai_responses_default_base_error_mentions_helper() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([("HOTL_MODEL", "openai-responses/m")]);
+        let err = select_provider(&cfg, &secrets).err().unwrap();
+        assert!(err.contains("api_key_helper"), "{err}");
+    }
+
+    /// The unknown-provider error advertises every door, the new one included.
+    #[test]
+    fn unknown_provider_error_names_openai_responses() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([("HOTL_MODEL", "groq/m")]);
+        let err = select_provider(&cfg, &secrets).err().unwrap();
+        assert!(err.contains("openai-responses/<model>"), "{err}");
+    }
+
+    /// The Responses dialect shares the openai base override, so `hotl
+    /// doctor` probes the endpoint the provider will actually use.
+    #[test]
+    fn active_endpoint_covers_openai_responses() {
+        let cfg = config_from_toml("");
+        let secrets = MapSecrets::from([
+            ("HOTL_MODEL", "openai-responses/m"),
+            ("HOTL_OPENAI_BASE_URL", "http://127.0.0.1:8080/v1"),
+        ]);
+        assert_eq!(
+            active_endpoint(&cfg, &secrets).as_deref(),
+            Some("http://127.0.0.1:8080/v1")
+        );
     }
 
     #[test]
