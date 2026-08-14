@@ -51,7 +51,8 @@ api_key_helper_ttl_secs = 300               # re-run the helper when the cached 
 window = 200000            # usually unnecessary — looked up per model; see below
 evict_tokens = 20000       # offload tool results larger than this (0 disables)
 compaction_reset = false   # fresh-slate compaction instead of in-place
-show_used_pct = true       # show context-fullness in each turn's status
+show_used_pct = false      # opt in to showing the model context-fullness each
+                           # turn (default hidden: it induces premature wrap-up)
 
 [behavior]
 sandbox = true             # false disables the bash sandbox floor

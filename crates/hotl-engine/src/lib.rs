@@ -97,7 +97,9 @@ pub struct EngineConfig {
     /// summarized-then-refilling window. Default false = M2 in-place behavior.
     pub compaction_reset: bool,
     /// Include `context_used%` in the MOIM turn-context block (M4/#9).
-    /// Default true = M2 behavior; false to avoid inducing context anxiety.
+    /// Default false: broadcasting fullness every sample induces "context
+    /// anxiety" — premature wrap-up (Anthropic long-horizon finding). Opt in
+    /// via `[context] show_used_pct = true`.
     pub show_context_pct: bool,
     /// Evict a successful tool result larger than this (estimated tokens) to a
     /// masked blob, leaving a head preview + read pointer (T4). `0` disables.
@@ -131,7 +133,7 @@ impl Default for EngineConfig {
             context_window: 200_000,
             fast_model: None,
             compaction_reset: false,
-            show_context_pct: true,
+            show_context_pct: false,
             evict_threshold_tokens: 20_000,
             ack_mode: AckMode::Pipelined,
         }

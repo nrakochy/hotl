@@ -2562,7 +2562,7 @@ fn engine_config(
     };
     config.show_context_pct = match secrets.get("HOTL_HIDE_CONTEXT_PCT").as_deref() {
         Some(v) => v != "1",
-        None => cfg.context.show_used_pct.unwrap_or(true),
+        None => cfg.context.show_used_pct.unwrap_or(false),
     };
     // Extended thinking is billed whether or not anything renders it, so the
     // off switch matters. Env-only until R4 adds `[behavior] thinking` — see

@@ -2759,8 +2759,8 @@ mod tests {
             .as_deref()
             .expect("turn context attached");
         assert!(
-            tc.contains("sample=\"1\"") && tc.contains("context_used="),
-            "was: {tc}"
+            tc.contains("sample=\"1\"") && !tc.contains("context_used="),
+            "pct is opt-in since 0030; was: {tc}"
         );
         assert!(
             !h.transcript().contains("<turn-context"),
@@ -2953,18 +2953,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn moim_context_pct_can_be_hidden() {
+    async fn moim_context_pct_can_be_shown() {
         let mut h = Harness::new(
             vec![ScriptedProvider::text_reply("hi")],
             EngineConfig {
-                show_context_pct: false,
+                show_context_pct: true,
                 ..cfg()
             },
         );
         h.prompt_and_wait("hello").await;
         let reqs = h.provider.requests();
         let tc = reqs[0].turn_context.as_deref().unwrap();
-        assert!(!tc.contains("context_used"), "pct must be omitted: {tc}");
+        assert!(tc.contains("context_used"), "pct rides when opted in: {tc}");
         assert!(tc.contains("sample="), "the rest of MOIM still rides");
     }
 
