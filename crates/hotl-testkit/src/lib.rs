@@ -643,11 +643,17 @@ pub mod wire {
     /// byte-indistinguishable from a durable one once it is JSON, which is
     /// precisely why the split had to happen upstream of the serializer.
     pub fn durable_wire_body(req: &SamplingRequest) -> serde_json::Value {
-        hotl_provider_anthropic::wire_body(&SamplingRequest {
+        parsed(&hotl_provider_anthropic::wire_body(&SamplingRequest {
             ephemeral_tail: Arc::new(Vec::new()),
             turn_context: None,
             ..req.clone()
-        })
+        }))
+    }
+
+    /// `wire_body` returns the final bytes (0033 Task 6); the structural
+    /// helpers here still want a tree to walk.
+    pub fn parsed(body: &str) -> serde_json::Value {
+        serde_json::from_str(body).expect("a wire body is valid JSON")
     }
 
     /// Every `cache_control` key removed, recursively.
@@ -729,7 +735,7 @@ pub mod wire {
     /// ordering (the API requires longer-lived breakpoints to precede
     /// shorter-lived ones).
     pub fn assert_marker_budget_and_ttl_order(req: &SamplingRequest, label: &str) {
-        let body = hotl_provider_anthropic::wire_body(req);
+        let body = parsed(&hotl_provider_anthropic::wire_body(req));
         let markers = count_markers(&body);
         assert!(
             markers <= MARKER_BUDGET,
@@ -2108,7 +2114,9 @@ mod tests {
 
         // Non-vacuous: the history really did outgrow the stride, so rolling
         // anchors exist, the budget is actually spent, and 1h reached the wire.
-        let last = hotl_provider_anthropic::wire_body(requests.last().expect("requests"));
+        let last = parsed(&hotl_provider_anthropic::wire_body(
+            requests.last().expect("requests"),
+        ));
         let marked = marker_positions(&last);
         assert!(
             marked.len() >= 2,
@@ -2185,7 +2193,7 @@ mod tests {
         );
 
         for (i, req) in requests.iter().enumerate() {
-            let full = hotl_provider_anthropic::wire_body(req);
+            let full = parsed(&hotl_provider_anthropic::wire_body(req));
             let durable = durable_wire_body(req);
             let full_msgs = full["messages"].as_array().expect("messages");
             let durable_msgs = durable["messages"].as_array().expect("messages");
@@ -2308,8 +2316,8 @@ mod tests {
             "exactly one discontinuity, and it is the fold"
         );
 
-        let before = hotl_provider_anthropic::wire_body(&session[1]);
-        let after = hotl_provider_anthropic::wire_body(&session[2]);
+        let before = parsed(&hotl_provider_anthropic::wire_body(&session[1]));
+        let after = parsed(&hotl_provider_anthropic::wire_body(&session[2]));
         assert_eq!(
             before["system"], after["system"],
             "the system segment — and so the entry the system marker wrote — \
@@ -2352,7 +2360,7 @@ mod tests {
         // Non-vacuous: the same run's session requests do mark.
         assert!(
             all.iter()
-                .any(|r| count_markers(&hotl_provider_anthropic::wire_body(r)) > 0),
+                .any(|r| count_markers(&parsed(&hotl_provider_anthropic::wire_body(r))) > 0),
             "the fixture must also exercise the marking path"
         );
     }
@@ -2506,8 +2514,8 @@ mod tests {
 
         // Level 2: the provider-serialized body — the actual bytes.
         assert_eq!(
-            hotl_provider_anthropic::wire_body(&without_moim(&adopted[1])).to_string(),
-            hotl_provider_anthropic::wire_body(&without_moim(&sequential[1])).to_string(),
+            hotl_provider_anthropic::wire_body(&without_moim(&adopted[1])),
+            hotl_provider_anthropic::wire_body(&without_moim(&sequential[1])),
             "…and so must the wire body built from it"
         );
 
@@ -2564,8 +2572,8 @@ mod tests {
             "the adopted request must equal the sequential rebuild"
         );
         assert_eq!(
-            hotl_provider_anthropic::wire_body(&without_moim(&adopted[1])).to_string(),
-            hotl_provider_anthropic::wire_body(&without_moim(&sequential[1])).to_string(),
+            hotl_provider_anthropic::wire_body(&without_moim(&adopted[1])),
+            hotl_provider_anthropic::wire_body(&without_moim(&sequential[1])),
             "…and so must the wire body built from it"
         );
     }

@@ -988,6 +988,7 @@ dependencies = [
  "hotl-provider",
  "hotl-types",
  "reqwest",
+ "serde",
  "serde_json",
  "tokio",
 ]

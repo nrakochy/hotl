@@ -155,107 +155,515 @@ impl AnthropicProvider {
         self.no_credential = true;
         self
     }
+}
 
-    fn build_body(req: &SamplingRequest) -> Value {
+/// Single-pass borrowed serialization of one request body (0033 Task 6):
+/// `Serialize` writes every string — texts, tool results, base64 image
+/// payloads — straight from the `Arc`ed items. No intermediate `Value` tree,
+/// no clone of any payload, one serialization pass per sample.
+///
+/// INVARIANT: byte-identical to the retired `Value`-tree builder. The
+/// workspace's serde_json has no `preserve_order`, so every `json!` map
+/// serialized its keys in ASCII-alphabetical order — every map here is
+/// hand-emitted in exactly that order. Enforced by
+/// `wire_body_bytes_match_the_value_tree_reference`, whose oracle
+/// (`build_body_reference`) is the old builder verbatim.
+struct WireBody<'a> {
+    req: &'a SamplingRequest,
+    plan: Option<cache_plan::Plan>,
+    /// The lifetime the PREFIX marker and the rolling ANCHOR markers ask
+    /// for (Task 4). Meaningless when `mark` is false (`CachePolicy::Off`
+    /// emits no `cache_control` at all, so this value is never read) —
+    /// `FiveMinutes` is just a harmless placeholder for that case.
+    ttl: CacheTtl,
+    /// Derived ONCE and consulted by both the planner and both render
+    /// passes: the plan's block arithmetic and the rendered block layout
+    /// must agree on whether image blocks exist, or markers land on the
+    /// wrong blocks and every sample re-bills its history at write price.
+    send_images: bool,
+    mark: bool,
+    effort: Option<Effort>,
+    /// Markers emitted so far — the debug-only budget check the old builder
+    /// ran over its finished tree, kept live during serialization. The API
+    /// rejects a fifth `cache_control`, and the budget is spent by two
+    /// independent pieces of code (the prefix marker, the plan's anchors).
+    markers: std::cell::Cell<usize>,
+}
+
+impl<'a> WireBody<'a> {
+    fn new(req: &'a SamplingRequest) -> Self {
         let mark = req.cache.marks_breakpoints();
-        // The lifetime the PREFIX marker and the rolling ANCHOR markers ask
-        // for (Task 4). Meaningless when `mark` is false (`CachePolicy::Off`
-        // emits no `cache_control` at all, so this value is never read) —
-        // `FiveMinutes` is just a harmless placeholder for that case.
         let ttl = match req.cache {
             CachePolicy::Static { prefix_ttl } => prefix_ttl,
             CachePolicy::Off => CacheTtl::FiveMinutes,
         };
-        // Derived ONCE and handed to both the planner and both render calls:
-        // the plan's block arithmetic and the rendered block layout must
-        // agree on whether image blocks exist, or markers land on the wrong
-        // blocks and every sample re-bills its history at write price.
         let send_images = hotl_provider::catalog::supports_images(&req.model);
         // One plan per body, from the durable items alone — see `cache_plan`
         // for why the planner may not remember anything.
         let plan = mark.then(|| cache_plan::plan(&req.items, send_images));
-        let mut messages = build_messages(&req.items, plan.as_ref(), ttl, send_images);
-        // The ephemeral suffix, in wire order: after every durable message and
-        // so after the deepest marker, before MOIM. Passing no plan is not a
-        // policy decision made here — these items are not in `req.items`, so
-        // the planner above never saw them and could not have picked one. That
-        // is the whole point of the split.
-        messages.extend(build_messages(&req.ephemeral_tail, None, ttl, send_images));
-        // MOIM rides last of all, after the cache marker: it changes every
-        // sample without invalidating the cached prefix (suffix position).
-        if let Some(tc) = &req.turn_context {
-            messages.push(json!({"role": "user", "content": [{"type": "text", "text": tc}]}));
-        }
-        let mut body = json!({
-            "model": req.model,
-            "max_tokens": req.max_tokens,
-            "stream": true,
-            "messages": messages,
-        });
-        // ONE prefix marker, not two. Render order is tools → system, so a
-        // marker on the last system block already seals tools *and* system as
-        // a single cached segment; the second marker the old code spent on the
-        // tool tail bought nothing and cost a quarter of the budget the
-        // rolling anchors now need. The tools marker survives only as the
-        // fallback for a request with no system prompt at all.
-        if !req.system.is_empty() {
-            let mut sys = json!({"type": "text", "text": req.system.as_ref()});
-            if mark {
-                sys["cache_control"] = ttl_marker(ttl);
-            }
-            body["system"] = json!([sys]);
-        }
-        if !req.tools.is_empty() {
-            let mut tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
-            if mark && req.system.is_empty() {
-                if let Some(last) = tools.last_mut() {
-                    last["cache_control"] = ttl_marker(ttl);
-                }
-            }
-            body["tools"] = json!(tools);
-        }
-        if req.thinking {
-            // `display` defaults to "omitted" on current models: without this
-            // the stream still bills reasoning tokens and every
-            // `thinking_delta` arrives empty (T3-15).
-            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
-        }
-        if let Some(e) = req
+        let effort = req
             .effort
-            .and_then(|e| AnthropicLadder.resolve(&req.model, e))
-        {
-            // Created-if-absent, not overwritten: `output_config` is also where
-            // a future `task_budget` lives.
-            body["output_config"]["effort"] = json!(e.as_str());
+            .and_then(|e| AnthropicLadder.resolve(&req.model, e));
+        Self {
+            req,
+            plan,
+            ttl,
+            send_images,
+            mark,
+            effort,
+            markers: std::cell::Cell::new(0),
         }
-        // The API rejects a fifth `cache_control`, and the budget is spent by
-        // two independent pieces of code (the prefix marker here, the plan in
-        // `cache_plan`). Count the built body rather than trusting the
-        // arithmetic that was supposed to keep them in their lanes.
-        debug_assert!(
-            count_markers(&body) <= cache_plan::MAX_BREAKPOINTS,
-            "{} cache_control markers exceeds the API budget of {}",
-            count_markers(&body),
-            cache_plan::MAX_BREAKPOINTS
-        );
-        body
+    }
+
+    /// The marker for one durable block, if the plan named it — LATEST
+    /// renders plain, anchors honor the TTL (Task 4's rule).
+    fn marker(&self, item: usize, block: usize) -> Option<Value> {
+        let p = self.plan.as_ref()?;
+        if p.is_latest(item, block) {
+            Some(json!({"type": "ephemeral"}))
+        } else if p.is_anchor(item, block) {
+            Some(ttl_marker(self.ttl))
+        } else {
+            None
+        }
+    }
+
+    fn count_marker(&self) {
+        self.markers.set(self.markers.get() + 1);
     }
 }
 
-/// The exact JSON body this provider puts on the wire for `req`.
+impl serde::Serialize for WireBody<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let req = self.req;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("max_tokens", &req.max_tokens)?;
+        map.serialize_entry("messages", &Messages(self))?;
+        map.serialize_entry("model", &req.model)?;
+        if let Some(e) = self.effort {
+            map.serialize_entry("output_config", &OutputConfig(e))?;
+        }
+        map.serialize_entry("stream", &true)?;
+        // ONE prefix marker, not two. Render order is tools → system, so a
+        // marker on the last system block already seals tools *and* system as
+        // a single cached segment. The tools marker survives only as the
+        // fallback for a request with no system prompt at all.
+        if !req.system.is_empty() {
+            map.serialize_entry("system", &SystemField(self))?;
+        }
+        if req.thinking {
+            map.serialize_entry("thinking", &Thinking)?;
+        }
+        if !req.tools.is_empty() {
+            map.serialize_entry("tools", &ToolsField(self))?;
+        }
+        let out = map.end()?;
+        debug_assert!(
+            self.markers.get() <= cache_plan::MAX_BREAKPOINTS,
+            "{} cache_control markers exceeds the API budget of {}",
+            self.markers.get(),
+            cache_plan::MAX_BREAKPOINTS
+        );
+        Ok(out)
+    }
+}
+
+/// `{"effort": "..."}` — the created-if-absent `output_config` object.
+struct OutputConfig(Effort);
+
+impl serde::Serialize for OutputConfig {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("effort", self.0.as_str())?;
+        map.end()
+    }
+}
+
+/// `display` defaults to "omitted" on current models: without it the stream
+/// still bills reasoning tokens and every `thinking_delta` arrives empty
+/// (T3-15).
+struct Thinking;
+
+impl serde::Serialize for Thinking {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("display", "summarized")?;
+        map.serialize_entry("type", "adaptive")?;
+        map.end()
+    }
+}
+
+/// The one-element `system` array, marker included when caching is on.
+struct SystemField<'a>(&'a WireBody<'a>);
+
+impl serde::Serialize for SystemField<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        struct Block<'a>(&'a WireBody<'a>);
+        impl serde::Serialize for Block<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut map = s.serialize_map(None)?;
+                if self.0.mark {
+                    map.serialize_entry("cache_control", &ttl_marker(self.0.ttl))?;
+                    self.0.count_marker();
+                }
+                map.serialize_entry("text", self.0.req.system.as_ref())?;
+                map.serialize_entry("type", "text")?;
+                map.end()
+            }
+        }
+        let mut seq = s.serialize_seq(Some(1))?;
+        seq.serialize_element(&Block(self.0))?;
+        seq.end()
+    }
+}
+
+/// The `tools` array — schemas serialized by reference, the last entry
+/// carrying the fallback prefix marker when there is no system prompt.
+struct ToolsField<'a>(&'a WireBody<'a>);
+
+impl serde::Serialize for ToolsField<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        struct Entry<'a> {
+            body: &'a WireBody<'a>,
+            tool: &'a ToolDef,
+            marked: bool,
+        }
+        impl serde::Serialize for Entry<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut map = s.serialize_map(None)?;
+                if self.marked {
+                    map.serialize_entry("cache_control", &ttl_marker(self.body.ttl))?;
+                    self.body.count_marker();
+                }
+                map.serialize_entry("description", &self.tool.description)?;
+                map.serialize_entry("input_schema", &self.tool.input_schema)?;
+                map.serialize_entry("name", &self.tool.name)?;
+                map.end()
+            }
+        }
+        let tools = &self.0.req.tools;
+        let fallback = self.0.mark && self.0.req.system.is_empty();
+        let mut seq = s.serialize_seq(Some(tools.len()))?;
+        for (i, tool) in tools.iter().enumerate() {
+            seq.serialize_element(&Entry {
+                body: self.0,
+                tool,
+                marked: fallback && i + 1 == tools.len(),
+            })?;
+        }
+        seq.end()
+    }
+}
+
+/// The `messages` array: durable items (with the plan), then the ephemeral
+/// suffix (planless — those items were never seen by the planner), then MOIM
+/// last of all, after every cache marker (suffix position).
+struct Messages<'a>(&'a WireBody<'a>);
+
+impl serde::Serialize for Messages<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let body = self.0;
+        let mut seq = s.serialize_seq(None)?;
+        for (idx, item) in body.req.items.iter().enumerate() {
+            // System items never reach the wire from here — the system prompt
+            // travels in the request's `system` field. The skip keeps `idx`
+            // aligned with the plan's item indices (the plan walks the same
+            // full list).
+            if matches!(&**item, Item::System { .. } | Item::Unknown) {
+                continue;
+            }
+            seq.serialize_element(&Msg {
+                body,
+                item,
+                idx,
+                planned: true,
+            })?;
+        }
+        for item in body.req.ephemeral_tail.iter() {
+            if matches!(&**item, Item::System { .. } | Item::Unknown) {
+                continue;
+            }
+            seq.serialize_element(&Msg {
+                body,
+                item,
+                idx: 0,
+                planned: false,
+            })?;
+        }
+        if let Some(tc) = &body.req.turn_context {
+            seq.serialize_element(&Moim(tc))?;
+        }
+        seq.end()
+    }
+}
+
+/// One item as a wire message. `planned` is true only for durable items —
+/// the ephemeral tail never carries markers.
+struct Msg<'a> {
+    body: &'a WireBody<'a>,
+    item: &'a Item,
+    idx: usize,
+    planned: bool,
+}
+
+impl serde::Serialize for Msg<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        match self.item {
+            Item::User { text, images, .. } => {
+                map.serialize_entry(
+                    "content",
+                    &UserContent {
+                        body: self.body,
+                        idx: self.idx,
+                        planned: self.planned,
+                        text,
+                        images,
+                    },
+                )?;
+                map.serialize_entry("role", "user")?;
+            }
+            // Echoed verbatim, never marked: these blocks carry thinking
+            // signatures the API validates byte for byte. The one exception
+            // is the Responses dialect's `reasoning` items (a session can
+            // cross dialects via /reload) — dropped by the narrow
+            // [`is_foreign_reasoning`].
+            Item::Assistant { blocks } => {
+                map.serialize_entry("content", &AssistantContent(blocks))?;
+                map.serialize_entry("role", "assistant")?;
+            }
+            Item::ToolResults { results } => {
+                map.serialize_entry(
+                    "content",
+                    &ResultsContent {
+                        body: self.body,
+                        idx: self.idx,
+                        planned: self.planned,
+                        results,
+                    },
+                )?;
+                map.serialize_entry("role", "user")?;
+            }
+            Item::System { .. } | Item::Unknown => {
+                unreachable!("Messages filters these before constructing a Msg")
+            }
+        }
+        map.end()
+    }
+}
+
+/// A user item's content: image blocks first (API guidance), then the one
+/// markable text block. When the model's catalog row refuses images the
+/// blocks are dropped and the text gains one deterministic omission note —
+/// inside this block, never a new one, so the plan's arithmetic (built with
+/// the same flag) still matches.
+struct UserContent<'a> {
+    body: &'a WireBody<'a>,
+    idx: usize,
+    planned: bool,
+    text: &'a str,
+    images: &'a [hotl_types::UserImage],
+}
+
+impl serde::Serialize for UserContent<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(None)?;
+        if self.body.send_images {
+            for img in self.images {
+                seq.serialize_element(&ImageBlock(img))?;
+            }
+        }
+        let text_block = if self.body.send_images {
+            self.images.len()
+        } else {
+            0
+        };
+        let rendered = if self.body.send_images {
+            std::borrow::Cow::Borrowed(self.text)
+        } else {
+            hotl_provider::transform::text_with_omitted_images(self.text, self.images.len())
+        };
+        let cc = if self.planned {
+            self.body.marker(self.idx, text_block)
+        } else {
+            None
+        };
+        seq.serialize_element(&TextBlock {
+            body: self.body,
+            text: rendered.as_ref(),
+            cc,
+        })?;
+        seq.end()
+    }
+}
+
+/// `{"cache_control"?, "text", "type": "text"}`, keys in that (alphabetical)
+/// order.
+struct TextBlock<'a> {
+    body: &'a WireBody<'a>,
+    text: &'a str,
+    cc: Option<Value>,
+}
+
+impl serde::Serialize for TextBlock<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = s.serialize_map(None)?;
+        if let Some(cc) = &self.cc {
+            map.serialize_entry("cache_control", cc)?;
+            self.body.count_marker();
+        }
+        map.serialize_entry("text", self.text)?;
+        map.serialize_entry("type", "text")?;
+        map.end()
+    }
+}
+
+/// `{"source": {"data", "media_type", "type": "base64"}, "type": "image"}` —
+/// the base64 payload written borrowed, never cloned.
+struct ImageBlock<'a>(&'a hotl_types::UserImage);
+
+impl serde::Serialize for ImageBlock<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        struct Source<'a>(&'a hotl_types::UserImage);
+        impl serde::Serialize for Source<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut map = s.serialize_map(None)?;
+                map.serialize_entry("data", &*self.0.data)?;
+                map.serialize_entry("media_type", &self.0.media_type)?;
+                map.serialize_entry("type", "base64")?;
+                map.end()
+            }
+        }
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("source", &Source(self.0))?;
+        map.serialize_entry("type", "image")?;
+        map.end()
+    }
+}
+
+/// Assistant blocks by reference — stored `Value`s serialized in place.
+struct AssistantContent<'a>(&'a [Value]);
+
+impl serde::Serialize for AssistantContent<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeSeq;
+        let mut seq = s.serialize_seq(None)?;
+        for block in self.0.iter().filter(|b| !is_foreign_reasoning(b)) {
+            seq.serialize_element(block)?;
+        }
+        seq.end()
+    }
+}
+
+/// Tool results as user content — interior positions are markable: an anchor
+/// inside a wide batch is what keeps the next marker within the API's
+/// lookback.
+struct ResultsContent<'a> {
+    body: &'a WireBody<'a>,
+    idx: usize,
+    planned: bool,
+    results: &'a [hotl_types::ToolResultItem],
+}
+
+impl serde::Serialize for ResultsContent<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        struct Block<'a> {
+            body: &'a WireBody<'a>,
+            r: &'a hotl_types::ToolResultItem,
+            cc: Option<Value>,
+        }
+        impl serde::Serialize for Block<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut map = s.serialize_map(None)?;
+                if let Some(cc) = &self.cc {
+                    map.serialize_entry("cache_control", cc)?;
+                    self.body.count_marker();
+                }
+                map.serialize_entry("content", &self.r.content)?;
+                if self.r.is_error {
+                    map.serialize_entry("is_error", &true)?;
+                }
+                map.serialize_entry("tool_use_id", &self.r.tool_use_id)?;
+                map.serialize_entry("type", "tool_result")?;
+                map.end()
+            }
+        }
+        let mut seq = s.serialize_seq(Some(self.results.len()))?;
+        for (block, r) in self.results.iter().enumerate() {
+            let cc = if self.planned {
+                self.body.marker(self.idx, block)
+            } else {
+                None
+            };
+            seq.serialize_element(&Block {
+                body: self.body,
+                r,
+                cc,
+            })?;
+        }
+        seq.end()
+    }
+}
+
+/// The MOIM `<turn-context …>` message — last of all, after the cache
+/// marker: it changes every sample without invalidating the cached prefix.
+struct Moim<'a>(&'a str);
+
+impl serde::Serialize for Moim<'_> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{SerializeMap, SerializeSeq};
+        struct Content<'a>(&'a str);
+        impl serde::Serialize for Content<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut seq = s.serialize_seq(Some(1))?;
+                seq.serialize_element(&TextBlockPlain(self.0))?;
+                seq.end()
+            }
+        }
+        struct TextBlockPlain<'a>(&'a str);
+        impl serde::Serialize for TextBlockPlain<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                let mut map = s.serialize_map(None)?;
+                map.serialize_entry("text", self.0)?;
+                map.serialize_entry("type", "text")?;
+                map.end()
+            }
+        }
+        let mut map = s.serialize_map(None)?;
+        map.serialize_entry("content", &Content(self.0))?;
+        map.serialize_entry("role", "user")?;
+        map.end()
+    }
+}
+
+/// The exact JSON bytes this provider puts on the wire for `req`.
 ///
 /// `#[doc(hidden)] pub` so a test can assert two `SamplingRequest`s
 /// serialize *identically at the wire level*, not merely structurally —
 /// commit-protocol.md case 9 requires the adopted speculative request to be
 /// proven equal to the sequential rebuild "against the provider-serialized
-/// body". It is the same `build_body` [`AnthropicProvider::stream`] calls, not
-/// a test-only reimplementation — which is what makes an assertion over these
-/// bytes an assertion about the wire.
+/// body". It is the same [`WireBody`] serialization
+/// [`AnthropicProvider::stream`] sends, not a test-only reimplementation —
+/// which is what makes an assertion over these bytes an assertion about the
+/// wire. Since 0033 Task 6 it returns the final bytes themselves: no `Value`
+/// round-trip stands between the assertion and the wire.
 #[doc(hidden)]
-pub fn wire_body(req: &SamplingRequest) -> Value {
-    AnthropicProvider::build_body(req)
+pub fn wire_body(req: &SamplingRequest) -> String {
+    serde_json::to_string(&WireBody::new(req)).expect("a request body always serializes")
 }
 
+#[cfg(test)] // the Value-tree reference oracle's tool renderer
 fn tool_json(t: &ToolDef) -> Value {
     json!({"name": t.name, "description": t.description, "input_schema": t.input_schema})
 }
@@ -296,13 +704,14 @@ pub(crate) fn is_foreign_reasoning(b: &Value) -> bool {
 /// loop and [`cache_plan::plan`] must walk the list the same way — that shared
 /// walk is why `cache_plan::item_blocks` is required to mirror the match arms
 /// below, and why `send_images` here MUST be the same flag the plan was built
-/// with (`build_body` derives it once from the model's catalog row).
+/// with (the body serializer derives it once from the model's catalog row).
 ///
 /// `ttl` is only ever consulted for a rolling ANCHOR: the LATEST marker
 /// (`Plan::is_latest`) always renders plain (Task 4's rule — see
 /// `CachePolicy::Static`'s doc comment for why), regardless of what the
 /// caller passed. Ignored entirely when `plan` is `None` (the ephemeral tail
 /// has no plan and so never marks anything).
+#[cfg(test)] // the Value-tree reference oracle's message renderer
 fn build_messages<I: std::borrow::Borrow<Item>>(
     items: &[I],
     plan: Option<&cache_plan::Plan>,
@@ -398,6 +807,7 @@ fn build_messages<I: std::borrow::Borrow<Item>>(
 }
 
 /// Every `cache_control` in a built body, counted structurally.
+#[cfg(test)] // the live path counts during serialization (`WireBody::markers`)
 fn count_markers(v: &Value) -> usize {
     match v {
         Value::Object(map) => {
@@ -463,7 +873,7 @@ async fn send_attempt(
     client: &reqwest::Client,
     url: &str,
     api_key: &str,
-    body: &Value,
+    body: &[u8],
     attempt: u32,
 ) -> Attempt {
     let sent = client
@@ -471,7 +881,9 @@ async fn send_attempt(
         .header("x-api-key", api_key)
         .header("anthropic-version", API_VERSION)
         .header("content-type", "application/json")
-        .json(body)
+        // Pre-serialized once per request (`WireBody`); a retry re-sends the
+        // same bytes instead of re-serializing the whole session.
+        .body(body.to_vec())
         .send()
         .await;
     match sent {
@@ -567,7 +979,11 @@ impl Provider for AnthropicProvider {
         req: SamplingRequest,
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let client = self.client.clone();
-        let body = Self::build_body(&req);
+        // One borrowed pass, straight to bytes — serialization is still
+        // charged here, before the first await point, so the ledger's
+        // `RequestBuilt` stamp keeps meaning what it says.
+        let body =
+            serde_json::to_vec(&WireBody::new(&req)).expect("a request body always serializes");
         let source = self.key_source.clone();
         let api_url = self.api_url.clone();
         let no_credential = self.no_credential;
@@ -706,6 +1122,217 @@ mod tests {
 
     use std::sync::{Arc, Mutex as StdMutex};
 
+    /// The retired `Value`-tree builder, verbatim — the oracle
+    /// `wire_body_bytes_match_the_value_tree_reference` compares the live
+    /// borrowed serializer against. Never delete: it IS the byte contract.
+    fn build_body_reference(req: &SamplingRequest) -> Value {
+        let mark = req.cache.marks_breakpoints();
+        let ttl = match req.cache {
+            CachePolicy::Static { prefix_ttl } => prefix_ttl,
+            CachePolicy::Off => CacheTtl::FiveMinutes,
+        };
+        let send_images = hotl_provider::catalog::supports_images(&req.model);
+        let plan = mark.then(|| cache_plan::plan(&req.items, send_images));
+        let mut messages = build_messages(&req.items, plan.as_ref(), ttl, send_images);
+        messages.extend(build_messages(&req.ephemeral_tail, None, ttl, send_images));
+        if let Some(tc) = &req.turn_context {
+            messages.push(json!({"role": "user", "content": [{"type": "text", "text": tc}]}));
+        }
+        let mut body = json!({
+            "model": req.model,
+            "max_tokens": req.max_tokens,
+            "stream": true,
+            "messages": messages,
+        });
+        if !req.system.is_empty() {
+            let mut sys = json!({"type": "text", "text": req.system.as_ref()});
+            if mark {
+                sys["cache_control"] = ttl_marker(ttl);
+            }
+            body["system"] = json!([sys]);
+        }
+        if !req.tools.is_empty() {
+            let mut tools: Vec<Value> = req.tools.iter().map(tool_json).collect();
+            if mark && req.system.is_empty() {
+                if let Some(last) = tools.last_mut() {
+                    last["cache_control"] = ttl_marker(ttl);
+                }
+            }
+            body["tools"] = json!(tools);
+        }
+        if req.thinking {
+            body["thinking"] = json!({"type": "adaptive", "display": "summarized"});
+        }
+        if let Some(e) = req
+            .effort
+            .and_then(|e| AnthropicLadder.resolve(&req.model, e))
+        {
+            body["output_config"]["effort"] = json!(e.as_str());
+        }
+        debug_assert!(
+            count_markers(&body) <= cache_plan::MAX_BREAKPOINTS,
+            "{} cache_control markers exceeds the API budget of {}",
+            count_markers(&body),
+            cache_plan::MAX_BREAKPOINTS
+        );
+        body
+    }
+
+    /// The live wire bytes, parsed — what the structural assertions below
+    /// inspect, so they keep testing the real path.
+    fn body_json(req: &SamplingRequest) -> Value {
+        serde_json::from_str(&wire_body(req)).expect("wire body is valid JSON")
+    }
+
+    fn corpus_user(text: &str, images: usize) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: None,
+            images: (0..images)
+                .map(|i| hotl_types::UserImage {
+                    media_type: "image/png".into(),
+                    data: format!("aGVsbG8t{i}").into(),
+                })
+                .collect(),
+        }
+    }
+
+    fn corpus_results(n: usize, with_error: bool) -> Item {
+        Item::ToolResults {
+            results: (0..n)
+                .map(|i| ToolResultItem {
+                    tool_use_id: format!("tu-{i}"),
+                    content: format!("result {i} with \"quotes\" and \nnewlines"),
+                    is_error: with_error && i == 0,
+                })
+                .collect(),
+        }
+    }
+
+    /// Requests exercising every serializer branch: images ×
+    /// cache Off/Static (both TTLs), anchors + latest landing on user text
+    /// AND interior tool-result blocks (enough blocks to cross the
+    /// 15-block anchor stride several times), `is_error`, foreign-reasoning
+    /// block filtering, ephemeral tail, MOIM, thinking, effort, and the
+    /// empty-system tools-marker fallback. (`send_images == false` cannot be
+    /// reached via a model name — every catalogued row accepts images and
+    /// unknown models fail open — so that branch is covered separately by
+    /// `refused_images_render_the_omission_note`.)
+    fn corpus() -> Vec<(&'static str, SamplingRequest)> {
+        let history: Vec<Item> = vec![
+            Item::System {
+                text: "seed".into(),
+            },
+            corpus_user("hello with [Image #1]", 2),
+            Item::Assistant {
+                blocks: vec![
+                    json!({"type": "thinking", "thinking": "mm", "signature": "s1"}),
+                    json!({"type": "reasoning", "encrypted_content": "foreign"}),
+                    json!({"type": "text", "text": "calling tools"}),
+                    json!({"type": "tool_use", "id": "tu-0", "name": "read", "input": {"path": "x"}}),
+                ],
+            },
+            corpus_results(20, true),
+            Item::Unknown,
+            corpus_user("follow-up", 0),
+            Item::Assistant {
+                blocks: vec![json!({"type": "text", "text": "more"})],
+            },
+            corpus_results(18, false),
+            corpus_user("latest question", 0),
+        ];
+        let tail = vec![Item::User {
+            text: "<todos>\n[~] a\n</todos>".into(),
+            synthetic: Some(SyntheticReason::Todos),
+            images: Vec::new(),
+        }];
+        let tools: Vec<ToolDef> = vec![
+            ToolDef {
+                name: "read".into(),
+                description: "read a file".into(),
+                input_schema: json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+            },
+            ToolDef {
+                name: "bash".into(),
+                description: "run a command".into(),
+                input_schema: json!({"type": "object"}),
+            },
+        ];
+        let full = SamplingRequest {
+            model: "claude-opus-4-8".into(),
+            max_tokens: 4096,
+            system: "you are a careful assistant".into(),
+            items: hotl_provider::arc_items(history.clone()),
+            ephemeral_tail: hotl_provider::arc_items(tail),
+            tools: tools.clone().into(),
+            thinking: true,
+            effort: Some(Effort::High),
+            cache: CachePolicy::Static {
+                prefix_ttl: CacheTtl::FiveMinutes,
+            },
+            turn_context: Some("<turn-context t=1/>".into()),
+        };
+        let mut one_hour = full.clone();
+        one_hour.cache = CachePolicy::Static {
+            prefix_ttl: CacheTtl::OneHour,
+        };
+        let mut off = full.clone();
+        off.cache = CachePolicy::Off;
+        let mut tools_fallback = full.clone();
+        tools_fallback.system = "".into();
+        tools_fallback.effort = None;
+        tools_fallback.thinking = false;
+        tools_fallback.turn_context = None;
+        let mut bare = sampling_req();
+        bare.items = hotl_provider::arc_items(vec![corpus_user("plain", 0)]);
+        vec![
+            ("full-static-5m", full),
+            ("full-static-1h", one_hour),
+            ("cache-off", off),
+            ("tools-marker-fallback", tools_fallback),
+            ("bare-minimal", bare),
+        ]
+    }
+
+    /// 0033 Task 6: the borrowed serializer is byte-identical to the retired
+    /// `Value`-tree builder over the whole corpus.
+    #[test]
+    fn wire_body_bytes_match_the_value_tree_reference() {
+        for (name, req) in corpus() {
+            let new = wire_body(&req);
+            let old = serde_json::to_string(&build_body_reference(&req)).unwrap();
+            assert_eq!(new, old, "wire bytes diverged for corpus case `{name}`");
+        }
+        // Non-vacuous: the corpus really exercises markers, both marker
+        // kinds, and error results.
+        let full = body_json(&corpus()[0].1);
+        assert!(
+            count_markers(&full) >= 3,
+            "corpus must place prefix + anchor + latest markers: {full}"
+        );
+        assert!(full.to_string().contains("\"is_error\":true"));
+        assert!(
+            !full.to_string().contains("foreign"),
+            "foreign reasoning blocks must be dropped"
+        );
+    }
+
+    /// The one branch no model name can reach today (every catalogued row
+    /// accepts images; unknown models fail open): a `send_images == false`
+    /// body drops image blocks and renders the omission note in place.
+    #[test]
+    fn refused_images_render_the_omission_note() {
+        let mut req = sampling_req();
+        req.items = hotl_provider::arc_items(vec![corpus_user("see [Image #1]", 1)]);
+        let body = WireBody {
+            send_images: false,
+            ..WireBody::new(&req)
+        };
+        let text = serde_json::to_string(&body).unwrap();
+        assert!(!text.contains("\"type\":\"image\""), "{text}");
+        assert!(text.contains("omitted"), "the note must be present: {text}");
+    }
+
     use futures_util::future::BoxFuture;
     use hotl_provider::key::{KeyError, KeySource};
 
@@ -784,7 +1411,7 @@ mod tests {
         let mut req = sampling_req();
         req.model = "claude-opus-4-8".into();
         req.effort = Some(Effort::High);
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert_eq!(body["output_config"]["effort"], "high");
     }
 
@@ -794,7 +1421,7 @@ mod tests {
     fn an_unset_effort_emits_no_output_config() {
         let mut req = sampling_req();
         req.model = "claude-opus-4-8".into();
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert!(body.get("output_config").is_none());
     }
 
@@ -806,7 +1433,7 @@ mod tests {
         let mut req = sampling_req();
         req.model = "claude-haiku-4-5".into();
         req.effort = Some(Effort::Max);
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert!(body.get("output_config").is_none());
     }
 
@@ -817,7 +1444,7 @@ mod tests {
         let mut req = sampling_req();
         req.model = "llama3".into();
         req.effort = Some(Effort::Low);
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert_eq!(body["output_config"]["effort"], "low");
     }
 
@@ -827,7 +1454,7 @@ mod tests {
         req.model = "claude-opus-4-8".into();
         req.thinking = true;
         req.effort = Some(Effort::Low);
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "low");
     }
@@ -838,7 +1465,7 @@ mod tests {
         let mut req = sampling_req();
         req.model = "claude-opus-4-8".into();
         req.effort = Some(Effort::XHigh);
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert_eq!(body["output_config"]["effort"], "xhigh");
     }
 
@@ -1171,16 +1798,14 @@ mod tests {
     fn thinking_requests_a_visible_summary() {
         let mut req = sampling_req();
         req.thinking = true;
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
 
         // And it is absent entirely when thinking is off.
         let mut off = sampling_req();
         off.thinking = false;
-        assert!(AnthropicProvider::build_body(&off)
-            .get("thinking")
-            .is_none());
+        assert!(body_json(&off).get("thinking").is_none());
     }
 
     #[test]
@@ -1220,7 +1845,7 @@ mod tests {
             },
             turn_context: Some("<turn-context sample=\"1\"/>".into()),
         };
-        let body = AnthropicProvider::build_body(&req);
+        let body = body_json(&req);
         assert_eq!(body["stream"], true);
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["thinking"]["display"], "summarized");
@@ -1289,7 +1914,7 @@ mod tests {
         }]);
         req.turn_context = Some("<turn-context/>".into());
 
-        let body = wire_body(&req);
+        let body = body_json(&req);
         let msgs = body["messages"].as_array().unwrap();
         assert_eq!(msgs.len(), 4, "2 durable + tail + MOIM");
 
@@ -1374,8 +1999,8 @@ mod tests {
             images: Vec::new(),
         }]);
 
-        let inactive_body = wire_body(&base);
-        let active_body = wire_body(&active);
+        let inactive_body = body_json(&base);
+        let active_body = body_json(&active);
 
         // Everything outside `messages` is untouched by the tail.
         for key in ["system", "tools", "model", "max_tokens", "stream"] {
@@ -1401,7 +2026,7 @@ mod tests {
         let mut off = base.clone();
         off.cache = CachePolicy::Off;
         assert!(
-            !wire_body(&off).to_string().contains("cache_control"),
+            !body_json(&off).to_string().contains("cache_control"),
             "CachePolicy::Off must emit zero markers"
         );
     }
@@ -1445,7 +2070,7 @@ mod tests {
             }]),
             ..sampling_req()
         };
-        let body = wire_body(&req);
+        let body = body_json(&req);
         assert!(
             !body.to_string().contains("encrypted_content"),
             "a foreign reasoning item must not reach the Anthropic wire"
@@ -1528,7 +2153,7 @@ mod tests {
             },
         ]
         .into();
-        let body = wire_body(&req);
+        let body = body_json(&req);
         assert!(body.get("system").is_none(), "no system prompt was set");
         assert!(
             body["tools"][0].get("cache_control").is_none(),
@@ -1542,7 +2167,7 @@ mod tests {
     /// Task 4: the tools-fallback prefix marker (no system prompt) must honor
     /// `prefix_ttl` exactly like the system-block prefix marker does. This
     /// combination — empty system + `OneHour` — has its own branch in
-    /// `build_body` (`mark && req.system.is_empty()`) that the two other new
+    /// the body serializer (`mark && req.system.is_empty()`) that the two other new
     /// TTL tests never exercise (both use `static_req("sys", ...)`), so it
     /// gets its own test rather than riding along on an assumption.
     #[test]
@@ -1571,7 +2196,7 @@ mod tests {
             },
         ]
         .into();
-        let body = wire_body(&req);
+        let body = body_json(&req);
         assert!(body.get("system").is_none(), "no system prompt was set");
         assert!(
             body["tools"][0].get("cache_control").is_none(),
@@ -1616,7 +2241,7 @@ mod tests {
             input_schema: serde_json::json!({"type":"object"}),
         }]
         .into();
-        let body = wire_body(&req);
+        let body = body_json(&req);
         assert_eq!(count_markers(&body), 2, "{body:#}");
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert!(body["tools"][0].get("cache_control").is_none());
@@ -1643,7 +2268,7 @@ mod tests {
                 tool_results(40),
             ],
         );
-        let body = wire_body(&req);
+        let body = body_json(&req);
         // 1 prefix + 2 anchors + 1 latest, the full budget and not one more.
         assert_eq!(
             count_markers(&body),
@@ -1694,7 +2319,7 @@ mod tests {
         req.cache = CachePolicy::Static {
             prefix_ttl: CacheTtl::OneHour,
         };
-        let body = wire_body(&req);
+        let body = body_json(&req);
 
         // The prefix marker.
         assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
@@ -1736,7 +2361,7 @@ mod tests {
                 tool_results(40),
             ],
         );
-        let five_body = wire_body(&five);
+        let five_body = body_json(&five);
         assert!(
             !five_body.to_string().contains("\"ttl\""),
             "FiveMinutes must never emit a ttl key: {five_body}"
@@ -1746,7 +2371,7 @@ mod tests {
         one.cache = CachePolicy::Static {
             prefix_ttl: CacheTtl::OneHour,
         };
-        let one_body = wire_body(&one);
+        let one_body = body_json(&one);
 
         // Strip every `ttl` field a ttl-marker may carry; what's left must be
         // byte-identical to the FiveMinutes body.
@@ -1777,7 +2402,7 @@ mod tests {
         assert_eq!(ttls.last().unwrap(), &None, "latest stays plain: {ttls:?}");
     }
 
-    /// The budget assertion is a `debug_assert` in `build_body`; this is the
+    /// The budget assertion is a `debug_assert` in the body serializer; this is the
     /// same claim held over shapes chosen to stress it, so a regression fails
     /// as a test rather than as a 400 from the API.
     #[test]
@@ -1827,7 +2452,7 @@ mod tests {
                     synthetic: Some(SyntheticReason::Todos),
                     images: Vec::new(),
                 }]);
-                let body = wire_body(&req);
+                let body = body_json(&req);
                 let markers = count_markers(&body);
                 assert!(
                     markers <= cache_plan::MAX_BREAKPOINTS,
@@ -1864,8 +2489,8 @@ mod tests {
         padded.extend(core.iter().cloned());
         padded.insert(2, Item::Unknown);
 
-        let plain = wire_body(&static_req("sys", core));
-        let interleaved = wire_body(&static_req("sys", padded));
+        let plain = body_json(&static_req("sys", core));
+        let interleaved = body_json(&static_req("sys", padded));
         assert_eq!(
             marked_block_indices(&plain),
             marked_block_indices(&interleaved)
@@ -1894,8 +2519,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let a = wire_body(&static_req("sys", items()));
-        let b = wire_body(&static_req("sys", items()));
+        let a = body_json(&static_req("sys", items()));
+        let b = body_json(&static_req("sys", items()));
         assert_eq!(a.to_string(), b.to_string());
         assert!(count_markers(&a) > 2, "fixture must produce anchors");
     }
@@ -1919,7 +2544,7 @@ mod tests {
     #[test]
     fn image_blocks_render_before_the_text_block_with_base64_sources() {
         let req = static_req("sys", vec![user_with_images("what is this?", 2)]);
-        let body = wire_body(&req);
+        let body = body_json(&req);
         let content = body["messages"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 3);
         assert_eq!(
@@ -1936,7 +2561,7 @@ mod tests {
     /// the image bytes before it into the cached prefix.
     #[test]
     fn an_image_bearing_item_marks_only_its_text_block() {
-        let body = wire_body(&static_req("sys", vec![user_with_images("go", 2)]));
+        let body = body_json(&static_req("sys", vec![user_with_images("go", 2)]));
         // Wire blocks: image@1, image@2, text@3 — the latest marker is at 3.
         assert_eq!(marked_block_indices(&body), vec![3]);
         let content = body["messages"][0]["content"].as_array().unwrap();
@@ -1988,8 +2613,8 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        let a = wire_body(&static_req("sys", items()));
-        let b = wire_body(&static_req("sys", items()));
+        let a = body_json(&static_req("sys", items()));
+        let b = body_json(&static_req("sys", items()));
         assert_eq!(a.to_string(), b.to_string());
         assert!(count_markers(&a) > 2, "fixture must produce anchors");
     }
