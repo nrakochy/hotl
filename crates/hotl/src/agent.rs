@@ -958,6 +958,7 @@ async fn scaffold(
         sandbox_enforced,
         initial_helper_key.clone(),
         cfg.agents.isolation(),
+        sessions_dir(),
     );
     // `spawn`'s own registration (agent.rs::spawn_session_with_todos) needs a
     // *clone* of this same instance (shared Arc semaphores) — cloned before
@@ -1579,6 +1580,10 @@ struct HotlChildBuilder {
     /// `[agents] isolation` — the fallback for defs whose frontmatter is
     /// silent. A def that names `isolation:` itself always wins.
     default_isolation: hotl_tools::agents::Isolation,
+    /// Where child session logs land — injected (the parent's own resolved
+    /// dir), never re-resolved from KNOWN_PATHS here, so tests can point it
+    /// at a tempdir instead of littering the real store (0032 Task 7).
+    sessions_dir: PathBuf,
 }
 
 impl HotlChildBuilder {
@@ -1697,7 +1702,7 @@ impl HotlChildBuilder {
     ) -> Result<crate::spawn::Child, String> {
         let inherited = lineage.as_ref().map(|(_, n)| *n);
         let mut log = SessionLog::create(
-            &sessions_dir(),
+            &self.sessions_dir,
             &self.model,
             lineage.map(|(parent, _)| parent),
             self.masker(),
@@ -1872,6 +1877,7 @@ fn child_builder(
     sandbox_enforced: bool,
     initial_helper_key: Option<String>,
     default_isolation: hotl_tools::agents::Isolation,
+    sessions_dir: PathBuf,
 ) -> Arc<dyn crate::spawn::ChildBuilder> {
     Arc::new(HotlChildBuilder {
         provider,
@@ -1886,6 +1892,7 @@ fn child_builder(
         sandbox_enforced,
         initial_helper_key,
         default_isolation,
+        sessions_dir,
     })
 }
 
@@ -3488,10 +3495,9 @@ mod fork_tests {
         assert!(cold_cache_note(dir.path(), &id, CacheTtl::OneHour).is_none());
     }
 
-    /// Find the log in the real sessions dir whose header names `parent` — a
+    /// Find the log in the injected store whose header names `parent` — a
     /// unique planted id, so this never races another test's children the way
-    /// "the newest log" would. `spawn_child` writes there by construction
-    /// (`sessions_dir()`), as the rest of the spawn suite already relies on.
+    /// "the newest log" would.
     fn push_user(log: &mut SessionLog, text: &str, ts: u64) -> String {
         log.append(
             &EntryPayload::Item {
@@ -3506,8 +3512,8 @@ mod fork_tests {
         .unwrap()
     }
 
-    fn child_of(parent: &str) -> Option<std::path::PathBuf> {
-        hotl_store::list_sessions(&sessions_dir())
+    fn child_of(dir: &std::path::Path, parent: &str) -> Option<std::path::PathBuf> {
+        hotl_store::list_sessions(dir)
             .into_iter()
             .map(|(_, path, _)| path)
             .find(|p| hotl_store::session_parent(p).as_deref() == Some(parent))
@@ -3522,8 +3528,8 @@ mod fork_tests {
     /// entire future".
     #[tokio::test]
     async fn a_forked_subagent_carries_pinned_lineage_a_plain_one_carries_none() {
-        let cb = super::tests::test_child_builder();
-        let dir = sessions_dir();
+        let (cb, store) = super::tests::test_child_builder();
+        let dir = store.path().to_path_buf();
         let mut parent = SessionLog::create(&dir, "m", None, Masker::empty(), 1).unwrap();
         let parent_id = parent.session_id.clone();
         let tip = push_user(&mut parent, "explored the auth flow", 2);
@@ -3547,7 +3553,7 @@ mod fork_tests {
             },
         )
         .expect("child spawns");
-        let child_path = child_of(&parent_id).expect("the forked child records its parent");
+        let child_path = child_of(&dir, &parent_id).expect("the forked child records its parent");
         let child_id = hotl_store::replay(&child_path).unwrap().header.session_id;
         assert_eq!(
             hotl_store::replay(&child_path)
@@ -3581,16 +3587,12 @@ mod fork_tests {
         let plain = crate::spawn::ChildBuilder::build(&cb, &def, "unrelated subtask")
             .expect("child spawns");
         assert!(
-            child_of(&parent_id)
+            child_of(&dir, &parent_id)
                 .map(|p| p == child_path)
                 .unwrap_or(false),
             "a plain subagent must not have recorded this parent too"
         );
         drop(plain);
-
-        for p in [&child_path, &parent.path().to_path_buf()] {
-            let _ = std::fs::remove_file(p);
-        }
     }
 
     /// Found by the wire-level fork proof, not by reading: `initial_items`
@@ -3867,8 +3869,11 @@ mod tests {
         )
     }
 
-    pub(super) fn test_child_builder() -> HotlChildBuilder {
-        HotlChildBuilder {
+    /// The guard is the child store: keep it alive for the whole test, or the
+    /// session log outlives its directory (absolute-path tempdir, 0030 lesson).
+    pub(super) fn test_child_builder() -> (HotlChildBuilder, tempfile::TempDir) {
+        let store = tempfile::tempdir().unwrap();
+        let cb = HotlChildBuilder {
             minify: hotl_tools::MinifyConfig::default(),
             provider: Arc::new(hotl_provider::ScriptedProvider::new(vec![])),
             rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -3881,7 +3886,9 @@ mod tests {
             sandbox_enforced: false,
             initial_helper_key: None,
             default_isolation: hotl_tools::agents::Isolation::None,
-        }
+            sessions_dir: store.path().to_path_buf(),
+        };
+        (cb, store)
     }
 
     /// Frontmatter beats config, config covers silent defs, and a read-only
@@ -3891,7 +3898,7 @@ mod tests {
     #[test]
     fn isolation_precedence_is_frontmatter_then_config_then_off() {
         use hotl_tools::agents::Isolation;
-        let mut cb = test_child_builder();
+        let (mut cb, _store) = test_child_builder();
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
         let explore = hotl_tools::agents::builtin("explore").unwrap();
         let worktreed = hotl_tools::agents::parse_def(
@@ -3950,7 +3957,7 @@ mod tests {
         std::fs::write(repo.path().join("NOTES.md"), "committed\nPARENT EDIT\n").unwrap();
         std::fs::write(repo.path().join("scratch.txt"), "untracked\n").unwrap();
 
-        let mut cb = test_child_builder();
+        let (mut cb, _store) = test_child_builder();
         cb.cwd = repo.path().to_path_buf();
         cb.default_isolation = hotl_tools::agents::Isolation::Worktree;
         cb.provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
@@ -4000,6 +4007,38 @@ mod tests {
         worktree.remove();
     }
 
+    /// Task 7 (0032): the proof the child's store is injected, not re-resolved
+    /// from the platform KNOWN_PATHS — ~942 fixture sessions in the real store
+    /// said otherwise. Asserting the injected dir's contents is the whole
+    /// check; the real dir cannot be asserted in CI.
+    #[tokio::test]
+    async fn child_sessions_write_only_to_the_injected_sessions_dir() {
+        let (mut cb, store) = test_child_builder();
+        cb.provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("child result"),
+        ]));
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let mut handle = cb
+            .spawn_child(&general, Vec::new(), None)
+            .expect("child spawns")
+            .handle;
+        handle.prompt("go".into()).await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            hotl_store::list_sessions(store.path()).len(),
+            1,
+            "exactly the child's own log lands in the injected dir"
+        );
+    }
+
     /// Task 4's named trap: `child_builder()` captures a *clone* of
     /// `Scaffold::config` inside `scaffold()`, before `acp_factory`/
     /// `serve_main` mutate their own copy to `CacheTtl::OneHour` — so a child
@@ -4014,7 +4053,7 @@ mod tests {
         let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
             hotl_provider::ScriptedProvider::text_reply("child result"),
         ]));
-        let mut cb = test_child_builder();
+        let (mut cb, _store) = test_child_builder();
         cb.provider = provider.clone();
         // The parent's own live config already asks for the 1h TTL — the
         // exact case that would leak into a child if `spawn_child` merely
@@ -4056,7 +4095,7 @@ mod tests {
         let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
             hotl_provider::ScriptedProvider::text_reply("child result"),
         ]));
-        let mut cb = test_child_builder();
+        let (mut cb, _store) = test_child_builder();
         cb.provider = provider.clone();
         cb.config.effort = parent_effort;
         let mut handle = cb
@@ -4123,7 +4162,7 @@ mod tests {
     /// gets `spawn` regardless of scope.
     #[test]
     fn child_registry_applies_the_defs_tool_scope() {
-        let cb = test_child_builder();
+        let (cb, _store) = test_child_builder();
         let explore = hotl_tools::agents::builtin("explore").unwrap();
         let reg = cb.child_registry(&explore, &cb.cwd);
         assert!(reg.get("read").is_some());
@@ -4143,7 +4182,7 @@ mod tests {
     /// the fork's first sample can replay the parent's cached prefix.
     #[test]
     fn fork_initial_items_is_byte_identical_when_the_def_does_not_override() {
-        let cb = test_child_builder();
+        let (cb, _store) = test_child_builder();
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
         assert!(
             general.system_prompt.is_none() && general.model.is_none(),
@@ -4183,7 +4222,7 @@ mod tests {
     /// of replaying the parent's raw transcript under a persona it never had.
     #[test]
     fn fork_initial_items_wraps_in_background_context_when_the_def_overrides_system_prompt() {
-        let cb = test_child_builder();
+        let (cb, _store) = test_child_builder();
         let explore = hotl_tools::agents::builtin("explore").unwrap();
         assert!(explore.system_prompt.is_some());
         let history = vec![hotl_types::Item::User {
@@ -4219,7 +4258,7 @@ mod tests {
     /// different cache namespace anyway — also routes through the wrap.
     #[test]
     fn fork_initial_items_wraps_when_only_the_model_differs() {
-        let cb = test_child_builder();
+        let (cb, _store) = test_child_builder();
         let cross_model = hotl_tools::agents::AgentDef {
             name: "x".into(),
             description: String::new(),
