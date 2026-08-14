@@ -1293,6 +1293,9 @@ impl Turn {
             }
         }
         self.ledger.stamp(Phase::ToolsJoined);
+        // Results are final: stamp them onto this batch's window entries so
+        // the next dispatch's doom check can tell repetition from polling.
+        backfill_result_hashes(&mut self.call_sigs, &results);
         if mutating {
             self.snap(format!("post batch {}", self.samples)).await;
         }
@@ -2407,18 +2410,27 @@ const DOOM_WINDOW: usize = 9;
 pub(crate) struct CallSig {
     hash: u64,
     display: String,
+    /// Hash of the completed call's result content, backfilled by
+    /// [`backfill_result_hashes`] once the batch joins; `None` while the call
+    /// is still in flight (a just-dispatched batch, by construction).
+    result_hash: Option<u64>,
 }
 
 impl CallSig {
     fn new(tu: &ToolUse) -> Self {
         let display = format!("{}({})", tu.name, tu.input);
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        display.hash(&mut hasher);
         Self {
-            hash: hasher.finish(),
+            hash: content_hash(&display),
             display,
+            result_hash: None,
         }
     }
+}
+
+fn content_hash(s: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    s.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Fold a batch's new call signatures into the trailing window, evicting
@@ -2432,6 +2444,22 @@ fn fold_call_sigs(window: &mut VecDeque<CallSig>, uses: &[ToolUse]) {
     window.extend(uses.iter().map(CallSig::new));
     while window.len() > DOOM_WINDOW {
         window.pop_front();
+    }
+}
+
+/// Stamp a joined batch's window entries with their result hashes. The
+/// window only evicts from the front, so the batch's sigs are its last
+/// `results.len()` entries in order — align tails (a batch longer than
+/// [`DOOM_WINDOW`] kept only its own tail at fold time).
+fn backfill_result_hashes(window: &mut VecDeque<CallSig>, results: &[ToolResultItem]) {
+    let n = results.len().min(window.len());
+    let skip = window.len() - n;
+    for (sig, r) in window
+        .iter_mut()
+        .skip(skip)
+        .zip(&results[results.len() - n..])
+    {
+        sig.result_hash = Some(content_hash(&r.content));
     }
 }
 
@@ -2451,10 +2479,20 @@ fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
         // INVARIANT: only genuinely identical calls count as a repetition.
         // Enforced by `a_hash_collision_alone_is_not_a_doom_loop`.
         let same = |a: &CallSig, b: &CallSig| a.hash == b.hash && a.display == b.display;
-        if tail
+        let identical_calls = tail
             .chunks(period)
-            .all(|c| c.iter().zip(block).all(|(a, b)| same(a, b)))
-        {
+            .all(|c| c.iter().zip(block).all(|(a, b)| same(a, b)));
+        // Same call, same answer, no progress — the two *completed* repeat
+        // blocks must agree elementwise before the just-dispatched third
+        // (results unknown by construction) condemns the turn. Legitimate
+        // polling repeats a call whose results keep changing; any `None` or
+        // mismatch is conservative toward allowing, with `max_turns` as the
+        // runaway backstop (0030 Task 7).
+        let no_progress = tail[..period]
+            .iter()
+            .zip(&tail[period..2 * period])
+            .all(|(a, b)| a.result_hash.is_some() && a.result_hash == b.result_hash);
+        if identical_calls && no_progress {
             return Some(
                 block
                     .iter()
@@ -2511,18 +2549,90 @@ mod tests {
         assert_eq!(blocks[1], text);
     }
 
+    /// `sig` with a completed result — the shape a prior batch's entries
+    /// have once `backfill_result_hashes` ran.
+    fn done(name: &str, input: Value, result: &str) -> CallSig {
+        let mut s = sig(name, input);
+        s.result_hash = Some(content_hash(result));
+        s
+    }
+
     #[test]
     fn doom_detector_finds_periods() {
-        let a = || sig("read", json!({"path":"x"}));
-        let b = || sig("bash", json!({"command":"ls"}));
-        assert!(detect_doom_loop(&[a(), a(), a()]).is_some());
-        let sigs = vec![a(), b(), a(), b(), a(), b()];
+        // The last repeat block is the just-dispatched batch: in flight,
+        // results unknown. The completed prior blocks carry identical results.
+        let a = || done("read", json!({"path":"x"}), "same body");
+        let b = || done("bash", json!({"command":"ls"}), "same listing");
+        let a_now = || sig("read", json!({"path":"x"}));
+        let b_now = || sig("bash", json!({"command":"ls"}));
+        assert!(detect_doom_loop(&[a(), a(), a_now()]).is_some());
+        let sigs = vec![a(), b(), a(), b(), a_now(), b_now()];
         assert!(detect_doom_loop(&sigs).is_some());
-        assert!(detect_doom_loop(&[a(), a(), b()]).is_none());
+        assert!(detect_doom_loop(&[a(), a(), b_now()]).is_none());
         assert!(detect_doom_loop(&[a(), a()]).is_none());
         // The ask still shows the human-readable signatures.
-        let pattern = detect_doom_loop(&[a(), a(), a()]).unwrap();
+        let pattern = detect_doom_loop(&[a(), a(), a_now()]).unwrap();
         assert_eq!(pattern, "read({\"path\":\"x\"})");
+    }
+
+    /// 0030 Task 7: identical calls whose completed results kept changing are
+    /// polling — progress, not a loop. Only "same call, same answer" fires.
+    #[test]
+    fn changing_results_are_polling_not_a_doom_loop() {
+        let poll = |r: &str| done("bash", json!({"command":"curl status"}), r);
+        let now = || sig("bash", json!({"command":"curl status"}));
+        assert!(detect_doom_loop(&[poll("queued"), poll("running"), now()]).is_none());
+        // An all-in-flight triple (one batch of three) cannot fire either.
+        assert!(detect_doom_loop(&[now(), now(), now()]).is_none());
+        // Control: identical answers still condemn the third dispatch.
+        assert!(detect_doom_loop(&[poll("queued"), poll("queued"), now()]).is_some());
+    }
+
+    #[test]
+    fn backfill_stamps_the_windows_tail_in_order() {
+        let mut window: VecDeque<CallSig> = VecDeque::new();
+        fold_call_sigs(&mut window, &uses(&[("read", json!({"path": "old"}))]));
+        window[0].result_hash = Some(1);
+        fold_call_sigs(
+            &mut window,
+            &uses(&[
+                ("read", json!({"path": "a"})),
+                ("bash", json!({"command": "b"})),
+            ]),
+        );
+        let results: Vec<ToolResultItem> = ["ra", "rb"]
+            .iter()
+            .map(|c| ToolResultItem {
+                tool_use_id: "t".into(),
+                content: (*c).into(),
+                is_error: false,
+            })
+            .collect();
+        backfill_result_hashes(&mut window, &results);
+        assert_eq!(window[0].result_hash, Some(1), "prior entries untouched");
+        assert_eq!(window[1].result_hash, Some(content_hash("ra")));
+        assert_eq!(window[2].result_hash, Some(content_hash("rb")));
+
+        // A batch longer than the window: only its tail survived the fold,
+        // so the result slice's tail aligns with the window's tail.
+        let mut window: VecDeque<CallSig> = VecDeque::new();
+        let big: Vec<(&str, Value)> = (0..DOOM_WINDOW + 2).map(|i| ("t", json!(i))).collect();
+        fold_call_sigs(&mut window, &uses(&big));
+        assert_eq!(window.len(), DOOM_WINDOW);
+        let results: Vec<ToolResultItem> = (0..DOOM_WINDOW + 2)
+            .map(|i| ToolResultItem {
+                tool_use_id: "t".into(),
+                content: format!("r{i}"),
+                is_error: false,
+            })
+            .collect();
+        backfill_result_hashes(&mut window, &results);
+        // Window entry 0 is call #2 (the first two were evicted) → result r2.
+        assert_eq!(window[0].result_hash, Some(content_hash("r2")));
+        assert_eq!(
+            window[DOOM_WINDOW - 1].result_hash,
+            Some(content_hash(&format!("r{}", DOOM_WINDOW + 1)))
+        );
     }
 
     fn uses(pairs: &[(&str, Value)]) -> Vec<ToolUse> {
@@ -2645,12 +2755,20 @@ mod tests {
     /// `DefaultHasher` collision must not terminate a turn that was working.
     #[test]
     fn a_hash_collision_alone_is_not_a_doom_loop() {
-        let collide = |display: &str| CallSig {
+        // Completed entries share a result so only call identity is under test.
+        let collide = |display: &str, in_flight: bool| CallSig {
             hash: 7,
             display: display.into(),
+            result_hash: (!in_flight).then_some(9),
         };
-        assert!(detect_doom_loop(&[collide("a"), collide("b"), collide("c")]).is_none());
-        assert!(detect_doom_loop(&[collide("a"), collide("a"), collide("a")]).is_some());
+        assert!(
+            detect_doom_loop(&[collide("a", false), collide("b", false), collide("c", true)])
+                .is_none()
+        );
+        assert!(
+            detect_doom_loop(&[collide("a", false), collide("a", false), collide("a", true)])
+                .is_some()
+        );
     }
 
     fn todos_item(text: &str) -> Item {

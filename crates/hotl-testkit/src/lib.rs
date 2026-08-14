@@ -1104,6 +1104,38 @@ mod tests {
         );
     }
 
+    /// 0030 Task 7: an identical call repeated across batches whose results
+    /// keep changing is polling, not a doom loop — the turn runs to its
+    /// scripted end. The command reads a file it also appends to, so each
+    /// repeat's output genuinely differs.
+    #[tokio::test]
+    async fn polling_with_changing_results_is_not_a_doom_loop() {
+        let poll = "cat c; echo x >> c";
+        let mut scripts = vec![ScriptedProvider::tool_call(
+            "t0",
+            "bash",
+            json!({"command": "echo start > c"}),
+        )];
+        scripts.extend((1..=4).map(|i| {
+            ScriptedProvider::tool_call(&format!("t{i}"), "bash", json!({"command": poll}))
+        }));
+        scripts.push(ScriptedProvider::text_reply("came up"));
+        let mut h = Harness::new(
+            scripts,
+            EngineConfig {
+                max_turns: 10,
+                ..Default::default()
+            },
+        );
+        let outcome = h.prompt_and_wait("wait for the service").await;
+        assert_eq!(
+            outcome,
+            Outcome::Done {
+                text: "came up".into()
+            }
+        );
+    }
+
     #[tokio::test]
     async fn golden_tool_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
