@@ -283,6 +283,14 @@ async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, St
     }
 }
 
+/// A streamed delta defers its draw to the armed tick; anything else —
+/// keys, tool events, TurnDone, Tick itself — draws now.
+fn defers_draw(msg: &Msg) -> bool {
+    matches!(msg, Msg::Update(v)
+        if matches!(v.get("type").and_then(Value::as_str),
+            Some("text_delta" | "thinking_delta")))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_loop(
     guard: &mut TerminalGuard,
@@ -304,10 +312,17 @@ async fn run_loop(
     // re-wrapping a transcript that did not change.
     let mut cache = TranscriptCache::default();
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // 0033 Task 2: deltas mark the frame dirty and ride the 30 Hz tick that
+    // is armed exactly when deltas can arrive; everything else draws now.
+    let mut needs_draw = true;
     loop {
-        guard
-            .terminal
-            .draw(|f| view(&state, &palette, &mut cache, f))?;
+        // No `needs_draw = false` here: every path below reassigns it before
+        // this line runs again (redraw-only `continue`, or the loop bottom).
+        if needs_draw {
+            guard
+                .terminal
+                .draw(|f| view(&state, &palette, &mut cache, f))?;
+        }
         let msg = tokio::select! {
             ev = keys.recv() => match ev {
                 Some(ev) => terminal_msg(ev, copy_on_select), // `None` = redraw-only (resize, mouse motion)
@@ -319,7 +334,14 @@ async fn run_loop(
             },
             _ = ticker.tick(), if state.phase != Phase::Idle => Some(Msg::Tick),
         };
-        let Some(msg) = msg else { continue };
+        let Some(msg) = msg else {
+            needs_draw = true; // redraw-only: resize, mouse motion
+            continue;
+        };
+        // Decided before `update` consumes the msg; applied after the cmd
+        // queue drains. The Idle guard covers the impossible-but-cheap case
+        // of a delta arriving with no tick armed to flush it.
+        let defer = defers_draw(&msg);
         let mut queue: VecDeque<Cmd> = update(&mut state, msg).into();
         while let Some(cmd) = queue.pop_front() {
             // The wire-bound half is shared with the e2e harness; what comes
@@ -371,6 +393,7 @@ async fn run_loop(
                 handled => debug_assert!(false, "unhandled cmd: {handled:?}"),
             }
         }
+        needs_draw = !defer || state.phase == Phase::Idle;
     }
 }
 
@@ -891,8 +914,8 @@ fn age(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_tui_args, parse_tui_flags, resolve_mouse, resolve_session_arg, terminal_msg,
-        WHEEL_LINES,
+        defers_draw, parse_tui_args, parse_tui_flags, resolve_mouse, resolve_session_arg,
+        terminal_msg, WHEEL_LINES,
     };
     use crossterm::event::{Event, KeyModifiers};
     use hotl_tui::app::Msg;
@@ -915,6 +938,22 @@ mod tests {
             media_type: "image/png".into(),
             data: None,
         }
+    }
+
+    /// 0033 Task 2: only streamed deltas ride the tick; every other message
+    /// draws immediately.
+    #[test]
+    fn deltas_defer_everything_else_draws() {
+        assert!(defers_draw(&Msg::Update(
+            json!({"type": "text_delta", "text": "x"})
+        )));
+        assert!(defers_draw(&Msg::Update(
+            json!({"type": "thinking_delta", "text": "x"})
+        )));
+        assert!(!defers_draw(&Msg::Update(
+            json!({"type": "tool_start", "name": "bash", "summary": ""})
+        )));
+        assert!(!defers_draw(&Msg::Tick));
     }
 
     #[tokio::test]

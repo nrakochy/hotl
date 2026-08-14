@@ -900,6 +900,10 @@ fn start_session(
     }
 }
 
+/// Bounds one coalesced delta line's size; a burst that large is already a
+/// caught-up backlog, not a live stream.
+const DELTA_COALESCE_MAX: usize = 16 * 1024;
+
 /// Map engine events to `session/update` notifications, turn permission asks
 /// into `session/request_permission` requests, questions into
 /// `session/request_question` requests, and answer the pending prompt on
@@ -916,7 +920,47 @@ async fn drain_events(
     mut req_id: u64,
     model: String,
 ) {
-    while let Some(event) = events.recv().await {
+    let mut held: Option<EngineEvent> = None;
+    loop {
+        let event = match held.take() {
+            Some(e) => e,
+            None => match events.recv().await {
+                Some(e) => e,
+                None => break,
+            },
+        };
+        // Fold a burst that is already sitting in the queue into one frame —
+        // one JSON line, one flush, one client parse. Cross-kind or control
+        // events end the fold and are handled next iteration, in order.
+        let event = match event {
+            EngineEvent::TextDelta(mut t) => {
+                while t.len() < DELTA_COALESCE_MAX {
+                    match events.try_recv() {
+                        Ok(EngineEvent::TextDelta(next)) => t.push_str(&next),
+                        Ok(other) => {
+                            held = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                EngineEvent::TextDelta(t)
+            }
+            EngineEvent::ThinkingDelta(mut t) => {
+                while t.len() < DELTA_COALESCE_MAX {
+                    match events.try_recv() {
+                        Ok(EngineEvent::ThinkingDelta(next)) => t.push_str(&next),
+                        Ok(other) => {
+                            held = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                EngineEvent::ThinkingDelta(t)
+            }
+            other => other,
+        };
         match event {
             EngineEvent::Ask {
                 summary,
@@ -1082,6 +1126,99 @@ async fn send(writer: &Writer, msg: &Value) {
     let mut w = writer.lock().await;
     let _ = w.write_all(line.as_bytes()).await;
     let _ = w.flush().await;
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+    use hotl_types::TokenUsage;
+    use tokio::io::AsyncReadExt;
+
+    /// Run `drain_events` to completion over a pre-closed channel, capturing
+    /// every line it writes.
+    async fn run_drain_events_capturing_writer(rx: mpsc::Receiver<EngineEvent>) -> Vec<String> {
+        let (write, mut read) = tokio::io::duplex(1 << 20);
+        let writer: Writer = Arc::new(Mutex::new(Box::new(write)));
+        drain_events(
+            rx,
+            Arc::clone(&writer),
+            Pending::default(),
+            PendingQuestions::default(),
+            PendingEgress::default(),
+            PendingPrompt::default(),
+            "acp-test".into(),
+            0,
+            "test-model".into(),
+        )
+        .await;
+        drop(writer); // close the duplex so read_to_string sees EOF
+        let mut buf = String::new();
+        read.read_to_string(&mut buf).await.unwrap();
+        buf.lines().map(str::to_string).collect()
+    }
+
+    fn turn_done() -> EngineEvent {
+        EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "ok".into() },
+            usage: TokenUsage::default(),
+        }
+    }
+
+    /// 0033 Task 2: a burst already sitting in the queue folds into ONE
+    /// frame — one JSON line, one flush, one client parse.
+    #[tokio::test]
+    async fn queued_text_deltas_coalesce_into_one_update() {
+        let (tx, rx) = mpsc::channel(64);
+        for chunk in ["a", "b", "c"] {
+            tx.send(EngineEvent::TextDelta(chunk.into())).await.unwrap();
+        }
+        tx.send(turn_done()).await.unwrap();
+        drop(tx);
+        let lines = run_drain_events_capturing_writer(rx).await;
+        let updates: Vec<_> = lines.iter().filter(|l| l.contains("text_delta")).collect();
+        assert_eq!(updates.len(), 1, "burst must fold: {lines:?}");
+        assert!(updates[0].contains("\"text\":\"abc\""), "{updates:?}");
+    }
+
+    /// Only *adjacent same-kind* deltas merge — a cross-kind event ends the
+    /// fold and everything stays in order.
+    #[tokio::test]
+    async fn a_cross_kind_event_ends_the_fold_in_order() {
+        let (tx, rx) = mpsc::channel(64);
+        tx.send(EngineEvent::TextDelta("a".into())).await.unwrap();
+        tx.send(EngineEvent::TextDelta("b".into())).await.unwrap();
+        tx.send(EngineEvent::ToolStart {
+            name: "bash".into(),
+            summary: "ls".into(),
+        })
+        .await
+        .unwrap();
+        tx.send(EngineEvent::TextDelta("c".into())).await.unwrap();
+        tx.send(EngineEvent::ThinkingDelta("t1".into()))
+            .await
+            .unwrap();
+        tx.send(EngineEvent::ThinkingDelta("t2".into()))
+            .await
+            .unwrap();
+        tx.send(turn_done()).await.unwrap();
+        drop(tx);
+        let lines = run_drain_events_capturing_writer(rx).await;
+        let kinds: Vec<&str> = lines
+            .iter()
+            .filter_map(|l| {
+                let v: Value = serde_json::from_str(l).ok()?;
+                match v["params"]["update"]["type"].as_str()? {
+                    "text_delta" => Some("text"),
+                    "thinking_delta" => Some("thinking"),
+                    "tool_start" => Some("tool"),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert_eq!(kinds, ["text", "tool", "text", "thinking"], "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("\"text\":\"ab\"")));
+        assert!(lines.iter().any(|l| l.contains("\"text\":\"t1t2\"")));
+    }
 }
 
 #[cfg(test)]
