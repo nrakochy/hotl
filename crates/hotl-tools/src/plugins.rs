@@ -191,13 +191,22 @@ pub struct PluginEntry {
     /// `skills/<name>` dirs whose `SKILL.md` resolved to a regular file
     /// inside the root — immediate children only (§7.1), sorted.
     pub skill_dirs: Vec<PathBuf>,
+    /// The per-plugin `PLUGIN_DATA` directory (`<data_base>/<name>`).
+    /// Not created here — the config layer creates it at discovery for
+    /// plugins with at least one valid stdio server (§9.1).
+    pub plugin_data: PathBuf,
+    /// Valid stdio servers from `mcp.json`, post-validation and
+    /// post-expansion, the reserved env pair already appended last.
+    pub servers: Vec<PluginServer>,
 }
 
-/// Load one plugin from a directory (§11.1 rule 1). Containment is
-/// symlink-resolving canonicalize + prefix — deliberately not
-/// `fsguard::resolve_beneath`, whose no-follow descent rejects the
-/// in-root symlinks §4.1 explicitly permits.
-pub fn load_plugin(handle: &str, root: &Path, _plugin_data: &Path) -> LoadedPlugin {
+/// Load one plugin from a directory (§11.1 rule 1). `data_base` is the
+/// parent of every per-plugin `PLUGIN_DATA` dir; the plugin's own is
+/// `<data_base>/<manifest-name>`. Containment is symlink-resolving
+/// canonicalize + prefix — deliberately not `fsguard::resolve_beneath`,
+/// whose no-follow descent rejects the in-root symlinks §4.1 explicitly
+/// permits.
+pub fn load_plugin(handle: &str, root: &Path, data_base: &Path) -> LoadedPlugin {
     let mut reports = Vec::new();
     let Ok(root) = dunce::canonicalize(root) else {
         return LoadedPlugin {
@@ -257,6 +266,8 @@ pub fn load_plugin(handle: &str, root: &Path, _plugin_data: &Path) -> LoadedPlug
     }
 
     let skill_dirs = discover_skills(handle, &root, &mut reports);
+    let plugin_data = data_base.join(&manifest.name);
+    let servers = discover_mcp(handle, &root, &plugin_data, &mut reports);
     LoadedPlugin {
         entry: Some(PluginEntry {
             name: manifest.name.clone(),
@@ -264,6 +275,8 @@ pub fn load_plugin(handle: &str, root: &Path, _plugin_data: &Path) -> LoadedPlug
             root,
             manifest,
             skill_dirs,
+            plugin_data,
+            servers,
         }),
         reports,
     }
@@ -324,6 +337,446 @@ fn discover_skills(handle: &str, root: &Path, reports: &mut Vec<String>) -> Vec<
         }
     }
     out
+}
+
+/// The canonical 1.0.0 MCP configuration schema identifier (§7.2.1).
+pub const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
+
+/// One valid stdio server from a plugin's `mcp.json`, after validation,
+/// containment, and placeholder expansion. `env` carries the configured
+/// pairs in order with the reserved (`PLUGIN_ROOT`, `PLUGIN_DATA`) pair
+/// appended **last** — §9.1's overlay order holds by construction when a
+/// launcher applies pairs first-to-last with last-wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginServer {
+    /// The `mcpServers` member name, unqualified — the config layer
+    /// composes `<plugin>:<server>`.
+    pub name: String,
+    /// Bare executable name, or the absolute root-joined path of a `./`
+    /// plugin-relative command.
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    /// Always set: the validated `cwd`, defaulting to the plugin root
+    /// (§7.2.1).
+    pub cwd: PathBuf,
+    pub description: String,
+}
+
+/// The result of validating one `mcp.json` (§7.2.2). `disabled` is rule
+/// 2's boundary: the whole MCP component is off for this plugin (bad
+/// JSON, wrong/mismatched `$schema`, extra top-level fields), while other
+/// component types keep loading.
+#[derive(Debug)]
+pub struct McpOutcome {
+    pub servers: Vec<PluginServer>,
+    pub reports: Vec<String>,
+    pub disabled: bool,
+}
+
+/// §9.2: single, non-recursive textual replacement of every exact
+/// `${PLUGIN_ROOT}` / `${PLUGIN_DATA}` occurrence. Only the original
+/// string is scanned, so replacement text is never re-expanded, and
+/// unrecognized placeholder-like text (`${HOME}`, `$PLUGIN_ROOT`,
+/// `${PLUGIN_ROOTX}`) stays literal.
+pub fn expand(s: &str, root: &str, data: &str) -> String {
+    const ROOT_VAR: &str = "${PLUGIN_ROOT}";
+    const DATA_VAR: &str = "${PLUGIN_DATA}";
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let hit = match (rest.find(ROOT_VAR), rest.find(DATA_VAR)) {
+            (None, None) => break,
+            (Some(i), None) => (i, root),
+            (None, Some(j)) => (j, data),
+            (Some(i), Some(j)) => {
+                if i < j {
+                    (i, root)
+                } else {
+                    (j, data)
+                }
+            }
+        };
+        out.push_str(&rest[..hit.0]);
+        out.push_str(hit.1);
+        rest = &rest[hit.0 + ROOT_VAR.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Parse and validate one `mcp.json` against the plugin root and its
+/// (possibly not-yet-created) `PLUGIN_DATA` dir. `root` must be the
+/// filesystem-resolved plugin root.
+pub fn parse_mcp_json(text: &str, root: &Path, data: &Path) -> McpOutcome {
+    let off = |report: String| McpOutcome {
+        servers: Vec::new(),
+        reports: vec![format!("{report} — MCP disabled for this plugin")],
+        disabled: true,
+    };
+    let value: Value = match serde_json::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return off(format!("mcp.json is not valid JSON ({e})")),
+    };
+    let Some(obj) = value.as_object() else {
+        return off("mcp.json must contain a top-level JSON object".into());
+    };
+    // Exactly `$schema` + `mcpServers`, nothing else (§7.2.1).
+    for key in obj.keys() {
+        if key != "$schema" && key != "mcpServers" {
+            return off(format!("mcp.json: unexpected top-level field `{key}`"));
+        }
+    }
+    let schema = match obj.get("$schema") {
+        Some(Value::String(s)) => s.as_str(),
+        _ => return off("mcp.json: required field `$schema` is missing or not a string".into()),
+    };
+    // §10.1: compare declared *versions*, not raw strings — a recognizable
+    // identifier at another version reports as a mismatch with the
+    // manifest (always 1.0.0 here, the one version hotl supports), while
+    // an unrecognizable one is simply invalid.
+    let version = schema
+        .strip_prefix("https://agent-plugins.org/schemas/")
+        .and_then(|s| s.strip_suffix("/mcp.schema.json"));
+    match version {
+        Some("1.0.0") => {}
+        Some(v) => {
+            return off(format!(
+                "mcp.json targets Agent Plugins {v} while plugin.json targets 1.0.0"
+            ))
+        }
+        None => return off(format!("mcp.json: `$schema` `{schema}` is not recognized")),
+    }
+    let Some(servers_obj) = obj.get("mcpServers").and_then(Value::as_object) else {
+        return off("mcp.json: required field `mcpServers` is missing or not an object".into());
+    };
+
+    let mut servers = Vec::new();
+    let mut reports = Vec::new();
+    for (name, entry) in servers_obj {
+        // Client-native constraint: the name becomes half of hotl's
+        // `<plugin>:<server>` roster key, so it gets the same charset the
+        // `[[mcp]]` lane enforces at `hotl mcp add`.
+        if !valid_server_name(name) {
+            reports.push(format!(
+                "server `{name}` entry invalid — server names are letters, digits, \
+                 `.`/`_`/`-` with an alphanumeric first char, ≤ 64 chars; entry skipped"
+            ));
+            continue;
+        }
+        match validate_server(entry, root, data) {
+            Ok(ServerEntry::Stdio(mut server)) => {
+                server.name = name.clone();
+                servers.push(server);
+            }
+            // §7.2.2 rule 4 — a *valid* remote entry, distinct wording
+            // from the invalid case so Appendix A's URL/header rows stay
+            // honest when a transport plan lands later.
+            Ok(ServerEntry::Unsupported(transport)) => reports.push(format!(
+                "server `{name}` skipped — unsupported transport `{transport}` \
+                 (hotl connects over stdio only)"
+            )),
+            Err(e) => reports.push(format!(
+                "server `{name}` entry invalid — {e}; entry skipped"
+            )),
+        }
+    }
+    McpOutcome {
+        servers,
+        reports,
+        disabled: false,
+    }
+}
+
+enum ServerEntry {
+    Stdio(PluginServer),
+    /// A fully valid entry whose declared transport hotl does not
+    /// support; carries the transport name for the report.
+    Unsupported(&'static str),
+}
+
+/// One server configuration object: a closed union over `type` (§7.2.1).
+/// An unknown field, unknown `type`, or cross-variant field is invalid.
+fn validate_server(entry: &Value, root: &Path, data: &Path) -> Result<ServerEntry, String> {
+    let Some(obj) = entry.as_object() else {
+        return Err("a server entry must be a JSON object".into());
+    };
+    let ty = match obj.get("type") {
+        Some(Value::String(s)) => s.as_str(),
+        _ => return Err("`type` is required and must be a string".into()),
+    };
+    match ty {
+        "stdio" => validate_stdio(obj, root, data).map(ServerEntry::Stdio),
+        "streamable-http" => {
+            validate_remote(obj).map(|()| ServerEntry::Unsupported("streamable-http"))
+        }
+        "sse" => validate_remote(obj).map(|()| ServerEntry::Unsupported("sse")),
+        other => Err(format!("unknown `type` `{other}`")),
+    }
+}
+
+fn validate_stdio(
+    obj: &serde_json::Map<String, Value>,
+    root: &Path,
+    data: &Path,
+) -> Result<PluginServer, String> {
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "type" | "command" | "args" | "env" | "cwd") {
+            return Err(format!("unknown field `{key}` on a stdio entry"));
+        }
+    }
+    let command = match obj.get("command") {
+        Some(Value::String(s)) => validate_command(s, root)?,
+        _ => return Err("`command` is required and must be a string".into()),
+    };
+    let root_str = root.to_string_lossy();
+    let data_str = data.to_string_lossy();
+    let mut args = Vec::new();
+    if let Some(v) = obj.get("args") {
+        let Some(arr) = v.as_array() else {
+            return Err("`args` must be an array of strings".into());
+        };
+        for a in arr {
+            let Some(a) = a.as_str() else {
+                return Err("`args` must be an array of strings".into());
+            };
+            args.push(expand(a, &root_str, &data_str));
+        }
+    }
+    let mut env = Vec::new();
+    if let Some(v) = obj.get("env") {
+        let Some(map) = v.as_object() else {
+            return Err("`env` must be an object of strings".into());
+        };
+        for (k, val) in map {
+            let Some(val) = val.as_str() else {
+                return Err(format!("`env.{k}` must be a string"));
+            };
+            // §9.2: the reserved names are the client's to set.
+            if k == "PLUGIN_ROOT" || k == "PLUGIN_DATA" {
+                return Err(format!("`env` must not define the reserved `{k}`"));
+            }
+            env.push((k.clone(), expand(val, &root_str, &data_str)));
+        }
+    }
+    // The reserved pair, last: applied first-to-last with last-wins,
+    // these replace any equivalently-named configured entry (§9.1).
+    env.push(("PLUGIN_ROOT".into(), root_str.into_owned()));
+    env.push(("PLUGIN_DATA".into(), data_str.into_owned()));
+    let cwd = match obj.get("cwd") {
+        None => root.to_path_buf(),
+        Some(Value::String(s)) => validate_cwd(s, root, data)?,
+        Some(_) => return Err("`cwd` must be a string".into()),
+    };
+    Ok(PluginServer {
+        name: String::new(),
+        command,
+        args,
+        env,
+        cwd,
+        description: String::new(),
+    })
+}
+
+/// §7.2.1: a single executable token — a bare name (platform search
+/// rules) or a `./` plugin-relative path resolved against the root. No
+/// placeholder expansion, ever.
+fn validate_command(raw: &str, root: &Path) -> Result<String, String> {
+    if let Some(rest) = raw.strip_prefix("./") {
+        let path = root.join(rest);
+        contain(&path, root, "the plugin root").map_err(|e| format!("`command` {e}"))?;
+        return Ok(path.to_string_lossy().into_owned());
+    }
+    if raw.is_empty() || raw.contains(['/', '\\']) || raw.contains("${") {
+        return Err(format!(
+            "`command` must be a bare executable name or a `./` plugin-relative \
+             path (got `{raw}`; placeholders do not expand in `command`)"
+        ));
+    }
+    Ok(raw.to_string())
+}
+
+/// §7.2.1's three explicit `cwd` forms, expanded before resolution, each
+/// contained in its declared base. The target may not exist yet (a
+/// `${PLUGIN_DATA}/sub` is created by the server itself), so containment
+/// is lexical `..`-rejection plus canonicalize-when-exists.
+fn validate_cwd(raw: &str, root: &Path, data: &Path) -> Result<PathBuf, String> {
+    let expanded = expand(raw, &root.to_string_lossy(), &data.to_string_lossy());
+    let (path, base, what) = if raw == "${PLUGIN_ROOT}" {
+        (root.to_path_buf(), root, "the plugin root")
+    } else if raw == "${PLUGIN_DATA}" {
+        (data.to_path_buf(), data, "the plugin data directory")
+    } else if raw.starts_with("./") {
+        (root.join(&expanded[2..]), root, "the plugin root")
+    } else if raw.starts_with("${PLUGIN_ROOT}/") {
+        (PathBuf::from(&expanded), root, "the plugin root")
+    } else if raw.starts_with("${PLUGIN_DATA}/") {
+        (PathBuf::from(&expanded), data, "the plugin data directory")
+    } else {
+        return Err(format!(
+            "`cwd` must be a `./` plugin-relative path, `${{PLUGIN_ROOT}}`[/…], \
+             or `${{PLUGIN_DATA}}`[/…] (got `{raw}`)"
+        ));
+    };
+    contain(&path, base, what).map_err(|e| format!("`cwd` {e}"))?;
+    Ok(path)
+}
+
+/// Lexical containment (`..`-free and prefix-anchored) plus a
+/// canonicalize-when-exists symlink check. The lexical prefix check is
+/// load-bearing: an expanded absolute path smuggled into a `./` value
+/// would otherwise replace the base in `Path::join`.
+fn contain(path: &Path, base: &Path, what: &str) -> Result<(), String> {
+    use std::path::Component;
+    if path.components().any(|c| matches!(c, Component::ParentDir)) || !path.starts_with(base) {
+        return Err(format!("escapes {what}"));
+    }
+    if let Ok(resolved) = dunce::canonicalize(path) {
+        let base = dunce::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+        if !resolved.starts_with(&base) {
+            return Err(format!("resolves outside {what}"));
+        }
+    }
+    Ok(())
+}
+
+/// The `hotl mcp add` charset, so a plugin server name can always live in
+/// the shared roster.
+fn valid_server_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// An HTTP field-name token (RFC 9110 tchar).
+fn valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
+/// A remote (`streamable-http` / `sse`) entry: fully validated (§7.2.1's
+/// URL and header requirements) even though hotl then skips it — so a
+/// future transport plan changes one match arm, not the validation.
+fn validate_remote(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
+    for key in obj.keys() {
+        if !matches!(key.as_str(), "type" | "url" | "headers") {
+            return Err(format!("unknown field `{key}` on a remote entry"));
+        }
+    }
+    let url = match obj.get("url") {
+        Some(Value::String(s)) => s.as_str(),
+        _ => return Err("`url` is required and must be a string".into()),
+    };
+    validate_remote_url(url)?;
+    if let Some(v) = obj.get("headers") {
+        let Some(map) = v.as_object() else {
+            return Err("`headers` must be an object of strings".into());
+        };
+        let mut seen: Vec<String> = Vec::new();
+        for (name, val) in map {
+            if !valid_header_name(name) {
+                return Err(format!("`{name}` is not a valid HTTP header name"));
+            }
+            let folded = name.to_ascii_lowercase();
+            if seen.contains(&folded) {
+                return Err(format!(
+                    "`headers` contains `{name}` more than once under different casing"
+                ));
+            }
+            seen.push(folded);
+            let ok = val
+                .as_str()
+                .is_some_and(|v| v.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b)));
+            if !ok {
+                return Err(format!("`headers.{name}` is not a valid HTTP header value"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// §7.2.1: absolute http(s), no user information, no fragment; plain
+/// `http` only for `localhost` or a loopback IP literal.
+fn validate_remote_url(url: &str) -> Result<(), String> {
+    let (plain_http, rest) = if let Some(rest) = url.strip_prefix("https://") {
+        (false, rest)
+    } else if let Some(rest) = url.strip_prefix("http://") {
+        (true, rest)
+    } else {
+        return Err("`url` must be an absolute http(s) URL".into());
+    };
+    if url.contains('#') {
+        return Err("`url` must not contain a fragment".into());
+    }
+    let authority = rest.split(['/', '?']).next().unwrap_or("");
+    if authority.is_empty() {
+        return Err("`url` has no host".into());
+    }
+    if authority.contains('@') {
+        return Err("`url` must not contain user information".into());
+    }
+    if plain_http {
+        let host = if let Some(v6) = authority.strip_prefix('[') {
+            v6.split(']').next().unwrap_or("")
+        } else {
+            authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+        };
+        let loopback = host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        if !loopback {
+            return Err("`url` must use https for non-loopback endpoints".into());
+        }
+    }
+    Ok(())
+}
+
+/// The `mcp.json` fixed location (§6.1): absent is fine (§6.2); an
+/// escaping or wrong-kind location invalidates the MCP component (§4.1
+/// boundary 2); everything else is `parse_mcp_json`'s problem.
+fn discover_mcp(
+    handle: &str,
+    root: &Path,
+    plugin_data: &Path,
+    reports: &mut Vec<String>,
+) -> Vec<PluginServer> {
+    let location = root.join("mcp.json");
+    if std::fs::symlink_metadata(&location).is_err() {
+        return Vec::new();
+    }
+    let resolved = dunce::canonicalize(&location)
+        .ok()
+        .filter(|p| p.starts_with(root) && p.is_file());
+    if resolved.is_none() {
+        reports.push(format!(
+            "plugin `{handle}`: mcp.json does not resolve to a regular file inside \
+             the plugin root — MCP component skipped"
+        ));
+        return Vec::new();
+    }
+    let text = match std::fs::read_to_string(&location) {
+        Ok(text) => text,
+        Err(e) => {
+            reports.push(format!(
+                "plugin `{handle}`: mcp.json unreadable ({e}) — MCP component skipped"
+            ));
+            return Vec::new();
+        }
+    };
+    let outcome = parse_mcp_json(&text, root, plugin_data);
+    reports.extend(
+        outcome
+            .reports
+            .into_iter()
+            .map(|r| format!("plugin `{handle}`: {r}")),
+    );
+    outcome.servers
 }
 
 #[cfg(test)]
@@ -685,5 +1138,383 @@ mod tests {
                 "extensions": {{"com.example.client": "not-an-object"}}}}"#
         ));
         assert!(err.contains("com.example.client"), "{err}");
+    }
+
+    fn mcp_doc(servers: &str) -> String {
+        format!(r#"{{"$schema": "{MCP_SCHEMA}", "mcpServers": {{{servers}}}}}"#)
+    }
+
+    /// One-server outcome against throwaway root/data dirs.
+    fn one_server(server_json: &str) -> (McpOutcome, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(&dir.path().join("plugin"), "p");
+        let data = dir.path().join("plugin-data/p");
+        let out = parse_mcp_json(&mcp_doc(&format!(r#""srv": {server_json}"#)), &root, &data);
+        (out, root, data)
+    }
+
+    /// §7.2.1's own example, verbatim shapes: the stdio server loads with
+    /// expansion applied and the reserved pair appended last; both remote
+    /// entries validate and then skip as unsupported transports (§7.2.2
+    /// rule 4, owner decision 3).
+    #[test]
+    fn the_specs_mcp_example_loads_stdio_and_skips_remote_transports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(&dir.path().join("plugin"), "p");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/validator"), "#!/bin/sh\n").unwrap();
+        let data = dir.path().join("plugin-data/p");
+        let text = format!(
+            r#"{{
+              "$schema": "{MCP_SCHEMA}",
+              "mcpServers": {{
+                "local-validator": {{
+                  "type": "stdio",
+                  "command": "./bin/validator",
+                  "args": ["--data", "${{PLUGIN_DATA}}/validator"],
+                  "env": {{"CONFIG": "${{PLUGIN_ROOT}}/config.json"}},
+                  "cwd": "${{PLUGIN_ROOT}}"
+                }},
+                "deployment-api": {{
+                  "type": "streamable-http",
+                  "url": "https://deploy.example.com/mcp",
+                  "headers": {{"X-Tenant": "public-tenant"}}
+                }},
+                "legacy-events": {{"type": "sse", "url": "https://legacy.example.com/sse"}}
+              }}
+            }}"#
+        );
+        let out = parse_mcp_json(&text, &root, &data);
+        assert!(!out.disabled);
+        assert_eq!(out.servers.len(), 1, "{:?}", out.reports);
+        let s = &out.servers[0];
+        assert_eq!(s.name, "local-validator");
+        assert_eq!(s.command, root.join("bin/validator").to_string_lossy());
+        assert_eq!(
+            s.args,
+            vec![
+                "--data".to_string(),
+                format!("{}/validator", data.display())
+            ]
+        );
+        assert_eq!(s.cwd, root);
+        assert_eq!(
+            s.env,
+            vec![
+                (
+                    "CONFIG".to_string(),
+                    format!("{}/config.json", root.display())
+                ),
+                (
+                    "PLUGIN_ROOT".to_string(),
+                    root.to_string_lossy().into_owned()
+                ),
+                (
+                    "PLUGIN_DATA".to_string(),
+                    data.to_string_lossy().into_owned()
+                ),
+            ],
+            "configured pairs first, reserved pair last (§9.1)"
+        );
+        assert_eq!(out.reports.len(), 2, "{:?}", out.reports);
+        assert!(
+            out.reports
+                .iter()
+                .all(|r| r.contains("unsupported transport")),
+            "{:?}",
+            out.reports
+        );
+    }
+
+    /// §9.2: one non-recursive textual pass over the original string.
+    #[test]
+    fn expansion_is_single_pass_exact_and_literal_preserving() {
+        assert_eq!(expand("${PLUGIN_ROOT}/x", "/r", "/d"), "/r/x");
+        assert_eq!(
+            expand("a${PLUGIN_DATA}b${PLUGIN_ROOT}c", "/r", "/d"),
+            "a/db/rc"
+        );
+        // Replacement text is never rescanned: a data path carrying the
+        // literal placeholder survives.
+        assert_eq!(
+            expand("${PLUGIN_DATA}/x", "/r", "/d/${PLUGIN_ROOT}"),
+            "/d/${PLUGIN_ROOT}/x"
+        );
+        for lit in [
+            "${HOME}",
+            "$PLUGIN_ROOT",
+            "${PLUGIN_ROOTX}",
+            "${plugin_root}",
+        ] {
+            assert_eq!(expand(lit, "/r", "/d"), lit, "must stay literal");
+        }
+    }
+
+    /// §9.2: a reserved env name invalidates only that entry; the sibling
+    /// still loads.
+    #[test]
+    fn a_reserved_env_name_invalidates_only_that_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(&dir.path().join("plugin"), "p");
+        let data = dir.path().join("data");
+        let out = parse_mcp_json(
+            &mcp_doc(
+                r#""bad": {"type": "stdio", "command": "npx",
+                          "env": {"PLUGIN_ROOT": "/somewhere"}},
+                   "good": {"type": "stdio", "command": "npx"}"#,
+            ),
+            &root,
+            &data,
+        );
+        assert!(!out.disabled);
+        assert_eq!(out.servers.len(), 1);
+        assert_eq!(out.servers[0].name, "good");
+        assert_eq!(out.reports.len(), 1);
+        assert!(
+            out.reports[0].contains("PLUGIN_ROOT") && out.reports[0].contains("invalid"),
+            "{}",
+            out.reports[0]
+        );
+    }
+
+    /// §7.2.1: the closed union — unknown fields, cross-variant fields,
+    /// and unknown `type` values invalidate the entry.
+    #[test]
+    fn unknown_fields_cross_variant_fields_and_unknown_types_invalidate() {
+        for bad in [
+            r#"{"type": "stdio", "command": "npx", "url": "https://x.com"}"#,
+            r#"{"type": "stdio", "command": "npx", "flags": []}"#,
+            r#"{"type": "sse", "url": "https://x.com/sse", "command": "x"}"#,
+            r#"{"type": "websocket", "url": "wss://x.com"}"#,
+            r#"{"type": "stdio"}"#,
+            r#"{"command": "npx"}"#,
+            r#""just a string""#,
+            r#"{"type": "stdio", "command": "npx", "args": "not-a-list"}"#,
+            r#"{"type": "stdio", "command": "npx", "env": {"K": 1}}"#,
+        ] {
+            let (out, _, _) = one_server(bad);
+            assert!(!out.disabled, "{bad}");
+            assert!(out.servers.is_empty(), "{bad}");
+            assert_eq!(out.reports.len(), 1, "{bad}: {:?}", out.reports);
+            assert!(out.reports[0].contains("invalid"), "{}", out.reports[0]);
+        }
+    }
+
+    /// The invalid-remote and unsupported-transport reports are distinct
+    /// strings — Appendix A's URL/header rows stay honest while remote
+    /// transports are out of scope.
+    #[test]
+    fn remote_entries_validate_before_they_skip() {
+        for bad in [
+            r#"{"type": "streamable-http", "url": "ftp://x.com/mcp"}"#,
+            r#"{"type": "streamable-http", "url": "https://x.com/mcp#frag"}"#,
+            r#"{"type": "streamable-http", "url": "https://user@x.com/mcp"}"#,
+            r#"{"type": "streamable-http", "url": "http://example.com/mcp"}"#,
+            r#"{"type": "sse", "url": "https://x.com/sse",
+                "headers": {"X-A": "1", "x-a": "2"}}"#,
+            r#"{"type": "sse", "url": "https://x.com/sse", "headers": {"bad name": "v"}}"#,
+            r#"{"type": "sse", "url": "https://x.com/sse", "headers": {"X-A": "v\u0000"}}"#,
+        ] {
+            let (out, _, _) = one_server(bad);
+            assert!(out.servers.is_empty(), "{bad}");
+            assert!(
+                out.reports[0].contains("invalid")
+                    && !out.reports[0].contains("unsupported transport"),
+                "{bad} → {}",
+                out.reports[0]
+            );
+        }
+        for good in [
+            r#"{"type": "streamable-http", "url": "https://x.com/mcp"}"#,
+            r#"{"type": "streamable-http", "url": "http://localhost:8080/mcp"}"#,
+            r#"{"type": "streamable-http", "url": "http://127.0.0.1/mcp"}"#,
+            r#"{"type": "streamable-http", "url": "http://[::1]:3000/mcp"}"#,
+            r#"{"type": "sse", "url": "https://x.com/sse", "headers": {"X-A": "v"}}"#,
+        ] {
+            let (out, _, _) = one_server(good);
+            assert!(
+                out.reports[0].contains("unsupported transport")
+                    && !out.reports[0].contains("invalid"),
+                "{good} → {}",
+                out.reports[0]
+            );
+        }
+    }
+
+    /// §10.1/§7.2.2 rule 2: a version mismatch or unrecognized `$schema`
+    /// disables MCP for the plugin — versions are compared, not strings.
+    #[test]
+    fn a_schema_version_mismatch_disables_mcp() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(dir.path(), "p");
+        let data = dir.path().join("data");
+        let mismatched = r#"{"$schema":
+            "https://agent-plugins.org/schemas/1.0.1/mcp.schema.json",
+            "mcpServers": {}}"#;
+        let out = parse_mcp_json(mismatched, &root, &data);
+        assert!(out.disabled);
+        assert!(
+            out.reports[0].contains("1.0.1") && out.reports[0].contains("1.0.0"),
+            "{}",
+            out.reports[0]
+        );
+        let unrecognized = format!(r#"{{"$schema": "{MANIFEST_SCHEMA}", "mcpServers": {{}}}}"#);
+        let out = parse_mcp_json(&unrecognized, &root, &data);
+        assert!(out.disabled);
+        assert!(
+            out.reports[0].contains("not recognized"),
+            "{}",
+            out.reports[0]
+        );
+    }
+
+    /// §7.2.1/§7.2.2 rule 2: the top level is exactly `$schema` +
+    /// `mcpServers`; anything else (or a non-object) disables MCP. An
+    /// empty `mcpServers` is valid.
+    #[test]
+    fn the_mcp_top_level_is_closed_and_empty_servers_are_valid() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(dir.path(), "p");
+        let data = dir.path().join("data");
+        for bad in [
+            format!(r#"{{"$schema": "{MCP_SCHEMA}", "mcpServers": {{}}, "extra": 1}}"#),
+            "[]".to_string(),
+            "not json".to_string(),
+            format!(r#"{{"$schema": "{MCP_SCHEMA}"}}"#),
+            format!(r#"{{"$schema": "{MCP_SCHEMA}", "mcpServers": []}}"#),
+            r#"{"mcpServers": {}}"#.to_string(),
+        ] {
+            let out = parse_mcp_json(&bad, &root, &data);
+            assert!(out.disabled, "{bad}");
+            assert!(out.servers.is_empty());
+        }
+        let out = parse_mcp_json(&mcp_doc(""), &root, &data);
+        assert!(!out.disabled);
+        assert!(out.servers.is_empty() && out.reports.is_empty());
+    }
+
+    /// §7.2.1's `command` forms: one executable token, bare or
+    /// `./`-relative, no expansion.
+    #[test]
+    fn command_forms_match_the_spec() {
+        let (out, root, _) = one_server(r#"{"type": "stdio", "command": "./bin/server"}"#);
+        assert_eq!(
+            out.servers[0].command,
+            root.join("bin/server").to_string_lossy(),
+            "a plugin-relative command is root-joined even before it exists"
+        );
+        let (out, _, _) = one_server(r#"{"type": "stdio", "command": "npx"}"#);
+        assert_eq!(out.servers[0].command, "npx", "a bare name stays bare");
+        for bad in [
+            r#"{"type": "stdio", "command": "../bin/server"}"#,
+            r#"{"type": "stdio", "command": "bin/server"}"#,
+            r#"{"type": "stdio", "command": "${PLUGIN_ROOT}/bin"}"#,
+            r#"{"type": "stdio", "command": "./bin/../../escape"}"#,
+            r#"{"type": "stdio", "command": ""}"#,
+            r#"{"type": "stdio", "command": "/abs/path"}"#,
+        ] {
+            let (out, _, _) = one_server(bad);
+            assert!(out.servers.is_empty(), "{bad}");
+            assert!(out.reports[0].contains("command"), "{}", out.reports[0]);
+        }
+    }
+
+    /// §7.2.1's `cwd` forms, including the omitted → plugin-root default
+    /// and a not-yet-existing `${PLUGIN_DATA}` target.
+    #[test]
+    fn cwd_forms_match_the_spec() {
+        let (out, root, _) = one_server(r#"{"type": "stdio", "command": "npx"}"#);
+        assert_eq!(out.servers[0].cwd, root, "omitted cwd is the plugin root");
+        let (out, root, _) = one_server(r#"{"type": "stdio", "command": "npx", "cwd": "./data"}"#);
+        assert_eq!(out.servers[0].cwd, root.join("data"));
+        let (out, root, _) =
+            one_server(r#"{"type": "stdio", "command": "npx", "cwd": "${PLUGIN_ROOT}"}"#);
+        assert_eq!(out.servers[0].cwd, root);
+        let (out, _, data) =
+            one_server(r#"{"type": "stdio", "command": "npx", "cwd": "${PLUGIN_DATA}/sub"}"#);
+        assert_eq!(
+            out.servers[0].cwd,
+            data.join("sub"),
+            "a not-yet-created data subdir is still a valid cwd"
+        );
+        for bad in [
+            r#"{"type": "stdio", "command": "npx", "cwd": "data"}"#,
+            r#"{"type": "stdio", "command": "npx", "cwd": "../x"}"#,
+            r#"{"type": "stdio", "command": "npx", "cwd": "./../x"}"#,
+            r#"{"type": "stdio", "command": "npx", "cwd": "${PLUGIN_ROOT}/../x"}"#,
+            r#"{"type": "stdio", "command": "npx", "cwd": "/abs"}"#,
+            r#"{"type": "stdio", "command": "npx", "cwd": "./${PLUGIN_DATA}"}"#,
+            r#"{"type": "stdio", "command": "npx", "cwd": "${PLUGIN_ROOT}x"}"#,
+        ] {
+            let (out, _, _) = one_server(bad);
+            assert!(out.servers.is_empty(), "{bad}");
+            assert!(out.reports[0].contains("cwd"), "{bad} → {}", out.reports[0]);
+        }
+    }
+
+    /// An escaping symlinked command invalidates the entry (§4.1
+    /// boundary 4 via the entry boundary).
+    #[cfg(unix)]
+    #[test]
+    fn an_escaping_symlinked_command_invalidates_the_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside-bin");
+        std::fs::write(&outside, "#!/bin/sh\n").unwrap();
+        let root = plugin_root(&dir.path().join("plugin"), "p");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("bin/server")).unwrap();
+        let out = parse_mcp_json(
+            &mcp_doc(r#""srv": {"type": "stdio", "command": "./bin/server"}"#),
+            &root,
+            &dir.path().join("data"),
+        );
+        assert!(out.servers.is_empty());
+        assert!(out.reports[0].contains("command"), "{}", out.reports[0]);
+    }
+
+    /// `load_plugin` wires `mcp.json` in through the fixed location: an
+    /// absent file is silent (§6.2), a present one populates `servers`,
+    /// and an escaping one invalidates only the MCP component.
+    #[test]
+    fn load_plugin_discovers_mcp_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(dir.path(), "p");
+        write_skill(&root.join("skills/s"));
+        let loaded = load_plugin("p", &root, &data_dir());
+        assert!(loaded.entry.unwrap().servers.is_empty());
+        assert!(loaded.reports.is_empty());
+
+        std::fs::write(
+            root.join("mcp.json"),
+            mcp_doc(r#""mem": {"type": "stdio", "command": "npx", "args": ["-y", "@x/mem"]}"#),
+        )
+        .unwrap();
+        let loaded = load_plugin("p", &root, &data_dir());
+        let entry = loaded.entry.unwrap();
+        assert_eq!(entry.servers.len(), 1);
+        assert_eq!(entry.servers[0].name, "mem");
+        assert_eq!(entry.plugin_data, data_dir().join("p"));
+        assert!(loaded.reports.is_empty(), "{:?}", loaded.reports);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_escaping_mcp_json_invalidates_only_the_mcp_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside-mcp.json");
+        std::fs::write(&outside, mcp_doc("")).unwrap();
+        let root = plugin_root(&dir.path().join("plugin"), "p");
+        write_skill(&root.join("skills/s"));
+        std::os::unix::fs::symlink(&outside, root.join("mcp.json")).unwrap();
+
+        let loaded = load_plugin("p", &root, &data_dir());
+        let entry = loaded.entry.expect("plugin still loads");
+        assert_eq!(entry.skill_dirs.len(), 1, "skills are unaffected");
+        assert!(entry.servers.is_empty());
+        assert!(
+            loaded.reports[0].contains("mcp.json"),
+            "{:?}",
+            loaded.reports
+        );
     }
 }
