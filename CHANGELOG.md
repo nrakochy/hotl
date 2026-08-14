@@ -6,6 +6,40 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **The client hot path sheds its avoidable milliseconds** (plan 0033). What
+  you can see: streamed text now coalesces delta bursts and draws on the
+  existing 30 Hz tick instead of paying a full render per delta, the
+  transcript re-renders only what actually grew (a long answer no longer
+  re-wraps from the top on every delta), and `hotl` paints a live composer
+  immediately — session hydration (skills walk, sandbox probe, git
+  orientation) runs behind it, a prompt typed during that window fires the
+  moment the session opens, and the orientation's git reads run in parallel
+  under a 1.5s cap so a wedged repo can't hold the first turn hostage. What
+  you can't see: the projection stops deep-copying the whole history on
+  every commit (`Arc<Item>` elements), the Anthropic request body serializes
+  in one borrowed pass (byte-identical to the old builder, differentially
+  tested; the OpenAI dialects keep the old build for now — tracker #81), the
+  pre-anchor context estimate is an O(1) running sum instead of a per-char
+  walk of the session, the post-batch shadow-git snapshot no longer gates
+  the next sample, and prompt admission rides the same ticket pipeline as
+  every other commit, so the first request's build-and-send overlaps the
+  prompt's fsync instead of waiting behind it (gated off automatically for
+  `Sync` sessions, `UserPromptSubmit` hooks, and held steers). Per-phase
+  client spans now ride the `-p --json` stream (`ledger_report.phase_deltas`,
+  additive) and `scripts/ab-wallclock.sh` prints them — the before/after A/B
+  against a pre-0033 binary still needs a live-credential run and is owed.
+- **`cargo install hotl` now builds the same optimized binary the published
+  artifacts ship** (thin LTO, one codegen unit in the release profile) —
+  parity hygiene worth single-digit-% CPU, paid in build time, not runtime.
+
+Open question for a future release (0033 Task 8): the workspace-orientation
+item sits at durable index 1 with live `git status` inside it, which keeps a
+brand-new session in the same repo from reusing another session's cache
+prefix (resumes are unaffected). Moving it after the stable start items
+would warm new sessions at the price of prefix-layout churn now.
+
 ## [0.15.0] - 2026-08-14
 
 ### Changed
