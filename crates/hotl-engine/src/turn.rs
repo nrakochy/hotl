@@ -115,6 +115,9 @@ pub(crate) async fn run(
     // path from `drive` passes through here, cancellation and panic-free
     // errors included.
     let end = seal_end(end, turn.pipeline.drain().await);
+    // A detached post-batch snapshot must finish inside the turn: `TurnDone`
+    // (and any `hotl undo` after it) never races a half-taken snapshot.
+    turn.join_pending_snap().await;
     let usage = turn.usage;
     // Flush the ledger (§S1) on the existing event channel — never the
     // canon log — before telling the actor the turn is over.
@@ -737,6 +740,9 @@ struct Turn {
     /// The un-adopted next sample, when this turn dispatched one
     /// optimistically at the last boundary (§Causal groups (b)).
     speculative: Option<Speculation>,
+    /// A detached post-batch shadow snapshot still running (0033 Task 4) —
+    /// joined before the next snapshot and at turn end, never by a sample.
+    pending_snap: Option<tokio::task::JoinHandle<()>>,
     /// Items this turn committed since `last_snapshot` was granted, in
     /// commit order — the tail a speculative build predicts the next head
     /// will carry. Under leaf equality that prediction is exact, which is
@@ -805,6 +811,7 @@ impl Turn {
             pipeline: TicketPipeline::default(),
             head,
             speculative: None,
+            pending_snap: None,
             projected_tail: Vec::new(),
         }
     }
@@ -1239,7 +1246,8 @@ impl Turn {
                 .is_some_and(|t| t.read_only())
         });
         if mutating {
-            self.snap(format!("pre batch {}", self.samples)).await;
+            self.snap_awaited(format!("pre batch {}", self.samples))
+                .await;
         }
         let mut results = Vec::with_capacity(uses.len());
         let mut budget_blown: Option<String> = None;
@@ -1297,7 +1305,7 @@ impl Turn {
         // the next dispatch's doom check can tell repetition from polling.
         backfill_result_hashes(&mut self.call_sigs, &results);
         if mutating {
-            self.snap(format!("post batch {}", self.samples)).await;
+            self.snap_detached(format!("post batch {}", self.samples));
         }
         let cancelled = self.cancel.is_cancelled();
         let mut entries = vec![EntryPayload::Item {
@@ -1917,9 +1925,30 @@ impl Turn {
         })
     }
 
-    async fn snap(&self, label: String) {
+    /// Pre-batch: the restore point — must exist before any tool mutates, and
+    /// must not overlap a still-running post-snap (one shadow index).
+    async fn snap_awaited(&mut self, label: String) {
+        self.join_pending_snap().await;
         if let Some(snapshots) = &self.shared.snapshots {
             snapshots.snapshot(label).await;
+        }
+    }
+
+    /// Post-batch: capture-only — nothing in-session ever reads it (its one
+    /// consumer is the separate-process `hotl undo`), so it runs concurrently
+    /// with the next sample's dispatch instead of gating it.
+    fn snap_detached(&mut self, label: String) {
+        if let Some(snapshots) = &self.shared.snapshots {
+            self.pending_snap = Some(tokio::spawn(snapshots.snapshot(label)));
+        }
+    }
+
+    /// Joined before the next snapshot (one shadow index) and at turn end —
+    /// so `TurnDone`, and any human `hotl undo` after it, never races a
+    /// half-taken snapshot.
+    async fn join_pending_snap(&mut self) {
+        if let Some(handle) = self.pending_snap.take() {
+            let _ = handle.await;
         }
     }
 

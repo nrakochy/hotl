@@ -235,6 +235,9 @@ impl Shadow {
 
     fn git(&self, args: &[&str]) -> Option<std::process::Output> {
         Command::new("git")
+            // Global flag, before the subcommand: never take optional locks,
+            // so a concurrent `git status` on the same tree can't contend.
+            .arg("--no-optional-locks")
             .arg(format!("--git-dir={}", self.git_dir.display()))
             .arg(format!("--work-tree={}", self.work_tree.display()))
             .args(args)

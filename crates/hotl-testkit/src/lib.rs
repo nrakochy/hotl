@@ -158,6 +158,7 @@ impl Harness {
             false,
             None,
             system,
+            None,
         )
     }
 
@@ -318,6 +319,29 @@ impl Harness {
     /// `wrap`, when present, sits between the engine and the scripted
     /// provider: the harness keeps the `ScriptedProvider` for `requests()`
     /// and `push_script`, while the engine talks to the wrapper.
+    /// Construct a harness with a custom registry AND a custom `Snapshotter`
+    /// (0033 Task 4: detached post-batch snapshot scenarios need one whose
+    /// futures the test can hold open).
+    pub fn with_registry_and_snapshotter(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        registry: Registry,
+        snapshotter: Arc<dyn hotl_engine::Snapshotter>,
+    ) -> Self {
+        Self::build_wrapped_with_system(
+            scripts,
+            config,
+            Vec::new(),
+            None,
+            registry,
+            Rules::default(),
+            false,
+            None,
+            DEFAULT_TEST_SYSTEM,
+            Some(snapshotter),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn build_wrapped(
         scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
@@ -339,6 +363,7 @@ impl Harness {
             sync_noop,
             wrap,
             DEFAULT_TEST_SYSTEM,
+            None,
         )
     }
 
@@ -353,6 +378,7 @@ impl Harness {
         sync_noop: bool,
         wrap: Option<ProviderWrap>,
         system: &str,
+        snapshotter: Option<Arc<dyn hotl_engine::Snapshotter>>,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
@@ -385,7 +411,9 @@ impl Harness {
             log,
             system: system.into(),
             cwd: dir.path().to_path_buf(),
-            snapshots: Some(Arc::new(RecordingSnapshotter(snapshots.clone()))),
+            snapshots: Some(
+                snapshotter.unwrap_or_else(|| Arc::new(RecordingSnapshotter(snapshots.clone()))),
+            ),
             hooks,
             initial_items,
             initial_todos: Vec::new(),
