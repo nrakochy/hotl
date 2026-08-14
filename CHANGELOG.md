@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-14
+
 ### Changed
 
 - **hotl now works noticeably deeper per prompt on the same model.** On the
