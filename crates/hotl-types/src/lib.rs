@@ -35,6 +35,8 @@ pub enum SyntheticReason {
     Memory,
     SubdirInstructions,
     Todos,
+    /// Session-start environment facts (`<env …/>`, 0030 Task 6).
+    Environment,
     #[serde(other)]
     Unknown,
 }

@@ -466,7 +466,12 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
             scaffold.clock.now_ms(),
         );
     }
-    let mut items = initial_items(&scaffold.config_dir, &scaffold.cwd);
+    let mut items = initial_items(
+        &scaffold.config_dir,
+        &scaffold.cwd,
+        &scaffold.model,
+        &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
+    );
     items.push(crate::structured::contract_item(&schema));
     record_fresh_seed(&mut log, &items, scaffold.clock.now_ms());
     let session_id = log.session_id.clone();
@@ -703,8 +708,7 @@ pub(crate) async fn build_acp() -> Result<
             .to_string();
         let plan = plan_override.unwrap_or_else(|| scaffold.rules.plan());
         let session_id = log.session_id.clone();
-        let (snapshots, initial) =
-            session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &resumed);
+        let (snapshots, initial) = session_context(&session_id, &scaffold, &resumed);
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
         }
@@ -810,8 +814,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         );
     }
     let session_id = log.session_id.clone();
-    let (snapshots, initial_items) =
-        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &None);
+    let (snapshots, initial_items) = session_context(&session_id, &scaffold, &None);
     record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
     let handle = spawn_interactive_session(
         (*scaffold.registry).clone(),
@@ -1163,8 +1166,7 @@ async fn run_session(
                                                                     // instructions are already items 0..k of it, so re-injecting them would
                                                                     // both duplicate the content and rewrite the very prefix the fork exists
                                                                     // to reuse (D-A6).
-    let (snapshots, initial_items) =
-        session_context(&session_id, &scaffold.cwd, &scaffold.config_dir, &lineage);
+    let (snapshots, initial_items) = session_context(&session_id, &scaffold, &lineage);
     if lineage.is_none() {
         record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
     }
@@ -1889,20 +1891,24 @@ fn child_builder(
 /// and instructions); fresh sessions assemble anew.
 fn session_context(
     session_id: &str,
-    cwd: &std::path::Path,
-    config_dir: &std::path::Path,
+    scaffold: &Scaffold,
     resumed: &Option<Resumed>,
 ) -> (
     Option<Arc<dyn hotl_engine::Snapshotter>>,
     Vec<hotl_types::Item>,
 ) {
-    let snapshots = shadow_snapshotter(session_id, cwd);
+    let snapshots = shadow_snapshotter(session_id, &scaffold.cwd);
     if snapshots.is_none() {
         eprintln!("hotl: git not found — `hotl undo` snapshots disabled this session");
     }
     let items = match resumed {
         Some(r) => r.items.clone(),
-        None => initial_items(config_dir, cwd),
+        None => initial_items(
+            &scaffold.config_dir,
+            &scaffold.cwd,
+            &scaffold.model,
+            &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
+        ),
     };
     (snapshots, items)
 }
@@ -2507,9 +2513,15 @@ fn spawn_secret_audit(current_log: PathBuf) {
     });
 }
 
-/// Session-start context: user memory (M2), then project instructions.
-fn initial_items(config_dir: &std::path::Path, cwd: &std::path::Path) -> Vec<hotl_types::Item> {
-    let mut items = Vec::new();
+/// Session-start context: environment facts (0030), user memory (M2), then
+/// project instructions.
+fn initial_items(
+    config_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    model: &str,
+    date: &str,
+) -> Vec<hotl_types::Item> {
+    let mut items = vec![hotl_context::environment(cwd, model, date)];
     if let Some(memory) = load_memory(config_dir) {
         items.push(memory);
     }
@@ -4593,6 +4605,20 @@ mod tests {
             engine_config("m", &MapSecrets::default(), &config_from_toml("")).max_turns,
             100
         );
+    }
+
+    #[test]
+    fn env_block_rides_first_in_session_context() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        std::fs::write(cwd.path().join("AGENTS.md"), "repo rules").unwrap();
+        let items = initial_items(config_dir.path(), cwd.path(), "m", "2026-08-14");
+        let hotl_types::Item::User { text, .. } = &items[0] else {
+            panic!("first item is the env block");
+        };
+        assert!(text.contains("<env platform=") && text.contains("is_git_repo="));
+        // Instructions still load, after it.
+        assert!(items.len() > 1);
     }
 
     #[test]

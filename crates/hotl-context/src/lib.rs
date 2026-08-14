@@ -90,6 +90,38 @@ pub fn project_instructions(cwd: &Path) -> Option<Item> {
     None
 }
 
+/// Session-start environment facts (0030): harness-authored, so no untrusted
+/// envelope. Byte-stable for the session — computed once, never per-sample.
+pub fn environment(cwd: &Path, model: &str, date: &str) -> Item {
+    let is_git = cwd.join(".git").exists();
+    Item::User {
+        text: format!(
+            "<env platform=\"{}\" arch=\"{}\" is_git_repo=\"{is_git}\" \
+             model=\"{model}\" date=\"{date}\"/>",
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+        ),
+        synthetic: Some(SyntheticReason::Environment),
+        images: Vec::new(),
+    }
+}
+
+/// `YYYY-MM-DD` (UTC) from unix millis — Hinnant's `civil_from_days`, the
+/// inverse of the provider crate's `days_from_civil`; a few lines of std
+/// instead of a date crate for one attribute.
+pub fn civil_date_utc(unix_ms: u64) -> String {
+    let z = (unix_ms / 86_400_000) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // Mar = 0
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Auto-memory (M2): `<config>/memory/MEMORY.md`, budget-capped, enveloped.
 /// Owner-authored, but it still rides in the envelope — memory files quote
 /// repo content and past sessions, so the same defense applies.
@@ -197,6 +229,40 @@ pub fn defang(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn environment_reports_git_state_and_carries_no_envelope() {
+        let dir = tempfile_dir("envblock");
+        let Item::User {
+            text, synthetic, ..
+        } = environment(&dir, "claude-opus-4-8", "2026-08-14")
+        else {
+            panic!()
+        };
+        assert_eq!(synthetic, Some(SyntheticReason::Environment));
+        assert!(text.contains("<env platform=\""));
+        assert!(text.contains("is_git_repo=\"false\""));
+        assert!(text.contains("model=\"claude-opus-4-8\""));
+        assert!(text.contains("date=\"2026-08-14\""));
+        // Harness-authored: never wrapped in the untrusted envelope.
+        assert!(!text.contains("trust=\"untrusted\""));
+
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        let Item::User { text, .. } = environment(&dir, "m", "2026-08-14") else {
+            panic!()
+        };
+        assert!(text.contains("is_git_repo=\"true\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn civil_date_utc_matches_known_dates() {
+        assert_eq!(civil_date_utc(0), "1970-01-01");
+        // 2026-08-14 00:00:00 UTC; leap-day and end-of-year boundaries.
+        assert_eq!(civil_date_utc(1_786_665_600_000), "2026-08-14");
+        assert_eq!(civil_date_utc(1_709_164_800_000), "2024-02-29");
+        assert_eq!(civil_date_utc(1_735_689_599_000), "2024-12-31");
+    }
 
     #[test]
     fn envelope_wraps_and_tags() {
