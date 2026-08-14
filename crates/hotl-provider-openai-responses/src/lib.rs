@@ -20,14 +20,25 @@
 //! `reasoning` in turn (`hotl_provider::transform::strip_foreign_reasoning`
 //! and the Anthropic converter's own filter).
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use futures_util::stream::BoxStream;
+use futures_util::StreamExt;
+use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{
-    Effort, EffortLadder, ProviderError, SamplingRequest, SseAssembler, StreamEvent, ToolDef,
-    ALL_EFFORTS,
+    ArmGuard, Effort, EffortLadder, Provider, ProviderError, SamplingRequest, SseAssembler,
+    StreamEvent, ToolDef, Warmable, ALL_EFFORTS,
 };
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+
+/// §S3.2: bounds the warm request end-to-end, independent of (and shorter
+/// than) the client's own `connect_timeout` — see the twin constant in
+/// `hotl-provider-anthropic` for the full rationale.
+const ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Marks a failed tool result in the Responses dialect.
 ///
@@ -641,6 +652,294 @@ impl ResponsesAssembler {
     }
 }
 
+/// The one client constructor. A default `reqwest` client has no connect
+/// timeout, no read timeout, and no keepalive; T1-4 traces a wedged session
+/// straight back to it.
+///
+/// `expect` rather than a fallback to a default client on purpose: T3-12 found
+/// exactly that fallback silently discarding a redirect policy and a timeout
+/// elsewhere in the tree. A client that cannot be built with these options is
+/// a broken TLS backend, and shipping an unbounded client instead is worse
+/// than failing loudly at construction.
+fn http_client(connect: std::time::Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(connect)
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        // §S3.2: an HTTP/2 ping every 15s, even while the connection is
+        // otherwise idle, keeps a pooled connection alive across a human's
+        // multi-minute pause instead of it being reclaimed and re-paying
+        // DNS+TCP+TLS on the next sample.
+        .http2_keep_alive_interval(std::time::Duration::from_secs(15))
+        .http2_keep_alive_while_idle(true)
+        .build()
+        .expect("reqwest client with timeouts (TLS backend unavailable?)")
+}
+
+pub struct OpenAiResponsesProvider {
+    client: reqwest::Client,
+    base_url: String,
+    key_source: Arc<dyn KeySource>,
+    headers_timeout: std::time::Duration,
+    stream_idle_timeout: std::time::Duration,
+    /// §S3.2 idempotency: `0` when idle, else the generation token of the
+    /// in-flight warm request — see the twin field in
+    /// `hotl-provider-anthropic` for the full rationale.
+    armed: Arc<AtomicU64>,
+}
+
+impl OpenAiResponsesProvider {
+    pub fn new(base_url: String, key_source: Arc<dyn KeySource>) -> Self {
+        Self {
+            client: http_client(hotl_provider::timeouts::CONNECT),
+            base_url,
+            key_source,
+            headers_timeout: hotl_provider::timeouts::HEADERS,
+            stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
+            armed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// The Responses endpoint for this provider's base URL. Shared by
+    /// `stream()` and the §S3.2 warm request so the two can never disagree
+    /// about where the connection pool's origin is — the twin of
+    /// `completions_url` in `hotl-provider-openai`.
+    fn responses_url(&self) -> String {
+        format!("{}/responses", self.base_url.trim_end_matches('/'))
+    }
+
+    /// Override the defaults (a slow local endpoint, or a test that wants a
+    /// short bound). `connect` rebuilds the client.
+    pub fn with_timeouts(
+        mut self,
+        connect: std::time::Duration,
+        headers: std::time::Duration,
+        stream_idle: std::time::Duration,
+    ) -> Self {
+        self.client = http_client(connect);
+        self.headers_timeout = headers;
+        self.stream_idle_timeout = stream_idle;
+        self
+    }
+}
+
+/// One send attempt, classified. Keeps the stream generator small while
+/// letting it yield `Retrying` events live (during the backoff, not after).
+enum Attempt {
+    Ok(reqwest::Response),
+    Retry {
+        reason: String,
+        wait: std::time::Duration,
+    },
+    Fail(ProviderError),
+}
+
+fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
+    match hotl_provider::retry::classify(&err, attempt) {
+        hotl_provider::retry::Decision::Retry { delay } => Attempt::Retry {
+            reason,
+            wait: hotl_provider::retry::with_jitter(delay),
+        },
+        hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
+    }
+}
+
+async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
+    if resp.status().is_success() {
+        return Attempt::Ok(resp);
+    }
+    let status = resp.status().as_u16();
+    let retry_after = resp
+        .headers()
+        .get("retry-after")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| hotl_provider::retry::parse_retry_after(v, hotl_provider::retry::now_unix()));
+    // Read the error class before the body consumes the response.
+    let error_type = resp
+        .headers()
+        .get("x-amzn-errortype")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
+    let body = resp.text().await.unwrap_or_default();
+    let message = hotl_provider::api_error::detail(error_type.as_deref(), &body);
+    if status == 401 || status == 403 {
+        return Attempt::Fail(ProviderError::Auth(message));
+    }
+    let err = ProviderError::Http {
+        status,
+        message,
+        retry_after,
+    };
+    classify_send(err, attempt, format!("HTTP {status}"))
+}
+
+async fn send_attempt(
+    client: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    body: &Value,
+    attempt: u32,
+) -> Attempt {
+    let mut builder = client
+        .post(url)
+        .header("content-type", "application/json")
+        .json(body);
+    if let Some(key) = api_key {
+        builder = builder.bearer_auth(key);
+    }
+    match builder.send().await {
+        Ok(resp) => classify_response(resp, attempt).await,
+        Err(e) => {
+            let reason = e.to_string();
+            classify_send(ProviderError::Transport(reason.clone()), attempt, reason)
+        }
+    }
+}
+
+/// Process-wide source of `spawn_arm` generation tokens (§S3.2) — see the
+/// twin static in `hotl-provider-anthropic` for the full rationale.
+static NEXT_ARM_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+/// §S3.2: fire one lightweight, credential-free GET at `url` to populate
+/// `client`'s connection pool. See the twin function in
+/// `hotl-provider-anthropic` for the full rationale — kept duplicated rather
+/// than shared, matching the dialect crates' existing convention (compare
+/// `http_client`, `classify_send`, `send_attempt` above).
+fn spawn_arm(client: reqwest::Client, url: String, armed: Arc<AtomicU64>) -> ArmGuard {
+    if armed.load(Ordering::Acquire) != 0 {
+        return ArmGuard::noop();
+    }
+    let token = NEXT_ARM_TOKEN.fetch_add(1, Ordering::Relaxed);
+    if armed
+        .compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return ArmGuard::noop();
+    }
+    let task_flag = armed.clone();
+    let handle = tokio::spawn(async move {
+        let _ = tokio::time::timeout(ARM_TIMEOUT, client.get(&url).send()).await;
+        let _ = task_flag.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+    });
+    let cancel_flag = armed;
+    ArmGuard::new(move || {
+        handle.abort();
+        let _ = cancel_flag.compare_exchange(token, 0, Ordering::AcqRel, Ordering::Acquire);
+    })
+}
+
+impl Warmable for OpenAiResponsesProvider {
+    fn arm(&self) -> ArmGuard {
+        spawn_arm(
+            self.client.clone(),
+            self.responses_url(),
+            self.armed.clone(),
+        )
+    }
+}
+
+impl Provider for OpenAiResponsesProvider {
+    fn arm(&self) -> ArmGuard {
+        <Self as Warmable>::arm(self)
+    }
+
+    /// The chat dialect's stream loop minus the legacy-max-tokens probe:
+    /// this dialect has no pre-2024 spelling to fall back to, so the body is
+    /// rendered exactly once.
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        let client = self.client.clone();
+        let url = self.responses_url();
+        let source = self.key_source.clone();
+        let headers_timeout = self.headers_timeout;
+        let stream_idle_timeout = self.stream_idle_timeout;
+        let body = body_for(&req);
+
+        Box::pin(async_stream::stream! {
+            // INVARIANT (T2-16): `attempt` counts network/HTTP attempts only.
+            // An auth refresh is a separate, once-per-request budget owned by
+            // `AuthRetry`, so a 401 → refresh → 429 sequence still has its
+            // full retry allowance.
+            let mut attempts_used: u32 = 0;
+            let mut auth_retry = AuthRetry::default();
+            let response = loop {
+                let attempt = attempts_used + 1;
+                let key = match source.get().await {
+                    Ok(k) => k,
+                    Err(e) => {
+                        yield Err(ProviderError::Auth(e.0));
+                        return;
+                    }
+                };
+                let sent = tokio::time::timeout(
+                    headers_timeout,
+                    send_attempt(&client, &url, key.as_deref(), &body, attempt),
+                )
+                .await;
+                let outcome = match sent {
+                    Ok(a) => a,
+                    // A timed-out attempt is retryable, not terminal.
+                    Err(_) => classify_send(
+                        ProviderError::Transport(format!(
+                            "no response headers within {}s",
+                            headers_timeout.as_secs()
+                        )),
+                        attempt,
+                        "response header timeout".into(),
+                    ),
+                };
+                match outcome {
+                    Attempt::Ok(resp) => break resp,
+                    Attempt::Retry { reason, wait } => {
+                        attempts_used = attempt;
+                        yield Ok(StreamEvent::Retrying { attempt, reason });
+                        tokio::time::sleep(wait).await;
+                    }
+                    Attempt::Fail(ProviderError::Auth(msg)) => {
+                        // attempts_used deliberately unchanged.
+                        match auth_retry.on_auth_error(source.refreshable()) {
+                            AuthAction::RefreshAndRetry => match source.refresh().await {
+                                Ok(()) => {
+                                    yield Ok(StreamEvent::Retrying {
+                                        attempt,
+                                        reason: "auth failed — re-running api_key_helper".into(),
+                                    });
+                                }
+                                Err(ke) => {
+                                    yield Err(ProviderError::Auth(format!(
+                                        "{msg} (key refresh also failed: {ke})"
+                                    )));
+                                    return;
+                                }
+                            },
+                            AuthAction::Surface => {
+                                yield Err(ProviderError::Auth(msg));
+                                return;
+                            }
+                        }
+                    }
+                    Attempt::Fail(e) => {
+                        yield Err(e);
+                        return;
+                    }
+                }
+            };
+            yield Ok(StreamEvent::Started);
+            let inner = hotl_provider::drive_sse(
+                response.bytes_stream(),
+                ResponsesAssembler::default(),
+                stream_idle_timeout,
+            );
+            futures_util::pin_mut!(inner);
+            while let Some(ev) = inner.next().await {
+                yield ev;
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1242,5 +1541,384 @@ mod tests {
         };
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["text"], "hi");
+    }
+
+    // ───────────────────────── HTTP level ─────────────────────────
+
+    use std::sync::Mutex as StdMutex;
+
+    use futures_util::future::BoxFuture;
+    use hotl_provider::key::{KeyError, KeySource};
+
+    /// Key source yielding key-1, then key-2 after refresh.
+    struct FlippingKey(StdMutex<u32>);
+    impl KeySource for FlippingKey {
+        fn get(&self) -> BoxFuture<'_, Result<Option<String>, KeyError>> {
+            let n = *self.0.lock().unwrap();
+            Box::pin(async move { Ok(Some(format!("key-{n}"))) })
+        }
+        fn refresh(&self) -> BoxFuture<'_, Result<(), KeyError>> {
+            *self.0.lock().unwrap() += 1;
+            Box::pin(async { Ok(()) })
+        }
+        fn refreshable(&self) -> bool {
+            true
+        }
+    }
+
+    const SSE_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+    const AUTH_401: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad api key";
+
+    /// Serve `responses` to consecutive connections; record each request's
+    /// `authorization` header (lowercased) into `seen`.
+    async fn tcp_double(responses: Vec<&'static str>, seen: Arc<StdMutex<Vec<String>>>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut req = String::new();
+                loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if req.contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let auth = req
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|l| l.split_once(':').unwrap().1.trim().to_string())
+                    .unwrap_or_default();
+                seen.lock().unwrap().push(auth);
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.shutdown().await.ok();
+            }
+        });
+        base
+    }
+
+    /// Sibling of [`tcp_double`] that records each **whole request** — head
+    /// and body — rather than just the auth header: read to the header
+    /// break, take `content-length`, then read exactly that many more bytes.
+    /// (The chat-dialect twin records the body alone; this dialect's tests
+    /// also assert on the request path, so the head is kept.)
+    async fn tcp_double_requests(
+        responses: Vec<&'static str>,
+        seen: Arc<StdMutex<Vec<String>>>,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for resp in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 65536];
+                let mut req = Vec::new();
+                let head_end = loop {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    req.extend_from_slice(&buf[..n]);
+                    if let Some(p) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break p + 4;
+                    }
+                };
+                let head = String::from_utf8_lossy(&req[..head_end]).to_string();
+                let len: usize = head
+                    .lines()
+                    .find(|l| l.to_ascii_lowercase().starts_with("content-length:"))
+                    .and_then(|l| l.split_once(':'))
+                    .and_then(|(_, v)| v.trim().parse().ok())
+                    .unwrap_or(0);
+                while req.len() < head_end + len {
+                    let n = sock.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..n]);
+                }
+                seen.lock()
+                    .unwrap()
+                    .push(String::from_utf8_lossy(&req).to_string());
+                sock.write_all(resp.as_bytes()).await.unwrap();
+                sock.shutdown().await.ok();
+            }
+        });
+        base
+    }
+
+    /// The success path over HTTP: the event sequence a consumer actually
+    /// sees, including the per-item `BlockEnd` (T3-14).
+    #[tokio::test]
+    async fn a_successful_stream_yields_the_full_event_sequence() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![SSE_OK], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        let oks: Vec<_> = events.into_iter().map(|e| e.expect("no error")).collect();
+        assert!(matches!(oks[0], StreamEvent::Started));
+        assert!(oks
+            .iter()
+            .any(|e| matches!(e, StreamEvent::BlockStart { index: 0, .. })));
+        assert!(oks
+            .iter()
+            .any(|e| matches!(e, StreamEvent::TextDelta { text, .. } if text == "hi")));
+        assert!(
+            oks.iter()
+                .any(|e| matches!(e, StreamEvent::BlockEnd { index: 0 })),
+            "T3-14: every dialect closes its blocks"
+        );
+        let Some(StreamEvent::Completed {
+            stop,
+            usage,
+            blocks,
+        }) = oks.last()
+        else {
+            panic!("no terminal event: {oks:?}")
+        };
+        assert_eq!(*stop, StopReason::EndTurn);
+        assert_eq!(usage.input_tokens, 1);
+        assert_eq!(blocks[0]["text"], "hi");
+    }
+
+    /// The Responses twin of the retry test.
+    #[tokio::test]
+    async fn a_429_is_retried_over_a_real_socket() {
+        const RETRY_429: &str = "HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/plain\r\nretry-after: 0\r\ncontent-length: 5\r\nconnection: close\r\n\r\nslow!";
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![RETRY_429, SSE_OK], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        assert_eq!(seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn auth_401_refreshes_key_once_and_retries() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![AUTH_401, SSE_OK], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(base, Arc::new(FlippingKey(StdMutex::new(1))));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(
+            events.iter().all(|e| e.is_ok()),
+            "no error expected: {events:?}"
+        );
+        assert_eq!(*seen.lock().unwrap(), vec!["Bearer key-1", "Bearer key-2"]);
+    }
+
+    #[tokio::test]
+    async fn static_source_auth_401_surfaces_immediately() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![AUTH_401], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(
+            base,
+            Arc::new(hotl_provider::key::StaticKey(Some("sk".into()))),
+        );
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(matches!(events.last(), Some(Err(ProviderError::Auth(_)))));
+        assert_eq!(seen.lock().unwrap().len(), 1); // exactly one request — no blind retry
+    }
+
+    /// The unterminated-final-line case at the HTTP layer: a server that
+    /// closes the socket right after its last `data:` line still produces a
+    /// complete response.
+    #[tokio::test]
+    async fn a_stream_ending_without_a_trailing_newline_still_completes() {
+        const SSE_NO_TRAILING_NEWLINE: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"message\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"output_index\":0,\"delta\":\"hi\"}\n\ndata: {\"type\":\"response.completed\",\"response\":{}}";
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![SSE_NO_TRAILING_NEWLINE], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(
+            matches!(events.last(), Some(Ok(StreamEvent::Completed { .. }))),
+            "the terminal event was dropped with the unterminated line: {events:?}"
+        );
+    }
+
+    /// The wire says what the dialect promises: the request hits
+    /// `…/responses` (not `…/chat/completions`) and the body carries
+    /// `"store":false` on every request.
+    #[tokio::test]
+    async fn the_request_hits_the_responses_endpoint_with_store_false() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double_requests(vec![SSE_OK], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
+        let reqs = seen.lock().unwrap().clone();
+        assert_eq!(reqs.len(), 1);
+        assert!(
+            reqs[0].starts_with("POST /v1/responses "),
+            "wrong path: {}",
+            reqs[0].lines().next().unwrap_or_default()
+        );
+        assert!(reqs[0].contains("\"store\":false"), "{}", reqs[0]);
+        assert!(!reqs[0].contains("chat/completions"));
+    }
+
+    /// §S3.2: the HTTP/2 keep-alive knobs must ride the same builder as the
+    /// existing timeouts.
+    #[test]
+    fn the_client_enables_http2_keep_alive() {
+        let src = include_str!("lib.rs");
+        assert!(src.contains("http2_keep_alive_interval"));
+        assert!(src.contains("http2_keep_alive_while_idle"));
+    }
+
+    /// INVARIANT (T1-4): the HTTP client is never the default one.
+    /// `Client::new()` has no connect timeout, so a stalled TLS handshake
+    /// hangs the session forever and Ctrl-C cannot reach it.
+    #[test]
+    fn the_client_is_built_with_timeouts() {
+        let src = include_str!("lib.rs");
+        // Split so this test's own source is not a match for itself.
+        assert!(
+            !src.contains(concat!("reqwest::Client", "::new()")),
+            "use http_client(); a default reqwest client has no timeout of any kind"
+        );
+        assert!(src.contains("connect_timeout"));
+    }
+
+    /// §S3.2 unit: dropping an armed guard resets "currently arming" state
+    /// synchronously.
+    #[tokio::test]
+    async fn spawn_arm_drop_resets_the_armed_flag_immediately() {
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            "http://192.0.2.1/".into(),
+            armed.clone(),
+        );
+        assert_ne!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "arm() must mark the provider as arming"
+        );
+        drop(guard);
+        assert_eq!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "drop must reset armed state immediately — not wait for the background \
+             task or its internal timeout"
+        );
+    }
+
+    /// §S3.2 unit: a second `arm()` while the first is still armed is a
+    /// no-op — dropping it must not disturb the still-live first guard's
+    /// state.
+    #[tokio::test]
+    async fn spawn_arm_second_call_while_armed_is_a_noop() {
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client = http_client(std::time::Duration::from_secs(1));
+        let g1 = spawn_arm(client.clone(), "http://192.0.2.1/".into(), armed.clone());
+        let before = armed.load(std::sync::atomic::Ordering::Acquire);
+        let g2 = spawn_arm(client, "http://192.0.2.1/".into(), armed.clone());
+        drop(g2);
+        assert_eq!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            before,
+            "a no-op re-arm's drop must not reset state owned by the still-live first guard"
+        );
+        drop(g1);
+        assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    /// §S3.2 unit: arming against a refused-connection target must not
+    /// panic and must not leak its background task.
+    #[tokio::test]
+    async fn spawn_arm_against_a_refused_target_does_not_leak_its_task() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            format!("http://{addr}/"),
+            armed.clone(),
+        );
+        // Windows refuses a connection to a dropped-listener port slowly, so
+        // bound this well above ARM_TIMEOUT rather than at 1s (as the sibling
+        // black-holed test already does).
+        tokio::time::timeout(ARM_TIMEOUT + std::time::Duration::from_secs(3), async {
+            while armed.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("a refused warm request must not leak its background task");
+        drop(guard);
+    }
+
+    /// §S3.2 unit: a target that never answers (RFC 5737 TEST-NET-1) must
+    /// still be bounded by the internal arm timeout.
+    #[tokio::test]
+    async fn spawn_arm_against_a_black_holed_target_is_bounded_by_the_arm_timeout() {
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let guard = spawn_arm(
+            http_client(std::time::Duration::from_secs(1)),
+            "http://192.0.2.1/".into(),
+            armed.clone(),
+        );
+        tokio::time::timeout(ARM_TIMEOUT + std::time::Duration::from_secs(3), async {
+            while armed.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a black-holed target must not hang past the internal arm timeout");
+        drop(guard);
+    }
+
+    /// §S3.2 unit: a guard whose own warm request already finished must not
+    /// clobber a later, still-in-flight arm when dropped late. See the twin
+    /// test in `hotl-provider-anthropic` for the full rationale.
+    #[tokio::test]
+    async fn a_late_dropped_stale_guard_does_not_clobber_a_newer_arm() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let armed = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let client = http_client(std::time::Duration::from_secs(1));
+        let g1 = spawn_arm(client.clone(), format!("http://{addr}/"), armed.clone());
+        // Windows refuses a connection to a dropped-listener port slowly, so
+        // bound this well above ARM_TIMEOUT rather than at 1s (as the sibling
+        // black-holed test already does).
+        tokio::time::timeout(ARM_TIMEOUT + std::time::Duration::from_secs(3), async {
+            while armed.load(std::sync::atomic::Ordering::Acquire) != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("g1's task must finish on its own before we proceed");
+        let g2 = spawn_arm(client, "http://192.0.2.1/".into(), armed.clone());
+        assert_ne!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "g2 must be in flight"
+        );
+        drop(g1);
+        assert_ne!(
+            armed.load(std::sync::atomic::Ordering::Acquire),
+            0,
+            "dropping the stale g1 must not clobber g2's still-in-flight state"
+        );
+        drop(g2);
+        assert_eq!(armed.load(std::sync::atomic::Ordering::Acquire), 0);
+    }
+
+    /// The public wiring: `Provider::arm` must reach the same `Warmable`
+    /// impl this crate defines.
+    #[tokio::test]
+    async fn provider_arm_reaches_the_warmable_impl_without_panicking() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let p = OpenAiResponsesProvider::new(
+            format!("http://{addr}"),
+            Arc::new(hotl_provider::key::StaticKey(None)),
+        );
+        let guard = Provider::arm(&p);
+        drop(guard);
     }
 }
