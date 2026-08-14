@@ -762,6 +762,32 @@ async fn edit_in(
 /// `between` runs after the match and before the write-back — the window an
 /// external writer would land in. Production passes a no-op; the test seam
 /// passes a real mutation.
+/// Show the edited region in its new form (±3 lines, capped) so the model can
+/// verify the splice without a follow-up read — a re-read is a whole sample.
+const SNIPPET_CONTEXT_LINES: usize = 3;
+const SNIPPET_MAX_LINES: usize = 40;
+
+pub(crate) fn result_snippet(updated: &str, splice_start: usize, splice_end: usize) -> String {
+    let first = updated[..splice_start].matches('\n').count();
+    let last = updated[..splice_end.min(updated.len())]
+        .matches('\n')
+        .count();
+    let from = first.saturating_sub(SNIPPET_CONTEXT_LINES);
+    let to = last + SNIPPET_CONTEXT_LINES;
+    let mut out = String::from("\n→ result:\n");
+    for (i, line) in updated.lines().enumerate().skip(from) {
+        if i > to {
+            break;
+        }
+        if i - from >= SNIPPET_MAX_LINES {
+            out.push_str("     … snippet capped\n");
+            break;
+        }
+        out.push_str(&format!("{:>6} {line}\n", i + 1));
+    }
+    out
+}
+
 async fn edit_with_hook(
     root: &std::path::Path,
     extras: &[std::path::PathBuf],
@@ -834,7 +860,8 @@ async fn edit_with_hook(
             } else {
                 " (whitespace-tolerant match; the file's indentation was preserved)"
             };
-            Ok(ToolOutcome::ok(format!("Edited {path}.{note}")))
+            let snippet = result_snippet(&updated, start, start + spliced.len());
+            Ok(ToolOutcome::ok(format!("Edited {path}.{note}{snippet}")))
         }
     }
 }
@@ -2639,6 +2666,40 @@ mod tests {
             json!({"command": "sleep 5", "timeout_ms": 200}),
         );
         assert!(t.is_error && t.content.contains("timed out"));
+    }
+
+    #[test]
+    fn result_snippet_windows_and_numbers_the_spliced_region() {
+        let doc = (1..=10)
+            .map(|i| format!("line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // Splice exactly line 5's text.
+        let start = doc.find("line-05").unwrap();
+        let end = start + "line-05".len();
+        let snip = result_snippet(&doc, start, end);
+        assert!(snip.starts_with("\n→ result:\n"), "{snip}");
+        // ±3 lines of context: 2..=8, 1-based numbering.
+        assert!(snip.contains("     2 line-02"), "{snip}");
+        assert!(snip.contains("     5 line-05"), "{snip}");
+        assert!(snip.contains("     8 line-08"), "{snip}");
+        assert!(!snip.contains("line-01"), "{snip}");
+        assert!(!snip.contains("line-09"), "{snip}");
+    }
+
+    #[test]
+    fn result_snippet_caps_a_giant_splice() {
+        let doc = (1..=200)
+            .map(|i| format!("row-{i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let snip = result_snippet(&doc, 0, doc.len());
+        let numbered = snip
+            .lines()
+            .filter(|l| l.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+            .count();
+        assert_eq!(numbered, SNIPPET_MAX_LINES, "{snip}");
+        assert!(snip.contains("… snippet capped"), "{snip}");
     }
 
     #[test]

@@ -259,9 +259,12 @@ mod enabled {
             )));
         }
         builtins::write_guarded(root, &target, path, updated.as_bytes())?;
+        // Same evidence as the plain edit (0032): the source-form splice, so
+        // verifying an edit made through the minified view costs no re-read.
+        let snippet = builtins::result_snippet(&updated, src_start, src_start + new.len());
         Ok(ToolOutcome::ok(format!(
             "Edited {path} (minified match projected to source bytes; the file's formatting was \
-             preserved)."
+             preserved).{snippet}"
         )))
     }
 
