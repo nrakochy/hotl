@@ -6,8 +6,41 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **hotl now works noticeably deeper per prompt on the same model.** On the
+  default Anthropic models, sessions had been producing fewer agent steps and
+  shallower work than other harnesses give the identical model — not one bug
+  but a stack of defaults that all leaned toward stopping early. All of them
+  flipped: the default system prompt now carries the persistence, tool-choice,
+  todo-discipline, and verify-before-done guidance Opus-class models are tuned
+  to expect (your `~/.config/hotl/system-prompt.md` override still wins);
+  unconfigured sessions on catalogued Anthropic models with effort support run
+  at `xhigh` (Haiku and every uncatalogued model keep the provider default,
+  and `/effort`/`HOTL_EFFORT`/`[provider] effort` still override); the
+  context-fullness percentage is no longer broadcast to the model each sample
+  (it measurably induces premature wrap-up — opt back in with `[context]
+  show_used_pct = true`); the per-sample output cap doubled to 64K tokens and
+  became configurable (`[provider] max_tokens` / `HOTL_MAX_TOKENS`, always
+  clamped to the model's catalogued maximum); and tool descriptions steer
+  proactively instead of listing caps, with the shrinking `<retry
+  attempts_left>` countdown on failed tools replaced by a single last-chance
+  hint. Each lever reverts independently without rebuilding if you preferred
+  the old behavior.
+- **A bare `/effort` (and `/status`) now reports the effort the session
+  actually runs at** — `effort xhigh (default)` when the seeded default
+  governs — instead of the word "default". Note the asymmetry `/effort
+  default` creates on purpose: clearing selects the *provider's* own default
+  (`high` on Anthropic today), not the `xhigh` session default, and the clear
+  notice says so.
+
 ### Added
 
+- **The model now knows where it is running.** A byte-stable `<env platform
+  arch is_git_repo model date/>` block rides first in session-start context,
+  so the model can pick GNU vs BSD flag spellings, reach for git only where
+  there is a repo, and date-stamp what it writes — facts that previously
+  never crossed the wire.
 - **A third provider dialect: `HOTL_MODEL=openai-responses/<model>` speaks
   the OpenAI Responses API.** OpenAI's current reasoning models refuse
   `reasoning_effort` next to function tools on `/v1/chat/completions`
@@ -27,6 +60,21 @@ semver promise of their own.
 
 ### Fixed
 
+- **A response truncated at the output-token cap is no longer silently
+  accepted as the answer.** The turn loop now recognizes the truncation stop
+  reason: complete tool calls still run, otherwise the model is told it was
+  cut off and asked to continue (bounded at three continues per prompt,
+  surviving compaction folds); a truncated trailing thinking block is pruned
+  before it can poison the next request. Server-side `pause_turn` similarly
+  resumes instead of ending the turn.
+- **Legitimate polling no longer trips the doom-loop brake.** Three identical
+  tool calls only end the turn when their results were also identical — "same
+  call, same answer, no progress". Repeating a status check whose output
+  keeps changing is now recognized as progress; a genuine no-progress loop
+  still stops, at most one round-trip later than before.
+- **The OpenAI-compatible dialect no longer sends `reasoning_effort` values
+  real servers reject** — `xhigh`/`max` clamp to `high` on that wire (the
+  `openai-responses/` dialect keeps all five rungs).
 - **Quitting no longer needs a second ctrl-c after a bash descendant escaped
   its process group.** A command whose descendant left the process group (a
   daemonizing tool: gpg-agent, an ssh ControlMaster, sccache, …) keeps the
