@@ -6,6 +6,25 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **A third provider dialect: `HOTL_MODEL=openai-responses/<model>` speaks
+  the OpenAI Responses API.** OpenAI's current reasoning models refuse
+  `reasoning_effort` next to function tools on `/v1/chat/completions`
+  ("Please use /v1/responses instead"), and every hotl request carries tools
+  — so setting an effort level on them was a dead end. The new dialect fixes
+  exactly that: it reuses the `openai/` door's configuration untouched
+  (`OPENAI_API_KEY`, `HOTL_OPENAI_BASE_URL`, the api-key helper, both auth
+  modes), maps all five effort rungs 1:1, streams reasoning summaries live
+  as thinking, and replays encrypted reasoning items verbatim so multi-step
+  tool loops hold with `store: false` on every request — nothing is kept
+  server-side. `openai/` stays the documented door for every
+  OpenAI-compatible endpoint, and the one 400 the new dialect fixes now
+  carries a hint naming `HOTL_MODEL=openai-responses/<model>`. Reasoning
+  items never leak across dialects: the other two providers drop them from
+  replayed history, exactly as signed Claude thinking never crosses the
+  other way.
+
 ### Fixed
 
 - **Quitting no longer needs a second ctrl-c after a bash descendant escaped
