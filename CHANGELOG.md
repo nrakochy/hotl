@@ -75,6 +75,12 @@ semver promise of their own.
 
 ### Fixed
 
+- The shell installer no longer puts `hotl-sbx` — the Windows write-floor
+  launcher, a stub that refuses to run everywhere else — on Unix machines. A
+  per-target `binaries` override confines it to the Windows archive; the four
+  Unix archives now ship `hotl` alone. `hotl update` was never affected (it
+  extracts only the `hotl` executable), so an install from an earlier release
+  just deletes `~/.cargo/bin/hotl-sbx`.
 - Unit tests that spawn scripted child sessions no longer write their logs
   into the real `~/.local/share/hotl/sessions` store — the child store is
   injected, and the test builder points it at a tempdir.

@@ -370,4 +370,29 @@ mod tests {
             "the primary binary must stay declared alongside it"
         );
     }
+
+    /// The Unix floors are in-process (Seatbelt, Landlock), so on those targets
+    /// this binary is a stub that refuses — yet without the per-target override
+    /// dist packaged it into every archive, and the shell installer put a
+    /// ~330 KiB dead executable on Unix users' PATH. The override confines it
+    /// to the Windows archive while the `[[bin]]` above keeps it building (and
+    /// `cargo check`-covered) everywhere.
+    #[test]
+    fn dist_ships_this_binary_in_the_windows_archive_alone() {
+        let manifest = include_str!("../../Cargo.toml");
+        assert!(
+            manifest.contains("[package.metadata.dist.binaries]"),
+            "the per-target binaries override is gone; every Unix archive would carry the \
+             hotl-sbx stub again, and the shell installer would install it on PATH"
+        );
+        assert!(
+            manifest.contains("\"*\" = [\"hotl\"]"),
+            "the wildcard arm must ship `hotl` alone everywhere the Windows arm does not name"
+        );
+        assert!(
+            manifest.contains("x86_64-pc-windows-msvc = [\"hotl\", \"hotl-sbx\"]"),
+            "the Windows arm must keep shipping the shim beside `hotl`, or \
+             `winfloor::shim_path()` finds nothing and the floor reports Unavailable"
+        );
+    }
 }

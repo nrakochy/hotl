@@ -24,13 +24,23 @@ path = "src/main.rs"
 # without it would report the floor `Unavailable` for a reason that reads like
 # a bug rather than a missing file.
 #
-# It builds on every platform. The non-Windows arm is a stub that explains
-# itself and exits — a few KB in the Unix archives, in exchange for
-# `cargo check --workspace` covering the file everywhere, which caught real
-# errors during the port.
+# It still builds on every platform — the non-Windows arm is a stub that
+# explains itself and exits — so `cargo check --workspace` covers the file
+# everywhere, which caught real errors during the port. But the stub links the
+# crate graph and strips to ~330 KiB, not the "few KB" first assumed, so the
+# per-target override below keeps it out of the Unix archives entirely.
 [[bin]]
 name = "hotl-sbx"
 path = "src/bin/hotl-sbx.rs"
+
+# Which binaries each target's archive — and so the shell installer — carries.
+# Same map shape as `min-glibc-version`: the `"*"` arm covers every triple the
+# explicit arm does not name. The shim is meaningless off Windows (the Unix
+# floors are in-process), so only the Windows archive ships it. Guarded by
+# `dist_ships_this_binary_in_the_windows_archive_alone`.
+[package.metadata.dist.binaries]
+"*" = ["hotl"]
+x86_64-pc-windows-msvc = ["hotl", "hotl-sbx"]
 
 [features]
 default = ["minify"]
