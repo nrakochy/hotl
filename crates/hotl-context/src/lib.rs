@@ -49,6 +49,10 @@ running programs.
 - Batch independent tool calls into a single response — contiguous read-only \
 calls execute in parallel. Sequence a call only when it depends on a prior \
 result.
+- When a spawn tool is available, delegate broad investigation — locating code \
+across many files, surveying a subsystem — to explore agents, several in \
+parallel; keep this thread for decisions and edits. Their results return as \
+summaries instead of raw file dumps filling your context.
 - If a tool call fails, read the error and adjust the approach; do not retry \
 the identical call.
 
