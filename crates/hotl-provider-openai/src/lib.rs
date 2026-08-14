@@ -28,7 +28,7 @@ use futures_util::StreamExt;
 use hotl_provider::key::{AuthAction, AuthRetry, KeySource};
 use hotl_provider::{
     ArmGuard, Effort, EffortLadder, Provider, ProviderError, SamplingRequest, SseAssembler,
-    StreamEvent, ToolDef, Warmable, ALL_EFFORTS,
+    StreamEvent, ToolDef, Warmable,
 };
 use hotl_types::{Item, StopReason, TokenUsage};
 use serde_json::{json, Value};
@@ -201,14 +201,15 @@ impl OpenAiCompatProvider {
     }
 }
 
-/// OpenAI's ladder is a superset of hotl's five rungs, so every rung maps
-/// through unclamped. The family is deliberately uncatalogued, so there is no
-/// per-model gating to do.
+/// Real OpenAI-compatible servers accept `minimal|low|medium|high` for
+/// `reasoning_effort` — no `xhigh`/`max`. Declaring only the shared rungs
+/// lets the trait's default `resolve` clamp `XHigh`/`Max` to `High`.
+/// (hotl's ladder has no `minimal` rung; `low` is the floor.)
 pub struct OpenAiLadder;
 
 impl EffortLadder for OpenAiLadder {
     fn rungs(&self, _model: &str) -> &'static [Effort] {
-        ALL_EFFORTS
+        &[Effort::Low, Effort::Medium, Effort::High]
     }
 }
 
@@ -1388,7 +1389,22 @@ mod tests {
         req.thinking = true;
         req.effort = Some(Effort::XHigh);
         let body = OpenAiCompatProvider::build_body(&req);
-        assert_eq!(body["reasoning_effort"], "xhigh");
+        // `xhigh` is not a real OpenAI-compat rung; the ladder clamps it.
+        assert_eq!(body["reasoning_effort"], "high");
+    }
+
+    /// Real servers 400 on `xhigh`/`max`; the ladder clamps down to the
+    /// dialect's ceiling while the floor passes through untouched.
+    #[test]
+    fn max_clamps_to_high_on_the_openai_dialect() {
+        let mut req = sampling_req();
+        req.thinking = true;
+        req.effort = Some(Effort::Max);
+        let body = OpenAiCompatProvider::build_body(&req);
+        assert_eq!(body["reasoning_effort"], "high");
+        req.effort = Some(Effort::Low);
+        let body = OpenAiCompatProvider::build_body(&req);
+        assert_eq!(body["reasoning_effort"], "low");
     }
 
     /// The byte-identity guard.
