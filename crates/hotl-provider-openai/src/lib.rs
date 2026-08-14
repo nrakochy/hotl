@@ -5,9 +5,11 @@
 //! no key needed). The base URL is configurable; auth is optional for
 //! non-default bases.
 //!
-//! **Chat Completions only.** The Responses API is a separate dialect; it is
-//! not implemented here (an assembler with no HTTP client behind it was
-//! deleted in R3 — see `specs/exec-plans/tech-debt-tracker.md`).
+//! **Chat Completions only.** The Responses API is a separate dialect served
+//! by the sibling crate `hotl-provider-openai-responses` (select it with
+//! `HOTL_MODEL=openai-responses/<model>`); it is deliberately not implemented
+//! here (R3 deleted an assembler with no HTTP client behind it — see
+//! `specs/exec-plans/tech-debt-tracker.md`).
 //!
 //! Cross-provider translation (`transform_messages`) lives
 //! in this crate's converters, where the corpus says it belongs:
@@ -220,6 +222,44 @@ fn rejects_max_completion_tokens(err: &ProviderError) -> bool {
         ProviderError::Http { status, message, .. }
             if (*status == 400 || *status == 422) && message.contains("max_completion_tokens")
     )
+}
+
+/// A 400 whose structured message names `reasoning_effort` and
+/// `/v1/responses`: OpenAI's reasoning models refusing effort next to
+/// function tools on this endpoint. Like [`rejects_max_completion_tokens`],
+/// deliberately narrow and matched on *structured API error text* (the
+/// RELIABILITY.md carve-out). Unlike it, the fix is a different dialect, not
+/// a different spelling — so the caller appends a pointer instead of
+/// retrying or degrading.
+fn needs_responses_dialect(err: &ProviderError) -> bool {
+    matches!(
+        err,
+        ProviderError::Http { status: 400, message, .. }
+            if message.contains("reasoning_effort") && message.contains("/v1/responses")
+    )
+}
+
+/// Append the Responses-dialect pointer to the one error it explains; every
+/// other error passes through untouched.
+fn with_responses_hint(err: ProviderError) -> ProviderError {
+    if !needs_responses_dialect(&err) {
+        return err;
+    }
+    match err {
+        ProviderError::Http {
+            status,
+            message,
+            retry_after,
+        } => ProviderError::Http {
+            status,
+            message: format!(
+                "{message} — this model speaks the Responses API; select it with \
+                 HOTL_MODEL=openai-responses/<model>"
+            ),
+            retry_after,
+        },
+        other => other,
+    }
 }
 
 fn tool_json(t: &ToolDef) -> Value {
@@ -658,7 +698,7 @@ impl Provider for OpenAiCompatProvider {
                         });
                     }
                     Attempt::Fail(e) => {
-                        yield Err(e);
+                        yield Err(with_responses_hint(e));
                         return;
                     }
                 }
@@ -1057,6 +1097,49 @@ mod tests {
         assert!(bodies[0].contains("max_completion_tokens"));
         assert!(bodies[1].contains("\"max_tokens\""));
         assert!(!bodies[1].contains("max_completion_tokens"));
+    }
+
+    /// The one 400 whose fix is a different dialect gains the pointer to it
+    /// — surfaced, never retried or degraded (plan 0031 task 7) — while a
+    /// plain 400 stays untouched.
+    #[tokio::test]
+    async fn a_reasoning_effort_400_carries_the_responses_hint() {
+        const LUNA_400: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"Function tools with reasoning_effort are not supported for gpt-5.6-luna-1 in /v1/chat/completions. Please use /v1/responses instead.\",\"type\":\"invalid_request_error\"}}";
+        const PLAIN_400: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"bad schema\",\"type\":\"invalid_request_error\"}}";
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![LUNA_400, PLAIN_400], seen.clone()).await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        let Some(Err(ProviderError::Http {
+            status, message, ..
+        })) = events.last()
+        else {
+            panic!("expected a terminal Http error: {events:?}");
+        };
+        assert_eq!(*status, 400);
+        assert!(
+            message.contains("HOTL_MODEL=openai-responses/<model>"),
+            "{message}"
+        );
+        assert!(
+            message.contains("reasoning_effort"),
+            "the API's own sentence must survive: {message}"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "no retry, no degradation probe"
+        );
+
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        let Some(Err(ProviderError::Http { message, .. })) = events.last() else {
+            panic!("expected a terminal Http error: {events:?}");
+        };
+        assert!(
+            !message.contains("openai-responses"),
+            "a plain 400 must not gain the hint: {message}"
+        );
     }
 
     /// The success path over HTTP: the event sequence a consumer actually
