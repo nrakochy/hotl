@@ -95,6 +95,10 @@ windows-sys = "0.61"
 
 [profile.release]
 strip = true
+# 0033 Task 9: parity with the published artifacts — `cargo install hotl`
+# builds the same optimized binary cargo-dist ships. Build-time cost only.
+lto = "thin"
+codegen-units = 1
 
 # Config for 'dist'
 [workspace.metadata.dist]
@@ -140,7 +144,6 @@ unix-archive = ".tar.gz"
 # the PowerShell installer unpacks either form. Consistency with other Windows
 # tools is not worth a new unpack path in the self-updater.
 
-# dist builds releases with the release profile plus thin LTO.
+# dist inherits the (now fully optimized) release profile unchanged.
 [profile.dist]
 inherits = "release"
-lto = "thin"
