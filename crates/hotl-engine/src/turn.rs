@@ -907,6 +907,12 @@ impl Turn {
                         });
                     }
                 }
+                StopReason::PauseTurn => {
+                    // Server-side pause: re-sending with the trailing
+                    // assistant turn resumes it. Bounded by max_turns.
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    continue;
+                }
                 _ => {
                     // Done branch (index E4): the TodoGate and a `Stop` hook
                     // veto both intercept "the model just stopped" and can

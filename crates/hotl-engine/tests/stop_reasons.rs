@@ -89,9 +89,10 @@ async fn run_to_done(s: &mut Session) -> Outcome {
     }
 }
 
-/// Truncation reminders in the RAW log (append-only, so a compaction fold
-/// can never hide one from this count).
-fn cut_off_reminders(path: &std::path::Path) -> usize {
+/// `SystemReminder` items whose text contains `needle`, counted in the RAW
+/// log (append-only, so a compaction fold can never hide one). An empty
+/// needle counts every reminder.
+fn reminders_containing(path: &std::path::Path, needle: &str) -> usize {
     std::fs::read_to_string(path)
         .expect("read log")
         .lines()
@@ -105,10 +106,14 @@ fn cut_off_reminders(path: &std::path::Path) -> usize {
                         synthetic: Some(SyntheticReason::SystemReminder),
                         ..
                     },
-                } if text.contains("cut off")
+                } if text.contains(needle)
             )
         })
         .count()
+}
+
+fn cut_off_reminders(path: &std::path::Path) -> usize {
+    reminders_containing(path, "cut off")
 }
 
 /// [`ScriptedProvider::text_reply_with_stop`] with a chosen reported
@@ -262,4 +267,26 @@ async fn max_tokens_continues_survive_a_compaction_fold() {
         3,
         "the recovery budget must cross the fold"
     );
+}
+
+#[tokio::test]
+async fn pause_turn_resamples_without_a_reminder() {
+    // The committed projection already ends with the paused assistant turn —
+    // exactly the resume shape the API expects, so nothing is injected.
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply_with_stop("pausing", StopReason::PauseTurn),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session(provider.clone(), EngineConfig::default());
+
+    let outcome = run_to_done(&mut s).await;
+
+    assert_eq!(
+        outcome,
+        Outcome::Done {
+            text: "done".into()
+        }
+    );
+    assert_eq!(reminders_containing(&s.log_path, ""), 0);
+    assert_eq!(provider.request_count(), 2);
 }
