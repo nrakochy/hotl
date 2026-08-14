@@ -389,13 +389,14 @@ mod tests {
 
     #[test]
     fn the_engines_default_max_tokens_fits_every_catalogued_model() {
-        // `EngineConfig::default().max_tokens` is 32_000
-        // (hotl-engine/src/lib.rs:81). If a catalogued model ever caps output
-        // below that, the request 400s — catch it here, not in production.
+        // `EngineConfig::default().max_tokens` is 64_000. If a catalogued
+        // model ever caps output below that, the request 400s — catch it
+        // here, not in production. (The CLI layer also clamps to the
+        // catalogued cap, so this is the belt to that suspender.)
         for m in CATALOG {
             assert!(
-                m.max_output_tokens >= 32_000,
-                "{} caps output at {} < the engine default 32_000",
+                m.max_output_tokens >= 64_000,
+                "{} caps output at {} < the engine default 64_000",
                 m.id,
                 m.max_output_tokens
             );

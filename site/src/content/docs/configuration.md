@@ -46,6 +46,7 @@ fast_model = "..."                          # cheap model for compaction summari
 effort = "high"                             # low | medium | high | xhigh | max; absent = xhigh on catalogued Anthropic models, else the provider's default
 api_key_helper = "..."                      # command whose trimmed stdout is the API key; beats static key env vars; 5s timeout, 64KB cap
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
+max_tokens = 64000                          # per-sample output cap (thinking + text); clamped to the model's catalogued maximum
 
 [context]
 window = 200000            # usually unnecessary — looked up per model; see below
@@ -257,6 +258,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_WEB_ALLOW_METADATA` | — | `1` permits `web_fetch` to reach cloud instance-metadata addresses (`169.254.169.254`, `169.254.170.2`, `fd00:ec2::254`), which are otherwise refused on every redirect hop including the first. Nothing legitimate needs this. |
 | `HOTL_PROXY_AUTH` | — | `off` drops the `Proxy-Authorization` requirement on the local egress proxy, for a client that honors `HTTP_PROXY` but discards its credentials. Without it, any local process could spend your allowlist. |
 | `HOTL_MAX_TURNS` | `[behavior].max_turns` | Model steps per prompt (default 100); `-1` = unlimited. |
+| `HOTL_MAX_TOKENS` | `[provider].max_tokens` | Per-sample output-token cap, thinking included (default 64000); always clamped to the model's catalogued maximum. |
 | `HOTL_CONCURRENCY_REQUESTS` | `[concurrency].requests` | Concurrent `web_fetch`/`web_search` HTTP requests (default 4). |
 | `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Concurrent sub-agent (`spawn`) sessions (default 4) — global across the parent and every child. |
 | `HOTL_CONCURRENCY_SUBPROCS` | `[concurrency].subprocs` | Reserved (subprocess batching; no effect yet). |

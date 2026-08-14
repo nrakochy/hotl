@@ -2551,6 +2551,17 @@ fn engine_config(
     {
         config.max_turns = turns;
     }
+    if let Some(mt) = secrets
+        .get("HOTL_MAX_TOKENS")
+        .and_then(|v| v.parse().ok())
+        .or(cfg.provider.max_tokens)
+    {
+        config.max_tokens = mt;
+    }
+    // Never ask a model for more output than its catalog says it can emit.
+    if let Some(cap) = hotl_provider::catalog::max_output_tokens(model) {
+        config.max_tokens = config.max_tokens.min(cap);
+    }
     config.fast_model = secrets
         .get("HOTL_FAST_MODEL")
         .or_else(|| cfg.provider.fast_model.clone());
@@ -4581,6 +4592,36 @@ mod tests {
         assert_eq!(
             engine_config("m", &MapSecrets::default(), &config_from_toml("")).max_turns,
             100
+        );
+    }
+
+    #[test]
+    fn max_tokens_precedence_env_config_default() {
+        let cfg = config_from_toml("[provider]\nmax_tokens = 48000\n");
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &cfg).max_tokens,
+            48_000
+        );
+        let secrets = MapSecrets::from([("HOTL_MAX_TOKENS", "24000")]);
+        assert_eq!(engine_config("m", &secrets, &cfg).max_tokens, 24_000);
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &config_from_toml("")).max_tokens,
+            64_000
+        );
+    }
+
+    #[test]
+    fn max_tokens_is_clamped_to_the_catalogued_cap() {
+        // Haiku's catalogued cap is exactly 64_000; an over-ask clamps down.
+        let secrets = MapSecrets::from([("HOTL_MAX_TOKENS", "999999")]);
+        assert_eq!(
+            engine_config("claude-haiku-4-5", &secrets, &config_from_toml("")).max_tokens,
+            64_000
+        );
+        // An uncatalogued model has no cap to clamp to.
+        assert_eq!(
+            engine_config("m", &secrets, &config_from_toml("")).max_tokens,
+            999_999
         );
     }
 

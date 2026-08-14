@@ -242,6 +242,9 @@ pub struct ProviderCfg {
     /// Re-run the helper when the cached key is older than this. Absent =
     /// refresh only at startup and on auth failure.
     pub api_key_helper_ttl_secs: Option<u64>,
+    /// Per-sample output-token cap (thinking + text). Absent = the engine
+    /// default (64_000), clamped to the model's catalogued maximum.
+    pub max_tokens: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]

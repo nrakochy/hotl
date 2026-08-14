@@ -119,7 +119,9 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             model: "claude-opus-4-8".into(),
-            max_tokens: 32_000,
+            // Anthropic recommends ≥64K output headroom at high/xhigh effort,
+            // and adaptive thinking shares this cap.
+            max_tokens: 64_000,
             // Roomy enough that ordinary agentic work (long edit/test/fix
             // chains) finishes inside it — the cap is a runaway backstop, not
             // a work ceiling. Sub-agent call sites set their own, tighter.
