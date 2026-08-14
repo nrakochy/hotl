@@ -792,7 +792,8 @@ impl Turn {
             // `anchor`/`injected_hints`/`last_snapshot` deliberately do NOT
             // carry: the fold rewrites the projection, so a stale anchor would
             // mis-slice it and a hint whose item was just folded away *should*
-            // be re-injected.
+            // be re-injected. Not carrying the anchor costs nothing: the
+            // pre-anchor fallback is the projection's O(1) running sum.
             anchor: None,
             samples: 0,
             injected_hints: HashSet::new(),
@@ -1884,8 +1885,12 @@ impl Turn {
     /// `tail` are equal by construction. The totals are identical to what a
     /// flat snapshot produced.
     fn estimate_tokens(&self, snapshot: &crate::actor::Snapshot) -> u64 {
-        anchored_estimate(self.anchor, &self.shared.system, &snapshot.durable)
-            + hotl_context::tokens::estimate_items(&snapshot.tail)
+        anchored_estimate(
+            self.anchor,
+            self.shared.system_estimate,
+            &snapshot.durable,
+            snapshot.durable_estimate,
+        ) + hotl_context::tokens::estimate_items(&snapshot.tail)
     }
 
     /// Just-in-time nested AGENTS.md injection (M2), deduped per turn and
@@ -2115,6 +2120,13 @@ impl Turn {
         durable.extend(self.projected_tail.iter().cloned());
         Some(crate::actor::Snapshot {
             durable: Arc::new(durable),
+            // A handful of items at most — summed on demand, not tracked.
+            durable_estimate: last.durable_estimate
+                + self
+                    .projected_tail
+                    .iter()
+                    .map(|i| hotl_context::tokens::estimate_item(i))
+                    .sum::<u64>(),
             tail: Arc::clone(&last.tail),
         })
     }
@@ -2366,23 +2378,25 @@ const DRAIN_MAX: usize = 64;
 
 /// Anchored context estimate for the next request: the provider-reported cost
 /// of the last sample plus the (overcounting) estimate of everything appended
-/// since. Falls back to a full estimate before the first sample. Takes the
-/// **durable** projection — the ephemeral tail is added by the one caller,
-/// [`Turn::estimate_tokens`], as its own term.
+/// since. Falls back to the projection's O(1) running sum before the first
+/// sample (0033 Task 7 — `durable_estimate` equals a full walk of `durable`
+/// by construction). Takes the **durable** projection — the ephemeral tail is
+/// added by the one caller, [`Turn::estimate_tokens`], as its own term.
 /// INVARIANT: everything committed after the anchored sample is counted exactly
 /// once. Enforced by `the_anchor_counts_tool_results_even_with_todos_active` and
 /// `compaction_still_triggers_with_todos_active`.
 fn anchored_estimate<I: std::borrow::Borrow<Item>>(
     anchor: Option<(u64, usize)>,
-    system: &str,
+    system_estimate: u64,
     durable: &[I],
+    durable_estimate: u64,
 ) -> u64 {
     use hotl_context::tokens;
     match anchor {
         Some((reported, len)) if durable.len() >= len => {
             reported + tokens::estimate_items(&durable[len..])
         }
-        _ => tokens::estimate_text(system) + tokens::estimate_items(durable),
+        _ => system_estimate + durable_estimate,
     }
 }
 
@@ -2864,7 +2878,12 @@ mod tests {
             },
             tool_results(&big),
         ];
-        let estimate = anchored_estimate(anchor, "sys", &sample2);
+        let estimate = anchored_estimate(
+            anchor,
+            hotl_context::tokens::estimate_text("sys"),
+            &sample2,
+            hotl_context::tokens::estimate_items(&sample2),
+        );
         assert!(
             estimate >= 500 + 1_000,
             "tool results must be inside the estimate, got {estimate}"
@@ -2891,8 +2910,18 @@ mod tests {
 
         for anchor in [None, Some((500, 1)), Some((500, 2))] {
             assert_eq!(
-                anchored_estimate(anchor, "sys", &durable) + tokens::estimate_items(&tail),
-                anchored_estimate(anchor, "sys", &flat),
+                anchored_estimate(
+                    anchor,
+                    tokens::estimate_text("sys"),
+                    &durable,
+                    tokens::estimate_items(&durable),
+                ) + tokens::estimate_items(&tail),
+                anchored_estimate(
+                    anchor,
+                    tokens::estimate_text("sys"),
+                    &flat,
+                    tokens::estimate_items(&flat),
+                ),
                 "anchor {anchor:?}"
             );
         }

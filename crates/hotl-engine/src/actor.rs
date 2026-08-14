@@ -97,6 +97,11 @@ pub struct ProjectionHead {
     /// A todo change is itself a durable `Todos` entry, so it moves
     /// `leaf`/`epoch` like any other commit.
     todos: Arc<Vec<Todo>>,
+    /// Running CONSERVATIVE-profile estimate of `items` (0033 Task 7),
+    /// maintained at the two mutation sites so the pre-anchor estimate is
+    /// O(1) instead of a per-char walk of the session. If a model-keyed
+    /// profile ever lands, this sum must be keyed to it.
+    estimated: u64,
     /// Id of the newest entry applied — the **durable leaf** (§Ordering
     /// authority), and what an optimistic dispatch's `expected_leaf` is
     /// compared against. `None` before anything is applied.
@@ -131,6 +136,7 @@ impl ProjectionHead {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             durable: Arc::clone(&self.items),
+            durable_estimate: self.estimated,
             tail: tail_for(&self.todos),
         }
     }
@@ -185,6 +191,10 @@ fn tool_tokens(registry: &Registry) -> ToolTokens {
 pub struct Snapshot {
     /// The durable projection — byte-stable between supersede events.
     pub durable: Arc<Vec<Arc<Item>>>,
+    /// Running CONSERVATIVE-profile estimate of `durable` — equals
+    /// `tokens::estimate_items(&durable)` by construction (the projection
+    /// maintains it at its two mutation sites; property-tested).
+    pub durable_estimate: u64,
     /// Ephemeral per-sample suffix (todo reminder today), regenerated per
     /// read, never committed, rendered after every cache marker.
     pub tail: Arc<Vec<Arc<Item>>>,
@@ -209,6 +219,7 @@ pub(crate) fn head_channel() -> (
     tokio::sync::watch::channel(Arc::new(ProjectionHead {
         items: Arc::new(Vec::new()),
         todos: Arc::new(Vec::new()),
+        estimated: 0,
         leaf: None,
         epoch: 0,
     }))
@@ -221,6 +232,8 @@ pub(crate) fn head_channel() -> (
 struct Head {
     tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
     items: Arc<Vec<Arc<Item>>>,
+    /// See [`ProjectionHead::estimated`] — maintained here, published there.
+    estimated: u64,
     todos: Arc<Vec<Todo>>,
     leaf: Option<String>,
     epoch: u64,
@@ -235,9 +248,12 @@ impl Head {
         items: Vec<Item>,
         todos: Vec<Todo>,
     ) -> Self {
+        let items: Vec<Arc<Item>> = items.into_iter().map(Arc::new).collect();
+        let estimated = tokens::estimate_items(&items);
         let mut head = Self {
             tx,
-            items: Arc::new(items.into_iter().map(Arc::new).collect()),
+            items: Arc::new(items),
+            estimated,
             todos: Arc::new(todos),
             leaf: None,
             epoch: 0,
@@ -260,6 +276,7 @@ impl Head {
     fn snapshot(&self) -> Snapshot {
         Snapshot {
             durable: Arc::clone(&self.items),
+            durable_estimate: self.estimated,
             tail: tail_for(&self.todos),
         }
     }
@@ -269,6 +286,7 @@ impl Head {
     /// `release_steers`), or a turn's refresh could observe the commit
     /// without the steer that overtook it.
     fn apply(&mut self, item: Item) {
+        self.estimated += tokens::estimate_item(&item);
         Arc::make_mut(&mut self.items).push(Arc::new(item));
     }
 
@@ -288,6 +306,8 @@ impl Head {
     /// mid-turn by construction — the actor terminates a turn *before*
     /// committing a compaction (§Read invariant).
     fn repoint(&mut self, items: Vec<Arc<Item>>) {
+        // O(folded list), rare, and correct by construction.
+        self.estimated = tokens::estimate_items(&items);
         self.items = Arc::new(items);
         self.publish();
     }
@@ -298,6 +318,7 @@ impl Head {
         let _ = self.tx.send(Arc::new(ProjectionHead {
             items: Arc::clone(&self.items),
             todos: Arc::clone(&self.todos),
+            estimated: self.estimated,
             leaf: self.leaf.clone(),
             epoch: self.epoch,
         }));
@@ -522,6 +543,9 @@ pub(crate) struct SharedDeps {
     pub sandbox_enforced: bool,
     pub clock: Arc<dyn Clock>,
     pub system: Arc<str>,
+    /// `tokens::estimate_text(&system)` computed once — the system prompt is
+    /// a byte-stable session constant (0033 Task 7).
+    pub system_estimate: u64,
     pub cwd: PathBuf,
     pub config: EngineConfig,
     pub snapshots: Option<Arc<dyn crate::Snapshotter>>,
@@ -629,6 +653,8 @@ impl SharedDeps {
         // and it's how a turn-side `prepare_payload` call ends up masking
         // under the exact same rules the log's own inline path uses.
         let masker = deps.log.masker_handle();
+        let system: Arc<str> = deps.system.into();
+        let system_estimate = tokens::estimate_text(&system);
         let shared = Self {
             provider: deps.provider,
             registry: deps.registry,
@@ -638,7 +664,8 @@ impl SharedDeps {
             effort,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,
-            system: deps.system.into(),
+            system,
+            system_estimate,
             cwd: deps.cwd,
             config: deps.config,
             snapshots: deps.snapshots,
@@ -2171,6 +2198,76 @@ mod tests {
         HeldSteer, Pipeline, ProjectionHead, Resolution, SharedDeps, FOLD_MARK, HELD_BYTES_MAX,
         HELD_IMAGE_B64_MAX,
     };
+
+    /// 0033 Task 7: the projection's running estimate must equal a
+    /// from-scratch `estimate_items` walk after every mutation the projection
+    /// has — `apply` and `repoint` — in any interleaving.
+    #[test]
+    fn running_estimate_equals_batch_estimate_under_apply_and_repoint() {
+        use hotl_context::tokens;
+        let (tx, _rx) = super::head_channel();
+        let mut head = Head::new(
+            tx,
+            vec![hotl_types::Item::System {
+                text: "seed".into(),
+            }],
+            Vec::new(),
+        );
+        let mix: Vec<hotl_types::Item> = vec![
+            hotl_types::Item::User {
+                text: "ascii and 日本語 and 🦀".into(),
+                synthetic: None,
+                images: vec![hotl_types::UserImage {
+                    media_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                }],
+            },
+            hotl_types::Item::Assistant {
+                blocks: vec![
+                    serde_json::json!({"type": "text", "text": "reply"}),
+                    serde_json::json!({"type": "tool_use", "id": "t1", "name": "read", "input": {}}),
+                ],
+            },
+            hotl_types::Item::ToolResults {
+                results: vec![hotl_types::ToolResultItem {
+                    tool_use_id: "t1".into(),
+                    content: "result body".into(),
+                    is_error: false,
+                }],
+            },
+            hotl_types::Item::Unknown,
+            hotl_types::Item::User {
+                text: "follow-up".into(),
+                synthetic: Some(hotl_types::SyntheticReason::Steer),
+                images: Vec::new(),
+            },
+        ];
+        let check = |head: &Head, step: &str| {
+            assert_eq!(
+                head.estimated,
+                tokens::estimate_items(head.items()),
+                "running sum diverged after {step}"
+            );
+        };
+        check(&head, "seed");
+        for (round, item) in mix.iter().cycle().take(12).enumerate() {
+            head.apply(item.clone());
+            check(&head, &format!("apply #{round}"));
+            if round == 4 || round == 9 {
+                // A fold: keep the first item, splice a digest, keep the tail.
+                let mut folded: Vec<std::sync::Arc<hotl_types::Item>> =
+                    vec![head.items()[0].clone()];
+                folded.push(std::sync::Arc::new(hotl_types::Item::User {
+                    text: format!("digest of round {round}"),
+                    synthetic: Some(hotl_types::SyntheticReason::CompactionSummary),
+                    images: Vec::new(),
+                }));
+                folded.extend(head.items().iter().skip(round).cloned());
+                head.repoint(folded);
+                check(&head, &format!("repoint #{round}"));
+            }
+        }
+    }
     use hotl_store::SessionLog;
     use hotl_types::{EntryPayload, Item, SyntheticReason, ToolResultItem};
     use serde_json::json;
@@ -2180,6 +2277,7 @@ mod tests {
     #[test]
     fn appending_to_the_head_shares_existing_image_payloads() {
         let (tx, _rx) = tokio::sync::watch::channel(Arc::new(ProjectionHead {
+            estimated: 0,
             items: Arc::new(Vec::new()),
             todos: Arc::new(Vec::new()),
             leaf: None,
