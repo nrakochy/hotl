@@ -323,17 +323,30 @@ fn discover_skills(handle: &str, root: &Path, reports: &mut Vec<String>) -> Vec<
             continue;
         }
         let skill_md = child.join("SKILL.md");
+        let name = || {
+            child
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned()
+        };
         match dunce::canonicalize(&skill_md) {
-            Ok(p) if p.starts_with(root) && p.is_file() => out.push(child),
             // No SKILL.md at all: just not a skill dir.
             Err(_) => {}
-            Ok(_) => {
-                let name = child.file_name().unwrap_or_default().to_string_lossy();
-                reports.push(format!(
-                    "plugin `{handle}`: skill `{name}` skipped — its SKILL.md \
-                     resolves outside the plugin root"
-                ));
-            }
+            Ok(p) if !p.starts_with(root) => reports.push(format!(
+                "plugin `{handle}`: skill `{}` skipped — its SKILL.md resolves \
+                 outside the plugin root",
+                name()
+            )),
+            Ok(p) if p.is_file() => out.push(child),
+            // Present, in-root, but not a regular file (§7.1's "resolves
+            // to a regular file"): an invalid skill, reported (§7.1
+            // SHOULD), never a containment complaint.
+            Ok(_) => reports.push(format!(
+                "plugin `{handle}`: skill `{}` skipped — SKILL.md is not a \
+                 regular file",
+                name()
+            )),
         }
     }
     out
