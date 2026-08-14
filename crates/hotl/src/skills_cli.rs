@@ -12,7 +12,7 @@ pub fn skills_main(args: &[String]) -> i32 {
     let config_dir = crate::agent::config_dir();
     match args.get(1).map(String::as_str) {
         None | Some("list") => {
-            print!("{}", render_list(&config_dir));
+            print!("{}", render_list(&config_dir, &crate::agent::data_dir()));
             0
         }
         Some("add") => match (args.get(2), args.get(3)) {
@@ -185,11 +185,19 @@ fn usage() -> i32 {
 
 /// The roster with a source column, then config warnings, then a warning
 /// per registered git marketplace whose managed checkout is missing.
-fn render_list(config_dir: &Path) -> String {
+fn render_list(config_dir: &Path, data_dir: &Path) -> String {
     let cfg = crate::config::Config::load(config_dir);
     let include_claude = cfg.skills.claude.unwrap_or(true);
-    let (roots, warnings) = cfg.skills.marketplace_roots(config_dir);
-    let tool = hotl_tools::skills::SkillTool::new(config_dir, include_claude, &roots);
+    let (roots, mut warnings) = cfg.skills.marketplace_roots(config_dir);
+    // The plugin tier, loaded exactly as `build_registry` loads it.
+    let (plugins, plugin_warnings) = cfg.plugins.load(config_dir, data_dir);
+    warnings.extend(plugin_warnings);
+    let plugin_skills: Vec<(String, Vec<std::path::PathBuf>)> = plugins
+        .iter()
+        .map(|p| (p.name.clone(), p.skill_dirs.clone()))
+        .collect();
+    let tool =
+        hotl_tools::skills::SkillTool::new(config_dir, include_claude, &roots, &plugin_skills);
     let mut out = String::new();
     if let Some(tool) = &tool {
         let width = tool
@@ -251,7 +259,7 @@ mod tests {
             ),
         )
         .unwrap();
-        let out = render_list(dir.path());
+        let out = render_list(dir.path(), dir.path());
         assert!(out.contains("release") && out.contains("acme"), "{out}");
         assert!(
             out.contains("`ghost` is registered but not fetched"),

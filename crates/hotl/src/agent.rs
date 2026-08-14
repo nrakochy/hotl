@@ -1474,7 +1474,13 @@ fn build_registry(
     let (minify, minify_warning) = minify_config(cfg);
     discovery_warnings.extend(minify_warning);
     let mut registry = Registry::builtin_with(diagnostics, minify);
-    let servers = cfg.mcp_servers();
+    // Agent Plugins (0032): loaded once, feeding both the MCP roster and
+    // the skill tier below — one discovery walk, one warnings channel.
+    let (plugins, plugin_warnings) = cfg.plugins.load(config_dir, &data_dir());
+    discovery_warnings.extend(plugin_warnings);
+    // The shared roster composition: `hotl mcp` renders the same call, so
+    // the CLI can never disagree with what a turn loads.
+    let servers = crate::config::all_mcp_servers(cfg, &plugins);
     if !servers.is_empty() {
         let trust = hotl_mcp::trust::TrustStore::load(config_dir);
         registry.register(Box::new(hotl_mcp::McpTool::new(servers, trust)));
@@ -1485,13 +1491,20 @@ fn build_registry(
     let include_claude = cfg.skills.claude.unwrap_or(true);
     let (marketplaces, warnings) = cfg.skills.marketplace_roots(config_dir);
     discovery_warnings.extend(warnings);
+    let plugin_skills: Vec<(String, Vec<std::path::PathBuf>)> = plugins
+        .iter()
+        .map(|p| (p.name.clone(), p.skill_dirs.clone()))
+        .collect();
     // One discovery walk: the names for `/`-dispatch and their descriptions
     // come off the same tool that goes into the registry, never a second
     // scan of the roots.
     let mut skills_catalog: Vec<(String, String)> = Vec::new();
-    if let Some(skills) =
-        hotl_tools::skills::SkillTool::new(config_dir, include_claude, &marketplaces)
-    {
+    if let Some(skills) = hotl_tools::skills::SkillTool::new(
+        config_dir,
+        include_claude,
+        &marketplaces,
+        &plugin_skills,
+    ) {
         skills_catalog = skills
             .catalog()
             .map(|(n, d)| (n.to_string(), d.to_string()))

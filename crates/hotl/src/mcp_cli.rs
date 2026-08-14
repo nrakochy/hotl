@@ -23,13 +23,14 @@ use hotl_mcp::trust::{Fingerprint, TrustState, TrustStore};
 
 pub fn mcp_main(args: &[String]) -> i32 {
     let config_dir = crate::agent::config_dir();
+    let data_dir = crate::agent::data_dir();
     match args.get(1).map(String::as_str) {
         None | Some("list") => {
-            print!("{}", render_list(&config_dir));
+            print!("{}", render_list(&config_dir, &data_dir));
             0
         }
         Some("show") => match args.get(2) {
-            Some(name) => report(show(&config_dir, name)),
+            Some(name) => report(show(&config_dir, &data_dir, name)),
             None => usage(),
         },
         Some("add") => match (args.get(2), args.get(3)) {
@@ -41,7 +42,7 @@ pub fn mcp_main(args: &[String]) -> i32 {
             None => usage(),
         },
         Some("test") => match args.get(2) {
-            Some(name) => report(test(&config_dir, name)),
+            Some(name) => report(test(&config_dir, &data_dir, name)),
             None => usage(),
         },
         _ => usage(),
@@ -78,10 +79,21 @@ fn program(cfg: &ServerConfig) -> String {
     }
 }
 
+/// The one roster composition every verb reads — identical to
+/// `build_registry`'s (`[[mcp]]` plus plugin servers as
+/// `<plugin>:<server>`), so this CLI can never disagree with what a turn
+/// loads. Plugin load warnings are dropped here; they surface at startup
+/// and in `hotl plugins list`.
+fn all_servers(config_dir: &Path, data_dir: &Path) -> Vec<ServerConfig> {
+    let cfg = crate::config::Config::load(config_dir);
+    let (plugins, _) = cfg.plugins.load(config_dir, data_dir);
+    crate::config::all_mcp_servers(&cfg, &plugins)
+}
+
 /// Servers, their trust state, then the warnings `TrustStore::load` swallows,
 /// then grants whose server has left the config.
-fn render_list(config_dir: &Path) -> String {
-    let servers = crate::config::Config::load(config_dir).mcp_servers();
+fn render_list(config_dir: &Path, data_dir: &Path) -> String {
+    let servers = all_servers(config_dir, data_dir);
     let (store, warnings) = TrustStore::load_reporting(config_dir);
     let workspace = hotl_tools::workspace_root();
     let mut out = String::new();
@@ -146,8 +158,8 @@ fn find<'a>(servers: &'a [ServerConfig], name: &str) -> Result<&'a ServerConfig,
 
 /// The exact text the in-session screen shows, plus what the gate will do.
 /// Reads the binary; never starts it.
-fn show(config_dir: &Path, name: &str) -> Result<String, String> {
-    let servers = crate::config::Config::load(config_dir).mcp_servers();
+fn show(config_dir: &Path, data_dir: &Path, name: &str) -> Result<String, String> {
+    let servers = all_servers(config_dir, data_dir);
     let cfg = find(&servers, name)?;
     let fp = Fingerprint::of(cfg);
     let state = TrustStore::load(config_dir).state(name, &fp, hotl_tools::workspace_root());
@@ -235,15 +247,20 @@ fn untrust(config_dir: &Path, name: &str) -> Result<String, String> {
     }
 }
 
-fn test(config_dir: &Path, name: &str) -> Result<String, String> {
-    test_with(config_dir, name, std::io::stdin().is_terminal())
+fn test(config_dir: &Path, data_dir: &Path, name: &str) -> Result<String, String> {
+    test_with(config_dir, data_dir, name, std::io::stdin().is_terminal())
 }
 
 /// Start the server and list its tools. Screens first when it is not already
 /// trusted, and records nothing either way. `interactive` is injected so the
 /// refusal path is testable without depending on the harness's stdin.
-fn test_with(config_dir: &Path, name: &str, interactive: bool) -> Result<String, String> {
-    let servers = crate::config::Config::load(config_dir).mcp_servers();
+fn test_with(
+    config_dir: &Path,
+    data_dir: &Path,
+    name: &str,
+    interactive: bool,
+) -> Result<String, String> {
+    let servers = all_servers(config_dir, data_dir);
     let cfg = find(&servers, name)?;
     let fp = Fingerprint::of(cfg);
     let state = TrustStore::load(config_dir).state(name, &fp, hotl_tools::workspace_root());
@@ -360,7 +377,7 @@ mod tests {
     fn list_reports_state_and_stale_grants() {
         let dir = tempfile::tempdir().unwrap();
         let bin = fixture(dir.path(), "docs");
-        let out = render_list(dir.path());
+        let out = render_list(dir.path(), dir.path());
         assert!(
             out.contains("docs") && out.contains("screens on first use"),
             "{out}"
@@ -371,7 +388,7 @@ mod tests {
         store
             .record("gone", &Fingerprint::of(&cfg_for("gone", &bin)))
             .unwrap();
-        let out = render_list(dir.path());
+        let out = render_list(dir.path(), dir.path());
         assert!(out.contains("no longer configured"), "{out}");
         assert!(out.contains("hotl mcp untrust gone"), "{out}");
 
@@ -380,13 +397,58 @@ mod tests {
         store
             .record("docs", &Fingerprint::of(&cfg_for("docs", &bin)))
             .unwrap();
-        assert!(render_list(dir.path()).contains("trusted"), "{out}");
+        assert!(
+            render_list(dir.path(), dir.path()).contains("trusted"),
+            "{out}"
+        );
+    }
+
+    /// The roster invariant, seen from the CLI: a plugin's stdio server
+    /// appears as `<plugin>:<server>` with its trust state, because list
+    /// reads the same `all_mcp_servers` composition the registry does.
+    #[test]
+    fn list_shows_plugin_servers_with_trust_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let plug = dir.path().join("myplug");
+        std::fs::create_dir_all(plug.join("bin")).unwrap();
+        std::fs::write(plug.join("bin/server"), b"#!/bin/sh\n").unwrap();
+        std::fs::write(
+            plug.join("plugin.json"),
+            format!(
+                r#"{{"$schema": "{}", "name": "acme.tools"}}"#,
+                hotl_tools::plugins::MANIFEST_SCHEMA
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            plug.join("mcp.json"),
+            format!(
+                r#"{{"$schema": "{}", "mcpServers":
+                    {{"mem": {{"type": "stdio", "command": "./bin/server"}}}}}}"#,
+                hotl_tools::plugins::MCP_SCHEMA
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[plugins.sources]\n\"acme.tools\" = {}\n",
+                crate::config::toml_path(&plug)
+            ),
+        )
+        .unwrap();
+
+        let out = render_list(dir.path(), dir.path());
+        assert!(out.contains("acme.tools:mem"), "{out}");
+        assert!(out.contains("screens on first use"), "{out}");
+        // Discovery created the plugin's data dir (it has a stdio server).
+        assert!(dir.path().join("plugin-data/acme.tools").is_dir());
     }
 
     #[test]
     fn list_is_clean_when_nothing_is_configured() {
         let dir = tempfile::tempdir().unwrap();
-        let out = render_list(dir.path());
+        let out = render_list(dir.path(), dir.path());
         assert!(out.contains("no MCP servers configured"), "{out}");
     }
 
@@ -394,11 +456,11 @@ mod tests {
     fn show_renders_the_screen_text_and_errors_helpfully() {
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path(), "docs");
-        let out = show(dir.path(), "docs").unwrap();
+        let out = show(dir.path(), dir.path(), "docs").unwrap();
         assert!(out.contains("binary:") && out.contains("sha256:"), "{out}");
         assert!(out.contains("key: fp3:"), "{out}");
         // Errors are prompts: name the known servers and the next command.
-        let err = show(dir.path(), "nope").unwrap_err();
+        let err = show(dir.path(), dir.path(), "nope").unwrap_err();
         assert!(
             err.contains("docs") && err.contains("hotl mcp list"),
             "{err}"
@@ -431,12 +493,12 @@ mod tests {
             .record("docs", &Fingerprint::of(&cfg_for("docs", &bin)))
             .unwrap();
 
-        let _ = render_list(dir.path());
-        let _ = show(dir.path(), "docs");
-        let _ = show(dir.path(), "nope");
+        let _ = render_list(dir.path(), dir.path());
+        let _ = show(dir.path(), dir.path(), "docs");
+        let _ = show(dir.path(), dir.path(), "nope");
         let _ = add("new", "npx", &["-y".into()]);
         let _ = add("bad name", "npx", &[]);
-        let _ = test_with(dir.path(), "docs", false);
+        let _ = test_with(dir.path(), dir.path(), "docs", false);
         let _ = untrust(dir.path(), "docs");
         let _ = untrust(dir.path(), "--all");
         let _ = untrust(dir.path(), "ghost");
@@ -444,7 +506,7 @@ mod tests {
 
         // Nothing conjures a config.toml where none existed.
         let empty = tempfile::tempdir().unwrap();
-        let _ = render_list(empty.path());
+        let _ = render_list(empty.path(), empty.path());
         let _ = add("docs", "npx", &[]);
         let _ = untrust(empty.path(), "--all");
         assert!(!empty.path().join("config.toml").exists());
@@ -477,7 +539,7 @@ mod tests {
     fn test_records_no_trust() {
         let dir = tempfile::tempdir().unwrap();
         fixture(dir.path(), "docs");
-        let err = test_with(dir.path(), "docs", false).unwrap_err();
+        let err = test_with(dir.path(), dir.path(), "docs", false).unwrap_err();
         assert!(err.contains("needs a terminal"), "{err}");
         assert!(
             !dir.path().join("trust.toml").exists(),
@@ -500,6 +562,9 @@ mod tests {
     fn valid_name_matches_the_documented_charset() {
         assert!(valid_name("docs") && valid_name("a.b_c-1") && valid_name("9x"));
         assert!(!valid_name("") && !valid_name("-x") && !valid_name("a b") && !valid_name("a/b"));
+        // `:` is reserved for plugin server names (`<plugin>:<server>`),
+        // so a hand-added `[[mcp]]` entry can never collide with one.
+        assert!(!valid_name("acme:mem"));
         assert!(!valid_name(&"a".repeat(65)));
     }
 }

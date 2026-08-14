@@ -35,6 +35,8 @@ pub struct Config {
     #[serde(default)]
     pub skills: SkillsCfg,
     #[serde(default)]
+    pub plugins: PluginsCfg,
+    #[serde(default)]
     pub agents: AgentsCfg,
     #[serde(default)]
     pub concurrency: ConcurrencyCfg,
@@ -85,6 +87,129 @@ impl SkillsCfg {
         }
         (roots, warnings)
     }
+}
+
+/// `[plugins.sources]` — Agent Plugins 1.0.0 packages (exec-plan 0032),
+/// the primary extension-package lane: handle → git URL (managed
+/// checkout under `<config_dir>/plugins/<handle>`, fetched only by
+/// `hotl plugins add`/`update`) or local path (read in place).
+#[derive(Debug, Default, Deserialize)]
+pub struct PluginsCfg {
+    #[serde(default)]
+    pub sources: std::collections::BTreeMap<String, String>,
+}
+
+impl PluginsCfg {
+    /// Resolve `[plugins.sources]` to plugin roots — the exact mirror of
+    /// [`SkillsCfg::marketplace_roots`]: local paths in place (`~`
+    /// expanded), git URLs at their managed checkout, invalid handles
+    /// skipped with a warning.
+    pub fn plugin_roots(
+        &self,
+        config_dir: &Path,
+    ) -> (Vec<(String, std::path::PathBuf)>, Vec<String>) {
+        let mut roots = Vec::new();
+        let mut warnings = Vec::new();
+        for (handle, source) in &self.sources {
+            let Some(handle) = hotl_tools::skills::normalize_marketplace_name(handle) else {
+                warnings.push(format!(
+                    "[plugins.sources] `{handle}` is not a valid handle \
+                     (letters, digits, `.`/`_`/`-`, alphanumeric first char, ≤ 64 chars) \
+                     — entry skipped"
+                ));
+                continue;
+            };
+            let dir = if is_git_url(source) {
+                config_dir.join("plugins").join(&handle)
+            } else {
+                expand_home(source)
+            };
+            roots.push((handle, dir));
+        }
+        (roots, warnings)
+    }
+
+    /// Load every registered plugin: resolve roots, run each through
+    /// `load_plugin`, dedupe duplicate manifest names (first handle wins,
+    /// alphabetically — the map is a BTreeMap), and create `PLUGIN_DATA`
+    /// dirs at discovery for plugins with at least one valid stdio server
+    /// (§9.1 requires the dir to exist before any launch, and hotl-mcp
+    /// connects lazily with no pre-spawn hook). A registered git source
+    /// whose checkout is missing skips silently, like a marketplace —
+    /// `hotl plugins list` names it.
+    pub fn load(
+        &self,
+        config_dir: &Path,
+        data_dir: &Path,
+    ) -> (Vec<hotl_tools::plugins::PluginEntry>, Vec<String>) {
+        let (roots, mut warnings) = self.plugin_roots(config_dir);
+        let data_base = data_dir.join("plugin-data");
+        let mut entries: Vec<hotl_tools::plugins::PluginEntry> = Vec::new();
+        for (handle, root) in roots {
+            let unfetched =
+                self.sources.get(&handle).is_some_and(|s| is_git_url(s)) && !root.is_dir();
+            if unfetched {
+                continue;
+            }
+            let loaded = hotl_tools::plugins::load_plugin(&handle, &root, &data_base);
+            warnings.extend(loaded.reports);
+            let Some(mut entry) = loaded.entry else {
+                continue;
+            };
+            if let Some(prev) = entries.iter().find(|e| e.name == entry.name) {
+                warnings.push(format!(
+                    "plugin `{}` (handle `{}`) duplicates the manifest name of \
+                     handle `{}` — skipped",
+                    entry.name, entry.handle, prev.handle
+                ));
+                continue;
+            }
+            if !entry.servers.is_empty() {
+                if let Err(e) = std::fs::create_dir_all(&entry.plugin_data) {
+                    // §9.1: the data dir MUST exist before a subprocess
+                    // launches, so servers without one do not load.
+                    warnings.push(format!(
+                        "plugin `{}`: could not create its data directory {} ({e}) \
+                         — its MCP servers are disabled",
+                        entry.name,
+                        entry.plugin_data.display()
+                    ));
+                    entry.servers.clear();
+                }
+            }
+            entries.push(entry);
+        }
+        (entries, warnings)
+    }
+}
+
+/// The full MCP roster: `[[mcp]]` entries plus every plugin server as
+/// `<plugin>:<server>`. The registry and `hotl mcp` both come through
+/// this one composition (the `mcp_servers` roster doctrine above), and
+/// `hotl mcp add`'s name validation rejects `:`, so a hand-added server
+/// can never collide with a plugin's.
+pub fn all_mcp_servers(
+    cfg: &Config,
+    plugins: &[hotl_tools::plugins::PluginEntry],
+) -> Vec<hotl_mcp::config::ServerConfig> {
+    let mut servers = cfg.mcp_servers();
+    for plugin in plugins {
+        for s in &plugin.servers {
+            servers.push(hotl_mcp::config::ServerConfig {
+                name: format!("{}:{}", plugin.name, s.name),
+                command: s.command.clone(),
+                args: s.args.clone(),
+                description: if s.description.is_empty() {
+                    format!("from plugin `{}`", plugin.name)
+                } else {
+                    s.description.clone()
+                },
+                env: s.env.clone(),
+                cwd: Some(s.cwd.clone()),
+            });
+        }
+    }
+    servers
 }
 
 /// `[agents]` — user-defined subagent shapes (tier-1 gap #6). Mirrors
@@ -2095,6 +2220,157 @@ path_prefix = "/Volumes/secrets"
         let home = home_dir().expect("a home directory");
         assert_eq!(roots, vec![("home".to_string(), home.join("team-skills"))]);
         assert!(cfg_with("").skills.marketplace_roots(dir).0.is_empty());
+    }
+
+    /// The `[plugins.sources]` mirror of the marketplaces test above.
+    #[test]
+    fn plugin_sources_parse_and_resolve() {
+        let cfg = cfg_with(
+            "[plugins.sources]\n\
+             acme = \"https://github.com/acme/plugin.git\"\n\
+             local = \"/abs/local-plugin\"\n\
+             \"bad:name\" = \"/x\"\n",
+        );
+        let dir = std::path::Path::new("/cfg");
+        let (roots, warnings) = cfg.plugins.plugin_roots(dir);
+        assert_eq!(
+            roots,
+            vec![
+                ("acme".to_string(), dir.join("plugins/acme")),
+                (
+                    "local".to_string(),
+                    std::path::PathBuf::from("/abs/local-plugin")
+                ),
+            ]
+        );
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("bad:name"), "{warnings:?}");
+        assert!(cfg_with("").plugins.plugin_roots(dir).0.is_empty());
+    }
+
+    fn write_plugin(root: &std::path::Path, name: &str, mcp: bool) {
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join("plugin.json"),
+            format!(
+                r#"{{"$schema": "{}", "name": "{name}"}}"#,
+                hotl_tools::plugins::MANIFEST_SCHEMA
+            ),
+        )
+        .unwrap();
+        if mcp {
+            std::fs::write(
+                root.join("mcp.json"),
+                format!(
+                    r#"{{"$schema": "{}", "mcpServers":
+                        {{"mem": {{"type": "stdio", "command": "npx",
+                                   "env": {{"K": "${{PLUGIN_ROOT}}/v"}}}}}}}}"#,
+                    hotl_tools::plugins::MCP_SCHEMA
+                ),
+            )
+            .unwrap();
+        }
+    }
+
+    /// Duplicate manifest names dedupe (first handle wins, with a
+    /// warning), a handle≠name mismatch warns, an unfetched git source
+    /// skips silently, and `PLUGIN_DATA` dirs are created at discovery —
+    /// only for plugins with at least one valid stdio server.
+    #[test]
+    fn plugins_load_dedupes_warns_and_creates_data_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("cfg");
+        let data_dir = dir.path().join("data");
+        write_plugin(&config_dir.join("../a1"), "dup.plugin", true);
+        write_plugin(&config_dir.join("../a2"), "dup.plugin", false);
+        write_plugin(&config_dir.join("../skills-only"), "skills-only", false);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[plugins.sources]\na1 = {}\na2 = {}\nskills-only = {}\n\
+                 ghost = \"https://example.com/ghost.git\"\n",
+                toml_path(&dir.path().join("a1")),
+                toml_path(&dir.path().join("a2")),
+                toml_path(&dir.path().join("skills-only")),
+            ),
+        )
+        .unwrap();
+
+        let cfg = Config::load(&config_dir);
+        let (entries, warnings) = cfg.plugins.load(&config_dir, &data_dir);
+        let names: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| (e.handle.as_str(), e.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![("a1", "dup.plugin"), ("skills-only", "skills-only")],
+            "{warnings:?}"
+        );
+        // a2 lost the name to a1; both mismatch warnings and the dedupe
+        // warning are present; the unfetched ghost is silent here.
+        assert!(
+            warnings.iter().any(|w| w.contains("duplicates")),
+            "{warnings:?}"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("install handle")),
+            "{warnings:?}"
+        );
+        assert!(
+            !warnings.iter().any(|w| w.contains("ghost")),
+            "{warnings:?}"
+        );
+        assert!(
+            data_dir.join("plugin-data/dup.plugin").is_dir(),
+            "a stdio plugin gets its data dir at discovery"
+        );
+        assert!(
+            !data_dir.join("plugin-data/skills-only").exists(),
+            "a skills-only plugin does not"
+        );
+    }
+
+    /// The roster composition: `[[mcp]]` entries plus `<plugin>:<server>`
+    /// rows carrying the expanded env (reserved pair last) and cwd.
+    #[test]
+    fn all_mcp_servers_appends_qualified_plugin_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("cfg");
+        let data_dir = dir.path().join("data");
+        write_plugin(&dir.path().join("acme"), "acme", true);
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!(
+                "[[mcp]]\nname = \"docs\"\ncommand = \"/bin/docs\"\n\
+                 description = \"d\"\n\n[plugins.sources]\nacme = {}\n",
+                toml_path(&dir.path().join("acme")),
+            ),
+        )
+        .unwrap();
+
+        let cfg = Config::load(&config_dir);
+        let (entries, _) = cfg.plugins.load(&config_dir, &data_dir);
+        let servers = all_mcp_servers(&cfg, &entries);
+        let names: Vec<&str> = servers.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["docs", "acme:mem"]);
+        let mem = &servers[1];
+        let root = dunce::canonicalize(dir.path().join("acme")).unwrap();
+        assert_eq!(
+            mem.env,
+            vec![
+                ("K".to_string(), format!("{}/v", root.display())),
+                ("PLUGIN_ROOT".to_string(), root.display().to_string()),
+                (
+                    "PLUGIN_DATA".to_string(),
+                    data_dir.join("plugin-data/acme").display().to_string()
+                ),
+            ]
+        );
+        assert_eq!(mem.cwd.as_deref(), Some(root.as_path()));
+        assert!(mem.description.contains("acme"), "{}", mem.description);
     }
 
     #[test]
