@@ -1423,7 +1423,14 @@ fn snapshot_provider(cell: HeadCell, session_id: String) -> crate::spawn::Snapsh
             let head = head?;
             let published = head.borrow();
             Some(crate::spawn::ForkSeed {
-                history: (*published.snapshot().durable).clone(),
+                // Boundary rule (0033 Task 5): the store side keeps plain
+                // `Item`, so a fork seed deep-copies once, here.
+                history: published
+                    .snapshot()
+                    .durable
+                    .iter()
+                    .map(|i| (**i).clone())
+                    .collect(),
                 parent_session_id: session_id,
                 parent_tip_entry_id: published.leaf().map(str::to_string),
             })
@@ -4452,9 +4459,9 @@ mod tests {
         );
     }
 
-    fn is_todo_reminder(item: &hotl_types::Item) -> bool {
+    fn is_todo_reminder<I: std::borrow::Borrow<hotl_types::Item>>(item: &I) -> bool {
         matches!(
-            item,
+            item.borrow(),
             hotl_types::Item::User {
                 synthetic: Some(hotl_types::SyntheticReason::Todos),
                 ..

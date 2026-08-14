@@ -746,7 +746,7 @@ mod tests {
             model: "m".into(),
             max_tokens: 16,
             system: "".into(),
-            items: std::sync::Arc::new(vec![Item::ToolResults {
+            items: hotl_provider::arc_items(vec![Item::ToolResults {
                 results: vec![
                     ToolResultItem {
                         tool_use_id: "ok".into(),
@@ -787,7 +787,7 @@ mod tests {
             model: "gpt-test".into(),
             max_tokens: 512,
             system: "sys".into(),
-            items: std::sync::Arc::new(vec![
+            items: hotl_provider::arc_items(vec![
                 Item::User {
                     text: "hi".into(),
                     synthetic: None,
@@ -816,7 +816,7 @@ mod tests {
                     ],
                 },
             ]),
-            ephemeral_tail: std::sync::Arc::new(vec![Item::User {
+            ephemeral_tail: hotl_provider::arc_items(vec![Item::User {
                 text: "<todos>\n[~] a\n</todos>".into(),
                 synthetic: Some(hotl_types::SyntheticReason::Todos),
                 images: Vec::new(),
@@ -1369,7 +1369,7 @@ mod tests {
             model: "m".into(),
             max_tokens: 16,
             system: "".into(),
-            items: std::sync::Arc::new(vec![Item::User {
+            items: hotl_provider::arc_items(vec![Item::User {
                 text: "hi".into(),
                 synthetic: None,
                 images: Vec::new(),
@@ -1495,7 +1495,7 @@ mod tests {
     #[test]
     fn image_parts_render_as_data_urls_before_the_text_part() {
         let mut req = sampling_req();
-        req.items = std::sync::Arc::new(vec![Item::User {
+        req.items = hotl_provider::arc_items(vec![Item::User {
             text: "what is this?".into(),
             synthetic: None,
             images: vec![hotl_types::UserImage {

@@ -1295,9 +1295,9 @@ mod tests {
         );
     }
 
-    fn is_steer(i: &Item) -> bool {
+    fn is_steer<I: std::borrow::Borrow<Item>>(i: &I) -> bool {
         matches!(
-            i,
+            i.borrow(),
             Item::User {
                 synthetic: Some(SyntheticReason::Steer),
                 ..
@@ -1837,7 +1837,7 @@ mod tests {
         // for item. A projection that ran ahead of the log would order these
         // differently even though both contain the same items.
         let requests = h.provider.requests();
-        let sampled = &requests[1].items;
+        let sampled: Vec<Item> = requests[1].items.iter().map(|i| (**i).clone()).collect();
         assert_eq!(
             sampled.as_slice(),
             &logged[..sampled.len()],
@@ -2547,7 +2547,7 @@ mod tests {
             );
             assert!(
                 !req.items.iter().any(|i| matches!(
-                    i,
+                    &**i,
                     Item::User {
                         synthetic: Some(hotl_types::SyntheticReason::Todos),
                         ..
@@ -2767,7 +2767,7 @@ mod tests {
         // …and the continuation request opens with the digest, tail verbatim.
         let continuation = &requests[3];
         assert!(matches!(
-            &continuation.items[0],
+            &*continuation.items[0],
             Item::User { synthetic: Some(SyntheticReason::CompactionSummary), text, .. }
                 if text.contains("GOAL: digest of earlier work")
         ));
@@ -2943,7 +2943,7 @@ mod tests {
             .iter()
             .filter(|i| {
                 matches!(
-                    i,
+                    &***i,
                     Item::User {
                         synthetic: None,
                         ..
@@ -3007,7 +3007,7 @@ mod tests {
         let continuation = h.provider.last_request().unwrap();
         // The digest is present…
         assert!(continuation.items.iter().any(|i| matches!(
-            i,
+            &**i,
             Item::User {
                 synthetic: Some(SyntheticReason::CompactionSummary),
                 ..
@@ -3018,7 +3018,7 @@ mod tests {
             !continuation
                 .items
                 .iter()
-                .any(|i| matches!(i, Item::ToolResults { .. } | Item::Assistant { .. })),
+                .any(|i| matches!(&**i, Item::ToolResults { .. } | Item::Assistant { .. })),
             "reset-mode continuation must not carry the verbatim tail: {:?}",
             continuation.items
         );

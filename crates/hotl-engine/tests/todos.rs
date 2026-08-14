@@ -22,9 +22,9 @@ fn todo(content: &str, status: TodoStatus) -> Todo {
     }
 }
 
-fn is_todos(item: &Item) -> bool {
+fn is_todos<I: std::borrow::Borrow<Item>>(item: &I) -> bool {
     matches!(
-        item,
+        item.borrow(),
         Item::User {
             synthetic: Some(SyntheticReason::Todos),
             ..
@@ -137,7 +137,7 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
         .ephemeral_tail
         .last()
         .expect("the reminder rides the tail");
-    match last {
+    match &**last {
         Item::User {
             text, synthetic, ..
         } => {
@@ -238,7 +238,7 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
         .ephemeral_tail
         .last()
         .expect("the reminder rides the tail");
-    match last {
+    match &**last {
         Item::User {
             text, synthetic, ..
         } => {

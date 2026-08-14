@@ -24,14 +24,23 @@ pub struct Plan {
 /// the most verbatim history that fits); if no tail fits, keeps the minimal
 /// clean tail and folds everything else. `None` means nothing can fold — the
 /// caller must surface context exhaustion rather than loop.
-pub fn plan(items: &[Item], tail_budget: u64, image_budget: usize) -> Option<Plan> {
+pub fn plan<I: std::borrow::Borrow<Item>>(
+    items: &[I],
+    tail_budget: u64,
+    image_budget: usize,
+) -> Option<Plan> {
     let fits = |b: usize| {
         estimate_items(&items[b..]) <= tail_budget
             && crate::tokens::image_b64_bytes(&items[b..]) <= image_budget
     };
     let prefix_end = preserved_prefix_len(items);
     let boundaries: Vec<usize> = (prefix_end + 1..items.len())
-        .filter(|&i| matches!(items[i], Item::User { .. } | Item::Assistant { .. }))
+        .filter(|&i| {
+            matches!(
+                items[i].borrow(),
+                Item::User { .. } | Item::Assistant { .. }
+            )
+        })
         .filter(|&i| is_clean_boundary(items, i))
         .collect();
     let latest = *boundaries.last()?;
@@ -49,11 +58,17 @@ pub fn plan(items: &[Item], tail_budget: u64, image_budget: usize) -> Option<Pla
     })
 }
 
-/// The new projection: preserved prefix + digest + verbatim tail.
-pub fn apply(items: &[Item], plan: &Plan, digest: &[Item]) -> Vec<Item> {
+/// The new projection: preserved prefix + digest + verbatim tail. `Arc`
+/// elements in and out (0033 Task 5): the kept ranges move as pointer
+/// clones, only the digest items are newly allocated.
+pub fn apply(
+    items: &[std::sync::Arc<Item>],
+    plan: &Plan,
+    digest: &[Item],
+) -> Vec<std::sync::Arc<Item>> {
     let mut out = Vec::with_capacity(plan.prefix_end + digest.len() + items.len() - plan.kept_from);
     out.extend_from_slice(&items[..plan.prefix_end]);
-    out.extend_from_slice(digest);
+    out.extend(digest.iter().cloned().map(std::sync::Arc::new));
     out.extend_from_slice(&items[plan.kept_from..]);
     out
 }
@@ -63,19 +78,21 @@ pub fn apply(items: &[Item], plan: &Plan, digest: &[Item]) -> Vec<Item> {
 /// would leave those results with no calls in front of them — the request is
 /// then rejected for having more tool_result blocks than the preceding turn
 /// has tool_use blocks, and the fold makes it permanent.
-fn is_clean_boundary(items: &[Item], i: usize) -> bool {
-    !matches!(items.get(i + 1), Some(Item::ToolResults { .. }))
-        || matches!(items[i], Item::Assistant { .. })
+fn is_clean_boundary<I: std::borrow::Borrow<Item>>(items: &[I], i: usize) -> bool {
+    !matches!(
+        items.get(i + 1).map(std::borrow::Borrow::borrow),
+        Some(Item::ToolResults { .. })
+    ) || matches!(items[i].borrow(), Item::Assistant { .. })
 }
 
 /// Leading System / ProjectInstructions / Memory items never fold — they are
 /// the byte-stable prefix (L6) and the cheapest tokens in the window.
-fn preserved_prefix_len(items: &[Item]) -> usize {
+fn preserved_prefix_len<I: std::borrow::Borrow<Item>>(items: &[I]) -> usize {
     items
         .iter()
         .position(|i| {
             !matches!(
-                i,
+                i.borrow(),
                 Item::System { .. }
                     | Item::User {
                         synthetic: Some(
@@ -101,11 +118,11 @@ Be specific (paths, names, values). Omit pleasantries and tool mechanics.";
 /// Render the folded items as a plain transcript for the summarize call.
 /// Tool results are clipped per-item — the digest needs their gist, and the
 /// summarize call must stay far smaller than the window being compacted.
-pub fn summarize_prompt(folded: &[Item]) -> String {
+pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(folded: &[I]) -> String {
     const RESULT_CLIP: usize = 600;
     let mut out = String::from("Transcript to compress:\n\n");
     for item in folded {
-        match item {
+        match item.borrow() {
             Item::System { .. } | Item::Unknown => {}
             Item::User {
                 text, synthetic, ..
@@ -293,16 +310,18 @@ mod tests {
         let p = plan(&with_history, 10, usize::MAX).expect("plan");
         assert_eq!(p.prefix_end, 1, "instructions stay out of the fold");
         let digest = [digest_item("GOAL: test")];
+        let with_history: Vec<std::sync::Arc<Item>> =
+            with_history.into_iter().map(std::sync::Arc::new).collect();
         let applied = apply(&with_history, &p, &digest);
         assert!(matches!(
-            applied[0],
+            *applied[0],
             Item::User {
                 synthetic: Some(SyntheticReason::ProjectInstructions),
                 ..
             }
         ));
         assert!(matches!(
-            applied[1],
+            *applied[1],
             Item::User {
                 synthetic: Some(SyntheticReason::CompactionSummary),
                 ..

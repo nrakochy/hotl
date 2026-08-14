@@ -472,7 +472,7 @@ fn parallel_chunks<'a>(uses: &'a [ToolUse], registry: &hotl_tools::Registry) -> 
 /// verbatim tail the fold keeps. `None` when there is nothing to fold yet.
 fn spawn_speculation(
     shared: &Arc<SharedDeps>,
-    snapshot: &Arc<Vec<Item>>,
+    snapshot: &Arc<Vec<Arc<Item>>>,
     cancel: &CancellationToken,
 ) -> Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>> {
     let tail_budget = (shared.config.context_window as f64 * crate::actor::TAIL_RATIO) as u64;
@@ -748,7 +748,7 @@ struct Turn {
     /// will carry. Under leaf equality that prediction is exact, which is
     /// what makes the adopted request byte-identical to the sequential
     /// rebuild.
-    projected_tail: Vec<Item>,
+    projected_tail: Vec<Arc<Item>>,
 }
 
 impl Drop for Turn {
@@ -1115,7 +1115,7 @@ impl Turn {
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
         };
-        self.projected_tail.push(assistant.clone());
+        self.projected_tail.push(Arc::new(assistant.clone()));
         self.ledger.stamp(Phase::BatchProposed);
         // The `Completed` boundary is ONE causal event — the assistant item
         // and the usage it was billed at — so it commits as one `Group`:
@@ -1320,7 +1320,7 @@ impl Turn {
         // before `entries` moves into the proposal.
         self.projected_tail
             .extend(entries.iter().filter_map(|e| match e {
-                EntryPayload::Item { item } => Some(item.clone()),
+                EntryPayload::Item { item } => Some(Arc::new(item.clone())),
                 _ => None,
             }));
         // `restamp`, not `stamp`: this sample already proposed its own
@@ -1918,7 +1918,7 @@ impl Turn {
         // and nothing ephemeral is ever a `SubdirInstructions` item anyway.
         snapshot.durable.iter().any(|i| {
             matches!(
-                i,
+                &**i,
                 Item::User { text, synthetic: Some(hotl_types::SyntheticReason::SubdirInstructions), .. }
                     if text.contains(marker)
             )
@@ -2372,7 +2372,11 @@ const DRAIN_MAX: usize = 64;
 /// INVARIANT: everything committed after the anchored sample is counted exactly
 /// once. Enforced by `the_anchor_counts_tool_results_even_with_todos_active` and
 /// `compaction_still_triggers_with_todos_active`.
-fn anchored_estimate(anchor: Option<(u64, usize)>, system: &str, durable: &[Item]) -> u64 {
+fn anchored_estimate<I: std::borrow::Borrow<Item>>(
+    anchor: Option<(u64, usize)>,
+    system: &str,
+    durable: &[I],
+) -> u64 {
     use hotl_context::tokens;
     match anchor {
         Some((reported, len)) if durable.len() >= len => {
@@ -2408,9 +2412,9 @@ fn pair(tu: &ToolUse, message: &str, is_error: bool) -> ToolResultItem {
 /// the render text directly rather than round-tripping through `Vec<Todo>`:
 /// it's exactly what the model just sampled against, so the gate's read
 /// matches what produced the reply.
-fn unfinished_todos(tail: &[Item]) -> bool {
+fn unfinished_todos<I: std::borrow::Borrow<Item>>(tail: &[I]) -> bool {
     matches!(
-        tail.last(),
+        tail.last().map(std::borrow::Borrow::borrow),
         Some(Item::User {
             text,
             synthetic: Some(SyntheticReason::Todos),
@@ -2896,7 +2900,7 @@ mod tests {
 
     #[test]
     fn unfinished_todos_reads_only_the_tagged_last_item() {
-        assert!(!unfinished_todos(&[]));
+        assert!(!unfinished_todos::<Item>(&[]));
         // Untagged last item (an ordinary reply) never counts, even if it
         // happens to contain the marker text.
         assert!(!unfinished_todos(&[Item::User {

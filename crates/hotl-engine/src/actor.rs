@@ -86,7 +86,9 @@ struct PendingAck {
 /// which only [`run`] owns.
 pub struct ProjectionHead {
     /// The durable projection: exactly the items the log carries.
-    items: Arc<Vec<Item>>,
+    /// `Arc<Item>` elements (0033 Task 5): a shared-head `make_mut` clone is
+    /// pointer copies, never a deep copy of every string and image.
+    items: Arc<Vec<Arc<Item>>>,
     /// The `todo_write` checklist — ephemeral session context that is never
     /// canon and never an entry in `items`. It rides the head rather than
     /// being stitched into it, so the published value stays *the durable
@@ -137,9 +139,9 @@ impl ProjectionHead {
 /// The ephemeral suffix a set of todos renders to. One definition, shared by
 /// the published head and by the actor's own copy ([`Head::snapshot`]) — two
 /// would be two answers to "what rides after the cache marker".
-fn tail_for(todos: &[Todo]) -> Arc<Vec<Item>> {
+fn tail_for(todos: &[Todo]) -> Arc<Vec<Arc<Item>>> {
     match hotl_tools::todo::render_reminder(todos) {
-        Some(reminder) => Arc::new(vec![reminder]),
+        Some(reminder) => Arc::new(vec![Arc::new(reminder)]),
         None => empty_tail(),
     }
 }
@@ -182,18 +184,18 @@ fn tool_tokens(registry: &Registry) -> ToolTokens {
 #[derive(Clone, Debug)]
 pub struct Snapshot {
     /// The durable projection — byte-stable between supersede events.
-    pub durable: Arc<Vec<Item>>,
+    pub durable: Arc<Vec<Arc<Item>>>,
     /// Ephemeral per-sample suffix (todo reminder today), regenerated per
     /// read, never committed, rendered after every cache marker.
-    pub tail: Arc<Vec<Item>>,
+    pub tail: Arc<Vec<Arc<Item>>>,
 }
 
 /// The one shared empty ephemeral tail. A `OnceLock` rather than
 /// `Arc::new(Vec::new())` per call so that a session with no todos — the
 /// common case, and the one on the sample-boundary hot path — allocates
 /// nothing to say "nothing ephemeral here".
-pub(crate) fn empty_tail() -> Arc<Vec<Item>> {
-    static EMPTY: std::sync::OnceLock<Arc<Vec<Item>>> = std::sync::OnceLock::new();
+pub(crate) fn empty_tail() -> Arc<Vec<Arc<Item>>> {
+    static EMPTY: std::sync::OnceLock<Arc<Vec<Arc<Item>>>> = std::sync::OnceLock::new();
     Arc::clone(EMPTY.get_or_init(|| Arc::new(Vec::new())))
 }
 
@@ -218,7 +220,7 @@ pub(crate) fn head_channel() -> (
 /// property of one type rather than of every call site.
 struct Head {
     tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
-    items: Arc<Vec<Item>>,
+    items: Arc<Vec<Arc<Item>>>,
     todos: Arc<Vec<Todo>>,
     leaf: Option<String>,
     epoch: u64,
@@ -235,7 +237,7 @@ impl Head {
     ) -> Self {
         let mut head = Self {
             tx,
-            items: Arc::new(items),
+            items: Arc::new(items.into_iter().map(Arc::new).collect()),
             todos: Arc::new(todos),
             leaf: None,
             epoch: 0,
@@ -244,7 +246,7 @@ impl Head {
         head
     }
 
-    fn items(&self) -> &Arc<Vec<Item>> {
+    fn items(&self) -> &Arc<Vec<Arc<Item>>> {
         &self.items
     }
 
@@ -267,7 +269,7 @@ impl Head {
     /// `release_steers`), or a turn's refresh could observe the commit
     /// without the steer that overtook it.
     fn apply(&mut self, item: Item) {
-        Arc::make_mut(&mut self.items).push(item);
+        Arc::make_mut(&mut self.items).push(Arc::new(item));
     }
 
     /// Record the durable leaf and epoch an acked unit advanced the head to.
@@ -285,7 +287,7 @@ impl Head {
     /// `leaf`/`epoch`, and this is that entry taking effect. Unobservable
     /// mid-turn by construction — the actor terminates a turn *before*
     /// committing a compaction (§Read invariant).
-    fn repoint(&mut self, items: Vec<Item>) {
+    fn repoint(&mut self, items: Vec<Arc<Item>>) {
         self.items = Arc::new(items);
         self.publish();
     }
@@ -1394,9 +1396,9 @@ fn fold_images(
 /// Whether the projection is mid-batch: it ends on an assistant turn whose
 /// tool calls have no results yet. Both APIs require those results to be the
 /// very next message, so nothing else may be appended in this window.
-fn awaiting_tool_results(items: &[Item]) -> bool {
+fn awaiting_tool_results<I: std::borrow::Borrow<Item>>(items: &[I]) -> bool {
     matches!(
-        items.last(),
+        items.last().map(std::borrow::Borrow::borrow),
         Some(Item::Assistant { blocks }) if !hotl_types::assistant_tool_uses(blocks).is_empty()
     )
 }
@@ -1561,7 +1563,7 @@ async fn close_open_batch(
     head: &mut Head,
     pipeline: &mut Pipeline,
 ) {
-    let Some(Item::Assistant { blocks }) = head.items().last() else {
+    let Some(Item::Assistant { blocks }) = head.items().last().map(Arc::as_ref) else {
         return;
     };
     let results = unanswered_results(blocks);
@@ -1908,7 +1910,7 @@ async fn summarize_bounded(
     tokio::time::timeout(bound, fut).await.ok().flatten()
 }
 
-pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<String> {
+pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Arc<Item>]) -> Option<String> {
     let model = shared
         .config
         .fast_model
@@ -1918,11 +1920,11 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Item]) -> Option<St
         model,
         max_tokens: SUMMARIZE_MAX_TOKENS,
         system: compaction::SUMMARIZE_SYSTEM.into(),
-        items: Arc::new(vec![Item::User {
+        items: Arc::new(vec![Arc::new(Item::User {
             text: compaction::summarize_prompt(folded),
             synthetic: None,
             images: Vec::new(),
-        }]),
+        })]),
         // A summarize is a one-shot call against a prompt that is different
         // every time: nothing to cache, and nothing ephemeral to append.
         ephemeral_tail: empty_tail(),
@@ -2198,7 +2200,7 @@ mod tests {
             Vec::new(),
         );
         head.apply(Item::Assistant { blocks: Vec::new() });
-        let Item::User { images, .. } = &head.items()[0] else {
+        let Item::User { images, .. } = &*head.items()[0] else {
             panic!("user item")
         };
         // INVARIANT: `Arc::make_mut`'s clone stays pointer-sized per image.
@@ -2379,7 +2381,7 @@ mod tests {
         assert!(awaiting_tool_results(&[calls("t1")]));
         assert!(!awaiting_tool_results(&[says("hello")]));
         assert!(!awaiting_tool_results(&[calls("t1"), answers("t1")]));
-        assert!(!awaiting_tool_results(&[]));
+        assert!(!awaiting_tool_results::<Item>(&[]));
     }
 
     #[test]
@@ -2684,8 +2686,11 @@ mod tests {
 
         pipeline.drain(&mut head, Resolution::Ack).await;
         assert_eq!(
-            head.items().as_slice(),
-            [user("one"), user("two"), user("three")].as_slice()
+            head.items()
+                .iter()
+                .map(|i| (**i).clone())
+                .collect::<Vec<_>>(),
+            [user("one"), user("two"), user("three")]
         );
         let mut last = 0;
         for (i, ticket) in tickets.into_iter().enumerate() {

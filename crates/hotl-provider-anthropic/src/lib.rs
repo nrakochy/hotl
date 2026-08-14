@@ -303,8 +303,8 @@ pub(crate) fn is_foreign_reasoning(b: &Value) -> bool {
 /// `CachePolicy::Static`'s doc comment for why), regardless of what the
 /// caller passed. Ignored entirely when `plan` is `None` (the ephemeral tail
 /// has no plan and so never marks anything).
-fn build_messages(
-    items: &[Item],
+fn build_messages<I: std::borrow::Borrow<Item>>(
+    items: &[I],
     plan: Option<&cache_plan::Plan>,
     ttl: CacheTtl,
     send_images: bool,
@@ -321,7 +321,7 @@ fn build_messages(
     };
     let mut out = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
-        match item {
+        match item.borrow() {
             // System items never reach the wire from here — the system prompt
             // travels in the request's `system` field (context assembly owns it).
             Item::System { .. } | Item::Unknown => continue,
@@ -765,7 +765,7 @@ mod tests {
             model: "m".into(),
             max_tokens: 16,
             system: "".into(),
-            items: std::sync::Arc::new(vec![Item::User {
+            items: hotl_provider::arc_items(vec![Item::User {
                 text: "hi".into(),
                 synthetic: None,
                 images: Vec::new(),
@@ -1189,7 +1189,7 @@ mod tests {
             model: DEFAULT_MODEL.into(),
             max_tokens: 1024,
             system: "sys".into(),
-            items: std::sync::Arc::new(vec![
+            items: hotl_provider::arc_items(vec![
                 Item::User {
                     text: "instructions".into(),
                     synthetic: None,
@@ -1268,7 +1268,7 @@ mod tests {
         req.cache = CachePolicy::Static {
             prefix_ttl: CacheTtl::FiveMinutes,
         };
-        req.items = std::sync::Arc::new(vec![
+        req.items = hotl_provider::arc_items(vec![
             Item::User {
                 text: "durable instructions".into(),
                 synthetic: None,
@@ -1282,7 +1282,7 @@ mod tests {
                 }],
             },
         ]);
-        req.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
+        req.ephemeral_tail = hotl_provider::arc_items(vec![Item::User {
             text: "<todos>do the thing</todos>".into(),
             synthetic: Some(SyntheticReason::Todos),
             images: Vec::new(),
@@ -1336,7 +1336,7 @@ mod tests {
             model: DEFAULT_MODEL.into(),
             max_tokens: 1024,
             system: "sys".into(),
-            items: std::sync::Arc::new(vec![
+            items: hotl_provider::arc_items(vec![
                 Item::User {
                     text: "instructions".into(),
                     synthetic: None,
@@ -1368,7 +1368,7 @@ mod tests {
             turn_context: Some("<turn-context/>".into()),
         };
         let mut active = base.clone();
-        active.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
+        active.ephemeral_tail = hotl_provider::arc_items(vec![Item::User {
             text: "<todos>\n[~] a\n</todos>".into(),
             synthetic: Some(SyntheticReason::Todos),
             images: Vec::new(),
@@ -1436,7 +1436,7 @@ mod tests {
         let thinking =
             serde_json::json!({"type": "thinking", "thinking": "chain", "signature": "sig=="});
         let req = SamplingRequest {
-            items: std::sync::Arc::new(vec![Item::Assistant {
+            items: hotl_provider::arc_items(vec![Item::Assistant {
                 blocks: vec![
                     serde_json::json!({"type": "reasoning", "id": "rs_1", "encrypted_content": "gAAA=="}),
                     thinking.clone(),
@@ -1462,7 +1462,7 @@ mod tests {
     fn static_req(system: &str, items: Vec<Item>) -> SamplingRequest {
         SamplingRequest {
             system: system.into(),
-            items: std::sync::Arc::new(items),
+            items: hotl_provider::arc_items(items),
             cache: CachePolicy::Static {
                 prefix_ttl: CacheTtl::FiveMinutes,
             },
@@ -1822,7 +1822,7 @@ mod tests {
                 }]
                 .into();
                 req.turn_context = Some("<turn-context/>".into());
-                req.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
+                req.ephemeral_tail = hotl_provider::arc_items(vec![Item::User {
                     text: "<todos/>".into(),
                     synthetic: Some(SyntheticReason::Todos),
                     images: Vec::new(),

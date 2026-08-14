@@ -51,11 +51,13 @@ async fn next_event(s: &mut Session) -> EngineEvent {
 
 /// The index of a results item that does not sit directly behind the assistant
 /// turn that called for it — what the APIs reject.
-fn stranded_results(items: &[Item]) -> Option<usize> {
+fn stranded_results<I: std::borrow::Borrow<Item>>(items: &[I]) -> Option<usize> {
     items.iter().enumerate().position(|(i, item)| {
-        matches!(item, Item::ToolResults { .. })
+        matches!(item.borrow(), Item::ToolResults { .. })
             && !matches!(
-                i.checked_sub(1).and_then(|prev| items.get(prev)),
+                i.checked_sub(1)
+                    .and_then(|prev| items.get(prev))
+                    .map(std::borrow::Borrow::borrow),
                 Some(Item::Assistant { .. })
             )
     })
@@ -117,7 +119,7 @@ async fn a_steer_mid_batch_lands_after_the_results_not_before() {
     // The steer still has to reach the model — placed, not dropped.
     assert!(
         items.iter().any(|i| matches!(
-            i,
+            &**i,
             Item::User { text, .. } if text.contains("actually, be brief")
         )),
         "the steer must still be in the projection: {items:#?}"
@@ -167,7 +169,7 @@ async fn resumed_history_repairs_results_stranded_by_an_older_build() {
     );
     assert!(
         items.iter().any(|i| matches!(
-            i,
+            &**i,
             Item::User { text, .. } if text.contains("a steer that landed in the gap")
         )),
         "repair must move the steer, never drop it: {items:#?}"
@@ -176,10 +178,13 @@ async fn resumed_history_repairs_results_stranded_by_an_older_build() {
 
 /// The index of an assistant turn that called tools but is not immediately
 /// followed by their results — the dangling call both APIs reject.
-fn dangling_call(items: &[Item]) -> Option<usize> {
+fn dangling_call<I: std::borrow::Borrow<Item>>(items: &[I]) -> Option<usize> {
     items.iter().enumerate().position(|(i, item)| {
-        matches!(item, Item::Assistant { blocks } if !assistant_tool_uses(blocks).is_empty())
-            && !matches!(items.get(i + 1), Some(Item::ToolResults { .. }))
+        matches!(item.borrow(), Item::Assistant { blocks } if !assistant_tool_uses(blocks).is_empty())
+            && !matches!(
+                items.get(i + 1).map(std::borrow::Borrow::borrow),
+                Some(Item::ToolResults { .. })
+            )
     })
 }
 
@@ -252,10 +257,12 @@ async fn every_call_is_answered_once() {
 
     let items = &provider.last_request().expect("a request").items;
     for (i, item) in items.iter().enumerate() {
-        let Item::ToolResults { results } = item else {
+        let Item::ToolResults { results } = &**item else {
             continue;
         };
-        let Some(Item::Assistant { blocks }) = i.checked_sub(1).and_then(|p| items.get(p)) else {
+        let Some(Item::Assistant { blocks }) =
+            i.checked_sub(1).and_then(|p| items.get(p)).map(|a| &**a)
+        else {
             panic!("results at {i} have no assistant turn: {items:#?}");
         };
         assert_eq!(

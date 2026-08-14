@@ -826,9 +826,9 @@ impl SessionHandle {
 /// item is a user prompt or a batch of tool results the model never answered
 /// — i.e. an interrupted turn worth continuing on resume. A projection ending
 /// in an assistant item (or holding only instructions) is complete.
-pub fn needs_continuation(items: &[Item]) -> bool {
+pub fn needs_continuation<I: std::borrow::Borrow<Item>>(items: &[I]) -> bool {
     matches!(
-        items.last(),
+        items.last().map(std::borrow::Borrow::borrow),
         Some(Item::User { .. } | Item::ToolResults { .. })
     )
 }

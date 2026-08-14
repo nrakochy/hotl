@@ -158,10 +158,11 @@ impl Plan {
 /// Every durable item is a candidate regardless of its `synthetic` tag:
 /// ephemerality is positional now (`SamplingRequest::ephemeral_tail` is a
 /// separate list this planner never sees), so there is no tag to special-case.
-fn candidates(items: &[Item], send_images: bool) -> Vec<(usize, Mark)> {
+fn candidates<I: std::borrow::Borrow<Item>>(items: &[I], send_images: bool) -> Vec<(usize, Mark)> {
     let mut out = Vec::new();
     let mut before = 0usize;
     for (item, entry) in items.iter().enumerate() {
+        let entry = entry.borrow();
         match entry {
             // Only the trailing text block is markable: image blocks count
             // toward cumulative wire position (so crossings shift correctly)
@@ -214,7 +215,7 @@ fn crossings(cands: &[(usize, Mark)]) -> Vec<Mark> {
 /// same plan out, always — `send_images` comes from static catalog data and a
 /// fixed per-request model, so byte-identity across speculative and
 /// sequential rebuilds holds.
-pub(crate) fn plan(items: &[Item], send_images: bool) -> Plan {
+pub(crate) fn plan<I: std::borrow::Borrow<Item>>(items: &[I], send_images: bool) -> Plan {
     let cands = candidates(items, send_images);
     // The last candidate *is* the last durable user-role block, by
     // construction — the same position the pre-anchor serializer marked. (A
@@ -363,7 +364,7 @@ mod tests {
     /// Nothing to mark is a legal plan, not a panic.
     #[test]
     fn an_item_list_with_no_user_role_blocks_plans_nothing() {
-        let p = plan(&[], true);
+        let p = plan::<Item>(&[], true);
         assert!(p.anchors.is_empty() && p.latest.is_none());
         let p = plan(
             &[

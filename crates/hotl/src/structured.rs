@@ -198,7 +198,7 @@ mod tests {
         let second = &provider.requests()[1];
         assert!(
             second.items.iter().any(|i| matches!(
-                i,
+                &**i,
                 Item::User {
                     synthetic: Some(SyntheticReason::RetryFeedback),
                     ..

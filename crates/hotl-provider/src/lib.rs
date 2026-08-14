@@ -48,6 +48,13 @@ pub struct ToolDef {
     pub input_schema: Value,
 }
 
+/// Wrap plain items as a `SamplingRequest` item list (0033 Task 5: the
+/// projection holds `Arc<Item>` elements; fixtures and one-shot calls start
+/// from owned items).
+pub fn arc_items(items: Vec<Item>) -> std::sync::Arc<Vec<std::sync::Arc<Item>>> {
+    std::sync::Arc::new(items.into_iter().map(std::sync::Arc::new).collect())
+}
+
 #[derive(Debug, Clone)]
 pub struct SamplingRequest {
     pub model: String,
@@ -57,13 +64,13 @@ pub struct SamplingRequest {
     /// The **durable** projection only — exactly the items the session log
     /// carries. Byte-stable between supersede events, which is what makes it
     /// the one region a cache breakpoint may be placed in (L6 discipline).
-    pub items: Arc<Vec<Item>>,
+    pub items: Arc<Vec<Arc<Item>>>,
     /// Ephemeral per-sample suffix (the `<todos>` reminder today): regenerated
     /// on every read of the projection head, never committed, and serialized
     /// AFTER every cache marker (and before MOIM). Splitting it from `items`
     /// is what makes "a marker on ephemeral content" unrepresentable rather
     /// than merely avoided — a serializer has no ephemeral item to pick.
-    pub ephemeral_tail: Arc<Vec<Item>>,
+    pub ephemeral_tail: Arc<Vec<Arc<Item>>>,
     pub tools: Arc<[ToolDef]>,
     /// Adaptive thinking on models that support it.
     pub thinking: bool,

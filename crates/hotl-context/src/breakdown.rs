@@ -87,11 +87,11 @@ pub fn image_term(item: &Item) -> u64 {
 ///
 /// `window` is carried through untouched: free space is a display concept the
 /// client derives from `window`, the row sum, and the provider's own figure.
-pub fn breakdown(
+pub fn breakdown<I: std::borrow::Borrow<Item>>(
     system: &str,
     tools: ToolTokens,
-    durable: &[Item],
-    tail: &[Item],
+    durable: &[I],
+    tail: &[I],
     window: u64,
 ) -> ContextBreakdown {
     let mut acc = [0u64; ROWS.len()];
@@ -106,11 +106,13 @@ pub fn breakdown(
     add(ContextKind::AgentsRoster, tools.agents);
 
     for item in durable {
+        let item = item.borrow();
         let images = image_term(item);
         add(classify(item), estimate_item(item) - images);
         add(ContextKind::Images, images);
     }
     for item in tail {
+        let item = item.borrow();
         let images = image_term(item);
         add(ContextKind::Todos, estimate_item(item) - images);
         add(ContextKind::Images, images);
@@ -268,7 +270,7 @@ mod tests {
 
     #[test]
     fn an_empty_session_emits_every_row_at_zero() {
-        let b = breakdown("", ToolTokens::default(), &[], &[], 200_000);
+        let b = breakdown::<Item>("", ToolTokens::default(), &[], &[], 200_000);
         assert_eq!(b.rows.len(), ROWS.len());
         assert!(b.rows.iter().all(|r| r.tokens == 0));
         assert_eq!(b.window, 200_000);
@@ -291,7 +293,7 @@ mod tests {
             skills: 20,
             agents: 3,
         };
-        let b = breakdown("system prompt text", tools, &[], &[], 200_000);
+        let b = breakdown::<Item>("system prompt text", tools, &[], &[], 200_000);
         assert_eq!(row(&b, ContextKind::ToolSchemas), 100);
         assert_eq!(row(&b, ContextKind::SkillsRoster), 20);
         assert_eq!(row(&b, ContextKind::AgentsRoster), 3);

@@ -950,7 +950,7 @@ mod tests {
             model: "gpt-5.6-luna-1".into(),
             max_tokens: 16,
             system: "".into(),
-            items: std::sync::Arc::new(vec![Item::User {
+            items: hotl_provider::arc_items(vec![Item::User {
                 text: "hi".into(),
                 synthetic: None,
                 images: Vec::new(),
@@ -996,7 +996,7 @@ mod tests {
     #[test]
     fn the_ephemeral_tail_keeps_its_position_before_moim() {
         let mut req = sampling_req();
-        req.ephemeral_tail = std::sync::Arc::new(vec![Item::User {
+        req.ephemeral_tail = hotl_provider::arc_items(vec![Item::User {
             text: "<todos>\n[~] a\n</todos>".into(),
             synthetic: Some(hotl_types::SyntheticReason::Todos),
             images: Vec::new(),
@@ -1049,7 +1049,7 @@ mod tests {
             "summary": [{"type": "summary_text", "text": "thought"}],
         });
         let mut req = sampling_req();
-        req.items = std::sync::Arc::new(vec![Item::Assistant {
+        req.items = hotl_provider::arc_items(vec![Item::Assistant {
             blocks: vec![
                 reasoning.clone(),
                 json!({"type": "tool_use", "id": "call_1", "name": "read", "input": {"path": "a.rs"}}),
@@ -1075,7 +1075,7 @@ mod tests {
     #[test]
     fn foreign_thinking_blocks_are_dropped() {
         let mut req = sampling_req();
-        req.items = std::sync::Arc::new(vec![Item::Assistant {
+        req.items = hotl_provider::arc_items(vec![Item::Assistant {
             blocks: vec![
                 json!({"type": "thinking", "thinking": "secret chain", "signature": "sig=="}),
                 json!({"type": "redacted_thinking", "data": "d"}),
@@ -1095,7 +1095,7 @@ mod tests {
     #[test]
     fn tool_result_errors_are_legible_in_the_responses_dialect() {
         let mut req = sampling_req();
-        req.items = std::sync::Arc::new(vec![Item::ToolResults {
+        req.items = hotl_provider::arc_items(vec![Item::ToolResults {
             results: vec![
                 ToolResultItem {
                     tool_use_id: "ok".into(),
@@ -1139,7 +1139,7 @@ mod tests {
     #[test]
     fn image_parts_render_as_data_urls_before_the_text_part() {
         let mut req = sampling_req();
-        req.items = std::sync::Arc::new(vec![Item::User {
+        req.items = hotl_provider::arc_items(vec![Item::User {
             text: "what is this?".into(),
             synthetic: None,
             images: vec![hotl_types::UserImage {

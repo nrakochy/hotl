@@ -114,10 +114,10 @@ pub const IMAGE_TOKENS_ESTIMATE: u64 = 1600;
 
 /// Base64 image bytes in a projection. The estimator charges images a flat
 /// token price on purpose, so bytes need their own accounting — this is it.
-pub fn image_b64_bytes(items: &[Item]) -> usize {
+pub fn image_b64_bytes<I: std::borrow::Borrow<Item>>(items: &[I]) -> usize {
     items
         .iter()
-        .map(|i| match i {
+        .map(|i| match i.borrow() {
             Item::User { images, .. } => images.iter().map(|im| im.data.len()).sum(),
             _ => 0,
         })
@@ -163,12 +163,18 @@ fn estimate_block(block: &serde_json::Value, profile: &TokenProfile) -> u64 {
         .sum()
 }
 
-pub fn estimate_items(items: &[Item]) -> u64 {
+pub fn estimate_items<I: std::borrow::Borrow<Item>>(items: &[I]) -> u64 {
     estimate_items_with(items, &TokenProfile::CONSERVATIVE)
 }
 
-pub fn estimate_items_with(items: &[Item], profile: &TokenProfile) -> u64 {
-    items.iter().map(|i| estimate_item_with(i, profile)).sum()
+pub fn estimate_items_with<I: std::borrow::Borrow<Item>>(
+    items: &[I],
+    profile: &TokenProfile,
+) -> u64 {
+    items
+        .iter()
+        .map(|i| estimate_item_with(i.borrow(), profile))
+        .sum()
 }
 
 #[cfg(test)]
@@ -249,7 +255,7 @@ mod tests {
             images: Vec::new(),
         };
         assert_eq!(estimate_item(&empty), ITEM_OVERHEAD);
-        assert_eq!(estimate_items(&[]), 0);
+        assert_eq!(estimate_items::<Item>(&[]), 0);
         // Two empty items cost exactly two envelopes.
         assert_eq!(estimate_items(&[empty.clone(), empty]), 2 * ITEM_OVERHEAD);
     }
