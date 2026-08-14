@@ -39,19 +39,15 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         Ok(a) => a,
         Err(code) => return code,
     };
-    let (factory, model, info) = match crate::agent::acp_factory().await {
-        Ok(triple) => triple,
-        Err(code) => return code,
-    };
     let cfg = crate::config::Config::load(&crate::agent::config_dir());
     // Prompt-history tail, loaded (and startup-compacted) before the screen is
     // taken; the store is handed to the loop to append each submitted prompt.
     // Startup-only on purpose — `/reload` does not re-read `[history]`.
     let (history_store, history) =
         crate::history::History::load(&cfg.history, &crate::agent::data_dir());
-    if let Some(hint) = crate::setup::first_run_hint(&crate::agent::config_dir()) {
-        eprintln!("hotl: {hint}");
-    }
+    // Deferred to a transcript notice: with the composer painted immediately
+    // (0033 Task 8b), a stderr line would only flash under the alt screen.
+    let first_run_hint = crate::setup::first_run_hint(&crate::agent::config_dir());
     // The same read `/reload` repeats. Warnings print as plain lines here,
     // before the alternate screen owns stdout; on reload they become notices.
     let settings = client_settings();
@@ -59,32 +55,8 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         eprintln!("hotl: {w}");
     }
 
-    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
-    let (sread, swrite) = tokio::io::split(server_io);
-    // `serve_with_reload`, not `serve`: `/reload` asks the engine to rebuild
-    // itself from `config.toml`. The TUI stays a pure ACP client — it hands
-    // over the hook and never calls it.
-    tokio::spawn(crate::acp::serve(
-        sread,
-        swrite,
-        factory,
-        info,
-        Some(crate::agent::reload_hook()),
-    ));
-    let (cread, cwrite) = tokio::io::split(client_io);
-    let mut reader = BufReader::new(cread);
-    let mut client = AcpClient::new(cwrite);
-
-    let opened = match handshake(&mut client, &mut reader, tui_args).await {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("hotl: {e}");
-            return 1;
-        }
-    };
-
     let suspended = Arc::new(AtomicBool::new(false));
-    let keys = spawn_key_reader(suspended.clone());
+    let mut keys = spawn_key_reader(suspended.clone());
     // Armed before the screen is taken: a signal or panic between here and
     // the guard's `Drop` must not strand the terminal in raw mode.
     crate::term::restore_on_panic();
@@ -92,6 +64,60 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut guard = match TerminalGuard::enter(settings.mouse) {
         Ok(g) => g,
         Err(e) => {
+            eprintln!("hotl: {e}");
+            return 1;
+        }
+    };
+
+    // 0033 Task 8b: paint the composer NOW and hydrate behind it. Nothing
+    // about session hydration is a render dependency — the one true
+    // sequencing constraint (session-start items commit before the first
+    // prompt commit) gates the first *send*, and sends only exist in the
+    // post-open loop. The neutral state renders NO mode badge (never a
+    // guessed one) and a quiet "starting" strip.
+    let mut state = State::new(settings.vim_mode, String::new());
+    state.mode = String::new();
+    state.density = settings.density;
+    state.editor.load_history(history);
+    let mut cache = TranscriptCache::default();
+    let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut open = std::pin::pin!(open_session(tui_args));
+    let opened = loop {
+        if let Err(e) = guard
+            .terminal
+            .draw(|f| view(&state, &settings.palette, &mut cache, f))
+        {
+            drop(guard);
+            eprintln!("hotl: {e}");
+            return 1;
+        }
+        tokio::select! {
+            o = &mut open => break o,
+            ev = keys.recv() => match ev {
+                Some(ev) => {
+                    if let Some(msg) = terminal_msg(ev, settings.copy_on_select) {
+                        hotl_tui::app::pre_open_input(&mut state, msg);
+                    }
+                }
+                None => return 1,
+            },
+            _ = ticker.tick() => {}
+        }
+    };
+    let (mut client, mut reader, model, opened) = match opened {
+        Ok(o) => o,
+        Err(OpenFail::Code(code)) => {
+            drop(guard);
+            // The factory's own diagnostics went to the (now discarded) alt
+            // screen; leave a pointer that survives the restore.
+            eprintln!(
+                "hotl: session startup failed — run `hotl doctor` (or `hotl -p \"hi\"`) to see the error"
+            );
+            return code;
+        }
+        Err(OpenFail::Msg(e)) => {
+            drop(guard);
             eprintln!("hotl: {e}");
             return 1;
         }
@@ -104,17 +130,24 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         default_effort,
         context_window,
     } = opened;
-    let mut state = State::new(settings.vim_mode, model);
+    state.model = model;
     state.session_name = session_name;
-    // Server-side truth, seeded before the first draw: the badge must never
-    // render a mode the session is not actually running (evaluation §5.7).
+    // Server-side truth, seeded before the post-open loop's first draw: the
+    // badge must never render a mode the session is not actually running
+    // (evaluation §5.7) — pre-open it rendered none at all.
     state.mode = mode;
     state.plan = plan;
     state.default_effort = default_effort;
     state.context_window = context_window;
     state.set_skills(skills);
-    state.density = settings.density;
-    state.editor.load_history(history);
+    if let Some(hint) = first_run_hint {
+        state
+            .transcript
+            .push(hotl_tui::app::TranscriptItem::Notice { text: hint.into() });
+    }
+    // A prompt typed and entered during the open window fires now, through
+    // the normal submit path — exactly one SendPrompt, history included.
+    let initial: VecDeque<Cmd> = hotl_tui::app::fire_queued_submit(&mut state).into();
     let result = run_loop(
         &mut guard,
         &mut client,
@@ -125,6 +158,8 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         settings.palette,
         history_store,
         settings.copy_on_select,
+        cache,
+        initial,
     )
     .await;
     drop(guard);
@@ -135,6 +170,40 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
             1
         }
     }
+}
+
+/// How an [`open_session`] failure surfaces: the factory exits with a code
+/// (it printed its own diagnostics), the handshake with a message.
+enum OpenFail {
+    Code(i32),
+    Msg(String),
+}
+
+/// The whole open sequence — factory, in-process server, handshake — as one
+/// future the pre-open loop drives concurrently with typing (0033 Task 8b).
+async fn open_session(
+    tui_args: TuiArgs,
+) -> Result<(Client, ServerReader, String, Opened), OpenFail> {
+    let (factory, model, info) = crate::agent::acp_factory().await.map_err(OpenFail::Code)?;
+    let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server_io);
+    // `serve` with the reload hook: `/reload` asks the engine to rebuild
+    // itself from `config.toml`. The TUI stays a pure ACP client — it hands
+    // over the hook and never calls it.
+    tokio::spawn(crate::acp::serve(
+        sread,
+        swrite,
+        factory,
+        info,
+        Some(crate::agent::reload_hook()),
+    ));
+    let (cread, cwrite) = tokio::io::split(client_io);
+    let mut reader = BufReader::new(cread);
+    let mut client = AcpClient::new(cwrite);
+    let opened = handshake(&mut client, &mut reader, tui_args)
+        .await
+        .map_err(OpenFail::Msg)?;
+    Ok((client, reader, model, opened))
 }
 
 /// Session settings from the handshake pair. The session's own `mode` wins
@@ -302,47 +371,23 @@ async fn run_loop(
     mut palette: Palette,
     mut history: crate::history::History,
     mut copy_on_select: bool,
+    // Carried over from the pre-open loop (0033 Task 8b) so the transition
+    // does not re-wrap what is already rendered.
+    mut cache: TranscriptCache,
+    // Startup commands — the queued pre-open submit — drained before the
+    // first select, through the same machinery every per-msg command uses.
+    mut queue: VecDeque<Cmd>,
 ) -> io::Result<i32> {
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
     // The animation's own rate, armed only while a turn runs — idle schedules
     // no wakeups, which is also why the idle wave is a frozen frame.
     let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
-    // Lives for the whole loop: an animation tick redraws the strip without
-    // re-wrapping a transcript that did not change.
-    let mut cache = TranscriptCache::default();
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // 0033 Task 2: deltas mark the frame dirty and ride the 30 Hz tick that
     // is armed exactly when deltas can arrive; everything else draws now.
     let mut needs_draw = true;
     loop {
-        // No `needs_draw = false` here: every path below reassigns it before
-        // this line runs again (redraw-only `continue`, or the loop bottom).
-        if needs_draw {
-            guard
-                .terminal
-                .draw(|f| view(&state, &palette, &mut cache, f))?;
-        }
-        let msg = tokio::select! {
-            ev = keys.recv() => match ev {
-                Some(ev) => terminal_msg(ev, copy_on_select), // `None` = redraw-only (resize, mouse motion)
-                None => return Ok(1),
-            },
-            sm = read_server_msg(reader) => match sm {
-                Some(m) => translate(m, &mut prompt_ids, &mut steer_ids),
-                None => return Ok(1), // server hung up
-            },
-            _ = ticker.tick(), if state.phase != Phase::Idle => Some(Msg::Tick),
-        };
-        let Some(msg) = msg else {
-            needs_draw = true; // redraw-only: resize, mouse motion
-            continue;
-        };
-        // Decided before `update` consumes the msg; applied after the cmd
-        // queue drains. The Idle guard covers the impossible-but-cheap case
-        // of a delta arriving with no tick armed to flush it.
-        let defer = defers_draw(&msg);
-        let mut queue: VecDeque<Cmd> = update(&mut state, msg).into();
         while let Some(cmd) = queue.pop_front() {
             // The wire-bound half is shared with the e2e harness; what comes
             // back is the terminal-bound remainder this loop owns.
@@ -393,6 +438,34 @@ async fn run_loop(
                 handled => debug_assert!(false, "unhandled cmd: {handled:?}"),
             }
         }
+        // No `needs_draw = false` here: every path below reassigns it before
+        // this line runs again (redraw-only `continue`, or the loop bottom).
+        if needs_draw {
+            guard
+                .terminal
+                .draw(|f| view(&state, &palette, &mut cache, f))?;
+        }
+        let msg = tokio::select! {
+            ev = keys.recv() => match ev {
+                Some(ev) => terminal_msg(ev, copy_on_select), // `None` = redraw-only (resize, mouse motion)
+                None => return Ok(1),
+            },
+            sm = read_server_msg(reader) => match sm {
+                Some(m) => translate(m, &mut prompt_ids, &mut steer_ids),
+                None => return Ok(1), // server hung up
+            },
+            _ = ticker.tick(), if state.phase != Phase::Idle => Some(Msg::Tick),
+        };
+        let Some(msg) = msg else {
+            needs_draw = true; // redraw-only: resize, mouse motion
+            continue;
+        };
+        // Decided before `update` consumes the msg; applied after the cmd
+        // queue drains at the top of the next iteration. The Idle guard
+        // covers the impossible-but-cheap case of a delta arriving with no
+        // tick armed to flush it.
+        let defer = defers_draw(&msg);
+        queue = update(&mut state, msg).into();
         needs_draw = !defer || state.phase == Phase::Idle;
     }
 }

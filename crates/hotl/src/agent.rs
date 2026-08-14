@@ -2564,36 +2564,58 @@ fn initial_items(
     items
 }
 
+/// The shared deadline for the orientation's git reads (0033 Task 8a): the
+/// backstop that keeps a wedged repo (cold NFS, giant index) from holding
+/// the first turn hostage. Expiry degrades that field to empty —
+/// `workspace_orientation` already renders partial inputs.
+const ORIENTATION_CAP: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// `program args` in `cwd`; stdout lines on success, empty on any failure or
+/// after `timeout`. Output is read on a thread — NOT `try_wait` polling on a
+/// piped child, which would deadlock against an unread pipe once the child's
+/// output exceeds the pipe buffer. On timeout the child is disowned, not
+/// killed: it exits on its own and the reader thread with it (bounded,
+/// benign).
+fn run_capped(
+    program: &str,
+    args: &[&str],
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Vec<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        // Orientation is about `cwd`; an inherited GIT_DIR would describe
+        // some other repo entirely (and has corrupted one before).
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE");
+    std::thread::spawn(move || {
+        let _ = tx.send(cmd.output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(o)) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// Gather branch/status/commits/top-level for the orientation item (0032);
 /// hotl-context stays pure, so the git runs live here. Any failure is an
-/// empty input. Local metadata reads, so no timeout machinery — a
-/// pathological repo making session start slow earns a tracker row first.
+/// empty input. The three git reads run concurrently against one shared
+/// [`ORIENTATION_CAP`] deadline (0033 Task 8a), so the wall cost is
+/// `min(slowest command, cap)` instead of the serial sum.
 fn workspace_orientation_item(cwd: &std::path::Path) -> Option<hotl_types::Item> {
-    let git = |args: &[&str]| -> Vec<String> {
-        std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            // Orientation is about `cwd`; an inherited GIT_DIR would describe
-            // some other repo entirely (and has corrupted one before).
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_WORK_TREE")
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| {
-                String::from_utf8_lossy(&o.stdout)
-                    .lines()
-                    .filter(|l| !l.is_empty())
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default()
+    let capped = |args: &'static [&'static str]| {
+        let cwd = cwd.to_path_buf();
+        std::thread::spawn(move || run_capped("git", args, &cwd, ORIENTATION_CAP))
     };
-    let branch = git(&["rev-parse", "--abbrev-ref", "HEAD"])
-        .into_iter()
-        .next();
-    let status = git(&["status", "--porcelain"]);
-    let commits = git(&["log", "-5", "--format=%s"]);
+    let branch_t = capped(&["--no-optional-locks", "rev-parse", "--abbrev-ref", "HEAD"]);
+    let status_t = capped(&["--no-optional-locks", "status", "--porcelain"]);
+    let commits_t = capped(&["--no-optional-locks", "log", "-5", "--format=%s"]);
     let mut top: Vec<String> = std::fs::read_dir(cwd)
         .map(|rd| {
             rd.filter_map(|e| e.ok())
@@ -2608,6 +2630,9 @@ fn workspace_orientation_item(cwd: &std::path::Path) -> Option<hotl_types::Item>
         })
         .unwrap_or_default();
     top.sort();
+    let branch = branch_t.join().unwrap_or_default().into_iter().next();
+    let status = status_t.join().unwrap_or_default();
+    let commits = commits_t.join().unwrap_or_default();
     hotl_context::workspace_orientation(branch.as_deref(), &status, &commits, &top)
 }
 
@@ -3690,6 +3715,35 @@ mod fork_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0033 Task 8a: the deadline is real — a wedged command degrades to an
+    /// empty input instead of holding session start hostage.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_returns_empty_on_deadline() {
+        let t = std::time::Instant::now();
+        let out = run_capped(
+            "sh",
+            &["-c", "sleep 5"],
+            std::path::Path::new("/"),
+            std::time::Duration::from_millis(200),
+        );
+        assert!(out.is_empty());
+        assert!(t.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    /// The success path still returns stdout lines, empties filtered.
+    #[cfg(unix)]
+    #[test]
+    fn run_capped_returns_lines_on_success() {
+        let out = run_capped(
+            "sh",
+            &["-c", "printf 'a\\n\\nb\\n'"],
+            std::path::Path::new("/"),
+            std::time::Duration::from_secs(5),
+        );
+        assert_eq!(out, ["a", "b"]);
+    }
 
     /// The headless SIGINT ladder (mirror of the TUI's Ctrl-C): the first
     /// Ctrl-C interrupts the turn and keeps draining; the second stops

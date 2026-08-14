@@ -259,6 +259,13 @@ fn parse_serve_args(args: &[String]) -> (String, Option<String>, Option<String>)
 /// and `tui::load_image`'s decode-plus-base64 work. Read once, synchronously,
 /// before the runtime exists — config loading itself needs no async.
 fn block_on(f: impl std::future::Future<Output = i32>) -> i32 {
+    // Warm the sandbox floor probe (a real confined-canary spawn, OnceLock-
+    // memoized) so its ~100ms overlaps startup instead of serializing inside
+    // scaffold(). Reads only HOTL_SANDBOX from the env — safe this early;
+    // `OnceLock::get_or_init` blocks any concurrent second caller until this
+    // first one finishes, so existing call sites only ever observe *earlier*
+    // answers (0033 Task 8c).
+    std::thread::spawn(hotl_tools::sandbox::probe);
     let mut builder = tokio::runtime::Builder::new_current_thread();
     builder.enable_all();
     if let Some(n) = resolve_blocking_threads() {

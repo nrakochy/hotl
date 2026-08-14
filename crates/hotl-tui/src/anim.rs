@@ -358,6 +358,11 @@ pub fn strip_text(state: &State) -> String {
         // "which model is this?" is still an open question — every other arm
         // is already reporting on a turn that model is running.
         Phase::Idle => {
+            // Pre-open (0033 Task 8b): no session behind the composer yet —
+            // the strip says so quietly. `mode` is never empty once open.
+            if state.mode.is_empty() {
+                return "starting…".to_string();
+            }
             let mut parts = Vec::new();
             let model = hotl_types::bare_model(&state.model);
             if !model.is_empty() {

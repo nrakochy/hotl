@@ -322,6 +322,11 @@ pub struct State {
     /// Running totals across every turn, the basis of `usage_line`.
     pub session_usage: SessionUsage,
     pub help_open: bool,
+    /// A draft the user entered before the session opened (0033 Task 8b):
+    /// `pre_open_input` sets it instead of submitting — there is no session
+    /// to send to yet — and `fire_queued_submit` replays it through the
+    /// normal path the moment the session opens.
+    pub queued_submit: bool,
     /// First Esc sent a cancel; suppresses duplicate notices until the result.
     pub interrupt_sent: bool,
     /// Turns the user detached from (second Esc) whose prompt results are
@@ -420,6 +425,7 @@ impl State {
             usage_line: None,
             session_usage: SessionUsage::default(),
             help_open: false,
+            queued_submit: false,
             interrupt_sent: false,
             detached_turns: 0,
             pending_auto_rule: None,
@@ -1390,6 +1396,47 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     }
 }
 
+/// 0033 Task 8b: composer-only handling for the pre-open window — the
+/// terminal is up but the session is not. Typing, editing and paste behave
+/// exactly as normal; Enter marks the draft queued instead of submitting
+/// (`fire_queued_submit` replays it on open); everything session-addressed
+/// — slash commands included — stays inert, buffered as text.
+pub fn pre_open_input(state: &mut State, msg: Msg) {
+    match msg {
+        Msg::Key(key) => {
+            let event = state.editor.handle(key);
+            refresh(state);
+            if let EditorEvent::Submit(text) = event {
+                // The editor already reset its buffer; put the draft back so
+                // the open transition submits exactly what was typed.
+                state.editor.set_text(&text);
+                if !text.trim().is_empty() {
+                    state.queued_submit = true;
+                }
+            }
+            // Scroll/external-editor events are inert: there is no transcript
+            // to scroll and no suspend machinery running yet.
+        }
+        // The paste arm of `update` touches only the editor and the
+        // attachment side table — safe pre-open, and reusing it keeps the
+        // marker bookkeeping in one place.
+        Msg::Paste(_) => {
+            let _ = update(state, msg);
+        }
+        _ => {}
+    }
+}
+
+/// The open transition (0033 Task 8b): replay the queued draft through the
+/// normal Enter path — history append, token expansion, exactly one
+/// `Cmd::SendPrompt` — as if the user had pressed Enter right now.
+pub fn fire_queued_submit(state: &mut State) -> Vec<Cmd> {
+    if !std::mem::take(&mut state.queued_submit) {
+        return Vec::new();
+    }
+    on_key(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+}
+
 /// The Esc ladder: the first press asks the engine to cancel; the second
 /// stops waiting for the answer. Control returns unconditionally — the
 /// client must never depend on the server to hand the prompt line back.
@@ -2014,6 +2061,58 @@ mod tests {
     /// A non-`Char` key with modifiers (Ctrl-Home, Ctrl-End, …).
     fn press_mod(s: &mut State, code: KeyCode, mods: KeyModifiers) -> Vec<Cmd> {
         update(s, Msg::Key(KeyEvent::new(code, mods)))
+    }
+
+    /// 0033 Task 8b: printable keys land in the composer; Enter queues the
+    /// draft (no Cmd, no transcript item, no phase change — there is no
+    /// session yet); the open transition then fires exactly one SendPrompt.
+    #[test]
+    fn pre_open_typing_queues_and_the_open_transition_submits_once() {
+        let mut s = State::new(false, "m".into());
+        for c in "hi there".chars() {
+            pre_open_input(
+                &mut s,
+                Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        assert_eq!(s.editor.text(), "hi there");
+        assert!(!s.queued_submit, "typing alone must not queue");
+        pre_open_input(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(s.queued_submit, "Enter queues the draft");
+        assert_eq!(s.editor.text(), "hi there", "the draft survives the queue");
+        assert!(s.transcript.is_empty(), "nothing echoes before the session");
+        assert_eq!(s.phase, Phase::Idle);
+
+        let cmds = fire_queued_submit(&mut s);
+        let prompts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Cmd::SendPrompt(p) => Some(p.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts, ["hi there"], "exactly one SendPrompt: {cmds:?}");
+        assert!(!s.queued_submit, "the queue is one-shot");
+        assert!(
+            fire_queued_submit(&mut s).is_empty(),
+            "a second transition fires nothing"
+        );
+    }
+
+    /// An empty Enter pre-open queues nothing, and an unqueued open
+    /// transition emits nothing.
+    #[test]
+    fn pre_open_empty_enter_never_queues() {
+        let mut s = State::new(false, "m".into());
+        pre_open_input(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert!(!s.queued_submit);
+        assert!(fire_queued_submit(&mut s).is_empty());
     }
 
     fn notices(n: usize) -> Vec<TranscriptItem> {

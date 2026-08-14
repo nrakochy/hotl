@@ -1156,8 +1156,10 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // Both axes ride one chip (`plan · bypass`): they are independent, and a
     // badge showing only the mode would hide half the posture.
     // INVARIANT: every mode renders its own name. Enforced by
-    // `the_mode_badge_is_always_drawn`.
-    {
+    // `the_mode_badge_is_always_drawn`. The one badge-less state is
+    // pre-open (0033 Task 8b, `mode` empty): no session exists yet, and
+    // rendering *no* mode is the only honest option — never a guessed one.
+    if !state.mode.is_empty() {
         let chip = if state.plan {
             format!(" plan · {} ", state.mode)
         } else {
