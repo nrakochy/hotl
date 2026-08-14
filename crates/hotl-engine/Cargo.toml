@@ -18,12 +18,12 @@ default = ["minify"]
 minify = ["hotl-retrieval/minify", "hotl-tools/minify"]
 
 [dependencies]
-hotl-types = { path = "../hotl-types", version = "0.14.0" }
-hotl-platform = { path = "../hotl-platform", version = "0.14.0" }
-hotl-provider = { path = "../hotl-provider", version = "0.14.0" }
-hotl-context = { path = "../hotl-context", version = "0.14.0" }
-hotl-tools = { path = "../hotl-tools", version = "0.14.0", default-features = false }
-hotl-store = { path = "../hotl-store", version = "0.14.0" }
+hotl-types = { path = "../hotl-types", version = "0.15.0" }
+hotl-platform = { path = "../hotl-platform", version = "0.15.0" }
+hotl-provider = { path = "../hotl-provider", version = "0.15.0" }
+hotl-context = { path = "../hotl-context", version = "0.15.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.15.0", default-features = false }
+hotl-store = { path = "../hotl-store", version = "0.15.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 futures-util = { workspace = true }
@@ -34,7 +34,7 @@ thiserror = { workspace = true }
 # dependency yet outside hotl-tools/hotl, so pinned locally here too.
 
 [dev-dependencies]
-hotl-retrieval = { path = "../hotl-retrieval", version = "0.14.0", default-features = false }
+hotl-retrieval = { path = "../hotl-retrieval", version = "0.15.0", default-features = false }
 tempfile = { workspace = true }
 # test-util: paused-clock tests measure summarize/sample overlap deterministically.
 tokio = { workspace = true, features = ["test-util"] }

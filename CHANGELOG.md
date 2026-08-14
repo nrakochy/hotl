@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-14
+
 ### Changed
 
 - **Sessions spend fewer round trips — and cheaper ones — on the same task.**
