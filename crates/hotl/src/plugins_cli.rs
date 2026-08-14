@@ -410,7 +410,7 @@ mod tests {
         write_plugin(&plug, "team", true);
         add(dir.path(), dir.path(), "team", &plug.to_string_lossy()).unwrap();
         // Simulate accumulated server state.
-        let data = dir.path().join("plugin-data/team");
+        let data = dir.path().join("plugin-data").join("team");
         std::fs::create_dir_all(&data).unwrap();
         std::fs::write(data.join("cache.db"), b"state").unwrap();
 

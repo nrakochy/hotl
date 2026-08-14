@@ -2365,7 +2365,11 @@ path_prefix = "/Volumes/secrets"
                 ("PLUGIN_ROOT".to_string(), root.display().to_string()),
                 (
                     "PLUGIN_DATA".to_string(),
-                    data_dir.join("plugin-data/acme").display().to_string()
+                    data_dir
+                        .join("plugin-data")
+                        .join("acme")
+                        .display()
+                        .to_string()
                 ),
             ]
         );
