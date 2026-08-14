@@ -1422,7 +1422,7 @@ async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> Too
     tokio::pin!(wait);
 
     tokio::select! {
-        result = &mut wait => Ok(shell_outcome(result)),
+        result = &mut wait => Ok(shell_outcome(result, sandbox_status())),
         _ = tokio::time::sleep(std::time::Duration::from_millis(timeout_ms)) => {
             kill_tree(&reaper);
             Err(ToolOutcome::err(format!(
@@ -1553,7 +1553,29 @@ async fn drain_capped<R: tokio::io::AsyncRead + Unpin>(reader: Option<R>, cap: u
     buf
 }
 
-fn shell_outcome(result: std::io::Result<(std::process::ExitStatus, Vec<u8>)>) -> ToolOutcome {
+/// A sandbox write-denial reads as a bare EPERM/EACCES to the model, which
+/// then burns samples diagnosing policy it cannot see. Name the policy once.
+fn sandbox_denial_hint(text: &str, status: &SandboxStatus) -> Option<&'static str> {
+    if !matches!(status, SandboxStatus::Enforced(_)) {
+        return None;
+    }
+    let denied = text.contains("Operation not permitted")
+        || text.contains("Permission denied")
+        || text.contains("Read-only file system");
+    denied.then_some(
+        "\n<system-hint>this command ran inside hotl's filesystem sandbox: writes are \
+         allowed only under the workspace, the temp dir, and [sandbox].writable \
+         entries. If this failed on a denied write outside those (toolchain caches \
+         like ~/.cargo, ~/.npm, ~/.cache are common), do not work around it — tell \
+         the user to add that directory to [sandbox].writable in \
+         ~/.config/hotl/config.toml and re-run.</system-hint>",
+    )
+}
+
+fn shell_outcome(
+    result: std::io::Result<(std::process::ExitStatus, Vec<u8>)>,
+    sandbox: &SandboxStatus,
+) -> ToolOutcome {
     let (status, bytes) = match result {
         Ok(o) => o,
         Err(e) => return ToolOutcome::err(format!("Failed waiting on command: {e}.")),
@@ -1581,7 +1603,11 @@ fn shell_outcome(result: std::io::Result<(std::process::ExitStatus, Vec<u8>)>) -
             "[exit unknown]".to_string(),
         ),
     };
-    ToolOutcome::err(format!("Command exited with {label}.\n{text}\n{trailer}"))
+    let mut content = format!("Command exited with {label}.\n{text}\n{trailer}");
+    if let Some(h) = sandbox_denial_hint(&text, sandbox) {
+        content.push_str(h);
+    }
+    ToolOutcome::err(content)
 }
 
 /// How a child died, when it did not exit with a status of its own.
@@ -2613,5 +2639,29 @@ mod tests {
             json!({"command": "sleep 5", "timeout_ms": 200}),
         );
         assert!(t.is_error && t.content.contains("timed out"));
+    }
+
+    #[test]
+    fn a_denial_under_an_enforced_sandbox_gets_the_hint() {
+        let hint = sandbox_denial_hint(
+            "mkdir: /Users/you/.cargo/registry: Operation not permitted",
+            &SandboxStatus::Enforced("seatbelt"),
+        )
+        .expect("an enforced-sandbox denial must name the policy");
+        assert!(hint.contains("[sandbox].writable"), "{hint}");
+    }
+
+    #[test]
+    fn no_hint_when_the_sandbox_is_off_or_the_text_is_clean() {
+        let denial = "touch: cannot touch '/etc/x': Permission denied";
+        assert!(sandbox_denial_hint(denial, &SandboxStatus::Disabled).is_none());
+        assert!(
+            sandbox_denial_hint(denial, &SandboxStatus::Unavailable("no mechanism".into()))
+                .is_none()
+        );
+        assert!(
+            sandbox_denial_hint("exit 1: tests failed", &SandboxStatus::Enforced("seatbelt"))
+                .is_none()
+        );
     }
 }

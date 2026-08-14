@@ -376,6 +376,13 @@ writable = ["~/Library/Caches/bazel", "~/.bazel_disk_cache"]
 file_tools = "workspace"   # optional; see below
 ```
 
+When a sandboxed command fails on one of these denied writes, the result the model sees names the sandbox and points here — you'll be asked to add the directory rather than watching the agent work around it. Ready-to-paste set for the common toolchain caches:
+
+```toml
+# [sandbox]
+# writable = ["~/.cargo", "~/.npm", "~/.cache", "~/go", "~/.gradle", "~/.m2"]
+```
+
 `writable` entries are absolute paths (`~/` expands). Each is created if missing (Landlock can only grant access to a directory that exists when the sandbox is built), canonicalized (symlinks resolved), and validated:
 
 - **Refused — hotl's own directories.** An entry that is, contains, or sits inside the config dir (`~/.config/hotl`, or `%LOCALAPPDATA%\hotl\config`) or data dir (`~/.local/share/hotl`, or `%LOCALAPPDATA%\hotl\data`) is dropped with a warning, and the rest are honored. A writable config dir would let a sandboxed command rewrite the allow-rules, hooks, and `api_key_helper` that govern it — self-granted privilege escalation. This is also why `~` and `/` can never be listed: they contain the config dir.
