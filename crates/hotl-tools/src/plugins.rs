@@ -9,6 +9,8 @@
 //! rather than serde-derived — derive cannot report-and-continue on
 //! unknown fields while failing on wrong-typed known ones.
 
+use std::path::{Path, PathBuf};
+
 use serde_json::Value;
 
 /// The canonical 1.0.0 manifest schema identifier (§5.2). Exact match:
@@ -163,6 +165,165 @@ pub fn parse_manifest(text: &str) -> Result<(Manifest, Vec<String>), String> {
         },
         reports,
     ))
+}
+
+/// One loaded (or rejected) plugin. `entry: None` means the plugin was
+/// rejected outright — fatal manifest, escaping `plugin.json`, unreadable
+/// root; the reports say why. Component-level failures leave the entry in
+/// place with the failing component skipped (§11.3).
+#[derive(Debug)]
+pub struct LoadedPlugin {
+    pub entry: Option<PluginEntry>,
+    pub reports: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PluginEntry {
+    /// The manifest `name` — the plugin identity (skill qualifier, MCP
+    /// prefix, PLUGIN_DATA key).
+    pub name: String,
+    /// The `[plugins.sources]` key — only where the checkout lives.
+    pub handle: String,
+    /// The filesystem-resolved plugin root (§4.1) — the `PLUGIN_ROOT`
+    /// value. Every containment check below compares against this.
+    pub root: PathBuf,
+    pub manifest: Manifest,
+    /// `skills/<name>` dirs whose `SKILL.md` resolved to a regular file
+    /// inside the root — immediate children only (§7.1), sorted.
+    pub skill_dirs: Vec<PathBuf>,
+}
+
+/// Load one plugin from a directory (§11.1 rule 1). Containment is
+/// symlink-resolving canonicalize + prefix — deliberately not
+/// `fsguard::resolve_beneath`, whose no-follow descent rejects the
+/// in-root symlinks §4.1 explicitly permits.
+pub fn load_plugin(handle: &str, root: &Path, _plugin_data: &Path) -> LoadedPlugin {
+    let mut reports = Vec::new();
+    let Ok(root) = dunce::canonicalize(root) else {
+        return LoadedPlugin {
+            entry: None,
+            reports: vec![format!(
+                "plugin `{handle}`: {} is not a readable directory",
+                root.display()
+            )],
+        };
+    };
+
+    // §4.1 boundary 1: an escaping plugin.json rejects the whole plugin.
+    let manifest_path = root.join("plugin.json");
+    let contained = dunce::canonicalize(&manifest_path)
+        .ok()
+        .filter(|p| p.starts_with(&root) && p.is_file());
+    if contained.is_none() {
+        return LoadedPlugin {
+            entry: None,
+            reports: vec![format!(
+                "plugin `{handle}`: plugin.json is missing or does not resolve \
+                 to a regular file inside the plugin root"
+            )],
+        };
+    }
+    let text = match std::fs::read_to_string(&manifest_path) {
+        Ok(text) => text,
+        Err(e) => {
+            return LoadedPlugin {
+                entry: None,
+                reports: vec![format!("plugin `{handle}`: plugin.json unreadable: {e}")],
+            }
+        }
+    };
+    // A fatal manifest rejects the plugin: no component of it may be
+    // discovered or executed (§5.2), so this returns before any scan.
+    let (manifest, manifest_reports) = match parse_manifest(&text) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return LoadedPlugin {
+                entry: None,
+                reports: vec![format!("plugin `{handle}`: {e}")],
+            }
+        }
+    };
+    reports.extend(
+        manifest_reports
+            .into_iter()
+            .map(|r| format!("plugin `{handle}`: {r}")),
+    );
+    if manifest.name != handle {
+        reports.push(format!(
+            "plugin `{handle}`: manifest name is `{}` — the manifest name is \
+             the plugin's identity; the config key is only the install handle",
+            manifest.name
+        ));
+    }
+
+    let skill_dirs = discover_skills(handle, &root, &mut reports);
+    LoadedPlugin {
+        entry: Some(PluginEntry {
+            name: manifest.name.clone(),
+            handle: handle.to_string(),
+            root,
+            manifest,
+            skill_dirs,
+        }),
+        reports,
+    }
+}
+
+/// The `skills/` fixed location (§6.1, §7.1): immediate child directories
+/// whose `SKILL.md` resolves to a regular file inside the plugin root.
+/// Absent is not an error (§6.2); present-but-not-a-directory (or
+/// resolving outside the root, §4.1 boundary 2) invalidates the skills
+/// component; an escaping `SKILL.md` skips that one skill (§4.1
+/// boundary 3) while its siblings load.
+fn discover_skills(handle: &str, root: &Path, reports: &mut Vec<String>) -> Vec<PathBuf> {
+    let location = root.join("skills");
+    // `symlink_metadata` so a dangling symlink counts as present (and then
+    // fails resolution below) rather than as the benign missing case.
+    if std::fs::symlink_metadata(&location).is_err() {
+        return Vec::new();
+    }
+    let resolved = dunce::canonicalize(&location)
+        .ok()
+        .filter(|p| p.starts_with(root) && p.is_dir());
+    if resolved.is_none() {
+        reports.push(format!(
+            "plugin `{handle}`: `skills` does not resolve to a directory inside \
+             the plugin root — skills component skipped"
+        ));
+        return Vec::new();
+    }
+    let Ok(read) = std::fs::read_dir(&location) else {
+        reports.push(format!(
+            "plugin `{handle}`: `skills` is not readable — skills component skipped"
+        ));
+        return Vec::new();
+    };
+    let mut children: Vec<PathBuf> = read.flatten().map(|e| e.path()).collect();
+    children.sort();
+    let mut out = Vec::new();
+    for child in children {
+        // Immediate children only, and only directories (a loose
+        // `skills/x.md` is not a skill). `is_dir` follows symlinks: an
+        // in-root symlinked dir is permitted, and an escaping one is
+        // caught by the SKILL.md resolution check next.
+        if !child.is_dir() {
+            continue;
+        }
+        let skill_md = child.join("SKILL.md");
+        match dunce::canonicalize(&skill_md) {
+            Ok(p) if p.starts_with(root) && p.is_file() => out.push(child),
+            // No SKILL.md at all: just not a skill dir.
+            Err(_) => {}
+            Ok(_) => {
+                let name = child.file_name().unwrap_or_default().to_string_lossy();
+                reports.push(format!(
+                    "plugin `{handle}`: skill `{name}` skipped — its SKILL.md \
+                     resolves outside the plugin root"
+                ));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -330,6 +491,181 @@ mod tests {
         assert_eq!(m.name, "a");
         assert_eq!(reports.len(), 1, "{reports:?}");
         assert!(reports[0].contains("extensions"), "{}", reports[0]);
+    }
+
+    /// Root with a valid `plugin.json` for `name`, returned canonicalized
+    /// (macOS tempdirs live under the `/private` symlink).
+    fn plugin_root(dir: &Path, name: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("plugin.json"),
+            format!(r#"{{"$schema": "{MANIFEST_SCHEMA}", "name": "{name}"}}"#),
+        )
+        .unwrap();
+        dunce::canonicalize(dir).unwrap()
+    }
+
+    fn write_skill(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: s\ndescription: d\n---\nbody\n",
+        )
+        .unwrap();
+    }
+
+    fn data_dir() -> PathBuf {
+        PathBuf::from("/nonexistent-plugin-data")
+    }
+
+    /// §6.2: a manifest-only plugin is complete — missing fixed locations
+    /// are not errors and produce no reports.
+    #[test]
+    fn a_manifest_only_plugin_loads_with_zero_reports() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(dir.path(), "solo");
+        let loaded = load_plugin("solo", &root, &data_dir());
+        let entry = loaded.entry.expect("must load");
+        assert_eq!(entry.name, "solo");
+        assert_eq!(entry.root, root);
+        assert!(entry.skill_dirs.is_empty());
+        assert!(loaded.reports.is_empty(), "{:?}", loaded.reports);
+    }
+
+    /// §7.1: immediate children of `skills/` only — no recursive descent,
+    /// and a loose `skills/x.md` is not a skill.
+    #[test]
+    fn skills_discovery_is_immediate_children_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(dir.path(), "p");
+        write_skill(&root.join("skills/real"));
+        write_skill(&root.join("skills/deep/nested"));
+        std::fs::write(root.join("skills/loose.md"), "not a skill\n").unwrap();
+
+        let loaded = load_plugin("p", &root, &data_dir());
+        let entry = loaded.entry.expect("must load");
+        assert_eq!(entry.skill_dirs, vec![root.join("skills/real")]);
+        assert!(loaded.reports.is_empty(), "{:?}", loaded.reports);
+    }
+
+    /// §4.1 boundary 3: an escaping `SKILL.md` skips that skill, with a
+    /// report, while its sibling loads. An in-root symlink is permitted.
+    #[cfg(unix)]
+    #[test]
+    fn an_escaping_skill_is_skipped_while_siblings_and_in_root_links_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("SKILL.md"), "---\nname: evil\n---\nx\n").unwrap();
+        let root = plugin_root(&dir.path().join("plugin"), "p");
+        write_skill(&root.join("skills/good"));
+        // Escaping: the skill dir is a symlink out of the root.
+        std::os::unix::fs::symlink(&outside, root.join("skills/evil")).unwrap();
+        // In-root: a symlinked dir whose target stays inside the root.
+        write_skill(&root.join("bundled"));
+        std::os::unix::fs::symlink(root.join("bundled"), root.join("skills/alias")).unwrap();
+
+        let loaded = load_plugin("p", &root, &data_dir());
+        let entry = loaded.entry.expect("plugin itself still loads");
+        assert_eq!(
+            entry.skill_dirs,
+            vec![root.join("skills/alias"), root.join("skills/good")],
+            "sibling and in-root symlink load; the escape does not"
+        );
+        assert_eq!(loaded.reports.len(), 1, "{:?}", loaded.reports);
+        assert!(loaded.reports[0].contains("evil"), "{}", loaded.reports[0]);
+    }
+
+    /// §4.1 boundary 1: an escaping `plugin.json` rejects the plugin.
+    #[cfg(unix)]
+    #[test]
+    fn an_escaping_plugin_json_rejects_the_plugin() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("manifest.json");
+        std::fs::write(
+            &outside,
+            format!(r#"{{"$schema": "{MANIFEST_SCHEMA}", "name": "evil"}}"#),
+        )
+        .unwrap();
+        let root = dir.path().join("plugin");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("plugin.json")).unwrap();
+        write_skill(&root.join("skills/s"));
+
+        let loaded = load_plugin("p", &root, &data_dir());
+        assert!(loaded.entry.is_none(), "rejected, components undiscovered");
+        assert!(
+            loaded.reports[0].contains("plugin.json"),
+            "{:?}",
+            loaded.reports
+        );
+    }
+
+    /// §6.2: a fixed location of the wrong filesystem kind invalidates
+    /// that component type only.
+    #[test]
+    fn skills_as_a_regular_file_invalidates_only_that_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = plugin_root(dir.path(), "p");
+        std::fs::write(root.join("skills"), "not a directory\n").unwrap();
+
+        let loaded = load_plugin("p", &root, &data_dir());
+        let entry = loaded.entry.expect("the plugin still loads");
+        assert!(entry.skill_dirs.is_empty());
+        assert_eq!(loaded.reports.len(), 1, "{:?}", loaded.reports);
+        assert!(
+            loaded.reports[0].contains("skills"),
+            "{}",
+            loaded.reports[0]
+        );
+    }
+
+    /// §5.2: a fatal manifest rejects the plugin — its valid `skills/` is
+    /// never discovered.
+    #[test]
+    fn a_fatal_manifest_prevents_all_component_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("plugin.json"),
+            format!(r#"{{"$schema": "{MANIFEST_SCHEMA}", "name": "NOT-VALID"}}"#),
+        )
+        .unwrap();
+        write_skill(&dir.path().join("skills/s"));
+
+        let loaded = load_plugin("p", dir.path(), &data_dir());
+        assert!(loaded.entry.is_none());
+        assert!(
+            loaded.reports[0].contains("plugin name"),
+            "{:?}",
+            loaded.reports
+        );
+    }
+
+    /// A missing manifest or an unreadable root is a rejection with a
+    /// legible report, and a handle≠name mismatch is reported (decision 4:
+    /// the manifest name is the identity, the key only the handle).
+    #[test]
+    fn missing_manifest_missing_root_and_handle_mismatch_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let loaded = load_plugin("p", &dir.path().join("nope"), &data_dir());
+        assert!(loaded.entry.is_none());
+        assert!(loaded.reports[0].contains("not a readable directory"));
+
+        std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+        let loaded = load_plugin("p", &dir.path().join("empty"), &data_dir());
+        assert!(loaded.entry.is_none());
+        assert!(loaded.reports[0].contains("plugin.json is missing"));
+
+        let root = plugin_root(&dir.path().join("named"), "acme.tools");
+        let loaded = load_plugin("other", &root, &data_dir());
+        let entry = loaded.entry.expect("a mismatch is a warning, not fatal");
+        assert_eq!(entry.name, "acme.tools");
+        assert_eq!(entry.handle, "other");
+        assert!(
+            loaded.reports[0].contains("install handle"),
+            "{:?}",
+            loaded.reports
+        );
     }
 
     /// §8.1: unimplemented namespaces pass with their contents unvalidated
