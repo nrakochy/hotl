@@ -120,10 +120,12 @@ impl Tool for TodoWriteTool {
         "todo_write"
     }
     fn description(&self) -> &str {
-        "Record or update your task list for this session. Send the ENTIRE list each time \
-         (it replaces the previous one). Mark exactly one item `in_progress` while you work on it, \
-         `completed` the moment it's done, `pending` for not-started. Use it for multi-step work so \
-         you and the user can see progress; skip it for single trivial actions."
+        "Maintain your task list for this session. Use it proactively for any work with \
+         more than one step, and update it as you go rather than at the end — the user \
+         watches it to see progress. Send the ENTIRE list each time (it replaces the \
+         previous one). Mark exactly one item `in_progress` before starting it and \
+         `completed` the moment it is done (never batch completions); add follow-up work \
+         you discover as new items. Only a single trivial action needs no list."
     }
     fn schema(&self) -> Value {
         json!({

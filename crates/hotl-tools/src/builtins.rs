@@ -580,14 +580,15 @@ impl Tool for WriteTool {
         "write"
     }
     fn description(&self) -> &str {
-        "Write a file (creating parent directories), overwriting any existing content. For partial changes to an existing file prefer `edit`."
+        "Write a file (creating parent directories), overwriting any existing content. \
+         Read an existing file before overwriting it; for partial changes prefer `edit`."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "content": {"type": "string"}
+                "path": {"type": "string", "description": "File path, relative to the working directory (absolute allowed, may require approval)"},
+                "content": {"type": "string", "description": "The complete new file contents"}
             },
             "required": ["path", "content"]
         })
@@ -694,9 +695,9 @@ impl Tool for EditTool {
         let mut schema = json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
-                "old_string": {"type": "string"},
-                "new_string": {"type": "string"}
+                "path": {"type": "string", "description": "File path, relative to the working directory (absolute allowed, may require approval)"},
+                "old_string": {"type": "string", "description": "The exact existing text to replace — must occur exactly once; include surrounding lines to make it unique"},
+                "new_string": {"type": "string", "description": "The replacement text"}
             },
             "required": ["path", "old_string", "new_string"]
         });
@@ -1341,7 +1342,10 @@ impl Tool for BashTool {
          the whole process group is killed on timeout or cancel. stdout and stderr share one pipe, \
          so output arrives in the order the command actually wrote it (as a terminal shows it) and \
          the two are not distinguishable. Truncated at 50KB. A failure ends with a structured \
-         trailer: `[exit N]` or `[killed by SIGNAME]`."
+         trailer: `[exit N]` or `[killed by SIGNAME]`. \
+         Prefer the dedicated `read`, `grep`, and `glob` tools over `cat`/`grep`/`find`/`ls` \
+         for reading and searching — they are faster and their output is budgeted. Use bash \
+         for what only a shell can do: builds, tests, git, package managers, running programs."
     }
     fn schema(&self) -> Value {
         json!({

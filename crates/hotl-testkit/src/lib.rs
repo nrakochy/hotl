@@ -1363,12 +1363,20 @@ mod tests {
                 tool: "read".into()
             }
         );
-        // Feedback element present in the failing results.
+        // Exactly one last-chance hint, on the one-failure-left result — a
+        // per-failure countdown was visible give-up pressure (0030 Task 5).
         let items = h.items();
-        let with_feedback = items.iter().any(|i| matches!(
-            i, Item::ToolResults { results } if results.iter().any(|r| r.content.contains("<retry attempts_left="))
-        ));
-        assert!(with_feedback);
+        let hints: usize = items
+            .iter()
+            .map(|i| match i {
+                Item::ToolResults { results } => results
+                    .iter()
+                    .filter(|r| r.content.contains("<system-hint>"))
+                    .count(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(hints, 1, "one warning, one failure before the budget blows");
     }
 
     #[tokio::test]

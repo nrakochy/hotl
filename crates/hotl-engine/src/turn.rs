@@ -164,7 +164,7 @@ enum Gate {
     /// Answered without running. `chargeable` is false for outcomes the model
     /// cannot fix by trying again — a human denial, a hook block, an
     /// interrupted turn — so they never draw down the retry budget and never
-    /// get a `<retry attempts_left>` hint that contradicts the message (T3-1).
+    /// get the last-chance `<system-hint>` that contradicts the message (T3-1).
     Resolved {
         outcome: ToolOutcome,
         chargeable: bool,
@@ -1361,8 +1361,9 @@ impl Turn {
         }
     }
 
-    /// Track per-tool consecutive failures; attach `<retry attempts_left>`
-    /// feedback and flag the budget when it hits zero.
+    /// Track per-tool consecutive failures; warn once, at one failure left
+    /// (a per-failure countdown reads as give-up pressure on every sample),
+    /// and flag the budget when it hits zero.
     fn apply_failure_budget(
         &mut self,
         tu: &ToolUse,
@@ -1376,7 +1377,7 @@ impl Turn {
         let mut content = outcome.content;
         if outcome.is_error && !chargeable {
             // Not a malfunction and not retryable: it neither draws down the
-            // budget nor earns a `<retry>` hint contradicting its own message.
+            // budget nor earns a hint contradicting its own message.
             // It must not *clear* the counter either — a denial cannot launder
             // a genuinely failing tool's streak (T3-1).
             return (content, true);
@@ -1388,7 +1389,13 @@ impl Turn {
                 .or_insert(0);
             *n += 1;
             let left = self.shared.config.tool_failure_budget.saturating_sub(*n);
-            content.push_str(&format!("\n<retry attempts_left={left}>"));
+            if left == 1 {
+                content.push_str(
+                    "\n<system-hint>this tool has failed repeatedly; one more \
+                     consecutive failure ends the turn — try a different \
+                     approach</system-hint>",
+                );
+            }
             // A parallel chunk may keep reporting after the first blow —
             // the outcome names the tool that blew the budget first.
             if left == 0 && budget_blown.is_none() {

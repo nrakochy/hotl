@@ -1,6 +1,6 @@
 //! T3-1: a denial is a decision, not a tool malfunction — it must not draw
-//! down the per-tool failure budget, and it must not carry a
-//! `<retry attempts_left>` hint that contradicts its own message.
+//! down the per-tool failure budget, and it must not carry the last-chance
+//! `<system-hint>` warning that contradicts its own message.
 //! T3-2: whether a batch is mutating is `Tool::read_only()`'s answer, not
 //! `name != "read"` — a `glob`/`grep` batch takes no shadow snapshot.
 
