@@ -8,7 +8,7 @@
 //! target, so `wire.rs` is deliberately self-contained (it depends on
 //! `hotl-engine` and `serde_json`, nothing else in the crate).
 
-use hotl_engine::{EngineEvent, Outcome};
+use hotl_engine::{EngineEvent, LedgerSummary, Outcome, Phase, PhaseDeltaSummary};
 use hotl_types::TokenUsage;
 use serde_json::json;
 
@@ -211,6 +211,35 @@ fn turn_done_usage_omits_cost_usd_for_an_uncatalogued_model() {
     assert!(
         f["usage"].get("cost_usd").is_none(),
         "an uncatalogued model must omit cost_usd, not guess: {f}"
+    );
+}
+
+/// 0033 Task 1: the per-phase deltas are the point of a wall-clock profiler —
+/// they ride the frame (additive, `UPDATE_SCHEMA_VERSION` stands); only the
+/// raw `samples` array stays off the wire.
+#[test]
+fn ledger_report_frame_carries_phase_deltas() {
+    let summary = LedgerSummary {
+        sample_count: 1,
+        overhead_p50_ns: 10,
+        overhead_p99_ns: 20,
+        phase_deltas: vec![PhaseDeltaSummary {
+            from: Phase::SnapshotReady,
+            to: Phase::RequestBuilt,
+            p50_ns: 5,
+            p99_ns: 9,
+        }],
+        max_rss_bytes: 0,
+        samples: vec![],
+    };
+    let frame = wire::update_frame(&EngineEvent::LedgerReport(summary)).unwrap();
+    assert_eq!(frame["phase_deltas"][0]["from"], "SnapshotReady");
+    assert_eq!(frame["phase_deltas"][0]["to"], "RequestBuilt");
+    assert_eq!(frame["phase_deltas"][0]["p50_ns"], 5);
+    assert_eq!(frame["phase_deltas"][0]["p99_ns"], 9);
+    assert!(
+        frame.get("samples").is_none(),
+        "raw samples stay off the wire"
     );
 }
 
