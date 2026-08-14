@@ -95,19 +95,105 @@ pub struct DiffLine {
     pub text: String,
 }
 
+/// Append-only text with a revision that bumps on every mutation, so the
+/// render memo can fingerprint it in O(1) as (seed, rev, len) instead of
+/// hashing the whole content per frame. Privacy of `text` is what keeps the
+/// old content-hash guarantee — no mutation path can skip the bump. `seed`
+/// hashes the construction-time content once: a *different* item landing at
+/// the same transcript index can never fingerprint equal to the old one.
+#[derive(Debug, Clone, Eq)]
+pub struct Streamed {
+    text: String,
+    seed: u64,
+    rev: u64,
+}
+
+impl Streamed {
+    pub fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
+        self.rev += 1;
+    }
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+    pub fn rev(&self) -> u64 {
+        self.rev
+    }
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+}
+
+/// Content equality — `seed`/`rev` are cache hints, not identity.
+impl PartialEq for Streamed {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl PartialEq<&str> for Streamed {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == **other
+    }
+}
+
+impl PartialEq<str> for Streamed {
+    fn eq(&self, other: &str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for Streamed {
+    fn eq(&self, other: &String) -> bool {
+        self.text == *other
+    }
+}
+
+impl std::ops::Deref for Streamed {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl std::fmt::Display for Streamed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.text.fmt(f)
+    }
+}
+
+impl From<String> for Streamed {
+    fn from(text: String) -> Self {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        text.hash(&mut h);
+        Self {
+            seed: h.finish(),
+            text,
+            rev: 0,
+        }
+    }
+}
+
+impl From<&str> for Streamed {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptItem {
     User {
-        text: String,
+        text: Streamed,
     },
     /// `queued=true` → pinned chip until the engine admits it (`prompt_queued`).
     Steer {
-        text: String,
+        text: Streamed,
         queued: bool,
     },
     /// Grows via `text_delta`.
     Assistant {
-        text: String,
+        text: Streamed,
     },
     /// Model reasoning, when the provider returns it. Billed on every turn
     /// (`EngineConfig.thinking` defaults true) and, before this, never shown
@@ -118,7 +204,7 @@ pub enum TranscriptItem {
     /// un-skippable. Empty deltas create no item — until R3 sends
     /// `thinking.display: "summarized"` the text really is empty.
     Thinking {
-        text: String,
+        text: Streamed,
     },
     Tool {
         name: String,
@@ -128,12 +214,12 @@ pub enum TranscriptItem {
     },
     /// Retrying / fallback / compacted / controlled stops.
     Notice {
-        text: String,
+        text: Streamed,
     },
     /// A turn that failed outright (provider/transport error, sealed log, panic).
     /// Its own variant, not a `Notice`: an error must not read as muted chatter.
     Error {
-        text: String,
+        text: Streamed,
     },
     /// A multi-line block a command produced — today only `/context`. Raw
     /// numbers, never formatted strings: `view.rs` owns column alignment, so
@@ -796,7 +882,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     Some(TranscriptItem::Thinking { text }) => text.push_str(&delta),
                     _ => state
                         .transcript
-                        .push(TranscriptItem::Thinking { text: delta }),
+                        .push(TranscriptItem::Thinking { text: delta.into() }),
                 }
                 enter_streaming(state);
             }
@@ -963,9 +1049,9 @@ fn on_prompt_result(
     // A turn that streamed nothing still shows its outcome text.
     if turn_chars(&state.transcript) == 0 {
         if let Some(t) = text.as_deref().filter(|t| kind == "done" && !t.is_empty()) {
-            state.transcript.push(TranscriptItem::Assistant {
-                text: t.to_string(),
-            });
+            state
+                .transcript
+                .push(TranscriptItem::Assistant { text: t.into() });
         }
     }
     // A real execution error gets its own loud item; controlled stops
@@ -973,7 +1059,7 @@ fn on_prompt_result(
     if kind == "error" {
         let msg = text.as_deref().map(str::trim).filter(|t| !t.is_empty());
         state.transcript.push(TranscriptItem::Error {
-            text: msg.unwrap_or("the turn failed").to_string(),
+            text: msg.unwrap_or("the turn failed").into(),
         });
     } else if let Some(n) = outcome_notice(kind, text.as_deref()) {
         notice(state, n);
@@ -1335,7 +1421,9 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
         return slash_command(state, rest, payload);
     }
     if state.phase == Phase::Idle {
-        state.transcript.push(TranscriptItem::User { text });
+        state
+            .transcript
+            .push(TranscriptItem::User { text: text.into() });
         state.phase = Phase::Sampling { ticks: 0 };
         state.scroll = Scroll::Follow;
         vec![
@@ -1343,9 +1431,10 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
             Cmd::SetTitle(title(state, " — working")),
         ]
     } else {
-        state
-            .transcript
-            .push(TranscriptItem::Steer { text, queued: true });
+        state.transcript.push(TranscriptItem::Steer {
+            text: text.into(),
+            queued: true,
+        });
         vec![Cmd::SendSteer(payload)]
     }
 }
@@ -1783,9 +1872,9 @@ fn append_assistant(state: &mut State, text: &str) {
     if let Some(TranscriptItem::Assistant { text: t }) = state.transcript.last_mut() {
         t.push_str(text);
     } else {
-        state.transcript.push(TranscriptItem::Assistant {
-            text: text.to_string(),
-        });
+        state
+            .transcript
+            .push(TranscriptItem::Assistant { text: text.into() });
     }
 }
 
@@ -1826,7 +1915,9 @@ fn mark_last_tool(state: &mut State, name: &str, status: ToolStatus) {
 }
 
 fn notice(state: &mut State, text: String) {
-    state.transcript.push(TranscriptItem::Notice { text });
+    state
+        .transcript
+        .push(TranscriptItem::Notice { text: text.into() });
 }
 
 /// Un-pin the newest queued steer chip (`SteerRejected`, `prompt_queued`).
@@ -1928,7 +2019,7 @@ mod tests {
     fn notices(n: usize) -> Vec<TranscriptItem> {
         (0..n)
             .map(|i| TranscriptItem::Notice {
-                text: i.to_string(),
+                text: i.to_string().into(),
             })
             .collect()
     }
@@ -2004,7 +2095,7 @@ mod tests {
     // A recorded `/<skill>` dispatch: the turn's user item plus the request.
     fn requested_skill(s: &mut State, name: &str) {
         s.transcript.push(TranscriptItem::User {
-            text: format!("Load the skill `{name}`"),
+            text: format!("Load the skill `{name}`").into(),
         });
         s.pending_skill = Some(name.into());
     }
@@ -3639,7 +3730,7 @@ mod tests {
 
     fn last_notice(s: &State) -> String {
         match s.transcript.last() {
-            Some(TranscriptItem::Notice { text }) => text.clone(),
+            Some(TranscriptItem::Notice { text }) => text.as_str().to_string(),
             other => panic!("expected a notice, got {other:?}"),
         }
     }
@@ -3981,11 +4072,11 @@ mod tests {
             "built-ins survive a roster swap"
         );
         assert!(!s.commands.iter().any(|c| c.name == "old"));
-        let notices: Vec<&String> = s
+        let notices: Vec<&str> = s
             .transcript
             .iter()
             .filter_map(|i| match i {
-                TranscriptItem::Notice { text } => Some(text),
+                TranscriptItem::Notice { text } => Some(text.as_str()),
                 _ => None,
             })
             .collect();

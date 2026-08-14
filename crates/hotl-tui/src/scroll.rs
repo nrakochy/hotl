@@ -50,7 +50,7 @@ mod tests {
         let mut s = State::test_default();
         s.transcript = (0..n)
             .map(|i| TranscriptItem::Notice {
-                text: i.to_string(),
+                text: i.to_string().into(),
             })
             .collect();
         s

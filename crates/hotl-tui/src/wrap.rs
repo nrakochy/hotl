@@ -14,41 +14,61 @@ use unicode_width::UnicodeWidthChar;
 /// Breaks after the last space that fits; a word longer than the row is cut.
 /// Ranges are contiguous and cover every char — that total coverage is what
 /// lets a cursor's char index map back to exactly one row.
+///
+/// Walks `char_indices` with a byte cursor instead of collecting a
+/// `Vec<char>` — zero allocation beyond the output, and each row re-scans at
+/// most its own chars (a space break resumes from the break's byte offset).
+/// Differential-tested against the old implementation
+/// (`rows_matches_the_reference_implementation`).
 pub fn rows(text: &str, width: usize) -> Vec<(usize, usize)> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() || width == 0 {
-        return vec![(0, chars.len())];
+    if text.is_empty() || width == 0 {
+        return vec![(0, text.chars().count())];
     }
     let mut out = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        let fits = start + fit(&chars[start..], width);
-        if fits >= chars.len() {
-            out.push((start, chars.len()));
-            break;
+    let mut row_char = 0usize; // char index where the current row starts
+    let mut row_byte = 0usize; // its byte offset
+    loop {
+        let mut used = 0usize;
+        // Char/byte position AFTER the last space seen in this row.
+        let mut space: Option<(usize, usize)> = None;
+        let mut i = row_char;
+        // (char, byte) of the first char that does NOT fit, if any.
+        let mut overflow = None;
+        for (b, c) in text[row_byte..].char_indices() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width {
+                overflow = Some((i, row_byte + b));
+                break;
+            }
+            used += w;
+            if c == ' ' {
+                space = Some((i + 1, row_byte + b + 1));
+            }
+            i += 1;
         }
+        let Some((fits_char, fits_byte)) = overflow else {
+            // Everything left fits: the trailing row.
+            out.push((row_char, i));
+            return out;
+        };
+        // Break after the last space that fits, else cut at the overflow;
         // `max(start + 1)` guarantees progress when even one char overflows.
-        let brk = chars[start..fits]
-            .iter()
-            .rposition(|c| *c == ' ')
-            .map_or(fits, |i| start + i + 1)
-            .max(start + 1);
-        out.push((start, brk));
-        start = brk;
-    }
-    out
-}
-
-/// Chars from the front of `chars` that fit in `width` display columns.
-fn fit(chars: &[char], width: usize) -> usize {
-    let mut used = 0;
-    for (i, c) in chars.iter().enumerate() {
-        used += c.width().unwrap_or(0);
-        if used > width {
-            return i;
+        let (brk_char, brk_byte) = match space {
+            Some(sp) => sp,
+            None if fits_char == row_char => {
+                let first = text[row_byte..].chars().next().expect("non-empty row");
+                (row_char + 1, row_byte + first.len_utf8())
+            }
+            None => (fits_char, fits_byte),
+        };
+        out.push((row_char, brk_char));
+        (row_char, row_byte) = (brk_char, brk_byte);
+        // A break that consumed the final char ends the text with no empty
+        // trailing row — the reference's `while start < len` exit.
+        if row_byte == text.len() {
+            return out;
         }
     }
-    chars.len()
 }
 
 /// Display columns spanned by `text`'s chars in `[a, b)` — the input's cursor
@@ -102,6 +122,72 @@ pub fn line<'a>(line: &Line<'a>, width: usize) -> Vec<Line<'a>> {
 mod tests {
     use super::*;
     use ratatui::style::{Color, Style};
+
+    /// The pre-0033 implementation, verbatim — the oracle the zero-alloc
+    /// rewrite is differential-tested against.
+    fn rows_reference(text: &str, width: usize) -> Vec<(usize, usize)> {
+        let chars: Vec<char> = text.chars().collect();
+        if chars.is_empty() || width == 0 {
+            return vec![(0, chars.len())];
+        }
+        let mut out = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let fits = start + fit(&chars[start..], width);
+            if fits >= chars.len() {
+                out.push((start, chars.len()));
+                break;
+            }
+            let brk = chars[start..fits]
+                .iter()
+                .rposition(|c| *c == ' ')
+                .map_or(fits, |i| start + i + 1)
+                .max(start + 1);
+            out.push((start, brk));
+            start = brk;
+        }
+        out
+    }
+
+    /// `fit` as it was when `rows_reference` was live code.
+    fn fit(chars: &[char], width: usize) -> usize {
+        let mut used = 0;
+        for (i, c) in chars.iter().enumerate() {
+            used += c.width().unwrap_or(0);
+            if used > width {
+                return i;
+            }
+        }
+        chars.len()
+    }
+
+    #[test]
+    fn rows_matches_the_reference_implementation() {
+        let corpus = [
+            "",
+            " ",
+            "   leading and trailing   ",
+            "the quick brown fox jumps over the lazy dog",
+            "averyveryverylongwordwithnospacesatallinit then short",
+            "日本語のテキストです これは折り返しのテスト",
+            "mixed 日本語 and ascii wrapping テスト here",
+            "e\u{301}e\u{301}e\u{301} combining marks e\u{301} everywhere",
+            "🦀🦀🦀 emoji 🎉 row 🚀🚀 with spaces",
+            "🦀日本a b日本🦀ascii mixed hard",
+            "word  double  spaces   triple",
+            "\n \n",
+        ];
+        for text in corpus {
+            for width in 1..=120 {
+                assert_eq!(
+                    rows(text, width),
+                    rows_reference(text, width),
+                    "text={text:?} width={width}"
+                );
+            }
+            assert_eq!(rows(text, 0), rows_reference(text, 0), "width=0 {text:?}");
+        }
+    }
 
     fn texts(text: &str, width: usize) -> Vec<String> {
         rows(text, width)

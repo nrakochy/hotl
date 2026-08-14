@@ -114,6 +114,7 @@ pub struct TranscriptCache {
     geometry: Option<Geometry>,
     items: Vec<CachedItem>,
     rewraps: u64,
+    line_wraps: u64,
 }
 
 impl TranscriptCache {
@@ -122,11 +123,50 @@ impl TranscriptCache {
     pub fn rewraps(&self) -> u64 {
         self.rewraps
     }
+
+    /// How many assistant lines have been classified+wrapped over this
+    /// cache's life — the unit the incremental render economizes. Tests
+    /// assert on it; nothing in the view reads it.
+    pub fn line_wraps(&self) -> u64 {
+        self.line_wraps
+    }
 }
 
 struct CachedItem {
     fingerprint: u64,
     rows: Vec<Line<'static>>,
+    /// Streaming state for a growing assistant item — `None` for every other
+    /// kind. Dropped with the rows on any geometry change.
+    incremental: Option<Incremental>,
+}
+
+/// Where an assistant item's frozen render ends. Rows below `frozen_rows`
+/// belong to the trailing (possibly partial) line and are recomputed each
+/// frame; everything above is exact because `Streamed` is append-only.
+struct Incremental {
+    /// Identity (construction seed) of the `Streamed` these rows came from —
+    /// a different item at the same index must never inherit them.
+    seed: u64,
+    /// Byte offset of the first byte NOT yet frozen into `rows` — always at
+    /// the start of the trailing (possibly partial) line.
+    consumed: usize,
+    /// Rows produced by the frozen prefix (can exceed its line count:
+    /// wrapping).
+    frozen_rows: usize,
+    /// Fence state at `consumed` — the one piece of cross-line classifier
+    /// state in `assistant_lines`.
+    in_fence: bool,
+}
+
+impl Incremental {
+    fn new(seed: u64) -> Self {
+        Self {
+            seed,
+            consumed: 0,
+            frozen_rows: 0,
+            in_fence: false,
+        }
+    }
 }
 
 /// What every item's rows depend on beyond the item itself. A change here
@@ -146,19 +186,23 @@ struct Geometry {
 ///
 /// Deriving this from content rather than from a hand-maintained revision
 /// counter is the point: a new mutation site anywhere in `app` cannot forget
-/// to invalidate the cache, because there is nothing to remember.
+/// to invalidate the cache, because there is nothing to remember. Text fields
+/// are `Streamed`, whose (seed, rev, len) is content-derived in O(1): the
+/// field is private, so no mutation path can skip the revision bump, and the
+/// construction-time seed keeps a replaced item from fingerprinting equal.
 ///
 /// INVARIANT: every field `item_block` reads is hashed here, at the same
 /// resolution it is rendered. Enforced by
 /// `cached_rows_are_identical_to_a_fresh_render`, which walks a turn's worth
 /// of mutations comparing a warm cache against a cold one.
 fn item_fingerprint(item: &TranscriptItem) -> u64 {
+    let text_key = |t: &crate::app::Streamed| (t.seed(), t.rev(), t.len() as u64);
     let mut h = DefaultHasher::new();
     match item {
-        TranscriptItem::User { text } => (0u8, text).hash(&mut h),
-        TranscriptItem::Steer { text, queued } => (1u8, text, queued).hash(&mut h),
-        TranscriptItem::Assistant { text } => (2u8, text).hash(&mut h),
-        TranscriptItem::Thinking { text } => (3u8, text).hash(&mut h),
+        TranscriptItem::User { text } => (0u8, text_key(text)).hash(&mut h),
+        TranscriptItem::Steer { text, queued } => (1u8, text_key(text), queued).hash(&mut h),
+        TranscriptItem::Assistant { text } => (2u8, text_key(text)).hash(&mut h),
+        TranscriptItem::Thinking { text } => (3u8, text_key(text)).hash(&mut h),
         TranscriptItem::Tool {
             name,
             summary,
@@ -185,12 +229,12 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
                 ToolStatus::AutoAllowed { rule } => (4u8, rule).hash(&mut h),
             }
         }
-        TranscriptItem::Notice { text } => (5u8, text).hash(&mut h),
+        TranscriptItem::Notice { text } => (5u8, text_key(text)).hash(&mut h),
         // A new variant without its own discriminant byte would collide with
         // `Notice` and render a stale block after the numbers changed — a bug
         // no unit test catches and every use does.
         TranscriptItem::Report(r) => (6u8, r).hash(&mut h),
-        TranscriptItem::Error { text } => (7u8, text).hash(&mut h),
+        TranscriptItem::Error { text } => (7u8, text_key(text)).hash(&mut h),
     }
     h.finish()
 }
@@ -257,9 +301,34 @@ fn render_transcript(
         {
             continue;
         }
-        let entry = CachedItem {
-            fingerprint,
-            rows: item_visual_lines(item, p, width, gutter, state.thinking_expanded),
+        // Assistant prose renders incrementally: a growing item keeps its
+        // frozen rows and classifies only what streamed in since the last
+        // frame. Every other kind re-renders whole (small, or rare).
+        let entry = if let TranscriptItem::Assistant { text } = item {
+            let (mut rows, mut inc) = cache
+                .items
+                .get_mut(i)
+                .and_then(|slot| {
+                    // Only the same append-only item, merely grown, may keep
+                    // its frozen prefix; anything else cold-renders.
+                    slot.incremental
+                        .take()
+                        .filter(|inc| inc.seed == text.seed() && text.len() >= inc.consumed)
+                        .map(|inc| (std::mem::take(&mut slot.rows), inc))
+                })
+                .unwrap_or_else(|| (Vec::new(), Incremental::new(text.seed())));
+            cache.line_wraps += assistant_append(&mut rows, &mut inc, text, p, width, gutter);
+            CachedItem {
+                fingerprint,
+                rows,
+                incremental: Some(inc),
+            }
+        } else {
+            CachedItem {
+                fingerprint,
+                rows: item_visual_lines(item, p, width, gutter, state.thinking_expanded),
+                incremental: None,
+            }
         };
         match cache.items.get_mut(i) {
             Some(slot) => *slot = entry,
@@ -389,46 +458,101 @@ fn item_visual_lines<'a>(
 /// except the fenced-code toggle. Anything unrecognized stays plain ink, so a
 /// stray `#` mid-sentence never turns into a heading.
 fn assistant_lines<'a>(text: &str, p: &Palette) -> Vec<Line<'a>> {
-    let mut out = Vec::new();
     let mut in_fence = false;
-    for raw in text.split('\n') {
-        let lead = raw.trim_start();
-        // ``` toggles a code fence; the fence line itself renders as a quiet
-        // divider rather than literal backticks shouting on screen.
-        if lead.starts_with("```") {
-            in_fence = !in_fence;
-            out.push(Line::styled(
-                raw.to_string(),
-                Style::new().fg(p.faint).dim(),
-            ));
-            continue;
-        }
-        if in_fence {
-            out.push(code_line(raw, p));
-            continue;
-        }
-        // `#`..`###`-led heading → bold, hashes stripped.
-        if let Some(h) = heading_text(lead) {
-            out.push(Line::styled(h, Style::new().fg(p.ink).bold()));
-            continue;
-        }
-        // `- ` / `* ` bullet → a `•` marker in the accent, indentation kept.
-        if let Some((indent, rest)) = bullet(raw) {
-            out.push(Line::from(vec![
-                Span::raw(indent.to_string()),
-                Span::styled("• ", Style::new().fg(p.accent)),
-                Span::styled(rest.to_string(), Style::new().fg(p.ink)),
-            ]));
-            continue;
-        }
-        // A 4-space indent is markdown's other code form.
-        if raw.starts_with("    ") && !raw.trim().is_empty() {
-            out.push(code_line(raw, p));
-            continue;
-        }
-        out.push(Line::styled(raw.to_string(), Style::new().fg(p.ink)));
+    text.split('\n')
+        .map(|raw| assistant_line(raw, &mut in_fence, p))
+        .collect()
+}
+
+/// One classified assistant line; `in_fence` is the only state carried across
+/// lines, which is what lets the incremental render re-enter mid-text.
+fn assistant_line<'a>(raw: &str, in_fence: &mut bool, p: &Palette) -> Line<'a> {
+    let lead = raw.trim_start();
+    // ``` toggles a code fence; the fence line itself renders as a quiet
+    // divider rather than literal backticks shouting on screen.
+    if lead.starts_with("```") {
+        *in_fence = !*in_fence;
+        return Line::styled(raw.to_string(), Style::new().fg(p.faint).dim());
     }
-    out
+    if *in_fence {
+        return code_line(raw, p);
+    }
+    // `#`..`###`-led heading → bold, hashes stripped.
+    if let Some(h) = heading_text(lead) {
+        return Line::styled(h, Style::new().fg(p.ink).bold());
+    }
+    // `- ` / `* ` bullet → a `•` marker in the accent, indentation kept.
+    if let Some((indent, rest)) = bullet(raw) {
+        return Line::from(vec![
+            Span::raw(indent.to_string()),
+            Span::styled("• ", Style::new().fg(p.accent)),
+            Span::styled(rest.to_string(), Style::new().fg(p.ink)),
+        ]);
+    }
+    // A 4-space indent is markdown's other code form.
+    if raw.starts_with("    ") && !raw.trim().is_empty() {
+        return code_line(raw, p);
+    }
+    Line::styled(raw.to_string(), Style::new().fg(p.ink))
+}
+
+/// Classify+wrap only what grew since the last frame: newly *completed* lines
+/// are frozen once (rows appended, fence state and byte cursor advanced); the
+/// trailing partial line is re-rendered every frame and replaced on the next.
+/// Returns the number of lines classified, the unit `line_wraps` counts.
+///
+/// Equivalence with a cold `item_visual_lines` render is the tested invariant
+/// (`incremental_assistant_rows_equal_cold_render`): same split, same
+/// classifier, same wrap, same spine-first rule.
+fn assistant_append(
+    rows: &mut Vec<Line<'static>>,
+    inc: &mut Incremental,
+    text: &str,
+    p: &Palette,
+    width: usize,
+    gutter: usize,
+) -> u64 {
+    let inner = width.saturating_sub(gutter + 2).max(1);
+    let spine = assistant_spine(p);
+    let mut classified = 0u64;
+    // Drop the previous frame's partial-line rows; the frozen prefix stands.
+    rows.truncate(inc.frozen_rows);
+    let tail = &text[inc.consumed..];
+    if let Some(nl) = tail.rfind('\n') {
+        for raw in tail[..nl].split('\n') {
+            let cl = assistant_line(raw, &mut inc.in_fence, p);
+            classified += 1;
+            for wl in wrap::line(&cl, inner) {
+                let first = rows.is_empty();
+                rows.push(spine.wrap(wl, gutter, first));
+            }
+        }
+        inc.consumed += nl + 1;
+        inc.frozen_rows = rows.len();
+    }
+    // The trailing (possibly partial) line. Its fence toggle must not leak
+    // into frozen state — the line may still grow into something else.
+    let mut fence = inc.in_fence;
+    let cl = assistant_line(&text[inc.consumed..], &mut fence, p);
+    classified += 1;
+    for wl in wrap::line(&cl, inner) {
+        let first = rows.is_empty();
+        rows.push(spine.wrap(wl, gutter, first));
+    }
+    classified
+}
+
+/// The assistant spine — shared by `item_block` and the incremental path so
+/// they cannot drift.
+fn assistant_spine(p: &Palette) -> Spine {
+    // The warm dot + a faint bar down the whole answer, so a long reply
+    // reads as one block rather than a wall of flat text.
+    Spine {
+        marker: "●",
+        cont: "│",
+        marker_style: Style::new().fg(p.accent),
+        cont_style: Style::new().fg(p.faint),
+    }
 }
 
 /// A code line: muted on the band, so it reads as code without a full-width
@@ -518,17 +642,7 @@ fn item_block<'a>(
                 })
                 .collect(),
         ),
-        TranscriptItem::Assistant { text } => (
-            // The warm dot + a faint bar down the whole answer, so a long
-            // reply reads as one block rather than a wall of flat text.
-            Spine {
-                marker: "●",
-                cont: "│",
-                marker_style: Style::new().fg(p.accent),
-                cont_style: Style::new().fg(p.faint),
-            },
-            assistant_lines(text, p),
-        ),
+        TranscriptItem::Assistant { text } => (assistant_spine(p), assistant_lines(text, p)),
         TranscriptItem::Steer { text, queued: true } => (
             Spine {
                 marker: "⤷",
@@ -1545,9 +1659,7 @@ mod tests {
     /// One assistant turn, so transcript row 0 is `"  ● alpha beta gamma"`.
     fn state_with_prose() -> State {
         let mut s = State::test_default();
-        s.transcript = vec![TranscriptItem::Assistant {
-            text: PROSE.to_string(),
-        }];
+        s.transcript = vec![TranscriptItem::Assistant { text: PROSE.into() }];
         s
     }
 
@@ -1713,7 +1825,8 @@ mod tests {
             text: (1..=6)
                 .map(|i| format!("line{i}"))
                 .collect::<Vec<_>>()
-                .join("\n"),
+                .join("\n")
+                .into(),
         }];
         let out = draw(&s).join("\n");
         assert!(out.contains("line3") && !out.contains("line4"), "{out}");
@@ -2244,8 +2357,9 @@ mod tests {
     fn transcript_wraps_long_output_instead_of_clipping_it() {
         let mut s = State::new(true, "m".into());
         let text = "word ".repeat(40); // 200 chars
-        s.transcript
-            .push(TranscriptItem::Assistant { text: text.clone() });
+        s.transcript.push(TranscriptItem::Assistant {
+            text: text.clone().into(),
+        });
         let rows = draw(&s);
         let shown: String = rows[..STRIP]
             .iter()
@@ -2384,7 +2498,7 @@ mod tests {
         let mut s = State::new(true, "m".into());
         for i in 0..30 {
             s.transcript.push(TranscriptItem::Assistant {
-                text: format!("answer {i}"),
+                text: format!("answer {i}").into(),
             });
         }
         let rows = draw(&s);
@@ -2399,7 +2513,7 @@ mod tests {
         let mut s = State::new(true, "m".into());
         for i in 0..10 {
             s.transcript.push(TranscriptItem::Assistant {
-                text: format!("{i} {}", "x".repeat(200)),
+                text: format!("{i} {}", "x".repeat(200)).into(),
             });
         }
         s.transcript.push(TranscriptItem::Notice {
@@ -2564,7 +2678,7 @@ mod tests {
             text: "explain the cache".into(),
         });
         s.transcript.push(TranscriptItem::Assistant {
-            text: "a ".repeat(1200),
+            text: "a ".repeat(1200).into(),
         });
         s.transcript.push(TranscriptItem::Tool {
             name: "bash".into(),
@@ -2707,6 +2821,101 @@ mod tests {
             let cold = draw_cached(&s, &mut TranscriptCache::default());
             let hot = draw_cached(&s, &mut warm);
             assert_eq!(hot, cold, "cached render diverged at step {step}");
+        }
+    }
+
+    /// 0033 Task 3: after every append, at every chunk size, the cached
+    /// incremental rows must equal a cold `item_visual_lines` of the full
+    /// text — same split, classifier, wrap, and spine-first rule.
+    #[test]
+    fn incremental_assistant_rows_equal_cold_render() {
+        let corpus = "# h\ntext **b**\n```rust\nlet x = 1;\n```\n- a\n- b\n    code\nplain\n";
+        let p = Palette::default();
+        for chunk in 1..=9usize {
+            let mut item = TranscriptItem::Assistant { text: "".into() };
+            let mut rows: Vec<Line<'static>> = Vec::new();
+            let mut inc = Incremental::new(match &item {
+                TranscriptItem::Assistant { text } => text.seed(),
+                _ => unreachable!(),
+            });
+            let mut fed = 0;
+            while fed < corpus.len() {
+                let mut end = (fed + chunk).min(corpus.len());
+                while !corpus.is_char_boundary(end) {
+                    end += 1;
+                }
+                let TranscriptItem::Assistant { text } = &mut item else {
+                    unreachable!()
+                };
+                text.push_str(&corpus[fed..end]);
+                fed = end;
+                assistant_append(&mut rows, &mut inc, text.as_str(), &p, 40, 2);
+                let cold = item_visual_lines(&item, &p, 40, 2, false);
+                assert_eq!(rows, cold, "diverged at chunk={chunk} fed={fed}");
+            }
+        }
+    }
+
+    /// The cost side of the same change: streaming N chunks over an L-line
+    /// answer classifies O(L + N) lines, not O(L × N).
+    #[test]
+    fn streaming_classifies_only_what_grew() {
+        let corpus =
+            "# h\ntext **b**\n```rust\nlet x = 1;\n```\n- a\n- b\n    code\nplain\n".repeat(30);
+        let mut s = cacheable_state();
+        s.transcript.pop();
+        let mut cache = TranscriptCache::default();
+        draw_cached(&s, &mut cache);
+        let base = cache.line_wraps();
+        let mut fed = 0;
+        let mut appends = 0u64;
+        while fed < corpus.len() {
+            let end = (fed + 5).min(corpus.len());
+            if let Some(TranscriptItem::Assistant { text }) = s.transcript.get_mut(1) {
+                text.push_str(&corpus[fed..end]);
+            }
+            fed = end;
+            appends += 1;
+            draw_cached(&s, &mut cache);
+        }
+        let lines = corpus.lines().count() as u64;
+        let spent = cache.line_wraps() - base;
+        // Each append re-does at most the partial line plus what completed;
+        // the whole stream costs every line once plus one partial per append.
+        assert!(
+            spent <= lines + 2 * appends + 8,
+            "classified {spent} lines for {lines} lines in {appends} appends — not incremental"
+        );
+    }
+
+    /// 0033 Task 3: the streaming shape specifically — hundreds of small
+    /// deltas cutting lines, fences, headings and bullets at every offset;
+    /// warm must equal cold after every single append.
+    #[test]
+    fn streamed_deltas_render_identically_to_a_fresh_render() {
+        let corpus = "# head\ntext **b** and prose that wraps past the narrow test terminal \
+                      width\n```rust\nlet x = 1;\n```\n- a\n- b\n    code\nplain tail\n"
+            .repeat(4);
+        let mut s = cacheable_state();
+        s.transcript.pop(); // drop the running tool card; this is about text
+        let mut warm = TranscriptCache::default();
+        let mut fed = 0;
+        let chunks = (1..=7).cycle();
+        for (step, take) in chunks.enumerate() {
+            if fed >= corpus.len() {
+                break;
+            }
+            let mut end = (fed + take).min(corpus.len());
+            while !corpus.is_char_boundary(end) {
+                end += 1;
+            }
+            if let Some(TranscriptItem::Assistant { text }) = s.transcript.get_mut(1) {
+                text.push_str(&corpus[fed..end]);
+            }
+            fed = end;
+            let cold = draw_cached(&s, &mut TranscriptCache::default());
+            let hot = draw_cached(&s, &mut warm);
+            assert_eq!(hot, cold, "streamed render diverged at step {step}");
         }
     }
 

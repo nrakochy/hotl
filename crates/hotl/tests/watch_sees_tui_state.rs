@@ -86,7 +86,7 @@ fn watch_sees_blocked_even_when_the_card_scrolls_out_of_the_tail() {
     let mut state = session();
     for i in 0..40 {
         state.transcript.push(TranscriptItem::Assistant {
-            text: format!("line {i} of a long session"),
+            text: format!("line {i} of a long session").into(),
         });
     }
     let cmds = ask(&mut state);
