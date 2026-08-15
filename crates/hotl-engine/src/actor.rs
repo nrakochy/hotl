@@ -19,7 +19,10 @@ use hotl_types::{assistant_text, EntryPayload, Item, SyntheticReason, Todo, Toke
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::{turn, EngineConfig, EngineEvent, Outcome, SessionCmd, SessionDeps, TurnEnd};
+use crate::{
+    turn, EngineConfig, EngineEvent, GoalVerdictKind, Outcome, SessionCmd, SessionDeps, TurnEnd,
+};
+use hotl_context::goal::GoalVerdict;
 
 /// Verbatim tail kept through a compaction, as a share of the window.
 pub(crate) const TAIL_RATIO: f64 = 0.3;
@@ -39,6 +42,14 @@ const MAX_COMPACT_STREAK: u32 = 2;
 /// INVARIANT: the actor's command loop stalls for at most this long on a fold.
 /// Enforced by `a_hung_inline_summarize_degrades_instead_of_wedging`.
 const COMPACT_SUMMARIZE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// The goal evaluator's output is two short lines; the bound is generous.
+const GOAL_EVAL_MAX_TOKENS: u32 = 300;
+const GOAL_EVAL_ATTEMPTS: u32 = 2;
+/// Wall-clock bound on the inline goal evaluation — the same posture as
+/// [`COMPACT_SUMMARIZE_TIMEOUT`] (the actor's loop blocks for its duration,
+/// and admission blocking during the call is its serialization working as
+/// designed); on expiry the gate fails open rather than wedging.
+const GOAL_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// Queued prompts before new ones coalesce into the last entry (T3-7).
 const QUEUE_MAX: usize = 64;
 /// Bytes of held steering (or coalesced prompt) text before folding truncates
@@ -859,6 +870,9 @@ pub(crate) async fn run(
         std::mem::take(&mut deps.initial_todos),
     );
     let mut running = false;
+    // The active goal (0034). In-memory beyond the seed, so the turn counter
+    // resets on resume by design; the condition itself is durable (`GoalSet`).
+    let mut goal: Option<GoalState> = deps.initial_goal.take().map(GoalState::new);
     let mut queue: VecDeque<QueuedPrompt> = VecDeque::new();
     // Steers that arrived while a turn was live (or a tool batch open),
     // waiting for a boundary before they can be appended.
@@ -1053,6 +1067,27 @@ pub(crate) async fn run(
                     .await;
                 let _ = events.send(EngineEvent::TodosChanged { items }).await;
             }
+            SessionCmd::SetGoal(condition) => {
+                // The `SetTodos` append+emit shape. Clearing when no goal is
+                // active is a silent no-op — no tombstone, no event.
+                let clearing_nothing = condition.is_none() && goal.is_none();
+                if !clearing_nothing {
+                    goal = condition.clone().map(GoalState::new);
+                    let outcome = condition.is_none().then(|| "cleared".to_string());
+                    let _ = shared
+                        .append(
+                            &mut log,
+                            &mut pipeline,
+                            &mut head,
+                            EntryPayload::GoalSet {
+                                condition: condition.clone(),
+                                outcome,
+                            },
+                        )
+                        .await;
+                    let _ = events.send(EngineEvent::GoalChanged { condition }).await;
+                }
+            }
             SessionCmd::ContextBreakdown { reply } => {
                 // The one arm that reads and returns. No append, no publish,
                 // no `.await` — that is what makes `/context` safe mid-turn.
@@ -1144,6 +1179,7 @@ pub(crate) async fn run(
                         running: &mut running,
                         carry_usage: &mut carry_usage,
                         compact_streak: &mut compact_streak,
+                        goal: &mut goal,
                         cmd_tx: &cmd_tx,
                         events: &events,
                         current_turn: &current_turn,
@@ -1192,9 +1228,27 @@ struct TurnFinishedCtx<'a> {
     running: &'a mut bool,
     carry_usage: &'a mut TokenUsage,
     compact_streak: &'a mut u32,
+    goal: &'a mut Option<GoalState>,
     cmd_tx: &'a mpsc::WeakSender<SessionCmd>,
     events: &'a mpsc::Sender<EngineEvent>,
     current_turn: &'a Arc<Mutex<CancellationToken>>,
+}
+
+/// The active `/goal` (0034). In-memory only (the condition is separately
+/// durable as `GoalSet`), so the turn counter resets to zero on resume —
+/// per the docs, elapsed time and turns-taken restart with the process.
+struct GoalState {
+    condition: String,
+    turns: u32,
+}
+
+impl GoalState {
+    fn new(condition: String) -> Self {
+        Self {
+            condition,
+            turns: 0,
+        }
+    }
 }
 
 /// A turn ended: either report it (and promote the queue) or, on a compaction
@@ -1222,6 +1276,116 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
     };
     if let Some(outcome) = outcome {
         *ctx.compact_streak = 0;
+        // The goal gate (0034): between outcome resolution and `end_turn`,
+        // exactly where the compaction respawn sits. Fires only on Done +
+        // active goal + empty queue — a user-queued prompt outranks the
+        // continuation (the goal re-evaluates after it), and a non-Done
+        // outcome (interrupt, error) returns control with the goal intact.
+        if matches!(outcome, Outcome::Done { .. }) && ctx.queue.is_empty() {
+            if let Some(state) = ctx.goal.as_mut() {
+                state.turns += 1;
+                let turns = state.turns;
+                // Esc during the evaluation returns control immediately: the
+                // eval races the turn's cancel token (`try_compact`'s
+                // pattern); cancel and timeout both fail open.
+                let cancel = ctx
+                    .current_turn
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                let snapshot = Arc::clone(ctx.head.items());
+                let verdict = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => None,
+                    v = tokio::time::timeout(
+                        GOAL_EVAL_TIMEOUT,
+                        evaluate_goal(ctx.shared, &snapshot[..], &state.condition),
+                    ) => v.ok().flatten(),
+                };
+                match verdict {
+                    Some((GoalVerdict::NotYetMet, reason)) => {
+                        let _ = ctx
+                            .events
+                            .send(EngineEvent::GoalVerdict {
+                                verdict: GoalVerdictKind::NotYet,
+                                reason: reason.clone(),
+                                turns,
+                            })
+                            .await;
+                        // No `end_turn`, so no intermediate `TurnDone`: that
+                        // one suppression keeps every surface in "turn
+                        // running" (TUI phase machine, ACP's parked reply,
+                        // headless run_until_idle), and the usage folds into
+                        // carry like a compaction respawn so the single
+                        // final TurnDone reports cumulative spend.
+                        *ctx.carry_usage += usage;
+                        let guidance = goal_guidance_text(&reason, &state.condition);
+                        *ctx.running = start_turn(
+                            ctx.shared,
+                            ctx.log,
+                            ctx.head,
+                            ctx.pipeline,
+                            QueuedPrompt {
+                                text: guidance,
+                                images: Vec::new(),
+                                synthetic: Some(SyntheticReason::GoalGuidance),
+                            },
+                            ctx.cmd_tx,
+                            ctx.events,
+                            ctx.current_turn,
+                            ctx.steers_held,
+                        )
+                        .await;
+                        return;
+                    }
+                    Some((v @ (GoalVerdict::Met | GoalVerdict::Impossible), reason)) => {
+                        let (kind, word) = if v == GoalVerdict::Met {
+                            (GoalVerdictKind::Met, "achieved")
+                        } else {
+                            (GoalVerdictKind::Impossible, "impossible")
+                        };
+                        // The tombstone: resume must never restore this goal.
+                        *ctx.goal = None;
+                        let _ = ctx
+                            .shared
+                            .append(
+                                ctx.log,
+                                ctx.pipeline,
+                                ctx.head,
+                                EntryPayload::GoalSet {
+                                    condition: None,
+                                    outcome: Some(word.into()),
+                                },
+                            )
+                            .await;
+                        let _ = ctx
+                            .events
+                            .send(EngineEvent::GoalChanged { condition: None })
+                            .await;
+                        let _ = ctx
+                            .events
+                            .send(EngineEvent::GoalVerdict {
+                                verdict: kind,
+                                reason,
+                                turns,
+                            })
+                            .await;
+                    }
+                    None => {
+                        // Fail open: keep the goal, end the turn — never
+                        // trap the user in a loop on a broken evaluator.
+                        let _ = ctx
+                            .events
+                            .send(EngineEvent::GoalVerdict {
+                                verdict: GoalVerdictKind::EvalFailed,
+                                reason: "goal evaluation returned no verdict".into(),
+                                turns,
+                            })
+                            .await;
+                    }
+                }
+            }
+        }
         let mut total = usage;
         total += std::mem::take(ctx.carry_usage);
         *ctx.running = end_turn(
@@ -1999,6 +2163,69 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Arc<Item>]) -> Opti
     None
 }
 
+/// One goal evaluation against the durable projection (0034): `summarize`'s
+/// shape — fast model with session-model fallback, no thinking, no cache,
+/// bounded attempts. `None` = no parseable verdict (the gate fails open).
+async fn evaluate_goal(
+    shared: &SharedDeps,
+    items: &[Arc<Item>],
+    condition: &str,
+) -> Option<(GoalVerdict, String)> {
+    let model = shared
+        .config
+        .fast_model
+        .clone()
+        .unwrap_or_else(|| shared.config.model.clone());
+    let request = SamplingRequest {
+        model,
+        max_tokens: GOAL_EVAL_MAX_TOKENS,
+        system: hotl_context::goal::GOAL_EVAL_SYSTEM.into(),
+        items: Arc::new(vec![Arc::new(Item::User {
+            text: hotl_context::goal::eval_prompt(condition, items),
+            synthetic: None,
+            images: Vec::new(),
+        })]),
+        // A one-shot call against a prompt that is different every time:
+        // nothing to cache, and nothing ephemeral to append (`summarize`).
+        ephemeral_tail: empty_tail(),
+        tools: Vec::new().into(),
+        thinking: false,
+        effort: None,
+        cache: hotl_provider::CachePolicy::Off,
+        turn_context: None,
+    };
+    for _ in 0..GOAL_EVAL_ATTEMPTS {
+        let mut stream = shared.provider.stream(request.clone());
+        let mut text: Option<String> = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::Completed { blocks, .. }) => text = Some(assistant_text(&blocks)),
+                Ok(_) => {}
+                Err(_) => {
+                    text = None;
+                    // Finish the stream rather than abandoning it mid-flight
+                    // — same reasoning as `summarize`.
+                    crate::turn::drain_to_end(&mut stream).await;
+                    break;
+                }
+            }
+        }
+        if let Some(v) = text.as_deref().and_then(hotl_context::goal::parse_verdict) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// The continuation's opening user item. The wrap happens here —
+/// `start_turn` commits synthetic prompts verbatim, it never wraps.
+fn goal_guidance_text(reason: &str, condition: &str) -> String {
+    format!(
+        "<system-reminder>Goal check — not yet met: {reason}\n\
+         Keep working toward the goal: {condition}</system-reminder>"
+    )
+}
+
 /// A prompt waiting its turn (one-at-a-time promotion), with everything the
 /// committed `Item::User` will carry.
 struct QueuedPrompt {
@@ -2739,6 +2966,7 @@ mod tests {
             hooks: None,
             initial_items: Vec::new(),
             initial_todos: Vec::new(),
+            initial_goal: None,
             config: crate::EngineConfig::default(),
         }
     }

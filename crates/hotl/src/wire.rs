@@ -60,6 +60,19 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             json!({"type": "compacted", "degraded": degraded})
         }
         EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
+        EngineEvent::GoalChanged { condition } => {
+            json!({"type": "goal_changed", "goal": condition})
+        }
+        EngineEvent::GoalVerdict {
+            verdict,
+            reason,
+            turns,
+        } => json!({
+            "type": "goal_verdict",
+            "verdict": goal_verdict_tag(*verdict),
+            "reason": reason,
+            "turns": turns,
+        }),
         // §S1 telemetry: a normal tagged frame (not a round-trip/result like
         // `Ask`/`Question`/`TurnDone`) — headline numbers plus the per-phase
         // deltas (9 small rows, the point of a wall-clock profiler). Only the
@@ -80,6 +93,16 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         | EngineEvent::EgressAsk { .. }
         | EngineEvent::TurnDone { .. } => return None,
     })
+}
+
+/// The `goal_verdict` frame's stable wire tag — never a `Debug` rendering.
+fn goal_verdict_tag(verdict: hotl_engine::GoalVerdictKind) -> &'static str {
+    match verdict {
+        hotl_engine::GoalVerdictKind::NotYet => "not_yet",
+        hotl_engine::GoalVerdictKind::Met => "met",
+        hotl_engine::GoalVerdictKind::Impossible => "impossible",
+        hotl_engine::GoalVerdictKind::EvalFailed => "eval_failed",
+    }
 }
 
 /// A turn outcome as a tagged object. The headless stream used

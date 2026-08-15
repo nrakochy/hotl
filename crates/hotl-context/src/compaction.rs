@@ -119,9 +119,16 @@ Be specific (paths, names, values). Omit pleasantries and tool mechanics.";
 /// Tool results are clipped per-item — the digest needs their gist, and the
 /// summarize call must stay far smaller than the window being compacted.
 pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(folded: &[I]) -> String {
+    format!("Transcript to compress:\n\n{}", render_transcript(folded))
+}
+
+/// The plain-text transcript both small-model calls read (the compaction
+/// summarizer and the goal evaluator): tool results clipped per-item, images
+/// text-only — the call must stay far smaller than the window it reads.
+pub(crate) fn render_transcript<I: std::borrow::Borrow<Item>>(items: &[I]) -> String {
     const RESULT_CLIP: usize = 600;
-    let mut out = String::from("Transcript to compress:\n\n");
-    for item in folded {
+    let mut out = String::new();
+    for item in items {
         match item.borrow() {
             Item::System { .. } | Item::Unknown => {}
             Item::User {

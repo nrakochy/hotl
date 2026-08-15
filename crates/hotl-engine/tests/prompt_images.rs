@@ -78,6 +78,7 @@ fn session() -> Session {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     Session {

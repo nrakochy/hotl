@@ -303,6 +303,20 @@ pub enum EngineEvent {
     TodosChanged {
         items: Vec<Todo>,
     },
+    /// The session's goal changed (`/goal`, 0034): set (`Some`) or
+    /// resolved/cleared (`None`). Same shape as `TodosChanged` — the surface
+    /// renders goal state from this, never from parsing text. Also covers
+    /// engine-initiated clears (met/impossible verdicts).
+    GoalChanged {
+        condition: Option<String>,
+    },
+    /// The goal evaluator's per-turn judgment (0034). `turns` counts
+    /// evaluated turns since the goal was set (in-memory; resets on resume).
+    GoalVerdict {
+        verdict: GoalVerdictKind,
+        reason: String,
+        turns: u32,
+    },
     /// Loop-overhead instrument (§S1), flushed once when the turn task ends.
     /// UI/telemetry only — this NEVER becomes a session-log entry, so it
     /// cannot perturb golden-transcript normalization.
@@ -327,9 +341,26 @@ impl std::fmt::Debug for EngineEvent {
             Self::EgressAsk { host, .. } => write!(f, "EgressAsk({host})"),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
             Self::TodosChanged { items } => write!(f, "TodosChanged(n={})", items.len()),
+            Self::GoalChanged { condition } => {
+                write!(f, "GoalChanged(set={})", condition.is_some())
+            }
+            Self::GoalVerdict { verdict, turns, .. } => {
+                write!(f, "GoalVerdict({verdict:?},turns={turns})")
+            }
             Self::LedgerReport(s) => write!(f, "LedgerReport(samples={})", s.sample_count),
         }
     }
+}
+
+/// What the goal evaluator concluded, engine-side vocabulary: the parser
+/// never produces `EvalFailed` — it marks an evaluation that failed, timed
+/// out, or was cancelled, which fails open (goal kept, turn ends).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoalVerdictKind {
+    NotYet,
+    Met,
+    Impossible,
+    EvalFailed,
 }
 
 /// One entry a turn task proposes to the actor, already serialized and
@@ -572,6 +603,11 @@ pub enum SessionCmd {
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
     /// only ever forwards a validated `Vec<Todo>` here.
     SetTodos(Vec<Todo>),
+    /// Set (`Some`) or clear (`None`) the session's goal (durable: appended
+    /// to the log as `GoalSet`, last-wins on replay). Clearing an *active*
+    /// goal appends the tombstone (outcome `"cleared"`); clearing when none
+    /// is active is a silent no-op — no entry, no event.
+    SetGoal(Option<String>),
     /// A read-only breakdown of what currently fills the context window
     /// (plan 0028). The ONLY `SessionCmd` that neither appends to the log nor
     /// advances the projection: it reads the actor's own head plus two
@@ -669,6 +705,12 @@ pub struct SessionDeps {
     /// re-enter through it, and seeding here (vs. a post-spawn `SetTodos`)
     /// means resume never appends a duplicate `Todos` log entry.
     pub initial_todos: Vec<Todo>,
+    /// The goal a resumed session starts with (the replayed chain's last
+    /// `GoalSet`, tombstones applied — see `hotl_store::Replayed::goal`).
+    /// `None` for a fresh session. A seed, never a post-spawn `SetGoal`, so
+    /// resume appends no duplicate `GoalSet` entry; the turn counter starts
+    /// at zero (in-memory by design).
+    pub initial_goal: Option<String>,
     pub config: EngineConfig,
 }
 
@@ -764,6 +806,12 @@ impl SessionHandle {
     /// entry point is the `todo_write` tool's sink.
     pub async fn set_todos(&self, items: Vec<Todo>) {
         let _ = self.cmd.send(SessionCmd::SetTodos(items)).await;
+    }
+    /// Set or clear the session's goal (a durable `goal_set` log entry;
+    /// last one wins, and the tombstone means an achieved/cleared goal never
+    /// survives resume). `None` clears.
+    pub async fn set_goal(&self, condition: Option<String>) {
+        let _ = self.cmd.send(SessionCmd::SetGoal(condition)).await;
     }
     /// What currently fills the context window, by source (`/context`).
     /// `None` if the actor is gone. Appends nothing and publishes nothing, so

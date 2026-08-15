@@ -46,6 +46,7 @@ fn session(provider: Arc<dyn Provider>, hooks: Arc<dyn Hooks>, config: EngineCon
         hooks: Some(hooks),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     Session { handle, dir }

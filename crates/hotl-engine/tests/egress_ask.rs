@@ -121,6 +121,7 @@ fn session(cmd: &str, host: &str, rules: Rules) -> (Session, Arc<AtomicBool>) {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     (Session { handle, dir }, saw)

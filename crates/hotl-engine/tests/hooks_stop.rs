@@ -71,6 +71,7 @@ async fn a_stop_hook_can_block_once_then_allow() {
         hooks: Some(Arc::new(hooks)),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -141,6 +142,7 @@ async fn an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the
         hooks: Some(Arc::new(hooks)),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     handle
@@ -207,6 +209,7 @@ async fn no_hooks_means_stop_never_fires_and_todo_gate_is_unaffected() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     handle.prompt("go".into()).await;

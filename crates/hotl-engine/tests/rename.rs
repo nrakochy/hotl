@@ -33,6 +33,7 @@ async fn rename_appends_a_durable_entry() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 

@@ -74,6 +74,7 @@ fn deps(dir: &std::path::Path, log: SessionLog, config: EngineConfig) -> Session
             },
         ],
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     }
 }

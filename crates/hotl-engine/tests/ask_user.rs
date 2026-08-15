@@ -47,6 +47,7 @@ fn spawn_with_ask_user(
             hooks: None,
             initial_items: Vec::new(),
             initial_todos: Vec::new(),
+            initial_goal: None,
             config,
         },
         cmd_tx,

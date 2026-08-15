@@ -36,6 +36,7 @@ async fn set_mode_appends_a_durable_entry() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -87,6 +88,7 @@ async fn set_plan_appends_its_own_durable_entry() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -148,6 +150,7 @@ async fn set_plan_takes_effect_on_the_running_session() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -233,6 +236,7 @@ async fn set_mode_auto_stays_auto_on_a_normal_build() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 

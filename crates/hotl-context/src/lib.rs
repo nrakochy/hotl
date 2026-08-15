@@ -7,6 +7,7 @@
 
 pub mod breakdown;
 pub mod compaction;
+pub mod goal;
 pub mod tokens;
 
 pub use tokens::TokenProfile;

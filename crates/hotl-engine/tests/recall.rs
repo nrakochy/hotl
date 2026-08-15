@@ -52,6 +52,7 @@ fn session_with_recall(provider: Arc<dyn Provider>) -> Session {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     Session { handle, dir }

@@ -53,6 +53,7 @@ async fn set_todos_appends_a_durable_entry_and_emits_todos_changed() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -113,6 +114,7 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -217,6 +219,7 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: replayed.todos,
+        initial_goal: None,
         config,
     });
 

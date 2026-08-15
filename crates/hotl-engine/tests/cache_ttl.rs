@@ -32,6 +32,7 @@ async fn run_one_turn_and_capture(config: EngineConfig) -> hotl_provider::Sampli
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     handle.prompt("go".into()).await;

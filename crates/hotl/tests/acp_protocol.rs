@@ -107,6 +107,7 @@ fn scripted_factory_recording(
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config: EngineConfig {
                     max_turns: 6,
                     ..Default::default()
@@ -166,6 +167,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
                     images: Vec::new(),
                 }],
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config: EngineConfig {
                     max_turns: 6,
                     ..Default::default()
@@ -631,6 +633,7 @@ async fn overlapping_prompts_resolve_in_order() {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config: EngineConfig {
                     max_turns: 6,
                     ..Default::default()
@@ -844,6 +847,7 @@ async fn prompt_images_are_validated_at_the_wire() {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config: EngineConfig::default(),
             }),
             name,
@@ -1031,6 +1035,7 @@ async fn ask_user_round_trip_via_session_request_question() {
                     hooks: None,
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_goal: None,
                     config: EngineConfig {
                         max_turns: 6,
                         ..Default::default()

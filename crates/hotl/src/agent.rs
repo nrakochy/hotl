@@ -1073,6 +1073,7 @@ impl Scaffold {
             hooks: self.hooks.clone(),
             initial_items,
             initial_todos,
+            initial_goal: None,
             config,
         }
     }
@@ -1793,6 +1794,7 @@ impl HotlChildBuilder {
                 hooks: None,
                 initial_items,
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config,
             },
         );
@@ -2279,6 +2281,28 @@ impl Surface {
                     .count();
                 eprintln!("· todos: {done}/{} done", items.len());
             }
+            EngineEvent::GoalChanged { condition } => match condition {
+                Some(c) => eprintln!("· goal set: {c}"),
+                None => eprintln!("· goal cleared"),
+            },
+            EngineEvent::GoalVerdict {
+                verdict,
+                reason,
+                turns,
+            } => match verdict {
+                hotl_engine::GoalVerdictKind::NotYet => {
+                    eprintln!("· goal check (turn {turns}): not yet — {reason}")
+                }
+                hotl_engine::GoalVerdictKind::Met => {
+                    eprintln!("· goal achieved after {turns} turn(s): {reason}")
+                }
+                hotl_engine::GoalVerdictKind::Impossible => {
+                    eprintln!("· goal impossible after {turns} turn(s): {reason}")
+                }
+                hotl_engine::GoalVerdictKind::EvalFailed => {
+                    eprintln!("· goal check failed — no verdict; the goal stays active")
+                }
+            },
             // §S1 telemetry, not a human-facing update — the headless
             // terminal renderer has nothing to show for it.
             EngineEvent::LedgerReport(_) => {}
@@ -4407,6 +4431,7 @@ mod tests {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config,
             });
         handle.prompt("go".into()).await;
@@ -4467,6 +4492,7 @@ mod tests {
                     status: hotl_types::TodoStatus::InProgress,
                     active_form: None,
                 }],
+                initial_goal: None,
                 config,
             });
 
@@ -4565,6 +4591,7 @@ mod tests {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config,
             });
 
@@ -4620,6 +4647,7 @@ mod tests {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config,
             });
         handle.prompt("go".into()).await;
@@ -4676,6 +4704,7 @@ mod tests {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_goal: None,
                 config,
             });
 
@@ -5451,6 +5480,7 @@ mod tests {
                     hooks: Some(hooks_for_deps),
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_goal: None,
                     config,
                 },
             );

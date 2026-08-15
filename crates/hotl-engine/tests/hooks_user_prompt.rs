@@ -39,6 +39,7 @@ async fn user_prompt_hook_injects_additional_context_after_the_prompt() {
         hooks: Some(Arc::new(hooks)),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -108,6 +109,7 @@ async fn multiple_user_prompt_hooks_concatenate_into_one_item() {
         hooks: Some(Arc::new(hooks)),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 
@@ -170,6 +172,7 @@ async fn no_hooks_means_no_injected_reminder() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
 

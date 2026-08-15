@@ -425,6 +425,7 @@ impl Harness {
             hooks,
             initial_items,
             initial_todos: Vec::new(),
+            initial_goal: None,
             config,
         };
         let handle = spawn_session(deps);

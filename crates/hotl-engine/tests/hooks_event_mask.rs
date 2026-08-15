@@ -98,6 +98,7 @@ fn session(provider: Arc<dyn Provider>, hooks: Arc<dyn Hooks>) -> Session {
         hooks: Some(hooks),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     Session { handle, dir }
@@ -263,6 +264,7 @@ async fn a_zero_hook_session_is_unaffected() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     handle.prompt("go".into()).await;

@@ -64,6 +64,7 @@ fn session_logged(
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_goal: None,
         config,
     });
     (handle, dir, log_path)
