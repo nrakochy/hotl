@@ -52,6 +52,10 @@ pub(crate) struct Resumed {
     /// same inheritance shape as `mode`/`name`). Empty = the parent never
     /// had a list, so the resumed session starts with none, same as fresh.
     pub todos: Vec<hotl_types::Todo>,
+    /// The chain's active goal, if any (last `GoalSet`, tombstones applied).
+    /// Resume adopts it; a **fork** deliberately drops it — see decision 6
+    /// (0034): a fork exists to be redirected.
+    pub goal: Option<String>,
 }
 
 use crate::acp::KeepSpec;
@@ -158,6 +162,7 @@ pub(crate) fn load_lineage(
         plan,
         effort,
         todos,
+        goal,
         tip_entry_id,
         ..
     } = replayed;
@@ -176,6 +181,9 @@ pub(crate) fn load_lineage(
         // an earlier prefix would inherit a checklist about work its own
         // history no longer contains — actively misleading, so drop it.
         todos: if truncated { Vec::new() } else { todos },
+        // The goal is the same shape as todos (a claim about the parent's
+        // final state); the fork arms drop it even untruncated.
+        goal: if truncated { None } else { goal },
     })
 }
 
@@ -400,7 +408,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
             Err(code) => code,
         },
         (None, Some(prompt)) => match prompt.resolve() {
-            Ok(text) => run_session(text, parsed.json_events, parsed.name, fork).await,
+            Ok(text) => run_session(text, parsed.json_events, parsed.name, fork, parsed.goal).await,
             Err(code) => code,
         },
         // Reachable via e.g. `hotl --json` with no -p (main.rs routes any
@@ -480,7 +488,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         Some(scaffold.spawn_registration(session_id)),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, None, items, Inherited::default(), Vec::new());
+            let mut deps = scaffold.deps(log, None, items, Inherited::default(), Vec::new(), None);
             deps.registry = registry;
             deps
         },
@@ -697,6 +705,17 @@ pub(crate) async fn build_acp() -> Result<
             .as_ref()
             .map(|r| r.todos.clone())
             .unwrap_or_default();
+        // Like todos, the goal seeds the actor directly and is never
+        // copy-forwarded (chain replay already finds the parent's `GoalSet`).
+        // A fork never inherits it, even at the head (0034 decision 6): a
+        // fork exists to be redirected, and inheriting would immediately
+        // spend money driving the parent's target — mirroring "a fork never
+        // auto-continues".
+        let inherited_goal = if is_fork {
+            None
+        } else {
+            resumed.as_ref().and_then(|r| r.goal.clone())
+        };
         // The effective mode this session will actually run under: the
         // inherited-and-coerced override, else the configured default. The
         // same value `deps()` hands the actor — computed once, reported once,
@@ -727,6 +746,7 @@ pub(crate) async fn build_acp() -> Result<
                         effort: effort_override,
                     },
                     inherited_todos,
+                    inherited_goal.clone(),
                 );
                 deps.registry = registry;
                 deps
@@ -737,6 +757,7 @@ pub(crate) async fn build_acp() -> Result<
             name: requested,
             mode,
             plan,
+            goal: inherited_goal,
             // Display-only: what a bare `/effort` reports as the session
             // default. The engine already holds the same resolved value.
             default_effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
@@ -830,6 +851,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
                 initial_items,
                 Inherited::default(),
                 Vec::new(),
+                None,
             );
             deps.registry = registry;
             deps
@@ -1037,6 +1059,7 @@ impl Scaffold {
         initial_items: Vec<hotl_types::Item>,
         inherited: Inherited,
         initial_todos: Vec<hotl_types::Todo>,
+        initial_goal: Option<String>,
     ) -> SessionDeps {
         let Inherited {
             mode: mode_override,
@@ -1073,7 +1096,7 @@ impl Scaffold {
             hooks: self.hooks.clone(),
             initial_items,
             initial_todos,
-            initial_goal: None,
+            initial_goal,
             config,
         }
     }
@@ -1094,6 +1117,7 @@ async fn run_session(
     json_events: bool,
     name: Option<String>,
     fork: Option<ForkArgs>,
+    goal: Option<String>,
 ) -> i32 {
     // Resolved before the provider is even selected: a bad `--fork-from` is a
     // usage error, and paying for a scaffold to discover it is silly.
@@ -1163,6 +1187,20 @@ async fn run_session(
             scaffold.clock.now_ms(),
         );
     }
+    // An explicit --goal is durably logged at create so the log and a later
+    // resume agree; the actor seeds from `initial_goal` below (never a
+    // post-spawn SetGoal, which would append a duplicate entry). The
+    // headless lineage is always a fork, which never inherits a goal (0034
+    // decision 6) — only the flag can set one here.
+    if let Some(g) = &goal {
+        let _ = log.append(
+            &hotl_types::EntryPayload::GoalSet {
+                condition: Some(g.clone()),
+                outcome: None,
+            },
+            scaffold.clock.now_ms(),
+        );
+    }
     let session_id = log.session_id.clone();
     spawn_secret_audit(log.path().to_path_buf());
     let gc_config_dir = scaffold.config_dir.clone();
@@ -1203,6 +1241,7 @@ async fn run_session(
                     effort: effort_override,
                 },
                 initial_todos,
+                goal,
             );
             deps.registry = registry;
             deps
@@ -2449,6 +2488,9 @@ struct Args {
     fork_from: Option<String>,
     keep: Option<usize>,
     keep_turns: Option<usize>,
+    /// `--goal <condition>`: run the goal loop headless — the turn keeps
+    /// continuing until the evaluator judges the condition met/impossible.
+    goal: Option<String>,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
@@ -2460,6 +2502,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut fork_from: Option<String> = None;
     let mut keep: Option<usize> = None;
     let mut keep_turns: Option<usize> = None;
+    let mut goal: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -2511,6 +2554,16 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
                     }
                 }
             }
+            "--goal" => match iter.next().as_deref().and_then(hotl_types::normalize_goal) {
+                Some(g) => goal = Some(g),
+                None => {
+                    eprintln!(
+                        "hotl: --goal needs a completion condition of 1–{} chars",
+                        hotl_types::GOAL_MAX_CHARS
+                    );
+                    return Err(2);
+                }
+            },
             other => {
                 eprintln!("hotl: unknown argument `{other}` (try --help)");
                 return Err(2);
@@ -2525,6 +2578,12 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     // from a lineage. Say so rather than accepting the flag and ignoring it.
     if schema.is_some() && fork_from.is_some() {
         eprintln!("hotl: --fork-from is not supported with --json-schema");
+        return Err(2);
+    }
+    // Same posture for the goal loop: a structured run is one validated
+    // turn by construction.
+    if schema.is_some() && goal.is_some() {
+        eprintln!("hotl: --goal is not supported with --json-schema");
         return Err(2);
     }
     // Headless has no `-r`, so "resuming" is always false here; the shared
@@ -2543,6 +2602,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         fork_from,
         keep,
         keep_turns,
+        goal,
     })
 }
 
@@ -5391,6 +5451,28 @@ mod tests {
         for bad in [vec!["-p", "hi", "-n"], vec!["-p", "hi", "-n", "   "]] {
             let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
             assert!(parse_args(args).is_err());
+        }
+    }
+
+    #[test]
+    fn parse_args_accepts_goal_and_rejects_bad_ones() {
+        let args: Vec<String> = ["-p", "hi", "--goal", "  tests pass  "]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_args(args).expect("parses");
+        assert_eq!(parsed.goal.as_deref(), Some("tests pass"));
+
+        let overlong = "x".repeat(hotl_types::GOAL_MAX_CHARS + 1);
+        for bad in [
+            vec!["-p", "hi", "--goal"],
+            vec!["-p", "hi", "--goal", "   "],
+            vec!["-p", "hi", "--goal", overlong.as_str()],
+            // A structured run is one validated turn by construction.
+            vec!["-p", "hi", "--json-schema", "s.json", "--goal", "g"],
+        ] {
+            let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
+            assert!(parse_args(args).is_err(), "{bad:?}");
         }
     }
 

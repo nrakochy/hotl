@@ -165,6 +165,9 @@ pub struct SessionOpen {
     /// `/effort` reports when the user has set nothing. `None` = the model
     /// gets no depth field (uncatalogued model, nothing configured).
     pub default_effort: Option<String>,
+    /// The active goal at open (0034): resume restores it, a fork never
+    /// does, a fresh session has none.
+    pub goal: Option<String>,
     /// The **store** session id — what `hotl_store::replay_chain` resolves and
     /// what `SessionSpec::Load` takes, as distinct from the `acp-N` handle
     /// this connection hands clients. `session/reload_config` resumes through
@@ -401,6 +404,7 @@ async fn handle_request(
                     let mode = open.mode.clone();
                     let plan = open.plan;
                     let default_effort = open.default_effort.clone();
+                    let goal = open.goal.clone();
                     let name = open.name.clone();
                     let sid = install_session(
                         open,
@@ -440,7 +444,7 @@ async fn handle_request(
                         writer,
                         id,
                         json!({"sessionId": sid, "name": name, "mode": mode, "plan": plan,
-                               "defaultEffort": default_effort, "images": true}),
+                               "defaultEffort": default_effort, "goal": goal, "images": true}),
                     )
                     .await;
                 }
@@ -601,6 +605,43 @@ async fn handle_request(
                 json!({"type": "effort_changed", "effort": wire}),
             )
             .await;
+        }
+        "session/set_goal" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            // `null` clears; a string must survive `normalize_goal`. No
+            // bespoke broadcast, unlike `set_effort`: the engine emits
+            // `GoalChanged`, which the drain's catch-all relays to every
+            // attached surface — and that path also covers the clears the
+            // engine initiates itself (met/impossible verdicts), which a
+            // handler-side notify never could.
+            let raw = msg.pointer("/params/goal");
+            let goal = match raw {
+                None | Some(Value::Null) => None,
+                Some(Value::String(s)) => match hotl_types::normalize_goal(s) {
+                    Some(g) => Some(g),
+                    None => {
+                        return reply_err(
+                            writer,
+                            id,
+                            "session/set_goal requires params.goal of 1–4000 chars \
+                             (or null to clear)",
+                        )
+                        .await;
+                    }
+                },
+                Some(_) => {
+                    return reply_err(
+                        writer,
+                        id,
+                        "session/set_goal requires params.goal (a string, or null to clear)",
+                    )
+                    .await;
+                }
+            };
+            state.handle.set_goal(goal.clone()).await;
+            reply_ok(writer, id, json!({"ok": true, "goal": goal})).await;
         }
         "session/steer" => {
             let Some(state) = session.as_ref() else {

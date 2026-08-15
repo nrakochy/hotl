@@ -119,6 +119,7 @@ fn scripted_factory_recording(
             // A resolved session default, so the handshake test can pin that
             // it rides the open reply (0030 Task 8).
             default_effort: Some("xhigh".into()),
+            goal: None,
             session_id,
         })
     })
@@ -177,6 +178,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             mode: "auto".to_string(),
             plan: false,
             default_effort: None,
+            goal: None,
             session_id,
         })
     })
@@ -643,6 +645,7 @@ async fn overlapping_prompts_resolve_in_order() {
             mode: "ask".into(),
             plan: false,
             default_effort: None,
+            goal: None,
             session_id,
         })
     });
@@ -854,6 +857,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             mode: "ask".into(),
             plan: false,
             default_effort: None,
+            goal: None,
             session_id,
         })
     });
@@ -1051,6 +1055,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             mode: "ask".into(),
             plan: false,
             default_effort: None,
+            goal: None,
             session_id,
         })
     });
@@ -1399,6 +1404,182 @@ async fn set_effort_acks_broadcasts_and_rejects_unknown_levels() {
     .await;
     let m = read_until_id(&mut lines, 5).await;
     assert!(m.get("error").is_some(), "an unknown rung must error: {m}");
+}
+
+/// `session/set_goal` acks with the normalized goal; the change reaches every
+/// attached surface as `goal_changed` through the drain's catch-all (the
+/// engine's own `GoalChanged` event — there is no handler-side notify to
+/// drift from it). `null` clears, and a non-string / overlong param errors.
+#[tokio::test]
+async fn set_goal_acks_relays_the_engine_broadcast_and_rejects_invalid_params() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    assert_eq!(
+        opened["result"]["goal"],
+        Value::Null,
+        "a fresh session opens with no goal"
+    );
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_goal",
+               "params":{"goal":"  all tests pass  "}}),
+    )
+    .await;
+    let mut saw = false;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "goal_changed" {
+            assert_eq!(m["params"]["update"]["goal"], "all tests pass");
+            saw = true;
+            break;
+        }
+        if m["id"] == json!(3) {
+            assert_eq!(
+                m["result"]["goal"], "all tests pass",
+                "the ack carries the normalized goal"
+            );
+        }
+    }
+    assert!(saw, "a set goal must reach the wire as goal_changed");
+
+    // `null` clears, and the engine's clear is broadcast the same way.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_goal","params":{"goal":null}}),
+    )
+    .await;
+    let mut saw_clear = false;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "goal_changed" {
+            assert_eq!(m["params"]["update"]["goal"], Value::Null);
+            saw_clear = true;
+            break;
+        }
+        if m["id"] == json!(4) {
+            assert_eq!(m["result"]["goal"], Value::Null);
+        }
+    }
+    assert!(saw_clear, "clearing must broadcast goal_changed with null");
+
+    // Overlong and non-string params are usage errors, not silent trims.
+    let overlong = "x".repeat(4001);
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/set_goal","params":{"goal":overlong}}),
+    )
+    .await;
+    let m = read_until_id(&mut lines, 5).await;
+    assert!(m.get("error").is_some(), "overlong must error: {m}");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":6,"method":"session/set_goal","params":{"goal":42}}),
+    )
+    .await;
+    let m = read_until_id(&mut lines, 6).await;
+    assert!(m.get("error").is_some(), "a non-string must error: {m}");
+}
+
+/// The open reply's `goal` key is the resume handshake: a factory restoring a
+/// goal on `session/load` reaches the client synchronously, and a fork's open
+/// carries `null` (forks never inherit the goal — 0034 decision 6).
+#[tokio::test]
+async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
+    // A factory shaped like the real one: Load restores the chain's goal,
+    // Fork (and New) never carry one.
+    let factory: acp::SessionFactory = Box::new(move |spec| {
+        let goal = match &spec {
+            acp::SessionSpec::Load { .. } => Some("all tests pass".to_string()),
+            acp::SessionSpec::New { .. } | acp::SessionSpec::Fork { .. } => None,
+        };
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        std::mem::forget(dir);
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                provider: Arc::new(ScriptedProvider::new(vec![])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: vec![hotl_types::Item::Assistant {
+                    blocks: vec![json!({"type":"text","text":"done"})],
+                }],
+                initial_todos: Vec::new(),
+                initial_goal: goal.clone(),
+                config: EngineConfig::default(),
+            }),
+            name: None,
+            mode: "ask".to_string(),
+            plan: false,
+            default_effort: None,
+            goal,
+            session_id,
+        })
+    });
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    assert_eq!(
+        opened["result"]["goal"], "all tests pass",
+        "resume must hand the restored goal to the client synchronously"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/load",
+               "params":{"sessionId":"S1","fork":true}}),
+    )
+    .await;
+    let forked = read_until_id(&mut lines, 3).await;
+    assert_eq!(
+        forked["result"]["goal"],
+        Value::Null,
+        "a fork never inherits the goal"
+    );
 }
 
 async fn next(lines: &mut tokio::io::Lines<BufReader<impl tokio::io::AsyncRead + Unpin>>) -> Value {

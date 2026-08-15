@@ -309,6 +309,16 @@ fn update_line(update: &Value) -> Option<String> {
                     .unwrap_or(0);
                 format!("· todos: {n} item(s)")
             }
+            "goal_changed" => match update.get("goal").and_then(Value::as_str) {
+                Some(goal) => format!("· goal set: {goal}"),
+                None => "· goal cleared".to_string(),
+            },
+            "goal_verdict" => format!(
+                "· goal check (turn {}): {} — {}",
+                n("turns"),
+                s("verdict"),
+                s("reason")
+            ),
             "mode_changed" => format!("· permission mode → {}", s("mode")),
             _ => return None,
         },
@@ -375,6 +385,15 @@ mod tests {
             EngineEvent::PromptQueued,
             EngineEvent::Compacted { degraded: false },
             EngineEvent::TodosChanged { items: Vec::new() },
+            EngineEvent::GoalChanged {
+                condition: Some("tests pass".into()),
+            },
+            EngineEvent::GoalChanged { condition: None },
+            EngineEvent::GoalVerdict {
+                verdict: hotl_engine::GoalVerdictKind::NotYet,
+                reason: "no commit yet".into(),
+                turns: 1,
+            },
         ]
     }
 

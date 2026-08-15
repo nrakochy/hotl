@@ -44,6 +44,14 @@ fn every_frame_is_tagged_and_versioned() {
         EngineEvent::PromptQueued,
         EngineEvent::Compacted { degraded: false },
         EngineEvent::TodosChanged { items: Vec::new() },
+        EngineEvent::GoalChanged {
+            condition: Some("tests pass".into()),
+        },
+        EngineEvent::GoalVerdict {
+            verdict: hotl_engine::GoalVerdictKind::NotYet,
+            reason: "no commit yet".into(),
+            turns: 1,
+        },
         EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
             usage: TokenUsage::default(),
@@ -117,6 +125,39 @@ fn every_outcome_variant_is_tagged_and_carries_its_payload() {
         if let Some((key, value)) = payload {
             assert_eq!(f[key], value, "{kind} must carry `{key}`");
         }
+    }
+}
+
+/// 0034: the goal frames are additive (`JSON_STREAM_SCHEMA_VERSION` stands).
+/// `goal_changed` carries the condition or an explicit `null` on clear;
+/// `goal_verdict` carries a stable snake_case tag, never a Debug rendering.
+#[test]
+fn goal_frames_carry_their_payloads() {
+    let set = wire::update_frame(&EngineEvent::GoalChanged {
+        condition: Some("tests pass".into()),
+    })
+    .unwrap();
+    assert_eq!(set["type"], "goal_changed");
+    assert_eq!(set["goal"], "tests pass");
+    let cleared = wire::update_frame(&EngineEvent::GoalChanged { condition: None }).unwrap();
+    assert_eq!(cleared["goal"], json!(null));
+
+    for (kind, tag) in [
+        (hotl_engine::GoalVerdictKind::NotYet, "not_yet"),
+        (hotl_engine::GoalVerdictKind::Met, "met"),
+        (hotl_engine::GoalVerdictKind::Impossible, "impossible"),
+        (hotl_engine::GoalVerdictKind::EvalFailed, "eval_failed"),
+    ] {
+        let f = wire::update_frame(&EngineEvent::GoalVerdict {
+            verdict: kind,
+            reason: "because".into(),
+            turns: 3,
+        })
+        .unwrap();
+        assert_eq!(f["type"], "goal_verdict");
+        assert_eq!(f["verdict"], tag);
+        assert_eq!(f["reason"], "because");
+        assert_eq!(f["turns"], 3);
     }
 }
 
