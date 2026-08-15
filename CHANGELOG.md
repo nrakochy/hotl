@@ -6,6 +6,28 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **`/goal` — run until a condition is met** (plan 0034). Set a completion
+  condition (`/goal all tests pass and the change is committed`); after each
+  turn a small fast evaluator (the compaction summarizer's model) judges it
+  against the conversation. *Not yet met* and the agent takes another turn
+  with the verdict's reason as guidance — with no intermediate turn-done, so
+  the console stays in "working", attached surfaces stay parked, and the one
+  final result reports the cumulative token spend. *Met* or *impossible* and
+  the goal clears with a transcript notice. Bare `/goal` reports condition,
+  elapsed time and turns; `/goal clear` ends it early; the status strip shows
+  `◎ /goal active · Nm` meanwhile. The evaluator fails open (a timeout,
+  garbage verdict, or Esc during the check ends the turn with the goal
+  intact — it can never trap the run in a loop), a queued prompt outranks
+  the continuation, and there is deliberately no built-in turn cap — bound
+  it in the condition text. An active goal survives `hotl resume` (turn
+  count and timer restart); an achieved/cleared one never comes back, and a
+  fork never inherits one. Headless parity: `hotl -p --goal "<condition>"
+  "<prompt>"` runs the whole loop in one invocation, and ACP clients get
+  `session/set_goal` plus `goal_changed`/`goal_verdict` updates (additive —
+  no schema-version bump).
+
 ## [0.16.0] - 2026-08-14
 
 ### Changed
