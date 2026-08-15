@@ -27,10 +27,11 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 10] = [
+const BUILTINS: [(&str, &str); 11] = [
     ("rename", "name this session"),
     ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
+    ("goal", "run until a condition is met"),
     ("reload", "re-read config.toml"),
     ("help", "show the key bindings"),
     ("status", "what this session is running"),
@@ -203,6 +204,7 @@ mod tests {
             names(&cmds, &c),
             vec![
                 "cost",
+                "goal",
                 "help",
                 "mode",
                 "plan",

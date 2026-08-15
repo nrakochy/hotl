@@ -381,6 +381,15 @@ pub struct State {
     /// The `todo_write` checklist, from `todos_changed` updates. Empty means
     /// either no list yet or the model cleared it — both render as nothing.
     pub todos: Vec<hotl_tools::todo::Todo>,
+    /// The active `/goal` condition. Seeded from the open handshake (resume
+    /// restores it) and corrected by every `goal_changed` — which also
+    /// carries the engine's own clears (met/impossible verdicts).
+    pub goal: Option<String>,
+    /// Ticks since the goal was set/restored — the strip's elapsed readout.
+    /// Ticks arrive only while a turn runs, so the clock pauses at idle.
+    pub goal_ticks: u64,
+    /// Turns the evaluator has judged, from `goal_verdict`.
+    pub goal_turns: u64,
     /// Every completable `/` command: the built-ins, plus one row per skill
     /// name the handshake advertised. Built once at startup.
     pub commands: Vec<complete::Command>,
@@ -440,6 +449,9 @@ impl State {
             pending_skill: None,
             density: hotl_theme::Density::default(),
             todos: Vec::new(),
+            goal: None,
+            goal_ticks: 0,
+            goal_turns: 0,
             commands: complete::builtins(),
             completion: None,
             dismissed: false,
@@ -564,6 +576,10 @@ pub enum Cmd {
     /// Send `session/set_effort` (fire-and-forget). `None` = back to the
     /// provider's default, sent as the wire word `"default"`.
     SetEffort(Option<String>),
+    /// Send `session/set_goal` (fire-and-forget; the ack is noise — the
+    /// engine's `goal_changed` broadcast is what corrects the optimism).
+    /// `None` clears.
+    SetGoal(Option<String>),
     Cancel,
     ReplyPermission {
         req_id: u64,
@@ -658,6 +674,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                     "mode_changed"
                         | "effort_changed"
                         | "todos_changed"
+                        | "goal_changed"
+                        | "goal_verdict"
                         | "config_reloaded"
                         | "config_reload_failed"
                 ) {
@@ -900,6 +918,38 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 .cloned()
                 .and_then(|items| serde_json::from_value(items).ok())
                 .unwrap_or_default();
+        }
+        // Seed-then-correct like `mode_changed`: covers a change made on
+        // another attached surface AND the engine's own clears (a met or
+        // impossible verdict). A confirmation of this surface's optimistic
+        // update leaves the counters alone.
+        "goal_changed" => {
+            let goal = v.get("goal").and_then(Value::as_str).map(str::to_string);
+            if goal != state.goal {
+                state.goal_ticks = 0;
+                state.goal_turns = 0;
+            }
+            state.goal = goal;
+        }
+        // The verdict rides as a Notice — no new view arms, and the reason
+        // is worth keeping in the transcript. `turns` comes from the event,
+        // not local state: on met/impossible the `goal_changed` clear (which
+        // resets counters) lands first.
+        "goal_verdict" => {
+            let turns = v.get("turns").and_then(Value::as_u64).unwrap_or(0);
+            state.goal_turns = turns;
+            let reason = text_of("reason");
+            notice(
+                state,
+                match text_of("verdict").as_str() {
+                    "not_yet" => format!("◎ goal check (turn {turns}): not yet — {reason}"),
+                    "met" => format!("◎ goal achieved after {turns} turn(s) — {reason}"),
+                    "impossible" => {
+                        format!("◎ goal impossible after {turns} turn(s) — {reason}")
+                    }
+                    _ => "◎ goal check failed — no verdict; the goal stays active".into(),
+                },
+            );
         }
         "retrying" => {
             let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
@@ -1569,6 +1619,57 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 }
             },
         },
+        // `/goal <condition>` sets/replaces, bare reports, and any of the
+        // clear words ends it early. Optimistic like `/mode`; the engine's
+        // `goal_changed` broadcast is the correction channel.
+        "goal" => match arg.trim() {
+            "" => {
+                let report = match &state.goal {
+                    Some(c) => format!(
+                        "◎ goal active · {}m · {} turn(s) — {c}",
+                        state.goal_ticks / (60 * crate::anim::TICK_HZ),
+                        state.goal_turns
+                    ),
+                    None => "no goal set — /goal <condition> keeps the turn going until a \
+                             fast evaluator judges it met"
+                        .into(),
+                };
+                notice(state, report);
+                Vec::new()
+            }
+            "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
+                if state.goal.take().is_some() {
+                    state.goal_ticks = 0;
+                    state.goal_turns = 0;
+                    notice(state, "goal cleared".into());
+                    vec![Cmd::SetGoal(None)]
+                } else {
+                    notice(state, "no goal set".into());
+                    Vec::new()
+                }
+            }
+            // The one validator every entry point funnels through, so the
+            // TUI and the wire cannot disagree on what a goal may be.
+            _ => match hotl_types::normalize_goal(arg) {
+                Some(goal) => {
+                    state.goal = Some(goal.clone());
+                    state.goal_ticks = 0;
+                    state.goal_turns = 0;
+                    notice(
+                        state,
+                        format!("◎ goal set — the turn keeps going until it is met: {goal}"),
+                    );
+                    vec![Cmd::SetGoal(Some(goal))]
+                }
+                None => {
+                    notice(
+                        state,
+                        "usage: /goal <condition> (1–4000 chars) | /goal clear".into(),
+                    );
+                    Vec::new()
+                }
+            },
+        },
         // Re-read `config.toml` without losing the session. The settings half
         // goes first so the theme flips at once while the engine rebuild — a
         // provider handshake and a skill walk — is still in flight.
@@ -1601,11 +1702,15 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             let name = state.session_name.as_deref().unwrap_or("(unnamed)");
             let todos = state.todos.len();
             let plan = if state.plan { " · plan" } else { "" };
+            let goal = match &state.goal {
+                Some(_) => " · ◎ goal active",
+                None => "",
+            };
             notice(
                 state,
                 format!(
                     "{name} · model {} · mode {}{plan} · effort {} · context {} tok · \
-                     {todos} todo(s)",
+                     {todos} todo(s){goal}",
                     state.model,
                     state.mode,
                     effort_report(state),
@@ -1879,6 +1984,11 @@ fn resume_after_ask(
 }
 
 fn on_tick(state: &mut State) {
+    // The goal's own clock: ticks arrive only while a turn runs, so this
+    // measures the time the loop actually spends working.
+    if state.goal.is_some() {
+        state.goal_ticks += 1;
+    }
     match &mut state.phase {
         Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => *ticks += 1,
         Phase::Tool { ticks, .. } => {
@@ -3346,8 +3456,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/");
-        // Ten built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(11));
+        // Eleven built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(12));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename` and `review` prefix-match; no other built-in
@@ -3811,6 +3921,182 @@ mod tests {
         // Null is "the provider's own default", not "missing".
         upd(&mut s, json!({"type": "effort_changed", "effort": null}));
         assert_eq!(s.effort, None);
+    }
+
+    // --- /goal (plan 0034) ------------------------------------------
+
+    #[test]
+    fn slash_goal_sets_normalizes_and_emits_the_cmd() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/goal   all tests pass  ");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetGoal(Some(g))] if g == "all tests pass"),
+            "got {cmds:?}"
+        );
+        assert_eq!(s.goal.as_deref(), Some("all tests pass"));
+        assert_eq!(
+            s.phase,
+            Phase::Idle,
+            "a goal set is bookkeeping, not a prompt"
+        );
+    }
+
+    #[test]
+    fn slash_goal_every_clear_word_ends_it_and_clearing_nothing_stays_local() {
+        for word in ["clear", "stop", "off", "reset", "none", "cancel"] {
+            let mut s = State::test_default();
+            type_and_submit(&mut s, "/goal ship it");
+            s.goal_ticks = 5;
+            s.goal_turns = 2;
+            let cmds = type_and_submit(&mut s, &format!("/goal {word}"));
+            assert!(
+                matches!(&cmds[..], [Cmd::SetGoal(None)]),
+                "{word}: {cmds:?}"
+            );
+            assert_eq!(s.goal, None, "{word}");
+            assert_eq!((s.goal_ticks, s.goal_turns), (0, 0), "{word}");
+        }
+        // Clearing when none is active sends nothing — the engine treats it
+        // as a no-op and so does the surface.
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/goal clear");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert!(
+            last_notice(&s).contains("no goal set"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    #[test]
+    fn slash_goal_bare_reports_and_overlong_shows_usage() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/goal");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert!(
+            last_notice(&s).contains("no goal set"),
+            "{}",
+            last_notice(&s)
+        );
+
+        type_and_submit(&mut s, "/goal ship it");
+        s.goal_ticks = 2 * 60 * crate::anim::TICK_HZ;
+        s.goal_turns = 3;
+        type_and_submit(&mut s, "/goal");
+        let text = last_notice(&s);
+        assert!(
+            text.contains("◎ goal active · 2m · 3 turn(s) — ship it"),
+            "{text}"
+        );
+
+        let cmds = slash(&mut s, &format!("goal {}", "x".repeat(4001)));
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert!(last_notice(&s).contains("usage"), "{}", last_notice(&s));
+        assert_eq!(
+            s.goal.as_deref(),
+            Some("ship it"),
+            "a rejected set must not clobber the active goal"
+        );
+    }
+
+    /// Seed-then-correct like `mode_changed`: another surface's set resets
+    /// the counters, a confirmation of this surface's own optimistic update
+    /// leaves them alone, and the engine's own clear (a met verdict) lands.
+    #[test]
+    fn goal_changed_seeds_corrects_and_resets_counters() {
+        let mut s = State::test_default();
+        s.goal_ticks = 99;
+        s.goal_turns = 4;
+        upd(
+            &mut s,
+            json!({"type": "goal_changed", "goal": "tests pass"}),
+        );
+        assert_eq!(s.goal.as_deref(), Some("tests pass"));
+        assert_eq!((s.goal_ticks, s.goal_turns), (0, 0));
+        s.goal_ticks = 7;
+        upd(
+            &mut s,
+            json!({"type": "goal_changed", "goal": "tests pass"}),
+        );
+        assert_eq!(s.goal_ticks, 7, "a confirmation must not reset the clock");
+        upd(&mut s, json!({"type": "goal_changed", "goal": null}));
+        assert_eq!(s.goal, None);
+    }
+
+    #[test]
+    fn goal_verdict_updates_turns_and_leaves_a_notice() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "not_yet",
+                   "reason": "no commit yet", "turns": 2}),
+        );
+        assert_eq!(s.goal_turns, 2);
+        assert!(
+            last_notice(&s).contains("(turn 2): not yet — no commit yet"),
+            "{}",
+            last_notice(&s)
+        );
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "met", "reason": "done", "turns": 3}),
+        );
+        assert!(
+            last_notice(&s).contains("achieved after 3 turn(s)"),
+            "{}",
+            last_notice(&s)
+        );
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "eval_failed", "reason": "", "turns": 4}),
+        );
+        assert!(
+            last_notice(&s).contains("stays active"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    /// Durable session state, like `mode_changed`: a detached turn's goal
+    /// updates still land — the engine may resolve the goal mid-detach.
+    #[test]
+    fn goal_updates_survive_a_detached_turn() {
+        let mut s = State::test_default();
+        s.detached_turns = 1;
+        upd(
+            &mut s,
+            json!({"type": "goal_changed", "goal": "tests pass"}),
+        );
+        assert_eq!(s.goal.as_deref(), Some("tests pass"));
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "not_yet", "reason": "r", "turns": 2}),
+        );
+        assert_eq!(s.goal_turns, 2);
+    }
+
+    /// The goal's clock advances only while a goal is set (and, like every
+    /// tick, only arrives while a turn runs).
+    #[test]
+    fn the_goal_clock_advances_only_while_a_goal_is_set() {
+        let mut s = State::test_default();
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.goal_ticks, 0);
+        s.goal = Some("g".into());
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.goal_ticks, 1);
+    }
+
+    #[test]
+    fn status_line_shows_an_active_goal() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "/goal ship it");
+        type_and_submit(&mut s, "/status");
+        assert!(
+            last_notice(&s).contains("◎ goal active"),
+            "{}",
+            last_notice(&s)
+        );
     }
 
     #[test]

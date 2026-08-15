@@ -381,6 +381,14 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 .request("session/set_effort", json!({"effort": wire}))
                 .await;
         }
+        // The ack is noise like set_mode: the engine's `goal_changed`
+        // broadcast is what corrects the optimistic update. `None` rides as
+        // JSON null, which is the wire's "clear".
+        Cmd::SetGoal(goal) => {
+            client
+                .request("session/set_goal", json!({"goal": goal}))
+                .await;
+        }
         // The ack is noise like rename/set_mode: the engine broadcasts
         // `config_reloaded` (or `config_reload_failed`), and that is what the
         // client acts on — no id-plumbing in the runtime's loop.

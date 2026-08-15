@@ -385,11 +385,28 @@ pub fn strip_text(state: &State) -> String {
         // the tool ask is the whole point of the prompt.
         Phase::WaitingEgress { .. } => "waiting on you · network".to_string(),
     };
-    match (base.is_empty(), todos_summary(&state.todos)) {
-        (_, None) => base,
-        (true, Some(summary)) => summary,
-        (false, Some(summary)) => format!("{base} · {summary}"),
+    let mut out = base;
+    for suffix in [todos_summary(&state.todos), goal_summary(state)]
+        .into_iter()
+        .flatten()
+    {
+        if out.is_empty() {
+            out = suffix;
+        } else {
+            out = format!("{out} · {suffix}");
+        }
     }
+    out
+}
+
+/// The goal's compact strip suffix: `◎ /goal active · 3m`. `None` when no
+/// goal is set. Minutes come from the goal's own tick clock, which advances
+/// only while a turn runs — exactly the time the loop is spending.
+fn goal_summary(state: &State) -> Option<String> {
+    state
+        .goal
+        .as_ref()
+        .map(|_| format!("◎ /goal active · {}m", state.goal_ticks / (60 * TICK_HZ)))
 }
 
 /// Snake and text as one plain string — what the strip reads as, minus color.
@@ -673,5 +690,20 @@ mod tests {
             diff: Vec::new(),
         };
         assert_eq!(strip_line(&s), format!("{w} waiting on you"));
+    }
+
+    /// 0034: an active goal rides the strip as its own suffix — after the
+    /// todo summary when both are present — with minutes off its own clock.
+    #[test]
+    fn the_goal_suffix_rides_the_strip_with_minutes() {
+        let mut s = State::new(true, "m".into());
+        s.goal = Some("all tests pass".into());
+        assert_eq!(strip_text(&s), "m · ◎ /goal active · 0m");
+        s.goal_ticks = 3 * 60 * TICK_HZ;
+        assert_eq!(strip_text(&s), "m · ◎ /goal active · 3m");
+        s.todos = vec![todo("wire the gate", TodoStatus::Pending, None)];
+        assert_eq!(strip_text(&s), "m · 0/1 todos · ◎ /goal active · 3m");
+        s.goal = None;
+        assert_eq!(strip_text(&s), "m · 0/1 todos", "no goal, no suffix");
     }
 }
