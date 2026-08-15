@@ -64,6 +64,7 @@ pub fn classify(item: &Item) -> ContextKind {
                 | SyntheticReason::RetryFeedback
                 | SyntheticReason::SubagentResult
                 | SyntheticReason::Environment
+                | SyntheticReason::GoalGuidance
                 | SyntheticReason::Unknown,
             ) => ContextKind::HarnessInjections,
         },

@@ -144,6 +144,7 @@ pub enum EntryKind {
     PendingQuestion,
     QuestionResolved,
     Todos,
+    GoalSet,
     Unknown,
 }
 
@@ -166,6 +167,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::PendingQuestion { .. } => EntryKind::PendingQuestion,
             EntryPayload::QuestionResolved { .. } => EntryKind::QuestionResolved,
             EntryPayload::Todos { .. } => EntryKind::Todos,
+            EntryPayload::GoalSet { .. } => EntryKind::GoalSet,
             EntryPayload::Unknown => EntryKind::Unknown,
         }
     }
@@ -1331,6 +1333,11 @@ pub struct Replayed {
     /// wins) — same last-wins, log-only shape as `mode`/`name`. Empty = no
     /// list was ever set (a resumed session starts with none, same as fresh).
     pub todos: Vec<hotl_types::Todo>,
+    /// The active goal condition (last `GoalSet` in the chain, child wins).
+    /// A *single* Option, unlike `effort`'s double: replay never needs
+    /// cleared-vs-never-set, because a cleared goal behaves identically to
+    /// no goal — the tombstone's `condition: None` folds to plain `None`.
+    pub goal: Option<String>,
     /// Integrity warnings (a broken `parent_id` chain — H-12). Empty is clean.
     /// Replay is defensive regardless (indices clamped, unknowns degraded), so
     /// a warning means "this log was edited/corrupted since it was written",
@@ -1350,6 +1357,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut plan = None;
     let mut effort = None;
     let mut todos = Vec::new();
+    let mut goal = None;
     let applied = apply_log(
         path,
         &mut items,
@@ -1359,6 +1367,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut plan,
         &mut effort,
         &mut todos,
+        &mut goal,
         None,
     )?;
     Ok(Replayed {
@@ -1369,6 +1378,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         plan,
         effort,
         todos,
+        goal,
         warnings,
         tip_entry_id: applied.last_entry_id,
     })
@@ -1482,6 +1492,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut plan = None;
     let mut effort = None;
     let mut todos = Vec::new();
+    let mut goal = None;
     let mut tip_entry_id = None;
     for (depth, (path, _)) in lineage.iter().enumerate().rev() {
         // Each ancestor is capped by the pin *its own child* recorded. The
@@ -1498,6 +1509,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut plan,
             &mut effort,
             &mut todos,
+            &mut goal,
             stop_after,
         )?;
         if depth == 0 {
@@ -1512,6 +1524,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         plan,
         effort,
         todos,
+        goal,
         warnings,
         tip_entry_id,
     })
@@ -1550,6 +1563,7 @@ fn apply_log(
     plan: &mut Option<bool>,
     effort: &mut Option<Option<String>>,
     todos: &mut Vec<hotl_types::Todo>,
+    goal: &mut Option<String>,
     stop_after: Option<&str>,
 ) -> Result<Applied, String> {
     let file = File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
@@ -1664,6 +1678,9 @@ fn apply_log(
             // is seeded from this (see `SessionDeps::initial_todos`), not
             // replayed into `items`.
             EntryPayload::Todos { items: list } => *todos = list,
+            // Log-only, last one wins; the tombstone's `condition: None`
+            // clears, so chain/fork replay inherits child-wins for free.
+            EntryPayload::GoalSet { condition, .. } => *goal = condition,
             EntryPayload::Usage { .. } | EntryPayload::Cancelled { .. } => {}
             // `#[serde(other)]` keeps an old binary from crashing on a new
             // entry kind — but a dropped kind that *re-points* the projection
@@ -2212,6 +2229,98 @@ mod tests {
         // `Some(None)` — cleared — not `None`, which would mean the session
         // never set an effort at all and should keep its config default.
         assert_eq!(replay(&path).unwrap().effort, Some(None));
+    }
+
+    /// Goal replay is last-one-wins, and the tombstone (`condition: None`)
+    /// clears it — an achieved or cleared goal must never be restored.
+    #[test]
+    fn goal_set_replays_last_one_wins_and_the_tombstone_clears() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        let path = log.path().to_path_buf();
+        log.append(
+            &EntryPayload::GoalSet {
+                condition: Some("first".into()),
+                outcome: None,
+            },
+            2,
+        )
+        .unwrap();
+        log.append(
+            &EntryPayload::GoalSet {
+                condition: Some("second".into()),
+                outcome: None,
+            },
+            3,
+        )
+        .unwrap();
+        let replayed = replay(&path).unwrap();
+        assert_eq!(replayed.goal.as_deref(), Some("second"));
+        assert!(
+            replayed.items.is_empty(),
+            "goal_set is not a projection item"
+        );
+
+        log.append(
+            &EntryPayload::GoalSet {
+                condition: None,
+                outcome: Some("achieved".into()),
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(replay(&path).unwrap().goal, None);
+    }
+
+    /// A parent's tombstone survives into the child: resuming a session whose
+    /// goal already resolved must not resurrect the parent's earlier set.
+    #[test]
+    fn chain_inherits_parent_goal_and_the_tombstone_survives_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut parent = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        parent
+            .append(
+                &EntryPayload::GoalSet {
+                    condition: Some("from-parent".into()),
+                    outcome: None,
+                },
+                2,
+            )
+            .unwrap();
+        let parent_id = parent.session_id.clone();
+
+        // Child of a mid-goal parent → inherits the condition.
+        let child = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef::unpinned(parent_id)),
+            Masker::empty(),
+            3,
+        )
+        .unwrap();
+        let replayed = replay_chain(dir.path(), &child.session_id).unwrap();
+        assert_eq!(replayed.goal.as_deref(), Some("from-parent"));
+
+        // The parent resolves the goal; a fresh child sees no goal.
+        parent
+            .append(
+                &EntryPayload::GoalSet {
+                    condition: None,
+                    outcome: Some("cleared".into()),
+                },
+                4,
+            )
+            .unwrap();
+        let child2 = SessionLog::create(
+            dir.path(),
+            "m",
+            Some(ParentRef::unpinned(parent.session_id.clone())),
+            Masker::empty(),
+            5,
+        )
+        .unwrap();
+        let replayed = replay_chain(dir.path(), &child2.session_id).unwrap();
+        assert_eq!(replayed.goal, None, "the tombstone must survive resume");
     }
 
     /// A log written before plan became its own axis carries `mode: "plan"`

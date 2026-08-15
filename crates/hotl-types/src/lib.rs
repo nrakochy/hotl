@@ -37,6 +37,9 @@ pub enum SyntheticReason {
     Todos,
     /// Session-start environment facts (`<env …/>`, 0030 Task 6).
     Environment,
+    /// Goal-loop continuation: the evaluator's "not yet met" reason,
+    /// injected as the next turn's opening user item (0034).
+    GoalGuidance,
     #[serde(other)]
     Unknown,
 }
@@ -431,6 +434,16 @@ pub enum EntryPayload {
     Todos {
         items: Vec<Todo>,
     },
+    /// Sets or resolves the session's goal (`/goal`, 0034). Log-only, last
+    /// one wins, like `ModeSet`. `condition: None` is the tombstone: an
+    /// achieved/cleared goal must never be restored by resume. `outcome`
+    /// (`"achieved" | "impossible" | "cleared"`) records why it ended;
+    /// absent on set.
+    GoalSet {
+        condition: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        outcome: Option<String>,
+    },
     #[serde(other)]
     Unknown,
 }
@@ -493,6 +506,16 @@ pub fn bare_model(model: &str) -> &str {
 pub fn normalize_session_name(raw: &str) -> Option<String> {
     let name = raw.trim();
     (!name.is_empty() && name.chars().count() <= 64).then(|| name.to_string())
+}
+
+/// A `/goal` condition may run to a paragraph, hence the roomier bound.
+pub const GOAL_MAX_CHARS: usize = 4000;
+
+/// A goal condition: trimmed, non-empty, at most [`GOAL_MAX_CHARS`] chars.
+/// The one validator every entry point (CLI, ACP, TUI) funnels through.
+pub fn normalize_goal(raw: &str) -> Option<String> {
+    let goal = raw.trim();
+    (!goal.is_empty() && goal.chars().count() <= GOAL_MAX_CHARS).then(|| goal.to_string())
 }
 
 #[cfg(test)]
@@ -897,6 +920,56 @@ mod tests {
         assert_eq!(normalize_session_name(&long), None);
         let max = "é".repeat(64); // chars, not bytes
         assert_eq!(normalize_session_name(&max), Some(max.clone()));
+    }
+
+    #[test]
+    fn normalize_goal_trims_and_bounds() {
+        assert_eq!(
+            normalize_goal("  all tests pass  "),
+            Some("all tests pass".into())
+        );
+        assert_eq!(normalize_goal("   "), None);
+        assert_eq!(normalize_goal(""), None);
+        let long = "x".repeat(GOAL_MAX_CHARS + 1);
+        assert_eq!(normalize_goal(&long), None);
+        let max = "é".repeat(GOAL_MAX_CHARS); // chars, not bytes
+        assert_eq!(normalize_goal(&max), Some(max.clone()));
+    }
+
+    #[test]
+    fn goal_set_entry_roundtrips_set_and_tombstone() {
+        let set = serde_json::to_string(&EntryPayload::GoalSet {
+            condition: Some("all tests pass".into()),
+            outcome: None,
+        })
+        .unwrap();
+        assert!(set.contains("\"kind\":\"goal_set\""), "wire kind: {set}");
+        assert!(
+            !set.contains("outcome"),
+            "absent outcome stays absent: {set}"
+        );
+        let back: EntryPayload = serde_json::from_str(&set).unwrap();
+        assert_eq!(
+            back,
+            EntryPayload::GoalSet {
+                condition: Some("all tests pass".into()),
+                outcome: None
+            }
+        );
+        // The tombstone: condition cleared, outcome recorded.
+        let tomb = serde_json::to_string(&EntryPayload::GoalSet {
+            condition: None,
+            outcome: Some("achieved".into()),
+        })
+        .unwrap();
+        let back: EntryPayload = serde_json::from_str(&tomb).unwrap();
+        assert_eq!(
+            back,
+            EntryPayload::GoalSet {
+                condition: None,
+                outcome: Some("achieved".into())
+            }
+        );
     }
 
     #[test]
