@@ -1039,6 +1039,7 @@ name = "hotl-store"
 version = "0.16.0"
 dependencies = [
  "bytes",
+ "dunce",
  "hotl-platform",
  "hotl-types",
  "serde",

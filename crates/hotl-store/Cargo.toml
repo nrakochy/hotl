@@ -23,6 +23,9 @@ bytes = { workspace = true }
 # its ack (commit-protocol.md §Durability ordering). `sync` is the only
 # feature this crate uses.
 tokio = { workspace = true }
+# Canonicalizing the workspace odb for alternates seeding (0035) — dunce, not
+# std: UNC-free paths on Windows (0027 policy, enforced by clippy.toml).
+dunce = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -1,6 +1,10 @@
 //! Shadow-git snapshots (M3b): a per-session repo under the data dir that
-//! snapshots the workspace tree around every mutating tool batch, so
-//! `hotl undo` can restore the last pre-batch state.
+//! captures the workspace tree at quiet windows — session start and after
+//! each mutating tool batch — so `hotl undo` can restore the last clean
+//! state. A capture whose staging overlapped a workspace mutation is
+//! committed under a `tainted ` label and never restored; the
+//! `hotl-mutations` marker gates undo to sessions where the agent actually
+//! mutated something (0035).
 //!
 //! Deliberately **not** the user's repo: the shadow keeps its own git dir
 //! (bare + explicit work-tree, the dotfiles pattern) and never touches the
@@ -69,6 +73,23 @@ serviceaccount*.json
 *.kdbx
 ";
 
+/// Snapshot label vocabulary (0035 decision 5): clean quiet-window captures
+/// start with `state ` and are restore targets; captures whose staging
+/// overlapped a workspace mutation start with `tainted ` — committed anyway
+/// (they still warm the shadow index, so successive attempts converge), but
+/// never restored. `checkpoint before undo` matches neither prefix.
+pub const CLEAN_PREFIX: &str = "state ";
+pub const TAINTED_PREFIX: &str = "tainted ";
+
+/// The tainted form of a clean label: `state after batch 3` →
+/// `tainted after batch 3`.
+pub fn taint_label(label: &str) -> String {
+    match label.strip_prefix(CLEAN_PREFIX) {
+        Some(rest) => format!("{TAINTED_PREFIX}{rest}"),
+        None => format!("{TAINTED_PREFIX}{label}"),
+    }
+}
+
 pub struct Shadow {
     git_dir: PathBuf,
     work_tree: PathBuf,
@@ -112,7 +133,48 @@ impl Shadow {
             "hotl.worktree",
             &shadow.work_tree.display().to_string(),
         ])?;
+        // Cheap-snapshot levers (0035 decision 10), best-effort: each only
+        // shrinks staging latency, never gates undo.
+        for kv in [
+            ["config", "core.untrackedCache", "true"],
+            ["config", "core.preloadIndex", "true"],
+            ["config", "feature.manyFiles", "true"],
+        ] {
+            let _ = shadow.git(&kv);
+        }
+        shadow.seed_alternates();
         Some(shadow)
+    }
+
+    /// Borrow the workspace repo's object store via `objects/info/alternates`
+    /// (0035 decision 10). `git add` still hashes every file; blobs already in
+    /// the workspace history just skip the object *write*. Best-effort.
+    fn seed_alternates(&self) {
+        let Some(out) = Command::new("git")
+            .arg("-C")
+            .arg(&self.work_tree)
+            .args(["rev-parse", "--git-dir"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+        else {
+            return;
+        };
+        let workspace_git = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+        let workspace_git = if workspace_git.is_absolute() {
+            workspace_git
+        } else {
+            self.work_tree.join(workspace_git)
+        };
+        // Absolute, symlink-free: the alternates file is read from the shadow
+        // git dir, so a relative workspace path would resolve wrong.
+        let Ok(odb) = dunce::canonicalize(workspace_git.join("objects")) else {
+            return;
+        };
+        let _ = std::fs::write(
+            self.git_dir.join("objects/info/alternates"),
+            format!("{}\n", odb.display()),
+        );
     }
 
     /// Open an existing shadow repo, reading its recorded work tree.
@@ -133,16 +195,15 @@ impl Shadow {
         Some(Self { git_dir, work_tree })
     }
 
-    /// Commit the current tree under `label`. Blocking (child process) —
-    /// async callers wrap in spawn_blocking.
-    ///
-    /// INVARIANT: `Some(hash)` means the commit reflects the workspace as it
-    /// was read. Every git step's exit status is checked, so a failed `add`
-    /// can no longer be followed by a `commit --allow-empty` that silently
-    /// records the *previous* tree. Enforced by
-    /// `snapshot_fails_when_the_index_is_locked`.
-    pub fn snapshot(&self, label: &str) -> Option<String> {
-        self.git_ok(&["add", "-A", "."])?;
+    /// Stage the current tree (`git add -A .`) into the shadow index.
+    /// Blocking (child process); the expensive half of a snapshot.
+    pub fn stage(&self) -> Option<()> {
+        self.git_ok(&["add", "-A", "."]).map(|_| ())
+    }
+
+    /// Commit whatever `stage` staged under `label`. Reads only the index —
+    /// workspace mutations after `stage` returned cannot tear the capture.
+    pub fn commit(&self, label: &str) -> Option<String> {
         self.git_ok(&[
             "-c",
             "user.name=hotl",
@@ -158,18 +219,46 @@ impl Shadow {
         Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
     }
 
-    /// The most recent commit whose label starts with "pre " — the state
-    /// before the agent's last mutating batch.
-    pub fn latest_pre(&self) -> Option<(String, String)> {
+    /// Commit the current tree under `label` — `stage` + `commit`.
+    ///
+    /// INVARIANT: `Some(hash)` means the commit reflects the workspace as it
+    /// was read. Every git step's exit status is checked, so a failed `add`
+    /// can no longer be followed by a `commit --allow-empty` that silently
+    /// records the *previous* tree. Enforced by
+    /// `snapshot_fails_when_the_index_is_locked`.
+    pub fn snapshot(&self, label: &str) -> Option<String> {
+        self.stage()?;
+        self.commit(label)
+    }
+
+    /// The most recent clean snapshot — newest commit labeled `state …`.
+    /// Falls back to the legacy `pre ` labels older on-disk shadows carry
+    /// (retention ages them out). `tainted …` and `checkpoint before undo`
+    /// match neither prefix.
+    pub fn latest_clean(&self) -> Option<(String, String)> {
         let out = self.git(&["log", "--format=%H %s"])?;
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .find_map(|line| {
+        let text = String::from_utf8_lossy(&out.stdout).into_owned();
+        let newest = |prefix: &str| {
+            text.lines().find_map(|line| {
                 let (hash, subject) = line.split_once(' ')?;
                 subject
-                    .starts_with("pre ")
+                    .starts_with(prefix)
                     .then(|| (hash.to_string(), subject.to_string()))
             })
+        };
+        newest(CLEAN_PREFIX).or_else(|| newest("pre "))
+    }
+
+    /// Record that the agent mutated the workspace this session. Undo refuses
+    /// without the marker: a session-start-only shadow must not restore over
+    /// user edits the agent never touched (0035 decision 6). Best-effort —
+    /// a failed write degrades to undo refusing, the safe direction.
+    pub fn mark_mutations(&self) {
+        let _ = std::fs::write(self.git_dir.join("hotl-mutations"), "");
+    }
+
+    pub fn has_mutations(&self) -> bool {
+        self.git_dir.join("hotl-mutations").exists()
     }
 
     /// Files that differ between the current tree and `hash` (what a restore
@@ -209,7 +298,17 @@ impl Shadow {
             .git(&["checkout", "-q", hash, "--", "."])
             .ok_or("git checkout failed")?;
         if !out.status.success() {
-            return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+            let mut err = String::from_utf8_lossy(&out.stderr).into_owned();
+            if self.git_dir.join("objects/info/alternates").exists() {
+                // Accepted risk (0035 decision 10): the shadow borrows objects
+                // from the workspace odb; a history rewrite + gc there can
+                // prune what this snapshot still references.
+                err.push_str(
+                    "\n(the shadow borrows objects from the workspace repo; a history \
+                     rewrite plus gc there can prune them, making this snapshot unrecoverable)",
+                );
+            }
+            return Err(err);
         }
         if !added.is_empty() {
             // `git rm` with an empty pathspec is a fatal error, hence the guard.
@@ -282,7 +381,7 @@ mod tests {
         std::fs::write(work.path().join(".ssh/id_rsa"), "PRIVATE KEY").unwrap();
 
         let shadow = Shadow::create(root.path(), "SEC", work.path()).expect("create");
-        shadow.snapshot("pre batch 1").expect("snapshot");
+        shadow.snapshot("state after batch 1").expect("snapshot");
 
         let listing = std::process::Command::new("git")
             .arg(format!(
@@ -333,7 +432,7 @@ mod tests {
         std::fs::write(work.path().join(".kube/config"), "CREDENTIAL").unwrap();
 
         let shadow = Shadow::create(root.path(), "SEC2", work.path()).expect("create");
-        shadow.snapshot("pre batch 1").expect("snapshot");
+        shadow.snapshot("state after batch 1").expect("snapshot");
 
         let listing = std::process::Command::new("git")
             .arg(format!(
@@ -368,19 +467,24 @@ mod tests {
         std::fs::write(work.path().join("a.txt"), "v1").unwrap();
 
         let shadow = Shadow::create(root.path(), "SESSION1", work.path()).expect("create");
-        shadow.snapshot("pre batch 1").expect("pre snapshot");
+        shadow
+            .snapshot("state after batch 1")
+            .expect("clean snapshot");
         std::fs::write(work.path().join("a.txt"), "v2-broken").unwrap();
         std::fs::write(work.path().join("b.txt"), "new file").unwrap();
         std::fs::create_dir_all(work.path().join("sub")).unwrap();
         std::fs::write(work.path().join("sub/c.txt"), "also new").unwrap();
-        shadow.snapshot("post batch 1").expect("post snapshot");
+        // A capture that raced a mutation: committed, but never a restore target.
+        shadow
+            .snapshot("tainted after batch 2")
+            .expect("tainted snapshot");
 
         // A later process finds the session's work tree.
         let reopened = Shadow::open(root.path(), "SESSION1").expect("open");
         assert_eq!(reopened.work_tree(), work.path());
 
-        let (hash, label) = reopened.latest_pre().expect("pre commit");
-        assert_eq!(label, "pre batch 1");
+        let (hash, label) = reopened.latest_clean().expect("clean commit");
+        assert_eq!(label, "state after batch 1");
         let touched = reopened.restore(&hash).expect("restore");
 
         assert_eq!(
@@ -430,14 +534,21 @@ mod tests {
         let work = tempfile::tempdir().unwrap();
         std::fs::write(work.path().join("a.txt"), "v1").unwrap();
         let shadow = Shadow::create(root.path(), "LOCKED", work.path()).expect("create");
-        assert!(shadow.snapshot("pre batch 1").is_some(), "baseline works");
+        assert!(
+            shadow.snapshot("state after batch 1").is_some(),
+            "baseline works"
+        );
 
         // Exactly what a concurrent snapshot or a crashed git leaves behind.
         std::fs::write(root.path().join("LOCKED.git/index.lock"), "").unwrap();
         std::fs::write(work.path().join("a.txt"), "v2").unwrap();
 
         assert!(
-            shadow.snapshot("pre batch 2").is_none(),
+            shadow.stage().is_none(),
+            "a locked index must fail the stage, not silently keep the old tree"
+        );
+        assert!(
+            shadow.snapshot("state after batch 2").is_none(),
             "a failed `git add` must not yield a snapshot of the previous tree"
         );
     }
@@ -452,7 +563,9 @@ mod tests {
         std::fs::write(work.path().join("a.txt"), "v1").unwrap();
 
         let shadow = Shadow::create(root.path(), "SESSION2", work.path()).expect("create");
-        shadow.snapshot("pre batch 1").expect("pre snapshot");
+        shadow
+            .snapshot("state after batch 1")
+            .expect("clean snapshot");
 
         // Created after the snapshot, but excluded — an undo must not delete the
         // user's credentials or their build output.
@@ -460,9 +573,11 @@ mod tests {
         std::fs::create_dir_all(work.path().join("target")).unwrap();
         std::fs::write(work.path().join("target/out"), "build").unwrap();
         std::fs::write(work.path().join("a.txt"), "v2").unwrap();
-        shadow.snapshot("post batch 1").expect("post snapshot");
+        shadow
+            .snapshot("tainted after batch 2")
+            .expect("tainted snapshot");
 
-        let (hash, _) = shadow.latest_pre().expect("pre commit");
+        let (hash, _) = shadow.latest_clean().expect("clean commit");
         shadow.restore(&hash).expect("restore");
         assert!(
             work.path().join(".env").exists(),
@@ -471,6 +586,99 @@ mod tests {
         assert!(
             work.path().join("target/out").exists(),
             "excluded build output survives undo"
+        );
+    }
+
+    #[test]
+    fn latest_clean_picks_newest_state_and_skips_tainted() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.txt"), "v1").unwrap();
+        let shadow = Shadow::create(root.path(), "LABELS", work.path()).expect("create");
+        shadow.snapshot("state session start").unwrap();
+        shadow.snapshot("state after batch 1").unwrap();
+        shadow.snapshot("tainted after batch 2").unwrap();
+        shadow.snapshot("checkpoint before undo").unwrap();
+
+        let (_, label) = shadow.latest_clean().expect("clean commit");
+        assert_eq!(
+            label, "state after batch 1",
+            "newest clean wins; tainted and checkpoint labels never do"
+        );
+    }
+
+    #[test]
+    fn latest_clean_falls_back_to_legacy_pre_labels() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        std::fs::write(work.path().join("a.txt"), "v1").unwrap();
+        let shadow = Shadow::create(root.path(), "LEGACY", work.path()).expect("create");
+        // What a pre-0035 shadow left on disk; retention ages these out.
+        shadow.snapshot("pre batch 1").unwrap();
+        shadow.snapshot("post batch 1").unwrap();
+
+        let (_, label) = shadow.latest_clean().expect("legacy fallback");
+        assert_eq!(label, "pre batch 1");
+    }
+
+    #[test]
+    fn mutation_marker_roundtrips_via_open() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let shadow = Shadow::create(root.path(), "MARKER", work.path()).expect("create");
+        assert!(!shadow.has_mutations(), "fresh sessions start unmarked");
+        shadow.mark_mutations();
+        assert!(shadow.has_mutations());
+
+        let reopened = Shadow::open(root.path(), "MARKER").expect("open");
+        assert!(
+            reopened.has_mutations(),
+            "undo (a separate process) must see the marker"
+        );
+    }
+
+    #[test]
+    fn create_on_a_git_workspace_seeds_alternates_and_roundtrips() {
+        if !git_available() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let work = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(work.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(work.path().join("a.txt"), "v1").unwrap();
+
+        let shadow = Shadow::create(root.path(), "ALT", work.path()).expect("create");
+        let alternates = root.path().join("ALT.git/objects/info/alternates");
+        let listed = std::fs::read_to_string(&alternates).expect("alternates written");
+        let odb = dunce::canonicalize(work.path().join(".git/objects")).unwrap();
+        assert_eq!(listed.trim(), odb.display().to_string());
+
+        // Borrowed odb or not, the snapshot/restore cycle must still work.
+        shadow.snapshot("state after batch 1").expect("snapshot");
+        std::fs::write(work.path().join("a.txt"), "v2").unwrap();
+        let (hash, _) = shadow.latest_clean().unwrap();
+        shadow.restore(&hash).expect("restore");
+        assert_eq!(
+            std::fs::read_to_string(work.path().join("a.txt")).unwrap(),
+            "v1"
         );
     }
 }

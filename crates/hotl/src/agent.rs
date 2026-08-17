@@ -2025,7 +2025,7 @@ pub(crate) fn undo_main(args: Vec<String>) -> i32 {
         eprintln!("hotl: shadow repo for session {session} is unreadable");
         return 1;
     };
-    let Some((hash, label)) = shadow.latest_pre() else {
+    let Some((hash, label)) = shadow.latest_clean() else {
         eprintln!("hotl: session {session} has no pre-batch snapshot to restore");
         return 1;
     };
