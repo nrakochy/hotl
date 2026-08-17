@@ -325,8 +325,7 @@ impl Harness {
     /// provider: the harness keeps the `ScriptedProvider` for `requests()`
     /// and `push_script`, while the engine talks to the wrapper.
     /// Construct a harness with a custom registry AND a custom `Snapshotter`
-    /// (0033 Task 4: detached post-batch snapshot scenarios need one whose
-    /// futures the test can hold open).
+    /// (0035: the latency gate needs one that models a wedged worker).
     pub fn with_registry_and_snapshotter(
         scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
         config: EngineConfig,
