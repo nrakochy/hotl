@@ -738,7 +738,7 @@ pub(crate) async fn build_acp() -> Result<
             |registry| {
                 let mut deps = scaffold.deps(
                     log,
-                    snapshots,
+                    snapshots.map(|s| s as Arc<dyn hotl_engine::Snapshotter>),
                     initial,
                     Inherited {
                         mode: mode_override,
@@ -847,7 +847,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         |registry| {
             let mut deps = scaffold.deps(
                 log,
-                snapshots,
+                snapshots.map(|s| s as Arc<dyn hotl_engine::Snapshotter>),
                 initial_items,
                 Inherited::default(),
                 Vec::new(),
@@ -1233,7 +1233,7 @@ async fn run_session(
         |registry| {
             let mut deps = scaffold.deps(
                 log,
-                snapshots,
+                snapshots.map(|s| s as Arc<dyn hotl_engine::Snapshotter>),
                 initial_items,
                 Inherited {
                     mode: mode_override,
@@ -1964,13 +1964,16 @@ fn session_context(
     session_id: &str,
     scaffold: &Scaffold,
     resumed: &Option<Resumed>,
-) -> (
-    Option<Arc<dyn hotl_engine::Snapshotter>>,
-    Vec<hotl_types::Item>,
-) {
+) -> (Option<Arc<GitSnapshotter>>, Vec<hotl_types::Item>) {
     let snapshots = shadow_snapshotter(session_id, &scaffold.cwd);
     if snapshots.is_none() {
         eprintln!("hotl: git not found — `hotl undo` snapshots disabled this session");
+    }
+    // Warm-up (0035 decision 2): enqueue the session-open capture now, so the
+    // first mutating batch's quiet window already has a warm shadow index.
+    // A sync enqueue — returns instantly even on a giant repo.
+    if let Some(s) = &snapshots {
+        hotl_engine::Snapshotter::snapshot(&**s, "state session start".to_string());
     }
     let items = match resumed {
         Some(r) => r.items.clone(),
@@ -1984,25 +1987,163 @@ fn session_context(
     (snapshots, items)
 }
 
-/// Shadow-git snapshotter (M3b): blocking git work runs on the blocking
-/// pool so a slow snapshot never stalls the turn.
-struct GitSnapshotter(Arc<hotl_store::shadow::Shadow>);
+/// The blocking half a snapshot job runs — [`hotl_store::shadow::Shadow`] in
+/// production; tests substitute a gated fake to steer the worker.
+trait SnapshotBackend: Send + Sync + 'static {
+    fn stage(&self) -> Option<()>;
+    fn commit(&self, label: &str) -> Option<String>;
+    fn mark_mutations(&self);
+}
 
-impl hotl_engine::Snapshotter for GitSnapshotter {
-    fn snapshot(&self, label: String) -> futures_util::future::BoxFuture<'static, ()> {
-        let shadow = self.0.clone();
-        Box::pin(async move {
-            let _ = tokio::task::spawn_blocking(move || shadow.snapshot(&label)).await;
-        })
+impl SnapshotBackend for hotl_store::shadow::Shadow {
+    fn stage(&self) -> Option<()> {
+        hotl_store::shadow::Shadow::stage(self)
+    }
+    fn commit(&self, label: &str) -> Option<String> {
+        hotl_store::shadow::Shadow::commit(self, label)
+    }
+    fn mark_mutations(&self) {
+        hotl_store::shadow::Shadow::mark_mutations(self)
     }
 }
 
-fn shadow_snapshotter(
-    session_id: &str,
-    cwd: &std::path::Path,
-) -> Option<Arc<dyn hotl_engine::Snapshotter>> {
+enum SnapJob {
+    Snapshot(String),
+    Mark,
+}
+
+/// What the worker shares with the enqueue side: the pending-job count (the
+/// drain condition) and its condvar.
+struct SnapQueue {
+    pending: std::sync::Mutex<usize>,
+    idle: std::sync::Condvar,
+}
+
+/// Shadow-git snapshotter (M3b, rebuilt by 0035): one dedicated worker
+/// thread drains an unbounded FIFO of jobs, so `snapshot()` is a sync
+/// enqueue and nothing on the turn path ever waits for git. One worker =
+/// one shadow-index writer — snapshots can never overlap. The generation
+/// counter carries the taint rule: read before and after `stage()`, a bump
+/// in between means a mutation overlapped the read and the capture commits
+/// under the tainted label.
+pub(crate) struct GitSnapshotter {
+    tx: std::sync::mpsc::Sender<SnapJob>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    marked: std::sync::atomic::AtomicBool,
+    queue: Arc<SnapQueue>,
+}
+
+impl GitSnapshotter {
+    fn new(backend: Arc<dyn SnapshotBackend>) -> Self {
+        let (tx, rx) = std::sync::mpsc::channel::<SnapJob>();
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let queue = Arc::new(SnapQueue {
+            pending: std::sync::Mutex::new(0),
+            idle: std::sync::Condvar::new(),
+        });
+        {
+            let generation = Arc::clone(&generation);
+            let queue = Arc::clone(&queue);
+            std::thread::spawn(move || snap_worker(rx, backend, generation, queue));
+        }
+        Self {
+            tx,
+            generation,
+            marked: std::sync::atomic::AtomicBool::new(false),
+            queue,
+        }
+    }
+
+    fn enqueue(&self, job: SnapJob) {
+        // Increment before send: the worker decrements after each job, so
+        // the count can only over-read, never underflow.
+        *lock_ok(&self.queue.pending) += 1;
+        if self.tx.send(job).is_err() {
+            // Worker gone (panicked): undo degrades, the session must not.
+            let mut pending = lock_ok(&self.queue.pending);
+            *pending -= 1;
+            if *pending == 0 {
+                self.queue.idle.notify_all();
+            }
+        }
+    }
+}
+
+/// `lock()` without poison propagation: a panicked snapshot job must degrade
+/// undo, never take the session down with it.
+fn lock_ok<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn snap_worker(
+    rx: std::sync::mpsc::Receiver<SnapJob>,
+    backend: Arc<dyn SnapshotBackend>,
+    generation: Arc<std::sync::atomic::AtomicU64>,
+    queue: Arc<SnapQueue>,
+) {
+    use std::sync::atomic::Ordering;
+    while let Ok(job) = rx.recv() {
+        match job {
+            SnapJob::Mark => backend.mark_mutations(),
+            SnapJob::Snapshot(label) => {
+                // Taint rule (0035 decision 4): compare the generation at
+                // add-start vs add-END. `commit` only reads the index, so a
+                // mutation after staging cannot tear the capture — comparing
+                // at commit time would over-taint. A tainted capture is
+                // committed anyway: it still warms the shadow index, so
+                // successive attempts converge (self-healing).
+                let gen0 = generation.load(Ordering::SeqCst);
+                let staged = backend.stage();
+                let gen1 = generation.load(Ordering::SeqCst);
+                let label = if gen1 != gen0 {
+                    hotl_store::shadow::taint_label(&label)
+                } else {
+                    label
+                };
+                let _ = staged.and_then(|()| backend.commit(&label));
+            }
+        }
+        let mut pending = lock_ok(&queue.pending);
+        *pending -= 1;
+        if *pending == 0 {
+            queue.idle.notify_all();
+        }
+    }
+}
+
+impl hotl_engine::Snapshotter for GitSnapshotter {
+    fn snapshot(&self, label: String) {
+        self.enqueue(SnapJob::Snapshot(label));
+    }
+
+    fn mutation_started(&self) {
+        use std::sync::atomic::Ordering;
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        // First mutation this session: queue the marker write (0035 decision
+        // 6) — the worker does the I/O, this path stays O(1).
+        if !self.marked.swap(true, Ordering::SeqCst) {
+            self.enqueue(SnapJob::Mark);
+        }
+    }
+
+    fn drain(&self, grace: std::time::Duration) {
+        let pending = lock_ok(&self.queue.pending);
+        let (pending, _) = self
+            .queue
+            .idle
+            .wait_timeout_while(pending, grace, |p| *p > 0)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *pending > 0 {
+            eprintln!(
+                "hotl: a shadow snapshot was still running at session close — left to finish on its own"
+            );
+        }
+    }
+}
+
+fn shadow_snapshotter(session_id: &str, cwd: &std::path::Path) -> Option<Arc<GitSnapshotter>> {
     let shadow = hotl_store::shadow::Shadow::create(&shadow_root(), session_id, cwd)?;
-    Some(Arc::new(GitSnapshotter(Arc::new(shadow))))
+    Some(Arc::new(GitSnapshotter::new(Arc::new(shadow))))
 }
 
 pub(crate) fn shadow_root() -> PathBuf {
@@ -5598,5 +5739,227 @@ mod tests {
             "the session_end hook's subprocess never completed before the runtime dropped \
              — Finding 1's detached `spawn_session_end` task was silently killed mid-flight"
         );
+    }
+
+    /// A gate a test opens once; waiters block until then. Pre-opened gates
+    /// make the fake backend instant.
+    struct TestLatch {
+        open: std::sync::Mutex<bool>,
+        cv: std::sync::Condvar,
+    }
+
+    impl TestLatch {
+        fn new(open: bool) -> Self {
+            Self {
+                open: std::sync::Mutex::new(open),
+                cv: std::sync::Condvar::new(),
+            }
+        }
+        fn open(&self) {
+            *self.open.lock().unwrap() = true;
+            self.cv.notify_all();
+        }
+        fn wait(&self) {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.cv.wait(open).unwrap();
+            }
+        }
+        /// Test-side wait with a deadline, so a broken worker fails the test
+        /// instead of hanging it.
+        fn wait_for(&self, d: std::time::Duration) {
+            let open = self.open.lock().unwrap();
+            let (open, timeout) = self.cv.wait_timeout_while(open, d, |o| !*o).unwrap();
+            assert!(*open && !timeout.timed_out(), "latch never opened");
+        }
+    }
+
+    /// A steerable [`SnapshotBackend`]: records commits and marker writes,
+    /// detects stage/commit overlap (the one-shadow-index invariant that
+    /// moved here from the deleted `detached_post_snapshot.rs`), and lets a
+    /// test hold the worker inside `stage` or before `commit`.
+    struct FakeBackend {
+        committed: std::sync::Mutex<Vec<String>>,
+        marks: std::sync::atomic::AtomicUsize,
+        busy: std::sync::atomic::AtomicBool,
+        overlapped: std::sync::atomic::AtomicBool,
+        stage_entered: TestLatch,
+        stage_release: TestLatch,
+        commit_entered: TestLatch,
+        commit_release: TestLatch,
+    }
+
+    impl FakeBackend {
+        fn instant() -> Self {
+            Self::gated(true, true)
+        }
+        fn gated(stage_open: bool, commit_open: bool) -> Self {
+            Self {
+                committed: std::sync::Mutex::new(Vec::new()),
+                marks: std::sync::atomic::AtomicUsize::new(0),
+                busy: std::sync::atomic::AtomicBool::new(false),
+                overlapped: std::sync::atomic::AtomicBool::new(false),
+                stage_entered: TestLatch::new(false),
+                stage_release: TestLatch::new(stage_open),
+                commit_entered: TestLatch::new(false),
+                commit_release: TestLatch::new(commit_open),
+            }
+        }
+    }
+
+    impl SnapshotBackend for FakeBackend {
+        fn stage(&self) -> Option<()> {
+            use std::sync::atomic::Ordering;
+            if self.busy.swap(true, Ordering::SeqCst) {
+                self.overlapped.store(true, Ordering::SeqCst);
+            }
+            self.stage_entered.open();
+            self.stage_release.wait();
+            Some(())
+        }
+        fn commit(&self, label: &str) -> Option<String> {
+            use std::sync::atomic::Ordering;
+            self.commit_entered.open();
+            self.commit_release.wait();
+            self.committed.lock().unwrap().push(label.to_string());
+            self.busy.store(false, Ordering::SeqCst);
+            Some("hash".into())
+        }
+        fn mark_mutations(&self) {
+            self.marks.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    const DRAIN: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The one-shadow-index invariant: a single worker means jobs run in
+    /// enqueue order and never overlap, even under concurrent enqueue.
+    #[test]
+    fn snapshot_jobs_run_fifo_and_never_overlap() {
+        use hotl_engine::Snapshotter as _;
+        let backend = Arc::new(FakeBackend::instant());
+        let snap = GitSnapshotter::new(backend.clone());
+        for i in 0..10 {
+            snap.snapshot(format!("state after batch {i}"));
+        }
+        snap.drain(DRAIN);
+        let expected: Vec<String> = (0..10).map(|i| format!("state after batch {i}")).collect();
+        assert_eq!(*backend.committed.lock().unwrap(), expected);
+
+        let snap = Arc::new(snap);
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let snap = Arc::clone(&snap);
+                std::thread::spawn(move || {
+                    for i in 0..25 {
+                        snap.snapshot(format!("state t{t} n{i}"));
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        snap.drain(DRAIN);
+        assert_eq!(backend.committed.lock().unwrap().len(), 10 + 100);
+        assert!(
+            !backend.overlapped.load(std::sync::atomic::Ordering::SeqCst),
+            "two snapshot jobs ran concurrently against the one shadow index"
+        );
+    }
+
+    /// The taint rule's positive half: a mutation signaled *during* staging
+    /// commits the capture under the tainted label.
+    #[test]
+    fn a_mutation_during_staging_taints_the_capture() {
+        use hotl_engine::Snapshotter as _;
+        let backend = Arc::new(FakeBackend::gated(false, true));
+        let snap = GitSnapshotter::new(backend.clone());
+        snap.snapshot("state after batch 1".into());
+        backend.stage_entered.wait_for(DRAIN);
+        snap.mutation_started();
+        backend.stage_release.open();
+        snap.drain(DRAIN);
+        assert_eq!(
+            *backend.committed.lock().unwrap(),
+            vec!["tainted after batch 1"]
+        );
+        assert_eq!(
+            backend.marks.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the first mutation queues exactly one marker write"
+        );
+    }
+
+    /// The negative half: the generation is compared at add-start vs add-END
+    /// — the commit only reads the index, so a mutation after staging cannot
+    /// tear the capture, and tainting it would over-taint (0035 decision 4).
+    #[test]
+    fn a_mutation_after_staging_stays_clean() {
+        use hotl_engine::Snapshotter as _;
+        let backend = Arc::new(FakeBackend::gated(true, false));
+        let snap = GitSnapshotter::new(backend.clone());
+        snap.snapshot("state after batch 1".into());
+        // `commit_entered` is past the label decision: gen1 was already read.
+        backend.commit_entered.wait_for(DRAIN);
+        snap.mutation_started();
+        backend.commit_release.open();
+        snap.drain(DRAIN);
+        assert_eq!(
+            *backend.committed.lock().unwrap(),
+            vec!["state after batch 1"]
+        );
+    }
+
+    #[test]
+    fn the_first_mutation_writes_the_marker_once() {
+        use hotl_engine::Snapshotter as _;
+        let backend = Arc::new(FakeBackend::instant());
+        let snap = GitSnapshotter::new(backend.clone());
+        snap.mutation_started();
+        snap.mutation_started();
+        snap.mutation_started();
+        snap.drain(DRAIN);
+        assert_eq!(backend.marks.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// The session-close bound (0035 decision 9): a wedged worker cannot hold
+    /// teardown past the grace.
+    #[test]
+    fn drain_returns_within_grace_against_a_wedged_worker() {
+        use hotl_engine::Snapshotter as _;
+        let backend = Arc::new(FakeBackend::gated(false, true));
+        let snap = GitSnapshotter::new(backend.clone());
+        snap.snapshot("state after batch 1".into());
+        backend.stage_entered.wait_for(DRAIN);
+        let t = std::time::Instant::now();
+        snap.drain(std::time::Duration::from_millis(100));
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "drain must abandon a wedged worker at the grace"
+        );
+        backend.stage_release.open();
+    }
+
+    /// The turn-path guarantee: enqueue and the generation bump stay
+    /// non-blocking while the worker is stuck inside a job.
+    #[test]
+    fn enqueue_never_blocks_while_the_worker_is_wedged() {
+        use hotl_engine::Snapshotter as _;
+        let backend = Arc::new(FakeBackend::gated(false, true));
+        let snap = GitSnapshotter::new(backend.clone());
+        snap.snapshot("state after batch 1".into());
+        backend.stage_entered.wait_for(DRAIN);
+        let t = std::time::Instant::now();
+        for i in 2..1000 {
+            snap.snapshot(format!("state after batch {i}"));
+            snap.mutation_started();
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(5),
+            "enqueue blocked behind the wedged worker"
+        );
+        backend.stage_release.open();
+        snap.drain(DRAIN);
     }
 }

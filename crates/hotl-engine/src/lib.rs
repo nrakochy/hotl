@@ -674,11 +674,22 @@ pub enum SessionCmd {
     BumpRulesEpoch,
 }
 
-/// Workspace snapshots around mutating tool batches (M3b shadow-git).
-/// Implementations run the actual snapshot off-thread; a slow or absent
-/// snapshotter must never wedge the turn.
+/// Workspace snapshots at quiet windows (M3b shadow-git, 0035): session
+/// start and after each mutating tool batch. All-sync by construction —
+/// nothing on the turn path ever awaits a snapshot, so a slow or absent
+/// snapshotter cannot wedge the turn *structurally*: there is no await to
+/// bound. Implementations queue the real work on their own worker.
 pub trait Snapshotter: Send + Sync {
-    fn snapshot(&self, label: String) -> futures_util::future::BoxFuture<'static, ()>;
+    /// Enqueue a snapshot of the current tree under `label`. Must never block.
+    fn snapshot(&self, label: String);
+    /// A workspace mutation is about to start: any capture whose staging
+    /// overlaps it must commit under a tainted label. O(1), never blocks.
+    fn mutation_started(&self) {}
+    /// Bounded wait for the queue to empty (session close). Returns within
+    /// `grace` even if the queue is still busy.
+    fn drain(&self, grace: std::time::Duration) {
+        let _ = grace;
+    }
 }
 
 pub struct SessionDeps {

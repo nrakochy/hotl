@@ -1209,11 +1209,29 @@ pub(crate) async fn run(
         shared.hook_mask(),
         crate::hooks::EventMask::SESSION_END,
         |hooks| {
+            // The hook command may write the workspace (0035 decision 7):
+            // taint any capture whose staging overlaps it, before it runs.
+            if let Some(snapshots) = &shared.snapshots {
+                snapshots.mutation_started();
+            }
             crate::hooks::call_session_end(hooks).await;
         },
         else {}
     );
+    // 0035 decision 9: bounded drain of queued shadow snapshots — the one
+    // residual user-visible snapshot cost, capped at the grace. Sync is fine
+    // here: the worker is an OS thread, not a tokio task, and nothing needs
+    // this actor responsive any more (same argument as the hook above).
+    if let Some(snapshots) = &shared.snapshots {
+        snapshots.drain(SNAPSHOT_DRAIN_GRACE);
+    }
 }
+
+/// How long session close waits for queued shadow snapshots before
+/// abandoning them (0035 decision 9). Abandonment is benign: a running git
+/// child is its own OS process — it finishes and releases its lock on its
+/// own; only the final capture may be lost.
+const SNAPSHOT_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// The mutable session state `on_turn_finished` threads back into the loop.
 struct TurnFinishedCtx<'a> {
@@ -2425,6 +2443,11 @@ async fn start_turn(
         shared.hook_mask(),
         crate::hooks::EventMask::USER_PROMPT,
         |hooks| {
+            // The hook command may write the workspace (0035 decision 7):
+            // taint any capture whose staging overlaps it, before it runs.
+            if let Some(snapshots) = &shared.snapshots {
+                snapshots.mutation_started();
+            }
             if let Some(context) = crate::hooks::call_user_prompt(hooks, &prompt_for_hooks).await {
                 let reminder = EntryPayload::Item {
                     item: Item::User {

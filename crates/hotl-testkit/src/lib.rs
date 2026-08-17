@@ -93,9 +93,8 @@ type ProviderWrap = Box<dyn FnOnce(Arc<ScriptedProvider>) -> Arc<dyn Provider>>;
 struct RecordingSnapshotter(Arc<std::sync::Mutex<Vec<String>>>);
 
 impl hotl_engine::Snapshotter for RecordingSnapshotter {
-    fn snapshot(&self, label: String) -> futures_util::future::BoxFuture<'static, ()> {
+    fn snapshot(&self, label: String) {
         self.0.lock().expect("snapshot log").push(label);
-        Box::pin(async {})
     }
 }
 
@@ -1102,11 +1101,8 @@ mod tests {
             "events: {:?}",
             h.seen
         );
-        // The undo safety net still brackets the batch.
-        assert_eq!(
-            *h.snapshots.lock().unwrap(),
-            vec!["pre batch 1", "post batch 1"]
-        );
+        // The undo safety net still captures the batch's quiet window.
+        assert_eq!(*h.snapshots.lock().unwrap(), vec!["state after batch 1"]);
     }
 
     #[tokio::test]
@@ -2914,7 +2910,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mutating_batches_are_bracketed_by_snapshots() {
+    async fn mutating_batches_take_one_quiet_window_snapshot() {
         let mut h = Harness::new(
             vec![
                 ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
@@ -2924,7 +2920,7 @@ mod tests {
         );
         h.prompt_and_wait("run it").await;
         let labels = h.snapshots.lock().unwrap().clone();
-        assert_eq!(labels, ["pre batch 1", "post batch 1"]);
+        assert_eq!(labels, ["state after batch 1"]);
 
         // Read-only batches don't snapshot.
         let dir = tempfile::tempdir().unwrap();
