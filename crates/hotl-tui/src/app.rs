@@ -319,6 +319,10 @@ pub struct State {
     pub model: String,
     /// Set on the prompt result (real usage; streaming shows `chars/4`).
     pub usage_line: Option<String>,
+    /// Undo-point state off the prompt reply's `undoStatus` field (0035):
+    /// `"warming"`, `"ready"` or `"degraded"`. `None` until a reply carries
+    /// it — a session without snapshots never does.
+    pub undo_status: Option<String>,
     /// Running totals across every turn, the basis of `usage_line`.
     pub session_usage: SessionUsage,
     pub help_open: bool,
@@ -432,6 +436,7 @@ impl State {
             vim_mode,
             model,
             usage_line: None,
+            undo_status: None,
             session_usage: SessionUsage::default(),
             help_open: false,
             queued_submit: false,
@@ -511,6 +516,9 @@ pub enum Msg {
         outcome_kind: String,
         outcome_text: Option<String>,
         usage: Value,
+        /// The reply's additive `undoStatus` field (0035); `Null` when the
+        /// session runs without snapshots.
+        undo: Value,
     },
     /// The server refused a steer — image validation, most often. The
     /// transcript's pinned "queued" chip must not outlive this.
@@ -741,7 +749,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             outcome_kind,
             outcome_text,
             usage,
-        } => on_prompt_result(state, &outcome_kind, outcome_text, &usage),
+            undo,
+        } => on_prompt_result(state, &outcome_kind, outcome_text, &usage, &undo),
         Msg::SteerRejected { why } => {
             clear_newest_queued_steer(state);
             notice(state, format!("steer rejected: {why}"));
@@ -1101,7 +1110,13 @@ fn on_prompt_result(
     kind: &str,
     text: Option<String>,
     usage: &Value,
+    undo: &Value,
 ) -> Vec<Cmd> {
+    // Keep the last known undo point when a reply omits the field — a
+    // session without snapshots never sets it at all.
+    if let Some(s) = undo.get("state").and_then(Value::as_str) {
+        state.undo_status = Some(s.to_string());
+    }
     // A turn that streamed nothing still shows its outcome text.
     if turn_chars(&state.transcript) == 0 {
         if let Some(t) = text.as_deref().filter(|t| kind == "done" && !t.is_empty()) {
@@ -1706,11 +1721,15 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 Some(_) => " · ◎ goal active",
                 None => "",
             };
+            let undo = match &state.undo_status {
+                Some(s) => format!(" · undo {s}"),
+                None => String::new(),
+            };
             notice(
                 state,
                 format!(
                     "{name} · model {} · mode {}{plan} · effort {} · context {} tok · \
-                     {todos} todo(s){goal}",
+                     {todos} todo(s){goal}{undo}",
                     state.model,
                     state.mode,
                     effort_report(state),
@@ -2258,6 +2277,7 @@ mod tests {
                 outcome_kind: kind.into(),
                 outcome_text: text,
                 usage: usage.clone(),
+                undo: Value::Null,
             },
         )
     }
@@ -3329,6 +3349,7 @@ mod tests {
                 outcome_kind: "done".into(),
                 outcome_text: Some("fin".into()),
                 usage: json!({"input_tokens": 120, "output_tokens": 45}),
+                undo: Value::Null,
             },
         );
         assert_eq!(s.phase, Phase::Idle);
@@ -3910,6 +3931,41 @@ mod tests {
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("effort high"))
         );
+        // 0035: the undo point rides /status once known, absent before.
+        assert!(!last_notice(&s).contains("undo"), "{}", last_notice(&s));
+        s.undo_status = Some("ready".into());
+        type_and_submit(&mut s, "/status");
+        assert!(
+            last_notice(&s).contains("undo ready"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    /// 0035 decision 11: the prompt reply's additive `undoStatus` field
+    /// lands in state; an omitted field keeps the last known point.
+    #[test]
+    fn the_prompt_reply_updates_the_undo_status() {
+        let mut s = State::test_default();
+        let result = |undo: Value| Msg::PromptResult {
+            outcome_kind: "done".into(),
+            outcome_text: None,
+            usage: json!({}),
+            undo,
+        };
+        update(&mut s, result(json!({"state": "warming"})));
+        assert_eq!(s.undo_status.as_deref(), Some("warming"));
+        update(&mut s, result(Value::Null));
+        assert_eq!(
+            s.undo_status.as_deref(),
+            Some("warming"),
+            "an omitted field keeps the last known state"
+        );
+        update(
+            &mut s,
+            result(json!({"state": "ready", "label": "state after batch 3"})),
+        );
+        assert_eq!(s.undo_status.as_deref(), Some("ready"));
     }
 
     /// A change made by another attached surface reaches this one.
@@ -4389,6 +4445,7 @@ mod tests {
                     "cache_read_input_tokens": 40_000,
                     "cache_creation_input_tokens": 300,
                 }),
+                undo: Value::Null,
             },
         );
         assert_eq!(s.live_context, Some(41_300));

@@ -570,11 +570,27 @@ fn memory_check(config_dir: &Path) -> Check {
     }
 }
 
+/// Undo-point status from on-disk state (0035 decision 11): doctor is a
+/// separate process, so it reports what the newest session's shadow shows —
+/// the in-process worker's live view is the TUI strip's job.
 fn undo_check() -> Check {
-    if hotl_store::shadow::git_available() {
-        ok("undo: git found — sessions snapshot before/after mutating steps".into())
-    } else {
-        warn("undo: git not found — `hotl undo` snapshots are disabled".into())
+    if !hotl_store::shadow::git_available() {
+        return warn("undo: git not found — `hotl undo` snapshots are disabled".into());
+    }
+    let root = crate::agent::shadow_root();
+    let opened = hotl_store::shadow::latest_session(&root)
+        .and_then(|s| hotl_store::shadow::Shadow::open(&root, &s).map(|sh| (s, sh)));
+    let Some((session, shadow)) = opened else {
+        return ok("undo: git found — sessions snapshot at quiet windows".into());
+    };
+    if !shadow.has_mutations() {
+        return ok(format!("undo: no agent mutations in session {session}"));
+    }
+    match shadow.latest_clean() {
+        Some((_, label)) => ok(format!("undo: ready (\"{label}\", session {session})")),
+        None => warn(format!(
+            "undo: warming — no snapshot yet in session {session}"
+        )),
     }
 }
 

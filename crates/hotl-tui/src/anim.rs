@@ -371,6 +371,12 @@ pub fn strip_text(state: &State) -> String {
             if let Some(usage) = &state.usage_line {
                 parts.push(usage.clone());
             }
+            // Undo-point chip (0035 decision 11): opacity must not be
+            // silence — the strip says whether `hotl undo` has a restore
+            // point right now.
+            if let Some(undo) = &state.undo_status {
+                parts.push(format!("undo {undo}"));
+            }
             parts.join(" · ")
         }
         Phase::Sampling { ticks } => format!("thinking · {}s · esc to interrupt", secs(*ticks)),

@@ -728,6 +728,12 @@ pub(crate) async fn build_acp() -> Result<
         let plan = plan_override.unwrap_or_else(|| scaffold.rules.plan());
         let session_id = log.session_id.clone();
         let (snapshots, initial) = session_context(&session_id, &scaffold, &resumed);
+        // The concrete handle stays here for the strip's status probe; deps
+        // get the upcast trait object (0035 decision 11).
+        let undo_probe = snapshots.as_ref().map(|s| {
+            let s = Arc::clone(s);
+            Box::new(move || s.status().to_wire()) as crate::acp::UndoProbe
+        });
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
         }
@@ -764,6 +770,7 @@ pub(crate) async fn build_acp() -> Result<
             // This log's own id — the one a later `session/load` (and so
             // `session/reload_config`) must name to replay this chain.
             session_id,
+            undo: undo_probe,
         })
     });
     Ok((factory, info, warnings))
@@ -2013,10 +2020,39 @@ enum SnapJob {
 }
 
 /// What the worker shares with the enqueue side: the pending-job count (the
-/// drain condition) and its condvar.
+/// drain condition), its condvar, and the last-outcome slot the strip chip
+/// polls (0035 decision 11 — failures used to be `let _ =`-dropped).
 struct SnapQueue {
     pending: std::sync::Mutex<usize>,
     idle: std::sync::Condvar,
+    status: std::sync::Mutex<UndoStatus>,
+}
+
+/// The undo point as this session's worker last saw it. On-disk truth for a
+/// separate process is `hotl doctor`; this is the in-process view the TUI
+/// strip renders.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum UndoStatus {
+    /// No clean capture committed yet (session open, or a giant first stage).
+    Warming,
+    /// The newest clean capture's label — the current restore target.
+    Ready(String),
+    /// The last capture attempt failed; the previous restore point (if any)
+    /// still stands.
+    Degraded(String),
+}
+
+impl UndoStatus {
+    /// The additive `undoStatus` wire field (0035 decision 11).
+    pub(crate) fn to_wire(&self) -> serde_json::Value {
+        match self {
+            UndoStatus::Warming => serde_json::json!({"state": "warming"}),
+            UndoStatus::Ready(label) => serde_json::json!({"state": "ready", "label": label}),
+            UndoStatus::Degraded(detail) => {
+                serde_json::json!({"state": "degraded", "detail": detail})
+            }
+        }
+    }
 }
 
 /// Shadow-git snapshotter (M3b, rebuilt by 0035): one dedicated worker
@@ -2040,6 +2076,7 @@ impl GitSnapshotter {
         let queue = Arc::new(SnapQueue {
             pending: std::sync::Mutex::new(0),
             idle: std::sync::Condvar::new(),
+            status: std::sync::Mutex::new(UndoStatus::Warming),
         });
         {
             let generation = Arc::clone(&generation);
@@ -2052,6 +2089,10 @@ impl GitSnapshotter {
             marked: std::sync::atomic::AtomicBool::new(false),
             queue,
         }
+    }
+
+    pub(crate) fn status(&self) -> UndoStatus {
+        lock_ok(&self.queue.status).clone()
     }
 
     fn enqueue(&self, job: SnapJob) {
@@ -2100,7 +2141,17 @@ fn snap_worker(
                 } else {
                     label
                 };
-                let _ = staged.and_then(|()| backend.commit(&label));
+                let committed = staged.and_then(|()| backend.commit(&label));
+                let mut status = lock_ok(&queue.status);
+                match committed {
+                    Some(_) if label.starts_with(hotl_store::shadow::CLEAN_PREFIX) => {
+                        *status = UndoStatus::Ready(label)
+                    }
+                    // A tainted capture warms the odb; the previous clean
+                    // restore point still stands.
+                    Some(_) => {}
+                    None => *status = UndoStatus::Degraded(format!("snapshot \"{label}\" failed")),
+                }
             }
         }
         let mut pending = lock_ok(&queue.pending);
@@ -2154,7 +2205,7 @@ pub(crate) fn shadow_root() -> PathBuf {
 }
 
 /// `hotl undo [--force]`: restore the workspace to the newest session's
-/// last pre-batch snapshot. Interactive confirm unless --force.
+/// last clean quiet-window snapshot. Interactive confirm unless --force.
 pub(crate) fn undo_main(args: Vec<String>) -> i32 {
     let force = args.iter().any(|a| a == "--force" || a == "-f");
     let root = shadow_root();
@@ -2166,14 +2217,27 @@ pub(crate) fn undo_main(args: Vec<String>) -> i32 {
         eprintln!("hotl: shadow repo for session {session} is unreadable");
         return 1;
     };
+    // The marker gate (0035 decision 6): without it, the session-open warm-up
+    // would let undo restore over user edits the agent never touched.
+    if !shadow.has_mutations() {
+        eprintln!("hotl: no agent mutations to undo in session {session}");
+        return 1;
+    }
     let Some((hash, label)) = shadow.latest_clean() else {
-        eprintln!("hotl: session {session} has no pre-batch snapshot to restore");
+        eprintln!(
+            "hotl: session {session} has no snapshot to restore yet — the first capture may still be staging; retry in a moment"
+        );
         return 1;
     };
     println!(
         "restore `{}` to snapshot \"{label}\" of session {session}?",
         shadow.work_tree().display()
     );
+    if label == "state session start" {
+        // Accepted degraded pre-image (0035 decision 12): the agent has
+        // mutated, but batch 1's capture hasn't landed yet.
+        println!("(the newest clean capture is session-open state — the first batch's snapshot has not landed yet)");
+    }
     if !force {
         eprint!("this overwrites tracked files changed since then [y/N] ");
         let mut answer = String::new();
@@ -2194,11 +2258,21 @@ pub(crate) fn undo_main(args: Vec<String>) -> i32 {
             for f in &files {
                 println!("  {f}");
             }
-            println!("(files created after the snapshot are kept, listed above if changed)");
+            println!("(files created after the snapshot were removed; the pre-undo checkpoint retains them)");
             0
         }
         Err(e) => {
             eprintln!("hotl: undo failed: {e}");
+            // Decision 8: no stale-lock sweep — this may be the LIVE newest
+            // session, whose worker legitimately holds the lock mid-`add`.
+            let lock = root.join(format!("{session}.git")).join("index.lock");
+            if lock.exists() {
+                eprintln!(
+                    "hotl: the shadow index is locked — a snapshot may be in progress; retry in a moment. \
+                     If no hotl session is running, a crashed process left it: remove {}",
+                    lock.display()
+                );
+            }
             1
         }
     }
@@ -5783,6 +5857,7 @@ mod tests {
         marks: std::sync::atomic::AtomicUsize,
         busy: std::sync::atomic::AtomicBool,
         overlapped: std::sync::atomic::AtomicBool,
+        fail_stage: std::sync::atomic::AtomicBool,
         stage_entered: TestLatch,
         stage_release: TestLatch,
         commit_entered: TestLatch,
@@ -5799,6 +5874,7 @@ mod tests {
                 marks: std::sync::atomic::AtomicUsize::new(0),
                 busy: std::sync::atomic::AtomicBool::new(false),
                 overlapped: std::sync::atomic::AtomicBool::new(false),
+                fail_stage: std::sync::atomic::AtomicBool::new(false),
                 stage_entered: TestLatch::new(false),
                 stage_release: TestLatch::new(stage_open),
                 commit_entered: TestLatch::new(false),
@@ -5815,6 +5891,10 @@ mod tests {
             }
             self.stage_entered.open();
             self.stage_release.wait();
+            if self.fail_stage.load(Ordering::SeqCst) {
+                self.busy.store(false, Ordering::SeqCst);
+                return None;
+            }
             Some(())
         }
         fn commit(&self, label: &str) -> Option<String> {
@@ -5889,6 +5969,11 @@ mod tests {
             1,
             "the first mutation queues exactly one marker write"
         );
+        assert_eq!(
+            snap.status(),
+            UndoStatus::Warming,
+            "a tainted capture never becomes the advertised restore point"
+        );
     }
 
     /// The negative half: the generation is compared at add-start vs add-END
@@ -5908,6 +5993,36 @@ mod tests {
         assert_eq!(
             *backend.committed.lock().unwrap(),
             vec!["state after batch 1"]
+        );
+    }
+
+    /// The strip's status source (0035 decision 11): warming until the first
+    /// clean commit, degraded on a failed capture, recovered by the next
+    /// clean one.
+    #[test]
+    fn status_tracks_warming_ready_and_degraded() {
+        use hotl_engine::Snapshotter as _;
+        use std::sync::atomic::Ordering;
+        let backend = Arc::new(FakeBackend::instant());
+        let snap = GitSnapshotter::new(backend.clone());
+        assert_eq!(snap.status(), UndoStatus::Warming);
+        snap.snapshot("state session start".into());
+        snap.drain(DRAIN);
+        assert_eq!(
+            snap.status(),
+            UndoStatus::Ready("state session start".into())
+        );
+        backend.fail_stage.store(true, Ordering::SeqCst);
+        snap.snapshot("state after batch 1".into());
+        snap.drain(DRAIN);
+        assert!(matches!(snap.status(), UndoStatus::Degraded(_)));
+        backend.fail_stage.store(false, Ordering::SeqCst);
+        snap.snapshot("state after batch 2".into());
+        snap.drain(DRAIN);
+        assert_eq!(
+            snap.status(),
+            UndoStatus::Ready("state after batch 2".into()),
+            "a later clean capture recovers from degraded"
         );
     }
 

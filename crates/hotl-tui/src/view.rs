@@ -2025,6 +2025,23 @@ mod tests {
         );
     }
 
+    /// 0035 decision 11: the idle strip carries the undo-point chip once the
+    /// wire reported one — opacity must not be silence.
+    #[test]
+    fn strip_shows_the_undo_chip_at_idle() {
+        let mut s = State::new(true, "m".into());
+        assert!(
+            !draw(&s)[STRIP].contains("undo"),
+            "no chip before the wire reports a status"
+        );
+        s.undo_status = Some("warming".into());
+        let rows = draw(&s);
+        assert!(rows[STRIP].contains("undo warming"), "{}", rows[STRIP]);
+        s.undo_status = Some("ready".into());
+        let rows = draw(&s);
+        assert!(rows[STRIP].contains("undo ready"), "{}", rows[STRIP]);
+    }
+
     #[test]
     fn waiting_ask_renders_modal_with_summary_and_protected_why() {
         let mut s = State::new(true, "m".into());

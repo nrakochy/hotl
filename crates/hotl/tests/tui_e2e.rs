@@ -77,6 +77,7 @@ fn scripted_factory() -> acp::SessionFactory {
             default_effort: None,
             goal: None,
             session_id,
+            undo: None,
         })
     })
 }
@@ -145,6 +146,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             default_effort: None,
             goal: None,
             session_id,
+            undo: None,
         })
     })
 }

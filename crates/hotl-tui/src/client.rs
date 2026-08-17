@@ -328,12 +328,14 @@ fn prompt_result_msg(result: Result<Value, String>) -> Msg {
                     .to_string(),
                 outcome_text: text,
                 usage: v.get("usage").cloned().unwrap_or(Value::Null),
+                undo: v.get("undoStatus").cloned().unwrap_or(Value::Null),
             }
         }
         Err(e) => Msg::PromptResult {
             outcome_kind: "error".into(),
             outcome_text: Some(e),
             usage: Value::Null,
+            undo: Value::Null,
         },
     }
 }

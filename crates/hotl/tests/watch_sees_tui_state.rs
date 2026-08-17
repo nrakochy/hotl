@@ -158,6 +158,7 @@ fn watch_sees_idle_when_the_turn_finishes() {
             outcome_kind: "end_turn".into(),
             outcome_text: None,
             usage: serde_json::json!({}),
+            undo: serde_json::Value::Null,
         },
     );
     assert_eq!(seen_by_watch(&state, &cmds), Status::Idle);

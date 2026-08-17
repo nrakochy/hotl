@@ -121,6 +121,11 @@ fn scripted_factory_recording(
             default_effort: Some("xhigh".into()),
             goal: None,
             session_id,
+            // A fixed probe, so the golden scenario can pin that the additive
+            // `undoStatus` field rides the prompt reply (0035 decision 11).
+            undo: Some(Box::new(
+                || json!({"state": "ready", "label": "state after batch 1"}),
+            )),
         })
     })
 }
@@ -180,6 +185,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             default_effort: None,
             goal: None,
             session_id,
+            undo: None,
         })
     })
 }
@@ -593,6 +599,10 @@ async fn initialize_new_prompt_permission_and_result() {
         result["result"].get("usage").is_some(),
         "usage rides in the stable result"
     );
+    assert_eq!(
+        result["result"]["undoStatus"]["state"], "ready",
+        "the additive undoStatus field rides the prompt reply (0035)"
+    );
     assert!(saw_tool_start, "tool status streamed as an update");
 
     // 4. unknown method → JSON-RPC error, no crash.
@@ -647,6 +657,7 @@ async fn overlapping_prompts_resolve_in_order() {
             default_effort: None,
             goal: None,
             session_id,
+            undo: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -859,6 +870,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             default_effort: None,
             goal: None,
             session_id,
+            undo: None,
         })
     });
     tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
@@ -1057,6 +1069,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             default_effort: None,
             goal: None,
             session_id,
+            undo: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1544,6 +1557,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             default_effort: None,
             goal,
             session_id,
+            undo: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
