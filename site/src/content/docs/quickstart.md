@@ -1,6 +1,6 @@
 ---
 title: 'Quickstart — your first hotl session'
-description: Install hotl, point it at a model, and complete one approved agent task — then undo it. Every command paired with the output you should see.
+description: Install hotl, point it at a model, and complete one approved agent task — then roll back to its checkpoint. Every command paired with the output you should see.
 ---
 
 From nothing installed to a completed agent task. Every command is copy-runnable and paired with the output you should see; the why behind things lives in [permissions-and-sandbox.md](../permissions-and-sandbox/) and [configuration.md](../configuration/).
@@ -80,7 +80,7 @@ hotl 0.2.0 — doctor
   ok    sessions: /Users/you/.local/share/hotl/sessions (writable)
   ok    memory: none (create /Users/you/.config/hotl/memory/MEMORY.md to enable)
   ok    secrets audit: no current secret values found in stored logs
-  ok    undo: git found — sessions snapshot before/after mutating steps
+  ok    undo: git found — sessions snapshot at quiet windows
 ```
 
 If the provider line says `FAIL`, your `HOTL_MODEL`/key env vars aren't set — redo step 2 in this same shell. Do not continue past a `FAIL` provider line.
@@ -107,19 +107,20 @@ allow edit README.md? [y/N]
 
 Type `y` and enter. It applies the edit and reports what it changed. Confirm with `git diff`.
 
-## 5. Undo it
+## 5. Roll back to the agent's checkpoint
 
-Leave the agent (`Ctrl-D`), then:
+The session automatically checkpointed your workspace at its quiet windows — at session open, and again right after the edit in step 4 — off the turn path, so you never waited on it. `hotl undo` restores the newest checkpoint. Leave the agent (`Ctrl-D`), mess the file up yourself to simulate work gone wrong:
 
 ```
+echo "oops" >> README.md
 hotl undo
 ```
 
-It asks to confirm, lists the files it touched, and restores them to before the edit — `git diff` is clean again. That snapshot was taken automatically around the edit in step 4.
+It asks to confirm, lists the files it touched, and restores them to the agent's last checkpoint — `git diff` shows only the agent's own edit again, your `oops` gone. (Undo restores the last *batch-end* state, so it rolls back everything since the agent's last completed step — an interrupted batch, a stray script, your own mess — not the completed step itself. Before the agent has changed anything at all, undo refuses rather than touch files that are only yours.)
 
 ## You've now seen the whole loop
 
-Type a request → the agent reads freely → it **asks before changing anything** (in `ask` mode) → you approve per step → every change is snapshotted for `undo`. When you drop the `HOTL_PERMISSIONS=ask` from step 2, the default `bypass` mode silences the ordinary prompts but keeps everything else: the kernel sandbox floor on `bash`, always-ask protection on execute-later paths (git hooks, shell rc, Makefiles, agent-instruction files), the full transcript of every auto-allowed call, and `undo`.
+Type a request → the agent reads freely → it **asks before changing anything** (in `ask` mode) → you approve per step → every step ends in a checkpoint for `undo`. When you drop the `HOTL_PERMISSIONS=ask` from step 2, the default `bypass` mode silences the ordinary prompts but keeps everything else: the kernel sandbox floor on `bash`, always-ask protection on execute-later paths (git hooks, shell rc, Makefiles, agent-instruction files), the full transcript of every auto-allowed call, and `undo`.
 
 **Next:**
 - Staying in `ask` mode but tired of approving trusted commands every time? → allow-rules in [configuration.md](../configuration/#allow-rules-allow).

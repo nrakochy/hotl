@@ -7,7 +7,7 @@
 //!   fleet         reserved (orchestrate, M4+)
 //!   doctor        environment/setup checks (MD)
 //!   resume        continue an earlier session from its log (M3b)
-//!   undo          restore files to the last pre-batch snapshot (M3b)
+//!   undo          restore files to the agent's last clean snapshot (M3b)
 //!   acp           serve the ACP JSON-RPC protocol over stdio (M4)
 //!   bg            background a session as a detached socket server (attach later)
 //!   attach        connect to a backgrounded session (bare: list them)
@@ -163,7 +163,7 @@ fn print_help() {
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
          hotl update          install the latest release (--check to only look)\n  \
          hotl resume [arg]    same as -r\n  \
-         hotl undo            restore files to before the agent's last change\n  \
+         hotl undo            restore files to the agent's last clean snapshot\n  \
          hotl fleet           reserved (orchestrate)\n  \
          hotl --version       print the version (-V, or `hotl version`)\n\n\
          PERMISSIONS: [permissions] mode = bypass (default, no per-action y/N) | ask |\n  \

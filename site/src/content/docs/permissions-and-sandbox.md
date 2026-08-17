@@ -316,7 +316,7 @@ Even then, allow-rules are trust *grants*, not fine scopes, and hotl treats them
 
 ## The safety net: snapshots and undo
 
-Approval is a judgment call, and judgment is fallible. So hotl photographs your workspace before and after every mutating batch (into a private git repo that never touches your project's own `.git`), and `hotl undo` restores the last pre-change snapshot. Secret-bearing files are kept out of these snapshots. This doesn't prevent a bad change — it makes one reversible, which is what lets you approve steps at a reasonable pace instead of agonizing over each one.
+Approval is a judgment call, and judgment is fallible. So hotl photographs your workspace at quiet windows — session start, and the end of each mutating tool batch — into a private git repo that never touches your project's own `.git`. All of it happens off the turn path on a background worker, so snapshots never delay a tool or a reply, whatever the repo size. `hotl undo` restores the newest clean snapshot — the agent's last checkpoint — and refuses when the agent hasn't mutated anything this session, so it can never trample edits that were only ever yours. A capture that raced a mutation is labeled tainted and never used as a restore target. Secret-bearing files are kept out of these snapshots. This doesn't prevent a bad change — it makes the work since the last checkpoint recoverable, which is what lets you approve steps at a reasonable pace instead of agonizing over each one.
 
 ## The honest summary
 

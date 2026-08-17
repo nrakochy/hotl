@@ -80,6 +80,9 @@ Look up the message you saw. Text in `code` is what hotl prints; find yours by g
 | `no session starts with \`X\`` | No session id has that prefix. | Run bare `hotl resume` to list ids, then use a longer prefix. |
 | `WARNING — … broken parent_id chain …` on resume | The session log was edited or truncated after it was written. | The context is still loaded, but treat it as untrusted — a broken chain means tampering or corruption. |
 | `hotl undo`: `no shadow snapshots found` | git wasn't available when the session ran, so nothing was snapshotted. | Install `git`; `hotl doctor` warns when snapshots are disabled. |
-| `hotl undo` didn't remove a file the agent created | By design: undo restores tracked files but never deletes new ones. | Delete the unwanted new file by hand; undo lists what it changed. |
+| `hotl undo`: `no agent mutations to undo in session …` | The agent never mutated the workspace that session, so undo refuses rather than touch files that are only yours. | Nothing to do — this is the safe refusal. |
+| `hotl undo`: `no snapshot to restore yet` | The agent has mutated, but the first capture is still staging (large repos take a moment, off the turn path). | Retry in a moment; `hotl doctor` shows warming → ready. |
+| `hotl undo` failed and named a locked shadow index | A snapshot is being taken right now (the lock is legitimate), or a crashed session left a stale lock. | Retry in a moment. If no hotl session is running, remove the `index.lock` path the message printed. |
+| A file the agent created came back after `hotl undo` | It shouldn't: undo removes files created after the snapshot (the pre-undo checkpoint retains them, so nothing is unrecoverable). | Re-run `hotl undo`; if it persists, file a bug. |
 
 **Report a bug hotl mislabels or a fix that's wrong:** the harness treats a repeated failure as a docs/behavior bug — file it against the repo. **Not covered here:** live-provider quirks — no real model has driven hotl end to end yet, so novel model behavior is expected and worth reporting.

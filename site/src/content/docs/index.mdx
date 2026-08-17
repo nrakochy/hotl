@@ -45,8 +45,8 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		Sessions are append-only event logs that nothing rewrites:
 
 		- `hotl resume` picks any session back up where it stopped
-		- `hotl undo` reverses the agent's file changes via shadow-git
-		  snapshots taken around every mutating step
+		- `hotl undo` restores the agent's last clean checkpoint via shadow-git
+		  snapshots taken at quiet windows, always off the turn path
 		- a long session keeps its thread: compaction folds the middle into a
 		  typed digest — goal, state, decisions, files, what's next — and
 		  leaves recent turns verbatim, a summary added *on top of* history
@@ -96,8 +96,9 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		- every entry point builds a `current_thread` runtime — nothing pays for
 		  thread-pool spinup on the cold-start path that `hotl -p` and the zsh
 		  plugin live on
-		- work that genuinely blocks — shadow-git snapshots, `glob`'s tree walk
-		  — leaves via `spawn_blocking`, and that pool is yours to size
+		- work that genuinely blocks leaves the async path: `glob`'s tree walk
+		  via `spawn_blocking` (a pool that's yours to size), shadow-git
+		  snapshots on their own dedicated worker thread
 		- one actor per session is the sole committer, so there's no lock order
 		  to get wrong: parallel-safe calls overlap, anything that mutates runs
 		  alone in source order, and `Ctrl-c` trips a cancellation token

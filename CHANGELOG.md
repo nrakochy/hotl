@@ -6,6 +6,35 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **Shadow snapshots are now invisible** (plan 0035). The first mutating tool
+  call no longer stalls behind an awaited pre-batch snapshot — on a large
+  repo that wait was ~60s of `git add` hashing the whole workspace before the
+  tool could run, and every later mutating batch paid a further stat walk
+  (0033 already detached the post-batch half; this finishes the thought).
+  Snapshots now happen at quiet windows — session open, and each mutating
+  batch's end — on a dedicated background worker the turn path never waits
+  for: dispatch and turn-done latency are independent of repo size and
+  snapshotter speed, enforced by a regression test. A capture that raced a
+  mutation is committed under a `tainted` label and never restored; the only
+  remaining user-visible cost is a bounded (2s) drain at session close.
+  `hotl undo` semantics sharpen with the model: it restores the newest
+  *clean* snapshot — the agent's last completed checkpoint (batch-end state,
+  not dispatch-time state) — refuses when the agent made no mutations that
+  session instead of trampling edits that were only yours, explains a locked
+  shadow index instead of guessing, and no longer misclaims that files
+  created after the snapshot are kept (they are removed; the pre-undo
+  checkpoint retains them). `hotl doctor` reports the undo point (ready /
+  warming / no agent mutations), and the console strip and `/status` carry an
+  `undo` chip off a new additive `undoStatus` field on the prompt reply.
+  Snapshots of git workspaces also borrow the workspace's own object store
+  (`alternates`) and enable git's many-files levers, shrinking capture cost;
+  `core.fsmonitor` was measured to deadlock under the shadow's bare-gitdir
+  shape and stays off. Known limit: a backgrounded process (`cmd &`) that
+  writes after its batch ends mutates outside any snapshot window — same as
+  the old design.
+
 ### Added
 
 - **`/goal` — run until a condition is met** (plan 0034). Set a completion
