@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-17
+
 ### Changed
 
 - **Shadow snapshots are now invisible** (plan 0035). The first mutating tool
