@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-08-18
+
 ### Changed
 
 - **Bypass mode no longer prompts — it notifies** (plan 0036). A session in
