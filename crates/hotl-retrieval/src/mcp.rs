@@ -201,6 +201,7 @@ impl Retriever for McpRetriever {
                      output into the model's context.{recurring}",
                     self.cfg.name
                 ),
+                class: hotl_tools::ProtectedClass::TrustFirstUse,
             }
         }
     }

@@ -1479,10 +1479,14 @@ impl Turn {
             },
             else {}
         );
-        let (summary, why) = match tool.permission(&input) {
-            Permission::None => (None, None),
-            Permission::Ask { summary } => (Some(summary), None),
-            Permission::AskProtected { summary, why } => (Some(summary), Some(why)),
+        let (summary, why, class) = match tool.permission(&input) {
+            Permission::None => (None, None, None),
+            Permission::Ask { summary } => (Some(summary), None, None),
+            Permission::AskProtected {
+                summary,
+                why,
+                class,
+            } => (Some(summary), Some(why), Some(class)),
         };
         // A gate-free tool has no permission summary; let it name the call
         // (`skill <name>`) so its card is not a bare, identical `skill`.
@@ -1495,7 +1499,8 @@ impl Turn {
         let mut secret_reads = false;
         let mut shown = None;
         if let Some(summary) = summary {
-            let Approval { reply, by_human } = self.approve_input(tu, &input, summary, why).await;
+            let Approval { reply, by_human } =
+                self.approve_input(tu, &input, summary, why, class).await;
             // Plan 0026: register the hosts the human actually read, and only
             // those. `display` is `safe_summary(summary)` — byte-for-byte what
             // `Turn::ask` renders — so the invariant is checkable rather than
@@ -1664,11 +1669,12 @@ impl Turn {
         input: &Value,
         summary: String,
         why: Option<String>,
+        class: Option<hotl_tools::ProtectedClass>,
     ) -> Approval {
         let tool = self.shared.registry.get(&tu.name);
         let facts = hotl_tools::rules::CallFacts {
             sandbox_enforced: self.shared.sandbox_enforced,
-            protected: why.is_some(),
+            protected: class,
             read_only: tool.as_ref().is_some_and(|t| t.read_only()),
             edits_files: tool.as_ref().is_some_and(|t| t.edits_files()),
         };

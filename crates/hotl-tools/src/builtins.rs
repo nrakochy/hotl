@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, OnceLock};
 
 use crate::sandbox::{self, SandboxStatus};
-use crate::{execute_later_reason, fsguard, Permission, Tool, ToolOutcome};
+use crate::{execute_later_reason, fsguard, Permission, ProtectedClass, Tool, ToolOutcome};
 use futures_util::future::BoxFuture;
 use hotl_platform::{ProcessControl as _, TreeReaper as _};
 use serde_json::{json, Value};
@@ -211,7 +211,11 @@ fn file_permission_with(
     // Tier A never reaches a y/n: the run-time door refuses regardless, and
     // the ask exists only so the human sees what was attempted.
     if let Some(why) = hotl_own_dir_reason(path) {
-        return Permission::AskProtected { summary, why };
+        return Permission::AskProtected {
+            summary,
+            why,
+            class: ProtectedClass::HotlOwn,
+        };
     }
     let resolved = dunce::canonicalize(path).ok();
     let target = write_target(root, extras, path);
@@ -237,11 +241,13 @@ fn file_permission_with(
         (Some(why), _) => Permission::AskProtected {
             summary,
             why: why.into(),
+            class: ProtectedClass::ExecuteLater,
         },
         (None, WriteTarget::OutsideApproved) => Permission::AskProtected {
             summary,
             why: "outside the working directory: not covered by this tool's workspace boundary"
                 .into(),
+            class: ProtectedClass::OutsideWrite,
         },
         (None, WriteTarget::Workspace(_) | WriteTarget::Extra(..)) => Permission::Ask { summary },
     }
@@ -312,12 +318,14 @@ impl Tool for ReadTool {
             return Permission::AskProtected {
                 summary: format!("read {path}"),
                 why,
+                class: ProtectedClass::HotlOwn,
             };
         }
         match fsguard::classify(&self.root, path) {
             fsguard::Placement::Inside(_) => Permission::None,
             fsguard::Placement::Outside(_) => Permission::AskProtected {
                 summary: format!("read {path}"),
+                class: ProtectedClass::OutsideRead,
                 // Show the human where it really lands, links resolved.
                 why: format!(
                     "outside the working directory{}: the workspace boundary does not cover it",
@@ -1379,6 +1387,7 @@ impl Tool for BashTool {
             return Permission::AskProtected {
                 summary,
                 why: format!("bash writes a protected path — {why}"),
+                class: ProtectedClass::ExecuteLater,
             };
         }
         Permission::Ask { summary }
@@ -1742,9 +1751,14 @@ mod tests {
         // plan and dontask.
         let out = ReadTool::default().permission(&json!({"path": "/Users/you/.ssh/id_rsa"}));
         match out {
-            Permission::AskProtected { summary, why } => {
+            Permission::AskProtected {
+                summary,
+                why,
+                class,
+            } => {
                 assert!(summary.contains("id_rsa"));
                 assert!(why.contains("outside the working directory"), "{why}");
+                assert_eq!(class, ProtectedClass::OutsideRead);
             }
             other => panic!("out-of-workspace read must be protected, got {other:?}"),
         }

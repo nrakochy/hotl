@@ -667,6 +667,16 @@ impl Tool for WebFetchTool {
         if escalated.is_empty() {
             Permission::Ask { summary }
         } else {
+            // Any metadata target makes the whole batch Metadata: it is the
+            // stricter class (bypass refuses it where PrivateNet flags-allows).
+            let class = if targets
+                .iter()
+                .any(|(_, c)| matches!(c, AddressClass::Metadata))
+            {
+                crate::ProtectedClass::Metadata
+            } else {
+                crate::ProtectedClass::PrivateNet
+            };
             Permission::AskProtected {
                 why: format!(
                     "targets the private network or a cloud-metadata address ({}). A fetch \
@@ -676,6 +686,7 @@ impl Tool for WebFetchTool {
                     escalated.join(", ")
                 ),
                 summary,
+                class,
             }
         }
     }
@@ -1015,7 +1026,11 @@ mod tests {
             "http://[::1]:9/",
         ] {
             match tool.permission(&json!({"urls": [url]})) {
-                Permission::AskProtected { summary, why } => {
+                Permission::AskProtected {
+                    summary,
+                    why,
+                    class,
+                } => {
                     assert!(
                         summary.contains(url.trim_end_matches('/'))
                             || summary.contains("169.254")
@@ -1024,6 +1039,14 @@ mod tests {
                             || summary.contains("::1")
                     );
                     assert!(!why.is_empty(), "the escalation must say why");
+                    // Metadata is its own class (bypass refuses it); the
+                    // private/loopback targets carry PrivateNet.
+                    let want = if url.contains("169.254") {
+                        crate::ProtectedClass::Metadata
+                    } else {
+                        crate::ProtectedClass::PrivateNet
+                    };
+                    assert_eq!(class, want, "{url}");
                 }
                 other => panic!("{url} must escalate, got {other:?}"),
             }

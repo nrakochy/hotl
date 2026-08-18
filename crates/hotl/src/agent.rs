@@ -5025,7 +5025,7 @@ mod tests {
         );
         // Refused file contributes nothing; the bypass default still applies.
         assert!(matches!(
-            rules.evaluate(rules.mode(), false, "bash", &serde_json::json!({"command": "git status"}), hotl_tools::rules::CallFacts { sandbox_enforced: true, protected: false, read_only: false, edits_files: false }),
+            rules.evaluate(rules.mode(), false, "bash", &serde_json::json!({"command": "git status"}), hotl_tools::rules::CallFacts { sandbox_enforced: true, protected: None, read_only: false, edits_files: false }),
             hotl_tools::rules::Verdict::Auto { rule } if rule == "permissions.mode=bypass"
         ));
         // Absent file: no warning, auto default.

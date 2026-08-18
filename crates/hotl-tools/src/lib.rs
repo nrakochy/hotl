@@ -47,8 +47,52 @@ pub enum Permission {
     None,
     /// Mutating/executing: y/n ask with this one-line summary.
     Ask { summary: String },
-    /// Write into the execute-later class: escalated warning ask.
-    AskProtected { summary: String, why: String },
+    /// A protected-floor hit: escalated warning ask under ask/dontask/plan;
+    /// `class` is what bypass mode maps to a non-blocking flagged verdict
+    /// (see `Rules::evaluate`).
+    AskProtected {
+        summary: String,
+        why: String,
+        class: ProtectedClass,
+    },
+}
+
+/// *Why* a call is on the protected floor. The gate maps this to a per-mode
+/// disposition: ask/dontask/plan always ask; bypass flags (allow-or-refuse
+/// with a loud notice) instead of blocking — except `TrustFirstUse`, which
+/// asks in every interactive mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectedClass {
+    /// Read of a path outside the session root.
+    OutsideRead,
+    /// Write/edit of a path outside the session root and every granted extra.
+    OutsideWrite,
+    /// Write into the execute-later class inside the boundary.
+    ExecuteLater,
+    /// hotl's own config/data dirs — the permission gate itself (Tier A).
+    HotlOwn,
+    /// First-use (or changed-program) trust screen for an MCP/retrieval server.
+    TrustFirstUse,
+    /// Web fetch targeting the private network or loopback.
+    PrivateNet,
+    /// Web fetch targeting a cloud-metadata endpoint.
+    Metadata,
+}
+
+impl ProtectedClass {
+    /// Short human label, feeding both the flagged verdict's rule string and
+    /// the TUI notice line.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OutsideRead => "outside-session read",
+            Self::OutsideWrite => "outside-session write",
+            Self::ExecuteLater => "protected write",
+            Self::HotlOwn => "hotl config",
+            Self::TrustFirstUse => "first-use trust",
+            Self::PrivateNet => "private-network fetch",
+            Self::Metadata => "metadata fetch",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

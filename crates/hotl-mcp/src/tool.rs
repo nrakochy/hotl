@@ -415,6 +415,7 @@ impl Tool for McpTool {
                      Approving runs this program on your machine and lets its \
                      output into the model's context.{recurring}"
                 ),
+                class: hotl_tools::ProtectedClass::TrustFirstUse,
             }
         }
     }

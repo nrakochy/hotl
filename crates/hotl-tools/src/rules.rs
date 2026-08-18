@@ -100,8 +100,9 @@ impl PermissionMode {
 pub struct CallFacts {
     /// The kernel sandbox floor is live. Bash allow-rules need it.
     pub sandbox_enforced: bool,
-    /// An execute-later path: always ask, never auto.
-    pub protected: bool,
+    /// The protected class, if any — see [`Rules::evaluate`] for the
+    /// per-mode floor it selects.
+    pub protected: Option<crate::ProtectedClass>,
     /// [`crate::Tool::read_only`] — a pure read.
     pub read_only: bool,
     /// [`crate::Tool::edits_files`] — a dedicated file mutation. Plan mode
@@ -408,7 +409,7 @@ impl Rules {
         if let Some(rule) = match_deny(&self.deny, tool, input, self.home()) {
             return Verdict::Deny { rule };
         }
-        if facts.protected {
+        if facts.protected.is_some() {
             return Verdict::Ask; // the floor: never auto into execute-later paths
         }
         if plan && facts.edits_files {
@@ -1232,11 +1233,13 @@ mod tests {
 
     /// The three facts most tests vary. `edits_files` is separate because only
     /// plan-mode tests care, and defaulting it false keeps every pre-existing
-    /// case reading as it did before the overlay landed.
+    /// case reading as it did before the overlay landed. `protected: true`
+    /// means the execute-later class — the class most pre-0036 cases meant;
+    /// tests that care about another class write the `CallFacts` literal.
     fn facts(sandbox_enforced: bool, protected: bool, read_only: bool) -> CallFacts {
         CallFacts {
             sandbox_enforced,
-            protected,
+            protected: protected.then_some(crate::ProtectedClass::ExecuteLater),
             read_only,
             edits_files: false,
         }
@@ -1809,7 +1812,7 @@ path_prefix = "src/"
                 "write",
                 &json!({"path": "Makefile"}),
                 CallFacts {
-                    protected: true,
+                    protected: Some(crate::ProtectedClass::ExecuteLater),
                     ..editing(true)
                 }
             ),
