@@ -323,6 +323,10 @@ pub struct State {
     /// `"warming"`, `"ready"` or `"degraded"`. `None` until a reply carries
     /// it — a session without snapshots never does.
     pub undo_status: Option<String>,
+    /// Running count of `tool_flagged` notices (0036) — bypass-mode calls
+    /// allowed or refused with a ⚑ instead of an ask. Never clears
+    /// mid-session, so an unattended run's flags survive scrollback.
+    pub flag_count: u64,
     /// Running totals across every turn, the basis of `usage_line`.
     pub session_usage: SessionUsage,
     pub help_open: bool,
@@ -437,6 +441,7 @@ impl State {
             model,
             usage_line: None,
             undo_status: None,
+            flag_count: 0,
             session_usage: SessionUsage::default(),
             help_open: false,
             queued_submit: false,
@@ -921,6 +926,24 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             }
         }
         "tool_auto_allowed" => state.pending_auto_rule = Some(text_of("rule")),
+        // The bypass floor's notification (0036): the flag *is* the ask's
+        // replacement, so it rides a Notice (no new TranscriptItem kind — a
+        // new kind breaks two view.rs matches at once) plus a running chip
+        // the strip keeps for the whole session.
+        "tool_flagged" => {
+            state.flag_count += 1;
+            let summary = text_of("summary");
+            let why = text_of("why");
+            let denied = v.get("denied").and_then(Value::as_bool).unwrap_or(false);
+            notice(
+                state,
+                if denied {
+                    format!("⚑ refused: {summary} — {why}")
+                } else {
+                    format!("⚑ allowed with notice: {summary} — {why}")
+                },
+            );
+        }
         "todos_changed" => {
             state.todos = v
                 .get("items")
@@ -3966,6 +3989,36 @@ mod tests {
             result(json!({"state": "ready", "label": "state after batch 3"})),
         );
         assert_eq!(s.undo_status.as_deref(), Some("ready"));
+    }
+
+    /// 0036: a `tool_flagged` update is a loud Notice plus the running chip
+    /// count — allowed and refused directions worded apart, and the count
+    /// only ever grows.
+    #[test]
+    fn tool_flagged_notices_and_bumps_the_chip_count() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "tool_flagged", "name": "write", "summary": "write Makefile",
+                   "why": "protected write", "denied": false}),
+        );
+        assert_eq!(s.flag_count, 1);
+        assert!(
+            last_notice(&s).starts_with("⚑ allowed with notice: write Makefile"),
+            "{}",
+            last_notice(&s)
+        );
+        upd(
+            &mut s,
+            json!({"type": "tool_flagged", "name": "write", "summary": "write /outside",
+                   "why": "outside-session write", "denied": true}),
+        );
+        assert_eq!(s.flag_count, 2, "the chip is a running count");
+        assert!(
+            last_notice(&s).starts_with("⚑ refused: write /outside"),
+            "{}",
+            last_notice(&s)
+        );
     }
 
     /// A change made by another attached surface reaches this one.

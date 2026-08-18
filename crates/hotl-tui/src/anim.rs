@@ -377,6 +377,12 @@ pub fn strip_text(state: &State) -> String {
             if let Some(undo) = &state.undo_status {
                 parts.push(format!("undo {undo}"));
             }
+            // Flag chip (0036): how many calls ran (or were refused) on a ⚑
+            // notice instead of an ask. A running count, never cleared
+            // mid-session, so an unattended run's flags survive scrollback.
+            if state.flag_count > 0 {
+                parts.push(format!("⚑ flags: {}", state.flag_count));
+            }
             parts.join(" · ")
         }
         Phase::Sampling { ticks } => format!("thinking · {}s · esc to interrupt", secs(*ticks)),

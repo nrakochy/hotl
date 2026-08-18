@@ -2042,6 +2042,20 @@ mod tests {
         assert!(rows[STRIP].contains("undo ready"), "{}", rows[STRIP]);
     }
 
+    /// 0036: the idle strip carries the ⚑ flag count once any bypass call ran
+    /// (or was refused) on a notice instead of an ask — absent at zero.
+    #[test]
+    fn strip_shows_the_flag_chip_at_idle() {
+        let mut s = State::new(true, "m".into());
+        assert!(
+            !draw(&s)[STRIP].contains("flags"),
+            "no chip before the first flag"
+        );
+        s.flag_count = 3;
+        let rows = draw(&s);
+        assert!(rows[STRIP].contains("⚑ flags: 3"), "{}", rows[STRIP]);
+    }
+
     #[test]
     fn waiting_ask_renders_modal_with_summary_and_protected_why() {
         let mut s = State::new(true, "m".into());
