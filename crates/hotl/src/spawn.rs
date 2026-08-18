@@ -672,6 +672,12 @@ mod tests {
         running: Arc<std::sync::atomic::AtomicUsize>,
         max_seen: Arc<std::sync::atomic::AtomicUsize>,
         delay_ms: u64,
+        /// `Some(n)`: hold the probe open until `max_seen` records `n`
+        /// simultaneous probes, instead of hoping `delay_ms` windows overlap —
+        /// a slow CI runner ran two 50ms windows entirely apart (max_seen=1).
+        /// Latches on monotonic `max_seen`, not `running`, which the first
+        /// leaver would un-make before the second poller sees it.
+        rendezvous: Option<usize>,
     }
 
     impl Tool for ConcurrencyProbe {
@@ -696,7 +702,22 @@ mod tests {
             Box::pin(async move {
                 let now = self.running.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_seen.fetch_max(now, Ordering::SeqCst);
-                tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+                match self.rendezvous {
+                    // Bounded: a regression that serializes the children must
+                    // fail the max_seen assertion, not hang the run.
+                    Some(n) => {
+                        let deadline =
+                            std::time::Instant::now() + std::time::Duration::from_secs(30);
+                        while self.max_seen.load(Ordering::SeqCst) < n
+                            && std::time::Instant::now() < deadline
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                    }
+                    None => {
+                        tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await
+                    }
+                }
                 self.running.fetch_sub(1, Ordering::SeqCst);
                 ToolOutcome::ok("probed")
             })
@@ -716,6 +737,9 @@ mod tests {
         /// A scratch git repo to cut a real `Worktree` from. `None` = the
         /// pre-0024 shared-tree child.
         isolate_in: Option<PathBuf>,
+        /// The number of children whose overlap the test asserts; see
+        /// `ConcurrencyProbe::rendezvous`.
+        rendezvous: Option<usize>,
     }
 
     impl ChildBuilder for ProbeChild {
@@ -732,6 +756,7 @@ mod tests {
                 running: self.running.clone(),
                 max_seen: self.max_seen.clone(),
                 delay_ms: self.delay_ms,
+                rendezvous: self.rendezvous,
             }));
             let worktree = self
                 .isolate_in
@@ -972,8 +997,9 @@ mod tests {
             Arc::new(ProbeChild {
                 running,
                 max_seen: max_seen.clone(),
-                delay_ms: 60,
+                delay_ms: 0,
                 isolate_in: Some(repo.path().to_path_buf()),
+                rendezvous: Some(2),
             }),
             tempfile::tempdir().unwrap().keep(),
             false,
@@ -1015,6 +1041,7 @@ mod tests {
                 max_seen: max_seen.clone(),
                 delay_ms: 40,
                 isolate_in: None,
+                rendezvous: None,
             }),
             tempfile::tempdir().unwrap().keep(),
             false,
@@ -1048,6 +1075,7 @@ mod tests {
                 max_seen: Arc::new(AtomicUsize::new(0)),
                 delay_ms: 5_000,
                 isolate_in: Some(repo.path().to_path_buf()),
+                rendezvous: None,
             }),
             tempfile::tempdir().unwrap().keep(),
             false,
@@ -1086,6 +1114,7 @@ mod tests {
             max_seen: max_seen.clone(),
             delay_ms: 40,
             isolate_in: None,
+            rendezvous: None,
         });
         let concurrency = SessionConcurrency::new(hotl_tools::concurrency::ConcurrencyLimits {
             agents: 1,
@@ -1135,6 +1164,7 @@ mod tests {
             max_seen: max_seen.clone(),
             delay_ms: 50,
             isolate_in: None,
+            rendezvous: None,
         });
         let concurrency = SessionConcurrency::new(hotl_tools::concurrency::ConcurrencyLimits {
             agents: 4, // plenty of budget — the mutex, not the semaphore, must gate this
@@ -1180,8 +1210,9 @@ mod tests {
         let builder = Arc::new(ProbeChild {
             running: running.clone(),
             max_seen: max_seen.clone(),
-            delay_ms: 50,
+            delay_ms: 0,
             isolate_in: None,
+            rendezvous: Some(2),
         });
         let concurrency = SessionConcurrency::new(hotl_tools::concurrency::ConcurrencyLimits {
             agents: 4,
