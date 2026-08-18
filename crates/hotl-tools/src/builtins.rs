@@ -126,7 +126,7 @@ pub(crate) fn hotl_own_dir_reason(path: &str) -> Option<String> {
                 .join(literal),
         )
     };
-    let candidates = [resolve_as_far_as_it_exists(&absolute), absolute];
+    let candidates = [fsguard::resolve_as_far_as_it_exists(&absolute), absolute];
     let hit = always
         .iter()
         .find(|dir| candidates.iter().any(|c| c.starts_with(dir)))?;
@@ -138,32 +138,6 @@ pub(crate) fn hotl_own_dir_reason(path: &str) -> Option<String> {
          for anything you need from it.",
         hit.display()
     ))
-}
-
-/// Canonicalize the longest existing prefix and re-append the rest.
-/// `canonicalize` needs the whole path to exist, but a `write` target
-/// usually does not — and the literal form is not comparable against a
-/// canonical deny entry (on macOS `/var/...` vs `/private/var/...` alone
-/// would let every not-yet-created path past).
-fn resolve_as_far_as_it_exists(p: &std::path::Path) -> std::path::PathBuf {
-    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
-    let mut head = p;
-    loop {
-        if let Ok(real) = dunce::canonicalize(head) {
-            let mut out = real;
-            for part in tail.iter().rev() {
-                out.push(part);
-            }
-            return out;
-        }
-        match (head.file_name(), head.parent()) {
-            (Some(name), Some(parent)) => {
-                tail.push(name);
-                head = parent;
-            }
-            _ => return p.to_path_buf(),
-        }
-    }
 }
 
 /// `..`/`.` collapsed without touching the filesystem.
@@ -201,6 +175,9 @@ pub(crate) fn write_target(
     path: &str,
 ) -> WriteTarget {
     match fsguard::classify(root, path) {
+        // An absolute path under BOTH the root and a nested extra resolves as
+        // Workspace (root wins) — correct, the workspace descent is the
+        // tighter door. Extras are only consulted for paths the root misses.
         fsguard::Placement::Inside(rel) => WriteTarget::Workspace(rel),
         fsguard::Placement::Outside(_) => match fsguard::extra_root_for(path, extras) {
             Some((eroot, rel)) => WriteTarget::Extra(eroot, rel),

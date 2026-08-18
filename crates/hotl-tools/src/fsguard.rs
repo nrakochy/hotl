@@ -110,15 +110,44 @@ pub(crate) enum Placement {
 /// Cheap pre-filter: normalize `.`/`..` and decide which *permission* to ask
 /// for.
 ///
-/// INVARIANT (this is NOT the security boundary): `classify` is string-only.
-/// It exists to produce good error messages and to pick the permission
-/// variant before anything is opened. A path it calls `Inside` may still
-/// escape through a symlink — that is `open_beneath`'s job to refuse, and it
-/// does, on the fd. Enforced by
-/// `symlinked_dir_is_lexically_inside_but_refused_by_the_guard`.
-pub(crate) fn classify(_root: &Path, path: &str) -> Placement {
+/// INVARIANT (this is NOT the security boundary): `classify` exists to
+/// produce good error messages and to pick the permission variant before
+/// anything is opened. A path it calls `Inside` may still escape through a
+/// symlink — that is `open_beneath`'s job to refuse, and it does, on the fd.
+/// Enforced by `symlinked_dir_is_lexically_inside_but_refused_by_the_guard`.
+///
+/// Absolute paths that resolve under `root` (which arrives canonical —
+/// `workspace_root()` canonicalizes, and child roots come canonical from the
+/// worktree store) are *inside*: models spell in-session paths absolutely all
+/// the time, and "absolute" is not "outside". That takes one filesystem call
+/// ([`resolve_as_far_as_it_exists`]), which is safe here because the
+/// canonicalize-then-swap race is fail-closed: the returned rel is symlink-free
+/// *at classification time*, and the fd descent re-validates every component
+/// at open time. Everything else stays string-only.
+pub(crate) fn classify(root: &Path, path: &str) -> Placement {
     let given = PathBuf::from(path);
     if given.is_absolute() {
+        let mut norm = PathBuf::new();
+        for c in given.components() {
+            match c {
+                Component::RootDir | Component::Prefix(_) => norm.push(c),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    norm.pop();
+                }
+                Component::Normal(s) => norm.push(s),
+            }
+        }
+        let resolved = resolve_as_far_as_it_exists(&norm);
+        if let Some(rest) = strip_root(&resolved, root) {
+            let mut rel = rest.to_path_buf();
+            if rel.as_os_str().is_empty() {
+                // The root itself: reads of "." already work; writes to "."
+                // are refused downstream by `split_parent`, same as relative.
+                rel.push(".");
+            }
+            return Placement::Inside(rel);
+        }
         return Placement::Outside(given);
     }
     let mut out: Vec<&OsStr> = Vec::new();
@@ -131,6 +160,9 @@ pub(crate) fn classify(_root: &Path, path: &str) -> Placement {
                 }
             }
             Component::Normal(s) => out.push(s),
+            // Anchored-but-not-absolute Windows forms (`C:foo`, `\x`): they
+            // resolve against state that is not this root, so they are Outside
+            // unless the absolute arm above already re-anchored them.
             Component::RootDir | Component::Prefix(_) => return Placement::Outside(given),
         }
     }
@@ -142,6 +174,59 @@ pub(crate) fn classify(_root: &Path, path: &str) -> Placement {
         rel.push(".");
     }
     Placement::Inside(rel)
+}
+
+/// Canonicalize the longest existing prefix and re-append the rest.
+/// `canonicalize` needs the whole path to exist, but a `write` target
+/// usually does not — and the literal form is not comparable against a
+/// canonical root or deny entry (on macOS `/var/...` vs `/private/var/...`
+/// alone would misplace every not-yet-created path).
+pub(crate) fn resolve_as_far_as_it_exists(p: &Path) -> PathBuf {
+    let mut tail: Vec<&OsStr> = Vec::new();
+    let mut head = p;
+    loop {
+        if let Ok(real) = dunce::canonicalize(head) {
+            let mut out = real;
+            for part in tail.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (head.file_name(), head.parent()) {
+            (Some(name), Some(parent)) => {
+                tail.push(name);
+                head = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// `path` with a leading `root` stripped, compared per component (never a
+/// string prefix — `/srv/cachette` is not under `/srv/cache`) and
+/// case-folded where the filesystem folds. `None` when `path` is not under
+/// `root`.
+fn strip_root<'a>(path: &'a Path, root: &Path) -> Option<&'a Path> {
+    let mut rest = path.components();
+    for want in root.components() {
+        match rest.next() {
+            Some(have) if same_component(have.as_os_str(), want.as_os_str()) => {}
+            _ => return None,
+        }
+    }
+    Some(rest.as_path())
+}
+
+/// One path component against another. Case-insensitive where the default
+/// filesystem is (APFS, NTFS) — same policy as `rules.rs`'s path matching —
+/// and ASCII-only for the same reason given there.
+fn same_component(a: &OsStr, b: &OsStr) -> bool {
+    if cfg!(any(windows, target_os = "macos")) {
+        a.to_string_lossy()
+            .eq_ignore_ascii_case(&b.to_string_lossy())
+    } else {
+        a == b
+    }
 }
 
 #[derive(Debug)]
@@ -589,6 +674,65 @@ pub(crate) mod tests {
         }
         // And an ordinary name still works, so the filter is not a blanket.
         assert!(create_beneath(&root, Path::new("notes.md"), false).is_ok());
+    }
+
+    #[test]
+    fn absolute_path_under_the_root_is_inside() {
+        let (_o, root, _home) = fixture();
+        assert_eq!(
+            classify(&root, root.join("src/lib.rs").to_str().unwrap()),
+            Placement::Inside(PathBuf::from("src/lib.rs"))
+        );
+        // A not-yet-existing target re-anchors too — a `write` creates it.
+        assert_eq!(
+            classify(&root, root.join("new/dir/file.txt").to_str().unwrap()),
+            Placement::Inside(PathBuf::from("new/dir/file.txt"))
+        );
+        // The root itself maps to "." (writes there are refused downstream).
+        assert_eq!(
+            classify(&root, root.to_str().unwrap()),
+            Placement::Inside(PathBuf::from("."))
+        );
+    }
+
+    /// The un-canonicalized alias form (`/var/...` where the canonical root is
+    /// `/private/var/...` on macOS) re-anchors like any other absolute path.
+    /// On a platform without the alias the two forms coincide and this pins
+    /// the trivial case.
+    #[test]
+    #[cfg(unix)]
+    fn absolute_path_under_the_root_through_an_alias_is_inside() {
+        let (outer, root, _home) = fixture();
+        let aliased = outer.path().join("workspace/src/lib.rs");
+        assert_eq!(
+            classify(&root, aliased.to_str().unwrap()),
+            Placement::Inside(PathBuf::from("src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn absolute_path_outside_stays_outside() {
+        let (_o, root, home) = fixture();
+        assert!(matches!(
+            classify(&root, home.join("id_rsa").to_str().unwrap()),
+            Placement::Outside(_)
+        ));
+    }
+
+    #[test]
+    fn in_root_symlink_resolving_outside_is_outside() {
+        let (_o, root, home) = fixture();
+        symlink_or_skip!(&home, root.join("link"));
+        assert!(matches!(
+            classify(&root, root.join("link/id_rsa").to_str().unwrap()),
+            Placement::Outside(_)
+        ));
+        // The resolving-inside twin: the returned rel is the *resolved* form,
+        // symlink-free, so the fd descent passes cleanly.
+        symlink_or_skip!(root.join("src"), root.join("alias"));
+        let placed = classify(&root, root.join("alias/lib.rs").to_str().unwrap());
+        assert_eq!(placed, Placement::Inside(PathBuf::from("src/lib.rs")));
+        assert!(open_beneath(&root, Path::new("src/lib.rs")).is_ok());
     }
 
     #[test]
