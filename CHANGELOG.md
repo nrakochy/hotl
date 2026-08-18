@@ -6,6 +6,33 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **Bypass mode no longer prompts — it notifies** (plan 0036). A session in
+  the default `bypass` mode never blocks on a permission prompt: the
+  protected floor now maps each class to a non-blocking disposition,
+  surfaced as a loud ⚑ notice in the transcript (`tool_flagged` on the wire)
+  and a running `⚑ flags: N` chip on the console strip. Execute-later writes
+  inside the session root, reads outside it, and private-network fetches
+  **run with a notice**; writes outside the session root, writes into hotl's
+  own config/data dirs, and cloud-metadata fetches are **refused with a
+  notice** — mirroring the kernel sandbox, which already lets `bash` read
+  outside the tree and denies it writes there. Two prompts survive in
+  bypass, deliberately: the MCP/retrieval first-use trust screen (a
+  recorded, once-per-binary grant) and `bash` without a live kernel sandbox.
+  The `ask`/`dontask`/plan floors are unchanged, deny rules and the plan
+  overlay still outrank bypass, and `security-enforced` builds cannot reach
+  any of it. `hotl doctor`'s permissions line states the new meaning.
+- **Absolute paths under the session root are in-session — in every mode**
+  (plan 0036). `read`/`write`/`edit`/`glob`/`grep` re-anchor an absolute
+  path that resolves under their root (through the macOS `/var` alias or an
+  in-root symlink) instead of classifying it "outside the working
+  directory", so a model spelling an in-session path absolutely — as models
+  constantly do, e.g. under `~/sources/worktrees/…` in a `~/sources` session
+  — no longer trips a false outside-the-workspace prompt. Absolute in-root
+  `glob`/`grep` search roots now work too. Containment is still decided on
+  the file descriptor, never the name.
+
 ## [0.17.0] - 2026-08-17
 
 ### Changed
