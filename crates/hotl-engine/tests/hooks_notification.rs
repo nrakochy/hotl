@@ -102,19 +102,31 @@ async fn notification_hook_sees_blocked_then_done_then_idle_in_order() {
     );
 }
 
-#[tokio::test]
+// Multi-thread runtime, deliberately: the hook below blocks its worker until
+// released, which on the default current-thread flavor would wedge the whole
+// event loop even with a correct (detached) engine. Four workers leave room
+// for the actor and the test while both notify tasks (Done, Idle) sit blocked.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_notification_hook_never_stalls_turn_done() {
-    // A notifier that would take far longer than any reasonable turn budget
-    // must not be awaited on the hot path — `TurnDone` must still arrive
-    // promptly.
+    // Causal, not wall-clock: the hook blocks until the test releases it
+    // *after* seeing `TurnDone`, so an engine that awaited the hook on the
+    // hot path deadlocks into the timeout deterministically. (The previous
+    // shape asserted a 500ms budget, which a slow Windows CI runner missed
+    // by 6ms with a perfectly healthy engine.)
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig::default();
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
     let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
         "done",
     )]));
-    let hooks = InProcessHooks::new().on_notification(|_kind, _detail| {
-        std::thread::sleep(Duration::from_millis(50));
+    let gate = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let hook_gate = Arc::clone(&gate);
+    let hooks = InProcessHooks::new().on_notification(move |_kind, _detail| {
+        let (lock, cvar) = &*hook_gate;
+        let mut released = lock.lock().unwrap();
+        while !*released {
+            released = cvar.wait(released).unwrap();
+        }
     });
     let mut handle = spawn_session(SessionDeps {
         provider,
@@ -134,21 +146,24 @@ async fn a_slow_notification_hook_never_stalls_turn_done() {
     });
 
     handle.prompt("go".into()).await;
-    let start = std::time::Instant::now();
-    loop {
-        let ev = tokio::time::timeout(Duration::from_secs(5), handle.events.recv())
-            .await
-            .expect("TurnDone must not be stalled by a slow notification hook")
-            .expect("event channel closed");
-        if matches!(ev, EngineEvent::TurnDone { .. }) {
-            break;
+    let mut done = false;
+    let waited = tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(ev) = handle.events.recv().await {
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                done = true;
+                break;
+            }
         }
-    }
-    assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "TurnDone must not wait on the notification hook: {:?}",
-        start.elapsed()
-    );
+    })
+    .await;
+    // Release the hook before asserting, on both paths: on success it lets
+    // the blocked workers wind down so runtime teardown stays prompt; on
+    // failure it frees them so the test panics cleanly instead of wedging.
+    let (lock, cvar) = &*gate;
+    *lock.lock().unwrap() = true;
+    cvar.notify_all();
+    waited.expect("TurnDone must not wait on the notification hook");
+    assert!(done, "event channel closed before TurnDone");
 }
 
 /// Finding 2 (IMPORTANT): `Notification::Blocked` must also fire at the
