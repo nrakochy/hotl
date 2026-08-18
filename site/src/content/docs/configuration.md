@@ -221,7 +221,7 @@ search over collapsed sources, bodies read on demand, marketplaces, and the
 What that means per tool:
 
 - `glob` and `grep` refuse an absolute path or a `..` escape outright, and refuse a search root reached through a symlink. This is why they run with no ask.
-- `read` runs unprompted inside the tree. Outside it — an absolute path, a `..` escape, or a path that leaves through a symlink — it is a **protected ask that outranks `mode=auto`**, so it prompts in every mode. That is deliberate: an ordinary ask would be auto-approved under the shipped default and protect nothing.
+- `read` runs unprompted inside the tree — and an absolute path that resolves under the session root counts as inside, in every mode. Outside it — a `..` escape, an absolute path that really leaves the root, or a path that leaves through a symlink — it is **protected**: it prompts under `ask`/`dontask`/plan, and under the default `bypass` it runs with a ⚑ notice instead of a prompt. That is deliberate: an ordinary ask would be auto-approved under the shipped default and protect nothing, while a blocking prompt in bypass would park an unattended run.
 - `write` and `edit` never follow a symlink at any component, including the final one, so a `docs/notes.md` that points at `~/.zshrc` is refused rather than silently writing the target. Their protected-path classification also runs on the *resolved* target, so a symlink cannot launder a protected write into an ordinary one.
 
 A refusal is a prompt: it names the offending component and tells the model to re-issue with the absolute path and take the ask. Benign in-tree symlinks are refused too — distinguishing them would mean resolving a name and comparing it, which is the very check this design removes.
@@ -286,7 +286,7 @@ Rules that do **not** auto-allow, even with a matching rule (safety carve-outs):
 - A `bash` command containing a shell control operator (`;`, `|`, `&`, `<`, `>`, backtick, `$(`, braces, newline) — it does more than the prefix implies.
 - A `bash` rule at all when the sandbox floor is not enforced, or when a configured `[network]` egress restriction cannot be kernel-enforced on this host.
 - A `write`/`edit` path that resolves outside the prefix after `..` normalization, or is absolute against a relative prefix.
-- Any write to a protected (execute-later) path — always asks. See [permissions-and-sandbox.md](../permissions-and-sandbox/#protected-paths).
+- Any write to a protected (execute-later) path — never silently auto: it asks under `ask`/`dontask`/plan and runs with a ⚑ notice under `bypass`. See [permissions-and-sandbox.md](../permissions-and-sandbox/#protected-paths).
 
 ### Deny-rules (`[[deny]]`)
 

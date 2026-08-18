@@ -14,13 +14,28 @@ identically no matter where you set them.
 
 ### The mode: how a call is handled
 
-**`bypass` (the default): ordinary tool calls run without asking.** The floor
-still holds: `bash` runs inside the kernel sandbox, writes to execute-later
-paths (git hooks, Makefiles, shell rc, agent-instruction files, hotl's own
-config) always stop and ask, deny rules refuse outright, every silenced prompt
-appears in the transcript as an auto-allow with its granting rule, and
-`hotl undo` reverses any change. It's named for what it does to the gate — it
-bypasses it — because that's a trust decision, not a convenience.
+**`bypass` (the default): tool calls run without asking — and never block on
+a prompt.** The floor still holds, but it *notifies* instead of asking:
+`bash` runs inside the kernel sandbox; a write to an execute-later path (git
+hooks, Makefiles, shell rc, agent-instruction files) inside the session root
+runs with a loud **⚑ notice** in the transcript and a running `⚑ flags: N`
+chip on the status line; a read outside the session root runs with the same
+notice; a **write outside the session root is refused** with a notice, no
+prompt — mirroring the kernel sandbox, which already lets `bash` read outside
+the working directory and denies it writes there. Writes into hotl's own
+config/data dirs and fetches of cloud-metadata addresses are refused with a
+notice too. Deny rules still refuse outright, every silenced prompt appears
+in the transcript, and `hotl undo` reverses any change. Two prompts survive
+in bypass, deliberately: the **first-use trust screen** for an MCP or
+retrieval server (a recorded, once-per-binary grant — auto-trusting a changed
+server binary would be a supply-chain hole) and **`bash` when the kernel
+sandbox isn't live** (kernel enforcement is what substitutes for prompting).
+It's named for what it does to the gate — it bypasses it — because that's a
+trust decision, not a convenience.
+
+Absolute paths that resolve under the session root count as *inside* it — in
+every mode, not just bypass — so a model spelling an in-session path
+absolutely no longer trips the "outside the working directory" ask.
 
 **`ask`: every mutating or executing call asks y/N first** — set
 `[permissions] mode = "ask"` (or `HOTL_PERMISSIONS=ask`) if you want the human
@@ -238,7 +253,7 @@ Two targets get stricter treatment:
 - **Cloud instance-metadata addresses** (`169.254.169.254` and its siblings) are refused outright, on the first hop and on every redirect hop. On a cloud VM that endpoint hands out instance credentials to anything that asks, and nothing legitimate needs an agent to read it. `HOTL_WEB_ALLOW_METADATA=1` exists if you genuinely do.
 - **A redirect from the public web into your private network is refused.** You approved hop one; hop two into `10.0.0.5` or `127.0.0.1` is a target you never saw. An allowed public host could otherwise 302 into an internal service and return its response into the model's context. A chain that *starts* private is fine — "fetch `http://localhost:3000` and tell me what's wrong" is a real workflow, and that target was on screen when you approved it.
 
-Fetching a private or loopback address directly still works, but it is a **protected** ask: it prompts in every mode, including the default `bypass`, the same way a write to an execute-later path does.
+Fetching a private or loopback address directly still works, but it is **protected**: it prompts under `ask`/`dontask`/plan, and under the default `bypass` it runs with a ⚑ notice instead of a prompt — the same treatment as a write to an execute-later path. A cloud-metadata target under `bypass` is refused with a notice, never fetched.
 
 One honest limit: the classification reads literal addresses. A *hostname* that resolves into private space on a redirect hop isn't caught, because the decision has to be made without doing a DNS lookup.
 
@@ -258,13 +273,20 @@ The practical consequences:
 - **A symlink out of the tree is refused, not followed.** `ln -s ~ link`
   followed by `grep --path link` used to search your whole home directory
   with no prompt. It now stops at `link`.
-- **`read` outside the working directory is a protected ask.** An absolute
-  path, a `..` escape, or a path that leaves through a symlink prompts — and
-  it is *protected*, so it prompts in **every** mode, including the default
-  `bypass`. This is the one deliberate exception to "ordinary tool calls run
-  without asking", and it is deliberate for a plain reason: an ordinary ask
-  is auto-approved under the shipped default, so it would have protected
-  nothing.
+- **An absolute path that resolves under the session root is in-session** —
+  in every mode. Models spell in-session paths absolutely all the time, and
+  those used to classify as "outside" and prompt. Only paths that actually
+  leave the root are outside.
+- **`read` outside the working directory is protected.** A `..` escape, an
+  absolute path that really leaves the root, or a path that leaves through a
+  symlink is never silently ordinary: it prompts under `ask`/`dontask`/plan,
+  and under the default `bypass` it runs with a loud ⚑ notice instead of a
+  prompt — visible in the transcript and counted on the status line, never
+  waved through as if it were in-tree.
+- **`write` and `edit` outside the working directory are refused under
+  `bypass`** — with a ⚑ notice and no prompt — mirroring the kernel sandbox,
+  which already denies `bash` writes outside the tree. Under
+  `ask`/`dontask`/plan they prompt as before.
 - **`write` and `edit` never follow a symlink**, at any component including
   the last, so a `docs/notes.md` that points at `~/.zshrc` is refused rather
   than quietly rewriting your shell config. Their protected-path
@@ -272,8 +294,9 @@ The practical consequences:
   launder a protected write into an ordinary one.
 
 **This is the change most likely to surprise you.** If your workflow has the
-agent read `~/notes.md` mid-session, that read now prompts where it used to
-be silent. Approving it works exactly as before — the escalation is a gate,
+agent read `~/notes.md` mid-session, that read prompts under `ask` where it
+used to be silent (under the default `bypass` it runs with a ⚑ notice
+instead). Approving it works exactly as before — the escalation is a gate,
 not a ban, and the prompt shows you where the path really lands, links
 resolved.
 
@@ -296,12 +319,14 @@ directories stays a protected ask, and a protected filename (a `Makefile`,
 a `.zshrc`) under a listed directory still escalates — the grant widens
 *where* the tools may write, never *what kind* of write gets waved through.
 An unknown `file_tools` value falls back to `"workspace"` with a warning.
+(Under `bypass`, "protected ask" for an outside write means a ⚑ refusal, no
+prompt — see the mode descriptions above.)
 
 ## Protected paths: some writes are more dangerous than they look
 
 Writing a file is usually harmless until *later*. A `.git/hooks/pre-commit`, a `Makefile`, a `build.rs`, your `~/.zshrc`, an `~/.ssh/authorized_keys` — writing these is benign, but the *next* git command, build, shell, or login runs code or grants access you never explicitly approved. This is the "write-now, execute-later" trap.
 
-hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule — it always asks, no matter what your `config.toml's [[allow]]` says. The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`, `setup.py`), toolchain entrypoints that run a command on the next ordinary invocation (`.cargo/config.toml`, `package.json` npm scripts, `.envrc`, `.pre-commit-config.yaml`, compose files, `.vscode/tasks.json` and `launch.json`), CI workflows under `.github/workflows/` (they run on your next push, with the repo's secrets), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), the whole shell-startup family (`.profile`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.bashrc`, `.zshrc`, `.zshenv`, `.zprofile`, `.zlogin`), hotl's own config directory (`~/.config/hotl/`, including `config.toml` and its `api_key_helper` command), SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
+hotl keeps a list of these **protected paths** and escalates their write ask with a warning that says *why* it's dangerous. A protected path can never be silently auto-approved by an allow-rule, no matter what your `config.toml's [[allow]]` says — it asks under `ask`/`dontask`/plan, and under the default `bypass` it runs with a loud ⚑ notice instead of a prompt (see the mode descriptions at the top). The list covers git hooks/config, build entrypoints (`Makefile`, `build.rs`, `conftest.py`, `setup.py`), toolchain entrypoints that run a command on the next ordinary invocation (`.cargo/config.toml`, `package.json` npm scripts, `.envrc`, `.pre-commit-config.yaml`, compose files, `.vscode/tasks.json` and `launch.json`), CI workflows under `.github/workflows/` (they run on your next push, with the repo's secrets), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), the whole shell-startup family (`.profile`, `.bash_profile`, `.bash_login`, `.bash_logout`, `.bashrc`, `.zshrc`, `.zshenv`, `.zprofile`, `.zlogin`), hotl's own config directory (`~/.config/hotl/`, including `config.toml` and its `api_key_helper` command), SSH keys and config, cloud and package-registry credentials (`.aws/`, `.npmrc`, `.pypirc`, `.netrc`, …), and cron/systemd units.
 
 ## Why allow-rules are a file you edit
 

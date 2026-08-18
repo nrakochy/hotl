@@ -440,8 +440,16 @@ fn permissions_check(config_dir: &Path) -> Check {
     };
     let mode_word = resolved.mode.as_str();
     let plan_note = if resolved.plan { " · plan" } else { "" };
+    // 0036: bypass never blocks — the protected floor notifies (⚑) or
+    // refuses instead of prompting; the other modes keep the blocking ask.
+    let floor_note = if resolved.mode == hotl_tools::rules::PermissionMode::Bypass {
+        "protected paths run or are refused with a ⚑ notice, never a prompt; \
+         outside-session writes are refused"
+    } else {
+        "protected paths always ask"
+    };
     ok(format!(
-        "permissions: {mode_word}{plan_note} (protected paths always ask){admin_note}"
+        "permissions: {mode_word}{plan_note} ({floor_note}){admin_note}"
     ))
 }
 

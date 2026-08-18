@@ -12,11 +12,43 @@ with it:
 | | default build, `mode="bypass"` (default) | default build, `mode="ask"` | `mode="dontask"` | `security-enforced` build |
 |---|---|---|---|---|
 | Ordinary bash/write/edit/MCP | runs, no prompt, `ToolAutoAllowed` in transcript | y/N ask per action | refused unless an allow-rule matches | y/N ask per action (config cannot change this) |
-| Protected execute-later paths | **always asks** (headless: denies) | always asks | always asks (headless: denies) | always asks |
-| File tool (`read`/`write`/`edit`) outside the working directory | **always asks** (headless: denies) | always asks | always asks (headless: denies) | always asks |
+| Protected classes (execute-later writes, outside-root file access, private-net/metadata fetches) | **never blocks**: runs or is refused with a ⚑ notice — see the bypass table below | always asks | always asks (headless: denies) | always asks |
+| MCP/retrieval first-use trust screen | **still asks** (headless: denies) | always asks | always asks (headless: denies) | always asks |
 | Admin preapproved (`/etc/hotl/preapproved.toml`) | grants apply (redundant under bypass) | grants silence matching asks | grants are the only thing that runs | grants are the admin's no-prompt channel |
 | Admin/user deny rules | refuse the call outright, with the rule named in the tool result | same | same | same |
 | Kernel sandbox / egress / undo / masking | on | on | on | on |
+
+**Bypass never blocks on a human (0036).** A session started with
+`mode="bypass"` is a trust decision, and a permission prompt in it is a
+contradiction — an unattended run parks forever on a question nobody is
+watching for. The protected floor therefore maps each protected *class* to a
+non-blocking disposition; every one emits a `ToolFlagged` event the surfaces
+must show loudly (the ⚑ transcript notice and the TUI's running `⚑ flags: N`
+strip chip):
+
+| class | bypass disposition |
+|---|---|
+| outside-root read | allow + notify |
+| outside-root write/edit | refuse + notify (no prompt) |
+| execute-later write inside the root | allow + notify |
+| hotl's own config/data dirs (Tier A) | refuse + notify (the runtime door refuses regardless) |
+| private-network web fetch | allow + notify |
+| cloud-metadata web fetch | refuse + notify |
+| MCP / retrieval first-use trust | **still asks** — the one residual prompt |
+
+The outside-root split mirrors the kernel sandbox: `bash` can already read
+outside the working directory and is kernel-denied writes there, so the file
+tools stop being *stricter* than the kernel on reads and stop being *looser*
+on writes. Two residual asks survive in bypass, deliberately: the
+**first-use (or changed-program) trust screen** for an MCP or retrieval
+server — a once-per-server-hash grant that gets recorded, where silent
+auto-trust of a changed binary would be a supply-chain hole — and **`bash`
+without a live kernel sandbox** (kernel enforcement substitutes for
+prompting; without it, bypass does not cover bash — `hotl doctor` surfaces a
+dead sandbox). The ask/dontask/plan floors are unchanged, and none of this is
+reachable in a `security-enforced` build: `enforced_mode` coerces Bypass to
+Ask at every mode-mutation entry point, so the flagged verdicts cannot occur
+there by construction.
 
 **Plan mode is a second, orthogonal axis, and is not a security control.** It
 moves `write`/`edit` into the "always asks" row above — never auto, not even
@@ -27,8 +59,8 @@ mode and a shell redirect writes a file without the `write` tool. Do not treat
 `--plan` as a sandbox. The unattended read-only posture is `dontask` with no
 allow-rules.
 
-In `bypass`, the boundary is **sandbox + protected asks + deny rules + undo**,
-not per-action approval. The README's "safety" claim holds unconditionally
+In `bypass`, the boundary is **sandbox + flagged notices/refusals + deny
+rules + undo**, not per-action approval. The README's "safety" claim holds unconditionally
 only for the `security-enforced` build; the default build's floor is the row
 above. `/etc/hotl/preapproved.toml` is trusted only when root-owned and not
 group/world-writable; otherwise it is refused loudly at startup and in
@@ -49,12 +81,15 @@ from the workspace-root fd reached it without traversing a symlink
 `O_NOFOLLOW` elsewhere). Since the check is made on the descriptor the tool
 then uses, there is no name to re-resolve and no check/open race.
 Consequences: `glob`/`grep` refuse an out-of-tree or symlinked search root
-outright; `read` outside the tree is a **protected ask that outranks
-`mode=bypass`**, so it prompts in every mode; `write`/`edit` never follow a
-symlink at any component and classify protected paths on the *resolved*
-target, so a symlink cannot launder a protected write into an ordinary one.
-This closes the "`ln -s ~ link` then `grep --path link`" read of the whole
-home directory under no prompt at all. It does **not** narrow `bash`.
+outright; `read` outside the tree is a **protected ask** under
+ask/dontask/plan and an allow-with-⚑-notice under bypass (see the mode
+table); `write`/`edit` never follow a symlink at any component and classify
+protected paths on the *resolved* target, so a symlink cannot launder a
+protected write into an ordinary one. An **absolute path that resolves under
+the session root is in-session** in every mode (0036) — "absolute" is not
+"outside"; the fd descent still decides containment. This closes the
+"`ln -s ~ link` then `grep --path link`" read of the whole home directory
+under no prompt at all. It does **not** narrow `bash`.
 
 ## The permission gate
 
@@ -62,7 +97,7 @@ Every mutating or executing tool call passes one fixed pipeline before it runs:
 
 1. **PreToolUse hooks** (in-process, then owner-configured shell hooks) may deny or rewrite the call. A rewritten call **re-enters the gate** — a hook cannot launder a call past the ask.
 2. **Allow rules** (`[[allow]]` in `~/.config/hotl/config.toml`) may auto-approve it, narrated. Rules are deliberately editor-written only — there is no in-console "always allow," so ask-fatigue cannot manufacture an ungoverned allowlist. Rule matching defends against shell-operator smuggling after an allowed prefix (`ls && curl …` does not match an `ls` rule) and `..` path traversal.
-3. **Protected paths** are checked *before* allow rules and **never auto-approve**. Writes that could execute later outside any gate escalate the ask with a *why* warning. The class covers: `.git/hooks/`, Makefile-class files (`Makefile`, `justfile`, `build.rs`, `conftest.py`, `*.gyp`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), harness/editor settings (`.hotl/`, `.claude/`, `settings.json`), shell rc files, `.ssh/`, credential stores (`.aws/`, `.config/gcloud/`, `.azure/`, `.npmrc`, `.pypirc`, `.netrc`, `.dockercfg`), git config, and cron/systemd units.
+3. **Protected paths** are checked *before* allow rules and **never silently auto-approve** — an allow rule cannot cover one, and under ask/dontask/plan they always ask. Under bypass they map to the flagged, non-blocking dispositions in the mode table above. Writes that could execute later outside any gate escalate the ask with a *why* warning. The class covers: `.git/hooks/`, Makefile-class files (`Makefile`, `justfile`, `build.rs`, `conftest.py`, `*.gyp`), agent-instruction files (`AGENTS.md`, `CLAUDE.md`), harness/editor settings (`.hotl/`, `.claude/`, `settings.json`), shell rc files, `.ssh/`, credential stores (`.aws/`, `.config/gcloud/`, `.azure/`, `.npmrc`, `.pypirc`, `.netrc`, `.dockercfg`), git config, and cron/systemd units.
 4. **The human ask** — a y/N modal in the console, escalated with a `⚠` line when a protected path is involved. Headless (`-p`, `--json`, or non-TTY stdin) **default-denies immediately**: nothing interactive ever blocks or leaks a prompt into CI logs. Interactive asks (the console modal, an attached `hotl bg` session) wait until you answer.
 
 Asks are durable: a `pending_ask` entry is committed to the session log before the question is surfaced and an `ask_resolved` entry after — a crash mid-ask is visible on replay, never silently resolved.

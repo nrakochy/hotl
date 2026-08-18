@@ -186,7 +186,9 @@ pub(crate) fn write_target(
     }
 }
 
-/// Permission for a mutating file tool: protected paths escalate.
+/// Permission for a mutating file tool: protected paths escalate (asking
+/// under ask/dontask/plan, flagged-not-blocking under bypass — the per-mode
+/// floor lives in `Rules::evaluate`).
 ///
 /// INVARIANT: the execute-later classification runs on the *resolved* target
 /// as well as the literal path, so an innocent-looking name that is a symlink
@@ -316,11 +318,12 @@ impl Tool for ReadTool {
         }
         schema
     }
-    /// INVARIANT: a read that stays inside the workspace runs unprompted; a
-    /// read that leaves it is `AskProtected` — the one tier that outranks
-    /// `mode=auto` (`rules.rs:232` vs `rules.rs:253`) — so the boundary is
-    /// real in the shipped default configuration, not just in `ask` mode.
-    /// Enforced by `read_outside_the_workspace_is_protected_not_free`.
+    /// INVARIANT: a read that stays inside the workspace — absolute or
+    /// relative; an in-root absolute path re-anchors (0036) — runs
+    /// unprompted; a read that leaves it is `AskProtected(OutsideRead)`, so
+    /// the boundary is visible in every mode: an ask under ask/dontask/plan,
+    /// an allow-with-⚑-notice under bypass (`Rules::evaluate`'s protected
+    /// floor). Enforced by `read_outside_the_workspace_is_protected_not_free`.
     fn permission(&self, input: &Value) -> Permission {
         let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
         // Tier A (plan 0022) outranks the workspace check: a symlink *inside*
@@ -1393,9 +1396,10 @@ impl Tool for BashTool {
             None => sandbox_status().label(),
         };
         let summary = format!("bash [{label}]: {short}");
-        // Vuln 4: a bash command that writes an execute-later path escalates to
-        // the protected ask (which auto-mode cannot skip), just like the `write`
-        // tool. Reads stay an ordinary Ask, so normal work is unaffected.
+        // Vuln 4: a bash command that writes an execute-later path escalates
+        // to the protected class, just like the `write` tool — an ask under
+        // ask/dontask/plan, an allow-with-⚑-notice under bypass (0036).
+        // Reads stay an ordinary Ask, so normal work is unaffected.
         if let Some(why) = bash_protected_write_reason(cmd) {
             return Permission::AskProtected {
                 summary,
