@@ -2492,6 +2492,18 @@ impl Surface {
             EngineEvent::ToolAutoAllowed { name, rule } => {
                 eprintln!("  (auto-allowed {name} by rule: {rule})");
             }
+            EngineEvent::ToolFlagged {
+                summary,
+                why,
+                denied,
+                ..
+            } => {
+                if denied {
+                    eprintln!("⚑ refused: {summary} — {why}");
+                } else {
+                    eprintln!("⚑ allowed with notice: {summary} — {why}");
+                }
+            }
             EngineEvent::Retrying { attempt, reason } => {
                 eprintln!("· retrying ({attempt}): {reason}")
             }

@@ -23,8 +23,11 @@
 //! any depth, and every tool is governable — `field = "<input key>"` covers
 //! anything without a declared subject.
 //!
-//! Two carve-outs hold in every mode and tier:
-//! 1. **Protected execute-later paths never auto-allow.** Enforced by
+//! Two carve-outs hold in every tier:
+//! 1. **Protected paths never auto-allow under ask/dontask/plan** — and never
+//!    *silently* auto under bypass, where they map to the flagged verdicts
+//!    (allow-or-refuse with a loud notice, never a blocking prompt);
+//!    `TrustFirstUse` asks in every interactive mode. Enforced by
 //!    `protected_paths_never_auto`.
 //! 2. **Bash rules only apply while the kernel sandbox floor is enforced.**
 //!    Enforced by `bash_rule_requires_sandbox`.
@@ -239,6 +242,10 @@ pub enum Verdict {
     Ask,
     /// A deny rule matched: refuse the call outright, without asking.
     Deny { rule: String },
+    /// Bypass: run it, but the surface must notify loudly (⚑), not narrate.
+    AutoFlagged { rule: String },
+    /// Bypass: refuse it without asking, and notify loudly.
+    DenyFlagged { rule: String },
 }
 
 impl Rules {
@@ -363,10 +370,11 @@ impl Rules {
     }
 
     /// The full tier pipeline, first match wins: admin deny → user deny →
-    /// protected (always ask) → **plan's file-edit floor** → admin allow →
-    /// user allow (unless locked) → mode=bypass → **dontask deny** (if the
-    /// tool isn't read-only) → ask. `facts` carries the live sandbox floor and
-    /// the tool's own classification.
+    /// protected (ask under ask/dontask/plan; flagged, never blocking, under
+    /// bypass — see the class mapping inline) → **plan's file-edit floor** →
+    /// admin allow → user allow (unless locked) → mode=bypass → **dontask
+    /// deny** (if the tool isn't read-only) → ask. `facts` carries the live
+    /// sandbox floor and the tool's own classification.
     ///
     /// **Plan is an overlay, not a mode.** It answers "what posture am I in";
     /// `mode` answers "how is a call handled". Plan's only effect is to put
@@ -409,8 +417,29 @@ impl Rules {
         if let Some(rule) = match_deny(&self.deny, tool, input, self.home()) {
             return Verdict::Deny { rule };
         }
-        if facts.protected.is_some() {
-            return Verdict::Ask; // the floor: never auto into execute-later paths
+        if let Some(class) = facts.protected {
+            // Bypass never blocks on a human (0036): the protected floor maps
+            // class → a flagged verdict — allow-with-notice or refuse-with-
+            // notice — except the first-use trust screen, a recorded grant
+            // that silently auto-trusting would turn into a supply-chain hole
+            // (D6). The plan overlay still outranks bypass (D5). `mode` here
+            // is the *effective* mode the engine passes — in a
+            // `security-enforced` build `enforced_mode` has already coerced
+            // Bypass to Ask at every entry point, so this arm is dead there
+            // by construction (D4).
+            if mode == PermissionMode::Bypass && !(plan && facts.edits_files) {
+                use crate::ProtectedClass::*;
+                return match class {
+                    ExecuteLater | OutsideRead | PrivateNet => Verdict::AutoFlagged {
+                        rule: format!("bypass: {} allowed with notice", class.label()),
+                    },
+                    OutsideWrite | HotlOwn | Metadata => Verdict::DenyFlagged {
+                        rule: format!("bypass: {} refused", class.label()),
+                    },
+                    TrustFirstUse => Verdict::Ask, // D6: recorded trust grant
+                };
+            }
+            return Verdict::Ask; // ask/dontask/plan: the floor, unchanged
         }
         if plan && facts.edits_files {
             return Verdict::Ask; // plan's floor: never auto into a file change
@@ -1293,13 +1322,32 @@ path_prefix = "src/"
         );
     }
 
+    /// The protected floor's mode matrix (0036): ask/dontask/plan always ask,
+    /// bypass maps class → a flagged, non-blocking verdict — and an
+    /// all-matching `[[allow]]` never changes any of it (the floor sits above
+    /// the allow tiers).
     #[test]
     fn protected_paths_never_auto() {
+        use crate::ProtectedClass::{self, *};
+        const EVERY_CLASS: [ProtectedClass; 7] = [
+            OutsideRead,
+            OutsideWrite,
+            ExecuteLater,
+            HotlOwn,
+            TrustFirstUse,
+            PrivateNet,
+            Metadata,
+        ];
         let r = Rules::from_toml("[[allow]]\ntool = \"write\"\npath_prefix = \"\"\n").unwrap();
-        // empty prefix matches everything — but protected still asks
+        let input = json!({"path": "Makefile"});
+        let prot = |class| CallFacts {
+            protected: Some(class),
+            ..facts(true, false, false)
+        };
+        // empty prefix matches everything — the unprotected baseline is Auto…
         assert!(matches!(
             r.evaluate(
-                r.mode(),
+                PermissionMode::Ask,
                 false,
                 "write",
                 &json!({"path": "src/a.rs"}),
@@ -1307,13 +1355,97 @@ path_prefix = "src/"
             ),
             Verdict::Auto { .. }
         ));
+        // …but under ask, dontask, and plan every protected class still asks.
+        for class in EVERY_CLASS {
+            for mode in [PermissionMode::Ask, PermissionMode::DontAsk] {
+                assert_eq!(
+                    r.evaluate(mode, false, "write", &input, prot(class)),
+                    Verdict::Ask,
+                    "{mode:?} {class:?}"
+                );
+            }
+            assert_eq!(
+                r.evaluate(
+                    PermissionMode::Bypass,
+                    true,
+                    "write",
+                    &input,
+                    CallFacts {
+                        edits_files: true,
+                        ..prot(class)
+                    }
+                ),
+                Verdict::Ask,
+                "plan overlay must outrank bypass for {class:?}"
+            );
+        }
+        // Bypass: allow-with-notice for the classes work flows through…
+        for class in [ExecuteLater, OutsideRead, PrivateNet] {
+            assert!(
+                matches!(
+                    r.evaluate(PermissionMode::Bypass, false, "write", &input, prot(class)),
+                    Verdict::AutoFlagged { .. }
+                ),
+                "{class:?}"
+            );
+        }
+        // …refuse-with-notice for the boundary itself…
+        for class in [OutsideWrite, HotlOwn, Metadata] {
+            assert!(
+                matches!(
+                    r.evaluate(PermissionMode::Bypass, false, "write", &input, prot(class)),
+                    Verdict::DenyFlagged { .. }
+                ),
+                "{class:?}"
+            );
+        }
+        // …and the first-use trust screen asks even in bypass (D6).
         assert_eq!(
             r.evaluate(
-                r.mode(),
+                PermissionMode::Bypass,
+                false,
+                "write",
+                &input,
+                prot(TrustFirstUse)
+            ),
+            Verdict::Ask
+        );
+    }
+
+    #[test]
+    fn deny_rules_beat_bypass_flags() {
+        let r =
+            Rules::from_toml("[[deny]]\ntool = \"write\"\npath_prefix = \"Makefile\"\n").unwrap();
+        // The class would flag-allow under bypass; the deny tier runs first.
+        assert!(matches!(
+            r.evaluate(
+                PermissionMode::Bypass,
                 false,
                 "write",
                 &json!({"path": "Makefile"}),
-                facts(true, true, false)
+                CallFacts {
+                    protected: Some(crate::ProtectedClass::ExecuteLater),
+                    ..facts(true, false, false)
+                }
+            ),
+            Verdict::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn plan_overlay_beats_bypass_flags() {
+        let r = Rules::default();
+        assert_eq!(
+            r.evaluate(
+                PermissionMode::Bypass,
+                true,
+                "write",
+                &json!({"path": "Makefile"}),
+                CallFacts {
+                    protected: Some(crate::ProtectedClass::ExecuteLater),
+                    edits_files: true,
+                    ..facts(true, false, false)
+                }
             ),
             Verdict::Ask
         );
@@ -1590,7 +1722,8 @@ path_prefix = "src/"
                 rule: "permissions.mode=bypass".into()
             }
         );
-        // Protected: still asks. The floor has no knob.
+        // Protected: never *silently* auto — the flagged verdict carries the
+        // notice the surface must show (0036).
         assert_eq!(
             r.evaluate(
                 r.mode(),
@@ -1599,7 +1732,9 @@ path_prefix = "src/"
                 &json!({"path": "Makefile"}),
                 facts(true, true, false)
             ),
-            Verdict::Ask
+            Verdict::AutoFlagged {
+                rule: "bypass: protected write allowed with notice".into()
+            }
         );
         // Ask mode (the library default) is unchanged.
         assert_eq!(

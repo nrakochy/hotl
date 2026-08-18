@@ -1105,23 +1105,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_mode_protected_write_still_asks() {
+    async fn bypass_protected_write_flags_instead_of_asking() {
+        if bypass_unavailable() {
+            return;
+        }
+        // In-root execute-later write (0036): runs with a ⚑ flag, never a
+        // prompt. Same in-tree scratch-dir shape as the ordinary-write test.
         let mut h = Harness::with_rules(Vec::new(), cfg(), bypass_rules());
-        // Protected by file name; inside the harness tempdir so the approved
-        // write never touches the test process cwd.
-        let makefile = h.dir().join("Makefile");
+        let scratch = tempfile::TempDir::new_in(".").expect("scratch dir");
+        let makefile = format!(
+            "{}/Makefile",
+            scratch.path().file_name().unwrap().to_str().unwrap()
+        );
         h.provider.push_script(ScriptedProvider::tool_call(
             "t1",
             "write",
-            json!({"path": makefile.to_str().unwrap(), "content": "x"}),
+            json!({"path": makefile, "content": "all:\n"}),
         ));
         h.provider.push_script(ScriptedProvider::text_reply("done"));
         h.prompt_and_wait("write the makefile").await;
         assert!(
-            h.seen.iter().any(|e| e.starts_with("Ask(")),
-            "protected must ask: {:?}",
+            !h.seen.iter().any(|e| e.starts_with("Ask(")),
+            "bypass must not prompt for a protected write: {:?}",
             h.seen
         );
+        assert!(
+            h.seen.iter().any(|e| e.contains("denied=false")),
+            "the flag must replace the ask: {:?}",
+            h.seen
+        );
+        assert!(
+            scratch.path().join("Makefile").exists(),
+            "the flagged write must actually run"
+        );
+    }
+
+    #[tokio::test]
+    async fn bypass_outside_write_is_flag_refused() {
+        if bypass_unavailable() {
+            return;
+        }
+        // Outside the session root (0036): refused with a ⚑ flag, never a
+        // prompt — the file tools stop being looser than the kernel on
+        // outside writes. The harness tempdir is outside the process cwd.
+        let mut h = Harness::with_rules(Vec::new(), cfg(), bypass_rules());
+        let outside = h.dir().join("outside-probe.txt");
+        h.provider.push_script(ScriptedProvider::tool_call(
+            "t1",
+            "write",
+            json!({"path": outside.to_str().unwrap(), "content": "x"}),
+        ));
+        h.provider.push_script(ScriptedProvider::text_reply("done"));
+        h.prompt_and_wait("write outside").await;
+        assert!(
+            !h.seen.iter().any(|e| e.starts_with("Ask(")),
+            "bypass must not prompt for an outside write: {:?}",
+            h.seen
+        );
+        assert!(
+            h.seen.iter().any(|e| e.contains("denied=true")),
+            "the refusal must be flagged: {:?}",
+            h.seen
+        );
+        assert!(!outside.exists(), "a flag-refused write must not land");
     }
 
     #[tokio::test]

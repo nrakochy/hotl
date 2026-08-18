@@ -291,6 +291,13 @@ fn update_line(update: &Value) -> Option<String> {
             }
             "tool_denied" => format!("· denied: {}", s("name")),
             "tool_auto_allowed" => format!("· auto-allowed {} (rule: {})", s("name"), s("rule")),
+            "tool_flagged" => {
+                if update.get("denied").and_then(Value::as_bool) == Some(true) {
+                    format!("⚑ refused: {} — {}", s("summary"), s("why"))
+                } else {
+                    format!("⚑ allowed with notice: {} — {}", s("summary"), s("why"))
+                }
+            }
             "retrying" => format!("· retrying (attempt {}) — {}", n("attempt"), s("reason")),
             "fallback_model" => format!("· model fallback → {}", s("model")),
             "prompt_queued" => "· queued".to_string(),
@@ -376,6 +383,18 @@ mod tests {
             EngineEvent::ToolAutoAllowed {
                 name: "bash".into(),
                 rule: "ls*".into(),
+            },
+            EngineEvent::ToolFlagged {
+                name: "write".into(),
+                summary: "write Makefile".into(),
+                why: "protected write".into(),
+                denied: false,
+            },
+            EngineEvent::ToolFlagged {
+                name: "write".into(),
+                summary: "write /outside".into(),
+                why: "outside-session write".into(),
+                denied: true,
             },
             EngineEvent::Retrying {
                 attempt: 1,

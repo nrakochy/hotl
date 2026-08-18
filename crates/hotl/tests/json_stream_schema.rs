@@ -36,6 +36,12 @@ fn every_frame_is_tagged_and_versioned() {
             name: "bash".into(),
             rule: "ls*".into(),
         },
+        EngineEvent::ToolFlagged {
+            name: "write".into(),
+            summary: "write Makefile".into(),
+            why: "protected write".into(),
+            denied: false,
+        },
         EngineEvent::Retrying {
             attempt: 1,
             reason: "429".into(),

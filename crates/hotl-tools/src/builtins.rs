@@ -238,17 +238,28 @@ fn file_permission_with(
         })
         .or(normalized_reason);
     match (reason, target) {
-        (Some(why), _) => Permission::AskProtected {
+        // Outside the boundary outranks the execute-later name (D2): the
+        // outside-root disposition is the stricter one under bypass (refuse
+        // vs allow-with-notice), so a protected filename must not launder an
+        // outside write into the milder class. The why still names the
+        // protected reason when there is one.
+        (reason, WriteTarget::OutsideApproved) => Permission::AskProtected {
             summary,
-            why: why.into(),
-            class: ProtectedClass::ExecuteLater,
-        },
-        (None, WriteTarget::OutsideApproved) => Permission::AskProtected {
-            summary,
-            why: "outside the working directory: not covered by this tool's workspace boundary"
-                .into(),
+            why: match reason {
+                Some(why) => format!("outside the working directory, and a protected path — {why}"),
+                None => "outside the working directory: not covered by this tool's workspace \
+                         boundary"
+                    .into(),
+            },
             class: ProtectedClass::OutsideWrite,
         },
+        (Some(why), WriteTarget::Workspace(_) | WriteTarget::Extra(..)) => {
+            Permission::AskProtected {
+                summary,
+                why: why.into(),
+                class: ProtectedClass::ExecuteLater,
+            }
+        }
         (None, WriteTarget::Workspace(_) | WriteTarget::Extra(..)) => Permission::Ask { summary },
     }
 }
@@ -392,8 +403,10 @@ pub(crate) fn open_for_read(
         fsguard::Placement::Inside(rel) => {
             fsguard::open_beneath(root, &rel).map_err(|e| ToolOutcome::err(e.prompt("read", path)))
         }
-        // Outside: the human approved *this path*, so open it plainly —
-        // following links is what they agreed to.
+        // Outside: approved either by a human on the protected ask, or — in
+        // bypass mode — by the gate itself via `AutoFlagged` (allow + ⚑
+        // notice). Either way the approval names *this path*, so open it
+        // plainly — following links is what was agreed to.
         fsguard::Placement::Outside(_) => std::fs::File::open(path).map_err(|e| {
             ToolOutcome::err(format!(
                 "Could not read `{path}`: {e}. Check the path (use `glob`) and try again."

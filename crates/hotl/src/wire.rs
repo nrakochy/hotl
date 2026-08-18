@@ -49,6 +49,14 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         EngineEvent::ToolAutoAllowed { name, rule } => {
             json!({"type": "tool_auto_allowed", "name": name, "rule": rule})
         }
+        EngineEvent::ToolFlagged {
+            name,
+            summary,
+            why,
+            denied,
+        } => {
+            json!({"type": "tool_flagged", "name": name, "summary": summary, "why": why, "denied": denied})
+        }
         EngineEvent::Retrying { attempt, reason } => {
             json!({"type": "retrying", "attempt": attempt, "reason": reason})
         }

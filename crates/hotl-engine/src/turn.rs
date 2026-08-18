@@ -1698,6 +1698,39 @@ impl Turn {
                     "a deny rule refused this call ({rule}); do not retry it"
                 )),
             }),
+            // The bypass floor's two non-blocking answers (0036): the gate
+            // resolves the call itself and `ToolFlagged` is the notification
+            // that replaces the ask. `why` never is None for a protected
+            // class; the summary is the fallback, not an unwrap.
+            Verdict::AutoFlagged { rule: _ } => {
+                let why = why.unwrap_or_else(|| summary.clone());
+                self.emit(EngineEvent::ToolFlagged {
+                    name: tu.name.clone(),
+                    summary,
+                    why,
+                    denied: false,
+                })
+                .await;
+                Approval::by_rule(AskReply::Allow)
+            }
+            Verdict::DenyFlagged { rule } => {
+                let why = why.unwrap_or_else(|| summary.clone());
+                self.emit(EngineEvent::ToolFlagged {
+                    name: tu.name.clone(),
+                    summary,
+                    why: why.clone(),
+                    denied: true,
+                })
+                .await;
+                Approval::by_rule(AskReply::Deny {
+                    message: Some(format!(
+                        "refused without prompting ({rule}): {why}. The session boundary is \
+                         the working directory; do not retry — work inside it, or tell the \
+                         user what you need and why so they can grant it (an allow rule, a \
+                         [sandbox].writable entry, or ask mode)."
+                    )),
+                })
+            }
             // The only path through `Turn::ask`, and therefore the only path
             // on which a human read the summary.
             Verdict::Ask => Approval {

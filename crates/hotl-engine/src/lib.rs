@@ -253,6 +253,15 @@ pub enum EngineEvent {
         name: String,
         rule: String,
     },
+    /// Bypass-mode floor event (0036): the call was allowed (`denied: false`)
+    /// or refused (`denied: true`) without a human, and the surface must show
+    /// it prominently — this is the notification that replaces the ask.
+    ToolFlagged {
+        name: String,
+        summary: String,
+        why: String,
+        denied: bool,
+    },
     Retrying {
         attempt: u32,
         reason: String,
@@ -332,6 +341,9 @@ impl std::fmt::Debug for EngineEvent {
             Self::ToolDone { name, ok } => write!(f, "ToolDone({name},{ok})"),
             Self::ToolDenied { name } => write!(f, "ToolDenied({name})"),
             Self::ToolAutoAllowed { name, rule } => write!(f, "ToolAutoAllowed({name},{rule})"),
+            Self::ToolFlagged { name, denied, .. } => {
+                write!(f, "ToolFlagged({name},denied={denied})")
+            }
             Self::Retrying { attempt, .. } => write!(f, "Retrying({attempt})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),
