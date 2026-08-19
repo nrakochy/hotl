@@ -330,7 +330,7 @@ impl Tool for ReadTool {
         // the tree pointing at the run dir would otherwise be `None`.
         if let Some(why) = hotl_own_dir_reason(path) {
             return Permission::AskProtected {
-                summary: format!("read {path}"),
+                summary: read_summary(input),
                 why,
                 class: ProtectedClass::HotlOwn,
             };
@@ -338,7 +338,7 @@ impl Tool for ReadTool {
         match fsguard::classify(&self.root, path) {
             fsguard::Placement::Inside(_) => Permission::None,
             fsguard::Placement::Outside(_) => Permission::AskProtected {
-                summary: format!("read {path}"),
+                summary: read_summary(input),
                 class: ProtectedClass::OutsideRead,
                 // Show the human where it really lands, links resolved.
                 why: format!(
@@ -352,6 +352,12 @@ impl Tool for ReadTool {
             },
         }
     }
+    /// Unprompted (in-workspace) reads have no permission summary; this is
+    /// what names their card, so a fan-out of paged reads doesn't render as
+    /// N identical rows (0037 D4).
+    fn display_summary(&self, input: &Value) -> Option<String> {
+        Some(read_summary(input))
+    }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
             let root = &*self.root;
@@ -362,6 +368,22 @@ impl Tool for ReadTool {
             })
         })
     }
+}
+
+/// `read {path}` for a whole-file read — byte-identical to the pre-0037
+/// spelling, so unpaged cards and asks don't churn — plus what distinguishes
+/// a paged call: ` · from line {offset}` and ` · {limit} lines` when set.
+/// Six pages of one file must not render as six identical cards (D4).
+fn read_summary(input: &Value) -> String {
+    let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
+    let mut summary = format!("read {path}");
+    if let Some(offset) = input.get("offset").and_then(Value::as_u64) {
+        summary.push_str(&format!(" · from line {offset}"));
+    }
+    if let Some(limit) = input.get("limit").and_then(Value::as_u64) {
+        summary.push_str(&format!(" · {limit} lines"));
+    }
+    summary
 }
 
 /// The `minified` arg. Absent or false means the plain path runs completely
@@ -1784,6 +1806,39 @@ mod tests {
             ReadTool::default().permission(&json!({"path": "../../etc/shadow"})),
             Permission::AskProtected { .. }
         ));
+    }
+
+    /// 0037 D4: the summary carries what distinguishes a paged read — six
+    /// pages of one file rendered as six identical `read {path}` cards, ⚑
+    /// notices, and asks. The whole-file spelling stays byte-identical.
+    #[test]
+    fn paged_read_summaries_name_their_page() {
+        let read = ReadTool::default();
+        assert_eq!(
+            read.display_summary(&json!({"path": "notes.vtt"})),
+            Some("read notes.vtt".into()),
+            "whole-file spelling unchanged"
+        );
+        assert_eq!(
+            read.display_summary(&json!({"path": "notes.vtt", "offset": 2001})),
+            Some("read notes.vtt · from line 2001".into())
+        );
+        assert_eq!(
+            read.display_summary(&json!({"path": "notes.vtt", "offset": 2001, "limit": 500})),
+            Some("read notes.vtt · from line 2001 · 500 lines".into())
+        );
+        assert_eq!(
+            read.display_summary(&json!({"path": "notes.vtt", "limit": 500})),
+            Some("read notes.vtt · 500 lines".into())
+        );
+        // The permission summary (asks and ⚑ notices) inherits the same
+        // spelling — this is what de-duplicates the flag lines a human reads.
+        match read.permission(&json!({"path": "/outside/notes.vtt", "offset": 4001})) {
+            Permission::AskProtected { summary, .. } => {
+                assert_eq!(summary, "read /outside/notes.vtt · from line 4001");
+            }
+            other => panic!("outside read must stay protected, got {other:?}"),
+        }
     }
 
     #[tokio::test]
