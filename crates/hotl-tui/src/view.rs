@@ -46,6 +46,10 @@ const COMPLETE_MAX_ROWS: usize = 8;
 /// Reasoning is context for a decision, not the decision.
 const THINKING_COLLAPSED_LINES: usize = 3;
 
+/// Live child rows a running spawn card shows inline (0039) — the newest
+/// tail, behind an `… +N earlier` line (the `THINKING_COLLAPSED_LINES` shape).
+const SPAWN_TAIL_ROWS: usize = 3;
+
 /// The four horizontal bands: transcript, status strip, input, hint. Shared by
 /// `view` and `selection_text` so the render and the copy can never disagree
 /// about where the transcript ends and the input box begins.
@@ -210,6 +214,8 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             summary,
             status,
             ticks,
+            calls,
+            children,
         } => {
             // Ticks are hashed at the two resolutions they are *rendered* at
             // — the marker's frame and the whole seconds of elapsed — not
@@ -230,6 +236,19 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
                 ToolStatus::Failed => 2u8.hash(&mut h),
                 ToolStatus::Denied => 3u8.hash(&mut h),
                 ToolStatus::AutoAllowed { rule } => (4u8, rule).hash(&mut h),
+            }
+            // 0039: everything `item_block` reads from the merged calls and
+            // nested children. `started_at`/`settled_at` deliberately NOT
+            // hashed — `item_block` never reads them; the drill-in renders
+            // outside the cache (D7). Running-child glyphs ride the parent
+            // ticks hashed above.
+            calls.len().hash(&mut h);
+            for c in calls {
+                (&c.id, c.ok).hash(&mut h);
+            }
+            children.len().hash(&mut h);
+            for c in children {
+                (&c.id, &c.name, &c.summary, c.ok).hash(&mut h);
             }
         }
         TranscriptItem::Notice { text } => (5u8, text_key(text)).hash(&mut h),
@@ -681,7 +700,10 @@ fn item_block<'a>(
             summary,
             status,
             ticks,
+            calls,
+            children,
         } => {
+            let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
             let (marker, color) = match status {
                 ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
                     (WORKING_FRAMES[marker_frame(*ticks)], p.active)
@@ -693,6 +715,14 @@ fn item_block<'a>(
             let (body, mut details) = split_summary(name, summary);
             if let ToolStatus::AutoAllowed { rule } = status {
                 details.push(format!("auto-allowed: {rule}"));
+            }
+            // The merged multiplier (0039 D3): one card, N absorbed calls.
+            if calls.len() > 1 {
+                details.push(format!("×{}", calls.len()));
+            }
+            // A settled spawn collapses its children to a count (0039).
+            if !running && !children.is_empty() {
+                details.push(format!("{} calls", children.len()));
             }
             if !matches!(status, ToolStatus::Denied) {
                 details.push(format!("{}s", ticks / anim::TICK_HZ));
@@ -709,6 +739,35 @@ fn item_block<'a>(
                     Style::new().fg(p.muted),
                 ));
             }
+            let mut lines = vec![Line::from(spans)];
+            // A running spawn shows its newest children inline (0039). The
+            // indent lives in the content span, NOT the gutter, so `text_col`
+            // holds for drag-copy; running-child glyphs derive from the
+            // PARENT's ticks — no per-child clocks, so the rewrap budget
+            // (`a_running_turn_rewraps_only_the_item_that_moved`) holds.
+            if running && !children.is_empty() {
+                if children.len() > SPAWN_TAIL_ROWS {
+                    lines.push(Line::styled(
+                        format!("  … +{} earlier", children.len() - SPAWN_TAIL_ROWS),
+                        Style::new().fg(p.muted),
+                    ));
+                }
+                let tail = children.len().saturating_sub(SPAWN_TAIL_ROWS);
+                for c in &children[tail..] {
+                    let (glyph, child_color) = match c.ok {
+                        None => (WORKING_FRAMES[marker_frame(*ticks)], p.active),
+                        Some(true) => ("✓", p.idle),
+                        Some(false) => ("✗", p.blocked),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("  {glyph} {}", c.name),
+                            Style::new().fg(child_color),
+                        ),
+                        Span::styled(format!("  {}", c.summary), Style::new().fg(p.muted)),
+                    ]));
+                }
+            }
             (
                 Spine {
                     marker,
@@ -716,7 +775,7 @@ fn item_block<'a>(
                     marker_style: Style::new().fg(color),
                     cont_style: Style::new(),
                 },
-                vec![Line::from(spans)],
+                lines,
             )
         }
         TranscriptItem::Notice { text } => (
@@ -1652,6 +1711,32 @@ mod tests {
             .collect()
     }
 
+    /// A minimal tool card — 0039 gave `Tool` its `calls`/`children` vecs,
+    /// and this keeps the next field from churning every literal again. The
+    /// anchor call's settle state follows the status (D5).
+    fn tool_item(
+        id: &str,
+        name: &str,
+        summary: &str,
+        status: ToolStatus,
+        ticks: u64,
+    ) -> TranscriptItem {
+        let ok = match status {
+            ToolStatus::Running | ToolStatus::AutoAllowed { .. } => None,
+            ToolStatus::Done => Some(true),
+            ToolStatus::Failed | ToolStatus::Denied => Some(false),
+        };
+        TranscriptItem::Tool {
+            id: id.into(),
+            name: name.into(),
+            summary: summary.into(),
+            status,
+            ticks,
+            calls: vec![crate::app::ToolCall { id: id.into(), ok }],
+            children: Vec::new(),
+        }
+    }
+
     // 80×24 layout: transcript rows 0-18, strip 19, input 20-22, hint 23.
     const STRIP: usize = 19;
     const INPUT_TOP: usize = 20;
@@ -2112,13 +2197,13 @@ mod tests {
     #[test]
     fn tool_card_and_strip_share_elapsed() {
         let mut s = State::new(true, "m".into());
-        s.transcript.push(TranscriptItem::Tool {
-            id: "t1".into(),
-            name: "bash".into(),
-            summary: "echo hi".into(),
-            status: ToolStatus::Running,
-            ticks: 2 * anim::TICK_HZ,
-        });
+        s.transcript.push(tool_item(
+            "t1",
+            "bash",
+            "echo hi",
+            ToolStatus::Running,
+            2 * anim::TICK_HZ,
+        ));
         s.phase = Phase::Tool {
             name: "bash".into(),
             ticks: 2 * anim::TICK_HZ,
@@ -2133,6 +2218,118 @@ mod tests {
             rows.iter().any(|r| r.contains("bash  echo hi · 2s")),
             "card elapsed"
         );
+    }
+
+    /// 0039 D3: a card that absorbed N calls says so — `×N` rides the muted
+    /// details, before the duration.
+    #[test]
+    fn a_merged_card_shows_a_multiplier_detail() {
+        let mut s = State::new(true, "m".into());
+        let mut item = tool_item("t1", "read", "read app.rs", ToolStatus::Done, anim::TICK_HZ);
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            for id in ["t2", "t3", "t4"] {
+                calls.push(crate::app::ToolCall {
+                    id: (*id).into(),
+                    ok: Some(true),
+                });
+            }
+        }
+        s.transcript.push(item);
+        let rows = draw(&s);
+        assert!(
+            rows.iter().any(|r| r.contains("read  app.rs · ×4 · 1s")),
+            "multiplier before the duration: {:?}",
+            rows.first()
+        );
+    }
+
+    fn spawn_with_children(status: ToolStatus, n: usize) -> TranscriptItem {
+        let mut item = tool_item("s1", "spawn", "spawn survey", status, 0);
+        if let TranscriptItem::Tool { children, .. } = &mut item {
+            for i in 1..=n {
+                children.push(crate::app::ChildCall {
+                    id: format!("c{i}"),
+                    name: "read".into(),
+                    summary: format!("read c{i}.rs"),
+                    // The last child still runs; earlier ones settled ok.
+                    ok: (i < n).then_some(true),
+                    started_at: 0,
+                    settled_at: (i < n).then_some(0),
+                });
+            }
+        }
+        item
+    }
+
+    /// 0039: a running spawn shows the newest `SPAWN_TAIL_ROWS` children
+    /// indented inline, behind an `… +N earlier` line.
+    #[test]
+    fn a_running_spawn_card_shows_the_tail_of_children_and_an_earlier_count() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(spawn_with_children(ToolStatus::Running, 5));
+        let rows = draw(&s);
+        let all = rows.join("\n");
+        assert!(all.contains("… +2 earlier"), "overflow line: {all}");
+        for i in [3, 4] {
+            assert!(
+                all.contains(&format!("✓ read  read c{i}.rs")),
+                "settled tail child c{i}: {all}"
+            );
+        }
+        assert!(
+            all.contains("⠑ read  read c5.rs"),
+            "the running child wears the parent-ticks wanderer frame: {all}"
+        );
+        assert!(
+            !all.contains("read c1.rs"),
+            "children beyond the tail stay behind the count: {all}"
+        );
+    }
+
+    /// 0039: a settled spawn collapses its children to a `· N calls` detail —
+    /// no child rows survive the settle.
+    #[test]
+    fn a_settled_spawn_card_collapses_children_to_a_call_count() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(spawn_with_children(ToolStatus::Done, 5));
+        let rows = draw(&s);
+        let all = rows.join("\n");
+        assert!(
+            all.contains("spawn  survey · 5 calls · 0s"),
+            "collapsed count: {all}"
+        );
+        assert!(!all.contains("read c5.rs"), "no child rows: {all}");
+    }
+
+    /// 0039 D7/T6: a child upsert re-wraps only the spawn card it lands on —
+    /// the prose above it must not move.
+    #[test]
+    fn a_child_upsert_rewraps_only_the_spawn_card() {
+        let mut s = cacheable_state();
+        s.transcript.pop();
+        s.transcript
+            .push(spawn_with_children(ToolStatus::Running, 1));
+        let mut cache = TranscriptCache::default();
+        draw_cached(&s, &mut cache);
+        assert_eq!(cache.rewraps(), 3, "three items, wrapped once each");
+        if let Some(TranscriptItem::Tool { children, .. }) = s.transcript.last_mut() {
+            children.push(crate::app::ChildCall {
+                id: "c2".into(),
+                name: "grep".into(),
+                summary: "grep foo".into(),
+                ok: None,
+                started_at: 0,
+                settled_at: None,
+            });
+        }
+        draw_cached(&s, &mut cache);
+        assert_eq!(cache.rewraps(), 4, "the push re-wraps only the card");
+        if let Some(TranscriptItem::Tool { children, .. }) = s.transcript.last_mut() {
+            children.last_mut().unwrap().ok = Some(true);
+        }
+        draw_cached(&s, &mut cache);
+        assert_eq!(cache.rewraps(), 5, "the settle re-wraps only the card");
     }
 
     #[test]
@@ -2160,13 +2357,13 @@ mod tests {
     #[test]
     fn tool_card_indents_dedupes_name_and_mutes_details() {
         let mut s = State::new(true, "m".into());
-        s.transcript.push(TranscriptItem::Tool {
-            id: "t1".into(),
-            name: "bash".into(),
-            summary: "bash [sandboxed:seatbelt]: echo hi".into(),
-            status: ToolStatus::Done,
-            ticks: anim::TICK_HZ,
-        });
+        s.transcript.push(tool_item(
+            "t1",
+            "bash",
+            "bash [sandboxed:seatbelt]: echo hi",
+            ToolStatus::Done,
+            anim::TICK_HZ,
+        ));
         let rows = draw(&s);
         // Comfortable gutter (2) + the ✓ spine glyph; the name is no longer
         // bracketed, and the duplicate leading "bash" is peeled off the body.
@@ -2214,13 +2411,8 @@ mod tests {
     #[test]
     fn strip_wears_band_and_running_tool_marker_is_active() {
         let mut s = State::new(true, "m".into());
-        s.transcript.push(TranscriptItem::Tool {
-            id: "t1".into(),
-            name: "bash".into(),
-            summary: "echo hi".into(),
-            status: ToolStatus::Running,
-            ticks: 0,
-        });
+        s.transcript
+            .push(tool_item("t1", "bash", "echo hi", ToolStatus::Running, 0));
         s.phase = Phase::Tool {
             name: "bash".into(),
             ticks: 0,
@@ -2720,13 +2912,8 @@ mod tests {
         s.transcript.push(TranscriptItem::Assistant {
             text: "a ".repeat(1200).into(),
         });
-        s.transcript.push(TranscriptItem::Tool {
-            id: "t1".into(),
-            name: "bash".into(),
-            summary: "echo hi".into(),
-            status: ToolStatus::Running,
-            ticks: 0,
-        });
+        s.transcript
+            .push(tool_item("t1", "bash", "echo hi", ToolStatus::Running, 0));
         s
     }
 
@@ -2864,6 +3051,9 @@ mod tests {
     fn cached_rows_are_identical_to_a_fresh_render() {
         // The cache is only ever correct if a reused one and a cold one agree.
         // Walks the same mutations a real turn makes, comparing every frame.
+        // Since 0039 the walk also absorbs/settles `calls` and pushes/settles
+        // `children` — the ONLY enforcement of the fingerprint invariant for
+        // the new fields.
         let mut s = cacheable_state();
         let mut warm = TranscriptCache::default();
         for step in 0..40u64 {
@@ -2875,6 +3065,32 @@ mod tests {
             }
             if step == 20 {
                 s.scroll = Scroll::At(1);
+            }
+            if let Some(TranscriptItem::Tool {
+                calls, children, ..
+            }) = s.transcript.last_mut()
+            {
+                match step {
+                    10 => calls.push(crate::app::ToolCall {
+                        id: "t2".into(),
+                        ok: None,
+                    }),
+                    15 => calls.last_mut().unwrap().ok = Some(true),
+                    25 => children.push(crate::app::ChildCall {
+                        id: "c1".into(),
+                        name: "read".into(),
+                        summary: "read a.rs".into(),
+                        ok: None,
+                        started_at: step,
+                        settled_at: None,
+                    }),
+                    30 => {
+                        let c = children.last_mut().unwrap();
+                        c.ok = Some(false);
+                        c.settled_at = Some(step);
+                    }
+                    _ => {}
+                }
             }
             let cold = draw_cached(&s, &mut TranscriptCache::default());
             let hot = draw_cached(&s, &mut warm);

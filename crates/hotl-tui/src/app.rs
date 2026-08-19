@@ -215,6 +215,13 @@ pub enum TranscriptItem {
         summary: String,
         status: ToolStatus,
         ticks: u64,
+        /// Every call this card absorbed (0039 D5), the anchor included —
+        /// INVARIANT: `id == calls[0].id`. Per-id settle state is what makes
+        /// the merged status (D4) computable out of order.
+        calls: Vec<ToolCall>,
+        /// A spawn card's forwarded child calls (0039), rendered inside this
+        /// item's block — item-indexed scroll never sees them.
+        children: Vec<ChildCall>,
     },
     /// Retrying / fallback / compacted / controlled stops.
     Notice {
@@ -257,6 +264,28 @@ pub enum ToolStatus {
     Failed,
     Denied,
     AutoAllowed { rule: String },
+}
+
+/// One call absorbed into a tool card (0039 D5). `ok: None` = outstanding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolCall {
+    pub id: String,
+    pub ok: Option<bool>,
+}
+
+/// A sub-agent's tool call, nested on its spawn card (0039).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildCall {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    /// `None` = running; `Some(ok)` = settled.
+    pub ok: Option<bool>,
+    /// Parent-card tick stamps for the drill-in's per-call durations.
+    /// Deliberately outside the fingerprint invariant: `item_block` never
+    /// reads them (the drill-in renders outside the cache, D7).
+    pub started_at: u64,
+    pub settled_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -870,6 +899,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
     }
 }
 
+/// A card's merge identity (0039 D3): the first ` · `-separated summary
+/// segment — for `read`, the (already elided) path with the page details
+/// stripped. Deterministic: both sides of the comparison are post-elision.
+fn merge_key(summary: &str) -> &str {
+    summary.split(" · ").next().unwrap_or(summary)
+}
+
 fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
     let text_of = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_string();
     match v.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -884,59 +920,169 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 None => ToolStatus::Running,
             };
             let name = text_of("name");
+            let summary = text_of("summary");
+            // 0039 D3: a consecutive same-key call absorbs into the previous
+            // card instead of stacking an identical row — adjacency alone
+            // enforces the turn boundary. The running flavor becomes the
+            // newest start's (two different auto-allow rules on one merged
+            // card show the newest — cosmetic, D4). Ticks keep accumulating:
+            // on_tick ticks any Running card in the turn.
+            let key = merge_key(&summary);
+            if let Some(TranscriptItem::Tool {
+                name: prev_name,
+                summary: prev_summary,
+                status: prev_status,
+                calls,
+                children,
+                ..
+            }) = state.transcript.last_mut()
+            {
+                // Never into/out of `spawn`, a card with children, or a
+                // settled failure (a retry after failure starts fresh — D3).
+                if *prev_name == name
+                    && name != "spawn"
+                    && children.is_empty()
+                    && merge_key(prev_summary) == key
+                    && !matches!(prev_status, ToolStatus::Failed | ToolStatus::Denied)
+                {
+                    calls.push(ToolCall { id, ok: None });
+                    *prev_summary = key.to_string();
+                    *prev_status = status;
+                    state.phase = Phase::Tool { name, ticks: 0 };
+                    return Vec::new();
+                }
+            }
             state.transcript.push(TranscriptItem::Tool {
-                id,
+                id: id.clone(),
                 name: name.clone(),
-                summary: text_of("summary"),
+                summary,
                 status,
                 ticks: 0,
+                calls: vec![ToolCall { id, ok: None }],
+                children: Vec::new(),
             });
             state.phase = Phase::Tool { name, ticks: 0 };
         }
         // Settles by id, never by name (0037): with N concurrent same-name
         // calls, "the newest matching card" was whichever start happened to
-        // land last — N−1 cards stranded as spinners forever.
+        // land last — N−1 cards stranded as spinners forever. Since 0039 the
+        // id lives in `calls` (a merged card holds several), and the card
+        // settles only when every absorbed call has (D4: any failed → Failed).
         "tool_done" => {
             let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            let status = if ok {
-                ToolStatus::Done
-            } else {
-                ToolStatus::Failed
-            };
             let id = text_of("id");
-            if let Some(TranscriptItem::Tool { status: s, .. }) = state
-                .transcript
-                .iter_mut()
-                .rev()
-                .find(|i| matches!(i, TranscriptItem::Tool { id: i, .. } if *i == id))
+            let mut found = false;
+            if let Some(TranscriptItem::Tool { status, calls, .. }) =
+                state.transcript.iter_mut().rev().find(|i| {
+                    matches!(i, TranscriptItem::Tool { calls, .. }
+                        if calls.iter().any(|c| c.id == id && c.ok.is_none()))
+                })
             {
-                *s = status;
-            } else {
+                found = true;
+                if let Some(call) = calls.iter_mut().find(|c| c.id == id && c.ok.is_none()) {
+                    call.ok = Some(ok);
+                }
+                if calls.iter().all(|c| c.ok.is_some()) {
+                    *status = if calls.iter().any(|c| c.ok == Some(false)) {
+                        ToolStatus::Failed
+                    } else {
+                        ToolStatus::Done
+                    };
+                }
+            }
+            if !found {
                 // No card: the human answered *as* the tool (§2b Respond
                 // skips execution, so no `tool_start` ever ran). The settle
-                // is still worth a card — the call happened.
+                // is still worth a card — the call happened. An absorbed id
+                // can never land here: its outstanding call is findable (D5).
+                let id2 = id.clone();
                 state.transcript.push(TranscriptItem::Tool {
                     id,
                     name: text_of("name"),
                     summary: text_of("name"),
-                    status,
+                    status: if ok {
+                        ToolStatus::Done
+                    } else {
+                        ToolStatus::Failed
+                    },
                     ticks: 0,
+                    calls: vec![ToolCall {
+                        id: id2,
+                        ok: Some(ok),
+                    }],
+                    children: Vec::new(),
                 });
             }
             enter_streaming(state);
         }
         // Denied tools never get a `tool_start` (the engine returns before
-        // running them) — the denial itself is the card.
+        // running them) — the denial itself is the card, its one call
+        // already settled.
         "tool_denied" => {
             let name = text_of("name");
+            let id = text_of("id");
             state.transcript.push(TranscriptItem::Tool {
-                id: text_of("id"),
+                id: id.clone(),
                 name: name.clone(),
                 summary: name,
                 status: ToolStatus::Denied,
                 ticks: 0,
+                calls: vec![ToolCall {
+                    id,
+                    ok: Some(false),
+                }],
+                children: Vec::new(),
             });
             enter_streaming(state);
+        }
+        // A sub-agent's forwarded tool activity (0039): nests under its own
+        // spawn card, routed by parent_id. No parent card → drop silently
+        // (reattach replays no tool frames — pre-existing gap). Deliberately
+        // no `enter_streaming`: child activity must not perturb the parent's
+        // phase.
+        "child_tool" => {
+            let parent_id = text_of("parent_id");
+            if let Some(TranscriptItem::Tool {
+                ticks, children, ..
+            }) = state
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if *id == parent_id))
+            {
+                let id = text_of("id");
+                match v.get("ok").and_then(Value::as_bool) {
+                    None => children.push(ChildCall {
+                        id,
+                        name: text_of("name"),
+                        summary: text_of("summary"),
+                        ok: None,
+                        started_at: *ticks,
+                        settled_at: None,
+                    }),
+                    Some(ok) => {
+                        if let Some(c) = children
+                            .iter_mut()
+                            .rev()
+                            .find(|c| c.id == id && c.ok.is_none())
+                        {
+                            c.ok = Some(ok);
+                            c.settled_at = Some(*ticks);
+                        } else {
+                            // Settled in one frame — a denied child never
+                            // got a start.
+                            children.push(ChildCall {
+                                id,
+                                name: text_of("name"),
+                                summary: text_of("summary"),
+                                ok: Some(ok),
+                                started_at: *ticks,
+                                settled_at: Some(*ticks),
+                            });
+                        }
+                    }
+                }
+            }
         }
         // T3-15: thinking is billed on every turn and used to be dropped on
         // the floor (`_ => {}`). Deltas accumulate into one item so a burst
@@ -2363,6 +2509,11 @@ mod tests {
             summary: summary.into(),
             status,
             ticks: 0,
+            calls: vec![ToolCall {
+                id: "t1".into(),
+                ok: None,
+            }],
+            children: Vec::new(),
         }
     }
 
@@ -2936,17 +3087,17 @@ mod tests {
             .collect()
     }
 
-    /// 0037: N concurrent same-name calls settle each their OWN card, dones
-    /// arriving in any order — the pre-id `mark_last_tool` landed all N dones
-    /// on the newest card and stranded the other N−1 as spinners forever.
+    /// 0037's cards-per-page rendering, narrowed by 0039 D3: calls with
+    /// DISTINCT merge keys (different paths) still keep their own cards and
+    /// settle each under their own id, dones arriving in any order.
     #[test]
-    fn concurrent_same_name_calls_settle_each_their_own_card() {
+    fn distinct_key_calls_keep_their_own_cards() {
         let mut s = State::test_default();
         s.phase = Phase::Sampling { ticks: 0 };
         for id in ["p1", "p2", "p3"] {
             upd(
                 &mut s,
-                json!({"type":"tool_start","id":id,"name":"read","summary":format!("read x · from line {id}")}),
+                json!({"type":"tool_start","id":id,"name":"read","summary":format!("read {id}.rs · 2 lines")}),
             );
         }
         // Out of order, mixed outcomes: p2 fails, then p1, then p3 succeed.
@@ -2970,6 +3121,222 @@ mod tests {
                 ("p3".into(), ToolStatus::Done),
             ],
             "every card settles under its own id; none is left Running"
+        );
+    }
+
+    /// 0039 D3 — DELIBERATELY supersedes 0037 D4's cards-per-page rendering
+    /// (the owner chose merging): same-key concurrent calls absorb into ONE
+    /// accumulating card, every id settles out of order via `calls` (D5), and
+    /// a mixed batch settles Failed (D4). The `tool_done` no-card fallback
+    /// must never fire for an absorbed id — no orphans, no duplicates.
+    #[test]
+    fn same_key_concurrent_calls_merge_and_settle_each_id_out_of_order() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        for (id, line) in [("p1", 1), ("p2", 501), ("p3", 1001)] {
+            upd(
+                &mut s,
+                json!({"type":"tool_start","id":id,"name":"read","summary":format!("read app.rs · from line {line}")}),
+            );
+        }
+        assert_eq!(
+            tool_statuses(&s),
+            vec![("p1".into(), ToolStatus::Running)],
+            "one ×3 card, anchored on the first id"
+        );
+        // Second and third dones land while the first is still outstanding.
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p2","name":"read","ok":false}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p3","name":"read","ok":true}),
+        );
+        assert_eq!(
+            tool_statuses(&s),
+            vec![("p1".into(), ToolStatus::Running)],
+            "still running while p1 is outstanding — and no orphan card"
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"read","ok":true}),
+        );
+        assert_eq!(
+            tool_statuses(&s),
+            vec![("p1".into(), ToolStatus::Failed)],
+            "a card summarizing three calls must not hide p2's failure"
+        );
+        let Some(TranscriptItem::Tool { calls, summary, .. }) = s.transcript.last() else {
+            panic!("the merged card is the last item");
+        };
+        assert_eq!(calls.len(), 3, "all three ids on the one card");
+        assert_eq!(summary, "read app.rs", "summary is the merge key");
+    }
+
+    /// 0039: a consecutive same-key call re-opens the settled card — Done
+    /// re-enters Running and the card's clock resumes (on_tick ticks every
+    /// running card, so duration accumulates across absorbed calls).
+    #[test]
+    fn consecutive_same_key_reads_absorb_and_resume_ticking() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"read","summary":"read app.rs · from line 1"}),
+        );
+        update(&mut s, Msg::Tick);
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"read","ok":true}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p2","name":"read","summary":"read app.rs · from line 501"}),
+        );
+        assert_eq!(
+            tool_statuses(&s),
+            vec![("p1".into(), ToolStatus::Running)],
+            "the Done card re-enters Running"
+        );
+        update(&mut s, Msg::Tick);
+        let Some(TranscriptItem::Tool { ticks, .. }) = s.transcript.last() else {
+            panic!("the merged card is the last item");
+        };
+        assert_eq!(*ticks, 2, "the clock resumed instead of resetting");
+    }
+
+    /// 0039 D3: failures are never laundered — a retry after a failed call
+    /// starts a fresh card instead of being absorbed into the red one.
+    #[test]
+    fn a_failed_card_never_absorbs_the_retry() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"read","summary":"read app.rs"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"read","ok":false}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p2","name":"read","summary":"read app.rs"}),
+        );
+        assert_eq!(
+            tool_statuses(&s),
+            vec![
+                ("p1".into(), ToolStatus::Failed),
+                ("p2".into(), ToolStatus::Running),
+            ],
+            "the failure stays visible; the retry is its own card"
+        );
+    }
+
+    /// 0039 D3: absorb reaches only the immediately previous item — an
+    /// interleaving item breaks the run — and `spawn` never merges.
+    #[test]
+    fn merge_stops_at_an_interleaving_item_and_never_touches_spawn() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"read","summary":"read app.rs"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"read","ok":true}),
+        );
+        upd(&mut s, json!({"type":"text_delta","text":"looking…"}));
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p2","name":"read","summary":"read app.rs"}),
+        );
+        assert_eq!(
+            tool_statuses(&s).len(),
+            2,
+            "the assistant text between them breaks the run"
+        );
+        // Two same-summary spawns stay two cards.
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        for id in ["s1", "s2"] {
+            upd(
+                &mut s,
+                json!({"type":"tool_start","id":id,"name":"spawn","summary":"spawn survey"}),
+            );
+        }
+        assert_eq!(
+            tool_statuses(&s),
+            vec![
+                ("s1".into(), ToolStatus::Running),
+                ("s2".into(), ToolStatus::Running),
+            ],
+            "spawn never merges"
+        );
+    }
+
+    /// 0039: interleaved `child_tool` frames route to their OWN spawn card by
+    /// parent_id; a denied child (settled in one frame) lands failed.
+    #[test]
+    fn child_tool_frames_nest_under_their_own_spawn_card() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        for id in ["s1", "s2"] {
+            upd(
+                &mut s,
+                json!({"type":"tool_start","id":id,"name":"spawn","summary":"spawn survey"}),
+            );
+        }
+        // Interleaved: s2's child starts first, then s1's; s1's settles ok,
+        // s2's second child arrives already denied.
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"s2","id":"c1","name":"read","summary":"read a.rs","phase":"start"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"s1","id":"c2","name":"grep","summary":"grep foo","phase":"start"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"s1","id":"c2","name":"grep","summary":"","phase":"done","ok":true}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"s2","id":"c3","name":"write","summary":"write (denied)","phase":"done","ok":false}),
+        );
+        let children_of = |s: &State, spawn: &str| -> Vec<(String, Option<bool>)> {
+            s.transcript
+                .iter()
+                .find_map(|i| match i {
+                    TranscriptItem::Tool { id, children, .. } if id == spawn => Some(
+                        children
+                            .iter()
+                            .map(|c| (c.id.clone(), c.ok))
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(
+            children_of(&s, "s1"),
+            vec![("c2".into(), Some(true))],
+            "s1 owns only its own child, settled ok"
+        );
+        assert_eq!(
+            children_of(&s, "s2"),
+            vec![("c1".into(), None), ("c3".into(), Some(false))],
+            "s2's running child plus the denied one, settled-failed"
+        );
+        // Child activity must not perturb the parent's phase.
+        assert!(matches!(s.phase, Phase::Tool { .. }), "{:?}", s.phase);
+        // A frame whose parent card is gone (reattach) drops silently.
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"nope","id":"c9","name":"read","summary":"read b.rs","phase":"start"}),
         );
     }
 
@@ -3017,10 +3384,12 @@ mod tests {
     fn every_running_card_ticks_settled_ones_do_not() {
         let mut s = State::test_default();
         s.phase = Phase::Sampling { ticks: 0 };
+        // Distinct paths — distinct merge keys, so the three stay three
+        // cards (same-key consecutive calls would merge, 0039 D3).
         for id in ["p1", "p2", "p3"] {
             upd(
                 &mut s,
-                json!({"type":"tool_start","id":id,"name":"read","summary":"read x"}),
+                json!({"type":"tool_start","id":id,"name":"read","summary":format!("read {id}.rs")}),
             );
         }
         // p3 settles; p1/p2 keep running while the phase moves to Streaming.
