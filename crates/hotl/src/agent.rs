@@ -2504,6 +2504,13 @@ impl Surface {
                     eprintln!("⚑ allowed with notice: {summary} — {why}");
                 }
             }
+            // Mirrors `tool_done`'s success exemption: a child that worked
+            // needs no line.
+            EngineEvent::ChildTool { summary, ok, .. } => match ok {
+                None => eprintln!("  ↳ {summary}"),
+                Some(false) => eprintln!("  ↳ (sub-agent tool error)"),
+                Some(true) => {}
+            },
             EngineEvent::Retrying { attempt, reason } => {
                 eprintln!("· retrying ({attempt}): {reason}")
             }

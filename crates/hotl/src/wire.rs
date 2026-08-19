@@ -64,6 +64,30 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         } => {
             json!({"type": "tool_flagged", "id": id, "name": name, "summary": summary, "why": why, "denied": denied})
         }
+        // Forwarded sub-agent tool activity (0039 D1). `phase` is explicit and
+        // `ok` rides only the done frame (omitted-not-null, the `hit_ratio`
+        // precedent) so later phases (text/thinking) fit without reshaping.
+        // Additive — `JSON_STREAM_SCHEMA_VERSION` stands (0037 ruling).
+        EngineEvent::ChildTool {
+            parent_id,
+            id,
+            name,
+            summary,
+            ok,
+        } => {
+            let mut v = json!({
+                "type": "child_tool",
+                "parent_id": parent_id,
+                "id": id,
+                "name": name,
+                "summary": summary,
+                "phase": if ok.is_some() { "done" } else { "start" },
+            });
+            if let Some(ok) = ok {
+                v["ok"] = json!(ok);
+            }
+            v
+        }
         EngineEvent::Retrying { attempt, reason } => {
             json!({"type": "retrying", "attempt": attempt, "reason": reason})
         }

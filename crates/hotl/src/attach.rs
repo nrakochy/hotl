@@ -289,6 +289,13 @@ fn update_line(update: &Value) -> Option<String> {
                     return None;
                 }
             }
+            // Mirrors `tool_done`'s success exemption: a child that worked
+            // needs no line (0039).
+            "child_tool" => match update.get("ok").and_then(Value::as_bool) {
+                None => format!("  ↳ {}", s("summary")),
+                Some(false) => "  ↳ (sub-agent tool error)".to_string(),
+                Some(true) => return None,
+            },
             "tool_denied" => format!("· denied: {}", s("name")),
             "tool_auto_allowed" => format!("· auto-allowed {} (rule: {})", s("name"), s("rule")),
             "tool_flagged" => {
@@ -402,6 +409,22 @@ mod tests {
                 why: "outside-session write".into(),
                 denied: true,
             },
+            // Both `child_tool` phases; the done phase uses `ok: false`
+            // because done-ok is a deliberate `None` (asserted below).
+            EngineEvent::ChildTool {
+                parent_id: "t1".into(),
+                id: "c1".into(),
+                name: "read".into(),
+                summary: "read ./x".into(),
+                ok: None,
+            },
+            EngineEvent::ChildTool {
+                parent_id: "t1".into(),
+                id: "c1".into(),
+                name: "read".into(),
+                summary: String::new(),
+                ok: Some(false),
+            },
             EngineEvent::Retrying {
                 attempt: 1,
                 reason: "429".into(),
@@ -453,6 +476,34 @@ mod tests {
         })
         .unwrap();
         assert!(update_line(&failed).is_some(), "a tool error must be shown");
+    }
+
+    /// 0039: `child_tool` mirrors `tool_done`'s success exemption per phase —
+    /// something the blanket exempt list above cannot express.
+    #[test]
+    fn child_tool_lines_follow_the_tool_done_success_exemption() {
+        let frame = |summary: &str, ok: Option<bool>| {
+            crate::wire::update_frame(&EngineEvent::ChildTool {
+                parent_id: "t1".into(),
+                id: "c1".into(),
+                name: "read".into(),
+                summary: summary.into(),
+                ok,
+            })
+            .unwrap()
+        };
+        assert_eq!(
+            update_line(&frame("read ./x", None)).as_deref(),
+            Some("  ↳ read ./x")
+        );
+        assert!(
+            update_line(&frame("", Some(true))).is_none(),
+            "a child that worked needs no line"
+        );
+        assert_eq!(
+            update_line(&frame("", Some(false))).as_deref(),
+            Some("  ↳ (sub-agent tool error)")
+        );
     }
 
     #[test]

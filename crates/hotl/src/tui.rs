@@ -360,11 +360,13 @@ async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, St
 }
 
 /// A streamed delta defers its draw to the armed tick; anything else —
-/// keys, tool events, TurnDone, Tick itself — draws now.
+/// keys, tool events, TurnDone, Tick itself — draws now. `child_tool` rides
+/// the tick too (0039 D9): children arrive at up to 4× the parent's tool
+/// rate, and the 30 Hz repaint caps the deferral at ≤ 33 ms.
 fn defers_draw(msg: &Msg) -> bool {
     matches!(msg, Msg::Update(v)
         if matches!(v.get("type").and_then(Value::as_str),
-            Some("text_delta" | "thinking_delta")))
+            Some("text_delta" | "thinking_delta" | "child_tool")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1029,6 +1031,10 @@ mod tests {
         )));
         assert!(defers_draw(&Msg::Update(
             json!({"type": "thinking_delta", "text": "x"})
+        )));
+        // 0039 D9: children arrive at up to 4× the parent's tool rate.
+        assert!(defers_draw(&Msg::Update(
+            json!({"type": "child_tool", "parent_id": "p", "id": "c", "name": "read", "summary": "read ./x", "phase": "start"})
         )));
         assert!(!defers_draw(&Msg::Update(
             json!({"type": "tool_start", "name": "bash", "summary": ""})

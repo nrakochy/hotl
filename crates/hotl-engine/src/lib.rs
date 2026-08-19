@@ -277,6 +277,17 @@ pub enum EngineEvent {
         why: String,
         denied: bool,
     },
+    /// A sub-agent's tool activity forwarded on the parent stream (0039 D1):
+    /// `parent_id` is the spawn call's own `tool_use` id, `ok: None` = start,
+    /// `Some(ok)` = done. A denied child arrives already settled
+    /// (`Some(false)`) — it never got a start.
+    ChildTool {
+        parent_id: String,
+        id: String,
+        name: String,
+        summary: String,
+        ok: Option<bool>,
+    },
     Retrying {
         attempt: u32,
         reason: String,
@@ -360,6 +371,10 @@ impl std::fmt::Debug for EngineEvent {
             }
             Self::ToolFlagged { name, denied, .. } => {
                 write!(f, "ToolFlagged({name},denied={denied})")
+            }
+            Self::ChildTool { name, ok, .. } => {
+                let phase = if ok.is_some() { "done" } else { "start" };
+                write!(f, "ChildTool({name},{phase})")
             }
             Self::Retrying { attempt, .. } => write!(f, "Retrying({attempt})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),

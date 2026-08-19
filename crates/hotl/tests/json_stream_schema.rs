@@ -47,6 +47,20 @@ fn every_frame_is_tagged_and_versioned() {
             why: "protected write".into(),
             denied: false,
         },
+        EngineEvent::ChildTool {
+            parent_id: "t5".into(),
+            id: "c1".into(),
+            name: "read".into(),
+            summary: "read ./x".into(),
+            ok: None,
+        },
+        EngineEvent::ChildTool {
+            parent_id: "t5".into(),
+            id: "c1".into(),
+            name: "read".into(),
+            summary: String::new(),
+            ok: Some(true),
+        },
         EngineEvent::Retrying {
             attempt: 1,
             reason: "429".into(),
@@ -210,6 +224,37 @@ fn tool_frames_carry_the_call_id() {
         let f = wire::update_frame(&e).expect("tool events are stream frames");
         assert_eq!(f["id"], "toolu_1", "missing call id on {}", f["type"]);
     }
+}
+
+/// 0039 D1: `child_tool` frames route by `parent_id`, carry an explicit
+/// `phase`, and `ok` rides only the done frame — omitted, not `null`, on
+/// start (the `hit_ratio` precedent), so later phases fit without reshaping.
+#[test]
+fn child_tool_frames_carry_parent_id_phase_and_ok_only_on_done() {
+    let start = wire::update_frame(&EngineEvent::ChildTool {
+        parent_id: "toolu_spawn".into(),
+        id: "toolu_child".into(),
+        name: "read".into(),
+        summary: "read ./x".into(),
+        ok: None,
+    })
+    .expect("child_tool is a stream frame");
+    assert_eq!(start["type"], "child_tool");
+    assert_eq!(start["parent_id"], "toolu_spawn");
+    assert_eq!(start["id"], "toolu_child");
+    assert_eq!(start["phase"], "start");
+    assert!(start.get("ok").is_none(), "start must omit ok: {start}");
+
+    let done = wire::update_frame(&EngineEvent::ChildTool {
+        parent_id: "toolu_spawn".into(),
+        id: "toolu_child".into(),
+        name: "read".into(),
+        summary: String::new(),
+        ok: Some(false),
+    })
+    .expect("child_tool is a stream frame");
+    assert_eq!(done["phase"], "done");
+    assert_eq!(done["ok"], json!(false));
 }
 
 #[test]
