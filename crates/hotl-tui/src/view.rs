@@ -46,10 +46,6 @@ const COMPLETE_MAX_ROWS: usize = 8;
 /// Reasoning is context for a decision, not the decision.
 const THINKING_COLLAPSED_LINES: usize = 3;
 
-/// Live child rows a running spawn card shows inline (0039) — the newest
-/// tail, behind an `… +N earlier` line (the `THINKING_COLLAPSED_LINES` shape).
-const SPAWN_TAIL_ROWS: usize = 3;
-
 /// The five horizontal bands: transcript, status strip, input, agent
 /// selector, hint. Shared by `view` and `selection_text` so the render and
 /// the copy can never disagree about where the transcript ends and the input
@@ -396,12 +392,24 @@ fn render_transcript(
             .map(|c| c.rows.len() + blanks)
             .sum()
     };
-    let skip = match state.scroll {
+    let mut skip = match state.scroll {
         Scroll::Follow => total.saturating_sub(height),
         Scroll::At(item) if item < cache.items.len() => start_of(item),
         Scroll::At(_) => total,
     }
     .min(total.saturating_sub(1));
+    // 0042 D1: a render-side clamp keeps the cursor item on screen (the
+    // `agent_scroll` "clamps again at render" precedent). The wheel may
+    // scroll it off; the next j/k re-renders with it visible.
+    if let Some(ci) = state.cursor.filter(|&ci| ci < cache.items.len()) {
+        let start = start_of(ci);
+        let end = start + cache.items[ci].rows.len();
+        if start < skip {
+            skip = start;
+        } else if end > skip + height {
+            skip = end.saturating_sub(height);
+        }
+    }
     // Walking to the window beats `Paragraph::scroll`, whose offset is a u16 a
     // long session would overflow. Only the rows actually on screen are
     // cloned, so the per-frame cost is bounded by the terminal, not by the
@@ -428,7 +436,14 @@ fn render_transcript(
                 break 'rows;
             }
             if row >= skip {
-                visible.push(line.clone());
+                let mut line = line.clone();
+                // 0042 D1: the cursor highlight is a post-cache patch on the
+                // cloned rows — the cache, `item_fingerprint` and `Geometry`
+                // never see it, and spans keep their own foregrounds.
+                if state.cursor == Some(i) {
+                    line.style = line.style.patch(Style::new().bg(p.band));
+                }
+                visible.push(line);
             }
             row += 1;
         }
@@ -744,12 +759,25 @@ fn item_block<'a>(
             if calls.len() > 1 {
                 details.push(format!("×{}", calls.len()));
             }
-            // A settled spawn collapses its children to a count (0039).
-            if !running && !children.is_empty() {
+            // A spawn's children collapse to a count, running or settled
+            // (0042 D3) — the full list lives in the drill-in.
+            if !children.is_empty() {
                 details.push(format!("{} calls", children.len()));
             }
             if !matches!(status, ToolStatus::Denied) {
                 details.push(format!("{}s", ticks / anim::TICK_HZ));
+            }
+            // Running only: the newest outstanding (else last) child call as
+            // a final muted detail, so the card stays one calm line.
+            if running {
+                if let Some(c) = children
+                    .iter()
+                    .rev()
+                    .find(|c| c.ok.is_none())
+                    .or_else(|| children.last())
+                {
+                    details.push(format!("{} {}", c.name, c.summary));
+                }
             }
             // Name in the status color (so it stays identifiable now the
             // marker moved to the spine), body ink, details muted.
@@ -763,35 +791,7 @@ fn item_block<'a>(
                     Style::new().fg(p.muted),
                 ));
             }
-            let mut lines = vec![Line::from(spans)];
-            // A running spawn shows its newest children inline (0039). The
-            // indent lives in the content span, NOT the gutter, so `text_col`
-            // holds for drag-copy; running-child glyphs derive from the
-            // PARENT's ticks — no per-child clocks, so the rewrap budget
-            // (`a_running_turn_rewraps_only_the_item_that_moved`) holds.
-            if running && !children.is_empty() {
-                if children.len() > SPAWN_TAIL_ROWS {
-                    lines.push(Line::styled(
-                        format!("  … +{} earlier", children.len() - SPAWN_TAIL_ROWS),
-                        Style::new().fg(p.muted),
-                    ));
-                }
-                let tail = children.len().saturating_sub(SPAWN_TAIL_ROWS);
-                for c in &children[tail..] {
-                    let (glyph, child_color) = match c.ok {
-                        None => (WORKING_FRAMES[marker_frame(*ticks)], p.active),
-                        Some(true) => ("✓", p.idle),
-                        Some(false) => ("✗", p.blocked),
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            format!("  {glyph} {}", c.name),
-                            Style::new().fg(child_color),
-                        ),
-                        Span::styled(format!("  {}", c.summary), Style::new().fg(p.muted)),
-                    ]));
-                }
-            }
+            let lines = vec![Line::from(spans)];
             (
                 Spine {
                     marker,
@@ -2449,8 +2449,9 @@ mod tests {
         );
     }
 
-    /// 0039: `● main` plus one windowed row per spawn — radio bullets, the
-    /// glyph/summary/duration per row, `… +N more` past the window.
+    /// 0039/0042 D4: the passive band — `● main` plus one windowed row per
+    /// spawn, radio bullet on the shown stream, `… +N more` past the window.
+    /// No focus state exists; navigation lives in the transcript cursor.
     #[test]
     fn the_selector_lists_main_and_spawns_with_radio_bullets_and_overflow() {
         let mut s = State::new(true, "m".into());
@@ -2614,29 +2615,24 @@ mod tests {
         item
     }
 
-    /// 0039: a running spawn shows the newest `SPAWN_TAIL_ROWS` children
-    /// indented inline, behind an `… +N earlier` line.
+    /// 0042 D3: a running spawn is ONE calm line — call count, duration and
+    /// the newest outstanding child call ride the muted details; no child
+    /// rows, no `… +N earlier` churn.
     #[test]
-    fn a_running_spawn_card_shows_the_tail_of_children_and_an_earlier_count() {
+    fn a_running_spawn_card_is_one_line_with_call_count_and_latest_child() {
         let mut s = State::new(true, "m".into());
         s.transcript
             .push(spawn_with_children(ToolStatus::Running, 5));
         let rows = draw(&s);
         let all = rows.join("\n");
-        assert!(all.contains("… +2 earlier"), "overflow line: {all}");
-        for i in [3, 4] {
-            assert!(
-                all.contains(&format!("✓ read  read c{i}.rs")),
-                "settled tail child c{i}: {all}"
-            );
-        }
         assert!(
-            all.contains("⠑ read  read c5.rs"),
-            "the running child wears the parent-ticks wanderer frame: {all}"
+            all.contains("spawn  survey · 5 calls · 0s · read read c5.rs"),
+            "one line, count then latest call: {all}"
         );
+        assert!(!all.contains("earlier"), "no tail block: {all}");
         assert!(
-            !all.contains("read c1.rs"),
-            "children beyond the tail stay behind the count: {all}"
+            !all.contains("read c4.rs"),
+            "settled children stay behind the count: {all}"
         );
     }
 
@@ -3449,6 +3445,58 @@ mod tests {
             let hot = draw_cached(&s, &mut warm);
             assert_eq!(hot, cold, "cached render diverged at step {step}");
         }
+    }
+
+    /// 0042 D1: the cursor highlight is a post-cache style patch — same
+    /// symbols, zero re-wraps, band background on the cursor item's rows and
+    /// nowhere else.
+    #[test]
+    fn the_cursor_item_renders_highlighted_without_touching_the_cache() {
+        let mut s = cacheable_state();
+        let mut cache = TranscriptCache::default();
+        let before = draw_cached(&s, &mut cache);
+        let wraps = cache.rewraps();
+        s.cursor = Some(2); // the tool card — already visible under Follow
+        let after = draw_cached(&s, &mut cache);
+        assert_eq!(cache.rewraps(), wraps, "the highlight must not re-wrap");
+        // Transcript region only — the hint row legitimately switches to the
+        // cursor keys.
+        assert_eq!(
+            before[..STRIP],
+            after[..STRIP],
+            "symbols identical — only style moved"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| view(&s, &Palette::default(), &mut cache, f))
+            .unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let band = Palette::default().band;
+        let has_band = |y: u16| {
+            (0..buf.area.width).any(|x| buf.cell((x, y)).unwrap().style().bg == Some(band))
+        };
+        assert!(has_band(18), "the cursor item's row wears the band bg");
+        assert!(!has_band(16), "its neighbors do not");
+    }
+
+    /// 0042: the render-side clamp — a cursor item outside the window pulls
+    /// the effective start so it stays visible; the next j/k after a wheel
+    /// scroll snaps it back the same way.
+    #[test]
+    fn the_cursor_stays_visible_when_it_moves_off_window() {
+        let mut s = cacheable_state();
+        let without = draw(&s).join("\n");
+        assert!(
+            !without.contains("explain the cache"),
+            "precondition: the first item sits above the Follow window: {without}"
+        );
+        s.cursor = Some(0);
+        let with = draw(&s).join("\n");
+        assert!(
+            with.contains("explain the cache"),
+            "the window snapped to the cursor: {with}"
+        );
     }
 
     /// 0033 Task 3: after every append, at every chunk size, the cached
