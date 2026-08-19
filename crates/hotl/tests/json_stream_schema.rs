@@ -22,21 +22,26 @@ fn every_frame_is_tagged_and_versioned() {
         EngineEvent::TextDelta("hi".into()),
         EngineEvent::ThinkingDelta("mm".into()),
         EngineEvent::ToolStart {
+            id: "t1".into(),
             name: "read".into(),
             summary: "read ./x".into(),
         },
         EngineEvent::ToolDone {
+            id: "t1".into(),
             name: "read".into(),
             ok: true,
         },
         EngineEvent::ToolDenied {
+            id: "t2".into(),
             name: "write".into(),
         },
         EngineEvent::ToolAutoAllowed {
+            id: "t3".into(),
             name: "bash".into(),
             rule: "ls*".into(),
         },
         EngineEvent::ToolFlagged {
+            id: "t4".into(),
             name: "write".into(),
             summary: "write Makefile".into(),
             why: "protected write".into(),
@@ -164,6 +169,46 @@ fn goal_frames_carry_their_payloads() {
         assert_eq!(f["verdict"], tag);
         assert_eq!(f["reason"], "because");
         assert_eq!(f["turns"], 3);
+    }
+}
+
+/// 0037: every tool lifecycle frame carries the provider's `tool_use` id —
+/// additive (`JSON_STREAM_SCHEMA_VERSION` stands, same ruling as the goal
+/// frames) — so a client can pair a `tool_done` with its own `tool_start`
+/// when N same-name calls run concurrently.
+#[test]
+fn tool_frames_carry_the_call_id() {
+    let events = [
+        EngineEvent::ToolStart {
+            id: "toolu_1".into(),
+            name: "read".into(),
+            summary: "read ./x".into(),
+        },
+        EngineEvent::ToolDone {
+            id: "toolu_1".into(),
+            name: "read".into(),
+            ok: true,
+        },
+        EngineEvent::ToolDenied {
+            id: "toolu_1".into(),
+            name: "write".into(),
+        },
+        EngineEvent::ToolAutoAllowed {
+            id: "toolu_1".into(),
+            name: "bash".into(),
+            rule: "ls*".into(),
+        },
+        EngineEvent::ToolFlagged {
+            id: "toolu_1".into(),
+            name: "write".into(),
+            summary: "write Makefile".into(),
+            why: "protected write".into(),
+            denied: false,
+        },
+    ];
+    for e in events {
+        let f = wire::update_frame(&e).expect("tool events are stream frames");
+        assert_eq!(f["id"], "toolu_1", "missing call id on {}", f["type"]);
     }
 }
 

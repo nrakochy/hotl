@@ -1454,6 +1454,7 @@ impl Turn {
                     crate::hooks::PreToolDecision::Continue => {}
                     crate::hooks::PreToolDecision::Deny { message } => {
                         self.emit(EngineEvent::ToolDenied {
+                            id: tu.id.clone(),
                             name: tu.name.clone(),
                         })
                         .await;
@@ -1531,6 +1532,7 @@ impl Turn {
                 AskReply::Respond { content } => {
                     // §2b: the human answered as the tool — skip execution.
                     self.emit(EngineEvent::ToolDone {
+                        id: tu.id.clone(),
                         name: tu.name.clone(),
                         ok: true,
                     })
@@ -1542,6 +1544,7 @@ impl Turn {
                 }
                 AskReply::Deny { message } => {
                     self.emit(EngineEvent::ToolDenied {
+                        id: tu.id.clone(),
                         name: tu.name.clone(),
                     })
                     .await;
@@ -1562,6 +1565,7 @@ impl Turn {
             // refuse — deny is a "never" the gate owes regardless of how
             // low-risk the tool's own permission is.
             self.emit(EngineEvent::ToolDenied {
+                id: tu.id.clone(),
                 name: tu.name.clone(),
             })
             .await;
@@ -1607,6 +1611,7 @@ impl Turn {
             }
         };
         self.emit(EngineEvent::ToolStart {
+            id: tu.id.clone(),
             name: tu.name.clone(),
             summary,
         })
@@ -1649,6 +1654,7 @@ impl Turn {
             );
         }
         self.emit(EngineEvent::ToolDone {
+            id: tu.id.clone(),
             name: tu.name.clone(),
             ok: !outcome.is_error,
         })
@@ -1687,6 +1693,7 @@ impl Turn {
         ) {
             Verdict::Auto { rule } => {
                 self.emit(EngineEvent::ToolAutoAllowed {
+                    id: tu.id.clone(),
                     name: tu.name.clone(),
                     rule,
                 })
@@ -1705,6 +1712,7 @@ impl Turn {
             Verdict::AutoFlagged { rule: _ } => {
                 let why = why.unwrap_or_else(|| summary.clone());
                 self.emit(EngineEvent::ToolFlagged {
+                    id: tu.id.clone(),
                     name: tu.name.clone(),
                     summary,
                     why,
@@ -1716,6 +1724,7 @@ impl Turn {
             Verdict::DenyFlagged { rule } => {
                 let why = why.unwrap_or_else(|| summary.clone());
                 self.emit(EngineEvent::ToolFlagged {
+                    id: tu.id.clone(),
                     name: tu.name.clone(),
                     summary,
                     why: why.clone(),

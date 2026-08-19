@@ -39,23 +39,30 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
     Some(match event {
         EngineEvent::TextDelta(t) => json!({"type": "text_delta", "text": t}),
         EngineEvent::ThinkingDelta(t) => json!({"type": "thinking_delta", "text": t}),
-        EngineEvent::ToolStart { name, summary } => {
-            json!({"type": "tool_start", "name": name, "summary": summary})
+        // `id` is the provider's `tool_use` id (0037) — additive, so
+        // `JSON_STREAM_SCHEMA_VERSION` stands (same ruling as the goal
+        // frames). It is what lets a client pair a `tool_done` with its own
+        // `tool_start` when N same-name calls run concurrently.
+        EngineEvent::ToolStart { id, name, summary } => {
+            json!({"type": "tool_start", "id": id, "name": name, "summary": summary})
         }
-        EngineEvent::ToolDone { name, ok } => {
-            json!({"type": "tool_done", "name": name, "ok": ok})
+        EngineEvent::ToolDone { id, name, ok } => {
+            json!({"type": "tool_done", "id": id, "name": name, "ok": ok})
         }
-        EngineEvent::ToolDenied { name } => json!({"type": "tool_denied", "name": name}),
-        EngineEvent::ToolAutoAllowed { name, rule } => {
-            json!({"type": "tool_auto_allowed", "name": name, "rule": rule})
+        EngineEvent::ToolDenied { id, name } => {
+            json!({"type": "tool_denied", "id": id, "name": name})
+        }
+        EngineEvent::ToolAutoAllowed { id, name, rule } => {
+            json!({"type": "tool_auto_allowed", "id": id, "name": name, "rule": rule})
         }
         EngineEvent::ToolFlagged {
+            id,
             name,
             summary,
             why,
             denied,
         } => {
-            json!({"type": "tool_flagged", "name": name, "summary": summary, "why": why, "denied": denied})
+            json!({"type": "tool_flagged", "id": id, "name": name, "summary": summary, "why": why, "denied": denied})
         }
         EngineEvent::Retrying { attempt, reason } => {
             json!({"type": "retrying", "attempt": attempt, "reason": reason})

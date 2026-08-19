@@ -370,27 +370,33 @@ mod tests {
             EngineEvent::TextDelta("hi".into()),
             EngineEvent::ThinkingDelta("mm".into()),
             EngineEvent::ToolStart {
+                id: "t1".into(),
                 name: "read".into(),
                 summary: "read ./x".into(),
             },
             EngineEvent::ToolDone {
+                id: "t1".into(),
                 name: "read".into(),
                 ok: true,
             },
             EngineEvent::ToolDenied {
+                id: "t2".into(),
                 name: "write".into(),
             },
             EngineEvent::ToolAutoAllowed {
+                id: "t3".into(),
                 name: "bash".into(),
                 rule: "ls*".into(),
             },
             EngineEvent::ToolFlagged {
+                id: "t4".into(),
                 name: "write".into(),
                 summary: "write Makefile".into(),
                 why: "protected write".into(),
                 denied: false,
             },
             EngineEvent::ToolFlagged {
+                id: "t5".into(),
                 name: "write".into(),
                 summary: "write /outside".into(),
                 why: "outside-session write".into(),
@@ -441,6 +447,7 @@ mod tests {
         }
         // A tool that failed does get a line — the exemption is about success.
         let failed = crate::wire::update_frame(&EngineEvent::ToolDone {
+            id: "t1".into(),
             name: "read".into(),
             ok: false,
         })

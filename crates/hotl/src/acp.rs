@@ -1244,6 +1244,7 @@ mod drain_tests {
         tx.send(EngineEvent::TextDelta("a".into())).await.unwrap();
         tx.send(EngineEvent::TextDelta("b".into())).await.unwrap();
         tx.send(EngineEvent::ToolStart {
+            id: "t1".into(),
             name: "bash".into(),
             summary: "ls".into(),
         })

@@ -2489,7 +2489,7 @@ impl Surface {
                 }
             }
             EngineEvent::ToolDenied { .. } => eprintln!("  (denied)"),
-            EngineEvent::ToolAutoAllowed { name, rule } => {
+            EngineEvent::ToolAutoAllowed { name, rule, .. } => {
                 eprintln!("  (auto-allowed {name} by rule: {rule})");
             }
             EngineEvent::ToolFlagged {

@@ -238,25 +238,36 @@ pub enum Outcome {
 pub enum EngineEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    /// Every tool lifecycle event carries the provider's `tool_use` id (0037):
+    /// N concurrent same-name calls are indistinguishable by name alone, and a
+    /// surface that settles "the newest `read` card" strands the other N−1.
     ToolStart {
+        id: String,
         name: String,
         summary: String,
     },
     ToolDone {
+        id: String,
         name: String,
         ok: bool,
     },
     ToolDenied {
+        id: String,
         name: String,
     },
     ToolAutoAllowed {
+        id: String,
         name: String,
         rule: String,
     },
     /// Bypass-mode floor event (0036): the call was allowed (`denied: false`)
     /// or refused (`denied: true`) without a human, and the surface must show
     /// it prominently — this is the notification that replaces the ask.
+    /// Coalesced per turn (0037): one notice per distinct
+    /// (tool, class, path, denied) decision — the floor still evaluates and
+    /// resolves every call.
     ToolFlagged {
+        id: String,
         name: String,
         summary: String,
         why: String,
@@ -338,9 +349,11 @@ impl std::fmt::Debug for EngineEvent {
             Self::TextDelta(t) => write!(f, "TextDelta({t:?})"),
             Self::ThinkingDelta(_) => write!(f, "ThinkingDelta"),
             Self::ToolStart { name, .. } => write!(f, "ToolStart({name})"),
-            Self::ToolDone { name, ok } => write!(f, "ToolDone({name},{ok})"),
-            Self::ToolDenied { name } => write!(f, "ToolDenied({name})"),
-            Self::ToolAutoAllowed { name, rule } => write!(f, "ToolAutoAllowed({name},{rule})"),
+            Self::ToolDone { name, ok, .. } => write!(f, "ToolDone({name},{ok})"),
+            Self::ToolDenied { name, .. } => write!(f, "ToolDenied({name})"),
+            Self::ToolAutoAllowed { name, rule, .. } => {
+                write!(f, "ToolAutoAllowed({name},{rule})")
+            }
             Self::ToolFlagged { name, denied, .. } => {
                 write!(f, "ToolFlagged({name},denied={denied})")
             }
