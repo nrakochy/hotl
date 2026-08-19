@@ -1394,9 +1394,12 @@ fn spawn_session_inner(
     }) = spawn
     {
         let snapshot = snapshot_provider(Arc::clone(&head_cell), session_id);
+        // `.with_events`: children never get `spawn` at all, so there is no
+        // recursive wiring to worry about — one hop, child to parent.
         registry.register(Box::new(
             crate::spawn::SpawnTool::new(builder, config_dir, include_claude, concurrency)
-                .with_snapshot(snapshot),
+                .with_snapshot(snapshot)
+                .with_events(event_tx.downgrade()),
         ));
     }
     let deps = build_deps(Arc::new(registry));

@@ -120,6 +120,10 @@ pub struct SpawnTool {
     /// standalone test that never exercises `fork`) — `fork: true` then
     /// fails with a prompt error instead of panicking.
     snapshot: Option<SnapshotFn>,
+    /// The parent session's event stream, weak for the same reason every
+    /// registry-held sink is (`spawn_session_inner`'s reference-cycle note).
+    /// `None` (a context with no live parent stream) means no forwarding.
+    events: Option<tokio::sync::mpsc::WeakSender<EngineEvent>>,
 }
 
 impl SpawnTool {
@@ -135,6 +139,7 @@ impl SpawnTool {
             include_claude,
             concurrency,
             snapshot: None,
+            events: None,
         }
     }
 
@@ -146,7 +151,17 @@ impl SpawnTool {
         self
     }
 
+    /// Attach the parent event stream child tool events are forwarded on
+    /// (0039). Same registration-time story as `with_snapshot`.
+    pub fn with_events(mut self, events: tokio::sync::mpsc::WeakSender<EngineEvent>) -> Self {
+        self.events = Some(events);
+        self
+    }
+
     async fn run_impl(&self, input: Value, cancel: CancellationToken) -> ToolOutcome {
+        // Captured at entry: the task-local is scoped around exactly this
+        // future (turn.rs), so this is the spawn call's own card id.
+        let parent_id = hotl_tools::current_call_id();
         if input.get("agent_type").and_then(Value::as_str) == Some("teammate") {
             return ToolOutcome::err(
                 "`teammate` (a peer topology) is reserved and not available yet. \
@@ -229,7 +244,7 @@ impl SpawnTool {
         } else {
             child.prompt(task.to_string()).await;
         }
-        let outcome = drain_child(&mut child, &cancel).await;
+        let outcome = drain_child(&mut child, &cancel, self.events.clone().zip(parent_id)).await;
         let note = isolation_unavailable.then_some(
             "Note: this agent def asked for worktree isolation, which is unavailable here \
              (no git, or the workspace is not a git worktree). The sub-agent ran in your \
@@ -299,7 +314,15 @@ impl SpawnTool {
 /// Drain the child to its terminal outcome. The child has no human on the
 /// loop, so its permission asks default-deny (headless posture — a sub-agent
 /// can't gate a mutating action a human never saw). Parent cancel propagates.
-async fn drain_child(child: &mut SessionHandle, cancel: &CancellationToken) -> Outcome {
+///
+/// `forward` (0039 D2): the parent event stream plus the spawn call's own
+/// card id; when both exist, the child's tool lifecycle is re-emitted as
+/// `ChildTool`. Bypass flags and text/thinking deltas stay dropped in v1.
+async fn drain_child(
+    child: &mut SessionHandle,
+    cancel: &CancellationToken,
+    forward: Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
+) -> Outcome {
     loop {
         tokio::select! {
             biased;
@@ -323,12 +346,49 @@ async fn drain_child(child: &mut SessionHandle, cancel: &CancellationToken) -> O
                     eprintln!("sub-agent egress denied: {host}");
                     let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
                 }
+                Some(EngineEvent::ToolStart { id, name, summary }) => {
+                    forward_child_tool(&forward, id, name, summary, None).await;
+                }
+                Some(EngineEvent::ToolDone { id, name, ok }) => {
+                    forward_child_tool(&forward, id, name, String::new(), Some(ok)).await;
+                }
+                Some(EngineEvent::ToolDenied { id, name }) => {
+                    // Settled-failed in one frame — a denied child never got
+                    // a start.
+                    let summary = format!("{name} (denied)");
+                    forward_child_tool(&forward, id, name, summary, Some(false)).await;
+                }
                 Some(EngineEvent::TurnDone { outcome, .. }) => return outcome,
                 Some(_) => {}
                 None => return Outcome::Error { message: "sub-agent ended without an outcome".into() },
             }
         }
     }
+}
+
+/// Re-emit one child tool event on the parent stream. Backpressure on the
+/// parent's 256-cap channel is the same contract as engine `emit`; a closing
+/// session fails the upgrade and the event drops with it.
+async fn forward_child_tool(
+    forward: &Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
+    id: String,
+    name: String,
+    summary: String,
+    ok: Option<bool>,
+) {
+    let Some((events, parent_id)) = forward else {
+        return;
+    };
+    let Some(tx) = events.upgrade() else { return };
+    let _ = tx
+        .send(EngineEvent::ChildTool {
+            parent_id: parent_id.clone(),
+            id,
+            name,
+            summary,
+            ok,
+        })
+        .await;
 }
 
 /// The untrusted-content envelope for a sub-agent's result (SECURITY.md §M4).
@@ -534,6 +594,138 @@ mod tests {
         assert!(out.content.contains("trust=\"untrusted\""));
         // A forged closing tag in the child output is defanged.
         assert_eq!(out.content.matches("</subagent-result>").count(), 1);
+    }
+
+    /// A child whose first turn is a batch of two paged reads — distinct
+    /// offsets, so 0037 D6 dedup never collapses them.
+    struct ToolRunningChild;
+
+    impl ChildBuilder for ToolRunningChild {
+        fn build(&self, _def: &AgentDef, _brief: &str) -> Result<Child, String> {
+            let dir = tempfile::tempdir().unwrap();
+            let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
+            std::mem::forget(dir);
+            let calls: Vec<Value> = [("c1", 1), ("c2", 2)]
+                .iter()
+                .map(|(id, offset)| {
+                    json!({"type": "tool_use", "id": id, "name": "read",
+                           "input": {"path": "Cargo.toml", "offset": offset, "limit": 2}})
+                })
+                .collect();
+            let provider = Arc::new(ScriptedProvider::new(vec![
+                vec![
+                    Ok(hotl_provider::StreamEvent::Started),
+                    Ok(hotl_provider::StreamEvent::Completed {
+                        stop: hotl_types::StopReason::ToolUse,
+                        usage: hotl_types::TokenUsage::default(),
+                        blocks: calls,
+                    }),
+                ],
+                ScriptedProvider::text_reply("read both pages"),
+            ]));
+            Ok(child_of(spawn_session(SessionDeps {
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "child".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 4,
+                    ..Default::default()
+                },
+            })))
+        }
+
+        fn build_fork(
+            &self,
+            _def: &AgentDef,
+            _brief: &str,
+            _seed: ForkSeed,
+        ) -> Result<Child, String> {
+            Err("unused in this test".into())
+        }
+    }
+
+    /// 0039 T4: the child's tool lifecycle is re-emitted on the parent stream
+    /// as `ChildTool`, stamped with the id `turn.rs` scoped around this very
+    /// `run` — start (`ok: None`) strictly before done (`ok: Some`) per call.
+    #[tokio::test]
+    async fn child_tool_events_are_forwarded_with_the_spawn_calls_own_id() {
+        let (event_tx, mut event_rx) = hotl_engine::event_channel();
+        let tool = SpawnTool::new(
+            Arc::new(ToolRunningChild),
+            tempfile::tempdir().unwrap().keep(),
+            false,
+            test_concurrency(),
+        )
+        .with_events(event_tx.downgrade());
+        let out = hotl_tools::CURRENT_CALL_ID
+            .scope(
+                "spawn_1".into(),
+                tool.run(json!({"task": "survey"}), CancellationToken::new()),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        drop(event_tx);
+
+        let mut frames: Vec<(String, String, String, Option<bool>)> = Vec::new();
+        while let Some(e) = event_rx.recv().await {
+            if let EngineEvent::ChildTool {
+                parent_id,
+                id,
+                name,
+                ok,
+                ..
+            } = e
+            {
+                frames.push((parent_id, id, name, ok));
+            }
+        }
+        assert_eq!(frames.len(), 4, "2 starts + 2 dones: {frames:?}");
+        for (parent_id, _, name, _) in &frames {
+            assert_eq!(parent_id, "spawn_1");
+            assert_eq!(name, "read");
+        }
+        for id in ["c1", "c2"] {
+            let phases: Vec<Option<bool>> = frames
+                .iter()
+                .filter(|(_, fid, ..)| fid == id)
+                .map(|(.., ok)| *ok)
+                .collect();
+            assert_eq!(
+                phases,
+                vec![None, Some(true)],
+                "{id} must start, then settle ok: {frames:?}"
+            );
+        }
+    }
+
+    /// No sink attached (or no call id in scope) → no forwarding, no panic,
+    /// and the spawn's own result is untouched.
+    #[tokio::test]
+    async fn no_event_sink_means_no_forwarding_and_no_panic() {
+        let tool = SpawnTool::new(
+            Arc::new(ToolRunningChild),
+            tempfile::tempdir().unwrap().keep(),
+            false,
+            test_concurrency(),
+        );
+        let out = hotl_tools::CURRENT_CALL_ID
+            .scope(
+                "spawn_1".into(),
+                tool.run(json!({"task": "survey"}), CancellationToken::new()),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("read both pages"));
     }
 
     #[test]
