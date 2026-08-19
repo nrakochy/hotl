@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-19
+
 ### Changed
 
 - **Sub-agent streams are vim-navigable, and spawn cards stay one line**
