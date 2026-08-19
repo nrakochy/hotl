@@ -24,6 +24,10 @@ struct Session {
 }
 
 fn session(provider: Arc<dyn Provider>) -> Session {
+    session_with(provider, Rules::default())
+}
+
+fn session_with(provider: Arc<dyn Provider>, rules: Rules) -> Session {
     let config = EngineConfig::default();
     let dir = tempfile::tempdir().expect("tempdir");
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
@@ -32,8 +36,10 @@ fn session(provider: Arc<dyn Provider>) -> Session {
     let handle = spawn_session(SessionDeps {
         provider,
         registry: Arc::new(Registry::builtin()),
-        rules: Arc::new(Rules::default()),
-        sandbox_enforced: false,
+        rules: Arc::new(rules),
+        // True so bash keeps its bypass auto-allow (bash keeps the sandbox
+        // gate even under bypass) — reads don't consult it either way.
+        sandbox_enforced: true,
         clock: Arc::new(SystemClock),
         log,
         system: "test-system".into(),
@@ -165,4 +171,88 @@ async fn a_parallel_batch_emits_start_and_done_per_call_id() {
     for r in &results {
         assert!(!r.is_error, "{}: {}", r.tool_use_id, r.content);
     }
+}
+
+/// 0037 D6: literally identical read-only parallel-safe calls in one batch
+/// execute once — one `ToolStart` — while every duplicate id still gets its
+/// own committed result (the provider requires one per `tool_use_id`).
+#[tokio::test]
+async fn identical_reads_in_one_batch_run_once_and_fan_out() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_batch(&[
+            ("d1", "read", json!({"path": "Cargo.toml", "limit": 3})),
+            ("d2", "read", json!({"path": "Cargo.toml", "limit": 3})),
+            (
+                "d3",
+                "read",
+                json!({"path": "Cargo.toml", "offset": 2, "limit": 3}),
+            ),
+        ]),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session(provider);
+    s.handle.prompt("go".into()).await;
+
+    let mut started: Vec<String> = Vec::new();
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::ToolStart { id, .. } => started.push(id),
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(
+        started,
+        vec!["d1", "d3"],
+        "the duplicate executes once, under the first id"
+    );
+
+    let results = committed_results(&s.log_path);
+    let ids: Vec<&str> = results.iter().map(|r| r.tool_use_id.as_str()).collect();
+    assert_eq!(ids, ["d1", "d2", "d3"], "every id still gets its result");
+    assert_eq!(
+        results[0].content, results[1].content,
+        "duplicates share the one outcome"
+    );
+    assert_ne!(
+        results[0].content, results[2].content,
+        "a distinct page is NOT a duplicate"
+    );
+    for r in &results {
+        assert!(!r.is_error, "{}: {}", r.tool_use_id, r.content);
+    }
+}
+
+/// D6's exemption: a non-read-only duplicate runs twice — duplicate
+/// mutations are the model's to own and the doom guard's to catch.
+#[tokio::test]
+async fn an_identical_mutating_duplicate_still_runs_twice() {
+    if hotl_tools::rules::enforced_build() {
+        return; // Bypass cannot exist on a security-enforced build.
+    }
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_batch(&[
+            ("m1", "bash", json!({"command": "echo hi"})),
+            ("m2", "bash", json!({"command": "echo hi"})),
+        ]),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session_with(
+        provider,
+        Rules::default().with_mode(hotl_tools::rules::PermissionMode::Bypass),
+    );
+    s.handle.prompt("go".into()).await;
+
+    let mut started: Vec<String> = Vec::new();
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::ToolStart { id, .. } => started.push(id),
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(started, vec!["m1", "m2"], "no dedup for a mutating tool");
+    let results = committed_results(&s.log_path);
+    let ids: Vec<&str> = results.iter().map(|r| r.tool_use_id.as_str()).collect();
+    assert_eq!(ids, ["m1", "m2"]);
 }

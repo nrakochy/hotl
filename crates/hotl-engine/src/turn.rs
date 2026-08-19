@@ -1247,12 +1247,20 @@ impl Turn {
             // loop` already cleared the window. Fall through and dispatch
             // this same batch normally.
         }
+        // In-batch identical-call dedup (0037 D6), after the doom fold (the
+        // window and its backfill keep seeing the model's real traffic),
+        // before chunking: N literally identical read-only parallel-safe
+        // calls run once, and the outcome fans out to every id below.
+        let deduped = dedup_batch(uses, &self.shared.registry);
+        let run_uses: &[ToolUse] = deduped
+            .as_ref()
+            .map_or(uses, |(unique, _)| unique.as_slice());
         // Per-batch taint signal (0035 decision 7): fires once, after a
         // gate resolves to Ready, before the first non-read-only execute —
         // a minutes-long ask or a fully-denied batch never taints, and a
         // batch where nothing mutating ran takes no snapshot at all.
         let mut mutation_signaled = false;
-        let mut results = Vec::with_capacity(uses.len());
+        let mut results = Vec::with_capacity(run_uses.len());
         let mut budget_blown: Option<String> = None;
         self.ledger.stamp(Phase::ToolsSpawned);
         // Barrier (a) again, as an assertion rather than a wait: the inline
@@ -1262,7 +1270,7 @@ impl Turn {
             self.pipeline.is_empty(),
             "barrier (a): no tool may run while a commit is unresolved"
         );
-        if let [only] = uses {
+        if let [only] = run_uses {
             // §S1 diet (1): a single-tool batch is the majority case — skip
             // `parallel_chunks` and `join_all` entirely and run the one call
             // inline. Same gate → execute → outcome-handling body the
@@ -1278,7 +1286,7 @@ impl Turn {
                 results.push(self.finish_call(only, executed, &mut budget_blown).await);
             }
         } else {
-            for chunk in parallel_chunks(uses, &self.shared.registry) {
+            for chunk in parallel_chunks(run_uses, &self.shared.registry) {
                 if self.cancel.is_cancelled() || budget_blown.is_some() {
                     for tu in chunk {
                         results.push(pair(tu, "Not executed (turn stopped).", true));
@@ -1308,6 +1316,13 @@ impl Turn {
             }
         }
         self.ledger.stamp(Phase::ToolsJoined);
+        // Fan the deduplicated outcomes back out: the provider requires one
+        // result per `tool_use_id`, so every duplicate id gets its own
+        // `ToolResultItem` carrying the shared outcome (0037 D6). Before the
+        // backfill, which aligns against the window's per-original-call fold.
+        if let Some((_, fan)) = &deduped {
+            results = fan_results(uses, fan, &results);
+        }
         // Results are final: stamp them onto this batch's window entries so
         // the next dispatch's doom check can tell repetition from polling.
         backfill_result_hashes(&mut self.call_sigs, &results);
@@ -2517,6 +2532,57 @@ fn pair(tu: &ToolUse, message: &str, is_error: bool) -> ToolResultItem {
         content: message.to_string(),
         is_error,
     }
+}
+
+/// In-batch identical-call dedup (0037 D6): calls in one batch with identical
+/// `(name, input)` whose tool is `read_only && parallel_safe` execute once.
+/// Returns the unique calls plus, per original call, the index of the unique
+/// call that answers it — or `None` when nothing is duplicated (the common
+/// case stays allocation-free). Mutating tools never dedup: duplicate
+/// mutations are the model's to own and the doom guard's to catch. Identity
+/// is [`CallSig`]'s own spelling, so "identical" here and in the doom
+/// detector can never drift apart.
+fn dedup_batch(
+    uses: &[ToolUse],
+    registry: &hotl_tools::Registry,
+) -> Option<(Vec<ToolUse>, Vec<usize>)> {
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut unique: Vec<ToolUse> = Vec::with_capacity(uses.len());
+    let mut fan: Vec<usize> = Vec::with_capacity(uses.len());
+    let mut any_dup = false;
+    for tu in uses {
+        let dedupable = registry
+            .get(&tu.name)
+            .is_some_and(|t| t.read_only() && t.parallel_safe());
+        let sig = format!("{}({})", tu.name, tu.input);
+        match seen.get(&sig) {
+            Some(&at) if dedupable => {
+                fan.push(at);
+                any_dup = true;
+            }
+            _ => {
+                if dedupable {
+                    seen.insert(sig, unique.len());
+                }
+                fan.push(unique.len());
+                unique.push(tu.clone());
+            }
+        }
+    }
+    any_dup.then_some((unique, fan))
+}
+
+/// Expand a deduplicated batch's results back to one `ToolResultItem` per
+/// original call, in source order — the wire requires a result for every id.
+fn fan_results(uses: &[ToolUse], fan: &[usize], unique: &[ToolResultItem]) -> Vec<ToolResultItem> {
+    uses.iter()
+        .zip(fan)
+        .map(|(tu, &at)| ToolResultItem {
+            tool_use_id: tu.id.clone(),
+            content: unique[at].content.clone(),
+            is_error: unique[at].is_error,
+        })
+        .collect()
 }
 
 /// Whether the todo reminder in a snapshot's **ephemeral tail** (see
