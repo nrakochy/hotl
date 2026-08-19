@@ -169,6 +169,15 @@ impl Editor {
         self.mode
     }
 
+    /// Half-typed Normal-mode state (count, operator, `:` command) that the
+    /// next Esc clears in the editor rather than reaching the app (0042 D2).
+    pub fn pending_active(&self) -> bool {
+        self.mode == Mode::Normal
+            && (self.pending.count.is_some()
+                || self.pending.op.is_some()
+                || self.pending.colon.is_some())
+    }
+
     pub fn cursor(&self) -> (usize, usize) {
         self.cursor
     }
@@ -951,6 +960,23 @@ mod tests {
     #[test]
     fn x_deletes_under_cursor() {
         assert_eq!(ed("iabc<esc>0x").text(), "bc");
+    }
+
+    #[test]
+    fn pending_state_is_active_until_esc_clears_it() {
+        let mut e = Editor::new(true);
+        keys(&mut e, "<esc>");
+        assert!(!e.pending_active(), "Normal with nothing pending");
+        keys(&mut e, "d");
+        assert!(e.pending_active(), "pending operator");
+        keys(&mut e, "<esc>");
+        assert!(!e.pending_active(), "esc cleared it");
+        keys(&mut e, "3");
+        assert!(e.pending_active(), "pending count");
+        keys(&mut e, "<esc>:");
+        assert!(e.pending_active(), "pending colon command");
+        keys(&mut e, "<esc>i");
+        assert!(!e.pending_active(), "Insert mode is never pending");
     }
 
     #[test]
