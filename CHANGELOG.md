@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-08-19
+
 ### Changed
 
 - **The running tool card's marker is now the braille wanderer from
