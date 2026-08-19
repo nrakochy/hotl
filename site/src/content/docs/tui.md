@@ -67,7 +67,23 @@ Top to bottom:
    empty or never-started list shows nothing extra.
 
 3. **Input** — bordered editor, title shows `-- INSERT --` / `-- NORMAL --`.
-4. **Hint row** — the keys that matter right now.
+4. **Agent selector** — appears below the input once the turn has spawned
+   sub-agents: `● main` plus one row per spawn. `Ctrl-O` focuses it; `↑`/`↓`
+   (and `j`/`k` in vim Normal mode) move the selection, and the selection IS
+   the view — the whole region above the strip swaps to that agent's own tool
+   stream. `Esc` returns to main; typing any other key drops you straight
+   back into the prompt while the chosen stream stays up.
+5. **Hint row** — the keys that matter right now.
+
+### Tool cards that stay readable
+
+Consecutive same-tool calls on the same target absorb into one accumulating
+card — four paged reads of one file render `✓ read ~/…/app.rs · ×4 · 3s`, not
+four rows — and long paths middle-elide in the card (permission asks always
+show the full path). A running `spawn` card shows its last three child tool
+calls indented inline with an `… +N earlier` line; once it settles it
+collapses to a `· N calls` detail, and the full list lives in the agent
+selector's drill-in.
 
 ### Scrolling
 

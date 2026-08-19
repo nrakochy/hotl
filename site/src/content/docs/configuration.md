@@ -613,7 +613,9 @@ a usage error rather than a silent wait.
 `--json` emits one JSON object per line — a machine contract, not a log. Every
 frame carries `"schema_version"` and a `"type"`: `text_delta`,
 `thinking_delta` (with its `text`), `tool_start`, `tool_done`, `tool_denied`,
-`tool_auto_allowed`, `retrying`, `fallback_model`, `prompt_queued`,
+`tool_auto_allowed`, `child_tool` (a sub-agent's tool activity, with the
+spawn call's `parent_id`, a `phase` of `start`/`done`, and `ok` on done
+frames only), `retrying`, `fallback_model`, `prompt_queued`,
 `compacted`, `todos_changed`, `ask_denied`, `question_no_human`, and a terminal
 `turn_done` carrying token usage and a tagged outcome:
 

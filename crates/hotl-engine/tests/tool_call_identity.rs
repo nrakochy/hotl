@@ -227,8 +227,11 @@ async fn identical_reads_in_one_batch_run_once_and_fan_out() {
     }
 }
 
+/// What each scripted call saw: its `tag` input and the task-local id.
+type Recorded = std::sync::Mutex<Vec<(String, Option<String>)>>;
+
 /// A tool that records what `current_call_id()` returned inside its `run`.
-struct RecordingTool(Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>);
+struct RecordingTool(Arc<Recorded>);
 
 impl hotl_tools::Tool for RecordingTool {
     fn name(&self) -> &'static str {
@@ -274,8 +277,7 @@ impl hotl_tools::Tool for RecordingTool {
 /// hook `spawn` uses to stamp forwarded child events with its card's id.
 #[tokio::test]
 async fn a_tool_sees_its_own_call_id_in_the_task_local() {
-    let recorded: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
-        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded: Arc<Recorded> = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut registry = Registry::builtin();
     registry.register(Box::new(RecordingTool(recorded.clone())));
     let provider = Arc::new(ScriptedProvider::new(vec![
