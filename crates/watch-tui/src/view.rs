@@ -35,9 +35,9 @@ fn project_name(p: &str) -> String {
         .to_string()
 }
 
-// Working animation: an equalizer-style bar rising and falling.
 // Working animation: a braille "snake" that wanders the cell, its body
 // breathing between 2 and 3 dots. Deterministic (indexed by tick).
+// Twin of hotl-tui's WORKING_FRAMES — keep in sync.
 const WORKING_FRAMES: [&str; 16] = [
     "⠑", "⠔", "⣄", "⣠", "⡠", "⠢", "⠚", "⠜", "⠔", "⠤", "⣠", "⣄", "⢄", "⠆", "⠃", "⠑",
 ];
