@@ -370,6 +370,15 @@ pub fn strip_text(state: &State) -> String {
             }
             if let Some(usage) = &state.usage_line {
                 parts.push(usage.clone());
+            } else if let Some(pct) = state
+                .open_context
+                .and_then(|l| crate::app::ctx_pct(l, state.context_window))
+            {
+                // At-open reality (0040): a session has context before its
+                // first turn — resume inherits real fullness, a fresh seed
+                // occupies tokens. Only the gauge, never a synthesized usage
+                // line: "0 in · 0 out" would claim a turn happened.
+                parts.push(format!("{pct}% ctx"));
             }
             // Undo-point chip (0035 decision 11): opacity must not be
             // silence — the strip says whether `hotl undo` has a restore
@@ -702,6 +711,24 @@ mod tests {
             diff: Vec::new(),
         };
         assert_eq!(strip_line(&s), format!("{w} waiting on you"));
+    }
+
+    /// 0040 §5.7 at open: before any turn completes, the idle strip shows
+    /// the at-open context estimate as a bare `% ctx` — and yields to the
+    /// real usage line the moment one exists, never showing both.
+    #[test]
+    fn the_at_open_context_rides_the_idle_strip_until_a_usage_line_exists() {
+        let mut s = State::test_default();
+        s.open_context = Some(24_000);
+        s.context_window = 200_000;
+        assert_eq!(strip_line(&s), resting("12% ctx"));
+
+        s.usage_line = Some("120 in · 45 out · 12% ctx".into());
+        assert_eq!(
+            strip_line(&s),
+            resting("120 in · 45 out · 12% ctx"),
+            "the estimate is superseded, not appended"
+        );
     }
 
     /// 0034: an active goal rides the strip as its own suffix — after the

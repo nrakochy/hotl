@@ -410,6 +410,14 @@ pub struct State {
     /// computes it for the strip's `% ctx` segment and used to discard it.
     /// `None` until the first turn completes.
     pub live_context: Option<u64>,
+    /// The engine's at-open context estimate, from the open reply (0040):
+    /// what the strip's `% ctx` shows before any turn completes — a resumed
+    /// session inherits real fullness, and a fresh session's seed items
+    /// already occupy tokens. Superseded by `usage_line` the moment
+    /// `on_prompt_result` builds one, and never shown as `/context`'s
+    /// `reported` row — that row is provider-reported truth, this is an
+    /// estimate (§5.7 in miniature).
+    pub open_context: Option<u64>,
     /// Every loadable skill name, from the `initialize` result. `/<name>`
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
@@ -498,6 +506,7 @@ impl State {
             default_effort: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
             live_context: None,
+            open_context: None,
             skills: Vec::new(),
             pending_skill: None,
             density: hotl_theme::Density::default(),
@@ -1452,6 +1461,13 @@ pub(crate) fn tok(n: u64) -> String {
 /// `cost_usd` — the UI never estimates prices. R4 owns the catalog that
 /// populates it (see the plan's RQ table). Enforced by
 /// `cost_is_shown_only_when_the_payload_carries_it`.
+/// Context fullness as a whole percentage, capped at 100; `None` on a zero
+/// window. Shared by `format_usage` and the strip's at-open rendering
+/// (`anim::strip_text`) so the two figures cannot drift.
+pub(crate) fn ctx_pct(live: u64, window: u64) -> Option<u64> {
+    (live * 100).checked_div(window).map(|pct| pct.min(100))
+}
+
 fn format_usage(state: &State, usage: &Value, live: u64) -> String {
     let u = &state.session_usage;
     let mut parts = vec![
@@ -1470,8 +1486,8 @@ fn format_usage(state: &State, usage: &Value, live: u64) -> String {
     // `live` is what the *next* turn starts from — this turn's resident
     // context, not the session's running total. The caller computes it: it is
     // also `State.live_context`, which `/context` reports.
-    if let Some(pct) = (live * 100).checked_div(state.context_window) {
-        parts.push(format!("{}% ctx", pct.min(100)));
+    if let Some(pct) = ctx_pct(live, state.context_window) {
+        parts.push(format!("{pct}% ctx"));
     }
     if let Some(cost) = u.cost_usd {
         parts.push(format!("${cost:.2}"));
@@ -2823,6 +2839,16 @@ mod tests {
         on_result(&mut s, "done", None, &json!({"input_tokens": 10}));
         let line = s.usage_line.clone().unwrap();
         assert!(!line.contains("ctx"), "no window, no gauge: {line}");
+    }
+
+    #[test]
+    fn ctx_pct_caps_at_one_hundred_and_refuses_a_zero_window() {
+        assert_eq!(ctx_pct(24_000, 200_000), Some(12));
+        assert_eq!(ctx_pct(0, 200_000), Some(0));
+        // An over-full window (compaction pending) still reads as full,
+        // never as an absurd 150%.
+        assert_eq!(ctx_pct(300_000, 200_000), Some(100));
+        assert_eq!(ctx_pct(10, 0), None);
     }
 
     #[test]
