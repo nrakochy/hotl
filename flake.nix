@@ -224,10 +224,17 @@
       # `nix flake check` stays predictive of the nixpkgs build, which keeps
       # tests on.
       checks = forAllSystems (pkgs: {
-        # doCheck is the only difference — preCheck and checkFlags live on the
-        # package itself, so what runs here is what a nixpkgs build would run.
-        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (_: {
+        # preCheck and checkFlags live on the package itself, so what runs here
+        # is what a nixpkgs build would run — except the release-profile knobs.
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
           doCheck = true;
+          # Thin LTO + codegen-units=1 (2497f71) exist for shipped-binary parity.
+          # checkPhase links ~70 test binaries in release mode; with the knobs on
+          # that is ~28 minutes of linking for tests that run in seconds.
+          env = (old.env or { }) // {
+            CARGO_PROFILE_RELEASE_LTO = "false";
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16";
+          };
         });
       });
 
