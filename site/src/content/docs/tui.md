@@ -53,7 +53,7 @@ Top to bottom:
 
    | You see | It means |
    |---|---|
-   | `· ─ ·` resting | idle — your move (after a turn it also shows real token usage) |
+   | `· ─ ·` resting | idle — your move (after a turn it also shows real token usage; before the first turn, a bare `N% ctx` — the context the session already occupies at open, which a resumed session inherits) |
    | the loop drawing itself, then turning · "thinking" | the model is reasoning |
    | the loop turning · "writing · ~N tok" | the reply is streaming (`~N tok` is a chars/4 approximation; exact usage arrives at the end of the turn) |
    | a dot orbiting the loop · tool name | a tool is running |

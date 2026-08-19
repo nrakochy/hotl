@@ -27,6 +27,14 @@ hotl resume [arg]       # the subcommand spelling of -r
 
 A resumed session that was interrupted mid-turn finishes that turn on load.
 
+The console shows the inherited reality immediately, before any turn runs:
+the status strip carries the inherited context fullness (`N% ctx`) and todo
+list, and `/effort` reports the inherited level. Usage counters and cost
+start at zero for the resumed session — only the context gauge carries over.
+If the configured model changed since the session last ran, a one-line
+transcript notice names the switch: the inherited transcript was produced by
+the previous model.
+
 ## Forking
 
 ```
