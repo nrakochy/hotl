@@ -204,6 +204,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
         TranscriptItem::Assistant { text } => (2u8, text_key(text)).hash(&mut h),
         TranscriptItem::Thinking { text } => (3u8, text_key(text)).hash(&mut h),
         TranscriptItem::Tool {
+            id,
             name,
             summary,
             status,
@@ -215,6 +216,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             // a running tool, which is exactly when the cache has to hold.
             (
                 4u8,
+                id,
                 name,
                 summary,
                 ticks / anim::TICK_HZ,
@@ -673,6 +675,7 @@ fn item_block<'a>(
             )],
         ),
         TranscriptItem::Tool {
+            id: _,
             name,
             summary,
             status,
@@ -2109,6 +2112,7 @@ mod tests {
     fn tool_card_and_strip_share_elapsed() {
         let mut s = State::new(true, "m".into());
         s.transcript.push(TranscriptItem::Tool {
+            id: "t1".into(),
             name: "bash".into(),
             summary: "echo hi".into(),
             status: ToolStatus::Running,
@@ -2156,6 +2160,7 @@ mod tests {
     fn tool_card_indents_dedupes_name_and_mutes_details() {
         let mut s = State::new(true, "m".into());
         s.transcript.push(TranscriptItem::Tool {
+            id: "t1".into(),
             name: "bash".into(),
             summary: "bash [sandboxed:seatbelt]: echo hi".into(),
             status: ToolStatus::Done,
@@ -2209,6 +2214,7 @@ mod tests {
     fn strip_wears_band_and_running_tool_marker_is_active() {
         let mut s = State::new(true, "m".into());
         s.transcript.push(TranscriptItem::Tool {
+            id: "t1".into(),
             name: "bash".into(),
             summary: "echo hi".into(),
             status: ToolStatus::Running,
@@ -2714,6 +2720,7 @@ mod tests {
             text: "a ".repeat(1200).into(),
         });
         s.transcript.push(TranscriptItem::Tool {
+            id: "t1".into(),
             name: "bash".into(),
             summary: "echo hi".into(),
             status: ToolStatus::Running,

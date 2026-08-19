@@ -207,6 +207,10 @@ pub enum TranscriptItem {
         text: Streamed,
     },
     Tool {
+        /// The engine's `tool_use` id (0037). Cards settle by id, never by
+        /// name: N concurrent same-name calls would otherwise all land their
+        /// `tool_done`s on the newest card and strand the other N−1.
+        id: String,
         name: String,
         summary: String,
         status: ToolStatus,
@@ -342,9 +346,11 @@ pub struct State {
     /// its result arrives and decrements this — the phase belongs to the
     /// user now, and nothing the dead turn says may take it back.
     pub detached_turns: u32,
-    /// `tool_auto_allowed` arrives before its `tool_start`; the rule parks
-    /// here until the card exists.
-    pub pending_auto_rule: Option<String>,
+    /// `tool_auto_allowed` arrives before its `tool_start`; each rule parks
+    /// here, keyed by call id, until its card exists — a parallel chunk
+    /// resolves every gate before any call starts, so several can be pending
+    /// at once (0037).
+    pub pending_auto_rules: std::collections::HashMap<String, String>,
     /// Display name (badge + titles); seeded from the open handshake,
     /// updated by `/rename`.
     pub session_name: Option<String>,
@@ -447,7 +453,7 @@ impl State {
             queued_submit: false,
             interrupt_sent: false,
             detached_turns: 0,
-            pending_auto_rule: None,
+            pending_auto_rules: std::collections::HashMap::new(),
             session_name: None,
             mode: "ask".into(),
             plan: false,
@@ -872,12 +878,14 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             enter_streaming(state);
         }
         "tool_start" => {
-            let status = match state.pending_auto_rule.take() {
+            let id = text_of("id");
+            let status = match state.pending_auto_rules.remove(&id) {
                 Some(rule) => ToolStatus::AutoAllowed { rule },
                 None => ToolStatus::Running,
             };
             let name = text_of("name");
             state.transcript.push(TranscriptItem::Tool {
+                id,
                 name: name.clone(),
                 summary: text_of("summary"),
                 status,
@@ -885,17 +893,36 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             });
             state.phase = Phase::Tool { name, ticks: 0 };
         }
+        // Settles by id, never by name (0037): with N concurrent same-name
+        // calls, "the newest matching card" was whichever start happened to
+        // land last — N−1 cards stranded as spinners forever.
         "tool_done" => {
             let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
-            mark_last_tool(
-                state,
-                &text_of("name"),
-                if ok {
-                    ToolStatus::Done
-                } else {
-                    ToolStatus::Failed
-                },
-            );
+            let status = if ok {
+                ToolStatus::Done
+            } else {
+                ToolStatus::Failed
+            };
+            let id = text_of("id");
+            if let Some(TranscriptItem::Tool { status: s, .. }) = state
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|i| matches!(i, TranscriptItem::Tool { id: i, .. } if *i == id))
+            {
+                *s = status;
+            } else {
+                // No card: the human answered *as* the tool (§2b Respond
+                // skips execution, so no `tool_start` ever ran). The settle
+                // is still worth a card — the call happened.
+                state.transcript.push(TranscriptItem::Tool {
+                    id,
+                    name: text_of("name"),
+                    summary: text_of("name"),
+                    status,
+                    ticks: 0,
+                });
+            }
             enter_streaming(state);
         }
         // Denied tools never get a `tool_start` (the engine returns before
@@ -903,6 +930,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         "tool_denied" => {
             let name = text_of("name");
             state.transcript.push(TranscriptItem::Tool {
+                id: text_of("id"),
                 name: name.clone(),
                 summary: name,
                 status: ToolStatus::Denied,
@@ -925,7 +953,11 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 enter_streaming(state);
             }
         }
-        "tool_auto_allowed" => state.pending_auto_rule = Some(text_of("rule")),
+        "tool_auto_allowed" => {
+            state
+                .pending_auto_rules
+                .insert(text_of("id"), text_of("rule"));
+        }
         // The bypass floor's notification (0036): the flag *is* the ask's
         // replacement, so it rides a Notice (no new TranscriptItem kind — a
         // new kind breaks two view.rs matches at once) plus a running chip
@@ -2102,17 +2134,6 @@ fn turn_chars(transcript: &[TranscriptItem]) -> u64 {
         .sum()
 }
 
-fn mark_last_tool(state: &mut State, name: &str, status: ToolStatus) {
-    if let Some(TranscriptItem::Tool { status: s, .. }) = state
-        .transcript
-        .iter_mut()
-        .rev()
-        .find(|i| matches!(i, TranscriptItem::Tool { name: n, .. } if n == name))
-    {
-        *s = status;
-    }
-}
-
 fn notice(state: &mut State, text: String) {
     state
         .transcript
@@ -2337,6 +2358,7 @@ mod tests {
 
     fn skill_card(summary: &str, status: ToolStatus) -> TranscriptItem {
         TranscriptItem::Tool {
+            id: "t1".into(),
             name: "skill".into(),
             summary: summary.into(),
             status,
@@ -2876,7 +2898,7 @@ mod tests {
         upd(&mut s, json!({"type":"text_delta","text":"hi you"}));
         upd(
             &mut s,
-            json!({"type":"tool_start","name":"bash","summary":"echo hi"}),
+            json!({"type":"tool_start","id":"t1","name":"bash","summary":"echo hi"}),
         );
         assert!(matches!(&s.phase, Phase::Tool { name, .. } if name == "bash"));
         assert!(matches!(
@@ -2886,7 +2908,10 @@ mod tests {
                 ..
             })
         ));
-        upd(&mut s, json!({"type":"tool_done","name":"bash","ok":true}));
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"t1","name":"bash","ok":true}),
+        );
         assert!(matches!(
             s.transcript.last(),
             Some(TranscriptItem::Tool {
@@ -2898,6 +2923,104 @@ mod tests {
             matches!(s.phase, Phase::Streaming { chars: 6, .. }),
             "chars survive the tool interlude"
         );
+    }
+
+    /// The card statuses of every `TranscriptItem::Tool`, in transcript order.
+    fn tool_statuses(s: &State) -> Vec<(String, ToolStatus)> {
+        s.transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Tool { id, status, .. } => Some((id.clone(), status.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 0037: N concurrent same-name calls settle each their OWN card, dones
+    /// arriving in any order — the pre-id `mark_last_tool` landed all N dones
+    /// on the newest card and stranded the other N−1 as spinners forever.
+    #[test]
+    fn concurrent_same_name_calls_settle_each_their_own_card() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        for id in ["p1", "p2", "p3"] {
+            upd(
+                &mut s,
+                json!({"type":"tool_start","id":id,"name":"read","summary":format!("read x · from line {id}")}),
+            );
+        }
+        // Out of order, mixed outcomes: p2 fails, then p1, then p3 succeed.
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p2","name":"read","ok":false}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"read","ok":true}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p3","name":"read","ok":true}),
+        );
+        assert_eq!(
+            tool_statuses(&s),
+            vec![
+                ("p1".into(), ToolStatus::Done),
+                ("p2".into(), ToolStatus::Failed),
+                ("p3".into(), ToolStatus::Done),
+            ],
+            "every card settles under its own id; none is left Running"
+        );
+    }
+
+    /// 0037: several `tool_auto_allowed` frames can park before any of their
+    /// `tool_start`s arrive (a parallel chunk gates every call up front) —
+    /// each rule must reach its own card, not the next start to happen by.
+    #[test]
+    fn parked_auto_rules_attach_by_id_not_arrival_order() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_auto_allowed","id":"a","name":"read","rule":"reads"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_auto_allowed","id":"b","name":"read","rule":"pages"}),
+        );
+        // Starts arrive in the opposite order.
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"b","name":"read","summary":"read y"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"a","name":"read","summary":"read x"}),
+        );
+        let statuses = tool_statuses(&s);
+        assert_eq!(statuses[0].0, "b");
+        assert!(
+            matches!(&statuses[0].1, ToolStatus::AutoAllowed { rule } if rule == "pages"),
+            "{statuses:?}"
+        );
+        assert!(
+            matches!(&statuses[1].1, ToolStatus::AutoAllowed { rule } if rule == "reads"),
+            "{statuses:?}"
+        );
+    }
+
+    /// A `tool_done` with no card (§2b Respond skips execution, so no
+    /// `tool_start` ever ran) still surfaces as a settled card — before ids
+    /// it silently re-marked some older same-name card instead.
+    #[test]
+    fn a_done_without_a_start_becomes_its_own_settled_card() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"r1","name":"read","ok":true}),
+        );
+        assert_eq!(tool_statuses(&s), vec![("r1".into(), ToolStatus::Done)]);
     }
 
     #[test]
