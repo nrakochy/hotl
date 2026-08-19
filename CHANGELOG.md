@@ -8,6 +8,11 @@ semver promise of their own.
 
 ### Changed
 
+- **The running tool card's marker is now the braille wanderer from
+  `hotl watch`** (plan 0038), replacing the ◐◓◑◒ circle spinner — the same
+  organism everywhere hotl shows work. Same 8 fps cadence as before (one
+  full wander every 2 s, matching watch's 125 ms twin); finished cards keep
+  their `✓`/`✗`/`⛔` markers unchanged.
 - **Tool calls have identity end-to-end** (plan 0037). Every tool lifecycle
   event now carries the provider's `tool_use` id (additive `"id"` field on
   `tool_start`/`tool_done`/`tool_denied`/`tool_auto_allowed`/`tool_flagged`
