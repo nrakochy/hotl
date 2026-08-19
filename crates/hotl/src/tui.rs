@@ -130,6 +130,10 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         default_effort,
         goal,
         context_window,
+        context_tokens,
+        todos,
+        effort,
+        previous_model,
     } = opened;
     state.model = model;
     state.session_name = session_name;
@@ -142,7 +146,34 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     // A resumed goal's counters start at zero (reset-on-resume, per docs).
     state.goal = goal;
     state.context_window = context_window;
+    // The rest of at-open reality (0040), same seeded-before-first-draw
+    // rule: the strip's context gauge and todo suffix, and the effort
+    // `/status` reports, must be true before any turn runs.
+    state.open_context = context_tokens;
+    state.todos = todos;
+    match effort {
+        // `set_effort`'s semantics: an inherited clear also drops the
+        // default seed, so `/effort` says `default`, not `x (default)`.
+        Some(Some(l)) => state.effort = Some(l),
+        Some(None) => {
+            state.effort = None;
+            state.default_effort = None;
+        }
+        None => {}
+    }
     state.set_skills(skills);
+    if let Some(prev) = previous_model {
+        state
+            .transcript
+            .push(hotl_tui::app::TranscriptItem::Notice {
+                text: format!(
+                    "model changed since this session last ran: {prev} → {cur} — the \
+                 inherited transcript was produced by {prev}",
+                    cur = state.model
+                )
+                .into(),
+            });
+    }
     if let Some(hint) = first_run_hint {
         state
             .transcript
@@ -233,6 +264,41 @@ fn open_settings(hello: &Value, opened: &Value) -> (String, bool, u64) {
     (mode, plan, window)
 }
 
+/// The 0040 additive keys off the open reply: the at-open context estimate,
+/// the inherited todo list, the inherited effort tri-state, and the previous
+/// model. Every key degrades on absence or a bad shape (an older server, a
+/// newer one) — empty/None is today's behavior, never an error.
+#[allow(clippy::type_complexity)]
+fn open_extras(
+    opened: &Value,
+) -> (
+    Option<u64>,
+    Vec<hotl_tools::todo::Todo>,
+    Option<Option<String>>,
+    Option<String>,
+) {
+    let context = opened.get("contextTokens").and_then(Value::as_u64);
+    let todos = opened
+        .get("todos")
+        .cloned()
+        .and_then(|t| serde_json::from_value(t).ok())
+        .unwrap_or_default();
+    // Absent ≠ null: absent is "never set" (keep the `defaultEffort` seed),
+    // null is "inherited-cleared" (drop it) — collapsing the two re-creates
+    // the §5.7 effort lie this key exists to fix. Any other type degrades
+    // to never-set.
+    let effort = match opened.get("effort") {
+        Some(Value::Null) => Some(None),
+        Some(Value::String(s)) => Some(Some(s.clone())),
+        _ => None,
+    };
+    let previous_model = opened
+        .get("previousModel")
+        .and_then(Value::as_str)
+        .map(String::from);
+    (context, todos, effort, previous_model)
+}
+
 /// The half of `config.toml` no server knows about: everything the console
 /// renders or reads keys with. Read at startup and again on every `/reload`,
 /// through the one function below — startup and reload cannot drift.
@@ -292,6 +358,20 @@ struct Opened {
     /// session's is `None`. Counters start at zero — reset-on-resume.
     goal: Option<String>,
     context_window: u64,
+    /// The engine's at-open context estimate (0040) — the strip's `% ctx`
+    /// before any turn completes. `None` = an older server.
+    context_tokens: Option<u64>,
+    /// The inherited todo list at open (0040): the engine injects it into
+    /// every request, so the client renders it or lies by omission (§5.7).
+    todos: Vec<hotl_tools::todo::Todo>,
+    /// Inherited effort tri-state (0040): `None` = never set (keep the
+    /// `defaultEffort` seed), `Some(None)` = inherited-cleared,
+    /// `Some(Some(l))` = inherited-set.
+    effort: Option<Option<String>>,
+    /// The lineage log's model when it differs from the running one (0040) —
+    /// worth a transcript notice. The strip is untouched: `state.model`
+    /// stays the config model, which IS what runs.
+    previous_model: Option<String>,
 }
 
 /// initialize + session/new|load before entering raw mode, so wiring errors
@@ -335,6 +415,7 @@ async fn handshake(
     };
     let v = wait_response(reader, open).await?;
     let (mode, plan, context_window) = open_settings(&hello, &v);
+    let (context_tokens, todos, effort, previous_model) = open_extras(&v);
     Ok(Opened {
         name: v.get("name").and_then(Value::as_str).map(String::from),
         skills,
@@ -346,6 +427,10 @@ async fn handshake(
             .map(String::from),
         goal: v.get("goal").and_then(Value::as_str).map(String::from),
         context_window,
+        context_tokens,
+        todos,
+        effort,
+        previous_model,
     })
 }
 
@@ -1117,6 +1202,34 @@ mod tests {
         let (mode, _plan, window) = super::open_settings(&json!({}), &json!({}));
         assert_eq!(mode, "ask");
         assert_eq!(window, hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
+    }
+
+    #[test]
+    fn open_extras_parses_context_todos_effort_and_previous_model() {
+        let (ctx, todos, effort, prev) = super::open_extras(&json!({
+            "contextTokens": 24_000,
+            "todos": [{"content": "wire the gate", "status": "pending"}],
+            "effort": "max",
+            "previousModel": "old-m",
+        }));
+        assert_eq!(ctx, Some(24_000));
+        assert_eq!(todos.len(), 1);
+        assert_eq!(todos[0].content, "wire the gate");
+        assert_eq!(effort, Some(Some("max".into())));
+        assert_eq!(prev, Some("old-m".into()));
+
+        // Null effort is "inherited-cleared", never collapsed into absent.
+        let (_, _, effort, _) = super::open_extras(&json!({ "effort": null }));
+        assert_eq!(effort, Some(None));
+
+        // An older server (absent keys) and unparseable todos both degrade
+        // to today's behavior; a wrongly-typed effort degrades to never-set.
+        let (ctx, todos, effort, prev) =
+            super::open_extras(&json!({"todos": "nonsense", "effort": 3}));
+        assert_eq!(ctx, None);
+        assert!(todos.is_empty());
+        assert_eq!(effort, None);
+        assert_eq!(prev, None);
     }
 
     /// A mouse event at `(col, row)`; column and row only matter for drags.
