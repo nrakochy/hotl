@@ -462,6 +462,14 @@ pub struct State {
     /// armed only while a turn runs, so an idle console would keep a timed
     /// notice forever.
     pub copy_notice: Option<usize>,
+    /// The agent whose stream fills the region above the strip (0039): a
+    /// spawn card's anchor id, `None` = main. Survives selector unfocus so
+    /// you can watch a child while composing; a dangling id renders main.
+    pub selected_agent: Option<String>,
+    /// Whether the selector strip owns ↑/↓ (and j/k under vim Normal, D8).
+    pub selector_focus: bool,
+    /// Line offset into the child stream; `None` follows the tail (D7).
+    pub agent_scroll: Option<usize>,
 }
 
 impl State {
@@ -504,7 +512,22 @@ impl State {
             attachments: Vec::new(),
             selection: None,
             copy_notice: None,
+            selected_agent: None,
+            selector_focus: false,
+            agent_scroll: None,
         }
+    }
+
+    /// Anchor ids of every spawn card, transcript order — the selector's
+    /// rows after `main` (0039).
+    pub fn spawn_ids(&self) -> Vec<&str> {
+        self.transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Tool { id, name, .. } if name == "spawn" => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Seed the loadable-skill roster and the completion table from it.
@@ -837,7 +860,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             Vec::new()
         }
         Msg::Scroll(intent) => {
-            crate::scroll::apply(state, intent);
+            scroll_route(state, intent);
             Vec::new()
         }
         Msg::Tick => {
@@ -1544,6 +1567,44 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     if matches!(state.phase, Phase::WaitingEgress { .. }) {
         return on_egress_key(state, key);
     }
+    // 0039 D8: the agent selector. Ctrl-O toggles focus (verified unbound:
+    // the interception layer binds only ctrl-c/ctrl-t, and ctrl-r/e live
+    // inside the editor); it sits above the editor because `Editor::handle`
+    // swallows every Ctrl chord it does not itself bind. The blocked modals
+    // above keep keyboard precedence — focus is retained but inert.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+        if state.selector_focus {
+            state.selector_focus = false;
+        } else if !state.spawn_ids().is_empty() {
+            state.selector_focus = true;
+        }
+        return Vec::new();
+    }
+    if state.selector_focus {
+        // ↑/↓ always; j/k only under vim Normal, where they are motions, not
+        // typing. The view follows the selection live (radio behavior).
+        let vim_normal = state.vim_mode && state.editor.mode() == crate::vim::Mode::Normal;
+        let down = match key.code {
+            KeyCode::Down => Some(true),
+            KeyCode::Up => Some(false),
+            KeyCode::Char('j') if vim_normal => Some(true),
+            KeyCode::Char('k') if vim_normal => Some(false),
+            _ => None,
+        };
+        if let Some(down) = down {
+            move_agent_selection(state, down);
+            return Vec::new();
+        }
+        if key.code == KeyCode::Esc {
+            state.selected_agent = None;
+            state.agent_scroll = None;
+            state.selector_focus = false;
+            return Vec::new();
+        }
+        // Any other key unfocuses and falls through, so typing lands in the
+        // prompt in the same press — the selection sticks (D8).
+        state.selector_focus = false;
+    }
     // Transcript scrolling, unconditional — not gated on vim mode, which is
     // the whole defect (`vim.rs::vertical` was the only emitter and needs
     // `[behavior] vim_mode = true`). PageUp/PageDown have no meaning in a
@@ -1562,7 +1623,15 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         _ => None,
     };
     if let Some(intent) = intent {
-        crate::scroll::apply(state, intent);
+        scroll_route(state, intent);
+        return Vec::new();
+    }
+    // 0039 D8: with a child stream on screen, the first empty-editor esc
+    // returns to main; the second interrupts as before.
+    if key.code == KeyCode::Esc && state.selected_agent.is_some() && state.editor.is_empty() {
+        state.selected_agent = None;
+        state.agent_scroll = None;
+        state.selector_focus = false;
         return Vec::new();
     }
     if key.code == KeyCode::Esc && state.phase != Phase::Idle && state.editor.is_empty() {
@@ -1651,11 +1720,11 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         }
         EditorEvent::OpenExternal(text) => vec![Cmd::OpenEditor(text)],
         EditorEvent::ScrollUp => {
-            crate::scroll::apply(state, crate::scroll::Intent::Up(1));
+            scroll_route(state, crate::scroll::Intent::Up(1));
             Vec::new()
         }
         EditorEvent::ScrollDown => {
-            crate::scroll::apply(state, crate::scroll::Intent::Down(1));
+            scroll_route(state, crate::scroll::Intent::Down(1));
             Vec::new()
         }
         EditorEvent::None => Vec::new(),
@@ -1701,6 +1770,60 @@ pub fn fire_queued_submit(state: &mut State) -> Vec<Cmd> {
         return Vec::new();
     }
     on_key(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+}
+
+/// Move the selector over `[main, spawn₁..spawnₙ]` — clamped, no wrap (D8).
+/// The selection IS the view, so `agent_scroll` resets to follow-tail.
+fn move_agent_selection(state: &mut State, down: bool) {
+    let spawns: Vec<String> = state.spawn_ids().iter().map(|s| s.to_string()).collect();
+    // Index 0 = main; spawn i sits at i+1. A dangling id counts as main.
+    let cur = state
+        .selected_agent
+        .as_ref()
+        .and_then(|id| spawns.iter().position(|s| s == id).map(|i| i + 1))
+        .unwrap_or(0);
+    let next = if down {
+        (cur + 1).min(spawns.len())
+    } else {
+        cur.saturating_sub(1)
+    };
+    state.selected_agent = next.checked_sub(1).map(|i| spawns[i].clone());
+    state.agent_scroll = None;
+}
+
+/// Route a scroll intent (0039 D8): the shown child stream's line offset
+/// when one is selected, the transcript otherwise.
+fn scroll_route(state: &mut State, intent: crate::scroll::Intent) {
+    if state.selected_agent.is_none() {
+        crate::scroll::apply(state, intent);
+        return;
+    }
+    // Line-indexed over the drill-in's rows; the view clamps again at render,
+    // so an over-estimate here only costs a keypress at the boundary.
+    let len = state
+        .selected_agent
+        .as_deref()
+        .and_then(|want| {
+            state.transcript.iter().find_map(|i| match i {
+                TranscriptItem::Tool { id, children, .. } if id == want => Some(children.len() + 2),
+                _ => None,
+            })
+        })
+        .unwrap_or(0);
+    let cur = state.agent_scroll.unwrap_or(len);
+    state.agent_scroll = match intent {
+        crate::scroll::Intent::Top => Some(0),
+        crate::scroll::Intent::Bottom => None,
+        crate::scroll::Intent::Up(n) => Some(cur.saturating_sub(n)),
+        crate::scroll::Intent::Down(n) => {
+            let next = cur.saturating_add(n);
+            if next >= len {
+                None
+            } else {
+                Some(next)
+            }
+        }
+    };
 }
 
 /// The Esc ladder: the first press asks the engine to cancel; the second
@@ -1977,6 +2100,10 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         "clear" => {
             state.transcript.clear();
             state.scroll = Scroll::Follow;
+            // 0039: a focus id must never dangle into the next transcript.
+            state.selected_agent = None;
+            state.selector_focus = false;
+            state.agent_scroll = None;
             notice(
                 state,
                 "cleared the transcript view — the session log and the model's context are untouched"
@@ -3338,6 +3465,142 @@ mod tests {
             &mut s,
             json!({"type":"child_tool","parent_id":"nope","id":"c9","name":"read","summary":"read b.rs","phase":"start"}),
         );
+    }
+
+    fn start_spawn(s: &mut State, id: &str) {
+        upd(
+            s,
+            json!({"type":"tool_start","id":id,"name":"spawn","summary":format!("spawn {id}")}),
+        );
+    }
+
+    /// 0039 D8: ctrl-o toggles selector focus, but only once there is
+    /// something to select.
+    #[test]
+    fn ctrl_o_focuses_the_selector_only_when_a_spawn_exists() {
+        let mut s = State::test_default();
+        ctrl(&mut s, 'o');
+        assert!(!s.selector_focus, "no spawns — nothing to select");
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        ctrl(&mut s, 'o');
+        assert!(s.selector_focus);
+        ctrl(&mut s, 'o');
+        assert!(!s.selector_focus, "ctrl-o toggles");
+    }
+
+    /// 0039 D8: ↑/↓ always, j/k under vim Normal — clamped over
+    /// [main, spawn₁..ₙ], and the view follows the selection live.
+    #[test]
+    fn arrow_and_vim_keys_move_the_selection_and_the_view_follows() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        start_spawn(&mut s, "s2");
+        ctrl(&mut s, 'o');
+        press(&mut s, KeyCode::Down);
+        assert_eq!(
+            s.selected_agent.as_deref(),
+            Some("s1"),
+            "selection IS the view"
+        );
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_agent.as_deref(), Some("s2"));
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.selected_agent.as_deref(), Some("s2"), "clamped, no wrap");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.selected_agent.as_deref(), Some("s1"));
+
+        // j/k move only under vim Normal, where they are motions not typing.
+        s.phase = Phase::Idle;
+        press(&mut s, KeyCode::Esc); // focused: back to main + unfocus
+        assert!(!s.selector_focus);
+        press(&mut s, KeyCode::Esc); // now reaches the editor: Insert → Normal
+        assert_eq!(s.editor.mode(), crate::vim::Mode::Normal);
+        ctrl(&mut s, 'o');
+        press(&mut s, KeyCode::Char('j'));
+        assert_eq!(
+            s.selected_agent.as_deref(),
+            Some("s1"),
+            "j moves down from main"
+        );
+        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.selected_agent, None, "k moves back up to main");
+    }
+
+    /// 0039 D8: any non-selector key unfocuses and falls through, so the
+    /// pressed char lands in the prompt in the same press — and the
+    /// selection sticks, so you can watch a child while composing.
+    #[test]
+    fn typing_unfocuses_the_selector_and_lands_in_the_prompt() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        ctrl(&mut s, 'o');
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Char('h'));
+        assert!(!s.selector_focus, "typing unfocuses");
+        assert_eq!(s.editor.text(), "h", "the char lands in the same press");
+        assert_eq!(s.selected_agent.as_deref(), Some("s1"), "selection sticks");
+    }
+
+    /// 0039 D8: with a child stream shown, the first empty-editor esc only
+    /// returns to main; the second interrupts as before.
+    #[test]
+    fn esc_returns_to_main_before_interrupting() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        ctrl(&mut s, 'o');
+        press(&mut s, KeyCode::Down);
+        ctrl(&mut s, 'o'); // unfocus; the stream stays up
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert!(cmds.is_empty(), "first esc only returns to main: {cmds:?}");
+        assert_eq!(s.selected_agent, None);
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert!(
+            cmds.contains(&Cmd::Cancel),
+            "second esc interrupts as before: {cmds:?}"
+        );
+    }
+
+    /// 0039 D8: scroll keys target the shown child stream's line offset; the
+    /// transcript's own scroll is untouched.
+    #[test]
+    fn scroll_keys_target_the_selected_child_stream() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        for i in 0..12 {
+            upd(
+                &mut s,
+                json!({"type":"child_tool","parent_id":"s1","id":format!("c{i}"),"name":"read","summary":format!("read c{i}.rs"),"phase":"start"}),
+            );
+        }
+        ctrl(&mut s, 'o');
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::PageUp);
+        assert!(s.agent_scroll.is_some(), "pgup scrolls the child stream");
+        assert_eq!(s.scroll, Scroll::Follow, "the transcript never moved");
+        press(&mut s, KeyCode::PageDown);
+        assert_eq!(s.agent_scroll, None, "pgdn returns to follow-tail");
+    }
+
+    /// 0039 D8: `/clear` clears the selection, focus and scroll — a focus id
+    /// must never dangle into the next transcript.
+    #[test]
+    fn clear_drops_selection_and_focus() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        s.phase = Phase::Idle;
+        s.selected_agent = Some("s1".into());
+        s.selector_focus = true;
+        s.agent_scroll = Some(1);
+        type_and_submit(&mut s, "/clear");
+        assert_eq!(s.selected_agent, None);
+        assert!(!s.selector_focus);
+        assert_eq!(s.agent_scroll, None);
     }
 
     /// 0037: several `tool_auto_allowed` frames can park before any of their

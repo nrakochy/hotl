@@ -50,17 +50,34 @@ const THINKING_COLLAPSED_LINES: usize = 3;
 /// tail, behind an `… +N earlier` line (the `THINKING_COLLAPSED_LINES` shape).
 const SPAWN_TAIL_ROWS: usize = 3;
 
-/// The four horizontal bands: transcript, status strip, input, hint. Shared by
-/// `view` and `selection_text` so the render and the copy can never disagree
-/// about where the transcript ends and the input box begins.
-fn regions(state: &State, area: Rect) -> [Rect; 4] {
+/// The five horizontal bands: transcript, status strip, input, agent
+/// selector, hint. Shared by `view` and `selection_text` so the render and
+/// the copy can never disagree about where the transcript ends and the input
+/// box begins. The selector band is height 0 with no spawn cards (0039) —
+/// zero-height keeps every pre-existing row-indexed view test honest.
+fn regions(state: &State, area: Rect) -> [Rect; 5] {
     Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
         Constraint::Length(input_height(state, area)),
+        Constraint::Length(selector_height(state)),
         Constraint::Length(1),
     ])
     .areas(area)
+}
+
+/// The selector's spawn-row window (0039); more spawns overflow to a count.
+const SELECTOR_MAX_SPAWNS: usize = 4;
+
+/// 0 with no spawn cards, else the `main` row + up to `SELECTOR_MAX_SPAWNS`
+/// spawn rows + one overflow line.
+fn selector_height(state: &State) -> u16 {
+    let spawns = state.spawn_ids().len();
+    if spawns == 0 {
+        return 0;
+    }
+    let overflow = usize::from(spawns > SELECTOR_MAX_SPAWNS);
+    (1 + spawns.min(SELECTOR_MAX_SPAWNS) + overflow) as u16
 }
 
 /// The text under a drag selection, read back out of a rendered frame.
@@ -263,10 +280,17 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
 
 pub fn view(state: &State, p: &Palette, cache: &mut TranscriptCache, frame: &mut Frame) {
     let area = frame.area();
-    let [transcript, strip, input, hint] = regions(state, area);
-    render_transcript(state, p, cache, frame, transcript);
+    let [transcript, strip, input, selector, hint] = regions(state, area);
+    // 0039: a selected spawn swaps the whole region above the strip for its
+    // child stream (the Claude Code client pattern — full swap, no modal).
+    // A dangling id falls back to the main transcript.
+    match selected_spawn(state) {
+        Some(item) => render_agent_stream(state, item, p, frame, transcript),
+        None => render_transcript(state, p, cache, frame, transcript),
+    }
     render_strip(state, p, frame, strip);
     render_input(state, p, frame, input);
+    render_selector(state, p, frame, selector);
     render_hint(state, p, frame, hint);
     render_completion(state, p, frame, transcript);
     if matches!(state.phase, Phase::WaitingAsk { .. }) {
@@ -1161,6 +1185,187 @@ fn split_summary(name: &str, summary: &str) -> (String, Vec<String>) {
     (rest.to_string(), Vec::new())
 }
 
+/// Marker glyph + color for a tool status; running wears the wanderer frame
+/// the card's own ticks select.
+fn status_glyph(status: &ToolStatus, ticks: u64, p: &Palette) -> (&'static str, Color) {
+    match status {
+        ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
+            (WORKING_FRAMES[marker_frame(ticks)], p.active)
+        }
+        ToolStatus::Done => ("✓", p.idle),
+        ToolStatus::Failed => ("✗", p.blocked),
+        ToolStatus::Denied => ("⛔", p.blocked),
+    }
+}
+
+/// The spawn card `selected_agent` names, when it still exists — a dangling
+/// id renders the main transcript instead.
+fn selected_spawn(state: &State) -> Option<&TranscriptItem> {
+    let want = state.selected_agent.as_deref()?;
+    state.transcript.iter().find(
+        |i| matches!(i, TranscriptItem::Tool { id, name, .. } if name == "spawn" && id == want),
+    )
+}
+
+/// The agent selector (0039): a `main` row plus a windowed row per spawn.
+/// Radio bullets — the selection IS the view; focus renders it accent+bold.
+fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let spawns: Vec<&TranscriptItem> = state
+        .transcript
+        .iter()
+        .filter(|i| matches!(i, TranscriptItem::Tool { name, .. } if name == "spawn"))
+        .collect();
+    let sel_idx = state
+        .selected_agent
+        .as_deref()
+        .and_then(|want| {
+            spawns
+                .iter()
+                .position(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == want))
+        })
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let row_style = |on: bool| match (on, state.selector_focus) {
+        (true, true) => Style::new().fg(p.accent).bold(),
+        (true, false) => Style::new().fg(p.accent),
+        _ => Style::new().fg(p.muted),
+    };
+    let mut lines = vec![Line::styled(
+        format!("{} main", if sel_idx == 0 { "●" } else { "○" }),
+        row_style(sel_idx == 0),
+    )];
+    // The window keeps the selection visible; the rest overflow to a count.
+    let start = if sel_idx == 0 {
+        0
+    } else {
+        (sel_idx - 1).saturating_sub(SELECTOR_MAX_SPAWNS - 1)
+    };
+    let end = (start + SELECTOR_MAX_SPAWNS).min(spawns.len());
+    for (i, item) in spawns.iter().enumerate().take(end).skip(start) {
+        let TranscriptItem::Tool {
+            summary,
+            status,
+            ticks,
+            children,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        let on = sel_idx == i + 1;
+        let (glyph, _) = status_glyph(status, *ticks, p);
+        let mut text = format!(
+            "{} {glyph} {summary} · {}s",
+            if on { "●" } else { "○" },
+            ticks / anim::TICK_HZ
+        );
+        if !children.is_empty() {
+            text.push_str(&format!(" · {} calls", children.len()));
+        }
+        lines.push(Line::styled(
+            text.chars().take(area.width as usize).collect::<String>(),
+            row_style(on),
+        ));
+    }
+    if spawns.len() > SELECTOR_MAX_SPAWNS {
+        lines.push(Line::styled(
+            format!("  … +{} more", spawns.len() - (end - start)),
+            Style::new().fg(p.faint),
+        ));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// The drill-in (0039 D7): the selected spawn's child stream, full-rect and
+/// cache-free — the content is one card's children (bounded), and the tick
+/// stamps it reads stay OUTSIDE the fingerprint invariant on purpose (no
+/// `item_block` ever sees them). Wrapped behind a muted spine so
+/// `text_col = gutter + 2` holds for drag-copy.
+fn render_agent_stream(
+    state: &State,
+    item: &TranscriptItem,
+    p: &Palette,
+    frame: &mut Frame,
+    area: Rect,
+) {
+    let TranscriptItem::Tool {
+        summary,
+        status,
+        ticks,
+        children,
+        ..
+    } = item
+    else {
+        return;
+    };
+    let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
+    let (glyph, color) = status_glyph(status, *ticks, p);
+    let mut content = vec![
+        Line::from(vec![
+            Span::styled(format!("{glyph} "), Style::new().fg(color).bold()),
+            Span::styled(summary.clone(), Style::new().fg(p.ink).bold()),
+            Span::styled(
+                format!(
+                    " · {}s · {} · esc back",
+                    ticks / anim::TICK_HZ,
+                    if running { "live" } else { "settled" }
+                ),
+                Style::new().fg(p.muted).bold(),
+            ),
+        ]),
+        Line::raw(""),
+    ];
+    for c in children {
+        let (cg, cc) = match c.ok {
+            None => (WORKING_FRAMES[marker_frame(*ticks)], p.active),
+            Some(true) => ("✓", p.idle),
+            Some(false) => ("✗", p.blocked),
+        };
+        let mut spans = vec![
+            Span::styled(format!("{cg} {}", c.name), Style::new().fg(cc)),
+            Span::styled(format!("  {}", c.summary), Style::new().fg(p.ink)),
+        ];
+        // Per-call duration from the parent-tick stamps, settled calls only.
+        if let Some(settled) = c.settled_at {
+            spans.push(Span::styled(
+                format!(
+                    " · {}s",
+                    settled.saturating_sub(c.started_at) / anim::TICK_HZ
+                ),
+                Style::new().fg(p.muted),
+            ));
+        }
+        content.push(Line::from(spans));
+    }
+    let gutter = state.density.gutter();
+    let inner = (area.width as usize).saturating_sub(gutter + 2).max(1);
+    let spine = Spine {
+        marker: "·",
+        cont: " ",
+        marker_style: Style::new().fg(p.muted),
+        cont_style: Style::new(),
+    };
+    let mut rows: Vec<Line> = Vec::new();
+    for cl in &content {
+        for wl in wrap::line(cl, inner) {
+            let first = rows.is_empty();
+            rows.push(spine.wrap(wl, gutter, first));
+        }
+    }
+    // Follow the tail unless scrolled back; a stale offset clamps.
+    let height = area.height as usize;
+    let total = rows.len();
+    let skip = match state.agent_scroll {
+        None => total.saturating_sub(height),
+        Some(o) => o.min(total.saturating_sub(1)),
+    };
+    let visible: Vec<Line> = rows.into_iter().skip(skip).take(height).collect();
+    frame.render_widget(Paragraph::new(visible), area);
+}
+
 fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // The band background is the watch look; blocked = "waiting on you".
     let style = match state.phase {
@@ -1367,8 +1572,17 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         _ if state.editor.search_prompt().is_some() => {
             "type to search · ctrl-r older · enter accept · esc cancel"
         }
+        // 0039 D8: while the selector is focused it owns ↑/↓ (before the
+        // popup does), so its hint outranks the popup's.
+        _ if state.selector_focus => match (state.vim_mode, state.editor.mode()) {
+            (true, Mode::Normal) => "↑↓ select agent · esc main · type to prompt · j/k",
+            _ => "↑↓ select agent · esc main · type to prompt",
+        },
         _ if state.completion.is_some() => "↑↓ pick · tab complete · enter run · esc dismiss",
         _ if copied.is_some() => copied.as_deref().unwrap_or_default(),
+        _ if selected_spawn(state).is_some() => {
+            "esc back to main · pgup/pgdn scroll · ctrl-o agents"
+        }
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
     };
@@ -1509,6 +1723,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "pgup pgdn scroll · ctrl-home/end jump · mouse wheel",
         "drag to select and copy · shift-drag for the terminal's own select",
         "ctrl-t expand model thinking",
+        "ctrl-o sub-agents · ↑↓ select · esc back to main",
         "/help /status /context /cost /clear /quit · /rename /plan /mode /effort /reload",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
@@ -2217,6 +2432,156 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("bash  echo hi · 2s")),
             "card elapsed"
+        );
+    }
+
+    /// 0039: with no spawn cards the selector band is zero-height — every
+    /// pre-existing row-indexed layout test stays honest.
+    #[test]
+    fn no_spawns_means_no_selector_row() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(tool_item("t1", "read", "read x", ToolStatus::Done, 0));
+        assert_eq!(selector_height(&s), 0);
+        let rows = draw(&s);
+        assert!(
+            rows[HINT].contains("history"),
+            "the hint keeps its pinned row: {}",
+            rows[HINT]
+        );
+    }
+
+    /// 0039: `● main` plus one windowed row per spawn — radio bullets, the
+    /// glyph/summary/duration per row, `… +N more` past the window.
+    #[test]
+    fn the_selector_lists_main_and_spawns_with_radio_bullets_and_overflow() {
+        let mut s = State::new(true, "m".into());
+        for i in 1..=6 {
+            s.transcript.push(tool_item(
+                &format!("s{i}"),
+                "spawn",
+                &format!("spawn task {i}"),
+                ToolStatus::Running,
+                0,
+            ));
+        }
+        s.selected_agent = Some("s1".into());
+        let all = draw(&s).join("\n");
+        assert!(all.contains("○ main"), "main unselected: {all}");
+        assert!(
+            all.contains("● ⠑ spawn task 1 · 0s"),
+            "selected spawn: {all}"
+        );
+        assert!(all.contains("○ ⠑ spawn task 2 · 0s"), "sibling row: {all}");
+        assert!(all.contains("… +2 more"), "overflow past the window: {all}");
+    }
+
+    /// 0039 D7: selecting a spawn swaps the WHOLE region above the strip for
+    /// its child stream — no floating modal — while strip, input, selector
+    /// and hint render exactly as before.
+    #[test]
+    fn selecting_a_spawn_swaps_the_full_transcript_region_and_keeps_strip_input_hint() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::User {
+            text: "main prose".into(),
+        });
+        s.transcript
+            .push(spawn_with_children(ToolStatus::Running, 2));
+        s.selected_agent = Some("s1".into());
+        let rows = draw(&s);
+        let all = rows.join("\n");
+        assert!(
+            all.contains("spawn survey · 0s · live · esc back"),
+            "stream header: {all}"
+        );
+        assert!(
+            all.contains("✓ read  read c1.rs"),
+            "settled child row: {all}"
+        );
+        assert!(
+            !all.contains("main prose"),
+            "the transcript region swapped wholesale: {all}"
+        );
+        assert!(
+            all.contains("● ⠑ spawn"),
+            "the selector still renders: {all}"
+        );
+        assert!(
+            rows[HINT].contains("esc back to main · pgup/pgdn scroll · ctrl-o agents"),
+            "stream hint: {}",
+            rows[HINT]
+        );
+    }
+
+    /// 0039 D7: the stream follows its tail while `agent_scroll` is `None`
+    /// and shows the top (header included) when scrolled back.
+    #[test]
+    fn the_agent_stream_follows_its_tail_and_scrolls_back() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(spawn_with_children(ToolStatus::Running, 30));
+        s.selected_agent = Some("s1".into());
+        let all = draw(&s).join("\n");
+        assert!(
+            all.contains("read c30.rs"),
+            "follow-tail shows the newest: {all}"
+        );
+        assert!(
+            !all.contains("read c1.rs "),
+            "the oldest scrolled off: {all}"
+        );
+        s.agent_scroll = Some(0);
+        let all = draw(&s).join("\n");
+        assert!(
+            all.contains("spawn survey · 0s · live · esc back"),
+            "the top shows the header: {all}"
+        );
+        assert!(all.contains("read c1.rs"), "…and the oldest child: {all}");
+        assert!(
+            !all.contains("read c30.rs"),
+            "the newest is below the fold: {all}"
+        );
+    }
+
+    /// 0039 D8: the hint names the selector keys while it is focused, with
+    /// j/k appended only under vim Normal.
+    #[test]
+    fn the_hint_row_names_selector_keys_while_focused() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(tool_item(
+            "s1",
+            "spawn",
+            "spawn survey",
+            ToolStatus::Running,
+            0,
+        ));
+        s.selector_focus = true;
+        let rows = draw(&s);
+        assert!(
+            rows[HINT].contains("↑↓ select agent · esc main · type to prompt"),
+            "focused hint: {}",
+            rows[HINT]
+        );
+        assert!(!rows[HINT].contains("j/k"), "insert mode: no j/k");
+        s.editor
+            .handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let rows = draw(&s);
+        assert!(
+            rows[HINT].contains("· j/k"),
+            "vim Normal appends j/k: {}",
+            rows[HINT]
+        );
+    }
+
+    /// 0039: the help overlay names the selector keys (additive line).
+    #[test]
+    fn the_help_overlay_names_the_agent_selector() {
+        let mut s = State::new(true, "m".into());
+        s.help_open = true;
+        let all = draw(&s).join("\n");
+        assert!(
+            all.contains("ctrl-o sub-agents · ↑↓ select · esc back to main"),
+            "{all}"
         );
     }
 
