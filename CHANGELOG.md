@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-08-19
+
 ### Added
 
 - **The status strip is true at session open** (plan 0040). The
