@@ -6,6 +6,33 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **Tool calls have identity end-to-end** (plan 0037). Every tool lifecycle
+  event now carries the provider's `tool_use` id (additive `"id"` field on
+  `tool_start`/`tool_done`/`tool_denied`/`tool_auto_allowed`/`tool_flagged`
+  frames; the stream schema version stands), and the TUI settles each card by
+  id instead of "newest card with that name" — a turn that fans out N
+  concurrent same-name calls (paged reads of one big file, typically) no
+  longer strands N−1 cards on a frozen `0s` spinner while the last card shows
+  whichever status arrived last. Every running card's elapsed time now ticks,
+  not just the newest, and paged reads name their page:
+  `read notes.vtt · from line 2001 · 500 lines` on cards, asks, and ⚑ notices
+  alike (whole-file reads render exactly as before).
+- **⚑ flag notices coalesce per turn** (plan 0036 follow-up, plan 0037). The
+  bypass floor still evaluates and resolves every call, but the notification
+  now fires once per distinct (tool, class, path, allowed/refused) decision
+  per prompt on every surface at once — six page reads of one outside file
+  are one notice and `flags: 1`, not six. A new prompt re-flags, so nothing
+  stays buried across a long session, and a flagged refusal is never
+  swallowed by an earlier allow-notice on the same file. The strip's `flags`
+  chip therefore counts decisions a human can actually review.
+- **Identical read-only calls in one batch run once** (plan 0037). Calls in a
+  single assistant batch with byte-identical name and input, whose tool is
+  read-only and parallel-safe, execute once and every duplicate still gets
+  its own result on the wire. Mutating duplicates are exempt and still run
+  each time — they are the model's to own and the doom guard's to catch.
+
 ## [0.18.0] - 2026-08-18
 
 ### Changed
