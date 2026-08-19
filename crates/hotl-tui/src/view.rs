@@ -17,20 +17,21 @@ use crate::app::{ContextReport, DiffOp, Phase, Scroll, State, ToolStatus, Transc
 use crate::vim::Mode;
 use crate::wrap;
 
-const SPIN: [&str; 4] = ["◐", "◓", "◑", "◒"];
+// Twin of watch-tui's WORKING_FRAMES — keep in sync.
+const WORKING_FRAMES: [&str; 16] = [
+    "⠑", "⠔", "⣄", "⣠", "⡠", "⠢", "⠚", "⠜", "⠔", "⠤", "⣠", "⣄", "⢄", "⠆", "⠃", "⠑",
+];
 
-/// How fast the running-tool card's spinner turns, in frames per second.
+/// How fast the running-tool card's wanderer steps, in frames per second.
 ///
-/// Deliberately *not* `anim::TICK_HZ`. This is a 4-frame spinner: at the
-/// strip's 30 ticks/sec it would turn over seven times a second and read as a
-/// strobe, where the strip's 10-frame wave reads as smooth. 8/sec is the rate
-/// it turned at before the strip sped up, and it is also what keeps a running
-/// card from invalidating its cached rows on every frame.
-const SPIN_HZ: u64 = 8;
+/// Deliberately *not* `anim::TICK_HZ`: 8/sec matches the cadence of watch's
+/// twin (125 ms), and it is what keeps a running card from invalidating its
+/// cached rows on every frame.
+const MARKER_HZ: u64 = 8;
 
-/// Which spinner frame a card at `ticks` shows.
-fn spin_frame(ticks: u64) -> usize {
-    (ticks * SPIN_HZ / anim::TICK_HZ) as usize % SPIN.len()
+/// Which marker frame a card at `ticks` shows.
+fn marker_frame(ticks: u64) -> usize {
+    (ticks * MARKER_HZ / anim::TICK_HZ) as usize % WORKING_FRAMES.len()
 }
 
 /// How tall the input box may grow before it scrolls instead. Past this the
@@ -211,7 +212,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             ticks,
         } => {
             // Ticks are hashed at the two resolutions they are *rendered* at
-            // — the spinner's frame and the whole seconds of elapsed — not
+            // — the marker's frame and the whole seconds of elapsed — not
             // raw. Hashing raw ticks would re-wrap the card on every frame of
             // a running tool, which is exactly when the cache has to hold.
             (
@@ -220,7 +221,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
                 name,
                 summary,
                 ticks / anim::TICK_HZ,
-                spin_frame(*ticks),
+                marker_frame(*ticks),
             )
                 .hash(&mut h);
             match status {
@@ -683,7 +684,7 @@ fn item_block<'a>(
         } => {
             let (marker, color) = match status {
                 ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
-                    (SPIN[spin_frame(*ticks)], p.active)
+                    (WORKING_FRAMES[marker_frame(*ticks)], p.active)
                 }
                 ToolStatus::Done => ("✓", p.idle),
                 ToolStatus::Failed => ("✗", p.blocked),
@@ -2774,9 +2775,9 @@ mod tests {
         }
         let card_rewraps = cache.rewraps() - 3;
         assert!(
-            card_rewraps <= SPIN_HZ + 1,
+            card_rewraps <= MARKER_HZ + 1,
             "a second of tool spin re-wrapped {card_rewraps} times, want <= {}",
-            SPIN_HZ + 1
+            MARKER_HZ + 1
         );
 
         // Streaming text: only the assistant item is touched per delta.
@@ -2792,6 +2793,23 @@ mod tests {
             10,
             "one re-wrap per delta — the user turn and the tool card must not move"
         );
+    }
+
+    #[test]
+    fn running_marker_walks_the_watch_wanderer() {
+        // Twin of watch-tui's WORKING_FRAMES; a drifted copy shows two
+        // different organisms for the same work.
+        assert_eq!(WORKING_FRAMES.len(), 16);
+        assert_eq!(WORKING_FRAMES[0], "⠑");
+        assert_eq!(WORKING_FRAMES[8], "⠔");
+        // 8 fps over 16 frames: one full wander every 2 seconds, every frame
+        // shown exactly once.
+        let walked: Vec<usize> = (0..2 * anim::TICK_HZ).map(marker_frame).collect();
+        assert_eq!(walked.first(), Some(&0));
+        assert_eq!(walked.last(), Some(&15));
+        let mut distinct = walked;
+        distinct.dedup();
+        assert_eq!(distinct.len(), 16);
     }
 
     #[test]
