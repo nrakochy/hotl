@@ -8,6 +8,22 @@ semver promise of their own.
 
 ### Changed
 
+- **Sub-agent streams are vim-navigable, and spawn cards stay one line**
+  (plan 0042, the 0039 follow-up). The `ctrl-o` selector is gone — it
+  required a vim Normal mode that was unreachable mid-turn, so j/k never
+  worked. In its place: with `vim_mode = true`, an empty input and Normal
+  mode, `j`/`k` walk a highlighted **transcript cursor** over items and
+  `Enter` on a spawn card opens that agent's live stream. `Esc` gets a
+  predictable ladder — in Insert it only enters Normal (it never interrupts
+  the turn); in Normal it backs out one rung per press: stream → main,
+  cursor → follow-tail, then interrupt. A running spawn card no longer
+  churns a three-row child tail at tick rate: it stays one calm line
+  (`spawn  survey · N calls · Ns · <latest child call>`), with the full call
+  list in the drill-in. The band below the input is now a passive per-agent
+  summary. With `vim_mode = false` (the default) nothing changes; note the
+  drill-in currently has no non-vim path (mouse selection remains out of
+  scope).
+
 - **`nix flake check` no longer pays thin-LTO link costs for test binaries**
   (plan 0041). The check derivation's checkPhase compiles ~70 test binaries
   in release mode, so the thin-LTO + `codegen-units = 1` profile v0.16.0
