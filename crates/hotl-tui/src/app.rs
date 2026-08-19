@@ -471,13 +471,16 @@ pub struct State {
     /// notice forever.
     pub copy_notice: Option<usize>,
     /// The agent whose stream fills the region above the strip (0039): a
-    /// spawn card's anchor id, `None` = main. Survives selector unfocus so
-    /// you can watch a child while composing; a dangling id renders main.
+    /// spawn card's anchor id, `None` = main. Survives back-to-main and
+    /// typing so you can watch a child while composing; a dangling id
+    /// renders main.
     pub selected_agent: Option<String>,
-    /// Whether the selector strip owns ↑/↓ (and j/k under vim Normal, D8).
-    pub selector_focus: bool,
     /// Line offset into the child stream; `None` follows the tail (D7).
     pub agent_scroll: Option<usize>,
+    /// The transcript cursor (0042 D1): the highlighted item j/k walk in vim
+    /// Normal with an empty buffer. `None` = disengaged. Deliberately outside
+    /// the view cache's `Geometry` — the highlight is a post-cache patch.
+    pub cursor: Option<usize>,
 }
 
 impl State {
@@ -522,8 +525,8 @@ impl State {
             selection: None,
             copy_notice: None,
             selected_agent: None,
-            selector_focus: false,
             agent_scroll: None,
+            cursor: None,
         }
     }
 
@@ -1515,6 +1518,10 @@ fn modal_active(state: &State) -> bool {
 /// something else owns the keyboard (`modal_active`) the popup stays closed
 /// regardless of what the buffer says.
 fn refresh(state: &mut State) {
+    // 0042 D1: typing disengages the transcript cursor.
+    if !state.editor.is_empty() {
+        state.cursor = None;
+    }
     if modal_active(state) {
         state.completion = None;
         return;
@@ -1583,44 +1590,6 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     if matches!(state.phase, Phase::WaitingEgress { .. }) {
         return on_egress_key(state, key);
     }
-    // 0039 D8: the agent selector. Ctrl-O toggles focus (verified unbound:
-    // the interception layer binds only ctrl-c/ctrl-t, and ctrl-r/e live
-    // inside the editor); it sits above the editor because `Editor::handle`
-    // swallows every Ctrl chord it does not itself bind. The blocked modals
-    // above keep keyboard precedence — focus is retained but inert.
-    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
-        if state.selector_focus {
-            state.selector_focus = false;
-        } else if !state.spawn_ids().is_empty() {
-            state.selector_focus = true;
-        }
-        return Vec::new();
-    }
-    if state.selector_focus {
-        // ↑/↓ always; j/k only under vim Normal, where they are motions, not
-        // typing. The view follows the selection live (radio behavior).
-        let vim_normal = state.vim_mode && state.editor.mode() == crate::vim::Mode::Normal;
-        let down = match key.code {
-            KeyCode::Down => Some(true),
-            KeyCode::Up => Some(false),
-            KeyCode::Char('j') if vim_normal => Some(true),
-            KeyCode::Char('k') if vim_normal => Some(false),
-            _ => None,
-        };
-        if let Some(down) = down {
-            move_agent_selection(state, down);
-            return Vec::new();
-        }
-        if key.code == KeyCode::Esc {
-            state.selected_agent = None;
-            state.agent_scroll = None;
-            state.selector_focus = false;
-            return Vec::new();
-        }
-        // Any other key unfocuses and falls through, so typing lands in the
-        // prompt in the same press — the selection sticks (D8).
-        state.selector_focus = false;
-    }
     // Transcript scrolling, unconditional — not gated on vim mode, which is
     // the whole defect (`vim.rs::vertical` was the only emitter and needs
     // `[behavior] vim_mode = true`). PageUp/PageDown have no meaning in a
@@ -1642,16 +1611,25 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         scroll_route(state, intent);
         return Vec::new();
     }
-    // 0039 D8: with a child stream on screen, the first empty-editor esc
-    // returns to main; the second interrupts as before.
-    if key.code == KeyCode::Esc && state.selected_agent.is_some() && state.editor.is_empty() {
-        state.selected_agent = None;
-        state.agent_scroll = None;
-        state.selector_focus = false;
-        return Vec::new();
-    }
-    if key.code == KeyCode::Esc && state.phase != Phase::Idle && state.editor.is_empty() {
-        return interrupt_or_detach(state);
+    // The esc ladder (0042 D2): child stream shown → back to main (cursor
+    // kept); cursor engaged → disengage to Follow; else a busy turn
+    // interrupts. Under vim this fires only from Normal with nothing pending
+    // (Insert esc always reaches the editor); an open completion popup keeps
+    // its own esc, layered below.
+    if key.code == KeyCode::Esc && esc_at_top_level(state) {
+        if state.selected_agent.is_some() {
+            state.selected_agent = None;
+            state.agent_scroll = None;
+            return Vec::new();
+        }
+        if state.cursor.is_some() {
+            state.cursor = None;
+            state.scroll = Scroll::Follow;
+            return Vec::new();
+        }
+        if state.phase != Phase::Idle && state.completion.is_none() {
+            return interrupt_or_detach(state);
+        }
     }
     if key.code == KeyCode::Char('?') && state.editor.is_empty() {
         state.help_open = true;
@@ -1687,6 +1665,20 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             KeyCode::Enter => accept_selected(state),
             _ => {}
         }
+    }
+    // 0042 D1: Enter with the cursor engaged opens the spawn card under it
+    // and is inert anywhere else. Gated on the cursor (vim-only reachable),
+    // so non-vim Enter is untouched.
+    if key.code == KeyCode::Enter && state.cursor.is_some() && state.editor.is_empty() {
+        if let Some(TranscriptItem::Tool { id, name, .. }) =
+            state.cursor.and_then(|i| state.transcript.get(i))
+        {
+            if name == "spawn" {
+                state.selected_agent = Some(id.clone());
+                state.agent_scroll = None;
+            }
+        }
+        return Vec::new();
     }
     let event = state.editor.handle(key);
     refresh(state);
@@ -1735,12 +1727,24 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             }
         }
         EditorEvent::OpenExternal(text) => vec![Cmd::OpenEditor(text)],
+        // Vim j/k (0042 D1): the shown child stream scrolls as before;
+        // otherwise the transcript cursor engages and moves. The wheel and
+        // page keys keep calling `scroll_route` — they move the window,
+        // never the cursor.
         EditorEvent::ScrollUp => {
-            scroll_route(state, crate::scroll::Intent::Up(1));
+            if state.selected_agent.is_some() {
+                scroll_route(state, crate::scroll::Intent::Up(1));
+            } else {
+                cursor_move(state, true);
+            }
             Vec::new()
         }
         EditorEvent::ScrollDown => {
-            scroll_route(state, crate::scroll::Intent::Down(1));
+            if state.selected_agent.is_some() {
+                scroll_route(state, crate::scroll::Intent::Down(1));
+            } else {
+                cursor_move(state, false);
+            }
             Vec::new()
         }
         EditorEvent::None => Vec::new(),
@@ -1788,23 +1792,39 @@ pub fn fire_queued_submit(state: &mut State) -> Vec<Cmd> {
     on_key(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
 }
 
-/// Move the selector over `[main, spawn₁..spawnₙ]` — clamped, no wrap (D8).
-/// The selection IS the view, so `agent_scroll` resets to follow-tail.
-fn move_agent_selection(state: &mut State, down: bool) {
-    let spawns: Vec<String> = state.spawn_ids().iter().map(|s| s.to_string()).collect();
-    // Index 0 = main; spawn i sits at i+1. A dangling id counts as main.
-    let cur = state
-        .selected_agent
-        .as_ref()
-        .and_then(|id| spawns.iter().position(|s| s == id).map(|i| i + 1))
-        .unwrap_or(0);
-    let next = if down {
-        (cur + 1).min(spawns.len())
+/// Is this esc the app's to walk the ladder with (0042 D2)? Vim: Normal with
+/// nothing pending — Insert esc always reaches the editor and never
+/// interrupts. Non-vim: the shipped empty-editor rule, unchanged.
+fn esc_at_top_level(state: &State) -> bool {
+    if state.vim_mode {
+        state.editor.mode() == crate::vim::Mode::Normal && !state.editor.pending_active()
     } else {
-        cur.saturating_sub(1)
-    };
-    state.selected_agent = next.checked_sub(1).map(|i| spawns[i].clone());
-    state.agent_scroll = None;
+        state.editor.is_empty()
+    }
+}
+
+/// The transcript cursor (0042 D1). The first press engages at the last item
+/// (`Follow`) or the window top (`At(i)`); then k walks up, j walks down, and
+/// j past the last item disengages back to Follow.
+fn cursor_move(state: &mut State, up: bool) {
+    let len = state.transcript.len();
+    if len == 0 {
+        return;
+    }
+    match state.cursor {
+        None => {
+            state.cursor = Some(match state.scroll {
+                Scroll::Follow => len - 1,
+                Scroll::At(i) => i.min(len - 1),
+            });
+        }
+        Some(i) if up => state.cursor = Some(i.saturating_sub(1)),
+        Some(i) if i + 1 >= len => {
+            state.cursor = None;
+            state.scroll = Scroll::Follow;
+        }
+        Some(i) => state.cursor = Some(i + 1),
+    }
 }
 
 /// Route a scroll intent (0039 D8): the shown child stream's line offset
@@ -2116,10 +2136,11 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         "clear" => {
             state.transcript.clear();
             state.scroll = Scroll::Follow;
-            // 0039: a focus id must never dangle into the next transcript.
+            // 0039/0042: neither a selection id nor a cursor index may
+            // dangle into the next transcript.
             state.selected_agent = None;
-            state.selector_focus = false;
             state.agent_scroll = None;
+            state.cursor = None;
             notice(
                 state,
                 "cleared the transcript view — the session log and the model's context are untouched"
@@ -3500,94 +3521,112 @@ mod tests {
         );
     }
 
-    /// 0039 D8: ctrl-o toggles selector focus, but only once there is
-    /// something to select.
+    /// 0042 D1: the first press engages the cursor at the last item (Follow)
+    /// or the window top (At); k walks up, j walks down, and j past the last
+    /// item disengages back to Follow.
     #[test]
-    fn ctrl_o_focuses_the_selector_only_when_a_spawn_exists() {
+    fn jk_engage_and_move_the_transcript_cursor() {
         let mut s = State::test_default();
-        ctrl(&mut s, 'o');
-        assert!(!s.selector_focus, "no spawns — nothing to select");
-        s.phase = Phase::Sampling { ticks: 0 };
-        start_spawn(&mut s, "s1");
-        ctrl(&mut s, 'o');
-        assert!(s.selector_focus);
-        ctrl(&mut s, 'o');
-        assert!(!s.selector_focus, "ctrl-o toggles");
+        s.transcript = notices(5);
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.cursor, Some(4), "engages at the last item");
+        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.cursor, Some(3));
+        press(&mut s, KeyCode::Char('j'));
+        assert_eq!(s.cursor, Some(4));
+        press(&mut s, KeyCode::Char('j'));
+        assert_eq!(s.cursor, None, "j past the tail disengages");
+        assert_eq!(s.scroll, Scroll::Follow);
+
+        // A scrolled-back window engages at its top item instead.
+        s.scroll = Scroll::At(2);
+        press(&mut s, KeyCode::Char('j'));
+        assert_eq!(s.cursor, Some(2), "engages at the window top");
     }
 
-    /// 0039 D8: ↑/↓ always, j/k under vim Normal — clamped over
-    /// [main, spawn₁..ₙ], and the view follows the selection live.
+    /// 0042 D1: Enter with the cursor on a spawn card opens its stream —
+    /// the drill-in 0039 hung off the deleted ctrl-o selector.
     #[test]
-    fn arrow_and_vim_keys_move_the_selection_and_the_view_follows() {
+    fn enter_on_a_spawn_card_opens_its_stream() {
         let mut s = State::test_default();
         s.phase = Phase::Sampling { ticks: 0 };
         start_spawn(&mut s, "s1");
-        start_spawn(&mut s, "s2");
-        ctrl(&mut s, 'o');
-        press(&mut s, KeyCode::Down);
-        assert_eq!(
-            s.selected_agent.as_deref(),
-            Some("s1"),
-            "selection IS the view"
-        );
-        press(&mut s, KeyCode::Down);
-        assert_eq!(s.selected_agent.as_deref(), Some("s2"));
-        press(&mut s, KeyCode::Down);
-        assert_eq!(s.selected_agent.as_deref(), Some("s2"), "clamped, no wrap");
-        press(&mut s, KeyCode::Up);
+        press(&mut s, KeyCode::Esc); // Insert → Normal, never an interrupt
+        press(&mut s, KeyCode::Char('k')); // engage on the spawn card
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.selected_agent.as_deref(), Some("s1"));
+        assert_eq!(s.agent_scroll, None);
+    }
+
+    /// 0042 D1: Enter anywhere else is inert while the cursor is engaged —
+    /// it must not submit the empty prompt or open anything.
+    #[test]
+    fn enter_off_a_spawn_card_is_inert_while_the_cursor_is_engaged() {
+        let mut s = State::test_default();
+        s.transcript = notices(3);
+        s.phase = Phase::Sampling { ticks: 0 };
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Char('k'));
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.selected_agent, None);
+        assert_eq!(s.transcript.len(), 3, "nothing submitted");
+        assert_eq!(s.cursor, Some(2), "the cursor stays engaged");
+    }
+
+    /// 0042 D1: a buffer going non-empty disengages the cursor, and the
+    /// typed char lands in the prompt.
+    #[test]
+    fn typing_disengages_the_cursor_and_lands_in_the_prompt() {
+        let mut s = State::test_default();
+        s.transcript = notices(3);
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.cursor, Some(2));
+        press(&mut s, KeyCode::Char('i')); // back to Insert
+        press(&mut s, KeyCode::Char('h'));
+        assert_eq!(s.editor.text(), "h", "the char lands in the prompt");
+        assert_eq!(s.cursor, None, "typing disengages");
+    }
+
+    /// 0042 D2: esc in Insert always reaches the editor — empty buffer and
+    /// running turn included. Pre-0042 this esc interrupted the turn, which
+    /// made vim Normal unreachable mid-turn.
+    #[test]
+    fn esc_in_insert_enters_normal_and_never_interrupts() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert!(!cmds.contains(&Cmd::Cancel), "{cmds:?}");
+        assert_eq!(s.editor.mode(), crate::vim::Mode::Normal);
+    }
+
+    /// 0042 D2: esc in Normal walks the ladder — stream → main (cursor
+    /// kept), cursor → Follow, then interrupt.
+    #[test]
+    fn esc_in_normal_walks_stream_then_cursor_then_interrupt() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Char('k')); // engage on the spawn card
+        press(&mut s, KeyCode::Enter); // open its stream
         assert_eq!(s.selected_agent.as_deref(), Some("s1"));
 
-        // j/k move only under vim Normal, where they are motions not typing.
-        s.phase = Phase::Idle;
-        press(&mut s, KeyCode::Esc); // focused: back to main + unfocus
-        assert!(!s.selector_focus);
-        press(&mut s, KeyCode::Esc); // now reaches the editor: Insert → Normal
-        assert_eq!(s.editor.mode(), crate::vim::Mode::Normal);
-        ctrl(&mut s, 'o');
-        press(&mut s, KeyCode::Char('j'));
-        assert_eq!(
-            s.selected_agent.as_deref(),
-            Some("s1"),
-            "j moves down from main"
-        );
-        press(&mut s, KeyCode::Char('k'));
-        assert_eq!(s.selected_agent, None, "k moves back up to main");
-    }
-
-    /// 0039 D8: any non-selector key unfocuses and falls through, so the
-    /// pressed char lands in the prompt in the same press — and the
-    /// selection sticks, so you can watch a child while composing.
-    #[test]
-    fn typing_unfocuses_the_selector_and_lands_in_the_prompt() {
-        let mut s = State::test_default();
-        s.phase = Phase::Sampling { ticks: 0 };
-        start_spawn(&mut s, "s1");
-        ctrl(&mut s, 'o');
-        press(&mut s, KeyCode::Down);
-        press(&mut s, KeyCode::Char('h'));
-        assert!(!s.selector_focus, "typing unfocuses");
-        assert_eq!(s.editor.text(), "h", "the char lands in the same press");
-        assert_eq!(s.selected_agent.as_deref(), Some("s1"), "selection sticks");
-    }
-
-    /// 0039 D8: with a child stream shown, the first empty-editor esc only
-    /// returns to main; the second interrupts as before.
-    #[test]
-    fn esc_returns_to_main_before_interrupting() {
-        let mut s = State::test_default();
-        s.phase = Phase::Sampling { ticks: 0 };
-        start_spawn(&mut s, "s1");
-        ctrl(&mut s, 'o');
-        press(&mut s, KeyCode::Down);
-        ctrl(&mut s, 'o'); // unfocus; the stream stays up
-        let cmds = press(&mut s, KeyCode::Esc);
-        assert!(cmds.is_empty(), "first esc only returns to main: {cmds:?}");
+        let cmds = press(&mut s, KeyCode::Esc); // stream → main
+        assert!(cmds.is_empty(), "{cmds:?}");
         assert_eq!(s.selected_agent, None);
-        let cmds = press(&mut s, KeyCode::Esc);
-        assert!(
-            cmds.contains(&Cmd::Cancel),
-            "second esc interrupts as before: {cmds:?}"
-        );
+        assert_eq!(s.cursor, Some(0), "back to main keeps the cursor");
+
+        let cmds = press(&mut s, KeyCode::Esc); // cursor → Follow
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.cursor, None);
+        assert_eq!(s.scroll, Scroll::Follow);
+
+        let cmds = press(&mut s, KeyCode::Esc); // now the turn
+        assert!(cmds.contains(&Cmd::Cancel), "{cmds:?}");
     }
 
     /// 0039 D8: scroll keys target the shown child stream's line offset; the
@@ -3603,8 +3642,7 @@ mod tests {
                 json!({"type":"child_tool","parent_id":"s1","id":format!("c{i}"),"name":"read","summary":format!("read c{i}.rs"),"phase":"start"}),
             );
         }
-        ctrl(&mut s, 'o');
-        press(&mut s, KeyCode::Down);
+        s.selected_agent = Some("s1".into());
         press(&mut s, KeyCode::PageUp);
         assert!(s.agent_scroll.is_some(), "pgup scrolls the child stream");
         assert_eq!(s.scroll, Scroll::Follow, "the transcript never moved");
@@ -3612,21 +3650,63 @@ mod tests {
         assert_eq!(s.agent_scroll, None, "pgdn returns to follow-tail");
     }
 
-    /// 0039 D8: `/clear` clears the selection, focus and scroll — a focus id
-    /// must never dangle into the next transcript.
+    /// 0042 D1: the wheel and page keys move the window and never the
+    /// cursor; the next j/k snaps the cursor back on screen render-side.
     #[test]
-    fn clear_drops_selection_and_focus() {
+    fn wheel_and_page_keys_move_the_window_not_the_cursor() {
+        let mut s = State::test_default();
+        s.transcript = notices(30);
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.cursor, Some(29));
+        update(&mut s, Msg::Scroll(crate::scroll::Intent::Up(3)));
+        assert_eq!(s.scroll, Scroll::At(27), "the wheel moves the window");
+        assert_eq!(s.cursor, Some(29), "…not the cursor");
+        press(&mut s, KeyCode::PageUp);
+        assert_eq!(s.scroll, Scroll::At(17));
+        assert_eq!(s.cursor, Some(29));
+    }
+
+    /// 0039/0042: `/clear` drops the cursor, the selection and its scroll —
+    /// neither an id nor an index may dangle into the next transcript.
+    #[test]
+    fn clear_drops_cursor_selection_and_scroll() {
         let mut s = State::test_default();
         s.phase = Phase::Sampling { ticks: 0 };
         start_spawn(&mut s, "s1");
         s.phase = Phase::Idle;
         s.selected_agent = Some("s1".into());
-        s.selector_focus = true;
         s.agent_scroll = Some(1);
+        s.cursor = Some(0);
         type_and_submit(&mut s, "/clear");
         assert_eq!(s.selected_agent, None);
-        assert!(!s.selector_focus);
         assert_eq!(s.agent_scroll, None);
+        assert_eq!(s.cursor, None);
+    }
+
+    /// vim_mode = false stays byte-identical (0042): empty-editor esc still
+    /// interrupts in one press.
+    #[test]
+    fn esc_with_empty_editor_still_interrupts_without_vim_mode() {
+        let mut s = State::new(false, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        let cmds = press(&mut s, KeyCode::Esc);
+        assert!(cmds.contains(&Cmd::Cancel), "{cmds:?}");
+    }
+
+    /// vim_mode = false stays byte-identical (0042): Enter submits — the
+    /// cursor intercept can never engage without vim.
+    #[test]
+    fn enter_still_submits_without_vim_mode() {
+        let mut s = State::new(false, "m".into());
+        s.transcript = notices(3);
+        type_str(&mut s, "hi");
+        let cmds = press(&mut s, KeyCode::Enter);
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_))),
+            "{cmds:?}"
+        );
+        assert_eq!(s.cursor, None, "no cursor ever engages without vim");
     }
 
     /// 0037: several `tool_auto_allowed` frames can park before any of their
@@ -4045,6 +4125,7 @@ mod tests {
     fn esc_interrupts_then_second_esc_takes_control_back() {
         let mut s = State::test_default();
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        press(&mut s, KeyCode::Esc); // Insert → Normal (0042 D2)
         let cmds = press(&mut s, KeyCode::Esc);
         assert!(matches!(cmds[..], [Cmd::Cancel]));
         assert!(s.interrupt_sent);
@@ -4070,8 +4151,9 @@ mod tests {
     fn a_detached_turns_updates_and_asks_cannot_reclaim_the_screen() {
         let mut s = State::test_default();
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
-        press(&mut s, KeyCode::Esc);
-        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Esc); // Insert → Normal (0042 D2)
+        press(&mut s, KeyCode::Esc); // interrupt
+        press(&mut s, KeyCode::Esc); // detach
         let items = s.transcript.len();
         upd(&mut s, json!({"type":"text_delta","text":"zombie"}));
         assert_eq!(
@@ -4101,8 +4183,10 @@ mod tests {
     fn a_detached_turns_late_result_is_absorbed_without_clobbering_a_new_turn() {
         let mut s = State::test_default();
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
-        press(&mut s, KeyCode::Esc);
-        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Esc); // Insert → Normal (0042 D2)
+        press(&mut s, KeyCode::Esc); // interrupt
+        press(&mut s, KeyCode::Esc); // detach
+        press(&mut s, KeyCode::Char('i')); // back to Insert to type
         type_str(&mut s, "hi");
         press(&mut s, KeyCode::Enter);
         assert!(matches!(s.phase, Phase::Sampling { .. }));
@@ -4135,7 +4219,8 @@ mod tests {
     fn ctrl_c_after_an_esc_interrupt_quits() {
         let mut s = State::test_default();
         s.phase = Phase::Streaming { ticks: 0, chars: 0 };
-        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Esc); // Insert → Normal (0042 D2)
+        press(&mut s, KeyCode::Esc); // interrupt
         assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Quit]));
     }
 
@@ -4282,8 +4367,9 @@ mod tests {
         // Turn end restarts the cycle from 0 — here via the esc-detach ladder
         // (the other reset is on a normal prompt result).
         s.phase = Phase::Sampling { ticks: 0 };
-        s.interrupt_sent = true; // first esc already sent
-        press(&mut s, KeyCode::Esc); // second esc abandons the turn
+        s.interrupt_sent = true; // an interrupt esc already sent
+        press(&mut s, KeyCode::Esc); // Insert → Normal (0042 D2)
+        press(&mut s, KeyCode::Esc); // the next esc abandons the turn
         assert_eq!(s.phase, Phase::Idle);
         assert_eq!(s.work_ticks, 0, "a new turn restarts the animation cycle");
     }

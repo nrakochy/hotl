@@ -1207,8 +1207,9 @@ fn selected_spawn(state: &State) -> Option<&TranscriptItem> {
     )
 }
 
-/// The agent selector (0039): a `main` row plus a windowed row per spawn.
-/// Radio bullets — the selection IS the view; focus renders it accent+bold.
+/// The agent band (0039, passive since 0042 D4): a `main` row plus a
+/// windowed row per spawn, at-a-glance only. `●` marks the shown stream
+/// (main when none); no focus state — navigation lives in the transcript.
 fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     if area.height == 0 {
         return;
@@ -1228,10 +1229,12 @@ fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         })
         .map(|i| i + 1)
         .unwrap_or(0);
-    let row_style = |on: bool| match (on, state.selector_focus) {
-        (true, true) => Style::new().fg(p.accent).bold(),
-        (true, false) => Style::new().fg(p.accent),
-        _ => Style::new().fg(p.muted),
+    let row_style = |on: bool| {
+        if on {
+            Style::new().fg(p.accent)
+        } else {
+            Style::new().fg(p.muted)
+        }
     };
     let mut lines = vec![Line::styled(
         format!("{} main", if sel_idx == 0 { "●" } else { "○" }),
@@ -1572,17 +1575,12 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         _ if state.editor.search_prompt().is_some() => {
             "type to search · ctrl-r older · enter accept · esc cancel"
         }
-        // 0039 D8: while the selector is focused it owns ↑/↓ (before the
-        // popup does), so its hint outranks the popup's.
-        _ if state.selector_focus => match (state.vim_mode, state.editor.mode()) {
-            (true, Mode::Normal) => "↑↓ select agent · esc main · type to prompt · j/k",
-            _ => "↑↓ select agent · esc main · type to prompt",
-        },
         _ if state.completion.is_some() => "↑↓ pick · tab complete · enter run · esc dismiss",
         _ if copied.is_some() => copied.as_deref().unwrap_or_default(),
-        _ if selected_spawn(state).is_some() => {
-            "esc back to main · pgup/pgdn scroll · ctrl-o agents"
-        }
+        _ if selected_spawn(state).is_some() => "esc back to main · pgup/pgdn scroll",
+        // 0042 D1: the engaged transcript cursor (requires an empty buffer,
+        // so it can never collide with the popup's hint above).
+        _ if state.cursor.is_some() => "j/k move · enter open agent · esc back",
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
     };
@@ -1723,7 +1721,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "pgup pgdn scroll · ctrl-home/end jump · mouse wheel",
         "drag to select and copy · shift-drag for the terminal's own select",
         "ctrl-t expand model thinking",
-        "ctrl-o sub-agents · ↑↓ select · esc back to main",
+        "j/k transcript cursor · enter open agent · esc back",
         "/help /status /context /cost /clear /quit · /rename /plan /mode /effort /reload",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
@@ -2507,7 +2505,7 @@ mod tests {
             "the selector still renders: {all}"
         );
         assert!(
-            rows[HINT].contains("esc back to main · pgup/pgdn scroll · ctrl-o agents"),
+            rows[HINT].contains("esc back to main · pgup/pgdn scroll"),
             "stream hint: {}",
             rows[HINT]
         );
@@ -2543,10 +2541,9 @@ mod tests {
         );
     }
 
-    /// 0039 D8: the hint names the selector keys while it is focused, with
-    /// j/k appended only under vim Normal.
+    /// 0042 D1: the hint names the cursor keys while it is engaged.
     #[test]
-    fn the_hint_row_names_selector_keys_while_focused() {
+    fn the_hint_row_names_the_cursor_keys_while_engaged() {
         let mut s = State::new(true, "m".into());
         s.transcript.push(tool_item(
             "s1",
@@ -2555,32 +2552,23 @@ mod tests {
             ToolStatus::Running,
             0,
         ));
-        s.selector_focus = true;
+        s.cursor = Some(0);
         let rows = draw(&s);
         assert!(
-            rows[HINT].contains("↑↓ select agent · esc main · type to prompt"),
-            "focused hint: {}",
-            rows[HINT]
-        );
-        assert!(!rows[HINT].contains("j/k"), "insert mode: no j/k");
-        s.editor
-            .handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        let rows = draw(&s);
-        assert!(
-            rows[HINT].contains("· j/k"),
-            "vim Normal appends j/k: {}",
+            rows[HINT].contains("j/k move · enter open agent · esc back"),
+            "engaged hint: {}",
             rows[HINT]
         );
     }
 
-    /// 0039: the help overlay names the selector keys (additive line).
+    /// 0042: the help overlay names the transcript cursor.
     #[test]
     fn the_help_overlay_names_the_agent_selector() {
         let mut s = State::new(true, "m".into());
         s.help_open = true;
         let all = draw(&s).join("\n");
         assert!(
-            all.contains("ctrl-o sub-agents · ↑↓ select · esc back to main"),
+            all.contains("j/k transcript cursor · enter open agent · esc back"),
             "{all}"
         );
     }
