@@ -6,6 +6,18 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **`nix flake check` no longer pays thin-LTO link costs for test binaries**
+  (plan 0041). The check derivation's checkPhase compiles ~70 test binaries
+  in release mode, so the thin-LTO + `codegen-units = 1` profile v0.16.0
+  added for shipped-binary parity turned it into ~28 minutes of link work
+  for tests that run in seconds — the critical path of every master push.
+  The check build now disables both knobs via `CARGO_PROFILE_RELEASE_*` env
+  overrides (measured locally: the full darwin check drops from ~28 to ~3.5
+  minutes); the shipped package, `cargo install`, and nixpkgs-style builds
+  keep the LTO'd release profile untouched.
+
 ## [0.20.0] - 2026-08-19
 
 ### Added
