@@ -120,6 +120,9 @@ fn scripted_factory_recording(
             // it rides the open reply (0030 Task 8).
             default_effort: Some("xhigh".into()),
             goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             // A fixed probe, so the golden scenario can pin that the additive
             // `undoStatus` field rides the prompt reply (0035 decision 11).
@@ -184,6 +187,9 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             plan: false,
             default_effort: None,
             goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             undo: None,
         })
@@ -331,6 +337,228 @@ async fn keep_params_are_rejected_without_a_fork_and_against_each_other() {
             .unwrap_or_default()
             .contains("mutually exclusive"),
         "{err}"
+    );
+}
+
+/// A factory whose opened session carries inherited state (0040): seed items
+/// in the engine's Head, a todo list, the given effort tri-state, and a
+/// lineage model that differs from the running one — everything the open
+/// reply must surface so the status strip is true at open (§5.7).
+fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactory {
+    Box::new(move |_spec| {
+        let dir = tempfile::tempdir().expect("tmp");
+        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        std::mem::forget(dir);
+        let todos = vec![hotl_types::Todo {
+            content: "wire the gate".into(),
+            status: hotl_types::TodoStatus::Pending,
+            active_form: None,
+        }];
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+                    "ok",
+                )])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                snapshots: None,
+                hooks: None,
+                initial_items: vec![hotl_types::Item::User {
+                    text: "an inherited turn's worth of context".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                }],
+                initial_todos: todos.clone(),
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: Some("xhigh".into()),
+            goal: None,
+            todos,
+            effort: effort.clone(),
+            previous_model: Some("old-m".into()),
+            session_id,
+            undo: None,
+        })
+    })
+}
+
+/// §5.7 at open: the reply carries the engine's at-open context estimate, the
+/// inherited todo list, and the inherited effort — before any turn runs. A
+/// session without them says so honestly: `todos: []`, and the `effort` key
+/// *absent* (never-set ≠ cleared; the client falls back to `defaultEffort`).
+#[tokio::test]
+async fn the_open_reply_seeds_context_todos_and_effort() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        inherited_state_factory(Some(Some("max".into()))),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let r = &opened["result"];
+    assert!(
+        r["contextTokens"].as_u64().unwrap_or(0) > 0,
+        "seed items, system prompt and tool schemas occupy real tokens: {opened}"
+    );
+    assert_eq!(r["todos"][0]["content"], "wire the gate", "{opened}");
+    assert_eq!(r["todos"][0]["status"], "pending", "{opened}");
+    assert_eq!(
+        r["effort"], "max",
+        "inherited-set rides as the level itself"
+    );
+
+    // The base factory inherits nothing: `effort` absent, `todos` empty.
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    let r = &opened["result"];
+    assert!(
+        r.get("effort").is_none(),
+        "never-set must stay absent, not null — collapsing the tri-state \
+         re-creates the effort lie: {opened}"
+    );
+    assert_eq!(r["todos"], json!([]), "{opened}");
+}
+
+/// The inner half of the tri-state: an inherited *clear* rides as `null`, so
+/// the client knows to drop its `defaultEffort` seed rather than fall back.
+#[tokio::test]
+async fn a_cleared_inherited_effort_rides_as_null() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        inherited_state_factory(Some(None)),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    assert_eq!(
+        opened["result"].get("effort"),
+        Some(&Value::Null),
+        "cleared ≠ never-set: {opened}"
+    );
+}
+
+/// Resume re-derives the model from config; when the lineage log's model
+/// differs, the reply names it — a silent switch under an inherited
+/// transcript is a §5.7 lie. Same model (or a fresh session): key absent.
+#[tokio::test]
+async fn the_open_reply_names_the_previous_model() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        inherited_state_factory(None),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    assert_eq!(opened["result"]["previousModel"], "old-m", "{opened}");
+
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let opened = read_until_id(&mut lines, 2).await;
+    assert!(
+        opened["result"].get("previousModel").is_none(),
+        "no switch, no key: {opened}"
     );
 }
 
@@ -656,6 +884,9 @@ async fn overlapping_prompts_resolve_in_order() {
             plan: false,
             default_effort: None,
             goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             undo: None,
         })
@@ -869,6 +1100,9 @@ async fn prompt_images_are_validated_at_the_wire() {
             plan: false,
             default_effort: None,
             goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             undo: None,
         })
@@ -1068,6 +1302,9 @@ async fn ask_user_round_trip_via_session_request_question() {
             plan: false,
             default_effort: None,
             goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             undo: None,
         })
@@ -1556,6 +1793,9 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             plan: false,
             default_effort: None,
             goal,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             undo: None,
         })

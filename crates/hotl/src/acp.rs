@@ -168,6 +168,20 @@ pub struct SessionOpen {
     /// The active goal at open (0034): resume restores it, a fork never
     /// does, a fresh session has none.
     pub goal: Option<String>,
+    /// The inherited todo list at open (0040): resume restores it into the
+    /// engine's Head, so the client renders the same list or it lies by
+    /// omission (§5.7). Empty for a fresh session.
+    pub todos: Vec<hotl_types::Todo>,
+    /// The effective effort the engine will run (0040): `None` = never set
+    /// (client falls back to `default_effort`), `Some(None)` =
+    /// inherited-cleared, `Some(Some(l))` = inherited-set. Mirrors
+    /// `effort_changed`'s encoding — collapsing the tri-state would make a
+    /// cleared setting indistinguishable from one never made.
+    pub effort: Option<Option<String>>,
+    /// The lineage log's model when it differs from the running model (0040) —
+    /// resume re-derives the model from config, and a silent switch under an
+    /// inherited transcript is a §5.7 lie.
+    pub previous_model: Option<String>,
     /// The **store** session id — what `hotl_store::replay_chain` resolves and
     /// what `SessionSpec::Load` takes, as distinct from the `acp-N` handle
     /// this connection hands clients. `session/reload_config` resumes through
@@ -414,6 +428,9 @@ async fn handle_request(
                     let default_effort = open.default_effort.clone();
                     let goal = open.goal.clone();
                     let name = open.name.clone();
+                    let todos = open.todos.clone();
+                    let effort = open.effort.clone();
+                    let previous_model = open.previous_model.clone();
                     let sid = install_session(
                         open,
                         writer,
@@ -425,6 +442,20 @@ async fn handle_request(
                         next_id,
                         &info.model,
                     );
+                    // The at-open context estimate (0040). Computed here
+                    // because the factory is sync and cannot await the actor;
+                    // placed before the auto-continuation below so ordering
+                    // makes it the at-open value by construction.
+                    // `ContextBreakdown` is a pure snapshot read — no append,
+                    // no publish — so it cannot deadlock the continuation.
+                    let context_tokens = match session.as_ref() {
+                        Some(state) => state
+                            .handle
+                            .context_breakdown()
+                            .await
+                            .map(|b| b.rows.iter().map(|r| r.tokens).sum::<u64>()),
+                        None => None,
+                    };
                     // Resume auto-continuation (M4/#8): a loaded projection
                     // that ends mid-turn (user prompt or unanswered tool
                     // results) picks the work back up; the engine no-ops when
@@ -444,17 +475,29 @@ async fn handle_request(
                     // The session's own effective mode rides the open result:
                     // a client's handshake runs before it takes the screen and
                     // wants the seed synchronously, rather than waiting for a
-                    // notification that only fires on a *change*.
+                    // notification that only fires on a *change* — the same
+                    // reason the 0040 at-open keys (context, todos, effort,
+                    // previous model) ride here too.
                     // `images: true` is the client's feature detection: an
                     // old server simply never sends the key, so a client can
                     // tell "images accepted" from "images silently ignored".
-                    reply_ok(
-                        writer,
-                        id,
-                        json!({"sessionId": sid, "name": name, "mode": mode, "plan": plan,
-                               "defaultEffort": default_effort, "goal": goal, "images": true}),
-                    )
-                    .await;
+                    let mut reply = json!({"sessionId": sid, "name": name, "mode": mode,
+                           "plan": plan, "defaultEffort": default_effort, "goal": goal,
+                           "images": true, "todos": todos});
+                    // Inserted rather than in the literal: `json!` cannot say
+                    // absent-vs-null, and these keys mean different things
+                    // absent (probe failed / never set / same model) than null.
+                    let obj = reply.as_object_mut().expect("the open reply is an object");
+                    if let Some(n) = context_tokens {
+                        obj.insert("contextTokens".into(), json!(n));
+                    }
+                    if let Some(e) = effort {
+                        obj.insert("effort".into(), e.map_or(Value::Null, |l| json!(l)));
+                    }
+                    if let Some(m) = previous_model {
+                        obj.insert("previousModel".into(), json!(m));
+                    }
+                    reply_ok(writer, id, reply).await;
                 }
                 Err(e) => reply_err(writer, id, &e).await,
             }

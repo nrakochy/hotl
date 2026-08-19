@@ -26,6 +26,11 @@ use hotl_tools::{rules::Rules, sandbox, Registry};
 #[derive(Debug)]
 pub(crate) struct Resumed {
     pub parent_id: String,
+    /// The model the lineage log records — what actually produced the
+    /// inherited transcript. Resume re-derives the running model from config,
+    /// so the factory compares the two and announces a switch
+    /// (`SessionOpen::previous_model`) rather than swapping silently (§5.7).
+    pub parent_model: String,
     /// The parent's tip at load time — the fork-point pin the new log records
     /// so nothing the parent logs afterwards can rewrite this session's
     /// inherited history (`hotl_store::ParentRef::tip_entry_id`). Resume
@@ -171,6 +176,7 @@ pub(crate) fn load_lineage(
     items.truncate(n);
     Ok(Resumed {
         parent_id: header.session_id,
+        parent_model: header.model,
         parent_tip_entry_id: tip_entry_id,
         inherited_name: name,
         items,
@@ -737,6 +743,17 @@ pub(crate) async fn build_acp() -> Result<
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
         }
+        // What the open reply needs, taken before the engine-spawn closure
+        // moves the inherited state (0040): the client seeds its status
+        // surface from these, or it lies by omission at open (§5.7). The
+        // wire mirrors the engine even for an unrecognized inherited level —
+        // it parsed to `Some(None)` above, so both run the provider default.
+        let todos_wire = inherited_todos.clone();
+        let effort_wire = effort_override.map(|o| o.map(|e| e.as_str().to_string()));
+        let previous_model = resumed
+            .as_ref()
+            .map(|r| r.parent_model.clone())
+            .filter(|m| *m != scaffold.model);
         let handle = spawn_interactive_session(
             (*scaffold.registry).clone(),
             Some(scaffold.spawn_registration(session_id.clone())),
@@ -764,6 +781,9 @@ pub(crate) async fn build_acp() -> Result<
             mode,
             plan,
             goal: inherited_goal,
+            todos: todos_wire,
+            effort: effort_wire,
+            previous_model,
             // Display-only: what a bare `/effort` reports as the session
             // default. The engine already holds the same resolved value.
             default_effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
@@ -3594,6 +3614,11 @@ mod fork_tests {
         let resumed = load_lineage(dir.path(), &parent_id, KeepSpec::Items(5)).unwrap();
         assert_eq!(resumed.items.len(), 5, "through the end of turn 2");
         assert_eq!(resumed.parent_id, parent_id);
+        assert_eq!(
+            resumed.parent_model, "m",
+            "the lineage log's model rides the resume — the factory compares \
+             it against the running model to announce a silent switch (0040)"
+        );
         assert!(
             resumed.parent_tip_entry_id.is_some(),
             "the pin is captured from the replay, not invented at the CLI"

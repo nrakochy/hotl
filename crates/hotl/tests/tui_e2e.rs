@@ -76,6 +76,9 @@ fn scripted_factory() -> acp::SessionFactory {
             plan: false,
             default_effort: None,
             goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             undo: None,
         })
@@ -145,6 +148,9 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             plan: false,
             default_effort: None,
             goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
             session_id,
             undo: None,
         })
