@@ -7,7 +7,7 @@ use std::sync::{Arc, OnceLock};
 use crate::sandbox::{self, SandboxStatus};
 use crate::{execute_later_reason, fsguard, Permission, ProtectedClass, Tool, ToolOutcome};
 use futures_util::future::BoxFuture;
-use hotl_platform::{ProcessControl as _, TreeReaper as _};
+use hotl_platform::{KnownPaths as _, ProcessControl as _, TreeReaper as _};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -354,9 +354,10 @@ impl Tool for ReadTool {
     }
     /// Unprompted (in-workspace) reads have no permission summary; this is
     /// what names their card, so a fan-out of paged reads doesn't render as
-    /// N identical rows (0037 D4).
+    /// N identical rows (0037 D4). Path elided for display only (0039 D6):
+    /// asks keep the verbatim `read_summary`.
     fn display_summary(&self, input: &Value) -> Option<String> {
-        Some(read_summary(input))
+        Some(read_display(input))
     }
     fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(async move {
@@ -376,6 +377,11 @@ impl Tool for ReadTool {
 /// Six pages of one file must not render as six identical cards (D4).
 fn read_summary(input: &Value) -> String {
     let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
+    read_summary_of(input, path.to_string())
+}
+
+/// The shared spelling behind the verbatim (asks) and elided (display) forms.
+fn read_summary_of(input: &Value, path: String) -> String {
     let mut summary = format!("read {path}");
     if let Some(offset) = input.get("offset").and_then(Value::as_u64) {
         summary.push_str(&format!(" · from line {offset}"));
@@ -384,6 +390,72 @@ fn read_summary(input: &Value) -> String {
         summary.push_str(&format!(" · {limit} lines"));
     }
     summary
+}
+
+/// MAX_SUMMARY_CHARS (120) − "read " − worst-case ` · from line NNNNN · NNN
+/// lines`, so the page details survive sanitize's tail-truncation.
+const PATH_DISPLAY_BUDGET: usize = 80;
+
+/// `read_summary` with the path middle-elided (0039 D6). Display only: a
+/// human approving a boundary crossing must see every byte, so `permission`
+/// never routes through here.
+fn read_display(input: &Value) -> String {
+    let path = input.get("path").and_then(Value::as_str).unwrap_or("?");
+    read_summary_of(input, elide_path(path, PATH_DISPLAY_BUDGET))
+}
+
+/// Middle-elide a path to `budget` chars: `~` for the home prefix, then the
+/// leading components + `…` + the longest tail that fits, degrading to
+/// `…/{filename}` and finally a char-elided filename (the `web.rs` `elide`
+/// precedent, path-shaped).
+fn elide_path(path: &str, budget: usize) -> String {
+    let sep = std::path::MAIN_SEPARATOR;
+    // `~` first — shorter *and* more readable. KNOWN_PATHS.home is the
+    // profile dir on Windows, so the abbreviation is correct there too.
+    let display = hotl_platform::KNOWN_PATHS
+        .home()
+        .and_then(|home| {
+            std::path::Path::new(path)
+                .strip_prefix(home)
+                .ok()
+                .map(|rest| format!("~{sep}{}", rest.display()))
+        })
+        .unwrap_or_else(|| path.to_string());
+    if display.chars().count() <= budget {
+        return display;
+    }
+    let parts: Vec<&str> = display.split(sep).collect();
+    // An absolute path splits to a leading empty component; keep it so the
+    // head still renders with its root separator.
+    let head_n = if parts.first().is_some_and(|p| p.is_empty()) {
+        3
+    } else {
+        2
+    };
+    let sep = sep.to_string();
+    if parts.len() > head_n + 1 {
+        let head = parts[..head_n].join(&sep);
+        for keep in (1..parts.len() - head_n).rev() {
+            let tail = parts[parts.len() - keep..].join(&sep);
+            let cand = format!("{head}{sep}…{sep}{tail}");
+            if cand.chars().count() <= budget {
+                return cand;
+            }
+        }
+    }
+    let filename = parts.last().copied().unwrap_or(&display);
+    let cand = format!("…{sep}{filename}");
+    if cand.chars().count() <= budget {
+        return cand;
+    }
+    let chars: Vec<char> = filename.chars().collect();
+    let keep = budget.saturating_sub(1).max(2).min(chars.len());
+    let front = keep / 2;
+    let back = keep - front;
+    let mut out: String = chars[..front].iter().collect();
+    out.push('…');
+    out.extend(chars[chars.len() - back..].iter());
+    out
 }
 
 /// The `minified` arg. Absent or false means the plain path runs completely
@@ -1836,6 +1908,54 @@ mod tests {
         match read.permission(&json!({"path": "/outside/notes.vtt", "offset": 4001})) {
             Permission::AskProtected { summary, .. } => {
                 assert_eq!(summary, "read /outside/notes.vtt · from line 4001");
+            }
+            other => panic!("outside read must stay protected, got {other:?}"),
+        }
+    }
+
+    /// 0039 T1: a long absolute path middle-elides in the display summary so
+    /// the home prefix, the filename, and the page details all survive
+    /// sanitize's MAX_SUMMARY_CHARS tail-truncation.
+    #[test]
+    fn long_read_paths_elide_keeping_home_filename_and_page_details() {
+        let home = hotl_platform::KNOWN_PATHS
+            .home()
+            .expect("tests run with a home dir");
+        let path = [
+            "sources",
+            "some-project",
+            "specs",
+            "exec-plans",
+            "active",
+            "deeply",
+            "nested",
+        ]
+        .iter()
+        .fold(home, |p, c| p.join(c))
+        .join("0039-subagent-streams-implementation-plan.md");
+        let s = ReadTool::default()
+            .display_summary(&json!({"path": path.to_string_lossy(), "offset": 2001, "limit": 500}))
+            .expect("read always names its card");
+        assert!(s.starts_with("read ~"), "{s}");
+        assert!(s.contains('…'), "{s}");
+        assert!(
+            s.contains("0039-subagent-streams-implementation-plan.md"),
+            "{s}"
+        );
+        assert!(s.contains(" · from line 2001"), "{s}");
+        assert!(s.contains(" · 500 lines"), "{s}");
+        assert!(s.chars().count() <= 120, "{} chars: {s}", s.chars().count());
+    }
+
+    /// 0039 D6: elision is display-only. A human approving a boundary
+    /// crossing must see every byte of the path.
+    #[test]
+    fn ask_summaries_never_elide_the_path() {
+        let long = format!("/outside/{}notes.vtt", "very-long-component/".repeat(8));
+        match ReadTool::default().permission(&json!({"path": long})) {
+            Permission::AskProtected { summary, .. } => {
+                assert_eq!(summary, format!("read {long}"));
+                assert!(!summary.contains('…'), "{summary}");
             }
             other => panic!("outside read must stay protected, got {other:?}"),
         }
