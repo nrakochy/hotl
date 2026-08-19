@@ -455,6 +455,19 @@ pub fn workspace_root() -> &'static std::path::Path {
     fsguard::workspace_root()
 }
 
+tokio::task_local! {
+    /// The provider `tool_use` id of the call running on this task, scoped by
+    /// `turn.rs` around the single `Tool::run` future (the `SECRET_READS`
+    /// shape). Lets a tool attribute its own side-stream — `spawn` stamps
+    /// forwarded child events with it (0039).
+    pub static CURRENT_CALL_ID: String;
+}
+
+/// The current call's `tool_use` id; `None` on any task outside a tool run.
+pub fn current_call_id() -> Option<String> {
+    CURRENT_CALL_ID.try_with(Clone::clone).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -28,6 +28,10 @@ fn session(provider: Arc<dyn Provider>) -> Session {
 }
 
 fn session_with(provider: Arc<dyn Provider>, rules: Rules) -> Session {
+    session_of(provider, rules, Registry::builtin())
+}
+
+fn session_of(provider: Arc<dyn Provider>, rules: Rules, registry: Registry) -> Session {
     let config = EngineConfig::default();
     let dir = tempfile::tempdir().expect("tempdir");
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
@@ -35,7 +39,7 @@ fn session_with(provider: Arc<dyn Provider>, rules: Rules) -> Session {
     let log_path = log.path().to_path_buf();
     let handle = spawn_session(SessionDeps {
         provider,
-        registry: Arc::new(Registry::builtin()),
+        registry: Arc::new(registry),
         rules: Arc::new(rules),
         // True so bash keeps its bypass auto-allow (bash keeps the sandbox
         // gate even under bypass) — reads don't consult it either way.
@@ -221,6 +225,88 @@ async fn identical_reads_in_one_batch_run_once_and_fan_out() {
     for r in &results {
         assert!(!r.is_error, "{}: {}", r.tool_use_id, r.content);
     }
+}
+
+/// A tool that records what `current_call_id()` returned inside its `run`.
+struct RecordingTool(Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>);
+
+impl hotl_tools::Tool for RecordingTool {
+    fn name(&self) -> &'static str {
+        "record_id"
+    }
+    fn description(&self) -> &str {
+        "records the task-local call id"
+    }
+    fn schema(&self) -> Value {
+        json!({"type": "object", "properties": {"tag": {"type": "string"}}})
+    }
+    fn permission(&self, _input: &Value) -> hotl_tools::Permission {
+        hotl_tools::Permission::None
+    }
+    fn parallel_safe(&self) -> bool {
+        true
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn run<'a>(
+        &'a self,
+        input: Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> futures_util::future::BoxFuture<'a, hotl_tools::ToolOutcome> {
+        Box::pin(async move {
+            let tag = input
+                .get("tag")
+                .and_then(Value::as_str)
+                .unwrap_or("?")
+                .to_string();
+            self.0
+                .lock()
+                .expect("recording lock")
+                .push((tag, hotl_tools::current_call_id()));
+            hotl_tools::ToolOutcome::ok("recorded")
+        })
+    }
+}
+
+/// 0039 T2: `CURRENT_CALL_ID` is scoped around exactly one `run` future, so
+/// a tool sees its OWN `tool_use` id — even in a parallel batch. This is the
+/// hook `spawn` uses to stamp forwarded child events with its card's id.
+#[tokio::test]
+async fn a_tool_sees_its_own_call_id_in_the_task_local() {
+    let recorded: Arc<std::sync::Mutex<Vec<(String, Option<String>)>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut registry = Registry::builtin();
+    registry.register(Box::new(RecordingTool(recorded.clone())));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        tool_batch(&[
+            ("c1", "record_id", json!({"tag": "one"})),
+            ("c2", "record_id", json!({"tag": "two"})),
+        ]),
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session_of(provider, Rules::default(), registry);
+    s.handle.prompt("go".into()).await;
+
+    let mut started: Vec<String> = Vec::new();
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::ToolStart { id, .. } => started.push(id),
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    let mut started_sorted = started.clone();
+    started_sorted.sort();
+    assert_eq!(started_sorted, ["c1", "c2"]);
+
+    let recorded = recorded.lock().expect("recording lock");
+    let by_tag: HashMap<&str, &Option<String>> =
+        recorded.iter().map(|(t, id)| (t.as_str(), id)).collect();
+    assert_eq!(by_tag["one"], &Some("c1".to_string()), "{recorded:?}");
+    assert_eq!(by_tag["two"], &Some("c2".to_string()), "{recorded:?}");
+    // Outside any run scope there is no id to leak.
+    assert_eq!(hotl_tools::current_call_id(), None);
 }
 
 /// D6's exemption: a non-read-only duplicate runs twice — duplicate

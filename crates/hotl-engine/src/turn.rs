@@ -1649,8 +1649,14 @@ impl Turn {
         // Plan 0022: the grant lives in a task-local scoped around exactly
         // this future, so `sandbox::build_command` sees it for this spawn and
         // no other. A later call in the same turn re-enters with `false`.
-        let mut outcome = hotl_tools::sandbox::SECRET_READS
-            .scope(secret_reads, tool.run(input, self.cancel.clone()))
+        // 0039: the call id rides the same shape, so `spawn` can stamp
+        // forwarded child events with its own card's id.
+        let mut outcome = hotl_tools::CURRENT_CALL_ID
+            .scope(
+                tu.id.clone(),
+                hotl_tools::sandbox::SECRET_READS
+                    .scope(secret_reads, tool.run(input, self.cancel.clone())),
+            )
             .await;
         // PostToolUse: a node-style proposal may replace a successful result.
         // §S1 HookRouter gate: a masked-off (or hook-less) session never
