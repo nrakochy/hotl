@@ -8,6 +8,21 @@ semver promise of their own.
 
 ### Added
 
+- **The status strip is true at session open** (plan 0040). The
+  `session/new`/`session/load` reply now carries the at-open reality the
+  strip used to leave blank — all additive keys, old clients and servers
+  interoperate: `contextTokens` (the engine's estimate of what already
+  fills the window, so the strip shows a bare `N% ctx` before the first
+  turn — a resumed session's inherited fullness, a fresh session's seed),
+  `todos` (a resumed checklist shows immediately instead of after the next
+  `todo_write`), `effort` (a resumed session's inherited level — `/effort`
+  and `/status` no longer report the config default while the engine runs
+  the inherited one), and `previousModel` (when the configured model
+  changed since the session last ran, a one-line transcript notice names
+  the switch instead of swapping silently; fires on fork too). Usage
+  counters and cost still start at zero on resume — only the context gauge
+  carries over, and the at-open estimate yields to the real usage line the
+  moment a turn completes.
 - **Sub-agent streams** (plan 0039). A `spawn` card is no longer opaque for
   its whole lifetime: the child's tool lifecycle is forwarded on the parent
   stream as a new `child_tool` frame (additive — the stream schema version
