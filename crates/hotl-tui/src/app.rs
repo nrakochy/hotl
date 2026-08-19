@@ -2065,24 +2065,7 @@ fn on_tick(state: &mut State) {
     }
     match &mut state.phase {
         Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => *ticks += 1,
-        Phase::Tool { ticks, .. } => {
-            *ticks += 1;
-            // The running card's elapsed stays in lock-step with the strip's.
-            if let Some(TranscriptItem::Tool {
-                ticks: card,
-                status,
-                ..
-            }) = state
-                .transcript
-                .iter_mut()
-                .rev()
-                .find(|i| matches!(i, TranscriptItem::Tool { .. }))
-            {
-                if matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. }) {
-                    *card += 1;
-                }
-            }
-        }
+        Phase::Tool { ticks, .. } => *ticks += 1,
         Phase::Idle
         | Phase::WaitingAsk { .. }
         | Phase::WaitingQuestion { .. }
@@ -2096,6 +2079,23 @@ fn on_tick(state: &mut State) {
         Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
     ) {
         state.work_ticks += 1;
+        // EVERY running card ticks (0037), not just the newest: with
+        // concurrent calls, a sibling's tool_done flips the phase to
+        // Streaming while others still run — their elapsed must stay honest.
+        // Bounded to this turn: running cards cannot predate the last prompt.
+        for item in state.transcript.iter_mut().rev() {
+            if matches!(item, TranscriptItem::User { .. }) {
+                break;
+            }
+            if let TranscriptItem::Tool {
+                ticks,
+                status: ToolStatus::Running | ToolStatus::AutoAllowed { .. },
+                ..
+            } = item
+            {
+                *ticks += 1;
+            }
+        }
     }
 }
 
@@ -3006,6 +3006,43 @@ mod tests {
         assert!(
             matches!(&statuses[1].1, ToolStatus::AutoAllowed { rule } if rule == "reads"),
             "{statuses:?}"
+        );
+    }
+
+    /// 0037: every running card ticks, not just the newest — and a sibling's
+    /// tool_done flipping the phase to Streaming must not freeze the cards
+    /// still running (pre-0037 they froze at 0s: ticks only reached the
+    /// newest card, and only in Phase::Tool).
+    #[test]
+    fn every_running_card_ticks_settled_ones_do_not() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        for id in ["p1", "p2", "p3"] {
+            upd(
+                &mut s,
+                json!({"type":"tool_start","id":id,"name":"read","summary":"read x"}),
+            );
+        }
+        // p3 settles; p1/p2 keep running while the phase moves to Streaming.
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p3","name":"read","ok":true}),
+        );
+        assert!(matches!(s.phase, Phase::Streaming { .. }));
+        update(&mut s, Msg::Tick);
+        update(&mut s, Msg::Tick);
+        let ticks: Vec<(String, u64)> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Tool { id, ticks, .. } => Some((id.clone(), *ticks)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ticks,
+            vec![("p1".into(), 2), ("p2".into(), 2), ("p3".into(), 0)],
+            "running cards advance, the settled one holds"
         );
     }
 
