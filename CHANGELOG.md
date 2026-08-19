@@ -6,6 +6,36 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **Sub-agent streams** (plan 0039). A `spawn` card is no longer opaque for
+  its whole lifetime: the child's tool lifecycle is forwarded on the parent
+  stream as a new `child_tool` frame (additive — the stream schema version
+  stands) carrying the spawn call's `parent_id`, a `phase` of `start`/`done`,
+  and `ok` on done frames only. A running spawn card shows its last three
+  child calls indented inline with an `… +N earlier` line; a settled one
+  collapses to a `· N calls` detail. `hotl attach` shows `↳` child lines and
+  headless `-p` prints them to stderr; `-p --json` emits the frames.
+- **Agent selector** (plan 0039). Once a turn spawns sub-agents, a selector
+  strip appears below the input: `● main` plus one row per spawn. `Ctrl-O`
+  focuses it; `↑`/`↓` (and `j`/`k` under vim Normal) move the selection and
+  the whole region above the strip swaps to the chosen agent's own stream —
+  live, following its tail, scrollable. `Esc` returns to main; any other key
+  drops straight back into the prompt while the chosen stream stays up.
+
+### Changed
+
+- **Consecutive same-target tool calls merge into one accumulating card**
+  (plan 0039). Four paged reads of one file render
+  `✓ read ~/…/app.rs · ×4 · 3s`, not four rows. Merging never crosses another
+  transcript item, never touches `spawn` cards, and never absorbs into a
+  failed card — a retry after a failure starts fresh, and a merged card with
+  any failed call settles ✗.
+- **Long paths middle-elide on tool cards** (plan 0039). The display summary
+  abbreviates your home directory to `~` and elides the middle of a long path
+  so the filename and page details survive the card width. Display only:
+  permission asks and ⚑ notices always carry the full verbatim path.
+
 ## [0.19.0] - 2026-08-19
 
 ### Changed
