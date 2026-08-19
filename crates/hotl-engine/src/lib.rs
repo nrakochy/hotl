@@ -174,6 +174,10 @@ pub struct TurnContinuation {
     pub(crate) model_idx: usize,
     /// The doom detector's trailing signature window.
     pub(crate) call_sigs: std::collections::VecDeque<crate::turn::CallSig>,
+    /// Flagged decisions already notified this prompt (0037 D5). Carried so a
+    /// mid-prompt compaction doesn't repeat every notice; a NEW prompt starts
+    /// from `default()`, so nothing stays buried across a long session.
+    pub(crate) flagged: std::collections::HashSet<crate::turn::FlagKey>,
     /// Per-tool consecutive failures (the tool-failure budget).
     pub(crate) consecutive_failures: std::collections::HashMap<String, u32>,
     /// The shared per-prompt "reminder and continue" budget.

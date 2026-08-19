@@ -26,6 +26,8 @@ hotl-tools = { path = "../hotl-tools", version = "0.18.0", default-features = fa
 hotl-store = { path = "../hotl-store", version = "0.18.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
+# FlagKey's canonical target (0037 D5) — dunce, not std, per clippy.toml.
+dunce = { workspace = true }
 futures-util = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

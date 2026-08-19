@@ -206,6 +206,158 @@ async fn bypass_outside_read_flows_with_a_flag() {
     assert!(content.contains("outside-content"), "{content}");
 }
 
+/// One prompt per batch under Bypass, collecting every `ToolFlagged` as
+/// (summary, denied) — the instrument for the 0037 D5 notice memo. Reads and
+/// writes land in/against `dir`-relative absolute paths the caller prepares.
+async fn run_flag_batches(batches: Vec<Vec<(String, &str, Value)>>) -> Vec<(String, bool)> {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = EngineConfig::default();
+    let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
+        .expect("session log");
+    let mut scripts = Vec::new();
+    for batch in &batches {
+        let blocks: Vec<Value> = batch
+            .iter()
+            .map(|(id, name, input)| {
+                serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input})
+            })
+            .collect();
+        scripts.push(vec![
+            Ok(hotl_provider::StreamEvent::Started),
+            Ok(hotl_provider::StreamEvent::Completed {
+                stop: hotl_types::StopReason::ToolUse,
+                usage: hotl_types::TokenUsage {
+                    input_tokens: 10,
+                    output_tokens: 8,
+                    ..Default::default()
+                },
+                blocks,
+            }),
+        ]);
+        scripts.push(ScriptedProvider::text_reply("done"));
+    }
+    let provider = Arc::new(ScriptedProvider::new(scripts));
+    let handle = spawn_session(SessionDeps {
+        provider,
+        registry: Arc::new(Registry::builtin()),
+        rules: Arc::new(Rules::default().with_mode(PermissionMode::Bypass)),
+        sandbox_enforced: true,
+        clock: Arc::new(SystemClock),
+        log,
+        system: "test-system".into(),
+        cwd: dir.path().to_path_buf(),
+        snapshots: None,
+        hooks: None,
+        initial_items: Vec::new(),
+        initial_todos: Vec::new(),
+        initial_goal: None,
+        config,
+    });
+    let mut s = Session { handle, dir };
+    let mut flags = Vec::new();
+    for _ in 0..batches.len() {
+        s.handle.prompt("go".into()).await;
+        loop {
+            match next_event(&mut s).await {
+                EngineEvent::ToolFlagged {
+                    summary, denied, ..
+                } => flags.push((summary, denied)),
+                EngineEvent::Ask { .. } => panic!("bypass must never ask"),
+                EngineEvent::TurnDone { .. } => break,
+                _ => {}
+            }
+        }
+    }
+    flags
+}
+
+/// 0037 D5: repeated page reads of ONE outside file are one boundary
+/// decision — one ⚑ notice per turn, not one per page — while a distinct
+/// file still gets its own, and a NEW prompt re-flags (the memo is per
+/// prompt, so nothing stays buried across a session).
+#[tokio::test]
+async fn repeat_page_reads_flag_once_per_turn_and_reflag_next_prompt() {
+    if bypass_unavailable() {
+        return;
+    }
+    let outside = tempfile::tempdir().expect("tempdir");
+    let a = outside.path().join("notes-a.vtt");
+    let b = outside.path().join("notes-b.vtt");
+    std::fs::write(&a, "line\n".repeat(50)).expect("fixture a");
+    std::fs::write(&b, "line\n").expect("fixture b");
+    let a_path = a.to_str().unwrap().to_string();
+    let b_path = b.to_str().unwrap().to_string();
+
+    let page = |id: &str, path: &str, offset: u64| {
+        (
+            id.to_string(),
+            "read",
+            json!({"path": path, "offset": offset, "limit": 10}),
+        )
+    };
+    let flags = run_flag_batches(vec![
+        // Turn 1: three pages of A plus one read of B — 2 unique decisions.
+        vec![
+            page("p1", &a_path, 1),
+            page("p2", &a_path, 11),
+            page("p3", &a_path, 21),
+            ("p4".to_string(), "read", json!({"path": b_path.clone()})),
+        ],
+        // Turn 2: A again — a fresh prompt must re-surface the notice.
+        vec![page("p5", &a_path, 31)],
+    ])
+    .await;
+
+    let (turn1, turn2): (Vec<_>, Vec<_>) = {
+        let split = flags
+            .iter()
+            .position(|(s, _)| s.contains("from line 31"))
+            .expect("turn 2's flag must exist");
+        (flags[..split].to_vec(), flags[split..].to_vec())
+    };
+    assert_eq!(
+        turn1.len(),
+        2,
+        "one notice per distinct file, not per page: {turn1:?}"
+    );
+    assert!(turn1.iter().any(|(s, _)| s.contains("notes-a.vtt")));
+    assert!(turn1.iter().any(|(s, _)| s.contains("notes-b.vtt")));
+    assert_eq!(turn2.len(), 1, "a new prompt re-flags: {turn2:?}");
+    assert!(flags.iter().all(|(_, denied)| !denied));
+}
+
+/// 0037 D5: a flagged REFUSAL is never buried by an earlier allow-notice on
+/// the same file — `denied` (with the class) is part of the memo key.
+#[tokio::test]
+async fn a_flagged_refusal_is_not_buried_by_a_prior_allow_flag() {
+    if bypass_unavailable() {
+        return;
+    }
+    let outside = tempfile::tempdir().expect("tempdir");
+    let target = outside.path().join("notes.txt");
+    std::fs::write(&target, "content\n").expect("fixture");
+    let path = target.to_str().unwrap().to_string();
+
+    let flags = run_flag_batches(vec![vec![
+        ("t1".to_string(), "read", json!({"path": path.clone()})),
+        (
+            "t2".to_string(),
+            "write",
+            json!({"path": path.clone(), "content": "overwrite"}),
+        ),
+    ]])
+    .await;
+    assert_eq!(flags.len(), 2, "{flags:?}");
+    assert!(
+        flags.iter().any(|(_, denied)| !denied),
+        "the read's allow-notice: {flags:?}"
+    );
+    assert!(
+        flags.iter().any(|(_, denied)| *denied),
+        "the write's refusal notice must surface: {flags:?}"
+    );
+}
+
 /// The control: under `Ask` mode all three calls still raise the blocking
 /// prompt — the floor survives outside bypass.
 #[tokio::test]

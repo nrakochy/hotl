@@ -702,6 +702,9 @@ struct Turn {
     /// The trailing tool-call signatures the doom-loop detector reads —
     /// bounded to [`DOOM_WINDOW`], not the whole turn.
     call_sigs: VecDeque<CallSig>,
+    /// Flagged decisions already notified this prompt (0037 D5) — the floor
+    /// still evaluates every call; only the notice fan-out is coalesced.
+    flagged: HashSet<FlagKey>,
     consecutive_failures: HashMap<String, u32>,
     usage: TokenUsage,
     /// (provider-reported tokens, projection length) at the last completed
@@ -787,6 +790,7 @@ impl Turn {
             models,
             model_idx: cont.model_idx,
             call_sigs: cont.call_sigs,
+            flagged: cont.flagged,
             consecutive_failures: cont.consecutive_failures,
             usage: TokenUsage::default(),
             // `anchor`/`injected_hints`/`last_snapshot` deliberately do NOT
@@ -822,6 +826,7 @@ impl Turn {
             spent: self.spent,
             model_idx: self.model_idx,
             call_sigs: std::mem::take(&mut self.call_sigs),
+            flagged: std::mem::take(&mut self.flagged),
             consecutive_failures: std::mem::take(&mut self.consecutive_failures),
             turn_extensions: self.turn_extensions,
             max_tokens_continues: self.max_tokens_continues,
@@ -1431,7 +1436,9 @@ impl Turn {
     /// A hook `Deny` skips execution; a `Rewrite` swaps the input and
     /// re-enters the permission gate with it. Runs serially per call, before
     /// any execution in its chunk — the ask is a one-at-a-time human moment.
-    async fn gate(&self, tu: &ToolUse) -> Gate {
+    /// (`&mut self` for the flag memo; the serial gating order is what makes
+    /// that borrow free.)
+    async fn gate(&mut self, tu: &ToolUse) -> Gate {
         let Some(tool) = self.shared.registry.get(&tu.name) else {
             // Chargeable: an invalid tool name is a model mistake the model can
             // fix, and repeating it is what the budget exists to stop.
@@ -1670,7 +1677,7 @@ impl Turn {
     /// ask, evaluated against `input` (which a PreToolUse hook may have
     /// rewritten — a rewritten call re-enters the gate, never bypasses it).
     async fn approve_input(
-        &self,
+        &mut self,
         tu: &ToolUse,
         input: &Value,
         summary: String,
@@ -1708,29 +1715,36 @@ impl Turn {
             // The bypass floor's two non-blocking answers (0036): the gate
             // resolves the call itself and `ToolFlagged` is the notification
             // that replaces the ask. `why` never is None for a protected
-            // class; the summary is the fallback, not an unwrap.
+            // class; the summary is the fallback, not an unwrap. The notice
+            // is coalesced per turn (0037 D5) — six page reads of one outside
+            // file are one boundary decision, not six ⚑ lines — while the
+            // evaluation and the resolution stay per-call.
             Verdict::AutoFlagged { rule: _ } => {
                 let why = why.unwrap_or_else(|| summary.clone());
-                self.emit(EngineEvent::ToolFlagged {
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                    summary,
-                    why,
-                    denied: false,
-                })
-                .await;
+                if self.first_flag(tu, input, class, false) {
+                    self.emit(EngineEvent::ToolFlagged {
+                        id: tu.id.clone(),
+                        name: tu.name.clone(),
+                        summary,
+                        why,
+                        denied: false,
+                    })
+                    .await;
+                }
                 Approval::by_rule(AskReply::Allow)
             }
             Verdict::DenyFlagged { rule } => {
                 let why = why.unwrap_or_else(|| summary.clone());
-                self.emit(EngineEvent::ToolFlagged {
-                    id: tu.id.clone(),
-                    name: tu.name.clone(),
-                    summary,
-                    why: why.clone(),
-                    denied: true,
-                })
-                .await;
+                if self.first_flag(tu, input, class, true) {
+                    self.emit(EngineEvent::ToolFlagged {
+                        id: tu.id.clone(),
+                        name: tu.name.clone(),
+                        summary,
+                        why: why.clone(),
+                        denied: true,
+                    })
+                    .await;
+                }
                 Approval::by_rule(AskReply::Deny {
                     message: Some(format!(
                         "refused without prompting ({rule}): {why}. The session boundary is \
@@ -1747,6 +1761,21 @@ impl Turn {
                 by_human: true,
             },
         }
+    }
+
+    /// The per-turn flag-notice memo (0037 D5): true exactly once per
+    /// distinct flagged decision per prompt. Carried across compaction folds
+    /// (one logical prompt), reset by a new prompt — the human may have
+    /// looked away, so nothing stays buried across a session. Display-only:
+    /// the caller resolves the call identically whether or not this fires.
+    fn first_flag(
+        &mut self,
+        tu: &ToolUse,
+        input: &Value,
+        class: Option<hotl_tools::ProtectedClass>,
+        denied: bool,
+    ) -> bool {
+        self.flagged.insert(FlagKey::new(tu, input, class, denied))
     }
 
     /// Complete protocol pairing for a batch that will not execute.
@@ -2540,6 +2569,50 @@ impl CallSig {
             hash: content_hash(&display),
             display,
             result_hash: None,
+        }
+    }
+}
+
+/// One flagged decision, keying the per-turn notice memo (0037 D5). `denied`
+/// is part of the key so a `DenyFlagged` is never buried by an earlier
+/// `AutoFlagged` on the same target (they are different decisions a human
+/// reviews differently).
+#[derive(Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FlagKey {
+    name: String,
+    class: Option<hotl_tools::ProtectedClass>,
+    /// The call's canonical path (or url) when the input carries one — page
+    /// reads of one file share a key while distinct files don't — else the
+    /// whole input, so unrelated calls of a pathless tool never coalesce.
+    target: String,
+    denied: bool,
+}
+
+impl FlagKey {
+    fn new(
+        tu: &ToolUse,
+        input: &Value,
+        class: Option<hotl_tools::ProtectedClass>,
+        denied: bool,
+    ) -> Self {
+        let target = input
+            .get("path")
+            .or_else(|| input.get("url"))
+            .and_then(Value::as_str)
+            .map(|p| {
+                // Canonical so two spellings of one file are one decision; the
+                // raw string when it can't resolve (the target of a refused
+                // write may not exist). A memo key, never displayed.
+                dunce::canonicalize(p)
+                    .map(|c| c.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| p.to_string())
+            })
+            .unwrap_or_else(|| input.to_string());
+        Self {
+            name: tu.name.clone(),
+            class,
+            target,
+            denied,
         }
     }
 }

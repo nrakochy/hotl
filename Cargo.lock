@@ -907,6 +907,7 @@ dependencies = [
 name = "hotl-engine"
 version = "0.18.0"
 dependencies = [
+ "dunce",
  "futures-util",
  "hotl-context",
  "hotl-platform",

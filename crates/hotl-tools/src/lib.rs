@@ -61,7 +61,7 @@ pub enum Permission {
 /// disposition: ask/dontask/plan always ask; bypass flags (allow-or-refuse
 /// with a loud notice) instead of blocking — except `TrustFirstUse`, which
 /// asks in every interactive mode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProtectedClass {
     /// Read of a path outside the session root.
     OutsideRead,
