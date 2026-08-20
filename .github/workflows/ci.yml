@@ -70,11 +70,11 @@ jobs:
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
       - name: Clippy (harness crates + binary)
-        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
+        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
         # `--no-fail-fast`: run every crate's tests even after one fails, so a
         # single run surfaces the whole failure set instead of one-per-round.
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked --no-fail-fast
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --locked --no-fail-fast
       - name: Test (security-enforced feature)
         run: |
           cargo test -p hotl-tools --features security-enforced --locked
@@ -130,11 +130,11 @@ jobs:
           if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw "ripgrep is not installed after 5 attempts" }
           rg --version
       - name: Clippy (harness crates + binary)
-        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --all-targets -- -D warnings
+        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --all-targets -- -D warnings
       - name: Test (harness crates + binary)
         # `--no-fail-fast`: run every crate's tests even after one fails, so a
         # single run surfaces the whole failure set instead of one-per-round.
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-testkit -p hotl --locked --no-fail-fast
+        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --locked --no-fail-fast
       - name: Test (security-enforced feature)
         run: |
           cargo test -p hotl-tools --features security-enforced --locked

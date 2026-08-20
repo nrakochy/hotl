@@ -1,0 +1,40 @@
+name = "review-changes"
+description = "Review the diff across dimensions, then verify each finding"
+concurrency = 8
+
+[[phases]]
+title = "Review"
+
+[[phases.agents]]
+label = "bugs"
+prompt = "Review {{args.target}} for correctness bugs. Return findings."
+agent = "explore"
+schema = { type = "object", required = ["findings"], properties = { findings = { type = "array" } } }
+
+[[phases.agents]]
+label = "perf"
+prompt = "Review {{args.target}} for performance problems. Return findings."
+agent = "explore"
+schema = { type = "object", required = ["findings"], properties = { findings = { type = "array" } } }
+
+[[phases]]
+title = "Verify"
+each = "Review[*].findings[*]"
+
+[[phases.stages]]
+label = "verify:{{item.file}}"
+prompt = "Try to refute: {{item.title}} in {{item.file}}. Reply {isReal: bool, why}."
+agent = "explore"
+votes = 3
+accept = "isReal"
+schema = { type = "object", required = ["isReal"], properties = { isReal = { type = "boolean" } } }
+
+[[phases]]
+title = "Find"
+until_quiet = { rounds = 2, max_rounds = 10, key = "file,line" }
+
+[[phases.agents]]
+label = "finder"
+prompt = "Find bugs in {{args.target}} not already in this list: {{Find}}. Reply with a JSON array of {file, line, title}."
+agent = "explore"
+schema = { type = "array", items = { type = "object", required = ["file", "line"] } }

@@ -1158,6 +1158,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hotl-workflow"
+version = "0.21.0"
+dependencies = [
+ "futures-util",
+ "hotl-provider",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "toml",
+]
+
+[[package]]
 name = "http"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

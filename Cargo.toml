@@ -20,6 +20,7 @@ members = [
     "crates/hotl-context",
     "crates/hotl-tui",
     "crates/hotl-engine",
+    "crates/hotl-workflow",
     "crates/hotl-testkit",
     "crates/hotl",
 ]
