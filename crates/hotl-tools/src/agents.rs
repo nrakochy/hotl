@@ -116,6 +116,10 @@ pub struct AgentDef {
     /// means "unset", not "off": the `[agents] isolation` default still
     /// applies (`hotl::agent::HotlChildBuilder::spawn_child`).
     pub isolation: Isolation,
+    /// A per-def ceiling on the child's turns; `None` = inherit the engine
+    /// default. Validated at parse time like `effort` (a non-number warns and
+    /// inherits), so `spawn_child` has nothing to reject.
+    pub max_turns: Option<i64>,
     pub source: AgentSource,
 }
 
@@ -142,6 +146,7 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             // The three built-ins stay unset; `[agents] isolation` is what
             // turns worktrees on for `general-purpose`.
             isolation: Isolation::None,
+            max_turns: None,
             source: AgentSource::BuiltIn,
         }),
         "explore" => Some(AgentDef {
@@ -160,6 +165,7 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             model: None,
             effort: None,
             isolation: Isolation::None,
+            max_turns: None,
             source: AgentSource::BuiltIn,
         }),
         "plan" => Some(AgentDef {
@@ -178,6 +184,7 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
             model: None,
             effort: None,
             isolation: Isolation::None,
+            max_turns: None,
             source: AgentSource::BuiltIn,
         }),
         _ => None,
@@ -227,6 +234,16 @@ pub fn parse_def_or_named(
     let isolation = get("isolation:")
         .map(|raw| parse_isolation(&raw, &format!("agent def `{name}`")))
         .unwrap_or_default();
+    let max_turns = get("max_turns:").and_then(|raw| match raw.parse::<i64>() {
+        Ok(n) => Some(n),
+        Err(_) => {
+            eprintln!(
+                "hotl: agent def `{name}` sets `max_turns: {raw}`, which is not a number \
+                 — inheriting instead."
+            );
+            None
+        }
+    });
     let system_prompt = if body.trim().is_empty() {
         None
     } else {
@@ -240,6 +257,7 @@ pub fn parse_def_or_named(
         model,
         effort,
         isolation,
+        max_turns,
         source,
     })
 }
@@ -367,8 +385,9 @@ pub fn list(config_dir: &Path, include_claude: bool) -> Vec<(String, String)> {
 }
 
 /// Build a child's registry from `full` per the resolved def's [`ToolScope`].
-/// `spawn` is defensively excluded regardless of scope — depth-1 is a
-/// structural invariant, not something a `tools:` list can override.
+/// `spawn` and `workflow` are defensively excluded regardless of scope —
+/// depth-1 is a structural invariant, not something a `tools:` list can
+/// override.
 pub fn filter_registry(def: &AgentDef, full: &Registry) -> Registry {
     match &def.tools {
         ToolScope::All => full.filtered(|_| true),
@@ -516,9 +535,34 @@ mod tests {
                 Box::pin(async { crate::ToolOutcome::ok("") })
             }
         }
+        // `workflow` is the other fan-out tool; it rides the same exclusion.
+        struct FakeWorkflow;
+        impl crate::Tool for FakeWorkflow {
+            fn name(&self) -> &'static str {
+                "workflow"
+            }
+            fn description(&self) -> &str {
+                "fake"
+            }
+            fn schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            fn permission(&self, _input: &serde_json::Value) -> crate::Permission {
+                crate::Permission::None
+            }
+            fn run<'a>(
+                &'a self,
+                _input: serde_json::Value,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> futures_util::future::BoxFuture<'a, crate::ToolOutcome> {
+                Box::pin(async { crate::ToolOutcome::ok("") })
+            }
+        }
         let mut full = Registry::builtin();
         full.register(Box::new(FakeSpawn));
+        full.register(Box::new(FakeWorkflow));
         assert!(full.get("spawn").is_some(), "test setup sanity check");
+        assert!(full.get("workflow").is_some(), "test setup sanity check");
 
         let all_def = AgentDef {
             name: "x".into(),
@@ -528,6 +572,7 @@ mod tests {
             model: None,
             effort: None,
             isolation: Isolation::None,
+            max_turns: None,
             source: AgentSource::User,
         };
         let child = filter_registry(&all_def, &full);
@@ -535,15 +580,23 @@ mod tests {
             child.get("spawn").is_none(),
             "spawn must never survive filter_registry, even under ToolScope::All"
         );
+        assert!(
+            child.get("workflow").is_none(),
+            "workflow must never survive filter_registry, even under ToolScope::All"
+        );
 
         let only_def = AgentDef {
-            tools: ToolScope::Only(vec!["spawn".into(), "read".into()]),
+            tools: ToolScope::Only(vec!["spawn".into(), "workflow".into(), "read".into()]),
             ..all_def
         };
         let child = filter_registry(&only_def, &full);
         assert!(
             child.get("spawn").is_none(),
             "spawn must never survive filter_registry, even if named explicitly in `tools:`"
+        );
+        assert!(
+            child.get("workflow").is_none(),
+            "workflow must never survive filter_registry, even if named explicitly in `tools:`"
         );
         assert!(child.get("read").is_some());
     }
@@ -560,6 +613,7 @@ mod tests {
             model: None,
             effort: None,
             isolation: Isolation::None,
+            max_turns: None,
             source: AgentSource::User,
         };
         assert!(is_read_only(&only_reads));
@@ -631,5 +685,29 @@ mod tests {
         assert_eq!(d.name, "typo");
         assert_eq!(d.effort, None);
         assert_eq!(parse_effort("ultra", "test"), None);
+    }
+
+    #[test]
+    fn parse_def_stores_a_max_turns_ceiling() {
+        let d = parse_def(
+            "---\nname: bounded\nmax_turns: 12\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        assert_eq!(d.max_turns, Some(12));
+        let silent = parse_def("---\nname: plain\n---\nbody", AgentSource::User).unwrap();
+        assert_eq!(silent.max_turns, None);
+    }
+
+    /// Same posture as an unknown effort: warn, inherit, keep the def.
+    #[test]
+    fn a_non_numeric_max_turns_inherits_and_the_def_still_loads() {
+        let d = parse_def(
+            "---\nname: typo\nmax_turns: lots\n---\nbody",
+            AgentSource::User,
+        )
+        .unwrap();
+        assert_eq!(d.name, "typo");
+        assert_eq!(d.max_turns, None);
     }
 }

@@ -38,6 +38,11 @@ pub struct Config {
     pub plugins: PluginsCfg,
     #[serde(default)]
     pub agents: AgentsCfg,
+    // Dead until the 0044 workflow tool reads it; `hotl` is bin-only, so `pub`
+    // confers no reachability. Drop the attribute when that call site lands.
+    #[allow(dead_code)]
+    #[serde(default)]
+    pub workflows: WorkflowsCfg,
     #[serde(default)]
     pub concurrency: ConcurrencyCfg,
     #[serde(default)]
@@ -236,6 +241,29 @@ impl AgentsCfg {
             .map_or(hotl_tools::agents::Isolation::None, |raw| {
                 hotl_tools::agents::parse_isolation(raw, "`[agents] isolation`")
             })
+    }
+}
+
+/// `[workflows]` — the declarative runner's (0044) fan-out caps. Both are
+/// floors of one: a `0` would make every plan deadlock on admission.
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)] // see `Config::workflows`
+pub struct WorkflowsCfg {
+    /// Steps one plan may run at once. Default: 8.
+    pub concurrency: Option<usize>,
+    /// Agents one plan may spawn in total. Default: 1000.
+    pub max_agents: Option<usize>,
+}
+
+#[allow(dead_code)] // see `Config::workflows`
+impl WorkflowsCfg {
+    /// `(concurrency, max_agents)`, each clamped to at least 1 — silently,
+    /// since config has no warnings pass for sections like this one.
+    pub fn limits(&self) -> (usize, usize) {
+        (
+            self.concurrency.unwrap_or(8).max(1),
+            self.max_agents.unwrap_or(1000).max(1),
+        )
     }
 }
 
@@ -1129,6 +1157,25 @@ mod tests {
                 .agents
                 .isolation(),
             Isolation::None
+        );
+    }
+
+    #[test]
+    fn workflows_limits_default_and_floor_at_one() {
+        assert_eq!(cfg_with("").workflows.limits(), (8, 1000));
+        assert_eq!(
+            cfg_with("[workflows]\nconcurrency = 2\nmax_agents = 50\n")
+                .workflows
+                .limits(),
+            (2, 50)
+        );
+        // Zero would deadlock every plan on admission.
+        assert_eq!(
+            cfg_with("[workflows]\nconcurrency = 0\n")
+                .workflows
+                .limits()
+                .0,
+            1
         );
     }
 

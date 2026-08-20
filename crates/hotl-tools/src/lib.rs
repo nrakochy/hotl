@@ -284,15 +284,16 @@ impl Registry {
 
     /// A child registry containing only the tools of `self` that satisfy
     /// `keep`, in the same order — cheap (`Arc`-clone per kept tool, no
-    /// rebuild). `spawn` is defensively excluded regardless of `keep`: the
-    /// depth-1 cap is this method's job to preserve, not each caller's (see
-    /// `hotl_tools::agents::filter_registry`, the only current caller).
+    /// rebuild). `spawn` and `workflow` are defensively excluded regardless
+    /// of `keep`: the depth-1 cap is this method's job to preserve, not each
+    /// caller's (see `hotl_tools::agents::filter_registry`, the only current
+    /// caller).
     pub fn filtered(&self, keep: impl Fn(&dyn Tool) -> bool) -> Registry {
         Registry {
             tools: self
                 .tools
                 .iter()
-                .filter(|t| t.name() != "spawn" && keep(t.as_ref()))
+                .filter(|t| t.name() != "spawn" && t.name() != "workflow" && keep(t.as_ref()))
                 .cloned()
                 .collect(),
         }

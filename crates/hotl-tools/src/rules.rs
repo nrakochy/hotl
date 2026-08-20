@@ -704,6 +704,7 @@ const SUBJECTS: &[(&str, SubjectKind, &[&str])] = &[
     ("recall", SubjectKind::Text, &["query", "backend"]),
     ("skill", SubjectKind::Text, &["name", "source"]),
     ("spawn", SubjectKind::Text, &["agent_type", "task"]),
+    ("workflow", SubjectKind::Text, &["name"]),
     ("mcp", SubjectKind::Text, &["server", "tool"]),
 ];
 
@@ -2222,6 +2223,31 @@ prefix = "payments"
             ),
             Verdict::Auto { .. }
         ));
+    }
+
+    /// `workflow`'s declared subject is the top-level `name` only: an inline
+    /// `plan` call has none, so an allow rule declines it rather than reading
+    /// the plan's own `name` as a grant.
+    #[test]
+    fn workflow_allow_matches_name_but_not_an_inline_plan() {
+        let r = Rules::from_toml("[[allow]]\ntool = \"workflow\"\nprefix = \"review-\"\n").unwrap();
+        let verdict = |input: &Value| {
+            r.evaluate(
+                PermissionMode::Ask,
+                false,
+                "workflow",
+                input,
+                facts(true, false, false),
+            )
+        };
+        assert!(matches!(
+            verdict(&json!({"name": "review-changes"})),
+            Verdict::Auto { .. }
+        ));
+        assert_eq!(
+            verdict(&json!({"plan": {"name": "review-changes"}})),
+            Verdict::Ask
+        );
     }
 
     #[test]
