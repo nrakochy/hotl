@@ -256,6 +256,7 @@ Everything that flows into the model's context from a source other than the user
 | auto-memory files → context | same envelope; clipped to a 16 KB load budget |
 | MCP server output → context | sanitizer chokepoint (below) |
 | sub-agent result → parent context | `<subagent-result trust="untrusted">` envelope |
+| workflow result → parent context | `<workflow-result trust="untrusted" run=…>` envelope around the run's JSON; hotl's own summary, truncation and merge-back lines sit outside it |
 | bash/tool output → context | human gated the *command*; output enters context unsanitized — the model treats tool results as data by system-prompt instruction only (see gaps) |
 | post-edit diagnostics output → context | closing-delimiter defang, so a compiler error quoting a model-written file cannot forge `</diagnostics>` and reclaim the surrounding context. Not otherwise sanitized or byte-capped like MCP output — the "native tool output is not sanitized" gap below still stands |
 | api_key_helper command (config/env) → key | editor-written planes only (config.toml is a protected path); runs as harness infrastructure outside the tool sandbox, never model-initiated; stdout registered with the ingestion masker (startup key), stderr console-only; **caveat:** auth-error response bodies from the provider/gateway are persisted in the session log — the startup helper key is masked, but a key *refreshed* mid-session is not re-registered with the masker, so a gateway that echoes keys in auth-error bodies would persist that refreshed key in the log |
@@ -300,6 +301,8 @@ in config.toml). The tool is absent when nothing is configured.
 ## Sub-agents and protocol clients
 
 **`spawn` (sub-agents).** The child has **no human on the loop**, so its permission asks default-deny — it runs only auto-allowed/read-only tools under the parent's sandbox floor and rules. The depth cap is **structural, not a counter**: children are built with a builtins-only tool registry — no `spawn`, no MCP — so a child cannot recurse or reach external servers; the capability simply isn't in its registry. Results return to the parent inside the untrusted envelope. `fork` and `teammate` are reserved topologies.
+
+**`workflow` (many sub-agents, one plan).** The same posture, multiplied: every agent a plan starts is a `spawn`-shaped child — builtins-only registry (no `spawn`, no `workflow`, no MCP), asks default-deny, the parent's floor and rules — and the run is gated by **one** ask that names the plan, its phases and an upper bound on agent count; `[[allow]] tool = "workflow"` can whitelist a *saved* name only, never an inline plan (it has no `name` subject). Two caps bound the blast radius, `[workflows] concurrency` and `max_agents`, and a plan may lower either but not raise it. Mutating agents without a worktree hold the shared-tree lock, so "parallel" edits to your tree are still one at a time. The consolidated result re-enters inside the envelope above, and bodies are cut at 64 KiB in context (the full JSON is on disk under the data dir).
 
 **Worktree isolation (`isolation: worktree`, `[agents] isolation`).** An isolated child works in its own `git worktree` under `<workspace>/.git/hotl-worktrees/`, and its diff is applied back to your working tree when it finishes. Two limits are deliberate and worth knowing:
 

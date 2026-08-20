@@ -13,6 +13,12 @@ otherwise crowd the parent's context.
 {"agent_type": "explore", "task": "find every place TokenUsage is summed"}
 ```
 
+One child per call is `spawn`'s whole shape. To run **many** — phases of
+agents, a pipeline per item, majority votes, repeat-until-quiet — hand the
+`workflow` tool a declarative plan instead; it drives the same agent defs
+through the same child builder, with one ask for the whole run. See
+[workflows.md](../workflows/).
+
 ## Choosing an `agent_type`
 
 Three built-in agent types ship with hotl:
@@ -47,6 +53,7 @@ Frontmatter fields:
 | `model` | Override the child's model. Omit to inherit the parent's. |
 | `effort` | Reasoning depth for this child: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Replaces the parent's for that child only. Omit to inherit. An unrecognized value warns and the def still loads. |
 | `isolation` | `worktree` gives this def's children their own git worktree to work in; `none` (default) shares your working directory. See [Worktree isolation](#worktree-isolation) below. Beats the `[agents] isolation` default. |
+| `max_turns` | A ceiling on the child's turns, replacing the engine default for that child only. A non-numeric value warns and the def still loads. |
 
 A def's `effort` is what makes the depth ladder compose with fan-out: a
 read-only searcher can run cheap under a parent thinking hard.

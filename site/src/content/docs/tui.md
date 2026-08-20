@@ -105,7 +105,10 @@ document-level jumps are the `Ctrl` pair.
 ### Navigating the agent band
 
 While the band is showing and the input is empty, `↑`/`↓` move a highlight
-over its rows — `main` first, then each running spawn — clamped at both ends.
+over its rows — `main` first, then each running spawn or
+[workflow](../workflows/) — clamped at both ends. A workflow is one row
+however many agents it runs; its drill-in lists them with a token count
+beside each settled one.
 Without vim that is any time the band shows; with `vim_mode = true` the
 arrows move the highlight from Normal mode only (Insert keeps them for
 history recall), and `j`/`k` move it too. The first press engages the
@@ -232,10 +235,12 @@ own.
 | `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. |
 | `/status` | What this session is running: name, model, permission mode and plan state, reasoning effort, context window, todo count. |
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
+| `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
 | `/quit` | Leave the console (the session log is already on disk). |
 | `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments — any attached images ride along too. |
+| `/<workflow> [args]` | Run a saved workflow recipe (`~/.config/hotl/workflows/<name>.toml`) with the rest of the line as its arguments. Names resolve builtin → skill → workflow, so a recipe named like a skill is unreachable here (and hidden from completion); rename it. |
 
 Typing `/` opens a menu of every command and skill, filtered as you keep
 typing: `↑` / `↓` pick, `Tab` completes the highlighted name, `Enter` runs

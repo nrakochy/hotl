@@ -22,6 +22,7 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, MCP trust, memory, secrets audit, undo/git. Exit 1 if any check FAILs. |
 | `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
 | `hotl skills [add\|update\|remove]` | List every discovered skill with its source; manage skill marketplaces. See [skills.md](../skills/). |
+| `hotl workflows [list\|show <name> [--mermaid]\|check <file>]` | Saved workflow recipes: list them, print one as TOML or a Mermaid flowchart, or validate a plan file and print the summary its ask will show (exit 1 on errors). See [workflows.md](../workflows/). |
 | `hotl mcp [list\|show\|add\|untrust\|test]` | Inspect configured MCP servers and their trust grants. Read-mostly: it never writes `config.toml`, and there is no verb that grants trust. See [below](#hotl-mcp) and [mcp.md](../mcp/). |
 | `hotl watch` | The tmux dashboard (separate capability; [crates/hotl/README.md](https://github.com/nrakochy/hotl/blob/master/crates/hotl/README.md)). |
 | `hotl update` | Install the latest release. `--check` only looks; `--version X.Y.Z` picks one; `-y` skips the prompt. See [updating](../updating/). |
@@ -106,6 +107,10 @@ isolation = "none"          # "worktree": every mutating child gets its own
                             # git worktree and they run in parallel; a def's
                             # own `isolation:` frontmatter wins
 
+[workflows]                 # the workflow tool's fan-out caps (see workflows.md)
+concurrency = 8             # agents one process runs at once across every workflow
+max_agents = 1000           # agent starts one run may make; a plan can lower either
+
 [concurrency]               # Layer-B budgets; every field optional, safe defaults
 requests = 4                # concurrent web_fetch/web_search HTTP requests
 agents = 4                  # concurrent spawn sub-agent sessions (global, parent + children)
@@ -166,7 +171,7 @@ feel; it's opt-in, the default stays `tokyo-night`.
 
 `config.toml` is read at startup. In the console, `/reload` re-reads it and rebuilds the engine against the new file, keeping the session — the transcript, the model's context, the todos, the session name, its permission mode, and plan mode all carry forward. `hotl acp` clients reach the same thing as `session/reload_config`.
 
-Most of the file reloads: `[provider]`, `[[allow]]`, `[[mcp]]`, `[[hook]]`, `[diagnostics]`, `[skills]`, `[agents]`, `[context]`, `[behavior]`, `[settings]`, `system-prompt.md`. A reload that fails to parse or to select a provider changes nothing and says so — the running engine keeps serving.
+Most of the file reloads: `[provider]`, `[[allow]]`, `[[mcp]]`, `[[hook]]`, `[diagnostics]`, `[skills]`, `[agents]`, `[workflows]`, saved workflow recipes, `[context]`, `[behavior]`, `[settings]`, `system-prompt.md`. A reload that fails to parse or to select a provider changes nothing and says so — the running engine keeps serving.
 
 These are fixed for the life of the process; restart to change them:
 
@@ -539,6 +544,15 @@ The shared budget that bounds concurrent external work, one process-wide instanc
 - `subprocs` is reserved config surface for upcoming subprocess-batching work; setting it has no effect yet.
 - `blocking_threads` caps the tokio blocking-thread pool (default 16) — the pool `glob`'s tree walk uses; tokio's own unconfigured default is 512.
 - `worker_threads` is parsed for completeness but stays deliberately inert: it only applies to a multi-threaded async runtime, and hotl runs a single-threaded (`current_thread`) runtime everywhere by design (switching would risk breaking `!Send` futures in the TUI/actor code). Setting it logs a startup warning noting it has no effect.
+
+### Workflows (`[workflows]`)
+
+The `workflow` tool's own caps, separate from `[concurrency] agents` (which paces interactive `spawn`):
+
+- `concurrency` is the process-wide gate: how many workflow agents run at once across every run in the process (default 8). A plan's own `concurrency` can lower its run below this, never raise it.
+- `max_agents` is the most agent starts one run may make (default 1000). A plan's `max_agents` can lower it. Reaching it is a run error — hotl never truncates a run quietly.
+
+Both are floors of one. Mutating agents that are not worktree-isolated still serialise on the shared-tree lock regardless of width. See [workflows.md](../workflows/).
 
 ### Retention (`[retention]`)
 
