@@ -30,6 +30,9 @@ hotl-engine = { path = "../hotl-engine", version = "0.23.0", default-features = 
 # consumer, and the byte-prefix claim it makes has to be the same claim the
 # in-crate cache scenarios make.
 hotl-provider-anthropic = { path = "../hotl-provider-anthropic", version = "0.23.0" }
+# The Responses dialect's structural-prefix twin (0046) states the same claim
+# over that dialect's bytes, so the kit serializes with it too.
+hotl-provider-openai-responses = { path = "../hotl-provider-openai-responses", version = "0.23.0" }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

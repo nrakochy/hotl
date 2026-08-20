@@ -791,6 +791,72 @@ pub mod wire {
                 .all(|(x, y)| without_markers(x) == without_markers(y))
     }
 
+    // ─────────── Responses-dialect twins (GPT-5.6 explicit breakpoints, 0046) ───────────
+
+    /// Responses-dialect twin of [`durable_wire_body`]: tail and MOIM
+    /// stripped, explicit markers forced on (the gate lives in the provider,
+    /// not the renderer).
+    pub fn responses_durable_body(req: &SamplingRequest) -> serde_json::Value {
+        hotl_provider_openai_responses::body_for(
+            &SamplingRequest {
+                ephemeral_tail: Arc::new(Vec::new()),
+                turn_context: None,
+                ..req.clone()
+            },
+            true,
+        )
+    }
+
+    /// Every `prompt_cache_breakpoint` in a Responses body, counted
+    /// structurally — the twin of [`count_markers`].
+    pub fn count_breakpoints(v: &serde_json::Value) -> usize {
+        match v {
+            serde_json::Value::Object(map) => {
+                usize::from(map.contains_key("prompt_cache_breakpoint"))
+                    + map.values().map(count_breakpoints).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count_breakpoints).sum(),
+            _ => 0,
+        }
+    }
+
+    /// Indices into `input` whose item carries a breakpoint.
+    pub fn responses_marker_positions(body: &serde_json::Value) -> Vec<usize> {
+        body["input"]
+            .as_array()
+            .expect("input")
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| count_breakpoints(item) > 0)
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// `instructions`, `tools` and the first `earlier.input.len()` input items
+    /// equal byte for byte — markers included, because OpenAI hashes the
+    /// marked block as part of the prefix and placement is append-stable by
+    /// design (no anchor ever rolls on this dialect).
+    pub fn is_responses_prefix(earlier: &serde_json::Value, later: &serde_json::Value) -> bool {
+        if earlier["instructions"] != later["instructions"] || earlier["tools"] != later["tools"] {
+            return false;
+        }
+        let a = earlier["input"].as_array().expect("input");
+        let b = later["input"].as_array().expect("input");
+        a.len() <= b.len() && a.iter().zip(b).all(|(x, y)| x == y)
+    }
+
+    /// Every input index that carries a marker in `earlier` carries one in
+    /// `later`: sample N+1 re-presents sample N's newest marker over the same
+    /// prefix, so the read hits before any write.
+    pub fn responses_markers_are_append_stable(
+        earlier: &serde_json::Value,
+        later: &serde_json::Value,
+    ) -> bool {
+        let a = responses_marker_positions(earlier);
+        let b = responses_marker_positions(later);
+        b.starts_with(&a)
+    }
+
     /// Indices `i` where request `i + 1` broke the prefix relation with
     /// request `i`. Empty for an ordinary session; exactly one across a
     /// compaction fold, which is the only sanctioned discontinuity.
