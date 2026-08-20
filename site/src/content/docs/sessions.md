@@ -117,9 +117,15 @@ naming: cache matching looks back a bounded distance from the request's newest
 breakpoint, so a pathologically block-heavy final turn can leave a sliver of the
 tail uncached. The rolling anchors bound how big that sliver can get.)
 
-The OpenAI dialects cache implicitly — no breakpoints to place — and route by a
-caller-supplied key before the prefix hash, so hotl sends the session id as
-`prompt_cache_key` and a session's samples stay on one cache shard.
+The OpenAI dialects route by a caller-supplied key before the prefix hash, so
+hotl sends the session id as `prompt_cache_key` and a session's samples stay on
+one cache shard. On GPT-5.6 and later the cache reads only at explicit
+breakpoints (and bills writes at 1.25×), so hotl sends explicit-only mode with a
+marker on the last block of every durable user message and tool result — the
+per-sample todo reminder and turn context ride after the last marker, where
+they can change without touching the cached prefix. Earlier OpenAI models, and
+compatible servers, cache implicitly and get no breakpoints; a model name that
+hides the version can be forced either way with `[provider] cache_breakpoints`.
 
 ## Keeping the discount: phase instructions go in the prompt
 
