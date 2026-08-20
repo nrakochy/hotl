@@ -766,6 +766,7 @@ mod tests {
             effort: None,
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
+            cache_key: None,
         };
         let body = OpenAiCompatProvider::build_body(&req);
         let msgs = body["messages"].as_array().unwrap();
@@ -833,6 +834,7 @@ mod tests {
                 prefix_ttl: hotl_provider::CacheTtl::FiveMinutes,
             },
             turn_context: Some("<turn-context/>".into()),
+            cache_key: None,
         };
         let body = OpenAiCompatProvider::build_body(&req);
         assert_eq!(
@@ -1380,6 +1382,7 @@ mod tests {
             effort: None,
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
+            cache_key: None,
         }
     }
 

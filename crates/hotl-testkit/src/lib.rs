@@ -2058,11 +2058,13 @@ mod tests {
     /// MOIM is the **sanctioned ephemeral suffix** (commit-protocol.md
     /// §Causal groups): it carries a wall-clock timestamp and the working
     /// directory, is regenerated on both paths, rides after the cache marker
-    /// and never persists. Everything else is what byte-identity is claimed
-    /// over.
+    /// and never persists. The cache key is session identity (0045 D1) and
+    /// the two runs compared are two sessions, so it is normalized too.
+    /// Everything else is what byte-identity is claimed over.
     fn without_moim(req: &hotl_provider::SamplingRequest) -> hotl_provider::SamplingRequest {
         hotl_provider::SamplingRequest {
             turn_context: Some("<MOIM>".into()),
+            cache_key: None,
             ..req.clone()
         }
     }
@@ -2568,6 +2570,11 @@ mod tests {
         // what makes the byte-identity claim load-bearing rather than trivial.
         assert_the_speculated_tail_crossed_an_anchor(&adopted);
         assert_the_speculated_tail_crossed_an_anchor(&sequential);
+
+        // The speculative sample IS the next prefix (0045 D1): same routing
+        // key as the sample it followed, so it lands on the same cache shard.
+        assert!(adopted[0].cache_key.is_some());
+        assert_eq!(adopted[0].cache_key, adopted[1].cache_key);
 
         // Level 1: the request the engine hands the provider.
         assert_eq!(

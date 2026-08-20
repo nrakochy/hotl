@@ -961,6 +961,7 @@ mod tests {
             effort: None,
             cache: hotl_provider::CachePolicy::Off,
             turn_context: None,
+            cache_key: None,
         }
     }
 

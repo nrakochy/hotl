@@ -585,6 +585,10 @@ pub(crate) struct SharedDeps {
     /// at construction, so proposal build in the turn task masks under
     /// exactly the rules the actor would have used.
     masker: Arc<hotl_store::Masker>,
+    /// The session's ULID, sent as every sample's `SamplingRequest::cache_key`
+    /// (0045 D1): stable across resume, distinct per fork, shared by the
+    /// speculative sample — which IS the next prefix.
+    pub session_id: Arc<str>,
     /// Monotonic masking-rules epoch (commit-protocol.md §Proposal
     /// payloads' `rules_epoch` guard). Today masking rules never change
     /// mid-session, so this is constant for the life of a `SharedDeps` — the
@@ -665,6 +669,7 @@ impl SharedDeps {
         // and it's how a turn-side `prepare_payload` call ends up masking
         // under the exact same rules the log's own inline path uses.
         let masker = deps.log.masker_handle();
+        let session_id: Arc<str> = deps.log.session_id.as_str().into();
         let system: Arc<str> = deps.system.into();
         let system_estimate = tokens::estimate_text(&system);
         let shared = Self {
@@ -685,6 +690,7 @@ impl SharedDeps {
             hook_mask,
             notifications,
             masker,
+            session_id,
             rules_epoch: std::sync::atomic::AtomicU32::new(0),
             head_rx,
         };
@@ -2155,6 +2161,9 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Arc<Item>]) -> Opti
         effort: None,
         cache: hotl_provider::CachePolicy::Off,
         turn_context: None,
+        // Keyless (0045 D2): a different prefix every call would only spend
+        // the session key's ~15 req/min routing budget.
+        cache_key: None,
     };
     for _ in 0..SUMMARIZE_ATTEMPTS {
         let mut stream = shared.provider.stream(request.clone());
@@ -2212,6 +2221,8 @@ async fn evaluate_goal(
         effort: None,
         cache: hotl_provider::CachePolicy::Off,
         turn_context: None,
+        // Keyless (0045 D2), as `summarize`.
+        cache_key: None,
     };
     for _ in 0..GOAL_EVAL_ATTEMPTS {
         let mut stream = shared.provider.stream(request.clone());

@@ -83,6 +83,11 @@ pub struct SamplingRequest {
     /// after the cache marker AND after [`Self::ephemeral_tail`] — always the
     /// last thing on the wire. Never persisted; it exists only on the wire.
     pub turn_context: Option<String>,
+    /// Stable per-session routing key for implicit-cache providers (OpenAI's
+    /// `prompt_cache_key`): without it every hotl request shares one routing
+    /// key — the system-prompt head — and past ~15 req/min on that key the
+    /// provider starts missing. Explicit-cache dialects ignore it.
+    pub cache_key: Option<Arc<str>>,
 }
 
 /// How long a cache entry a breakpoint writes stays readable. Anthropic's two

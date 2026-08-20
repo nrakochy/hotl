@@ -1271,6 +1271,7 @@ mod tests {
                 prefix_ttl: CacheTtl::FiveMinutes,
             },
             turn_context: Some("<turn-context t=1/>".into()),
+            cache_key: None,
         };
         let mut one_hour = full.clone();
         one_hour.cache = CachePolicy::Static {
@@ -1403,6 +1404,7 @@ mod tests {
             effort: None,
             cache: CachePolicy::Off,
             turn_context: None,
+            cache_key: None,
         }
     }
 
@@ -1844,6 +1846,7 @@ mod tests {
                 prefix_ttl: CacheTtl::FiveMinutes,
             },
             turn_context: Some("<turn-context sample=\"1\"/>".into()),
+            cache_key: None,
         };
         let body = body_json(&req);
         assert_eq!(body["stream"], true);
@@ -1991,6 +1994,7 @@ mod tests {
                 prefix_ttl: CacheTtl::FiveMinutes,
             },
             turn_context: Some("<turn-context/>".into()),
+            cache_key: None,
         };
         let mut active = base.clone();
         active.ephemeral_tail = hotl_provider::arc_items(vec![Item::User {

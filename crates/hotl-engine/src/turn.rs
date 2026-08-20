@@ -1930,6 +1930,7 @@ impl Turn {
                 CachePolicy::Off
             },
             turn_context: Some(turn_context),
+            cache_key: Some(Arc::clone(&self.shared.session_id)),
         }
     }
 
