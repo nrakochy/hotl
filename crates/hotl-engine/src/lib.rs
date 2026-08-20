@@ -287,6 +287,9 @@ pub enum EngineEvent {
         name: String,
         summary: String,
         ok: Option<bool>,
+        /// Child token total on the done frame (input + output + cache_read +
+        /// cache_creation); `None` on start and for forwarded tool calls.
+        tokens: Option<u64>,
     },
     Retrying {
         attempt: u32,

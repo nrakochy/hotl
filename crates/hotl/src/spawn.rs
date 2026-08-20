@@ -387,6 +387,7 @@ async fn forward_child_tool(
             name,
             summary,
             ok,
+            tokens: None,
         })
         .await;
 }

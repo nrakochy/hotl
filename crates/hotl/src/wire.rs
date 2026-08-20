@@ -74,6 +74,7 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             name,
             summary,
             ok,
+            tokens,
         } => {
             let mut v = json!({
                 "type": "child_tool",
@@ -85,6 +86,9 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             });
             if let Some(ok) = ok {
                 v["ok"] = json!(ok);
+            }
+            if let Some(tokens) = tokens {
+                v["tokens"] = json!(tokens);
             }
             v
         }

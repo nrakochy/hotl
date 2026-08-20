@@ -255,8 +255,8 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             // 0039: everything `item_block` reads from the merged calls and
             // nested children. `started_at`/`settled_at` deliberately NOT
             // hashed — `item_block` never reads them; the drill-in renders
-            // outside the cache (D7). Running-child glyphs ride the parent
-            // ticks hashed above.
+            // outside the cache (D7). `tokens` is excluded for the same
+            // reason. Running-child glyphs ride the parent ticks hashed above.
             calls.len().hash(&mut h);
             for c in calls {
                 (&c.id, c.ok).hash(&mut h);
@@ -1334,6 +1334,12 @@ fn render_agent_stream(
                     " · {}s",
                     settled.saturating_sub(c.started_at) / anim::TICK_HZ
                 ),
+                Style::new().fg(p.muted),
+            ));
+        }
+        if let Some(n) = c.tokens {
+            spans.push(Span::styled(
+                format!(" · {} tok", crate::app::tok(n)),
                 Style::new().fg(p.muted),
             ));
         }
@@ -2606,6 +2612,28 @@ mod tests {
         );
     }
 
+    /// 0044: a settled child that reported a token total shows it after its
+    /// duration, compactly; one that did not stays as before.
+    #[test]
+    fn the_agent_stream_shows_a_childs_token_total_when_known() {
+        let mut s = State::new(true, "m".into());
+        let mut item = spawn_with_children(ToolStatus::Running, 3);
+        if let TranscriptItem::Tool { children, .. } = &mut item {
+            children[0].tokens = Some(12_345);
+        }
+        s.transcript.push(item);
+        s.selected_agent = Some("s1".into());
+        let all = draw(&s).join("\n");
+        assert!(
+            all.contains("✓ read  read c1.rs · 0s · 12.3k tok"),
+            "token total after the duration: {all}"
+        );
+        assert!(
+            all.contains("read c2.rs · 0s") && !all.contains("read c2.rs · 0s ·"),
+            "no total, no segment: {all}"
+        );
+    }
+
     /// 0039 D7: the stream follows its tail while `agent_scroll` is `None`
     /// and shows the top (header included) when scrolled back.
     #[test]
@@ -2723,6 +2751,7 @@ mod tests {
                     ok: (i < n).then_some(true),
                     started_at: 0,
                     settled_at: (i < n).then_some(0),
+                    tokens: None,
                 });
             }
         }
@@ -2784,6 +2813,7 @@ mod tests {
                 ok: None,
                 started_at: 0,
                 settled_at: None,
+                tokens: None,
             });
         }
         draw_cached(&s, &mut cache);
@@ -3387,6 +3417,19 @@ mod tests {
         *ticks = to;
     }
 
+    /// 0044: a child's token total is drill-in data, like its tick stamps —
+    /// it must not re-wrap the spawn card when the done frame lands.
+    #[test]
+    fn a_childs_tokens_stay_outside_the_fingerprint() {
+        let a = spawn_with_children(ToolStatus::Done, 2);
+        let mut b = a.clone();
+        if let TranscriptItem::Tool { children, .. } = &mut b {
+            children[0].tokens = Some(4321);
+        }
+        assert_ne!(a, b, "the fixture differs only in tokens");
+        assert_eq!(item_fingerprint(&a), item_fingerprint(&b));
+    }
+
     #[test]
     fn a_static_transcript_never_rewraps_however_long_the_wave_runs() {
         // The thinking phase: nothing in the transcript moves, only the strip.
@@ -3546,6 +3589,7 @@ mod tests {
                         ok: None,
                         started_at: step,
                         settled_at: None,
+                        tokens: None,
                     }),
                     30 => {
                         let c = children.last_mut().unwrap();

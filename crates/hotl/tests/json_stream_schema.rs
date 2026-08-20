@@ -53,6 +53,7 @@ fn every_frame_is_tagged_and_versioned() {
             name: "read".into(),
             summary: "read ./x".into(),
             ok: None,
+            tokens: None,
         },
         EngineEvent::ChildTool {
             parent_id: "t5".into(),
@@ -60,6 +61,7 @@ fn every_frame_is_tagged_and_versioned() {
             name: "read".into(),
             summary: String::new(),
             ok: Some(true),
+            tokens: Some(12),
         },
         EngineEvent::Retrying {
             attempt: 1,
@@ -229,6 +231,7 @@ fn tool_frames_carry_the_call_id() {
 /// 0039 D1: `child_tool` frames route by `parent_id`, carry an explicit
 /// `phase`, and `ok` rides only the done frame — omitted, not `null`, on
 /// start (the `hit_ratio` precedent), so later phases fit without reshaping.
+/// `tokens` (0044) follows the same rule: present only when known.
 #[test]
 fn child_tool_frames_carry_parent_id_phase_and_ok_only_on_done() {
     let start = wire::update_frame(&EngineEvent::ChildTool {
@@ -237,6 +240,7 @@ fn child_tool_frames_carry_parent_id_phase_and_ok_only_on_done() {
         name: "read".into(),
         summary: "read ./x".into(),
         ok: None,
+        tokens: None,
     })
     .expect("child_tool is a stream frame");
     assert_eq!(start["type"], "child_tool");
@@ -244,6 +248,10 @@ fn child_tool_frames_carry_parent_id_phase_and_ok_only_on_done() {
     assert_eq!(start["id"], "toolu_child");
     assert_eq!(start["phase"], "start");
     assert!(start.get("ok").is_none(), "start must omit ok: {start}");
+    assert!(
+        start.get("tokens").is_none(),
+        "start must omit tokens: {start}"
+    );
 
     let done = wire::update_frame(&EngineEvent::ChildTool {
         parent_id: "toolu_spawn".into(),
@@ -251,10 +259,26 @@ fn child_tool_frames_carry_parent_id_phase_and_ok_only_on_done() {
         name: "read".into(),
         summary: String::new(),
         ok: Some(false),
+        tokens: None,
     })
     .expect("child_tool is a stream frame");
     assert_eq!(done["phase"], "done");
     assert_eq!(done["ok"], json!(false));
+    assert!(
+        done.get("tokens").is_none(),
+        "an unknown total is omitted, not null: {done}"
+    );
+
+    let counted = wire::update_frame(&EngineEvent::ChildTool {
+        parent_id: "toolu_spawn".into(),
+        id: "toolu_child".into(),
+        name: "spawn".into(),
+        summary: String::new(),
+        ok: Some(true),
+        tokens: Some(1234),
+    })
+    .expect("child_tool is a stream frame");
+    assert_eq!(counted["tokens"], json!(1234));
 }
 
 #[test]

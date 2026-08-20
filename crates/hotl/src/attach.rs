@@ -417,6 +417,7 @@ mod tests {
                 name: "read".into(),
                 summary: "read ./x".into(),
                 ok: None,
+                tokens: None,
             },
             EngineEvent::ChildTool {
                 parent_id: "t1".into(),
@@ -424,6 +425,7 @@ mod tests {
                 name: "read".into(),
                 summary: String::new(),
                 ok: Some(false),
+                tokens: None,
             },
             EngineEvent::Retrying {
                 attempt: 1,
@@ -489,6 +491,7 @@ mod tests {
                 name: "read".into(),
                 summary: summary.into(),
                 ok,
+                tokens: None,
             })
             .unwrap()
         };

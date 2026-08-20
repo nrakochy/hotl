@@ -286,6 +286,9 @@ pub struct ChildCall {
     /// reads them (the drill-in renders outside the cache, D7).
     pub started_at: u64,
     pub settled_at: Option<u64>,
+    /// Token total from the done frame (0044) — drill-in only, so outside the
+    /// fingerprint invariant for the same reason as the stamps above.
+    pub tokens: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1109,8 +1112,10 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                         ok: None,
                         started_at: *ticks,
                         settled_at: None,
+                        tokens: None,
                     }),
                     Some(ok) => {
+                        let tokens = v.get("tokens").and_then(Value::as_u64);
                         if let Some(c) = children
                             .iter_mut()
                             .rev()
@@ -1118,6 +1123,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                         {
                             c.ok = Some(ok);
                             c.settled_at = Some(*ticks);
+                            c.tokens = tokens;
                         } else {
                             // Settled in one frame — a denied child never
                             // got a start.
@@ -1128,6 +1134,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                                 ok: Some(ok),
                                 started_at: *ticks,
                                 settled_at: Some(*ticks),
+                                tokens,
                             });
                         }
                     }
@@ -3546,6 +3553,25 @@ mod tests {
             vec![("c1".into(), None), ("c3".into(), Some(false))],
             "s2's running child plus the denied one, settled-failed"
         );
+        // 0044: a done frame's `tokens` lands on the settled child; absent
+        // stays `None`.
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"s2","id":"c1","name":"read","summary":"","phase":"done","ok":true,"tokens":777}),
+        );
+        let tokens_of = |s: &State, spawn: &str| -> Vec<Option<u64>> {
+            s.transcript
+                .iter()
+                .find_map(|i| match i {
+                    TranscriptItem::Tool { id, children, .. } if id == spawn => {
+                        Some(children.iter().map(|c| c.tokens).collect::<Vec<_>>())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(tokens_of(&s, "s2"), vec![Some(777), None]);
+        assert_eq!(tokens_of(&s, "s1"), vec![None]);
         // Child activity must not perturb the parent's phase.
         assert!(matches!(s.phase, Phase::Tool { .. }), "{:?}", s.phase);
         // A frame whose parent card is gone (reattach) drops silently.
