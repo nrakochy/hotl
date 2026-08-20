@@ -232,10 +232,40 @@ pub enum TranscriptItem {
     Error {
         text: Streamed,
     },
-    /// A multi-line block a command produced — today only `/context`. Raw
-    /// numbers, never formatted strings: `view.rs` owns column alignment, so
-    /// these tests can assert tokens instead of whitespace.
+    /// A multi-line block a command produced — `/context`. Raw numbers,
+    /// never formatted strings: `view.rs` owns column alignment, so these
+    /// tests can assert tokens instead of whitespace.
     Report(ContextReport),
+    /// `/workflows` (0044): every run of the `workflow` tool this process has
+    /// started, one row each. Parsed ad hoc from the payload like `ContextRow`.
+    WorkflowsReport(Vec<WorkflowRun>),
+}
+
+/// One `workflow` run as `/workflows` shows it.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkflowRun {
+    pub name: String,
+    /// `running` | `done` | `failed` | `cancelled`, verbatim from the wire.
+    pub status: String,
+    pub tokens: u64,
+    pub elapsed_ms: u64,
+    pub phases: Vec<WorkflowPhase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkflowPhase {
+    pub title: String,
+    /// Agents settled (done or failed) / started so far, and how many failed.
+    pub settled: usize,
+    pub started: usize,
+    pub failed: usize,
+}
+
+/// The two tool cards that own a row of the agent band (0039/0044): a
+/// running `spawn` or `workflow` call, whose forwarded children the drill-in
+/// shows. Three sites test this; one helper keeps them agreeing.
+pub fn is_agent_card(name: &str) -> bool {
+    matches!(name, "spawn" | "workflow")
 }
 
 /// A `/context` answer, ready to render. Everything a row needs is here; the
@@ -562,7 +592,7 @@ impl State {
             .iter()
             .filter(|i| {
                 matches!(i, TranscriptItem::Tool { id, name, status, .. }
-                    if name == "spawn"
+                    if is_agent_card(name)
                         && ((live && matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. }))
                             || pinned(id)))
             })
@@ -738,6 +768,9 @@ pub enum Cmd {
     /// Send `session/context` (fire-and-forget; the ack is noise — the engine
     /// broadcasts `context_report`, which is what the client acts on).
     RequestContext,
+    /// Send `session/workflows` (0044; same fire-and-forget shape — the
+    /// engine broadcasts `workflows_report`).
+    RequestWorkflows,
     /// Re-read the client-side half of `config.toml` — theme, density, vim
     /// mode, mouse. The runtime owns this one: `hotl-tui` never touches the
     /// filesystem.
@@ -1017,10 +1050,10 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 ..
             }) = state.transcript.last_mut()
             {
-                // Never into/out of `spawn`, a card with children, or a
+                // Never into/out of an agent card, a card with children, or a
                 // settled failure (a retry after failure starts fresh — D3).
                 if *prev_name == name
-                    && name != "spawn"
+                    && !is_agent_card(&name)
                     && children.is_empty()
                     && merge_key(prev_summary) == key
                     && !matches!(prev_status, ToolStatus::Failed | ToolStatus::Denied)
@@ -1329,6 +1362,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // a surface that never asked — harmless, it is read-only information
         // about a session both surfaces share.
         "context_report" => push_context_report(state, v),
+        "workflows_report" => push_workflows_report(state, v),
         "prompt_queued" => clear_newest_queued_steer(state),
         "compacted" => {
             let degraded = v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
@@ -1390,6 +1424,62 @@ fn push_context_report(state: &mut State, v: &Value) {
         free: window.saturating_sub(estimated.max(reported.unwrap_or(0))),
         rows: display,
     }));
+}
+
+/// Turn a `workflows_report` payload into a `TranscriptItem::WorkflowsReport`.
+/// Same honesty rule as `push_context_report`: a payload without a `runs`
+/// array is a notice, never an empty table.
+fn push_workflows_report(state: &mut State, v: &Value) {
+    let Some(runs) = v.get("runs").and_then(Value::as_array) else {
+        notice(
+            state,
+            "could not read the workflows report the engine sent".into(),
+        );
+        return;
+    };
+    if runs.is_empty() {
+        notice(state, "no workflows have run in this process".into());
+        return;
+    }
+    let str_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("?").to_string();
+    let u64_of = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64).unwrap_or(0);
+    let rows = runs
+        .iter()
+        .map(|r| WorkflowRun {
+            name: str_of(r, "name"),
+            status: str_of(r, "status"),
+            tokens: u64_of(r, "tokens"),
+            elapsed_ms: u64_of(r, "elapsed_ms"),
+            phases: r
+                .get("phases")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|p| {
+                    let agents: Vec<&Value> = p
+                        .get("agents")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    let statuses: Vec<&str> = agents
+                        .iter()
+                        .map(|a| a.get("status").and_then(Value::as_str).unwrap_or(""))
+                        .collect();
+                    WorkflowPhase {
+                        title: str_of(p, "title"),
+                        settled: statuses
+                            .iter()
+                            .filter(|s| matches!(**s, "done" | "failed"))
+                            .count(),
+                        started: agents.len(),
+                        failed: statuses.iter().filter(|s| **s == "failed").count(),
+                    }
+                })
+                .collect(),
+        })
+        .collect();
+    state.transcript.push(TranscriptItem::WorkflowsReport(rows));
 }
 
 fn on_prompt_result(
@@ -2182,6 +2272,9 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // No idle guard, unlike `/reload`: this appends nothing and replaces
         // nothing, so it is safe mid-turn.
         "context" => vec![Cmd::RequestContext],
+        // Every run of the `workflow` tool this process has started, with
+        // per-phase progress — read-only, safe mid-turn like `/context`.
+        "workflows" => vec![Cmd::RequestWorkflows],
         // The strip shows a compact line; this prints the breakdown without
         // stealing strip width.
         "cost" => {
@@ -2251,6 +2344,29 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             if state.phase == Phase::Idle {
                 state.pending_skill = Some(other.to_string());
             }
+            submit(state, text, payload)
+        }
+        // A saved workflow recipe (0044), after the built-ins and skills —
+        // the precedence `set_workflows` hides shadowed names by. Desugars
+        // to a prompt naming the recipe; the tool call is the model's.
+        other if state.workflows.iter().any(|w| w == other) => {
+            let rest = payload
+                .text
+                .trim()
+                .strip_prefix('/')
+                .and_then(|r| r.split_once(char::is_whitespace))
+                .map(|(_, a)| a.trim())
+                .unwrap_or("");
+            let mut text = format!(
+                "Run the saved workflow `{other}` with the `workflow` tool (name = \"{other}\")."
+            );
+            if !rest.is_empty() {
+                text.push_str(&format!(" Arguments: {rest}"));
+            }
+            let payload = paste::PromptPayload {
+                text: text.clone(),
+                images: payload.images,
+            };
             submit(state, text, payload)
         }
         other => {
@@ -3631,6 +3747,51 @@ mod tests {
             .collect()
     }
 
+    /// 0044: a running `workflow` card is a band row like a spawn, and two
+    /// workflow cards with equal summaries never merge (D3's spawn rule).
+    #[test]
+    fn a_running_workflow_card_is_a_band_row_and_never_merges() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        let start = |s: &mut State, id: &str| {
+            upd(
+                s,
+                json!({"type":"tool_start","id":id,"name":"workflow","summary":"workflow `x` — 1 phase"}),
+            )
+        };
+        start(&mut s, "w1");
+        start(&mut s, "w2");
+        assert_eq!(band_ids(&s), vec!["w1", "w2"]);
+        let cards = s
+            .transcript
+            .iter()
+            .filter(|i| matches!(i, TranscriptItem::Tool { name, .. } if name == "workflow"))
+            .count();
+        assert_eq!(cards, 2, "equal summaries must not merge into one card");
+        // Its forwarded agents land on the card like a spawn's children.
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"w1","id":"r:A:a:0","name":"agent","summary":"A · a","phase":"start"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"child_tool","parent_id":"w1","id":"r:A:a:0","name":"agent","summary":"","phase":"done","ok":true,"tokens":1200}),
+        );
+        let Some(TranscriptItem::Tool { children, .. }) = s
+            .transcript
+            .iter()
+            .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == "w1"))
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (children[0].ok, children[0].tokens),
+            (Some(true), Some(1200))
+        );
+        settle(&mut s, "w1");
+        assert_eq!(band_ids(&s), vec!["w2"]);
+    }
+
     /// 0043 D1: a spawn row exists while its card runs — the settle drops it.
     #[test]
     fn settled_spawns_leave_the_band() {
@@ -4632,8 +4793,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/");
-        // Eleven built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(12));
+        // Twelve built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(13));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename` and `review` prefix-match; no other built-in
@@ -5359,6 +5520,108 @@ mod tests {
             Some(TranscriptItem::Notice { text }) => text.as_str().to_string(),
             other => panic!("expected a notice, got {other:?}"),
         }
+    }
+
+    /// 0044: `/<recipe>` desugars to a prompt naming the saved workflow; the
+    /// model makes the tool call. Arguments ride verbatim; none means no
+    /// trailing clause. Precedence is builtin > skill > workflow.
+    #[test]
+    fn a_saved_workflow_slash_desugars_to_a_prompt_below_builtins_and_skills() {
+        let mut s = State::test_default();
+        s.set_skills(vec![("review".into(), String::new())]);
+        s.set_workflows(vec![
+            ("review-changes".into(), String::new()),
+            ("review".into(), String::new()),
+            ("context".into(), String::new()),
+        ]);
+        let cmds = slash(&mut s, "review-changes crates/hotl-workflow");
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
+            panic!("expected a prompt, got {cmds:?}");
+        };
+        assert_eq!(
+            p.text,
+            "Run the saved workflow `review-changes` with the `workflow` tool (name = \"review-changes\"). Arguments: crates/hotl-workflow"
+        );
+        let mut s2 = State::test_default();
+        s2.set_workflows(vec![("review-changes".into(), String::new())]);
+        let cmds = slash(&mut s2, "review-changes");
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
+            panic!("{cmds:?}")
+        };
+        assert!(
+            p.text.ends_with("(name = \"review-changes\")."),
+            "{}",
+            p.text
+        );
+
+        // A skill wins over a same-named recipe; a builtin over both.
+        s.phase = Phase::Idle;
+        let cmds = slash(&mut s, "review");
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
+            panic!("{cmds:?}")
+        };
+        assert!(p.text.starts_with("Load the skill `review`"), "{}", p.text);
+        assert_eq!(slash(&mut s, "context"), vec![Cmd::RequestContext]);
+        assert_eq!(slash(&mut s, "workflows"), vec![Cmd::RequestWorkflows]);
+    }
+
+    #[test]
+    fn a_workflows_report_becomes_an_item_and_malformed_or_empty_ones_notice() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::Update(json!({"type": "workflows_report", "runs": [{
+                "id": "r1", "name": "review-changes", "status": "running", "tokens": 41_200, "elapsed_ms": 192_000,
+                "phases": [
+                    {"title": "Review", "agents": [{"status": "done"}, {"status": "done"}]},
+                    {"title": "Verify", "agents": [{"status": "done"}, {"status": "failed"}, {"status": "running"}]},
+                    {"title": "Find", "agents": []}
+                ]
+            }]})),
+        );
+        let Some(TranscriptItem::WorkflowsReport(runs)) = s.transcript.last() else {
+            panic!("{:?}", s.transcript.last());
+        };
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            (
+                runs[0].name.as_str(),
+                runs[0].status.as_str(),
+                runs[0].tokens,
+                runs[0].elapsed_ms
+            ),
+            ("review-changes", "running", 41_200, 192_000)
+        );
+        assert_eq!(
+            runs[0].phases,
+            vec![
+                WorkflowPhase {
+                    title: "Review".into(),
+                    settled: 2,
+                    started: 2,
+                    failed: 0
+                },
+                WorkflowPhase {
+                    title: "Verify".into(),
+                    settled: 2,
+                    started: 3,
+                    failed: 1
+                },
+                WorkflowPhase {
+                    title: "Find".into(),
+                    settled: 0,
+                    started: 0,
+                    failed: 0
+                },
+            ]
+        );
+        update(&mut s, Msg::Update(json!({"type": "workflows_report"})));
+        assert!(last_notice(&s).contains("could not read the workflows report"));
+        update(
+            &mut s,
+            Msg::Update(json!({"type": "workflows_report", "runs": []})),
+        );
+        assert_eq!(last_notice(&s), "no workflows have run in this process");
     }
 
     #[test]

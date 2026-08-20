@@ -272,6 +272,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
         // no unit test catches and every use does.
         TranscriptItem::Report(r) => (6u8, r).hash(&mut h),
         TranscriptItem::Error { text } => (7u8, text_key(text)).hash(&mut h),
+        TranscriptItem::WorkflowsReport(runs) => (8u8, runs).hash(&mut h),
     }
     h.finish()
 }
@@ -822,6 +823,16 @@ fn item_block<'a>(
             },
             report_lines(r, p, inner),
         ),
+        // A `/workflows` report (0044): one row per run, the same spine.
+        TranscriptItem::WorkflowsReport(runs) => (
+            Spine {
+                marker: "·",
+                cont: "·",
+                marker_style: Style::new().fg(p.muted),
+                cont_style: Style::new().fg(p.muted),
+            },
+            workflow_lines(runs, p),
+        ),
         // Reasoning: dimmed italic behind a faint spine, collapsed by default.
         // The trailer names the toggle so it is discoverable without opening
         // the help overlay.
@@ -854,6 +865,60 @@ fn item_block<'a>(
             )
         }
     }
+}
+
+/// `name · status · Review 4/4 ✓ → Verify 6/7 ✗ · 41.2k tok · 3m12s` per run.
+/// A phase is `✓` once every started agent settled without failure, `✗`
+/// when any failed, and bare while it is still running.
+fn workflow_lines<'a>(runs: &[crate::app::WorkflowRun], p: &Palette) -> Vec<Line<'a>> {
+    let mut out = vec![Line::styled(
+        format!(
+            "Workflows — {} run{}",
+            runs.len(),
+            if runs.len() == 1 { "" } else { "s" }
+        ),
+        Style::new().fg(p.ink).bold(),
+    )];
+    for r in runs {
+        let status_color = match r.status.as_str() {
+            "done" => p.idle,
+            "failed" | "cancelled" => p.blocked,
+            _ => p.active,
+        };
+        let phases: Vec<String> = r
+            .phases
+            .iter()
+            .map(|ph| {
+                let mark = if ph.failed > 0 {
+                    " ✗"
+                } else if ph.started > 0 && ph.settled == ph.started {
+                    " ✓"
+                } else {
+                    ""
+                };
+                format!("{} {}/{}{mark}", ph.title, ph.settled, ph.started)
+            })
+            .collect();
+        let secs = r.elapsed_ms / 1000;
+        let elapsed = if secs >= 60 {
+            format!("{}m{:02}s", secs / 60, secs % 60)
+        } else {
+            format!("{secs}s")
+        };
+        out.push(Line::from(vec![
+            Span::styled(r.name.clone(), Style::new().fg(p.ink).bold()),
+            Span::styled(format!(" · {}", r.status), Style::new().fg(status_color)),
+            Span::styled(
+                format!(
+                    " · {} · {} tok · {elapsed}",
+                    phases.join(" → "),
+                    crate::app::tok(r.tokens)
+                ),
+                Style::new().fg(p.muted),
+            ),
+        ]));
+    }
+    out
 }
 
 /// Display labels for `/context` rows. The wire tag (`ContextKind`'s
@@ -1185,9 +1250,10 @@ fn status_glyph(status: &ToolStatus, ticks: u64, p: &Palette) -> (&'static str, 
 /// id renders the main transcript instead.
 fn selected_spawn(state: &State) -> Option<&TranscriptItem> {
     let want = state.selected_agent.as_deref()?;
-    state.transcript.iter().find(
-        |i| matches!(i, TranscriptItem::Tool { id, name, .. } if name == "spawn" && id == want),
-    )
+    state.transcript.iter().find(|i| {
+        matches!(i, TranscriptItem::Tool { id, name, .. }
+            if crate::app::is_agent_card(name) && id == want)
+    })
 }
 
 /// The agent band (0039, navigable since 0043): a `main` row plus a

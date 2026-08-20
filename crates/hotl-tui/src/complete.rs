@@ -27,7 +27,7 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 11] = [
+const BUILTINS: [(&str, &str); 12] = [
     ("rename", "name this session"),
     ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
@@ -36,6 +36,7 @@ const BUILTINS: [(&str, &str); 11] = [
     ("help", "show the key bindings"),
     ("status", "what this session is running"),
     ("context", "what is filling the context window"),
+    ("workflows", "runs of the workflow tool, with progress"),
     ("cost", "token and cost breakdown"),
     ("clear", "clear the transcript view"),
     ("quit", "leave the console"),
@@ -214,6 +215,7 @@ mod tests {
                 "rename",
                 "status",
                 "context",
+                "workflows",
                 "run",
                 "review",
                 "rag-recall",

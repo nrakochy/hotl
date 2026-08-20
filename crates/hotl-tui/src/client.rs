@@ -412,6 +412,9 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         Cmd::RequestContext => {
             client.request("session/context", json!({})).await;
         }
+        Cmd::RequestWorkflows => {
+            client.request("session/workflows", json!({})).await;
+        }
         Cmd::ReplyPermission {
             req_id,
             allow,
