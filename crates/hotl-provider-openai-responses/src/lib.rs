@@ -20,7 +20,7 @@
 //! `reasoning` in turn (`hotl_provider::transform::strip_foreign_reasoning`
 //! and the Anthropic converter's own filter).
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::stream::BoxStream;
@@ -49,24 +49,23 @@ const ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Twin of the constant in `hotl-provider-openai`. Do not remove as cosmetic.
 const TOOL_ERROR_PREFIX: &str = "[tool_error] ";
 
-/// The Responses serializer. Public so the provider (`stream()`) and the
-/// body-render tests share one entry point; there is no legacy re-render
-/// mid-loop here, so the body is built exactly once per request.
-pub fn body_for(req: &SamplingRequest) -> Value {
+/// The Responses serializer. Public so the provider (`stream()`), the
+/// body-render tests and the testkit share one entry point. Built once per
+/// capability, like the chat dialect's `legacy` flip: `explicit` is the
+/// caller's decision (model gate, policy, probe latch); the renderer obeys.
+pub fn body_for(req: &SamplingRequest, explicit: bool) -> Value {
     // Derived once per request from static catalog data. The OpenAI family
     // is uncatalogued, so this fails open (images always sent) — a
     // non-vision server answers with its own 400, surfaced honestly.
     let send_images = hotl_provider::catalog::supports_images(&req.model);
     let mut input = Vec::new();
     for item in req.items.iter() {
-        convert_item(item, &mut input, send_images);
+        convert_item(item, &mut input, send_images, explicit);
     }
-    // The ephemeral suffix keeps its wire position in this dialect too:
-    // after every durable item, before MOIM. Caching is implicit here, but
-    // the ordering is what the engine's byte-identity claim is made over,
-    // so it is not this crate's to reorder.
+    // Tail and MOIM ride after the last marker: under GPT-5.6's rules a
+    // marker on either would rewrite the whole prefix every sample (0046).
     for item in req.ephemeral_tail.iter() {
-        convert_item(item, &mut input, send_images);
+        convert_item(item, &mut input, send_images, false);
     }
     if let Some(tc) = &req.turn_context {
         input.push(json!({"role": "user", "content": tc}));
@@ -96,9 +95,12 @@ pub fn body_for(req: &SamplingRequest) -> Value {
     if let Some(key) = &req.cache_key {
         body["prompt_cache_key"] = json!(key.as_ref());
     }
-    // `cache` stays an Anthropic-surface knob: caching is implicit here and
-    // this dialect emits no breakpoints under ANY `CachePolicy`.
-    //
+    // `Static` → explicit-only mode with a marker on every durable user-role
+    // item when the model (or the override) says GPT-5.6+; `Off` → no cache
+    // fields at all, byte-identical to the implicit wire.
+    if explicit {
+        body["prompt_cache_options"] = hotl_provider::openai_cache::options();
+    }
     // Only spoken when the session opted into the ladder: an unconfigured
     // request keeps its old bytes (the 0029 byte-conservatism rule), and an
     // unsolicited `reasoning` object — even `summary` alone — 400s on
@@ -139,33 +141,46 @@ fn tool_json(t: &ToolDef) -> Value {
     json!({"type": "function", "name": t.name, "description": t.description, "parameters": t.input_schema})
 }
 
-fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool) {
+/// `mark`: put a GPT-5.6 explicit breakpoint on this item's last content
+/// block. Only the durable loop ever passes `true`, so a marker on ephemeral
+/// content is unrepresentable here, as on Anthropic.
+fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool, mark: bool) {
     match item {
         // System rides `instructions`, never `input`.
         Item::System { .. } | Item::Unknown => {}
-        // INVARIANT: an imageless user item stays `"content": <plain string>`
-        // — byte-identical to the pre-image wire (the chat dialect's
+        // INVARIANT: an unmarked imageless user item stays `"content": <plain
+        // string>` — byte-identical to the pre-image wire (the chat dialect's
         // invariant, kept here so gateways that reject array content for
         // plain text keep working). Image parts precede the text part,
         // matching every other dialect: one provider-neutral ordering rule.
+        // A marked item is always the array form: the marker needs a block.
         Item::User { text, images, .. } => {
-            if send_images && !images.is_empty() {
-                let mut parts: Vec<Value> = images
-                    .iter()
-                    .map(|img| {
-                        json!({
-                            "type": "input_image",
-                            "image_url": format!("data:{};base64,{}", img.media_type, img.data)
-                        })
-                    })
-                    .collect();
-                parts.push(json!({"type": "input_text", "text": text}));
-                out.push(json!({"role": "user", "content": parts}));
-            } else {
+            let with_images = send_images && !images.is_empty();
+            if !with_images && !mark {
                 let rendered =
                     hotl_provider::transform::text_with_omitted_images(text, images.len());
                 out.push(json!({"role": "user", "content": rendered.as_ref()}));
+                return;
             }
+            let mut parts: Vec<Value> = Vec::new();
+            let mut text_part = if with_images {
+                parts.extend(images.iter().map(|img| {
+                    json!({
+                        "type": "input_image",
+                        "image_url": format!("data:{};base64,{}", img.media_type, img.data)
+                    })
+                }));
+                json!({"type": "input_text", "text": text})
+            } else {
+                let rendered =
+                    hotl_provider::transform::text_with_omitted_images(text, images.len());
+                json!({"type": "input_text", "text": rendered.as_ref()})
+            };
+            if mark {
+                text_part["prompt_cache_breakpoint"] = hotl_provider::openai_cache::breakpoint();
+            }
+            parts.push(text_part);
+            out.push(json!({"role": "user", "content": parts}));
         }
         // Blocks replay in original order, so a `reasoning` item stays
         // directly before the `function_call` it justified — the stateless
@@ -203,13 +218,25 @@ fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool) {
             }
         }
         Item::ToolResults { results } => {
-            for r in results {
+            let last = results.len().saturating_sub(1);
+            for (i, r) in results.iter().enumerate() {
                 // T3-13 twin: Responses has no structured error field on
                 // `function_call_output` either, so the signal is in-band.
                 let output = if r.is_error && !r.content.starts_with(TOOL_ERROR_PREFIX) {
                     format!("{TOOL_ERROR_PREFIX}{}", r.content)
                 } else {
                     r.content.clone()
+                };
+                // One marker per item, on the last result: a parallel batch
+                // of K results can never exhaust the four write slots.
+                let output = if mark && i == last {
+                    json!([{
+                        "type": "input_text",
+                        "text": output,
+                        "prompt_cache_breakpoint": hotl_provider::openai_cache::breakpoint(),
+                    }])
+                } else {
+                    Value::String(output)
                 };
                 out.push(json!({
                     "type": "function_call_output",
@@ -608,15 +635,22 @@ impl ResponsesAssembler {
         stop: Option<StopReason>,
     ) -> Result<Vec<StreamEvent>, ProviderError> {
         if let Some(u) = v.pointer("/response/usage") {
-            // OpenAI counts cached tokens INSIDE `input_tokens`; `TokenUsage`
-            // counts them outside it (Anthropic semantics), so carve them out.
+            // OpenAI counts cached and written tokens INSIDE `input_tokens`;
+            // `TokenUsage` counts both outside it (Anthropic semantics).
             let cached = u
                 .pointer("/input_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let written = u
+                .pointer("/input_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             if let Some(n) = u.get("input_tokens").and_then(Value::as_u64) {
-                self.usage.input_tokens = n.saturating_sub(cached);
-                self.usage.cache_read_input_tokens = cached;
+                let (input, read, creation) =
+                    hotl_provider::openai_cache::carve_usage(n, cached, written);
+                self.usage.input_tokens = input;
+                self.usage.cache_read_input_tokens = read;
+                self.usage.cache_creation_input_tokens = creation;
             }
             if let Some(n) = u.get("output_tokens").and_then(Value::as_u64) {
                 self.usage.output_tokens = n;
@@ -692,6 +726,10 @@ pub struct OpenAiResponsesProvider {
     /// in-flight warm request — see the twin field in
     /// `hotl-provider-anthropic` for the full rationale.
     armed: Arc<AtomicU64>,
+    /// `None` = decide by model name (`openai_cache::breakpoints_supported`).
+    cache_breakpoints: Option<bool>,
+    /// Latched by the 0046 probe: the endpoint 400'd on a cache field once.
+    breakpoints_rejected: Arc<AtomicBool>,
 }
 
 impl OpenAiResponsesProvider {
@@ -703,7 +741,28 @@ impl OpenAiResponsesProvider {
             headers_timeout: hotl_provider::timeouts::HEADERS,
             stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
             armed: Arc::new(AtomicU64::new(0)),
+            cache_breakpoints: None,
+            breakpoints_rejected: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Force GPT-5.6 explicit cache breakpoints on or off, overriding the
+    /// model-name gate (a gateway alias that hides the version, or an
+    /// endpoint known to reject `prompt_cache_options`).
+    pub fn cache_breakpoints(mut self, on: bool) -> Self {
+        self.cache_breakpoints = Some(on);
+        self
+    }
+
+    /// The three-term decision `stream()` renders under: the policy asks for
+    /// markers, the probe has not latched, and the override or the name gate
+    /// says the model takes them.
+    pub fn wants_explicit(&self, req: &SamplingRequest) -> bool {
+        req.cache.marks_breakpoints()
+            && !self.breakpoints_rejected.load(Ordering::Relaxed)
+            && self
+                .cache_breakpoints
+                .unwrap_or_else(|| hotl_provider::openai_cache::breakpoints_supported(&req.model))
     }
 
     /// The Responses endpoint for this provider's base URL. Shared by
@@ -849,9 +908,9 @@ impl Provider for OpenAiResponsesProvider {
         <Self as Warmable>::arm(self)
     }
 
-    /// The chat dialect's stream loop minus the legacy-max-tokens probe:
-    /// this dialect has no pre-2024 spelling to fall back to, so the body is
-    /// rendered exactly once.
+    /// The chat dialect's stream loop with one probe of its own: a 4xx
+    /// naming a prompt-cache field re-renders the same sample without the
+    /// cache fields and latches the provider so later samples skip the probe.
     fn stream(
         &self,
         req: SamplingRequest,
@@ -861,7 +920,9 @@ impl Provider for OpenAiResponsesProvider {
         let source = self.key_source.clone();
         let headers_timeout = self.headers_timeout;
         let stream_idle_timeout = self.stream_idle_timeout;
-        let body = body_for(&req);
+        let explicit = self.wants_explicit(&req);
+        let mut body = body_for(&req, explicit);
+        let rejected = Arc::clone(&self.breakpoints_rejected);
 
         Box::pin(async_stream::stream! {
             // INVARIANT (T2-16): `attempt` counts network/HTTP attempts only.
@@ -926,6 +987,21 @@ impl Provider for OpenAiResponsesProvider {
                             }
                         }
                     }
+                    Attempt::Fail(e)
+                        if explicit
+                            && !rejected.load(Ordering::Relaxed)
+                            && hotl_provider::openai_cache::rejects_breakpoints(&e) =>
+                    {
+                        // A capability probe, not a failure: no retry slot,
+                        // latched per provider.
+                        rejected.store(true, Ordering::Relaxed);
+                        body = body_for(&req, false);
+                        yield Ok(StreamEvent::Retrying {
+                            attempt,
+                            reason: "endpoint rejects prompt-cache breakpoints — retrying \
+                                     without; caching falls back to implicit".into(),
+                        });
+                    }
                     Attempt::Fail(e) => {
                         yield Err(e);
                         return;
@@ -977,9 +1053,9 @@ mod tests {
     fn the_session_cache_key_rides_prompt_cache_key() {
         let mut req = sampling_req();
         req.cache_key = Some("01J0SESSIONULID".into());
-        assert_eq!(body_for(&req)["prompt_cache_key"], "01J0SESSIONULID");
+        assert_eq!(body_for(&req, false)["prompt_cache_key"], "01J0SESSIONULID");
         req.cache_key = None;
-        assert!(body_for(&req).get("prompt_cache_key").is_none());
+        assert!(body_for(&req, false).get("prompt_cache_key").is_none());
     }
 
     #[test]
@@ -992,7 +1068,7 @@ mod tests {
             input_schema: json!({"type":"object"}),
         }]
         .into();
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
@@ -1020,7 +1096,7 @@ mod tests {
             images: Vec::new(),
         }]);
         req.turn_context = Some("<turn-context/>".into());
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["content"], "hi");
         assert_eq!(input[1]["content"], "<todos>\n[~] a\n</todos>");
@@ -1028,10 +1104,198 @@ mod tests {
         assert_eq!(input.len(), 3);
     }
 
+    fn user(text: &str) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: None,
+            images: Vec::new(),
+        }
+    }
+
+    fn todos(text: &str) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: Some(hotl_types::SyntheticReason::Todos),
+            images: Vec::new(),
+        }
+    }
+
+    fn tool_use(id: &str) -> Item {
+        Item::Assistant {
+            blocks: vec![json!({"type": "tool_use", "id": id, "name": "read", "input": {}})],
+        }
+    }
+
+    fn results(ids: &[&str]) -> Item {
+        Item::ToolResults {
+            results: ids
+                .iter()
+                .map(|id| ToolResultItem {
+                    tool_use_id: (*id).into(),
+                    content: format!("out-{id}"),
+                    is_error: false,
+                })
+                .collect(),
+        }
+    }
+
+    /// The 0046 fixture: durable history with one parallel batch, a todos
+    /// tail and a MOIM — the shape GPT-5.6's implicit breakpoint punishes.
+    fn static_req() -> SamplingRequest {
+        let mut req = sampling_req();
+        req.cache = hotl_provider::CachePolicy::Static {
+            prefix_ttl: hotl_provider::CacheTtl::FiveMinutes,
+        };
+        req.cache_key = Some("01J0SESSIONULID".into());
+        req.items = hotl_provider::arc_items(vec![
+            user("hi"),
+            tool_use("a"),
+            results(&["a1", "a2"]),
+            Item::Assistant {
+                blocks: vec![json!({"type": "text", "text": "done"})],
+            },
+            user("more"),
+        ]);
+        req.ephemeral_tail = hotl_provider::arc_items(vec![todos("<todos>\n[~] a\n</todos>")]);
+        req.turn_context = Some("<turn-context now_unix_ms=\"1\"/>".into());
+        req
+    }
+
+    fn markers_in(v: &Value) -> usize {
+        v.to_string().matches("\"prompt_cache_breakpoint\"").count()
+    }
+
+    /// D1/D2: explicit-only mode, one marker on the last block of every
+    /// durable user-role item, nothing on the tail or the MOIM.
+    #[test]
+    fn explicit_mode_marks_every_durable_user_role_item_and_nothing_ephemeral() {
+        let body = body_for(&static_req(), true);
+        assert_eq!(body["prompt_cache_options"], json!({"mode": "explicit"}));
+        assert_eq!(body["prompt_cache_key"], "01J0SESSIONULID");
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input.len(), 8, "{input:#?}");
+        // "hi": array form, marker on its only block.
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[0]["content"][0]["text"], "hi");
+        assert_eq!(
+            input[0]["content"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
+        );
+        // The batch: a1 stays a plain string, a2 (the last) carries the marker.
+        assert_eq!(input[2]["call_id"], "a1");
+        assert_eq!(input[2]["output"], "out-a1");
+        assert_eq!(input[3]["call_id"], "a2");
+        assert_eq!(input[3]["output"][0]["type"], "input_text");
+        assert_eq!(input[3]["output"][0]["text"], "out-a2");
+        assert_eq!(
+            input[3]["output"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
+        );
+        // "more": marked.
+        assert_eq!(input[5]["content"][0]["text"], "more");
+        assert_eq!(markers_in(&input[5]), 1);
+        // Tail and MOIM: plain strings, no marker anywhere in them.
+        assert_eq!(input[6]["content"], "<todos>\n[~] a\n</todos>");
+        assert_eq!(input[7]["content"], "<turn-context now_unix_ms=\"1\"/>");
+        assert_eq!(markers_in(&input[6]) + markers_in(&input[7]), 0);
+        assert_eq!(markers_in(&body), 3);
+    }
+
+    /// D2: with explicit mode off, the body is today's wire byte for byte —
+    /// no cache fields, plain-string user content and tool outputs.
+    #[test]
+    fn a_pre_5_6_model_keeps_the_implicit_wire_byte_for_byte() {
+        let mut req = static_req();
+        req.model = "gpt-5.5".into();
+        let body = body_for(&req, false);
+        let expected = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "store": false,
+            "include": ["reasoning.encrypted_content"],
+            "max_output_tokens": 16,
+            "prompt_cache_key": "01J0SESSIONULID",
+            "input": [
+                {"role": "user", "content": "hi"},
+                {"type": "function_call", "call_id": "a", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "a1", "output": "out-a1"},
+                {"type": "function_call_output", "call_id": "a2", "output": "out-a2"},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "done"}]},
+                {"role": "user", "content": "more"},
+                {"role": "user", "content": "<todos>\n[~] a\n</todos>"},
+                {"role": "user", "content": "<turn-context now_unix_ms=\"1\"/>"},
+            ],
+        });
+        assert_eq!(body.to_string(), expected.to_string());
+        assert!(!body.to_string().contains("prompt_cache_breakpoint"));
+        assert!(body.get("prompt_cache_options").is_none());
+    }
+
+    /// D1: placement is append-stable. Sample N+1 appends durable items and
+    /// swaps the ephemeral tail and MOIM; every input element of N is still
+    /// at the same index in N+1, markers included.
+    #[test]
+    fn consecutive_samples_keep_every_earlier_marker_in_place() {
+        let req_n = static_req();
+        let mut req_n1 = static_req();
+        let mut items: Vec<Item> = req_n.items.iter().map(|i| (**i).clone()).collect();
+        items.push(tool_use("b"));
+        items.push(results(&["b1"]));
+        req_n1.items = hotl_provider::arc_items(items);
+        req_n1.ephemeral_tail = hotl_provider::arc_items(vec![todos("<todos>\n[x] a\n</todos>")]);
+        req_n1.turn_context = Some("<turn-context now_unix_ms=\"2\"/>".into());
+
+        let input_n = body_for(&req_n, true)["input"].as_array().unwrap().clone();
+        let input_n1 = body_for(&req_n1, true)["input"].as_array().unwrap().clone();
+        let marked = |input: &[Value]| -> Vec<usize> {
+            input
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| markers_in(v) > 0)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let (m_n, m_n1) = (marked(&input_n), marked(&input_n1));
+        assert_eq!(m_n, vec![0, 3, 5]);
+        assert!(
+            m_n1.starts_with(&m_n),
+            "{m_n:?} is not a prefix of {m_n1:?}"
+        );
+        assert_eq!(m_n1, vec![0, 3, 5, 7]);
+        // The durable prefix of N (everything before its tail) is byte-equal.
+        let n = req_n.items.len() + 1; // 5 items render as 6 input elements
+        assert_eq!(input_n[..n], input_n1[..n]);
+    }
+
+    /// D3: the override beats the name gate in both directions; the policy
+    /// beats both.
+    #[test]
+    fn the_override_and_the_policy_gate_the_markers() {
+        let key: Arc<dyn KeySource> = Arc::new(hotl_provider::key::StaticKey(None));
+        let p = |b: String| OpenAiResponsesProvider::new(b, key.clone());
+        let with_model = |m: &str| {
+            let mut req = static_req();
+            req.model = m.into();
+            req
+        };
+        assert!(p("b".into())
+            .cache_breakpoints(true)
+            .wants_explicit(&with_model("sol-fast")));
+        assert!(!p("b".into())
+            .cache_breakpoints(false)
+            .wants_explicit(&with_model("gpt-5.6")));
+        let mut off = with_model("gpt-5.6");
+        off.cache = hotl_provider::CachePolicy::Off;
+        assert!(!p("b".into()).wants_explicit(&off));
+        assert!(!p("b".into()).wants_explicit(&with_model("gpt-5.5")));
+        assert!(p("b".into()).wants_explicit(&with_model("gpt-5.6-luna-1")));
+    }
+
     /// An empty system leaves `instructions` off the wire entirely.
     #[test]
     fn an_empty_system_emits_no_instructions_key() {
-        let body = body_for(&sampling_req());
+        let body = body_for(&sampling_req(), false);
         assert!(body.get("instructions").is_none());
     }
 
@@ -1041,17 +1305,17 @@ mod tests {
     fn effort_gating_covers_all_four_corners() {
         // Unset → no key, whatever `thinking` says.
         let mut req = sampling_req();
-        assert!(body_for(&req).get("reasoning").is_none());
+        assert!(body_for(&req, false).get("reasoning").is_none());
         req.thinking = true;
-        assert!(body_for(&req).get("reasoning").is_none());
+        assert!(body_for(&req, false).get("reasoning").is_none());
         // Set + thinking → the resolved rung, with summaries on.
         req.effort = Some(Effort::XHigh);
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         assert_eq!(body["reasoning"]["effort"], "xhigh");
         assert_eq!(body["reasoning"]["summary"], "auto");
         // Set + thinking off → the off-switch wins; no summary.
         req.thinking = false;
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         assert_eq!(body["reasoning"]["effort"], "none");
         assert!(body["reasoning"].get("summary").is_none());
     }
@@ -1074,7 +1338,7 @@ mod tests {
                 json!({"type": "text", "text": "done"}),
             ],
         }]);
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0], reasoning, "replayed byte-for-byte");
         assert_eq!(input[1]["type"], "function_call");
@@ -1100,7 +1364,7 @@ mod tests {
                 json!({"type": "text", "text": "ok"}),
             ],
         }]);
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         assert!(!body.to_string().contains("secret chain"));
         let input = body["input"].as_array().unwrap();
         assert_eq!(input.len(), 1);
@@ -1127,7 +1391,7 @@ mod tests {
                 },
             ],
         }]);
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         let input = body["input"].as_array().unwrap();
         assert_eq!(input[0]["type"], "function_call_output");
         assert_eq!(input[0]["call_id"], "ok");
@@ -1147,7 +1411,7 @@ mod tests {
     /// byte-identical to the pre-image wire.
     #[test]
     fn an_imageless_user_item_stays_a_plain_string() {
-        let body = body_for(&sampling_req());
+        let body = body_for(&sampling_req(), false);
         assert_eq!(body["input"][0]["content"], "hi");
     }
 
@@ -1165,7 +1429,7 @@ mod tests {
                 data: "aW1n".into(),
             }],
         }]);
-        let body = body_for(&req);
+        let body = body_for(&req, false);
         let content = body["input"][0]["content"].as_array().unwrap();
         assert_eq!(content.len(), 2);
         assert_eq!(content[0]["type"], "input_image");
@@ -1190,6 +1454,7 @@ mod tests {
                 }],
             },
             &mut out,
+            false,
             false,
         );
         let content = out[0]["content"].as_str().unwrap();
@@ -1230,6 +1495,23 @@ mod tests {
         assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.cache_read_input_tokens, 30);
         assert_eq!(usage.hit_ratio(), Some(30.0 / 42.0));
+    }
+
+    /// D5: `cache_write_tokens` is a cache write, not input — the guide's own
+    /// 2600/2000/400 example lands as 200 input, 2000 read, 400 written, and
+    /// the writes count as non-hits.
+    #[test]
+    fn cache_write_tokens_land_in_cache_creation_and_leave_input() {
+        let (_, done) = run(&[
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":2600,"output_tokens":8,"input_tokens_details":{"cached_tokens":2000,"cache_write_tokens":400}}}}"#,
+        ]);
+        let StreamEvent::Completed { usage, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 2000);
+        assert_eq!(usage.cache_creation_input_tokens, 400);
+        assert_eq!(usage.hit_ratio(), Some(2000.0 / 2600.0));
     }
 
     /// R3's first golden test, resurrected on the current wire (per-item
@@ -1789,6 +2071,55 @@ mod tests {
         );
         assert!(reqs[0].contains("\"store\":false"), "{}", reqs[0]);
         assert!(!reqs[0].contains("chat/completions"));
+    }
+
+    /// D4: a 400 naming a prompt-cache field is a capability probe. The same
+    /// sample is re-sent without the cache fields behind a `Retrying`
+    /// notice, and the provider latches so the next `stream()` never probes.
+    #[tokio::test]
+    async fn a_rejected_breakpoint_probes_once_then_latches() {
+        const REJECT_400: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 97\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"Unknown parameter: 'prompt_cache_options'.\",\"type\":\"invalid_request_error\"}}";
+        assert_eq!(REJECT_400.split("\r\n\r\n").nth(1).unwrap().len(), 97);
+        let has_cache_fields =
+            |r: &str| r.contains("prompt_cache_options") || r.contains("prompt_cache_breakpoint");
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double_requests(vec![REJECT_400, SSE_OK, SSE_OK], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        assert!(p.wants_explicit(&static_req()));
+
+        let events: Vec<_> = p.stream(static_req()).collect::<Vec<_>>().await;
+        let oks: Vec<_> = events.into_iter().map(|e| e.expect("no error")).collect();
+        assert!(
+            matches!(&oks[0], StreamEvent::Retrying { reason, .. }
+                if reason.contains("prompt-cache breakpoints")),
+            "{oks:?}"
+        );
+        assert!(matches!(oks[1], StreamEvent::Started));
+        assert!(matches!(oks.last(), Some(StreamEvent::Completed { .. })));
+        {
+            let reqs = seen.lock().unwrap();
+            assert_eq!(reqs.len(), 2);
+            assert!(reqs[0].contains("\"prompt_cache_options\""), "{}", reqs[0]);
+            assert!(
+                reqs[0].contains("\"prompt_cache_breakpoint\""),
+                "{}",
+                reqs[0]
+            );
+            assert!(!has_cache_fields(&reqs[1]), "{}", reqs[1]);
+            assert!(
+                reqs[1].contains("\"prompt_cache_key\""),
+                "the routing key is not a breakpoint field: {}",
+                reqs[1]
+            );
+        }
+
+        // Latched: the second call on the same provider never probes.
+        assert!(!p.wants_explicit(&static_req()));
+        let events: Vec<_> = p.stream(static_req()).collect::<Vec<_>>().await;
+        assert!(matches!(events[0], Ok(StreamEvent::Started)), "{events:?}");
+        let reqs = seen.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(!has_cache_fields(&reqs[2]), "{}", reqs[2]);
     }
 
     /// §S3.2: the HTTP/2 keep-alive knobs must ride the same builder as the
