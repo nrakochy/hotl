@@ -117,6 +117,10 @@ naming: cache matching looks back a bounded distance from the request's newest
 breakpoint, so a pathologically block-heavy final turn can leave a sliver of the
 tail uncached. The rolling anchors bound how big that sliver can get.)
 
+The OpenAI dialects cache implicitly — no breakpoints to place — and route by a
+caller-supplied key before the prefix hash, so hotl sends the session id as
+`prompt_cache_key` and a session's samples stay on one cache shard.
+
 ## Keeping the discount: phase instructions go in the prompt
 
 The system prompt is byte-stable for a session's lifetime by design — every
