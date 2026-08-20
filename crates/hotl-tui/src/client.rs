@@ -22,7 +22,17 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 /// handshake and the reload notification, so a reloaded roster is decoded
 /// exactly like the one it replaces.
 pub fn parse_skills(from: &Value) -> Vec<(String, String)> {
-    from.get("skills")
+    parse_roster(from, "skills")
+}
+
+/// The saved-workflow roster (0044) — the `workflows` array beside `skills`,
+/// same shape, same two senders. Absent on an older engine: no `/<name>`.
+pub fn parse_workflows(from: &Value) -> Vec<(String, String)> {
+    parse_roster(from, "workflows")
+}
+
+fn parse_roster(from: &Value, key: &str) -> Vec<(String, String)> {
+    from.get(key)
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
@@ -818,6 +828,21 @@ mod tests {
                 ("acme:deploy".to_string(), String::new()),
             ]
         );
+    }
+
+    #[test]
+    fn workflows_parse_from_the_same_object_shape() {
+        let hello = json!({"skills": [], "workflows": [
+            {"name": "review-changes", "description": "review then verify"}
+        ]});
+        assert_eq!(
+            parse_workflows(&hello),
+            vec![(
+                "review-changes".to_string(),
+                "review then verify".to_string()
+            )]
+        );
+        assert!(parse_workflows(&json!({"skills": ["x"]})).is_empty());
     }
 
     #[test]

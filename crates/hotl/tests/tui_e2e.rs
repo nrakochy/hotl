@@ -171,6 +171,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
         factory,
         acp::ServerInfo {
             skills: Vec::new(),
+            workflows: Vec::new(),
             default_mode: "ask".into(),
             default_plan: false,
             context_window: 200_000,

@@ -37,6 +37,7 @@ fn scripted_factory() -> acp::SessionFactory {
 fn server_info() -> acp::ServerInfo {
     acp::ServerInfo {
         skills: Vec::new(),
+        workflows: Vec::new(),
         default_mode: "ask".into(),
         default_plan: false,
         context_window: 200_000,
@@ -591,6 +592,10 @@ async fn initialize_advertises_skill_names_and_descriptions() {
         scripted_factory(),
         acp::ServerInfo {
             skills,
+            workflows: vec![acp::WorkflowInfo {
+                name: "review-changes".into(),
+                description: "review then verify".into(),
+            }],
             ..server_info()
         },
         None,
@@ -610,6 +615,12 @@ async fn initialize_advertises_skill_names_and_descriptions() {
             {"name": "brainstorming", "description": "turn an idea into a design"},
             {"name": "acme:deploy", "description": ""},
         ])
+    );
+    // 0044: saved recipes ride beside skills, same shape, so `/<recipe>`
+    // completes and dispatches from the handshake alone.
+    assert_eq!(
+        init["result"]["workflows"],
+        json!([{"name": "review-changes", "description": "review then verify"}])
     );
 }
 
@@ -1437,6 +1448,7 @@ async fn the_session_reports_its_effective_mode() {
         scripted_factory_with_mode("auto"),
         acp::ServerInfo {
             skills: Vec::new(),
+            workflows: Vec::new(),
             default_mode: "auto".into(),
             default_plan: false,
             context_window: 1_000_000,
@@ -1891,6 +1903,10 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
             name: "run".into(),
             description: "launch the app".into(),
         }],
+        workflows: vec![acp::WorkflowInfo {
+            name: "review-changes".into(),
+            description: "review then verify".into(),
+        }],
         default_mode: "auto".into(),
         default_plan: false,
         context_window: 900_000,
@@ -1970,6 +1986,11 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         u["skills"],
         json!([{"name": "run", "description": "launch the app"}]),
         "the client re-seeds its `/`-completion from this"
+    );
+    assert_eq!(
+        u["workflows"],
+        json!([{"name": "review-changes", "description": "review then verify"}]),
+        "and its workflow roster (0044)"
     );
     assert_eq!(u["warnings"], json!(["[network] egress unenforced"]));
 

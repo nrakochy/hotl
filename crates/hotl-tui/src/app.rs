@@ -432,6 +432,13 @@ pub struct State {
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
     pub skills: Vec<String>,
+    /// Every saved workflow recipe name (0044), from the same handshake.
+    /// `/<name>` falls through to this after the built-ins and skills.
+    pub workflows: Vec<String>,
+    /// The rosters as advertised, kept so either `set_*` can rebuild the
+    /// completion table without the other's input.
+    skill_roster: Vec<(String, String)>,
+    workflow_roster: Vec<(String, String)>,
     /// The skill the human requested via `/<name>`, held until the turn ends.
     /// If no successful `skill` load names it by then, the model silently
     /// skipped it — the one skill failure the per-load cards cannot show.
@@ -520,6 +527,9 @@ impl State {
             live_context: None,
             open_context: None,
             skills: Vec::new(),
+            workflows: Vec::new(),
+            skill_roster: Vec::new(),
+            workflow_roster: Vec::new(),
             pending_skill: None,
             density: hotl_theme::Density::default(),
             todos: Vec::new(),
@@ -566,15 +576,33 @@ impl State {
     /// offers) can never disagree about which skills exist.
     pub fn set_skills(&mut self, skills: Vec<(String, String)>) {
         self.skills = skills.iter().map(|(name, _)| name.clone()).collect();
+        self.skill_roster = skills;
+        self.rebuild_commands();
+    }
+
+    /// The saved-workflow roster (0044), same contract as `set_skills`. A
+    /// recipe named like a built-in or a skill is hidden from completion —
+    /// dispatch precedence (builtin > skill > workflow) would never reach it.
+    pub fn set_workflows(&mut self, workflows: Vec<(String, String)>) {
+        self.workflows = workflows.iter().map(|(name, _)| name.clone()).collect();
+        self.workflow_roster = workflows;
+        self.rebuild_commands();
+    }
+
+    fn rebuild_commands(&mut self) {
         self.commands = complete::builtins();
+        let row = |(name, description): &(String, String)| complete::Command {
+            name: name.clone(),
+            description: description.clone(),
+            builtin: false,
+        };
+        self.commands.extend(self.skill_roster.iter().map(row));
+        let shadowed: Vec<String> = self.commands.iter().map(|c| c.name.clone()).collect();
         self.commands.extend(
-            skills
-                .into_iter()
-                .map(|(name, description)| complete::Command {
-                    name,
-                    description,
-                    builtin: false,
-                }),
+            self.workflow_roster
+                .iter()
+                .filter(|(name, _)| !shadowed.contains(name))
+                .map(row),
         );
     }
 
@@ -1266,6 +1294,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 state.context_window = w;
             }
             state.set_skills(crate::client::parse_skills(v));
+            state.set_workflows(crate::client::parse_workflows(v));
             for w in v
                 .get("warnings")
                 .and_then(Value::as_array)
@@ -5576,6 +5605,35 @@ mod tests {
         let r = last_report(&s);
         assert_eq!(r.estimated, 109);
         assert!(r.rows.contains(&(ContextKind::Unknown, 99)));
+    }
+
+    /// 0044: the workflow roster joins completion after the skills; a recipe
+    /// named like a built-in or a skill is hidden, since dispatch
+    /// (builtin > skill > workflow) could never reach it.
+    #[test]
+    fn set_workflows_extends_completion_below_skills_and_hides_shadowed_names() {
+        let mut s = State::test_default();
+        s.set_skills(vec![("review".into(), "a skill".into())]);
+        s.set_workflows(vec![
+            ("review-changes".into(), "a recipe".into()),
+            ("review".into(), "shadowed by the skill".into()),
+            ("help".into(), "shadowed by a builtin".into()),
+        ]);
+        assert_eq!(s.workflows, vec!["review-changes", "review", "help"]);
+        let names: Vec<&str> = s.commands.iter().map(|c| c.name.as_str()).collect();
+        let review_at = names.iter().position(|n| *n == "review").unwrap();
+        let recipe_at = names.iter().position(|n| *n == "review-changes").unwrap();
+        assert!(review_at < recipe_at, "skills before workflows: {names:?}");
+        assert_eq!(names.iter().filter(|n| **n == "review").count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == "help").count(), 1);
+        assert!(!s.commands[recipe_at].builtin);
+        // Re-seeding skills keeps the workflow rows (a reload sends both).
+        s.set_skills(Vec::new());
+        assert!(s.commands.iter().any(|c| c.name == "review-changes"));
+        assert!(
+            s.commands.iter().any(|c| c.name == "review"),
+            "no longer shadowed"
+        );
     }
 
     #[test]

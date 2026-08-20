@@ -574,7 +574,19 @@ pub(crate) async fn build_acp() -> Result<
     // (see `HotlChildBuilder::spawn_child`), so children are unaffected.
     scaffold.config.cache_ttl = CacheTtl::OneHour;
     // Taken before the closure below moves `scaffold` out of reach.
-    let warnings = std::mem::take(&mut scaffold.warnings);
+    let mut warnings = std::mem::take(&mut scaffold.warnings);
+    // Saved workflow recipes (0044): an unparsable file is a warning on the
+    // same channel as every other discovery failure, never an `eprintln!`.
+    let mut workflows = Vec::new();
+    for found in hotl_workflow::discover(&scaffold.config_dir) {
+        match found.plan {
+            Ok(plan) => workflows.push(crate::acp::WorkflowInfo {
+                name: found.name,
+                description: plan.description.unwrap_or_default(),
+            }),
+            Err(e) => warnings.push(format!("workflow recipe skipped — {e}")),
+        }
+    }
     let skills: Vec<crate::acp::SkillInfo> = scaffold
         .skills
         .iter()
@@ -588,6 +600,7 @@ pub(crate) async fn build_acp() -> Result<
     // divides by. Advertised at `initialize` so no client has to guess either.
     let info = crate::acp::ServerInfo {
         skills,
+        workflows,
         default_mode: scaffold.rules.mode().as_str().to_string(),
         default_plan: scaffold.rules.plan(),
         context_window: scaffold.config.context_window,

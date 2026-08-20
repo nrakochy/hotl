@@ -223,12 +223,22 @@ pub struct SkillInfo {
     pub description: String,
 }
 
+/// One saved workflow recipe (0044) as `initialize` advertises it — the same
+/// client-facing shape as [`SkillInfo`], so `/<name>` completes and dispatches
+/// without the client walking `<config_dir>/workflows`.
+#[derive(Debug, Clone)]
+pub struct WorkflowInfo {
+    pub name: String,
+    pub description: String,
+}
+
 /// What `serve` advertises to a client before any session exists. Bundled
 /// rather than passed positionally: `serve` is already at the argument count
 /// where this workspace reaches for `#[allow(clippy::too_many_arguments)]`.
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub skills: Vec<SkillInfo>,
+    pub workflows: Vec<WorkflowInfo>,
     /// The configured permission mode a new session starts in, already run
     /// through `enforced_mode`. Clients render it; they never infer it.
     pub default_mode: String,
@@ -243,6 +253,22 @@ pub struct ServerInfo {
     /// model used mid-turn is still priced as this one (see
     /// `wire::usage_frame`).
     pub model: String,
+}
+
+/// The `skills` array `initialize` and `config_reloaded` both carry.
+fn skill_roster(info: &ServerInfo) -> Vec<Value> {
+    info.skills
+        .iter()
+        .map(|s| json!({"name": s.name, "description": s.description}))
+        .collect()
+}
+
+/// The `workflows` array beside it (0044) — additive, same shape.
+fn workflow_roster(info: &ServerInfo) -> Vec<Value> {
+    info.workflows
+        .iter()
+        .map(|w| json!({"name": w.name, "description": w.description}))
+        .collect()
 }
 
 /// Drive the protocol over one connection until the client hangs up.
@@ -348,11 +374,7 @@ async fn handle_request(
             // client never has to walk the config dirs to know what a slash
             // could mean. Descriptions ride this response only; they are
             // never part of any prompt.
-            let skills: Vec<Value> = info
-                .skills
-                .iter()
-                .map(|s| json!({"name": s.name, "description": s.description}))
-                .collect();
+            let skills = skill_roster(info);
             // `defaultMode` and `contextWindow` are server-side truth a client
             // renders rather than guesses: the badge used to read "ask" while
             // the shipped default ran "auto" (evaluation §5.7).
@@ -363,6 +385,7 @@ async fn handle_request(
                     "protocolVersion": PROTOCOL_VERSION,
                     "schemaVersion": UPDATE_SCHEMA_VERSION,
                     "skills": skills,
+                    "workflows": workflow_roster(info),
                     "defaultMode": info.default_mode,
                     "defaultPlan": info.default_plan,
                     "contextWindow": info.context_window,
@@ -788,11 +811,8 @@ async fn handle_request(
                         next_id,
                         &info.model,
                     );
-                    let skills: Vec<Value> = info
-                        .skills
-                        .iter()
-                        .map(|s| json!({"name": s.name, "description": s.description}))
-                        .collect();
+                    let skills = skill_roster(info);
+                    let workflows = workflow_roster(info);
                     reply_ok(
                         writer,
                         id,
@@ -821,6 +841,7 @@ async fn handle_request(
                             "plan": plan,
                             "context_window": info.context_window,
                             "skills": skills,
+                            "workflows": workflows,
                             "warnings": warnings,
                         }),
                     )

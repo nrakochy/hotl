@@ -125,6 +125,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let Opened {
         name: session_name,
         skills,
+        workflows,
         mode,
         plan,
         default_effort,
@@ -162,6 +163,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         None => {}
     }
     state.set_skills(skills);
+    state.set_workflows(workflows);
     if let Some(prev) = previous_model {
         state
             .transcript
@@ -349,6 +351,8 @@ fn client_settings() -> ClientSettings {
 struct Opened {
     name: Option<String>,
     skills: Vec<(String, String)>,
+    /// Saved workflow recipes (0044) — what makes `/<recipe>` resolvable.
+    workflows: Vec<(String, String)>,
     mode: String,
     plan: bool,
     /// The session's resolved starting effort — display-only, what a bare
@@ -384,6 +388,7 @@ async fn handshake(
     let init = client.request("initialize", Value::Null).await;
     let hello = wait_response(reader, init).await?;
     let skills = hotl_tui::client::parse_skills(&hello);
+    let workflows = hotl_tui::client::parse_workflows(&hello);
     let TuiArgs {
         spec,
         name,
@@ -419,6 +424,7 @@ async fn handshake(
     Ok(Opened {
         name: v.get("name").and_then(Value::as_str).map(String::from),
         skills,
+        workflows,
         mode,
         plan,
         default_effort: v
