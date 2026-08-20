@@ -6,6 +6,24 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **Sub-agent navigation moved into the agent band, and finished spawns
+  leave it** (plan 0043, the 0042 follow-up). The band below the input used
+  to list every spawn the session ever produced, settled or not, so it only
+  ever grew; it now lists the spawns still *running* (plus the one you are
+  viewing or pointing at, pinned until you leave it) and collapses to
+  nothing when nothing runs. Navigation happens in the band, not the
+  transcript: with the input empty, `↑`/`↓` move a highlight over
+  `main` and the running spawns — without vim whenever the band shows, with
+  `vim_mode = true` from Normal mode only (Insert keeps the arrows for
+  history recall) — and vim Normal `j`/`k` move it too. `Enter` on a spawn
+  opens its live stream, `Enter` on `main` returns, and `Esc` backs out one
+  rung per press (stream → highlight → interrupt). The 0042 transcript
+  cursor is deleted rather than rebound: with no band, vim `j`/`k` go back
+  to scrolling the transcript one item. Non-vim users now have a keyboard
+  path into the drill-in for the first time.
+
 ## [0.21.0] - 2026-08-19
 
 ### Changed
