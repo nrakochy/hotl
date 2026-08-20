@@ -294,6 +294,13 @@ pub enum Scroll {
     At(usize),
 }
 
+/// A row of the agent band (0043): `main` or one spawn card, by anchor id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BandRow {
+    Main,
+    Spawn(String),
+}
+
 /// Running totals across every turn in this session. Per-turn usage is
 /// overwritten by design (the strip shows one line); these are what a human
 /// actually budgets against.
@@ -477,10 +484,9 @@ pub struct State {
     pub selected_agent: Option<String>,
     /// Line offset into the child stream; `None` follows the tail (D7).
     pub agent_scroll: Option<usize>,
-    /// The transcript cursor (0042 D1): the highlighted item j/k walk in vim
-    /// Normal with an empty buffer. `None` = disengaged. Deliberately outside
-    /// the view cache's `Geometry` — the highlight is a post-cache patch.
-    pub cursor: Option<usize>,
+    /// The highlighted agent-band row (0043 D3); `None` = disengaged. Id-based
+    /// so a row settling above it never shifts the highlight onto another agent.
+    pub band_cursor: Option<BandRow>,
 }
 
 impl State {
@@ -526,18 +532,26 @@ impl State {
             copy_notice: None,
             selected_agent: None,
             agent_scroll: None,
-            cursor: None,
+            band_cursor: None,
         }
     }
 
-    /// Anchor ids of every spawn card, transcript order — the selector's
-    /// rows after `main` (0039).
-    pub fn spawn_ids(&self) -> Vec<&str> {
+    /// The agent band's spawn rows (0043 D1), transcript order: running while
+    /// the turn is live, plus the shown and the highlighted spawn, pinned
+    /// until left.
+    pub fn band_spawns(&self) -> Vec<&TranscriptItem> {
+        let live = self.phase != Phase::Idle;
+        let pinned = |id: &str| {
+            self.selected_agent.as_deref() == Some(id)
+                || matches!(&self.band_cursor, Some(BandRow::Spawn(c)) if c == id)
+        };
         self.transcript
             .iter()
-            .filter_map(|i| match i {
-                TranscriptItem::Tool { id, name, .. } if name == "spawn" => Some(id.as_str()),
-                _ => None,
+            .filter(|i| {
+                matches!(i, TranscriptItem::Tool { id, name, status, .. }
+                    if name == "spawn"
+                        && ((live && matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. }))
+                            || pinned(id)))
             })
             .collect()
     }
@@ -1025,6 +1039,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     };
                 }
             }
+            band_tidy(state);
             if !found {
                 // No card: the human answered *as* the tool (§2b Respond
                 // skips execution, so no `tool_start` ever ran). The settle
@@ -1393,6 +1408,7 @@ fn on_prompt_result(
     state.live_context = Some(live);
     state.usage_line = Some(format_usage(state, usage, live));
     state.phase = Phase::Idle;
+    band_tidy(state);
     state.work_ticks = 0;
     state.interrupt_sent = false;
     vec![Cmd::SetTitle(title(state, ""))]
@@ -1518,9 +1534,9 @@ fn modal_active(state: &State) -> bool {
 /// something else owns the keyboard (`modal_active`) the popup stays closed
 /// regardless of what the buffer says.
 fn refresh(state: &mut State) {
-    // 0042 D1: typing disengages the transcript cursor.
+    // 0043: typing disengages the band cursor.
     if !state.editor.is_empty() {
-        state.cursor = None;
+        state.band_cursor = None;
     }
     if modal_active(state) {
         state.completion = None;
@@ -1611,8 +1627,8 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         scroll_route(state, intent);
         return Vec::new();
     }
-    // The esc ladder (0042 D2): child stream shown → back to main (cursor
-    // kept); cursor engaged → disengage to Follow; else a busy turn
+    // The esc ladder (0042 D2, 0043 D5): child stream shown → back to main
+    // (band cursor kept); band cursor engaged → disengage; else a busy turn
     // interrupts. Under vim this fires only from Normal with nothing pending
     // (Insert esc always reaches the editor); an open completion popup keeps
     // its own esc, layered below.
@@ -1620,11 +1636,11 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         if state.selected_agent.is_some() {
             state.selected_agent = None;
             state.agent_scroll = None;
+            band_tidy(state);
             return Vec::new();
         }
-        if state.cursor.is_some() {
-            state.cursor = None;
-            state.scroll = Scroll::Follow;
+        if state.band_cursor.is_some() {
+            state.band_cursor = None;
             return Vec::new();
         }
         if state.phase != Phase::Idle && state.completion.is_none() {
@@ -1666,19 +1682,28 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             _ => {}
         }
     }
-    // 0042 D1: Enter with the cursor engaged opens the spawn card under it
-    // and is inert anywhere else. Gated on the cursor (vim-only reachable),
-    // so non-vim Enter is untouched.
-    if key.code == KeyCode::Enter && state.cursor.is_some() && state.editor.is_empty() {
-        if let Some(TranscriptItem::Tool { id, name, .. }) =
-            state.cursor.and_then(|i| state.transcript.get(i))
-        {
-            if name == "spawn" {
-                state.selected_agent = Some(id.clone());
-                state.agent_scroll = None;
-            }
-        }
+    // 0043 D2: the agent band owns ↑/↓ on an empty input — non-vim whenever
+    // the band shows, vim from Normal only (Insert keeps history recall).
+    // Sits above the editor so `handle_insert`'s recall never sees the key.
+    let band_keys = state.editor.is_empty()
+        && !state.band_spawns().is_empty()
+        && (!state.vim_mode || state.editor.mode() == crate::vim::Mode::Normal);
+    if band_keys && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+        band_move(state, key.code == KeyCode::Up);
         return Vec::new();
+    }
+    // 0043 D3: Enter on the highlighted row opens it — a spawn's stream, or
+    // main. The cursor stays engaged.
+    if key.code == KeyCode::Enter && state.editor.is_empty() {
+        if let Some(row) = state.band_cursor.clone() {
+            state.selected_agent = match row {
+                BandRow::Spawn(id) => Some(id),
+                BandRow::Main => None,
+            };
+            state.agent_scroll = None;
+            band_tidy(state);
+            return Vec::new();
+        }
     }
     let event = state.editor.handle(key);
     refresh(state);
@@ -1727,23 +1752,22 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             }
         }
         EditorEvent::OpenExternal(text) => vec![Cmd::OpenEditor(text)],
-        // Vim j/k (0042 D1): the shown child stream scrolls as before;
-        // otherwise the transcript cursor engages and moves. The wheel and
-        // page keys keep calling `scroll_route` — they move the window,
-        // never the cursor.
+        // Vim j/k (0043 D4): the agent band's cursor while the band shows,
+        // else one item of whichever stream is shown. The wheel and page
+        // keys keep calling `scroll_route` — they never touch the band.
         EditorEvent::ScrollUp => {
-            if state.selected_agent.is_some() {
+            if state.band_spawns().is_empty() {
                 scroll_route(state, crate::scroll::Intent::Up(1));
             } else {
-                cursor_move(state, true);
+                band_move(state, true);
             }
             Vec::new()
         }
         EditorEvent::ScrollDown => {
-            if state.selected_agent.is_some() {
+            if state.band_spawns().is_empty() {
                 scroll_route(state, crate::scroll::Intent::Down(1));
             } else {
-                cursor_move(state, false);
+                band_move(state, false);
             }
             Vec::new()
         }
@@ -1803,27 +1827,43 @@ fn esc_at_top_level(state: &State) -> bool {
     }
 }
 
-/// The transcript cursor (0042 D1). The first press engages at the last item
-/// (`Follow`) or the window top (`At(i)`); then k walks up, j walks down, and
-/// j past the last item disengages back to Follow.
-fn cursor_move(state: &mut State, up: bool) {
-    let len = state.transcript.len();
-    if len == 0 {
+/// The band cursor (0043 D3) over rows `[main, spawn₁..spawnₙ]`, clamped at
+/// both ends. Disengaged, it engages at the shown row and then moves, so ↓
+/// from main lands on spawn₁ in one press. An empty band never engages.
+fn band_move(state: &mut State, up: bool) {
+    let mut rows = vec![BandRow::Main];
+    rows.extend(state.band_spawns().into_iter().filter_map(|i| match i {
+        TranscriptItem::Tool { id, .. } => Some(BandRow::Spawn(id.clone())),
+        _ => None,
+    }));
+    if rows.len() == 1 {
         return;
     }
-    match state.cursor {
-        None => {
-            state.cursor = Some(match state.scroll {
-                Scroll::Follow => len - 1,
-                Scroll::At(i) => i.min(len - 1),
-            });
-        }
-        Some(i) if up => state.cursor = Some(i.saturating_sub(1)),
-        Some(i) if i + 1 >= len => {
-            state.cursor = None;
-            state.scroll = Scroll::Follow;
-        }
-        Some(i) => state.cursor = Some(i + 1),
+    let shown = state
+        .selected_agent
+        .as_deref()
+        .map(|id| BandRow::Spawn(id.into()))
+        .unwrap_or(BandRow::Main);
+    let from = state
+        .band_cursor
+        .as_ref()
+        .and_then(|c| rows.iter().position(|r| r == c))
+        .or_else(|| rows.iter().position(|r| *r == shown))
+        .unwrap_or(0);
+    let to = if up {
+        from.saturating_sub(1)
+    } else {
+        (from + 1).min(rows.len() - 1)
+    };
+    state.band_cursor = Some(rows[to].clone());
+    band_tidy(state);
+}
+
+/// A cursor has nothing to sit in once the band is gone, and must not
+/// resurface when the next turn spawns.
+fn band_tidy(state: &mut State) {
+    if state.band_spawns().is_empty() {
+        state.band_cursor = None;
     }
 }
 
@@ -1873,6 +1913,7 @@ fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
     }
     state.detached_turns += 1;
     state.phase = Phase::Idle;
+    band_tidy(state);
     state.work_ticks = 0;
     state.interrupt_sent = false;
     notice(
@@ -2136,11 +2177,11 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         "clear" => {
             state.transcript.clear();
             state.scroll = Scroll::Follow;
-            // 0039/0042: neither a selection id nor a cursor index may
-            // dangle into the next transcript.
+            // 0039/0043: neither a selection id nor a band row may dangle
+            // into the next transcript.
             state.selected_agent = None;
             state.agent_scroll = None;
-            state.cursor = None;
+            state.band_cursor = None;
             notice(
                 state,
                 "cleared the transcript view — the session log and the model's context are untouched"
@@ -3521,74 +3562,266 @@ mod tests {
         );
     }
 
-    /// 0042 D1: the first press engages the cursor at the last item (Follow)
-    /// or the window top (At); k walks up, j walks down, and j past the last
-    /// item disengages back to Follow.
-    #[test]
-    fn jk_engage_and_move_the_transcript_cursor() {
-        let mut s = State::test_default();
-        s.transcript = notices(5);
-        press(&mut s, KeyCode::Esc); // Insert → Normal
-        press(&mut s, KeyCode::Char('k'));
-        assert_eq!(s.cursor, Some(4), "engages at the last item");
-        press(&mut s, KeyCode::Char('k'));
-        assert_eq!(s.cursor, Some(3));
-        press(&mut s, KeyCode::Char('j'));
-        assert_eq!(s.cursor, Some(4));
-        press(&mut s, KeyCode::Char('j'));
-        assert_eq!(s.cursor, None, "j past the tail disengages");
-        assert_eq!(s.scroll, Scroll::Follow);
-
-        // A scrolled-back window engages at its top item instead.
-        s.scroll = Scroll::At(2);
-        press(&mut s, KeyCode::Char('j'));
-        assert_eq!(s.cursor, Some(2), "engages at the window top");
+    fn settle(s: &mut State, id: &str) {
+        upd(s, json!({"type":"tool_done","id":id,"ok":true}));
     }
 
-    /// 0042 D1: Enter with the cursor on a spawn card opens its stream —
-    /// the drill-in 0039 hung off the deleted ctrl-o selector.
+    fn band_ids(s: &State) -> Vec<&str> {
+        s.band_spawns()
+            .into_iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Tool { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 0043 D1: a spawn row exists while its card runs — the settle drops it.
     #[test]
-    fn enter_on_a_spawn_card_opens_its_stream() {
+    fn settled_spawns_leave_the_band() {
         let mut s = State::test_default();
         s.phase = Phase::Sampling { ticks: 0 };
         start_spawn(&mut s, "s1");
-        press(&mut s, KeyCode::Esc); // Insert → Normal, never an interrupt
-        press(&mut s, KeyCode::Char('k')); // engage on the spawn card
+        start_spawn(&mut s, "s2");
+        assert_eq!(band_ids(&s), vec!["s1", "s2"]);
+        settle(&mut s, "s1");
+        assert_eq!(band_ids(&s), vec!["s2"]);
+        settle(&mut s, "s2");
+        assert!(band_ids(&s).is_empty());
+    }
+
+    /// 0043 D1: a card stranded running by a cancelled turn must not hold
+    /// the band open.
+    #[test]
+    fn a_stranded_running_spawn_leaves_the_band_when_the_turn_goes_idle() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        assert_eq!(band_ids(&s), vec!["s1"]);
+        s.phase = Phase::Idle;
+        assert!(band_ids(&s).is_empty());
+    }
+
+    /// 0043 D1: the shown spawn is pinned — settled or not, it stays listed
+    /// until you leave its stream.
+    #[test]
+    fn the_shown_spawn_stays_in_the_band_after_it_settles_until_you_leave() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        s.selected_agent = Some("s1".into());
+        settle(&mut s, "s1");
+        assert_eq!(band_ids(&s), vec!["s1"], "pinned by the shown stream");
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Esc); // stream → main
+        assert_eq!(s.selected_agent, None);
+        assert!(band_ids(&s).is_empty());
+    }
+
+    /// 0043 D1: the highlighted spawn is pinned until the cursor moves off.
+    #[test]
+    fn the_highlighted_spawn_stays_in_the_band_until_you_move_off() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        start_spawn(&mut s, "s2");
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s2".into())));
+        settle(&mut s, "s2");
+        assert_eq!(band_ids(&s), vec!["s1", "s2"], "pinned by the cursor");
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s1".into())));
+        assert_eq!(band_ids(&s), vec!["s1"]);
+    }
+
+    /// 0043: a `Main` cursor has nothing to sit in once the band is gone.
+    #[test]
+    fn the_band_cursor_clears_when_the_band_empties() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.band_cursor, Some(BandRow::Main));
+        settle(&mut s, "s1");
+        assert_eq!(s.band_cursor, None);
+    }
+
+    /// 0043 D2: non-vim ↑/↓ move the band cursor while the band shows and
+    /// the input is empty — clamped, no wrap, and no history recall fires.
+    #[test]
+    fn arrows_move_the_band_cursor_without_vim_mode_when_the_band_is_visible() {
+        let mut s = State::new(false, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        start_spawn(&mut s, "s2");
+        s.editor.remember("older".into());
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s1".into())));
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        assert_eq!(
+            s.band_cursor,
+            Some(BandRow::Spawn("s2".into())),
+            "clamped at the last row"
+        );
+        press(&mut s, KeyCode::Up);
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.band_cursor, Some(BandRow::Main));
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.band_cursor, Some(BandRow::Main), "clamped at main");
+        assert_eq!(s.editor.text(), "", "no recall fired");
+    }
+
+    /// 0043 D2: with no band, non-vim ↑/↓ recall history exactly as before.
+    #[test]
+    fn arrows_recall_history_without_vim_mode_when_no_band() {
+        let mut s = State::new(false, "m".into());
+        s.editor.remember("older".into());
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "older");
+        assert_eq!(s.band_cursor, None);
+    }
+
+    /// 0043 D2: vim Insert keeps history on the arrows unconditionally.
+    #[test]
+    fn arrows_recall_history_in_vim_insert_even_with_a_band() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        s.editor.remember("older".into());
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.editor.text(), "older");
+        assert_eq!(s.band_cursor, None);
+    }
+
+    /// 0043 D2: vim Normal + empty input — j/k and ↑/↓ both move the band cursor.
+    #[test]
+    fn jk_and_arrows_move_the_band_cursor_in_vim_normal() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Char('j'));
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s1".into())));
+        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.band_cursor, Some(BandRow::Main));
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s1".into())));
+    }
+
+    /// 0043 D4: with no band, j/k fall back to their pre-0042 meaning — one
+    /// transcript item per press.
+    #[test]
+    fn jk_scroll_the_transcript_with_no_band() {
+        let mut s = State::test_default();
+        s.transcript = notices(30);
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.scroll, Scroll::At(29));
+        assert_eq!(s.band_cursor, None);
+    }
+
+    /// 0043 D3: Enter on a spawn row opens its stream; Enter on `main`
+    /// returns. Neither submits, and the cursor stays engaged.
+    #[test]
+    fn enter_on_a_band_row_opens_its_stream_and_enter_on_main_returns() {
+        let mut s = State::new(false, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        press(&mut s, KeyCode::Down);
         let cmds = press(&mut s, KeyCode::Enter);
         assert!(cmds.is_empty(), "{cmds:?}");
         assert_eq!(s.selected_agent.as_deref(), Some("s1"));
         assert_eq!(s.agent_scroll, None);
-    }
-
-    /// 0042 D1: Enter anywhere else is inert while the cursor is engaged —
-    /// it must not submit the empty prompt or open anything.
-    #[test]
-    fn enter_off_a_spawn_card_is_inert_while_the_cursor_is_engaged() {
-        let mut s = State::test_default();
-        s.transcript = notices(3);
-        s.phase = Phase::Sampling { ticks: 0 };
-        press(&mut s, KeyCode::Esc);
-        press(&mut s, KeyCode::Char('k'));
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s1".into())));
+        press(&mut s, KeyCode::Up);
         let cmds = press(&mut s, KeyCode::Enter);
         assert!(cmds.is_empty(), "{cmds:?}");
         assert_eq!(s.selected_agent, None);
-        assert_eq!(s.transcript.len(), 3, "nothing submitted");
-        assert_eq!(s.cursor, Some(2), "the cursor stays engaged");
+        assert_eq!(s.band_cursor, Some(BandRow::Main));
     }
 
-    /// 0042 D1: a buffer going non-empty disengages the cursor, and the
+    /// 0043 D5: esc in Normal walks the ladder — stream → main (cursor
+    /// kept), cursor → disengaged, then interrupt.
+    #[test]
+    fn esc_in_normal_walks_stream_then_band_cursor_then_interrupt() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Char('j'));
+        press(&mut s, KeyCode::Enter);
+        assert_eq!(s.selected_agent.as_deref(), Some("s1"));
+
+        let cmds = press(&mut s, KeyCode::Esc); // stream → main
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.selected_agent, None);
+        assert_eq!(
+            s.band_cursor,
+            Some(BandRow::Spawn("s1".into())),
+            "back to main keeps the cursor"
+        );
+
+        let cmds = press(&mut s, KeyCode::Esc); // cursor → disengaged
+        assert!(cmds.is_empty(), "{cmds:?}");
+        assert_eq!(s.band_cursor, None);
+
+        let cmds = press(&mut s, KeyCode::Esc); // now the turn
+        assert!(cmds.contains(&Cmd::Cancel), "{cmds:?}");
+    }
+
+    /// 0043: a buffer going non-empty disengages the band cursor, and the
     /// typed char lands in the prompt.
     #[test]
-    fn typing_disengages_the_cursor_and_lands_in_the_prompt() {
-        let mut s = State::test_default();
-        s.transcript = notices(3);
-        press(&mut s, KeyCode::Esc);
-        press(&mut s, KeyCode::Char('k'));
-        assert_eq!(s.cursor, Some(2));
-        press(&mut s, KeyCode::Char('i')); // back to Insert
+    fn typing_disengages_the_band_cursor_and_lands_in_the_prompt() {
+        let mut s = State::new(false, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        press(&mut s, KeyCode::Down);
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s1".into())));
         press(&mut s, KeyCode::Char('h'));
         assert_eq!(s.editor.text(), "h", "the char lands in the prompt");
-        assert_eq!(s.cursor, None, "typing disengages");
+        assert_eq!(s.band_cursor, None, "typing disengages");
+    }
+
+    /// 0039/0043: `/clear` drops the band cursor, the selection and its
+    /// scroll — neither an id may dangle into the next transcript.
+    #[test]
+    fn clear_drops_band_cursor_selection_and_scroll() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        start_spawn(&mut s, "s1");
+        s.phase = Phase::Idle;
+        s.selected_agent = Some("s1".into());
+        s.agent_scroll = Some(1);
+        s.band_cursor = Some(BandRow::Main);
+        type_and_submit(&mut s, "/clear");
+        assert_eq!(s.selected_agent, None);
+        assert_eq!(s.agent_scroll, None);
+        assert_eq!(s.band_cursor, None);
+    }
+
+    /// 0043: the cursor is id-based — a row settling above it never shifts
+    /// the highlight onto another agent.
+    #[test]
+    fn a_settled_row_above_the_cursor_does_not_shift_the_highlight() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        for id in ["s1", "s2", "s3"] {
+            start_spawn(&mut s, id);
+        }
+        press(&mut s, KeyCode::Esc);
+        for _ in 0..3 {
+            press(&mut s, KeyCode::Down);
+        }
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s3".into())));
+        settle(&mut s, "s1");
+        assert_eq!(s.band_cursor, Some(BandRow::Spawn("s3".into())));
+        assert_eq!(band_ids(&s), vec!["s2", "s3"]);
     }
 
     /// 0042 D2: esc in Insert always reaches the editor — empty buffer and
@@ -3601,32 +3834,6 @@ mod tests {
         let cmds = press(&mut s, KeyCode::Esc);
         assert!(!cmds.contains(&Cmd::Cancel), "{cmds:?}");
         assert_eq!(s.editor.mode(), crate::vim::Mode::Normal);
-    }
-
-    /// 0042 D2: esc in Normal walks the ladder — stream → main (cursor
-    /// kept), cursor → Follow, then interrupt.
-    #[test]
-    fn esc_in_normal_walks_stream_then_cursor_then_interrupt() {
-        let mut s = State::test_default();
-        s.phase = Phase::Sampling { ticks: 0 };
-        start_spawn(&mut s, "s1");
-        press(&mut s, KeyCode::Esc); // Insert → Normal
-        press(&mut s, KeyCode::Char('k')); // engage on the spawn card
-        press(&mut s, KeyCode::Enter); // open its stream
-        assert_eq!(s.selected_agent.as_deref(), Some("s1"));
-
-        let cmds = press(&mut s, KeyCode::Esc); // stream → main
-        assert!(cmds.is_empty(), "{cmds:?}");
-        assert_eq!(s.selected_agent, None);
-        assert_eq!(s.cursor, Some(0), "back to main keeps the cursor");
-
-        let cmds = press(&mut s, KeyCode::Esc); // cursor → Follow
-        assert!(cmds.is_empty(), "{cmds:?}");
-        assert_eq!(s.cursor, None);
-        assert_eq!(s.scroll, Scroll::Follow);
-
-        let cmds = press(&mut s, KeyCode::Esc); // now the turn
-        assert!(cmds.contains(&Cmd::Cancel), "{cmds:?}");
     }
 
     /// 0039 D8: scroll keys target the shown child stream's line offset; the
@@ -3650,40 +3857,6 @@ mod tests {
         assert_eq!(s.agent_scroll, None, "pgdn returns to follow-tail");
     }
 
-    /// 0042 D1: the wheel and page keys move the window and never the
-    /// cursor; the next j/k snaps the cursor back on screen render-side.
-    #[test]
-    fn wheel_and_page_keys_move_the_window_not_the_cursor() {
-        let mut s = State::test_default();
-        s.transcript = notices(30);
-        press(&mut s, KeyCode::Esc);
-        press(&mut s, KeyCode::Char('k'));
-        assert_eq!(s.cursor, Some(29));
-        update(&mut s, Msg::Scroll(crate::scroll::Intent::Up(3)));
-        assert_eq!(s.scroll, Scroll::At(27), "the wheel moves the window");
-        assert_eq!(s.cursor, Some(29), "…not the cursor");
-        press(&mut s, KeyCode::PageUp);
-        assert_eq!(s.scroll, Scroll::At(17));
-        assert_eq!(s.cursor, Some(29));
-    }
-
-    /// 0039/0042: `/clear` drops the cursor, the selection and its scroll —
-    /// neither an id nor an index may dangle into the next transcript.
-    #[test]
-    fn clear_drops_cursor_selection_and_scroll() {
-        let mut s = State::test_default();
-        s.phase = Phase::Sampling { ticks: 0 };
-        start_spawn(&mut s, "s1");
-        s.phase = Phase::Idle;
-        s.selected_agent = Some("s1".into());
-        s.agent_scroll = Some(1);
-        s.cursor = Some(0);
-        type_and_submit(&mut s, "/clear");
-        assert_eq!(s.selected_agent, None);
-        assert_eq!(s.agent_scroll, None);
-        assert_eq!(s.cursor, None);
-    }
-
     /// vim_mode = false stays byte-identical (0042): empty-editor esc still
     /// interrupts in one press.
     #[test]
@@ -3694,8 +3867,8 @@ mod tests {
         assert!(cmds.contains(&Cmd::Cancel), "{cmds:?}");
     }
 
-    /// vim_mode = false stays byte-identical (0042): Enter submits — the
-    /// cursor intercept can never engage without vim.
+    /// vim_mode = false (0042/0043 D6): Enter with text still submits — the
+    /// band intercept needs an empty buffer.
     #[test]
     fn enter_still_submits_without_vim_mode() {
         let mut s = State::new(false, "m".into());
@@ -3706,7 +3879,7 @@ mod tests {
             cmds.iter().any(|c| matches!(c, Cmd::SendPrompt(_))),
             "{cmds:?}"
         );
-        assert_eq!(s.cursor, None, "no cursor ever engages without vim");
+        assert_eq!(s.band_cursor, None);
     }
 
     /// 0037: several `tool_auto_allowed` frames can park before any of their

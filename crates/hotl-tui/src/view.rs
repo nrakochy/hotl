@@ -13,7 +13,9 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, Clear, Paragraph};
 
 use crate::anim;
-use crate::app::{ContextReport, DiffOp, Phase, Scroll, State, ToolStatus, TranscriptItem};
+use crate::app::{
+    BandRow, ContextReport, DiffOp, Phase, Scroll, State, ToolStatus, TranscriptItem,
+};
 use crate::vim::Mode;
 use crate::wrap;
 
@@ -68,7 +70,7 @@ const SELECTOR_MAX_SPAWNS: usize = 4;
 /// 0 with no spawn cards, else the `main` row + up to `SELECTOR_MAX_SPAWNS`
 /// spawn rows + one overflow line.
 fn selector_height(state: &State) -> u16 {
-    let spawns = state.spawn_ids().len();
+    let spawns = state.band_spawns().len();
     if spawns == 0 {
         return 0;
     }
@@ -392,24 +394,12 @@ fn render_transcript(
             .map(|c| c.rows.len() + blanks)
             .sum()
     };
-    let mut skip = match state.scroll {
+    let skip = match state.scroll {
         Scroll::Follow => total.saturating_sub(height),
         Scroll::At(item) if item < cache.items.len() => start_of(item),
         Scroll::At(_) => total,
     }
     .min(total.saturating_sub(1));
-    // 0042 D1: a render-side clamp keeps the cursor item on screen (the
-    // `agent_scroll` "clamps again at render" precedent). The wheel may
-    // scroll it off; the next j/k re-renders with it visible.
-    if let Some(ci) = state.cursor.filter(|&ci| ci < cache.items.len()) {
-        let start = start_of(ci);
-        let end = start + cache.items[ci].rows.len();
-        if start < skip {
-            skip = start;
-        } else if end > skip + height {
-            skip = end.saturating_sub(height);
-        }
-    }
     // Walking to the window beats `Paragraph::scroll`, whose offset is a u16 a
     // long session would overflow. Only the rows actually on screen are
     // cloned, so the per-frame cost is bounded by the terminal, not by the
@@ -436,14 +426,7 @@ fn render_transcript(
                 break 'rows;
             }
             if row >= skip {
-                let mut line = line.clone();
-                // 0042 D1: the cursor highlight is a post-cache patch on the
-                // cloned rows — the cache, `item_fingerprint` and `Geometry`
-                // never see it, and spans keep their own foregrounds.
-                if state.cursor == Some(i) {
-                    line.style = line.style.patch(Style::new().bg(p.band));
-                }
-                visible.push(line);
+                visible.push(line.clone());
             }
             row += 1;
         }
@@ -1207,28 +1190,30 @@ fn selected_spawn(state: &State) -> Option<&TranscriptItem> {
     )
 }
 
-/// The agent band (0039, passive since 0042 D4): a `main` row plus a
-/// windowed row per spawn, at-a-glance only. `●` marks the shown stream
-/// (main when none); no focus state — navigation lives in the transcript.
+/// The agent band (0039, navigable since 0043): a `main` row plus a
+/// windowed row per running spawn. `●` = shown stream, band bg = cursor —
+/// two independent things that usually coincide.
 fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     if area.height == 0 {
         return;
     }
-    let spawns: Vec<&TranscriptItem> = state
-        .transcript
-        .iter()
-        .filter(|i| matches!(i, TranscriptItem::Tool { name, .. } if name == "spawn"))
-        .collect();
+    let spawns = state.band_spawns();
+    let position = |want: &str| {
+        spawns
+            .iter()
+            .position(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == want))
+            .map(|i| i + 1)
+    };
     let sel_idx = state
         .selected_agent
         .as_deref()
-        .and_then(|want| {
-            spawns
-                .iter()
-                .position(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == want))
-        })
-        .map(|i| i + 1)
+        .and_then(position)
         .unwrap_or(0);
+    let cur_idx = match &state.band_cursor {
+        Some(BandRow::Main) => Some(0),
+        Some(BandRow::Spawn(id)) => position(id),
+        None => None,
+    };
     let row_style = |on: bool| {
         if on {
             Style::new().fg(p.accent)
@@ -1236,15 +1221,25 @@ fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
             Style::new().fg(p.muted)
         }
     };
-    let mut lines = vec![Line::styled(
+    let styled = |text: String, on: bool, idx: usize| {
+        let mut line = Line::styled(text, row_style(on));
+        if cur_idx == Some(idx) {
+            line.style = line.style.patch(Style::new().bg(p.band));
+        }
+        line
+    };
+    let mut lines = vec![styled(
         format!("{} main", if sel_idx == 0 { "●" } else { "○" }),
-        row_style(sel_idx == 0),
+        sel_idx == 0,
+        0,
     )];
-    // The window keeps the selection visible; the rest overflow to a count.
-    let start = if sel_idx == 0 {
+    // The window follows the cursor (else the selection); the rest overflow
+    // to a count.
+    let focus = cur_idx.unwrap_or(sel_idx);
+    let start = if focus == 0 {
         0
     } else {
-        (sel_idx - 1).saturating_sub(SELECTOR_MAX_SPAWNS - 1)
+        (focus - 1).saturating_sub(SELECTOR_MAX_SPAWNS - 1)
     };
     let end = (start + SELECTOR_MAX_SPAWNS).min(spawns.len());
     for (i, item) in spawns.iter().enumerate().take(end).skip(start) {
@@ -1268,9 +1263,10 @@ fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         if !children.is_empty() {
             text.push_str(&format!(" · {} calls", children.len()));
         }
-        lines.push(Line::styled(
+        lines.push(styled(
             text.chars().take(area.width as usize).collect::<String>(),
-            row_style(on),
+            on,
+            i + 1,
         ));
     }
     if spawns.len() > SELECTOR_MAX_SPAWNS {
@@ -1577,10 +1573,13 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         }
         _ if state.completion.is_some() => "↑↓ pick · tab complete · enter run · esc dismiss",
         _ if copied.is_some() => copied.as_deref().unwrap_or_default(),
-        _ if selected_spawn(state).is_some() => "esc back to main · pgup/pgdn scroll",
-        // 0042 D1: the engaged transcript cursor (requires an empty buffer,
-        // so it can never collide with the popup's hint above).
-        _ if state.cursor.is_some() => "j/k move · enter open agent · esc back",
+        // 0043: the engaged band cursor (requires an empty buffer, so it can
+        // never collide with the popup's hint above).
+        (_, true, Mode::Normal) if state.band_cursor.is_some() => {
+            "j/k move · enter open · esc back"
+        }
+        _ if state.band_cursor.is_some() => "↑↓ move · enter open · esc back",
+        _ if selected_spawn(state).is_some() => "↑↓ agents · esc back to main · pgup/pgdn scroll",
         (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
         _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
     };
@@ -1721,7 +1720,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "pgup pgdn scroll · ctrl-home/end jump · mouse wheel",
         "drag to select and copy · shift-drag for the terminal's own select",
         "ctrl-t expand model thinking",
-        "j/k transcript cursor · enter open agent · esc back",
+        "↑↓ (j/k normal) agent band · enter open · esc back",
         "/help /status /context /cost /clear /quit · /rename /plan /mode /effort /reload",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
@@ -2449,12 +2448,13 @@ mod tests {
         );
     }
 
-    /// 0039/0042 D4: the passive band — `● main` plus one windowed row per
+    /// 0039/0043 D1: the band — `● main` plus one windowed row per *running*
     /// spawn, radio bullet on the shown stream, `… +N more` past the window.
-    /// No focus state exists; navigation lives in the transcript cursor.
+    /// Settled cards neither render nor count toward the overflow.
     #[test]
     fn the_selector_lists_main_and_spawns_with_radio_bullets_and_overflow() {
         let mut s = State::new(true, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
         for i in 1..=6 {
             s.transcript.push(tool_item(
                 &format!("s{i}"),
@@ -2463,6 +2463,15 @@ mod tests {
                 ToolStatus::Running,
                 0,
             ));
+            if i % 3 == 0 {
+                s.transcript.push(tool_item(
+                    &format!("d{i}"),
+                    "spawn",
+                    &format!("spawn done {i}"),
+                    ToolStatus::Done,
+                    0,
+                ));
+            }
         }
         s.selected_agent = Some("s1".into());
         let all = draw(&s).join("\n");
@@ -2472,7 +2481,92 @@ mod tests {
             "selected spawn: {all}"
         );
         assert!(all.contains("○ ⠑ spawn task 2 · 0s"), "sibling row: {all}");
-        assert!(all.contains("… +2 more"), "overflow past the window: {all}");
+        assert!(
+            !all.contains("spawn done"),
+            "settled cards never list: {all}"
+        );
+        assert!(
+            all.contains("… +2 more"),
+            "overflow counts running only: {all}"
+        );
+    }
+
+    /// 0043 D1: a band of settled cards is no band — zero height, default hint.
+    #[test]
+    fn all_settled_means_no_selector_row() {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.transcript
+            .push(tool_item("s1", "spawn", "spawn a", ToolStatus::Done, 0));
+        s.transcript
+            .push(tool_item("s2", "spawn", "spawn b", ToolStatus::Failed, 0));
+        assert_eq!(selector_height(&s), 0);
+        let rows = draw(&s);
+        assert!(rows[HINT].contains("history"), "{}", rows[HINT]);
+    }
+
+    /// 0043 D3: the band cursor is a band-background highlight on its row —
+    /// the `main` line included — while `●` keeps marking the shown stream.
+    #[test]
+    fn the_band_cursor_row_wears_the_band_background() {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.transcript.push(tool_item(
+            "s1",
+            "spawn",
+            "spawn survey",
+            ToolStatus::Running,
+            0,
+        ));
+        s.band_cursor = Some(BandRow::Spawn("s1".into()));
+        let band = Palette::default().band;
+        let check = |s: &State, want_spawn: bool| {
+            let buf = draw_buffer(s);
+            let rows: Vec<String> = (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf.cell((x, y)).unwrap().symbol())
+                        .collect()
+                })
+                .collect();
+            let find = |needle: &str| rows.iter().position(|r| r.contains(needle)).unwrap() as u16;
+            let has_band = |y: u16| {
+                (0..buf.area.width).any(|x| buf.cell((x, y)).unwrap().style().bg == Some(band))
+            };
+            let (main_y, spawn_y) = (find("● main"), find("○ ⠑ spawn survey"));
+            assert_eq!(has_band(spawn_y), want_spawn, "spawn row: {rows:#?}");
+            assert_eq!(has_band(main_y), !want_spawn, "main row: {rows:#?}");
+        };
+        check(&s, true);
+        s.band_cursor = Some(BandRow::Main);
+        check(&s, false);
+    }
+
+    /// 0043: the 4-row window follows the cursor, not just the selection.
+    #[test]
+    fn the_band_window_follows_the_cursor() {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        for i in 1..=6 {
+            s.transcript.push(tool_item(
+                &format!("s{i}"),
+                "spawn",
+                &format!("spawn task {i}"),
+                ToolStatus::Running,
+                0,
+            ));
+        }
+        s.band_cursor = Some(BandRow::Spawn("s6".into()));
+        let all = draw(&s).join("\n");
+        assert!(
+            all.contains("spawn task 6"),
+            "the cursor row is in view: {all}"
+        );
+        assert!(
+            !all.contains("spawn task 1 ·"),
+            "the head scrolled off: {all}"
+        );
+        assert!(all.contains("… +2 more"), "{all}");
     }
 
     /// 0039 D7: selecting a spawn swaps the WHOLE region above the strip for
@@ -2542,10 +2636,12 @@ mod tests {
         );
     }
 
-    /// 0042 D1: the hint names the cursor keys while it is engaged.
+    /// 0043: the hint names the band keys while the cursor is engaged — the
+    /// arrows without vim, j/k from vim Normal.
     #[test]
-    fn the_hint_row_names_the_cursor_keys_while_engaged() {
-        let mut s = State::new(true, "m".into());
+    fn the_hint_row_names_the_band_keys_while_engaged() {
+        let mut s = State::new(false, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
         s.transcript.push(tool_item(
             "s1",
             "spawn",
@@ -2553,23 +2649,41 @@ mod tests {
             ToolStatus::Running,
             0,
         ));
-        s.cursor = Some(0);
+        s.band_cursor = Some(BandRow::Main);
         let rows = draw(&s);
         assert!(
-            rows[HINT].contains("j/k move · enter open agent · esc back"),
-            "engaged hint: {}",
+            rows[HINT].contains("↑↓ move · enter open · esc back"),
+            "non-vim hint: {}",
+            rows[HINT]
+        );
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.transcript.push(tool_item(
+            "s1",
+            "spawn",
+            "spawn survey",
+            ToolStatus::Running,
+            0,
+        ));
+        s.band_cursor = Some(BandRow::Main);
+        s.editor
+            .handle(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let rows = draw(&s);
+        assert!(
+            rows[HINT].contains("j/k move · enter open · esc back"),
+            "vim Normal hint: {}",
             rows[HINT]
         );
     }
 
-    /// 0042: the help overlay names the transcript cursor.
+    /// 0043: the help overlay names the agent band.
     #[test]
     fn the_help_overlay_names_the_agent_selector() {
         let mut s = State::new(true, "m".into());
         s.help_open = true;
         let all = draw(&s).join("\n");
         assert!(
-            all.contains("j/k transcript cursor · enter open agent · esc back"),
+            all.contains("↑↓ (j/k normal) agent band · enter open · esc back"),
             "{all}"
         );
     }
@@ -3445,58 +3559,6 @@ mod tests {
             let hot = draw_cached(&s, &mut warm);
             assert_eq!(hot, cold, "cached render diverged at step {step}");
         }
-    }
-
-    /// 0042 D1: the cursor highlight is a post-cache style patch — same
-    /// symbols, zero re-wraps, band background on the cursor item's rows and
-    /// nowhere else.
-    #[test]
-    fn the_cursor_item_renders_highlighted_without_touching_the_cache() {
-        let mut s = cacheable_state();
-        let mut cache = TranscriptCache::default();
-        let before = draw_cached(&s, &mut cache);
-        let wraps = cache.rewraps();
-        s.cursor = Some(2); // the tool card — already visible under Follow
-        let after = draw_cached(&s, &mut cache);
-        assert_eq!(cache.rewraps(), wraps, "the highlight must not re-wrap");
-        // Transcript region only — the hint row legitimately switches to the
-        // cursor keys.
-        assert_eq!(
-            before[..STRIP],
-            after[..STRIP],
-            "symbols identical — only style moved"
-        );
-
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|f| view(&s, &Palette::default(), &mut cache, f))
-            .unwrap();
-        let buf = terminal.backend().buffer().clone();
-        let band = Palette::default().band;
-        let has_band = |y: u16| {
-            (0..buf.area.width).any(|x| buf.cell((x, y)).unwrap().style().bg == Some(band))
-        };
-        assert!(has_band(18), "the cursor item's row wears the band bg");
-        assert!(!has_band(16), "its neighbors do not");
-    }
-
-    /// 0042: the render-side clamp — a cursor item outside the window pulls
-    /// the effective start so it stays visible; the next j/k after a wheel
-    /// scroll snaps it back the same way.
-    #[test]
-    fn the_cursor_stays_visible_when_it_moves_off_window() {
-        let mut s = cacheable_state();
-        let without = draw(&s).join("\n");
-        assert!(
-            !without.contains("explain the cache"),
-            "precondition: the first item sits above the Follow window: {without}"
-        );
-        s.cursor = Some(0);
-        let with = draw(&s).join("\n");
-        assert!(
-            with.contains("explain the cache"),
-            "the window snapped to the cursor: {with}"
-        );
     }
 
     /// 0033 Task 3: after every append, at every chunk size, the cached
