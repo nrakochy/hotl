@@ -3477,10 +3477,7 @@ fn resolve_openai(
         let source: Arc<dyn hotl_provider::key::KeySource> =
             Arc::new(hotl_provider::key::StaticKey(None));
         return Ok((
-            Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(
-                base,
-                source.clone(),
-            )),
+            Arc::new(openai_chat_provider(cfg, base, source.clone())),
             source,
         ));
     }
@@ -3503,12 +3500,38 @@ fn resolve_openai(
     // static env key, so it must trip this warning too.
     warn_cleartext(&base, auth, key.is_some() || source.refreshable());
     Ok((
-        Arc::new(hotl_provider_openai::OpenAiCompatProvider::new(
-            base,
-            source.clone(),
-        )),
+        Arc::new(openai_chat_provider(cfg, base, source.clone())),
         source,
     ))
+}
+
+/// The session's chat-completions provider. `[provider] cache_breakpoints`
+/// overrides the GPT-5.6 name gate when set; the compaction `fast_model`
+/// provider is built elsewhere and stays on the default (its one-shots run
+/// under `CachePolicy::Off` anyway).
+fn openai_chat_provider(
+    cfg: &crate::config::Config,
+    base: String,
+    source: Arc<dyn hotl_provider::key::KeySource>,
+) -> hotl_provider_openai::OpenAiCompatProvider {
+    let provider = hotl_provider_openai::OpenAiCompatProvider::new(base, source);
+    match cfg.provider.cache_breakpoints {
+        Some(on) => provider.cache_breakpoints(on),
+        None => provider,
+    }
+}
+
+/// Twin of [`openai_chat_provider`] for the Responses dialect.
+fn openai_responses_provider(
+    cfg: &crate::config::Config,
+    base: String,
+    source: Arc<dyn hotl_provider::key::KeySource>,
+) -> hotl_provider_openai_responses::OpenAiResponsesProvider {
+    let provider = hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source);
+    match cfg.provider.cache_breakpoints {
+        Some(on) => provider.cache_breakpoints(on),
+        None => provider,
+    }
 }
 
 /// Twin of [`resolve_openai`] for the Responses dialect: the same base-URL
@@ -3528,9 +3551,7 @@ fn resolve_openai_responses(
         let source: Arc<dyn hotl_provider::key::KeySource> =
             Arc::new(hotl_provider::key::StaticKey(None));
         return Ok((
-            Arc::new(
-                hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source.clone()),
-            ),
+            Arc::new(openai_responses_provider(cfg, base, source.clone())),
             source,
         ));
     }
@@ -3552,9 +3573,7 @@ fn resolve_openai_responses(
     // H-09 twin: see resolve_openai for the cleartext-bearer rationale.
     warn_cleartext(&base, auth, key.is_some() || source.refreshable());
     Ok((
-        Arc::new(
-            hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source.clone()),
-        ),
+        Arc::new(openai_responses_provider(cfg, base, source.clone())),
         source,
     ))
 }
@@ -5720,6 +5739,46 @@ mod tests {
         ]);
         let (_p, m, _s) = select_provider(&cfg, &secrets).unwrap();
         assert_eq!(m, "gpt-5.6-luna-1");
+    }
+
+    /// `[provider] cache_breakpoints` reaches both session providers and
+    /// overrides the name gate in either direction; absent leaves the gate.
+    #[test]
+    fn provider_cache_breakpoints_overrides_the_name_gate_on_both_dialects() {
+        let source: Arc<dyn hotl_provider::key::KeySource> =
+            Arc::new(hotl_provider::key::StaticKey(None));
+        let req = |model: &str| hotl_provider::SamplingRequest {
+            model: model.into(),
+            max_tokens: 16,
+            system: "".into(),
+            items: hotl_provider::arc_items(Vec::new()),
+            ephemeral_tail: Arc::new(Vec::new()),
+            tools: Arc::from(Vec::<hotl_provider::ToolDef>::new()),
+            thinking: false,
+            effort: None,
+            cache: hotl_provider::CachePolicy::Static {
+                prefix_ttl: hotl_provider::CacheTtl::FiveMinutes,
+            },
+            turn_context: None,
+            cache_key: None,
+        };
+        let base = || "http://localhost:11434/v1".to_string();
+        let off = config_from_toml("[provider]\ncache_breakpoints = false\n");
+        assert!(!openai_responses_provider(&off, base(), source.clone())
+            .wants_explicit(&req("gpt-5.6-luna-1")));
+        assert!(!openai_chat_provider(&off, base(), source.clone())
+            .wants_explicit(&req("gpt-5.6-luna-1")));
+        let on = config_from_toml("[provider]\ncache_breakpoints = true\n");
+        assert!(
+            openai_responses_provider(&on, base(), source.clone()).wants_explicit(&req("sol-fast"))
+        );
+        assert!(openai_chat_provider(&on, base(), source.clone()).wants_explicit(&req("sol-fast")));
+        let unset = config_from_toml("");
+        assert!(openai_responses_provider(&unset, base(), source.clone())
+            .wants_explicit(&req("gpt-5.6-luna-1")));
+        assert!(
+            !openai_chat_provider(&unset, base(), source.clone()).wants_explicit(&req("sol-fast"))
+        );
     }
 
     /// Keyless against the vendor default base fails with the same guidance

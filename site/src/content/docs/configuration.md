@@ -48,6 +48,7 @@ effort = "high"                             # low | medium | high | xhigh | max;
 api_key_helper = "..."                      # command whose trimmed stdout is the API key; beats static key env vars; 5s timeout, 64KB cap
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
 max_tokens = 64000                          # per-sample output cap (thinking + text); clamped to the model's catalogued maximum
+cache_breakpoints = true                    # OpenAI dialects only: explicit GPT-5.6 prompt-cache breakpoints; absent = on for model names at or past gpt-5.6, off otherwise
 
 [context]
 window = 200000            # usually unnecessary — looked up per model; see below

@@ -61,6 +61,12 @@ api_key_helper_ttl_secs = 300         # optional: re-run when older than 5m
 Works identically for Anthropic direct — the helper is a key *source*, not a
 gateway feature.
 
+One more gateway-specific knob: a gateway alias that hides the model version
+(`sol-fast` in front of a GPT-5.6) never passes the name gate for explicit
+prompt-cache breakpoints, so set `[provider] cache_breakpoints = true` to
+turn them on by hand; if the gateway rejects the cache fields hotl notices
+the 400 once, retries without them and stays off for the session.
+
 ## Worked example: Bifrost with a virtual key
 
 [Bifrost](https://github.com/maximhq/bifrost) is a self-hostable gateway

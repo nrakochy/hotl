@@ -393,6 +393,12 @@ pub struct ProviderCfg {
     /// Per-sample output-token cap (thinking + text). Absent = the engine
     /// default (64_000), clamped to the model's catalogued maximum.
     pub max_tokens: Option<u32>,
+    /// Explicit prompt-cache breakpoints on the OpenAI dialects. Absent = on for
+    /// model names at or past `gpt-5.6` (`gpt-5.6-sol`, `gpt-6`), off otherwise.
+    /// Set `true` for a gateway alias that hides the version; `false` if the
+    /// endpoint rejects `prompt_cache_options` (hotl also probes once and backs
+    /// off on its own).
+    pub cache_breakpoints: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1433,6 +1439,24 @@ path_prefix = "/Volumes/secrets"
             Some("mint-key --gw")
         );
         assert_eq!(cfg.provider.api_key_helper_ttl_secs, Some(300));
+    }
+
+    /// Absent = decide by model name; either literal is an override.
+    #[test]
+    fn provider_cache_breakpoints_parses_as_a_tri_state() {
+        assert_eq!(cfg_with("").provider.cache_breakpoints, None);
+        assert_eq!(
+            cfg_with("[provider]\ncache_breakpoints = true\n")
+                .provider
+                .cache_breakpoints,
+            Some(true)
+        );
+        assert_eq!(
+            cfg_with("[provider]\ncache_breakpoints = false\n")
+                .provider
+                .cache_breakpoints,
+            Some(false)
+        );
     }
 
     #[test]
