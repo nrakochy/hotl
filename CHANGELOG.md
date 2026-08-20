@@ -6,6 +6,29 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI prompt caching: the session id now rides as `prompt_cache_key`,
+  and cached tokens are no longer double-counted** (plan 0045). OpenAI
+  routes a request to a cache shard by `prompt_cache_key` first and the
+  prompt-prefix hash second, and throttles any one key past ~15 requests a
+  minute; hotl sent no key, so every sample of every session — org-wide
+  behind a shared gateway — collapsed onto the same routing key (the shared
+  system-prompt head) and mostly missed, which is what a `4% hit` strip on
+  `gpt-5.6-sol` was showing. Both OpenAI dialects now send the session's
+  ULID as `prompt_cache_key` (stable across resume, distinct per fork,
+  shared by speculative samples); one-shot calls — compaction summaries and
+  `/goal` evaluation — stay keyless. The chat-completions dialect sends it
+  unconditionally: a documented OpenAI parameter that Ollama, llama.cpp and
+  vLLM ignore, and a deliberate exception to the byte-conservatism rule
+  that guards `reasoning_effort` — if a strict gateway rejects the key, that
+  is the field to look at. Separately, OpenAI's `input_tokens` /
+  `prompt_tokens` *include* `cached_tokens`, while hotl's `TokenUsage`
+  counts cached tokens outside the input figure (Anthropic semantics); both
+  dialects now subtract at parse time, so on OpenAI the strip's `in` and
+  `ctx %` stop over-reporting, `hit` stops under-reporting, and a catalogued
+  model would no longer be over-billed.
+
 ## [0.22.0] - 2026-08-20
 
 ### Added
