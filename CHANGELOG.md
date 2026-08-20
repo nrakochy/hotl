@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-20
+
 ### Added
 
 - **`workflow`: many sub-agents from one declarative plan** (plan 0044,
