@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-08-20
+
 ### Fixed
 
 - **OpenAI prompt caching: the session id now rides as `prompt_cache_key`,

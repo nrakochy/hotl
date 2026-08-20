@@ -19,8 +19,8 @@ minify = ["hotl-tools/minify"]
 
 [dependencies]
 dunce = { workspace = true }
-hotl-tools = { path = "../hotl-tools", version = "0.22.0", default-features = false }
-hotl-types = { path = "../hotl-types", version = "0.22.0" }
+hotl-tools = { path = "../hotl-tools", version = "0.23.0", default-features = false }
+hotl-types = { path = "../hotl-types", version = "0.23.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
