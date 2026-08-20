@@ -91,6 +91,11 @@ pub fn body_for(req: &SamplingRequest) -> Value {
     if !req.tools.is_empty() {
         body["tools"] = json!(req.tools.iter().map(tool_json).collect::<Vec<_>>());
     }
+    // Routing key first, prefix hash second: without it every session's
+    // samples collapse onto the shared system-prompt head (0045).
+    if let Some(key) = &req.cache_key {
+        body["prompt_cache_key"] = json!(key.as_ref());
+    }
     // `cache` stays an Anthropic-surface knob: caching is implicit here and
     // this dialect emits no breakpoints under ANY `CachePolicy`.
     //
@@ -603,17 +608,18 @@ impl ResponsesAssembler {
         stop: Option<StopReason>,
     ) -> Result<Vec<StreamEvent>, ProviderError> {
         if let Some(u) = v.pointer("/response/usage") {
+            // OpenAI counts cached tokens INSIDE `input_tokens`; `TokenUsage`
+            // counts them outside it (Anthropic semantics), so carve them out.
+            let cached = u
+                .pointer("/input_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             if let Some(n) = u.get("input_tokens").and_then(Value::as_u64) {
-                self.usage.input_tokens = n;
+                self.usage.input_tokens = n.saturating_sub(cached);
+                self.usage.cache_read_input_tokens = cached;
             }
             if let Some(n) = u.get("output_tokens").and_then(Value::as_u64) {
                 self.usage.output_tokens = n;
-            }
-            if let Some(n) = u
-                .pointer("/input_tokens_details/cached_tokens")
-                .and_then(Value::as_u64)
-            {
-                self.usage.cache_read_input_tokens = n;
             }
         }
         // INVARIANT (T3-14): every opened block closes, even against a
@@ -965,6 +971,17 @@ mod tests {
         }
     }
 
+    /// OpenAI routes by `prompt_cache_key` first and prefix hash second; the
+    /// session id is what keeps one session's samples on one cache shard.
+    #[test]
+    fn the_session_cache_key_rides_prompt_cache_key() {
+        let mut req = sampling_req();
+        req.cache_key = Some("01J0SESSIONULID".into());
+        assert_eq!(body_for(&req)["prompt_cache_key"], "01J0SESSIONULID");
+        req.cache_key = None;
+        assert!(body_for(&req).get("prompt_cache_key").is_none());
+    }
+
     #[test]
     fn the_body_speaks_the_responses_dialect() {
         let mut req = sampling_req();
@@ -1199,6 +1216,22 @@ mod tests {
         (streamed, a.finish().unwrap())
     }
 
+    /// OpenAI's `input_tokens` includes `cached_tokens`; `TokenUsage` counts
+    /// cached tokens outside `input_tokens` (Anthropic semantics), so the
+    /// assembler carves them out rather than every consumer learning a case.
+    #[test]
+    fn cached_tokens_are_carved_out_of_openais_input_total() {
+        let (_, done) = run(&[
+            r#"{"type":"response.completed","response":{"usage":{"input_tokens":42,"output_tokens":8,"input_tokens_details":{"cached_tokens":30}}}}"#,
+        ]);
+        let StreamEvent::Completed { usage, .. } = done else {
+            panic!("wrong terminal event")
+        };
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.hit_ratio(), Some(30.0 / 42.0));
+    }
+
     /// R3's first golden test, resurrected on the current wire (per-item
     /// terminators, `output_item.added` for every item): a different event
     /// vocabulary folds into the *same* verbatim assistant blocks and
@@ -1228,7 +1261,7 @@ mod tests {
         };
         // Same contract as every other dialect: verbatim blocks + usage + stop.
         assert_eq!(stop, StopReason::ToolUse);
-        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.input_tokens, 12);
         assert_eq!(usage.output_tokens, 8);
         assert_eq!(usage.cache_read_input_tokens, 30);
         assert_eq!(blocks[0]["type"], "text");

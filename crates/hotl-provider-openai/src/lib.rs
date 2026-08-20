@@ -174,6 +174,11 @@ impl OpenAiCompatProvider {
         if !req.tools.is_empty() {
             body["tools"] = json!(req.tools.iter().map(tool_json).collect::<Vec<_>>());
         }
+        // Sent unconditionally (0045 D3): a documented OpenAI parameter the
+        // compat servers ignore — a deliberate exception to byte-conservatism.
+        if let Some(key) = &req.cache_key {
+            body["prompt_cache_key"] = json!(key.as_ref());
+        }
         // `cache` stays an Anthropic-surface knob: caching is implicit here and
         // this dialect emits no breakpoints under ANY `CachePolicy`. Depth does
         // not — Chat Completions carries a flattened top-level
@@ -373,17 +378,18 @@ impl SseAssembler for Assembler {
             .map_err(|e| ProviderError::Parse(format!("bad SSE json: {e}")))?;
         let mut out = Vec::new();
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+            // OpenAI counts cached tokens INSIDE `prompt_tokens`; `TokenUsage`
+            // counts them outside it (Anthropic semantics), so carve them out.
+            let cached = u
+                .pointer("/prompt_tokens_details/cached_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             if let Some(n) = u.get("prompt_tokens").and_then(Value::as_u64) {
-                self.usage.input_tokens = n;
+                self.usage.input_tokens = n.saturating_sub(cached);
+                self.usage.cache_read_input_tokens = cached;
             }
             if let Some(n) = u.get("completion_tokens").and_then(Value::as_u64) {
                 self.usage.output_tokens = n;
-            }
-            if let Some(n) = u
-                .pointer("/prompt_tokens_details/cached_tokens")
-                .and_then(Value::as_u64)
-            {
-                self.usage.cache_read_input_tokens = n;
             }
         }
         let Some(choice) = v.pointer("/choices/0") else {
@@ -968,7 +974,7 @@ mod tests {
             panic!("wrong terminal")
         };
         assert_eq!(stop, StopReason::ToolUse);
-        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.input_tokens, 15);
         assert_eq!(usage.output_tokens, 9);
         assert_eq!(usage.cache_read_input_tokens, 5);
         assert_eq!(blocks[0]["text"], "Hello");
@@ -1384,6 +1390,38 @@ mod tests {
             turn_context: None,
             cache_key: None,
         }
+    }
+
+    /// Sent unconditionally (D3): `prompt_cache_key` is a documented OpenAI
+    /// parameter and the compat servers hotl names ignore unknown fields.
+    #[test]
+    fn the_session_cache_key_rides_prompt_cache_key() {
+        let mut req = sampling_req();
+        req.cache_key = Some("01J0SESSIONULID".into());
+        let body = OpenAiCompatProvider::body_for(&req, false);
+        assert_eq!(body["prompt_cache_key"], "01J0SESSIONULID");
+        req.cache_key = None;
+        let body = OpenAiCompatProvider::body_for(&req, false);
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    /// OpenAI's `prompt_tokens` includes `cached_tokens`; `TokenUsage` counts
+    /// cached tokens outside `input_tokens`, so the assembler carves them out.
+    #[test]
+    fn cached_tokens_are_carved_out_of_openais_input_total() {
+        let mut a = Assembler::default();
+        a.handle(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
+            .unwrap();
+        a.handle(
+            r#"{"choices":[],"usage":{"prompt_tokens":42,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":30}}}"#,
+        )
+        .unwrap();
+        let StreamEvent::Completed { usage, .. } = a.finish().unwrap() else {
+            panic!("wrong terminal")
+        };
+        assert_eq!(usage.input_tokens, 12);
+        assert_eq!(usage.cache_read_input_tokens, 30);
+        assert_eq!(usage.hit_ratio(), Some(30.0 / 42.0));
     }
 
     #[test]
