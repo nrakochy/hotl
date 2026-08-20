@@ -6,7 +6,7 @@
 //! exhaustion → non-zero exit.
 
 use hotl_engine::{EngineEvent, Outcome, SessionHandle};
-use hotl_types::{Item, SyntheticReason};
+use hotl_types::{Item, SyntheticReason, TokenUsage};
 use serde_json::Value;
 
 pub const MAX_RETRIES: u32 = 2;
@@ -66,14 +66,34 @@ pub async fn run_structured(
     prompt: &str,
     max_retries: u32,
 ) -> Result<Value, String> {
+    handle.prompt(prompt.to_string()).await;
+    structured_loop(handle, schema, max_retries, wait_for_done)
+        .await
+        .map(|(value, _)| value)
+}
+
+/// The validate-and-retry loop behind [`run_structured`], for a caller that
+/// has already issued the first prompt and drains the session its own way
+/// (`wait` answers asks, forwards events, whatever the surface needs). Usage
+/// is summed across every attempt.
+pub async fn structured_loop<F>(
+    handle: &mut SessionHandle,
+    schema: &Value,
+    max_retries: u32,
+    mut wait: F,
+) -> Result<(Value, TokenUsage), String>
+where
+    F: AsyncFnMut(&mut SessionHandle) -> Result<(String, TokenUsage), String>,
+{
     let validator = jsonschema::validator_for(schema)
         .map_err(|e| format!("the --json-schema file is not a valid JSON Schema: {e}"))?;
-    handle.prompt(prompt.to_string()).await;
     let mut attempts = 0;
+    let mut total = TokenUsage::default();
     loop {
-        let text = wait_for_done(handle).await?;
+        let (text, usage) = wait(handle).await?;
+        total += usage;
         match validate(&validator, &text) {
-            Ok(value) => return Ok(value),
+            Ok(value) => return Ok((value, total)),
             Err(e) if attempts < max_retries => {
                 attempts += 1;
                 handle
@@ -92,10 +112,10 @@ pub async fn run_structured(
     }
 }
 
-/// Wait for the turn to complete, returning the assistant text or an error for
-/// a non-`Done` outcome. Ask events cannot occur (headless default-deny), but
-/// are denied defensively.
-async fn wait_for_done(handle: &mut SessionHandle) -> Result<String, String> {
+/// Wait for the turn to complete, returning the assistant text and the turn's
+/// usage, or an error for a non-`Done` outcome. Ask events cannot occur
+/// (headless default-deny), but are denied defensively.
+async fn wait_for_done(handle: &mut SessionHandle) -> Result<(String, TokenUsage), String> {
     while let Some(event) = handle.events.recv().await {
         match event {
             EngineEvent::Ask { reply, .. } => {
@@ -108,9 +128,9 @@ async fn wait_for_done(handle: &mut SessionHandle) -> Result<String, String> {
             EngineEvent::EgressAsk { reply, .. } => {
                 let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
             }
-            EngineEvent::TurnDone { outcome, .. } => {
+            EngineEvent::TurnDone { outcome, usage } => {
                 return match outcome {
-                    Outcome::Done { text } => Ok(text),
+                    Outcome::Done { text } => Ok((text, usage)),
                     Outcome::Refused => Err("the model refused the request".into()),
                     Outcome::TurnLimit => Err("hit the turn limit before answering".into()),
                     other => Err(format!("the turn did not complete: {other:?}")),
@@ -155,8 +175,13 @@ mod tests {
         assert!(text.contains("output-contract"));
     }
 
-    #[tokio::test]
-    async fn retries_on_invalid_then_succeeds() {
+    /// A session whose first sample is invalid (`{}` — missing `name`) and
+    /// whose second is valid. The guard is the log's directory.
+    fn invalid_then_valid() -> (
+        SessionHandle,
+        std::sync::Arc<hotl_provider::ScriptedProvider>,
+        tempfile::TempDir,
+    ) {
         use hotl_engine::{spawn_session, EngineConfig, SessionDeps};
         use hotl_platform::SystemClock;
         use hotl_provider::ScriptedProvider;
@@ -166,12 +191,11 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
-        // sample 1: invalid ("{}" — missing `name`); sample 2: valid.
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::text_reply("{}"),
             ScriptedProvider::text_reply(r#"{"name":"ok"}"#),
         ]));
-        let mut handle = spawn_session(SessionDeps {
+        let handle = spawn_session(SessionDeps {
             provider: provider.clone(),
             registry: Arc::new(Registry::builtin()),
             rules: Arc::new(Rules::default()),
@@ -190,6 +214,12 @@ mod tests {
                 ..Default::default()
             },
         });
+        (handle, provider, dir)
+    }
+
+    #[tokio::test]
+    async fn retries_on_invalid_then_succeeds() {
+        let (mut handle, provider, _dir) = invalid_then_valid();
         let schema = json!({"type":"object","required":["name"]});
         let out = run_structured(&mut handle, &schema, "give me a name", 2)
             .await
@@ -207,5 +237,21 @@ mod tests {
             )),
             "the retry must feed back as a tagged RetryFeedback item"
         );
+    }
+
+    /// The loop itself, driven by a caller-issued prompt: usage is the sum
+    /// over every attempt, not the last one's.
+    #[tokio::test]
+    async fn structured_loop_sums_usage_across_attempts() {
+        let (mut handle, _provider, _dir) = invalid_then_valid();
+        let schema = json!({"type":"object","required":["name"]});
+        handle.prompt("give me a name".into()).await;
+        let (out, usage) = structured_loop(&mut handle, &schema, 2, wait_for_done)
+            .await
+            .unwrap();
+        assert_eq!(out["name"], "ok");
+        // `text_reply` bills 10 in / 5 out per sample; two samples ran.
+        assert_eq!(usage.input_tokens, 20);
+        assert_eq!(usage.output_tokens, 10);
     }
 }

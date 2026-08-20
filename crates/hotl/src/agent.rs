@@ -1683,6 +1683,37 @@ impl HotlChildBuilder {
         masker_with_helper(self.initial_helper_key.as_deref())
     }
 
+    /// The parent's engine config with the def's overrides applied: `model`,
+    /// `effort` and `max_turns` replace the parent's for this child only.
+    /// Every value was validated at parse time (`parse_effort`, the
+    /// `max_turns` number check), so there is nothing to reject here — this
+    /// runs inside the TUI process, where a warning would land on the
+    /// alternate screen (T3-23).
+    fn child_config(&self, def: &hotl_tools::agents::AgentDef) -> EngineConfig {
+        let mut config = self.config.clone();
+        if let Some(model) = &def.model {
+            config.model = model.clone();
+        }
+        // Task 4 (mode-derived 1h TTL): children pin FiveMinutes
+        // deliberately — short-lived, no human pauses to amortize a 1h
+        // write premium over. Set explicitly rather than left to whatever
+        // `self.config` already carries: `self.config` is captured inside
+        // `scaffold()` (via `child_builder(...)`) *before* `acp_factory`/
+        // `serve_main` mutate their own copy to `OneHour`, so today it would
+        // happen to read `FiveMinutes` anyway — but that's an accident of
+        // capture order, not a guarantee, and must not be the mechanism a
+        // future refactor (or an `engine_config()` default change) silently
+        // breaks.
+        config.cache_ttl = CacheTtl::FiveMinutes;
+        if let Some(e) = def.effort {
+            config.effort = Some(e);
+        }
+        if let Some(n) = def.max_turns {
+            config.max_turns = n;
+        }
+        config
+    }
+
     /// Shared by `build`/`build_fork`: apply the resolved def — tool filter
     /// (never `spawn`/MCP/skills; depth-1 + "children stay lean" both hold
     /// structurally, since the registry is built fresh from
@@ -1824,28 +1855,7 @@ impl HotlChildBuilder {
             .system_prompt
             .clone()
             .unwrap_or_else(|| self.system.clone());
-        let mut config = self.config.clone();
-        if let Some(model) = &def.model {
-            config.model = model.clone();
-        }
-        // Task 4 (mode-derived 1h TTL): children pin FiveMinutes
-        // deliberately — short-lived, no human pauses to amortize a 1h
-        // write premium over. Set explicitly rather than left to whatever
-        // `self.config` already carries: `self.config` is captured inside
-        // `scaffold()` (via `child_builder(...)`) *before* `acp_factory`/
-        // `serve_main` mutate their own copy to `OneHour`, so today it would
-        // happen to read `FiveMinutes` anyway — but that's an accident of
-        // capture order, not a guarantee, and must not be the mechanism a
-        // future refactor (or an `engine_config()` default change) silently
-        // breaks.
-        config.cache_ttl = CacheTtl::FiveMinutes;
-        // A def's effort replaces the parent's for this child only, exactly
-        // like `model`. Already validated at parse time (`parse_effort`), so
-        // there is nothing to reject here — this code runs inside the TUI
-        // process, where a warning would land on the alternate screen (T3-23).
-        if let Some(e) = def.effort {
-            config.effort = Some(e);
-        }
+        let config = self.child_config(def);
         let handle = spawn_session_with_todos(
             registry,
             None, // children never get their own `spawn` tool — depth-1 is structural
@@ -4533,6 +4543,25 @@ mod tests {
             }
         }
         provider.last_request().expect("one request").effort
+    }
+
+    /// A def's `max_turns:` caps this child only; a silent def inherits the
+    /// parent's. Asserted on `child_config`, the pure step `spawn_child`
+    /// hands to `spawn_session_with_todos`.
+    #[test]
+    fn a_def_max_turns_overrides_the_parent_and_a_silent_def_inherits() {
+        let (mut cb, _store) = test_child_builder();
+        cb.config.max_turns = 40;
+        let bounded = hotl_tools::agents::parse_def(
+            "---\nname: kid\nmax_turns: 3\n---\nbe brief\n",
+            hotl_tools::agents::AgentSource::User,
+        )
+        .expect("def parses");
+        assert_eq!(cb.child_config(&bounded).max_turns, 3);
+        let silent = def_with_effort(None);
+        assert_eq!(cb.child_config(&silent).max_turns, 40);
+        // The other overrides still ride the same step.
+        assert_eq!(cb.child_config(&silent).cache_ttl, CacheTtl::FiveMinutes);
     }
 
     /// Built through the real frontmatter parse, so the parse-time validation
