@@ -48,7 +48,7 @@ Two knobs, one in each table:
 
 Top to bottom:
 
-1. **Transcript** — every turn carries a marker in the left gutter, so you can see the shape of the conversation by scanning straight down: `❯` your prompts, `●` the assistant (with a `│` bar down a long answer), `✓ ✗ ⛔` tool cards (`✓ bash  cargo test · 2s`), `⤷` steers, `·` dim notices (retries, fallbacks, compaction). Inside an assistant answer, headings, bullets, and code get light styling so a long reply is scannable. With the input empty (vim Normal mode), `j`/`k` walk a highlighted [cursor](#the-transcript-cursor-vim) over it; it snaps back to following the bottom on your next prompt.
+1. **Transcript** — every turn carries a marker in the left gutter, so you can see the shape of the conversation by scanning straight down: `❯` your prompts, `●` the assistant (with a `│` bar down a long answer), `✓ ✗ ⛔` tool cards (`✓ bash  cargo test · 2s`), `⤷` steers, `·` dim notices (retries, fallbacks, compaction). Inside an assistant answer, headings, bullets, and code get light styling so a long reply is scannable. With the input empty and no agent band showing, vim Normal `j`/`k` scroll it one item at a time; it snaps back to following the bottom on your next prompt.
 2. **Activity strip** — one line that tells you what the turn is doing, animated as a loop drawing itself:
 
    | You see | It means |
@@ -67,13 +67,16 @@ Top to bottom:
    empty or never-started list shows nothing extra.
 
 3. **Input** — bordered editor, title shows `-- INSERT --` / `-- NORMAL --`.
-4. **Agent band** — appears below the input once the turn has spawned
-   sub-agents: `● main` plus one summary row per spawn, at a glance only —
-   `●` marks the stream you are watching. To open a spawn's stream, walk the
-   [transcript cursor](#the-transcript-cursor-vim) onto its card and press
-   `Enter`; the whole region above the strip swaps to that agent's own tool
-   stream, and `Esc` steps back out. The band itself takes no keys, and
-   there is no non-vim path into the drill-in yet.
+4. **Agent band** — appears below the input while the turn has sub-agents
+   *running*: `● main` plus one summary row per running spawn — `●` marks
+   the stream you are watching. A spawn drops off the band the moment it
+   settles (the one you are viewing or pointing at stays until you leave
+   it), and the band disappears when nothing runs. It is navigated in place:
+   `↑`/`↓` (any mode without vim; Normal mode with vim) or `j`/`k` (vim
+   Normal) move a highlight over the rows, `Enter` opens the highlighted
+   agent's stream — the whole region above the strip swaps to that agent's
+   own tool stream — or returns to `main`, and `Esc` backs out. See
+   [Navigating the agent band](#navigating-the-agent-band).
 5. **Hint row** — the keys that matter right now.
 
 ### Tool cards that stay readable
@@ -84,7 +87,8 @@ four rows — and long paths middle-elide in the card (permission asks always
 show the full path). A `spawn` card stays one calm line whether running or
 settled: a `· N calls` count plus — while it runs — its newest child call as
 a muted trailing detail (`spawn  survey · 3 calls · 12s · read src/app.rs`).
-The full call list lives in the drill-in: cursor onto the card, `Enter`.
+The full call list lives in the drill-in: highlight the agent in the band
+and press `Enter`.
 
 ### Scrolling
 
@@ -93,25 +97,36 @@ The full call list lives in the drill-in: cursor onto the card, `Enter`.
 | `PageUp` / `PageDown` | Scroll the transcript a page (ten items) |
 | `Ctrl-Home` / `Ctrl-End` | Jump to the top / back to following the newest |
 | mouse wheel | Scroll three items a notch |
-| `j` / `k` | Move the transcript cursor, in vim Normal mode with the input empty (below) |
+| `j` / `k` | Move the agent-band highlight (vim Normal, input empty); scroll the transcript one item when no band is shown |
 
 `Home` and `End` on their own are line motions in the input, which is why the
 document-level jumps are the `Ctrl` pair.
 
-### The transcript cursor (vim)
+### Navigating the agent band
 
-With `vim_mode = true`, an empty input and Normal mode, `j`/`k` engage a
-highlighted cursor over transcript items: the first press lands on the newest
-item (or the top of a scrolled-back window), each press moves it one item,
-and `j` below the newest item disengages back to following the tail. `Enter`
-with the cursor on a `spawn` card opens that agent's live stream; on any
-other item it does nothing. Typing drops the cursor and lands in the prompt.
-The wheel and `PageUp`/`PageDown` move the window without touching the
-cursor — the next `j`/`k` snaps it back into view.
+While the band is showing and the input is empty, `↑`/`↓` move a highlight
+over its rows — `main` first, then each running spawn — clamped at both ends.
+Without vim that is any time the band shows; with `vim_mode = true` the
+arrows move the highlight from Normal mode only (Insert keeps them for
+history recall), and `j`/`k` move it too. The first press engages the
+highlight on the row you are watching and moves from there, so `↓` from
+`main` lands on the first spawn in one press.
+
+`Enter` on a spawn row opens that agent's live stream; `Enter` on `main`
+returns to the transcript. The highlight stays put after `Enter`, so `●`
+(the stream you are watching) and the highlight (where you are pointing) are
+two independent things that usually coincide. Typing drops the highlight and
+lands in the prompt. The wheel and `PageUp`/`PageDown` scroll whichever
+stream is shown and never touch the band.
+
+A spawn you are viewing or pointing at stays listed after it settles (with
+its `✓`) until you move off it or back out; a spawn settling *above* the
+highlight never shifts it onto another agent.
 
 `Esc` walks back one rung per press: an open agent stream returns to main
-(cursor kept), an engaged cursor disengages, and only then — Normal mode,
-nothing half-typed — does it interrupt the running turn.
+(highlight kept), an engaged highlight disengages, and only then — with the
+input empty, and under vim from Normal mode — does it interrupt the running
+turn.
 
 ### Selecting and copying
 
@@ -196,7 +211,7 @@ Type and press `Enter` to prompt. **Typing while a turn runs is steering**: subm
 
 Your submitted prompts are remembered across sessions (shell-style), stored under `[history]` in `config.toml` ([configuration.md](../configuration/)).
 
-- **`↑` / `↓`** — walk previous prompts. Recall triggers only at the buffer's edge: `↑` from the **first** line steps to an older prompt, `↓` from the **last** line steps to a newer one; anywhere else the arrows just move the cursor between lines. What's on the line when you start walking becomes a **prefix filter** — type `git ` then `↑` and you only cycle prompts that began with `git `. An empty line walks everything. Your in-progress text is saved and comes back when you press `↓` past the newest match; editing a recalled prompt keeps it and drops you out of recall.
+- **`↑` / `↓`** — walk previous prompts. Recall triggers only at the buffer's edge: `↑` from the **first** line steps to an older prompt, `↓` from the **last** line steps to a newer one; anywhere else the arrows just move the cursor between lines. What's on the line when you start walking becomes a **prefix filter** — type `git ` then `↑` and you only cycle prompts that began with `git `. An empty line walks everything. Your in-progress text is saved and comes back when you press `↓` past the newest match; editing a recalled prompt keeps it and drops you out of recall. While the agent band is showing and the input is empty, `↑`/`↓` move the band highlight instead (with `vim_mode = true` only from Normal mode — Insert always recalls).
 - **`Ctrl-R`** — reverse-incremental search. The input line becomes `(reverse-i-search)'query': match`; each character narrows to the most recent prompt containing it, and pressing `Ctrl-R` again steps to the next older match. `Enter` drops the match into the input to edit or send; `Esc` cancels and restores what you had.
 
 Only prompts that start a turn are saved to disk — steers and `/slash` commands aren't, though the running session still recalls everything you typed. Consecutive duplicates are collapsed, and the file is size-bounded (see `[history]`). Vim `k`/`j` remain pure cursor/scroll motion — recall is on the arrows.
@@ -381,8 +396,8 @@ In headless (`-p`) or JSON mode there is no one to ask, so the question resolves
 - `Esc` (with the input empty) — interrupt the running turn; press again to insist.
   With `vim_mode = true` the interrupt fires from **Normal** mode only —
   `Esc` in Insert just changes mode (so it is `Esc Esc` from a fresh
-  prompt), and a shown agent stream or an engaged transcript cursor backs
-  out first, one rung per press.
+  prompt), and a shown agent stream or a band highlight backs out first,
+  one rung per press.
 - `Ctrl-C` — cancel the turn while one runs; quit from idle.
 
 ## Vim keys
@@ -397,8 +412,8 @@ In headless (`-p`) or JSON mode there is no one to ask, so the question resolves
 | `h l 0 $ w b e` | Motions, with counts (`3w`) |
 | `d c y` + motion | Delete / change / yank; `dd cc yy` for the whole line |
 | `x p u` | Delete char · paste · undo (one level) |
-| `j k` | Walk the transcript cursor when the input is empty; move lines otherwise |
-| `↑ ↓` | Recall prompt history at the buffer's edges (see [History recall](#history-recall)); `Ctrl-R` searches it |
+| `j k` | Move the agent-band highlight when the input is empty (scroll the transcript when no band); move lines otherwise |
+| `↑ ↓` | Recall prompt history at the buffer's edges (see [History recall](#history-recall)); `Ctrl-R` searches it; move the agent-band highlight from Normal with the input empty |
 | `/` then `↑ ↓` | Pick from the command menu; `Tab` completes, `Enter` runs it, `Esc` dismisses |
 | `Enter` | Submit (either mode) |
 
