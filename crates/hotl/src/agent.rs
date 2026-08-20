@@ -576,7 +576,7 @@ pub(crate) async fn build_acp() -> Result<
     // Taken before the closure below moves `scaffold` out of reach.
     let mut warnings = std::mem::take(&mut scaffold.warnings);
     // Saved workflow recipes (0044): an unparsable file is a warning on the
-    // same channel as every other discovery failure, never an `eprintln!`.
+    // same channel as every other discovery failure, never printed here.
     let mut workflows = Vec::new();
     for found in hotl_workflow::discover(&scaffold.config_dir) {
         match found.plan {
@@ -601,6 +601,7 @@ pub(crate) async fn build_acp() -> Result<
     let info = crate::acp::ServerInfo {
         skills,
         workflows,
+        workflows_report: crate::workflow::report,
         default_mode: scaffold.rules.mode().as_str().to_string(),
         default_plan: scaffold.rules.plan(),
         context_window: scaffold.config.context_window,
@@ -934,6 +935,10 @@ struct Scaffold {
     /// `[agents] claude` — whether `spawn`'s agent_type resolution also reads
     /// `~/.claude/agents/*.md` (mirrors `[skills] claude`).
     agents_include_claude: bool,
+    /// `[workflows]` (0044): the process-wide agent gate every run shares,
+    /// built once here like `concurrency`, and the limits a plan may lower.
+    workflow_gate: Arc<tokio::sync::Semaphore>,
+    workflow_limits: hotl_workflow::Limits,
     /// Startup warnings, collected rather than printed: `/reload` rebuilds a
     /// scaffold with the alternate screen up, where a stray `eprintln!` would
     /// corrupt the display. Startup callers print these verbatim; the reload
@@ -1033,6 +1038,12 @@ async fn scaffold(
     let registry = Arc::new(registry);
     let hooks = load_hooks(&cfg, concurrency.clone());
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
+    let (wf_concurrency, wf_max_agents) = cfg.workflows.limits();
+    let workflow_limits = hotl_workflow::Limits {
+        concurrency: wf_concurrency,
+        max_agents: wf_max_agents,
+    };
+    let workflow_gate = Arc::new(tokio::sync::Semaphore::new(wf_concurrency));
     Ok(Scaffold {
         provider,
         model,
@@ -1050,6 +1061,8 @@ async fn scaffold(
         spawn_builder,
         concurrency,
         agents_include_claude,
+        workflow_gate,
+        workflow_limits,
         warnings,
     })
 }
@@ -1081,6 +1094,9 @@ impl Scaffold {
             config_dir: self.config_dir.clone(),
             include_claude: self.agents_include_claude,
             session_id,
+            workflow_gate: self.workflow_gate.clone(),
+            workflow_limits: self.workflow_limits,
+            data_dir: data_dir(),
         }
     }
 
@@ -1355,6 +1371,11 @@ struct SpawnRegistration {
     /// parent. Per-session, like the head reader beside it; the builder itself
     /// is process-wide and cannot know it.
     session_id: String,
+    /// The `workflow` tool's share (0044): the one process-wide gate, the
+    /// configured limits, and where run artefacts land.
+    workflow_gate: Arc<tokio::sync::Semaphore>,
+    workflow_limits: hotl_workflow::Limits,
+    data_dir: PathBuf,
 }
 
 /// A session on a surface that can put a question in front of a human, so it
@@ -1424,15 +1445,36 @@ fn spawn_session_inner(
         config_dir,
         include_claude,
         session_id,
+        workflow_gate,
+        workflow_limits,
+        data_dir,
     }) = spawn
     {
         let snapshot = snapshot_provider(Arc::clone(&head_cell), session_id);
         // `.with_events`: children never get `spawn` at all, so there is no
         // recursive wiring to worry about — one hop, child to parent.
         registry.register(Box::new(
-            crate::spawn::SpawnTool::new(builder, config_dir, include_claude, concurrency)
-                .with_snapshot(snapshot)
-                .with_events(event_tx.downgrade()),
+            crate::spawn::SpawnTool::new(
+                builder.clone(),
+                config_dir.clone(),
+                include_claude,
+                concurrency,
+            )
+            .with_snapshot(snapshot)
+            .with_events(event_tx.downgrade()),
+        ));
+        // The workflow runner (0044) drives the same child builder; its
+        // agents never see it either (`Registry::filtered`).
+        registry.register(Box::new(
+            crate::workflow::WorkflowTool::new(
+                builder,
+                config_dir,
+                include_claude,
+                data_dir,
+                workflow_limits,
+                workflow_gate,
+            )
+            .with_events(event_tx.downgrade()),
         ));
     }
     let deps = build_deps(Arc::new(registry));

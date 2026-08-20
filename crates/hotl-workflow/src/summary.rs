@@ -108,8 +108,12 @@ impl Plan {
         );
         if serialised > 0 {
             line.push_str(&format!(
-                " (serialised: {serialised} mutating agent{} share the tree)",
-                if serialised == 1 { "" } else { "s" }
+                " (serialised: {serialised} mutating agent{} the tree)",
+                if serialised == 1 {
+                    " shares"
+                } else {
+                    "s share"
+                }
             ));
         }
         line

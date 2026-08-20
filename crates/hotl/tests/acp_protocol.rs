@@ -38,6 +38,7 @@ fn server_info() -> acp::ServerInfo {
     acp::ServerInfo {
         skills: Vec::new(),
         workflows: Vec::new(),
+        workflows_report: || json!({"runs": []}),
         default_mode: "ask".into(),
         default_plan: false,
         context_window: 200_000,
@@ -621,6 +622,63 @@ async fn initialize_advertises_skill_names_and_descriptions() {
     assert_eq!(
         init["result"]["workflows"],
         json!([{"name": "review-changes", "description": "review then verify"}])
+    );
+}
+
+/// `session/workflows` (0044): the `session/context` shape — ack on the id,
+/// `workflows_report` as a broadcast, and an error with no session open.
+#[tokio::test]
+async fn session_workflows_returns_an_ack_and_broadcasts_a_report() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/workflows"}),
+    )
+    .await;
+    let err = next(&mut lines).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires an open session"),
+        "{err}"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new","params":{}}),
+    )
+    .await;
+    next_matching(&mut lines, |m| m["id"] == json!(3)).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/workflows"}),
+    )
+    .await;
+    let ack = next_matching(&mut lines, |m| m["id"] == json!(4)).await;
+    assert_eq!(ack["result"], json!({"ok": true}));
+    let note = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "workflows_report"
+    })
+    .await;
+    assert!(
+        note["params"]["update"]["runs"].is_array(),
+        "runs is the list, empty in a fresh process: {note}"
     );
 }
 
@@ -1449,6 +1507,7 @@ async fn the_session_reports_its_effective_mode() {
         acp::ServerInfo {
             skills: Vec::new(),
             workflows: Vec::new(),
+            workflows_report: || json!({"runs": []}),
             default_mode: "auto".into(),
             default_plan: false,
             context_window: 1_000_000,
@@ -1907,6 +1966,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
             name: "review-changes".into(),
             description: "review then verify".into(),
         }],
+        workflows_report: || json!({"runs": []}),
         default_mode: "auto".into(),
         default_plan: false,
         context_window: 900_000,

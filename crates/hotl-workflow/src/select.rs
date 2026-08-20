@@ -29,7 +29,8 @@ pub enum SelectError {
 }
 
 /// Where a name may be looked up: the executor's scope, or a test map.
-pub trait Lookup {
+/// `Sync` so a `&dyn Lookup` can cross the executor's `Send` futures.
+pub trait Lookup: Sync {
     fn get(&self, root: &str) -> Option<&Value>;
 }
 

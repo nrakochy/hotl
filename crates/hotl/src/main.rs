@@ -50,6 +50,7 @@ mod tui;
 mod update;
 mod watch;
 mod wire;
+mod workflow;
 mod workflows_cli;
 
 /// The zsh `:` prefix: a line starting with `: ` becomes

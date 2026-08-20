@@ -163,11 +163,12 @@ fn tail_for(todos: &[Todo]) -> Arc<Vec<Arc<Item>>> {
     }
 }
 
-/// These two carry a whole roster inside `description()` (`skills.rs:470`,
-/// `agents.rs:470`), so `/context` bills them as rows of their own instead of
-/// burying a session's biggest schema line in the tool-schema total.
+/// These carry a whole roster (or, for `workflow`, the plan schema it
+/// teaches) inside `description()`/`schema()`, so `/context` bills them as
+/// rows of their own instead of burying a session's biggest schema line in
+/// the tool-schema total.
 const SKILLS_TOOL: &str = "skill";
-const AGENTS_TOOL: &str = "spawn";
+const AGENTS_TOOLS: [&str; 2] = ["spawn", "workflow"];
 
 /// A tool definition's share of the request: the three strings that go on the
 /// wire, under the same profile-less estimator every other call site uses.
@@ -185,7 +186,7 @@ fn tool_tokens(registry: &Registry) -> ToolTokens {
         let n = estimate_tool_def(&def);
         match def.name.as_str() {
             SKILLS_TOOL => out.skills += n,
-            AGENTS_TOOL => out.agents += n,
+            name if AGENTS_TOOLS.contains(&name) => out.agents += n,
             _ => out.schemas += n,
         }
     }

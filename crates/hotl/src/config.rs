@@ -38,9 +38,6 @@ pub struct Config {
     pub plugins: PluginsCfg,
     #[serde(default)]
     pub agents: AgentsCfg,
-    // Dead until the 0044 workflow tool reads it; `hotl` is bin-only, so `pub`
-    // confers no reachability. Drop the attribute when that call site lands.
-    #[allow(dead_code)]
     #[serde(default)]
     pub workflows: WorkflowsCfg,
     #[serde(default)]
@@ -247,7 +244,6 @@ impl AgentsCfg {
 /// `[workflows]` — the declarative runner's (0044) fan-out caps. Both are
 /// floors of one: a `0` would make every plan deadlock on admission.
 #[derive(Debug, Default, Deserialize)]
-#[allow(dead_code)] // see `Config::workflows`
 pub struct WorkflowsCfg {
     /// Steps one plan may run at once. Default: 8.
     pub concurrency: Option<usize>,
@@ -255,7 +251,6 @@ pub struct WorkflowsCfg {
     pub max_agents: Option<usize>,
 }
 
-#[allow(dead_code)] // see `Config::workflows`
 impl WorkflowsCfg {
     /// `(concurrency, max_agents)`, each clamped to at least 1 — silently,
     /// since config has no warnings pass for sections like this one.

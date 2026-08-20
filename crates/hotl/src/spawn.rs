@@ -307,9 +307,7 @@ impl SpawnTool {
 /// the same handle before draining again.
 pub(crate) struct Drained {
     pub(crate) outcome: Outcome,
-    // Read by the 0044 workflow tool; `spawn` ignores it. Drop the attribute
-    // when that call site lands.
-    #[allow(dead_code)]
+    /// Read by the workflow tool; `spawn` ignores it.
     pub(crate) usage: hotl_types::TokenUsage,
 }
 

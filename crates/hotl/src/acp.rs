@@ -239,6 +239,10 @@ pub struct WorkflowInfo {
 pub struct ServerInfo {
     pub skills: Vec<SkillInfo>,
     pub workflows: Vec<WorkflowInfo>,
+    /// The live `workflows_report` payload (`crate::workflow::report` in the
+    /// binary). A fn pointer, not a module path: this file is `#[path]`-
+    /// included by the protocol tests, which cannot reach the tool.
+    pub workflows_report: fn() -> Value,
     /// The configured permission mode a new session starts in, already run
     /// through `enforced_mode`. Clients render it; they never infer it.
     pub default_mode: String,
@@ -888,6 +892,19 @@ async fn handle_request(
                 }
                 None => reply_err(writer, id, "session/context: the session is gone").await,
             }
+        }
+        // Every workflow run this process has started (0044), live. The
+        // registry is process-wide, but the broadcast needs a session to ride
+        // on — the same guard and ack-then-broadcast shape as `session/context`.
+        "session/workflows" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "session/workflows requires an open session").await;
+            };
+            let sid = state.id.clone();
+            reply_ok(writer, id, json!({"ok": true})).await;
+            let mut payload = (info.workflows_report)();
+            payload["type"] = json!("workflows_report");
+            notify(writer, &sid, payload).await;
         }
         other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
     }

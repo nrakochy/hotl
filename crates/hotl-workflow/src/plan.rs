@@ -310,6 +310,67 @@ impl Plan {
     }
 }
 
+/// The JSON Schema for [`Plan`] the `workflow` tool embeds in its own input
+/// schema — what teaches the model the format. Hand-written to stay short;
+/// `fixture_validates_against_the_plan_schema` keeps it honest.
+pub fn json_schema() -> Value {
+    let agent = serde_json::json!({
+        "type": "object",
+        "required": ["label", "prompt"],
+        "additionalProperties": false,
+        "properties": {
+            "label": {"type": "string", "description": "Short name; may use {{item.x}} inside `each`."},
+            "prompt": {"type": "string", "description": "The brief. Templates: {{args.x}}, {{PhaseTitle}}, and inside `each`: {{item}}, {{prev}}."},
+            "schema": {"type": "object", "description": "JSON Schema the answer must satisfy (validated, retried twice). Without one the answer is a text string."},
+            "agent": {"type": "string", "description": "Agent def: general-purpose (default), explore or plan (read-only), or agents/*.md."},
+            "model": {"type": "string"},
+            "effort": {"type": "string", "enum": ["low", "medium", "high", "xhigh", "max"]},
+            "isolation": {"type": "string", "enum": ["none", "worktree"], "description": "worktree: own git checkout, merged back on success."},
+            "max_turns": {"type": "integer", "minimum": 1},
+            "votes": {"type": "integer", "minimum": 1, "description": "Run N identical agents; value becomes {accepted, votes} by majority on `accept`. Needs `schema`."},
+            "accept": {"type": "string", "description": "Field path in each vote whose truthiness is counted, e.g. isReal."}
+        }
+    });
+    serde_json::json!({
+        "type": "object",
+        "required": ["name", "phases"],
+        "additionalProperties": false,
+        "properties": {
+            "name": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*$"},
+            "description": {"type": "string"},
+            "concurrency": {"type": "integer", "minimum": 1, "description": "Lowers the configured width; never raises it."},
+            "max_agents": {"type": "integer", "minimum": 1},
+            "output": {"type": "string", "description": "Selector for the result, e.g. Verify[*].votes; default: the last phase's output."},
+            "phases": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "required": ["title"],
+                    "additionalProperties": false,
+                    "description": "Exactly one shape: `agents` (all at once); `each` + `stages` (a pipeline per selected item, no barrier); `until_quiet` + `agents` (rounds until nothing new).",
+                    "properties": {
+                        "title": {"type": "string", "description": "Identifier; later phases read this phase's output as {{Title}} / Title[*]."},
+                        "agents": {"type": "array", "items": agent},
+                        "each": {"type": "string", "description": "Selector over earlier outputs or args: Review[*].findings[*]"},
+                        "stages": {"type": "array", "items": agent},
+                        "until_quiet": {
+                            "type": "object",
+                            "required": ["key"],
+                            "additionalProperties": false,
+                            "properties": {
+                                "rounds": {"type": "integer", "minimum": 1, "default": 2, "description": "Quiet rounds before stopping."},
+                                "max_rounds": {"type": "integer", "minimum": 1, "default": 10},
+                                "key": {"type": "string", "description": "Comma-separated field paths that identify an element: file,line"}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 #[derive(Default)]
 struct Validator {
     out: Vec<PlanError>,
@@ -585,6 +646,15 @@ pub(crate) mod tests {
         assert!(errs
             .iter()
             .any(|e| e.contains("`max_turns` must be at least 1")));
+    }
+
+    #[test]
+    fn fixture_validates_against_the_plan_schema() {
+        let schema = jsonschema::validator_for(&json_schema()).unwrap();
+        let plan = serde_json::to_value(fixture()).unwrap();
+        let errors: Vec<String> = schema.iter_errors(&plan).map(|e| e.to_string()).collect();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!schema.is_valid(&json!({"name": "x", "phases": [{"title": "A", "agnets": []}]})));
     }
 
     #[test]

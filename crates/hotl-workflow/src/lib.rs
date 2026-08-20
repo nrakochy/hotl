@@ -17,5 +17,7 @@ pub use exec::{
     run_plan, AgentReply, AgentRequest, AgentRunner, AgentStatus, Limits, Observer, Run, RunError,
     RunOutcome, RunStatus, RunSummary, Silent,
 };
-pub use plan::{AgentSpec, Effort, Isolation, Phase, Plan, PlanError, Severity, Shape};
+pub use plan::{
+    json_schema, AgentSpec, Effort, Isolation, Phase, Plan, PlanError, Severity, Shape,
+};
 pub use summary::Estimate;
