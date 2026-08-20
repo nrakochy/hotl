@@ -6,6 +6,35 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **`workflow`: many sub-agents from one declarative plan** (plan 0044,
+  hotl's answer to `/workflows`). The model hands hotl a plan — phases of
+  agents run all at once, a pipeline per selected item with no barrier
+  between stages, majority `votes`, and `until_quiet` rounds that stop when
+  nothing new turns up — or names a saved recipe from
+  `~/.config/hotl/workflows/*.toml`, and hotl runs it: bounded by a
+  process-wide `[workflows] concurrency` gate (default 8) that a plan can
+  lower but never raise, capped at `max_agents` (default 1000, a run error
+  rather than a silent truncation), every schema-shaped answer validated
+  with two retries, and every agent a `spawn`-shaped child (asks
+  default-deny, no `spawn`/`workflow`/MCP in its registry, mutating agents
+  serialised on the shared-tree lock unless `isolation = "worktree"`). One
+  ask covers the whole run and names its phases and an upper bound on agent
+  count; `[[allow]] tool = "workflow"` can whitelist a saved name only. The
+  run is one row in the agent band, its agents in the drill-in with token
+  counts; `/workflows` lists every run this process started with per-phase
+  progress; `/<recipe> [args]` invokes a saved one (after built-ins and
+  skills). The result comes back as JSON inside
+  `<workflow-result trust="untrusted">`, cut at 64 KiB in context with the
+  full JSON at `~/.local/share/hotl/workflows/<run_id>/`. `hotl workflows
+  list | show <name> [--mermaid] | check <file>` inspects recipes from the
+  shell; `--mermaid` draws a plan as a flowchart. The plan is data, not
+  code — no script engine, so `cargo install hotl` stays pure Rust. Agent
+  defs gained a `max_turns:` field along the way, and `child_tool` done
+  frames now carry the child's `tokens`. New crate `hotl-workflow` holds
+  the runner; see the new [workflows guide](site/src/content/docs/workflows.md).
+
 ### Changed
 
 - **Sub-agent navigation moved into the agent band, and finished spawns
