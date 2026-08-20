@@ -20,7 +20,7 @@
 //! - responses map back to canonical blocks (tool_calls → `tool_use` blocks),
 //!   so a session can cross dialects mid-conversation in either direction.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::stream::BoxStream;
@@ -84,6 +84,10 @@ pub struct OpenAiCompatProvider {
     /// in-flight warm request — see the twin field in
     /// `hotl-provider-anthropic` for the full rationale.
     armed: Arc<AtomicU64>,
+    /// `None` = decide by model name (`openai_cache::breakpoints_supported`).
+    cache_breakpoints: Option<bool>,
+    /// Latched by the 0046 probe: the endpoint 400'd on a cache field once.
+    breakpoints_rejected: Arc<AtomicBool>,
 }
 
 impl OpenAiCompatProvider {
@@ -96,6 +100,8 @@ impl OpenAiCompatProvider {
             stream_idle_timeout: hotl_provider::timeouts::STREAM_IDLE,
             legacy_max_tokens: false,
             armed: Arc::new(AtomicU64::new(0)),
+            cache_breakpoints: None,
+            breakpoints_rejected: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -127,35 +133,56 @@ impl OpenAiCompatProvider {
         self
     }
 
-    /// The default spelling. `stream()` calls [`Self::body_for`] directly
-    /// because it may re-render the body mid-loop after the legacy probe.
+    /// Force GPT-5.6 explicit cache breakpoints on or off, overriding the
+    /// model-name gate (a gateway alias that hides the version, or an
+    /// endpoint known to reject `prompt_cache_options`).
+    pub fn cache_breakpoints(mut self, on: bool) -> Self {
+        self.cache_breakpoints = Some(on);
+        self
+    }
+
+    /// The three-term decision `stream()` renders under: the policy asks for
+    /// markers, the probe has not latched, and the override or the name gate
+    /// says the model takes them.
+    pub fn wants_explicit(&self, req: &SamplingRequest) -> bool {
+        req.cache.marks_breakpoints()
+            && !self.breakpoints_rejected.load(Ordering::Relaxed)
+            && self
+                .cache_breakpoints
+                .unwrap_or_else(|| hotl_provider::openai_cache::breakpoints_supported(&req.model))
+    }
+
+    /// The default spelling, no cache fields. `stream()` calls
+    /// [`Self::body_for`] directly because it may re-render the body
+    /// mid-loop after either probe.
     #[cfg(test)]
     fn build_body(req: &SamplingRequest) -> Value {
-        Self::body_for(req, false)
+        Self::body_for(req, false, false)
     }
 
     /// `legacy` sends the pre-2024 `max_tokens` spelling. Older
     /// OpenAI-compatible servers (llama.cpp, older vLLM/Ollama) reject
     /// `max_completion_tokens` with a 400, and this crate advertises them.
-    fn body_for(req: &SamplingRequest, legacy: bool) -> Value {
+    /// `explicit` is the 0046 GPT-5.6 cache mode; the caller decides it
+    /// (model gate, policy, probe latch), the renderer only obeys.
+    fn body_for(req: &SamplingRequest, legacy: bool, explicit: bool) -> Value {
         // Derived once per request from static catalog data. The compat
         // family is uncatalogued, so this fails open (images always sent) —
         // a non-vision server answers with its own 400, surfaced honestly.
         let send_images = hotl_provider::catalog::supports_images(&req.model);
         let mut messages = Vec::new();
+        // The system message carries no marker: it cannot (top-level
+        // instructions are not markable) and the first user marker covers it.
         if !req.system.is_empty() {
             messages.push(json!({"role": "system", "content": req.system.as_ref()}));
         }
         for item in req.items.iter() {
-            convert_item(item, &mut messages, send_images);
+            convert_item(item, &mut messages, send_images, explicit);
         }
-        // The ephemeral suffix keeps its wire position in this dialect too:
-        // after every durable message, before MOIM. There is no marker to be
-        // after here — caching is implicit — but the ordering is what the
-        // engine's byte-identity claim is made over, so it is not this crate's
-        // to reorder.
+        // Tail and MOIM ride after the last marker: under GPT-5.6's rules a
+        // marker on either would rewrite the whole prefix every sample (0046).
         for item in req.ephemeral_tail.iter() {
-            convert_item(item, &mut messages, send_images);
+            convert_item(item, &mut messages, send_images, false);
         }
         if let Some(tc) = &req.turn_context {
             messages.push(json!({"role": "user", "content": tc}));
@@ -179,9 +206,13 @@ impl OpenAiCompatProvider {
         if let Some(key) = &req.cache_key {
             body["prompt_cache_key"] = json!(key.as_ref());
         }
-        // `cache` stays an Anthropic-surface knob: caching is implicit here and
-        // this dialect emits no breakpoints under ANY `CachePolicy`. Depth does
-        // not — Chat Completions carries a flattened top-level
+        // `Static` → explicit-only mode with a marker on every durable
+        // user-role message when the model (or the override) says GPT-5.6+;
+        // `Off` → no cache fields at all, byte-identical to the implicit wire.
+        if explicit {
+            body["prompt_cache_options"] = hotl_provider::openai_cache::options();
+        }
+        // Depth: Chat Completions carries a flattened top-level
         // `reasoning_effort`, and `thinking: false` has an exact spelling here
         // (`none`) that the Anthropic dialect has no equivalent for.
         //
@@ -272,34 +303,47 @@ fn tool_json(t: &ToolDef) -> Value {
     json!({"type": "function", "function": {"name": t.name, "description": t.description, "parameters": t.input_schema}})
 }
 
-fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool) {
+/// `mark`: put a GPT-5.6 explicit breakpoint on this item's last content
+/// part. Only the durable loop ever passes `true`, so a marker on ephemeral
+/// content is unrepresentable here, as on Anthropic.
+fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool, mark: bool) {
     match item {
         Item::System { .. } | Item::Unknown => {}
-        // INVARIANT: an imageless user item stays `"content": <plain string>`
-        // — byte-identical to the pre-image wire. Some OpenAI-compat servers
-        // reject the array content form, so it appears only when images ride.
-        // Image parts precede the text part, matching the Anthropic dialect:
-        // one provider-neutral ordering rule.
+        // INVARIANT: an unmarked imageless user item stays `"content": <plain
+        // string>` — byte-identical to the pre-image wire. Some OpenAI-compat
+        // servers reject the array content form, so it appears only when
+        // images ride or a marker needs a part to sit on. Image parts precede
+        // the text part, matching the Anthropic dialect: one provider-neutral
+        // ordering rule.
         Item::User { text, images, .. } => {
-            if send_images && !images.is_empty() {
-                let mut parts: Vec<Value> = images
-                    .iter()
-                    .map(|img| {
-                        json!({
-                            "type": "image_url",
-                            "image_url": {
-                                "url": format!("data:{};base64,{}", img.media_type, img.data)
-                            }
-                        })
-                    })
-                    .collect();
-                parts.push(json!({"type": "text", "text": text}));
-                out.push(json!({"role": "user", "content": parts}));
-            } else {
+            let with_images = send_images && !images.is_empty();
+            if !with_images && !mark {
                 let rendered =
                     hotl_provider::transform::text_with_omitted_images(text, images.len());
                 out.push(json!({"role": "user", "content": rendered.as_ref()}));
+                return;
             }
+            let mut parts: Vec<Value> = Vec::new();
+            let mut text_part = if with_images {
+                parts.extend(images.iter().map(|img| {
+                    json!({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": format!("data:{};base64,{}", img.media_type, img.data)
+                        }
+                    })
+                }));
+                json!({"type": "text", "text": text})
+            } else {
+                let rendered =
+                    hotl_provider::transform::text_with_omitted_images(text, images.len());
+                json!({"type": "text", "text": rendered.as_ref()})
+            };
+            if mark {
+                text_part["prompt_cache_breakpoint"] = hotl_provider::openai_cache::breakpoint();
+            }
+            parts.push(text_part);
+            out.push(json!({"role": "user", "content": parts}));
         }
         Item::Assistant { blocks } => {
             // Named canonicalization stage: provider-bound reasoning from a
@@ -333,11 +377,23 @@ fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool) {
             out.push(msg);
         }
         Item::ToolResults { results } => {
-            for r in results {
+            let last = results.len().saturating_sub(1);
+            for (i, r) in results.iter().enumerate() {
                 let content = if r.is_error && !r.content.starts_with(TOOL_ERROR_PREFIX) {
                     format!("{TOOL_ERROR_PREFIX}{}", r.content)
                 } else {
                     r.content.clone()
+                };
+                // One marker per item, on the last result: a parallel batch
+                // of K results can never exhaust the four write slots.
+                let content = if mark && i == last {
+                    json!([{
+                        "type": "text",
+                        "text": content,
+                        "prompt_cache_breakpoint": hotl_provider::openai_cache::breakpoint(),
+                    }])
+                } else {
+                    Value::String(content)
                 };
                 out.push(json!({
                     "role": "tool",
@@ -378,15 +434,22 @@ impl SseAssembler for Assembler {
             .map_err(|e| ProviderError::Parse(format!("bad SSE json: {e}")))?;
         let mut out = Vec::new();
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            // OpenAI counts cached tokens INSIDE `prompt_tokens`; `TokenUsage`
-            // counts them outside it (Anthropic semantics), so carve them out.
+            // OpenAI counts cached and written tokens INSIDE `prompt_tokens`;
+            // `TokenUsage` counts both outside it (Anthropic semantics).
             let cached = u
                 .pointer("/prompt_tokens_details/cached_tokens")
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let written = u
+                .pointer("/prompt_tokens_details/cache_write_tokens")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             if let Some(n) = u.get("prompt_tokens").and_then(Value::as_u64) {
-                self.usage.input_tokens = n.saturating_sub(cached);
-                self.usage.cache_read_input_tokens = cached;
+                let (input, read, creation) =
+                    hotl_provider::openai_cache::carve_usage(n, cached, written);
+                self.usage.input_tokens = input;
+                self.usage.cache_read_input_tokens = read;
+                self.usage.cache_creation_input_tokens = creation;
             }
             if let Some(n) = u.get("completion_tokens").and_then(Value::as_u64) {
                 self.usage.output_tokens = n;
@@ -629,7 +692,9 @@ impl Provider for OpenAiCompatProvider {
         let headers_timeout = self.headers_timeout;
         let stream_idle_timeout = self.stream_idle_timeout;
         let mut legacy = self.legacy_max_tokens;
-        let mut body = Self::body_for(&req, legacy);
+        let explicit = self.wants_explicit(&req);
+        let mut body = Self::body_for(&req, legacy, explicit);
+        let rejected = Arc::clone(&self.breakpoints_rejected);
 
         Box::pin(async_stream::stream! {
             // INVARIANT (T2-16): `attempt` counts network/HTTP attempts only.
@@ -697,11 +762,28 @@ impl Provider for OpenAiCompatProvider {
                     Attempt::Fail(e) if !legacy && rejects_max_completion_tokens(&e) => {
                         // A capability probe, not a failure: no retry slot.
                         legacy = true;
-                        body = Self::body_for(&req, true);
+                        body = Self::body_for(&req, true, explicit && !rejected.load(Ordering::Relaxed));
                         yield Ok(StreamEvent::Retrying {
                             attempt,
                             reason: "endpoint predates max_completion_tokens — \
                                      retrying with max_tokens".into(),
+                        });
+                    }
+                    // The two probes are independent: a server may fail one,
+                    // both, or neither; each flips only its own flag.
+                    Attempt::Fail(e)
+                        if explicit
+                            && !rejected.load(Ordering::Relaxed)
+                            && hotl_provider::openai_cache::rejects_breakpoints(&e) =>
+                    {
+                        // A capability probe, not a failure: no retry slot,
+                        // latched per provider.
+                        rejected.store(true, Ordering::Relaxed);
+                        body = Self::body_for(&req, legacy, false);
+                        yield Ok(StreamEvent::Retrying {
+                            attempt,
+                            reason: "endpoint rejects prompt-cache breakpoints — retrying \
+                                     without; caching falls back to implicit".into(),
                         });
                     }
                     Attempt::Fail(e) => {
@@ -1367,7 +1449,7 @@ mod tests {
     /// The explicit opt-in skips the probe entirely.
     #[test]
     fn legacy_max_tokens_uses_the_old_spelling_from_the_start() {
-        let body = OpenAiCompatProvider::body_for(&sampling_req(), true);
+        let body = OpenAiCompatProvider::body_for(&sampling_req(), true, false);
         assert_eq!(body["max_tokens"], 16);
         assert!(body.get("max_completion_tokens").is_none());
     }
@@ -1398,11 +1480,279 @@ mod tests {
     fn the_session_cache_key_rides_prompt_cache_key() {
         let mut req = sampling_req();
         req.cache_key = Some("01J0SESSIONULID".into());
-        let body = OpenAiCompatProvider::body_for(&req, false);
+        let body = OpenAiCompatProvider::body_for(&req, false, false);
         assert_eq!(body["prompt_cache_key"], "01J0SESSIONULID");
         req.cache_key = None;
-        let body = OpenAiCompatProvider::body_for(&req, false);
+        let body = OpenAiCompatProvider::body_for(&req, false, false);
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    fn user(text: &str) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: None,
+            images: Vec::new(),
+        }
+    }
+
+    fn todos(text: &str) -> Item {
+        Item::User {
+            text: text.into(),
+            synthetic: Some(hotl_types::SyntheticReason::Todos),
+            images: Vec::new(),
+        }
+    }
+
+    fn tool_use(id: &str) -> Item {
+        Item::Assistant {
+            blocks: vec![json!({"type": "tool_use", "id": id, "name": "read", "input": {}})],
+        }
+    }
+
+    fn results(ids: &[&str]) -> Item {
+        Item::ToolResults {
+            results: ids
+                .iter()
+                .map(|id| ToolResultItem {
+                    tool_use_id: (*id).into(),
+                    content: format!("out-{id}"),
+                    is_error: false,
+                })
+                .collect(),
+        }
+    }
+
+    /// The 0046 fixture: a system message, durable history with one parallel
+    /// batch, a todos tail and a MOIM.
+    fn static_req() -> SamplingRequest {
+        let mut req = sampling_req();
+        req.model = "gpt-5.6-luna-1".into();
+        req.system = "sys".into();
+        req.cache = hotl_provider::CachePolicy::Static {
+            prefix_ttl: hotl_provider::CacheTtl::FiveMinutes,
+        };
+        req.cache_key = Some("01J0SESSIONULID".into());
+        req.items = hotl_provider::arc_items(vec![
+            user("hi"),
+            tool_use("a"),
+            results(&["a1", "a2"]),
+            Item::Assistant {
+                blocks: vec![json!({"type": "text", "text": "done"})],
+            },
+            user("more"),
+        ]);
+        req.ephemeral_tail = hotl_provider::arc_items(vec![todos("<todos>\n[~] a\n</todos>")]);
+        req.turn_context = Some("<turn-context now_unix_ms=\"1\"/>".into());
+        req
+    }
+
+    fn markers_in(v: &Value) -> usize {
+        v.to_string().matches("\"prompt_cache_breakpoint\"").count()
+    }
+
+    /// D1/D2 on the chat wire: explicit-only mode, one marker on the last
+    /// part of every durable user-role message, nothing on the system
+    /// message, the tail or the MOIM.
+    #[test]
+    fn explicit_mode_marks_every_durable_user_role_message_and_nothing_ephemeral() {
+        let body = OpenAiCompatProvider::body_for(&static_req(), false, true);
+        assert_eq!(body["prompt_cache_options"], json!({"mode": "explicit"}));
+        assert_eq!(body["prompt_cache_key"], "01J0SESSIONULID");
+        let msgs = body["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 9, "{msgs:#?}");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "sys");
+        assert_eq!(msgs[1]["content"][0]["type"], "text");
+        assert_eq!(msgs[1]["content"][0]["text"], "hi");
+        assert_eq!(
+            msgs[1]["content"][0]["prompt_cache_breakpoint"],
+            json!({"mode": "explicit"})
+        );
+        // The batch: a1 stays a plain string, a2 (the last) carries the marker.
+        assert_eq!(msgs[3]["role"], "tool");
+        assert_eq!(msgs[3]["content"], "out-a1");
+        assert_eq!(msgs[4]["tool_call_id"], "a2");
+        assert_eq!(msgs[4]["content"][0]["type"], "text");
+        assert_eq!(msgs[4]["content"][0]["text"], "out-a2");
+        assert_eq!(markers_in(&msgs[4]), 1);
+        assert_eq!(msgs[6]["content"][0]["text"], "more");
+        assert_eq!(markers_in(&msgs[6]), 1);
+        assert_eq!(msgs[7]["content"], "<todos>\n[~] a\n</todos>");
+        assert_eq!(msgs[8]["content"], "<turn-context now_unix_ms=\"1\"/>");
+        assert_eq!(
+            markers_in(&msgs[0]) + markers_in(&msgs[7]) + markers_in(&msgs[8]),
+            0
+        );
+        assert_eq!(markers_in(&body), 3);
+    }
+
+    /// D2: with explicit mode off, the body is today's wire byte for byte.
+    #[test]
+    fn a_pre_5_6_model_keeps_the_implicit_wire_byte_for_byte() {
+        let mut req = static_req();
+        req.model = "gpt-5.5".into();
+        let body = OpenAiCompatProvider::body_for(&req, false, false);
+        let expected = json!({
+            "model": "gpt-5.5",
+            "stream": true,
+            "stream_options": {"include_usage": true},
+            "max_completion_tokens": 16,
+            "prompt_cache_key": "01J0SESSIONULID",
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "a", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "a1", "content": "out-a1"},
+                {"role": "tool", "tool_call_id": "a2", "content": "out-a2"},
+                {"role": "assistant", "content": "done"},
+                {"role": "user", "content": "more"},
+                {"role": "user", "content": "<todos>\n[~] a\n</todos>"},
+                {"role": "user", "content": "<turn-context now_unix_ms=\"1\"/>"},
+            ],
+        });
+        assert_eq!(body.to_string(), expected.to_string());
+        assert!(!body.to_string().contains("prompt_cache_breakpoint"));
+        assert!(body.get("prompt_cache_options").is_none());
+    }
+
+    /// D1: placement is append-stable across samples, markers included.
+    #[test]
+    fn consecutive_samples_keep_every_earlier_marker_in_place() {
+        let req_n = static_req();
+        let mut req_n1 = static_req();
+        let mut items: Vec<Item> = req_n.items.iter().map(|i| (**i).clone()).collect();
+        items.push(tool_use("b"));
+        items.push(results(&["b1"]));
+        req_n1.items = hotl_provider::arc_items(items);
+        req_n1.ephemeral_tail = hotl_provider::arc_items(vec![todos("<todos>\n[x] a\n</todos>")]);
+        req_n1.turn_context = Some("<turn-context now_unix_ms=\"2\"/>".into());
+
+        let msgs_n = OpenAiCompatProvider::body_for(&req_n, false, true)["messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let msgs_n1 = OpenAiCompatProvider::body_for(&req_n1, false, true)["messages"]
+            .as_array()
+            .unwrap()
+            .clone();
+        let marked = |msgs: &[Value]| -> Vec<usize> {
+            msgs.iter()
+                .enumerate()
+                .filter(|(_, v)| markers_in(v) > 0)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let (m_n, m_n1) = (marked(&msgs_n), marked(&msgs_n1));
+        assert_eq!(m_n, vec![1, 4, 6]);
+        assert!(
+            m_n1.starts_with(&m_n),
+            "{m_n:?} is not a prefix of {m_n1:?}"
+        );
+        assert_eq!(m_n1, vec![1, 4, 6, 8]);
+        // system + 5 items rendering as 6 messages = the durable prefix of N.
+        let n = 1 + req_n.items.len() + 1;
+        assert_eq!(msgs_n[..n], msgs_n1[..n]);
+    }
+
+    /// D3: the override beats the name gate in both directions; the policy
+    /// beats both.
+    #[test]
+    fn the_override_and_the_policy_gate_the_markers() {
+        let key: Arc<dyn KeySource> = Arc::new(hotl_provider::key::StaticKey(None));
+        let p = |b: String| OpenAiCompatProvider::new(b, key.clone());
+        let with_model = |m: &str| {
+            let mut req = static_req();
+            req.model = m.into();
+            req
+        };
+        assert!(p("b".into())
+            .cache_breakpoints(true)
+            .wants_explicit(&with_model("sol-fast")));
+        assert!(!p("b".into())
+            .cache_breakpoints(false)
+            .wants_explicit(&with_model("gpt-5.6")));
+        let mut off = with_model("gpt-5.6");
+        off.cache = hotl_provider::CachePolicy::Off;
+        assert!(!p("b".into()).wants_explicit(&off));
+        assert!(!p("b".into()).wants_explicit(&with_model("gpt-5.5")));
+        assert!(p("b".into()).wants_explicit(&with_model("gpt-5.6-luna-1")));
+    }
+
+    /// D5: `cache_write_tokens` is a cache write, not input.
+    #[test]
+    fn cache_write_tokens_land_in_cache_creation_and_leave_input() {
+        let mut a = Assembler::default();
+        a.handle(r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#)
+            .unwrap();
+        a.handle(
+            r#"{"choices":[],"usage":{"prompt_tokens":2600,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":2000,"cache_write_tokens":400}}}"#,
+        )
+        .unwrap();
+        let StreamEvent::Completed { usage, .. } = a.finish().unwrap() else {
+            panic!("wrong terminal")
+        };
+        assert_eq!(usage.input_tokens, 200);
+        assert_eq!(usage.cache_read_input_tokens, 2000);
+        assert_eq!(usage.cache_creation_input_tokens, 400);
+        assert_eq!(usage.hit_ratio(), Some(2000.0 / 2600.0));
+    }
+
+    /// D4 on the chat wire, with both probes firing on one stream: the
+    /// breakpoint 400 re-sends without cache fields, the legacy 400 then
+    /// re-sends with `max_tokens` — each flips only its own flag — and the
+    /// breakpoint latch survives into the next `stream()`.
+    ///
+    /// The request-level `prompt_cache_options` for Chat Completions is
+    /// documented in the prompt-caching guide, but the API reference's
+    /// request section did not render in the 2026-08-20 scrape; the live
+    /// check confirms the chat twin, and this probe is the safety net.
+    #[tokio::test]
+    async fn a_rejected_breakpoint_probes_once_then_latches_independently_of_legacy() {
+        const REJECT_400: &str = "HTTP/1.1 400 Bad Request\r\ncontent-type: application/json\r\ncontent-length: 97\r\nconnection: close\r\n\r\n{\"error\":{\"message\":\"Unknown parameter: 'prompt_cache_options'.\",\"type\":\"invalid_request_error\"}}";
+        assert_eq!(REJECT_400.split("\r\n\r\n").nth(1).unwrap().len(), 97);
+        let has_cache_fields =
+            |b: &str| b.contains("prompt_cache_options") || b.contains("prompt_cache_breakpoint");
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double_bodies(
+            vec![REJECT_400, UNKNOWN_PARAM_400, SSE_OK, SSE_OK],
+            seen.clone(),
+        )
+        .await;
+        let p = OpenAiCompatProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        assert!(p.wants_explicit(&static_req()));
+
+        let events: Vec<_> = p.stream(static_req()).collect::<Vec<_>>().await;
+        let oks: Vec<_> = events.into_iter().map(|e| e.expect("no error")).collect();
+        assert!(
+            matches!(&oks[0], StreamEvent::Retrying { reason, .. }
+                if reason.contains("prompt-cache breakpoints")),
+            "{oks:?}"
+        );
+        assert!(
+            matches!(&oks[1], StreamEvent::Retrying { reason, .. }
+                if reason.contains("max_completion_tokens")),
+            "{oks:?}"
+        );
+        assert!(matches!(oks[2], StreamEvent::Started));
+        {
+            let bodies = seen.lock().unwrap();
+            assert_eq!(bodies.len(), 3);
+            assert!(has_cache_fields(&bodies[0]) && bodies[0].contains("max_completion_tokens"));
+            assert!(!has_cache_fields(&bodies[1]) && bodies[1].contains("max_completion_tokens"));
+            assert!(!has_cache_fields(&bodies[2]) && bodies[2].contains("\"max_tokens\""));
+            assert!(bodies[2].contains("\"prompt_cache_key\""), "{}", bodies[2]);
+        }
+
+        // Latched: the second call never probes breakpoints again (the legacy
+        // probe is a per-call local and fires again — tracker follow-up).
+        assert!(!p.wants_explicit(&static_req()));
+        let events: Vec<_> = p.stream(static_req()).collect::<Vec<_>>().await;
+        assert!(matches!(events[0], Ok(StreamEvent::Started)), "{events:?}");
+        let bodies = seen.lock().unwrap();
+        assert_eq!(bodies.len(), 4);
+        assert!(!has_cache_fields(&bodies[3]), "{}", bodies[3]);
     }
 
     /// OpenAI's `prompt_tokens` includes `cached_tokens`; `TokenUsage` counts
@@ -1577,6 +1927,7 @@ mod tests {
                 }],
             },
             &mut out,
+            false,
             false,
         );
         let content = out[0]["content"].as_str().unwrap();
