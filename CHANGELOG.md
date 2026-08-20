@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-08-20
+
 ### Fixed
 
 - **OpenAI prompt caching on GPT-5.6: explicit cache breakpoints, so the
