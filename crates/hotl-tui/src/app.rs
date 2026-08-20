@@ -342,6 +342,9 @@ pub struct SessionUsage {
     pub input: u64,
     pub output: u64,
     pub cache_read: u64,
+    /// Cache writes, cumulative. The signal a write-heavy, read-poor session
+    /// shows (GPT-5.6 bills writes at 1.25×; Anthropic likewise) — 0046.
+    pub cache_written: u64,
     /// Last completed turn's split, for the /cost hit-rate line — a cold
     /// cache mid-session is the biggest latency bug we can have and the
     /// cumulative counter hides it. Overwritten, never accumulated.
@@ -360,6 +363,7 @@ impl SessionUsage {
         self.input += n("input_tokens");
         self.output += n("output_tokens");
         self.cache_read += n("cache_read_input_tokens");
+        self.cache_written += n("cache_creation_input_tokens");
         self.last_input = n("input_tokens") + n("cache_creation_input_tokens");
         self.last_cache_read = n("cache_read_input_tokens");
         if let Some(c) = usage.get("cost_usd").and_then(Value::as_f64) {
@@ -1622,6 +1626,10 @@ fn format_usage(state: &State, usage: &Value, live: u64) -> String {
     if u.cache_read > 0 {
         parts.push(format!("{} cached", tok(u.cache_read)));
     }
+    // Strip width is scarce: writes show only once there are some.
+    if u.cache_written > 0 {
+        parts.push(format!("{} written", tok(u.cache_written)));
+    }
     // Per-turn, not accumulated (a session-wide average would blur a cold
     // first turn into a warm tenth one) — present only when this turn had
     // cache activity to report (§S1 cache telemetry).
@@ -2280,10 +2288,11 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         "cost" => {
             let u = state.session_usage;
             let mut text = format!(
-                "session: {} in · {} out · {} cached",
+                "session: {} in · {} out · {} cached · {} written",
                 tok(u.input),
                 tok(u.output),
-                tok(u.cache_read)
+                tok(u.cache_read),
+                tok(u.cache_written)
             );
             // Recent, not averaged: a session-wide ratio would blur a cold
             // cache mid-session into the warm turns before it (0032).
@@ -2996,6 +3005,44 @@ mod tests {
         slash(&mut s, "cost");
         let text = last_notice(&s);
         assert!(text.contains("cache 90% last turn"), "{text}");
+    }
+
+    /// Cache writes accumulate like reads and surface on `/cost` always and
+    /// on the strip only once nonzero (0046 D6).
+    #[test]
+    fn cache_writes_accumulate_and_show_once_nonzero() {
+        let mut s = State::test_default();
+        s.context_window = 200_000;
+        let usage = |i, c, w| {
+            json!({
+                "input_tokens": i, "output_tokens": 1,
+                "cache_read_input_tokens": c, "cache_creation_input_tokens": w
+            })
+        };
+        on_result(&mut s, "done", None, &usage(100, 50, 0));
+        let line = s.usage_line.clone().unwrap();
+        assert!(
+            !line.contains("written"),
+            "zero writes stay off the strip: {line}"
+        );
+        slash(&mut s, "cost");
+        assert!(
+            last_notice(&s).contains("· 0 written"),
+            "{}",
+            last_notice(&s)
+        );
+
+        on_result(&mut s, "done", None, &usage(100, 50, 700));
+        on_result(&mut s, "done", None, &usage(100, 50, 500));
+        assert_eq!(s.session_usage.cache_written, 1_200);
+        let line = s.usage_line.clone().unwrap();
+        assert!(line.contains("1.2k written"), "{line}");
+        slash(&mut s, "cost");
+        assert!(
+            last_notice(&s).contains("1.2k written"),
+            "{}",
+            last_notice(&s)
+        );
     }
 
     #[test]
