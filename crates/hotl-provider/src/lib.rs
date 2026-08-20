@@ -1259,6 +1259,7 @@ pub mod api_error;
 pub mod catalog;
 pub mod effort;
 pub mod key;
+pub mod openai_cache;
 
 pub use effort::{Effort, EffortLadder, ALL_EFFORTS};
 
