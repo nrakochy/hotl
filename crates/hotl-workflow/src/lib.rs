@@ -3,13 +3,16 @@
 //! bounded concurrency by an `AgentRunner` the host supplies. Pure: no
 //! engine or tool deps, so the executor is tested with a fake runner.
 
+pub mod discover;
 pub mod exec;
+pub mod mermaid;
 pub mod plan;
 pub mod select;
 pub mod structured;
 pub mod summary;
 pub mod template;
 
+pub use discover::{discover, Found};
 pub use exec::{
     run_plan, AgentReply, AgentRequest, AgentRunner, AgentStatus, Limits, Observer, Run, RunError,
     RunOutcome, RunStatus, RunSummary, Silent,
