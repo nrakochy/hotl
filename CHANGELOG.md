@@ -6,6 +6,41 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **OpenAI prompt caching on GPT-5.6: explicit cache breakpoints, so the
+  prefix is read instead of rewritten every sample** (plan 0046; the routing
+  half was 0045). GPT-5.6 and later cache only at *breakpoints*, place an
+  implicit one at the latest user or tool message, no longer fall back to the
+  longest matching unmarked prefix, and bill cache writes at 1.25× the input
+  rate. hotl ends every request with a per-sample user message (the
+  `<turn-context>` block, preceded by the todo reminder), so on GPT-5.6 the
+  implicit breakpoint always landed on bytes the cache had never seen: zero
+  reads, and the whole history written again at 1.25× on every sample — which
+  is what a `163k in · 33k cached · 17% hit` strip at 18% context was
+  showing, *with* `prompt_cache_key` already on the wire. Both OpenAI dialects
+  now send `prompt_cache_options: {mode: "explicit"}` and put a
+  `prompt_cache_breakpoint` on the last content block of every durable user
+  message and on the last result of every tool-result batch; the todo
+  reminder and turn context ride after the last marker, where they can change
+  freely. Placement is append-stable by construction (a marker is only ever
+  decided while walking the durable items), so sample N+1 re-presents sample
+  N's newest marker over the same bytes and the read hits before any write.
+  The markers are gated on the model name (`gpt-5.6`, `gpt-5.7-mini`,
+  `gpt-6`, a `gpt-5.6-sol` gateway alias — anything at or past 5.6; unknown
+  names fail closed to today's implicit wire), overridable either way with
+  `[provider] cache_breakpoints = true | false`, and guarded by a one-shot
+  probe: an endpoint that 400s on a prompt-cache field gets the same sample
+  re-sent without the fields behind a `Retrying` notice, and the provider
+  stays on the implicit wire for the rest of the session. Pre-5.6 models,
+  OpenAI-compatible servers and `CachePolicy::Off` bodies are byte-identical
+  to before. Separately, OpenAI's `cache_write_tokens` now lands in
+  `cache_creation_input_tokens` and is carved out of the input figure like
+  `cached_tokens` already was, so `hit` stops hiding the writes inside `in`;
+  `/cost` prints a `written` total and the strip shows one once it is
+  nonzero — the figure OpenAI's own troubleshooting says to watch, and just as
+  telling on a write-heavy Anthropic session.
+
 ## [0.23.0] - 2026-08-20
 
 ### Fixed
