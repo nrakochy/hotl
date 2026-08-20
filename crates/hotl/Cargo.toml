@@ -73,6 +73,7 @@ hotl-store = { path = "../hotl-store", version = "0.21.0" }
 hotl-context = { path = "../hotl-context", version = "0.21.0" }
 hotl-engine = { path = "../hotl-engine", version = "0.21.0", default-features = false }
 hotl-tui = { path = "../hotl-tui", version = "0.21.0", default-features = false }
+hotl-workflow = { path = "../hotl-workflow", version = "0.21.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }

@@ -50,6 +50,7 @@ mod tui;
 mod update;
 mod watch;
 mod wire;
+mod workflows_cli;
 
 /// The zsh `:` prefix: a line starting with `: ` becomes
 /// an agent prompt; everything else runs as normal shell.
@@ -111,6 +112,7 @@ fn main() {
         Some("mcp") => std::process::exit(mcp_cli::mcp_main(&args)),
         Some("plugins") => std::process::exit(plugins_cli::plugins_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
+        Some("workflows") => std::process::exit(workflows_cli::workflows_main(&args)),
         Some("update") => std::process::exit(block_on(update::update_main(&args, &version_line()))),
         Some("init") => {
             // Binary-generated shell integration (the `:` prefix).
@@ -161,6 +163,7 @@ fn print_help() {
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
          hotl mcp             list MCP servers and trust state; show/add/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
+         hotl workflows       list saved workflows; show <name> [--mermaid]; check <file>\n  \
          hotl update          install the latest release (--check to only look)\n  \
          hotl resume [arg]    same as -r\n  \
          hotl undo            restore files to the agent's last clean snapshot\n  \

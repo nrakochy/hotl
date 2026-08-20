@@ -879,6 +879,7 @@ dependencies = [
  "hotl-watch-tmux",
  "hotl-watch-tui",
  "hotl-watch-types",
+ "hotl-workflow",
  "jsonschema",
  "libc",
  "ratatui",
