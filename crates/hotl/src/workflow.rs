@@ -923,10 +923,16 @@ mod tests {
             assert_eq!(phases, [None, Some(true)], "{id} starts then settles");
         }
 
-        // The run is registered and on disk.
+        // The run is registered and on disk. The registry is process-global,
+        // so under one-process `cargo test` other tests' runs land in it too:
+        // select ours by name, never by position.
         let report = report();
-        let run = report["runs"].as_array().unwrap().last().unwrap();
-        assert_eq!(run["name"], "two");
+        let run = report["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == "two")
+            .unwrap();
         assert_eq!(run["status"], "done");
         assert_eq!(run["phases"][1]["agents"].as_array().unwrap().len(), 2);
         let run_dir = f
