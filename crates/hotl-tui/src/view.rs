@@ -1869,11 +1869,11 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         format!("copied {n} line{plural} · any key clears")
     });
     let hint = match (&state.phase, state.vim_mode, state.editor.mode()) {
-        (Phase::WaitingAsk { .. }, ..) => {
-            "y allow · n deny · type a reason after n · esc interrupt · ctrl-c"
-        }
+        // The modal's own key line names y/n/s (0049 T6); the row keeps
+        // the keys that leave it.
+        (Phase::WaitingAsk { .. }, ..) => "esc interrupt · ctrl-c",
         (Phase::WaitingQuestion { .. }, ..) => {
-            "1-9 pick an option · type for free text · enter submit · esc clear/interrupt"
+            "↑↓ or 1-9 pick · enter choose · type for free text · esc clear/interrupt"
         }
         (Phase::WaitingEgress { .. }, ..) => {
             "y allow this host for the session · n deny · esc interrupt · ctrl-c"
@@ -1896,6 +1896,105 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
 }
 
+/// How a modal row meets the edge: prose folds, code and commands clip.
+#[derive(Clone, Copy)]
+enum Fold {
+    Prose,
+    Clip,
+}
+
+/// A modal body: rows with their fold rule.
+type Body<'a> = Vec<(Line<'a>, Fold)>;
+
+/// Content width plus padding, clamped to 60–90% of `over`; centered.
+fn modal_rect(over: Rect, content_w: u16, rows: u16) -> Rect {
+    let lo = over.width * 60 / 100;
+    let hi = over.width * 90 / 100;
+    let width = (content_w + 4)
+        .clamp(lo.max(10), hi.max(10))
+        .min(over.width);
+    let height = rows.min(over.height);
+    Rect {
+        x: over.x + (over.width - width) / 2,
+        y: over.y + (over.height - height) / 2,
+        width,
+        height,
+    }
+}
+
+/// A row cut hard at `w` cells with `…`, keeping the line's own style.
+fn clip_line<'a>(line: &Line<'a>, w: usize) -> Line<'a> {
+    if line.width() <= w {
+        return line.clone();
+    }
+    use unicode_width::UnicodeWidthChar;
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let cw = c.width().unwrap_or(0);
+        if used + cw > w.saturating_sub(1) {
+            break;
+        }
+        out.push(c);
+        used += cw;
+    }
+    out.push('…');
+    Line::styled(out, line.style)
+}
+
+/// Draw a bordered modal (0049 T6): one cell of padding each side, prose
+/// rows wrapped to the inner width, clip rows cut with `…`, and a window of
+/// `scroll` rows when the body is taller than the frame — the last row then
+/// reads `… +N more · pgdn`.
+fn draw_modal(
+    frame: &mut Frame,
+    p: &Palette,
+    over: Rect,
+    title: &str,
+    border: Style,
+    body: &[(Line, Fold)],
+    scroll: usize,
+) {
+    let content_w = body.iter().map(|(l, _)| l.width()).max().unwrap_or(0) as u16;
+    // Width first, so the rows can be laid out; the height follows them.
+    let inner_w = modal_rect(over, content_w, 0)
+        .width
+        .saturating_sub(4)
+        .max(1) as usize;
+    let mut rows: Vec<Line> = Vec::new();
+    for (line, fold) in body {
+        match fold {
+            Fold::Prose => rows.extend(wrap::line(line, inner_w)),
+            Fold::Clip => rows.push(clip_line(line, inner_w)),
+        }
+    }
+    let avail = over.height.saturating_sub(2) as usize;
+    if rows.len() > avail && avail > 0 {
+        let top = scroll.min(rows.len() - avail);
+        let below = rows.len() - top - avail;
+        rows = rows.into_iter().skip(top).take(avail).collect();
+        if below > 0 {
+            rows.pop();
+            rows.push(Line::styled(
+                format!("… +{} more · pgdn", below + 1),
+                Style::new().fg(p.faint),
+            ));
+        }
+    }
+    let area = modal_rect(over, content_w, rows.len() as u16 + 2);
+    frame.render_widget(Clear, area);
+    let block = Block::bordered().title(title).border_style(border);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(2),
+        ..inner
+    };
+    frame.render_widget(Paragraph::new(rows), inner);
+}
+
 fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let Phase::WaitingAsk {
         summary,
@@ -1908,19 +2007,23 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     else {
         return;
     };
-    let mut lines = vec![Line::styled(summary.clone(), Style::new().fg(p.ink).bold())];
+    let mut body: Body = vec![(
+        Line::styled(summary.clone(), Style::new().fg(p.ink).bold()),
+        Fold::Prose,
+    )];
     if let Some(why) = protected_why {
-        lines.push(Line::styled(
-            format!("⚠ {why}"),
-            Style::new().fg(p.blocked).bold(),
+        body.push((
+            Line::styled(format!("⚠ {why}"), Style::new().fg(p.blocked).bold()),
+            Fold::Prose,
         ));
     }
     // The proposed change, between the summary and the y/n line — approving a
     // write without seeing it is the gap this closes. Empty until the engine's
     // ask carries the tool input (RQ-2), and an empty diff must render exactly
-    // as the card did before.
+    // as the card did before. Diff rows clip, never wrap: a wrapped diff
+    // line reads as two lines that were never in the file.
     if !diff.is_empty() {
-        lines.push(Line::raw(""));
+        body.push((Line::raw(""), Fold::Prose));
         for l in diff {
             let (prefix, style) = match l.op {
                 DiffOp::Add => ("+ ", Style::new().fg(p.idle)),
@@ -1928,42 +2031,43 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
                 DiffOp::Ctx => ("  ", Style::new().fg(p.muted)),
                 DiffOp::Trailer => ("  ", Style::new().fg(p.faint).dim()),
             };
-            lines.push(Line::styled(format!("{prefix}{}", l.text), style));
+            body.push((
+                Line::styled(format!("{prefix}{}", l.text), style),
+                Fold::Clip,
+            ));
         }
     }
-    lines.push(Line::raw(""));
+    body.push((Line::raw(""), Fold::Prose));
     if *denying {
-        lines.push(Line::styled(
-            format!("deny reason: {input}▏"),
-            Style::new().fg(p.ink),
+        body.push((
+            Line::styled(format!("deny reason: {input}▏"), Style::new().fg(p.ink)),
+            Fold::Prose,
         ));
     } else {
         // Plan 0022: `s` is offered only where it does something — a bash ask
         // whose label does not already say the credential reads are open.
         // An option that is a no-op is worse than no option.
-        lines.push(Line::styled(
-            if crate::app::secret_read_grant_applies(summary) {
-                "y allow · s allow + credential reads (this command only) · n deny"
-            } else {
-                "y allow · n deny · type a reason after n"
-            },
-            Style::new().fg(p.faint),
+        body.push((
+            Line::styled(
+                if crate::app::secret_read_grant_applies(summary) {
+                    "y allow · s allow + credential reads (this command only) · n deny"
+                } else {
+                    "y allow · n deny · type a reason after n"
+                },
+                Style::new().fg(p.faint),
+            ),
+            Fold::Prose,
         ));
     }
-    // A long command — or a long deny reason — grows the card downward rather
-    // than vanishing off its right edge.
-    let lines: Vec<Line> = lines
-        .iter()
-        .flat_map(|l| wrap::line(l, centered(over, 60, 0).width.saturating_sub(2) as usize))
-        .collect();
-    let area = centered(over, 60, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title(" waiting on you ")
-        .border_style(Style::new().fg(p.blocked));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    draw_modal(
+        frame,
+        p,
+        over,
+        " waiting on you ",
+        Style::new().fg(p.blocked),
+        &body,
+        state.modal_scroll,
+    );
 }
 
 /// `ask_user`'s option-picker modal (tier-1 gap #4) — generalizes
@@ -1978,47 +2082,77 @@ fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
         prompt,
         options,
         input,
+        selected,
         ..
     } = &state.phase
     else {
         return;
     };
-    let mut lines = vec![
-        Line::styled(header.clone(), Style::new().fg(p.ink).bold()),
-        Line::styled(prompt.clone(), Style::new().fg(p.ink)),
-        Line::raw(""),
+    let mut body: Body = vec![
+        (
+            Line::styled(header.clone(), Style::new().fg(p.ink).bold()),
+            Fold::Prose,
+        ),
+        (
+            Line::styled(prompt.clone(), Style::new().fg(p.ink)),
+            Fold::Prose,
+        ),
+        (Line::raw(""), Fold::Prose),
     ];
+    // Options as a list with a cursor (0049 T6, LD5): `› n  label`, the
+    // description muted on its own row, aligned under the label.
     for (i, opt) in options.iter().enumerate() {
-        let mut text = format!("{}) {}", i + 1, opt.label);
+        let on = i == *selected;
+        let label = if on {
+            Style::new().fg(p.ink).bold()
+        } else {
+            Style::new().fg(p.ink)
+        };
+        body.push((
+            Line::from(vec![
+                Span::styled(
+                    if on { "› " } else { "  " },
+                    Style::new().fg(p.accent).bold(),
+                ),
+                Span::styled(format!("{}  ", i + 1), Style::new().fg(p.muted)),
+                Span::styled(opt.label.clone(), label),
+            ]),
+            Fold::Prose,
+        ));
         if let Some(desc) = &opt.description {
-            text.push_str(&format!(" — {desc}"));
+            body.push((
+                Line::styled(format!("     {desc}"), Style::new().fg(p.muted)),
+                Fold::Prose,
+            ));
         }
-        lines.push(Line::styled(text, Style::new().fg(p.ink)));
     }
-    lines.push(Line::raw(""));
+    body.push((Line::raw(""), Fold::Prose));
     if input.is_empty() {
-        lines.push(Line::styled(
-            "1-9 pick an option, or type free text",
-            Style::new().fg(p.faint),
+        body.push((
+            Line::styled(
+                format!(
+                    "↑↓ or 1-{} pick · enter choose · type for free text",
+                    options.len()
+                ),
+                Style::new().fg(p.faint),
+            ),
+            Fold::Prose,
         ));
     } else {
-        lines.push(Line::styled(
-            format!("free text: {input}▏"),
-            Style::new().fg(p.ink),
+        body.push((
+            Line::styled(format!("free text: {input}▏"), Style::new().fg(p.ink)),
+            Fold::Prose,
         ));
     }
-    let lines: Vec<Line> = lines
-        .iter()
-        .flat_map(|l| wrap::line(l, centered(over, 60, 0).width.saturating_sub(2) as usize))
-        .collect();
-    let area = centered(over, 60, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title(" a question for you ")
-        .border_style(Style::new().fg(p.accent));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    draw_modal(
+        frame,
+        p,
+        over,
+        " a question for you ",
+        Style::new().fg(p.accent),
+        &body,
+        state.modal_scroll,
+    );
 }
 
 /// Columns the command list wraps at: two lines for the builtin table on the
@@ -2103,33 +2237,39 @@ fn render_egress(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let Phase::WaitingEgress { host, .. } = &state.phase else {
         return;
     };
-    let lines = [
-        Line::styled(
-            format!("reaching \"{host}\" was not in the approved command"),
-            Style::new().fg(p.ink).bold(),
+    let body: Body = vec![
+        (
+            Line::styled(
+                format!("reaching \"{host}\" was not in the approved command"),
+                Style::new().fg(p.ink).bold(),
+            ),
+            Fold::Prose,
         ),
-        Line::styled(
-            "this host is not in [network].allow".to_string(),
-            Style::new().fg(p.muted),
+        (
+            Line::styled(
+                "this host is not in [network].allow".to_string(),
+                Style::new().fg(p.muted),
+            ),
+            Fold::Prose,
         ),
-        Line::raw(""),
-        Line::styled(
-            "y allow for this session · n deny",
-            Style::new().fg(p.faint),
+        (Line::raw(""), Fold::Prose),
+        (
+            Line::styled(
+                "y allow for this session · n deny",
+                Style::new().fg(p.faint),
+            ),
+            Fold::Prose,
         ),
     ];
-    let lines: Vec<Line> = lines
-        .iter()
-        .flat_map(|l| wrap::line(l, centered(over, 60, 0).width.saturating_sub(2) as usize))
-        .collect();
-    let area = centered(over, 60, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title(" network egress ")
-        .border_style(Style::new().fg(p.blocked));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    draw_modal(
+        frame,
+        p,
+        over,
+        " network egress ",
+        Style::new().fg(p.blocked),
+        &body,
+        state.modal_scroll,
+    );
 }
 
 /// The `/`-command menu: a bordered list pinned to the bottom-left of the
@@ -2497,7 +2637,9 @@ mod tests {
             denying: false,
             diff: Vec::new(),
         };
-        assert!(draw(&s)[HINT].contains("y allow"), "{:?}", draw(&s));
+        let hint = draw(&s)[HINT].clone();
+        assert!(hint.starts_with("esc interrupt"), "{hint:?}");
+        assert!(!hint.contains("copied"), "{hint:?}");
     }
 
     /// A human who just approved `npm install` must not read the egress modal
@@ -2659,7 +2801,7 @@ mod tests {
             diff: Vec::new(),
         };
         let hint = draw(&s)[HINT].clone();
-        assert!(hint.contains("y allow"), "got: {hint}");
+        assert!(hint.starts_with("esc interrupt"), "got: {hint}");
         assert!(
             !hint.contains("ctrl-r older"),
             "dead keys advertised: {hint}"
@@ -2950,6 +3092,117 @@ mod tests {
         assert!(popup.starts_with("  ┌"), "{popup:?}");
     }
 
+    // ---- 0049 T6: modals sized to content; code clips; scroll; cursor ----
+
+    fn ask_with_diff(n_lines: usize) -> State {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "edit crates/gw/src/send.rs".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: (0..n_lines)
+                .map(|i| crate::app::DiffLine {
+                    op: DiffOp::Add,
+                    text: format!(
+                        "    let very_long_identifier_number_{i} = compute_something_with(base, timer, backoff, {i});"
+                    ),
+                })
+                .collect(),
+        };
+        s
+    }
+
+    #[test]
+    fn diff_rows_clip_instead_of_wrapping() {
+        let rows = draw(&ask_with_diff(3));
+        let clipped: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains("very_long_identifier"))
+            .collect();
+        assert_eq!(clipped.len(), 3, "one row per diff line: {clipped:?}");
+        assert!(clipped.iter().all(|r| r.contains('…')), "{clipped:?}");
+    }
+
+    #[test]
+    fn a_modal_pads_one_cell_inside_its_border() {
+        let rows = draw(&ask_with_diff(1));
+        let row = rows.iter().find(|r| r.contains("edit crates")).unwrap();
+        let i = row.find('│').unwrap();
+        assert_eq!(&row[i + '│'.len_utf8()..][..1], " ", "{row:?}");
+    }
+
+    #[test]
+    fn a_modal_widens_to_its_content_up_to_90_percent() {
+        let rows = draw_at(&ask_with_diff(1), 120, 40);
+        let top = rows.iter().find(|r| r.contains("waiting on you")).unwrap();
+        let width = top.trim().chars().count();
+        assert!(width > 72 && width <= 108, "60% < {width} <= 90%");
+    }
+
+    #[test]
+    fn a_tall_ask_scrolls_with_pgdn() {
+        let mut s = ask_with_diff(40);
+        let first = draw(&s);
+        assert!(
+            first.iter().any(|r| r.contains("more · pgdn")),
+            "{first:#?}"
+        );
+        assert!(first.iter().any(|r| r.contains("number_0 ")));
+        s.modal_scroll = 10;
+        let later = draw(&s);
+        assert!(!later.iter().any(|r| r.contains("number_0 ")));
+        assert!(later.iter().any(|r| r.contains("number_12")));
+        // Past the end clamps: the last diff row and the key line show.
+        s.modal_scroll = 1_000;
+        let end = draw(&s);
+        assert!(end.iter().any(|r| r.contains("number_39")), "{end:#?}");
+        assert!(end.iter().any(|r| r.contains("y allow")), "{end:#?}");
+        assert!(!end.iter().any(|r| r.contains("more · pgdn")));
+    }
+
+    #[test]
+    fn the_question_modal_lists_options_with_descriptions_below() {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::WaitingQuestion {
+            req_id: 1,
+            header: "h".into(),
+            prompt: "p".into(),
+            input: String::new(),
+            selected: 0,
+            options: vec![
+                hotl_tools::ask::QuestionOption {
+                    label: "A".into(),
+                    description: Some("first".into()),
+                },
+                hotl_tools::ask::QuestionOption {
+                    label: "B".into(),
+                    description: None,
+                },
+            ],
+        };
+        let rows = draw(&s);
+        let a = rows.iter().position(|r| r.contains("› 1  A")).unwrap();
+        assert!(
+            rows[a + 1].contains("first"),
+            "description on its own row: {:?}",
+            rows[a + 1]
+        );
+        assert!(rows[a + 2].contains("  2  B"));
+        assert!(
+            rows.iter().any(|r| r.contains("↑↓ or 1-2 pick")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_clipped_row_counts_cells_not_chars() {
+        let line = Line::raw("日本語テキスト");
+        assert_eq!(clip_line(&line, 20).to_string(), "日本語テキスト");
+        assert_eq!(clip_line(&line, 7).to_string(), "日本語…");
+    }
+
     // ---- 0049 T5: a measure for prose ----
 
     #[test]
@@ -3153,16 +3406,15 @@ mod tests {
                 },
             ],
             input: String::new(),
+            selected: 0,
         };
         let rows = draw(&s);
         let all = rows.join("\n");
         assert!(all.contains("Scope"), "header in modal");
         assert!(all.contains("How far?"), "prompt in modal");
-        assert!(all.contains("1) MVP"), "numbered option: {all}");
-        assert!(
-            all.contains("2) Full — everything"),
-            "description shown: {all}"
-        );
+        assert!(all.contains("› 1  MVP"), "numbered option: {all}");
+        assert!(all.contains("  2  Full"), "second option: {all}");
+        assert!(all.contains("everything"), "description shown: {all}");
         assert!(rows[STRIP].contains("waiting on you"), "halted strip");
     }
 
@@ -3181,6 +3433,7 @@ mod tests {
                 description: None,
             }],
             input: String::new(),
+            selected: 0,
         };
         let buf = draw_buffer(&s);
         let rows: Vec<String> = (0..buf.area.height)
@@ -4215,7 +4468,7 @@ mod tests {
         };
         let rows = draw(&s);
         assert!(
-            rows[HINT].contains("y allow · n deny"),
+            rows[HINT].starts_with("esc interrupt") && !rows[HINT].contains("tab complete"),
             "the ask's hint must win over the popup's: {}",
             rows[HINT]
         );

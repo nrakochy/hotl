@@ -719,6 +719,7 @@ mod tests {
                     prompt: "p".into(),
                     options: Vec::new(),
                     input: String::new(),
+                    selected: 0,
                 },
                 &p
             ),

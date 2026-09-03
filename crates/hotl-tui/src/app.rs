@@ -49,6 +49,9 @@ pub enum Phase {
         prompt: String,
         options: Vec<QuestionOption>,
         input: String,
+        /// The option under the `↑`/`↓` cursor (0049 T6, LD5); `Enter` with
+        /// nothing typed picks it, exactly as its digit would.
+        selected: usize,
     },
     /// An egress ask (plan 0026): a subprocess reached a host that was not in
     /// `[network].allow` and was not on screen when the human approved the
@@ -407,6 +410,9 @@ pub struct State {
     /// Running totals across every turn, the basis of `usage_line`.
     pub session_usage: SessionUsage,
     pub help_open: bool,
+    /// Row offset into an ask/question/help body taller than the frame;
+    /// reset whenever a modal opens. The view clamps the top.
+    pub modal_scroll: usize,
     /// A draft the user entered before the session opened (0033 Task 8b):
     /// `pre_open_input` sets it instead of submitting — there is no session
     /// to send to yet — and `fire_queued_submit` replays it through the
@@ -550,6 +556,7 @@ impl State {
             flag_count: 0,
             session_usage: SessionUsage::default(),
             help_open: false,
+            modal_scroll: 0,
             queued_submit: false,
             interrupt_sent: false,
             detached_turns: 0,
@@ -884,6 +891,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             // advertise keys `on_ask_key` ignores (tracker #13).
             state.completion = None;
             state.editor.clear_search();
+            state.modal_scroll = 0;
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::QuestionRequest { req_id, question } => {
@@ -893,10 +901,12 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                 prompt: question.prompt,
                 options: question.options,
                 input: String::new(),
+                selected: 0,
             };
             // Same reasoning as the ask arm above (tracker #13).
             state.completion = None;
             state.editor.clear_search();
+            state.modal_scroll = 0;
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::EgressRequest { req_id, host } => {
@@ -904,6 +914,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             // Same reasoning as the ask arm above (tracker #13).
             state.completion = None;
             state.editor.clear_search();
+            state.modal_scroll = 0;
             vec![Cmd::SetTitle(title(state, " — waiting on you"))]
         }
         Msg::PromptResult {
@@ -1785,6 +1796,7 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
     }
     if key.code == KeyCode::Char('?') && state.editor.is_empty() {
         state.help_open = true;
+        state.modal_scroll = 0;
         return Vec::new();
     }
     // The popup owns these four keys while it is open. Esc is layered — it
@@ -2266,6 +2278,7 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // not a new feature.
         "help" => {
             state.help_open = true;
+            state.modal_scroll = 0;
             Vec::new()
         }
         // The single highest-value "what am I actually running?" answer, and
@@ -2407,7 +2420,24 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
     }
 }
 
+/// Rows a PageUp/PageDown moves a modal body (0049 T6).
+const MODAL_PAGE: usize = 5;
+
+/// PageUp/PageDown scroll a tall ask/question/help body; the view clamps
+/// the top. True when the key was consumed.
+fn modal_page(state: &mut State, key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::PageUp => state.modal_scroll = state.modal_scroll.saturating_sub(MODAL_PAGE),
+        KeyCode::PageDown => state.modal_scroll = state.modal_scroll.saturating_add(MODAL_PAGE),
+        _ => return false,
+    }
+    true
+}
+
 fn on_ask_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
+    if modal_page(state, key) {
+        return Vec::new();
+    }
     let Phase::WaitingAsk {
         req_id,
         summary,
@@ -2470,15 +2500,20 @@ pub(crate) fn secret_read_grant_applies(summary: &str) -> bool {
 
 /// `ask_user`'s modal (tier-1 gap #4): number keys 1-N pick an option
 /// instantly (submits right away — no confirm step, matching `on_ask_key`'s
-/// `y`); any other printable character starts free text instead (typing
-/// commits to free text — once `input` is non-empty, digits are just more
-/// text, never a late option pick). Esc while typing free text backs out to
-/// the picker rather than submitting a partial answer.
+/// `y`), as does `Enter` on the `↑`/`↓` cursor (0049 T6); any other
+/// printable character starts free text instead (typing commits to free
+/// text — once `input` is non-empty, digits are just more text, never a
+/// late option pick). Esc while typing free text backs out to the picker
+/// rather than submitting a partial answer.
 fn on_question_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
+    if modal_page(state, key) {
+        return Vec::new();
+    }
     let Phase::WaitingQuestion {
         req_id,
         options,
         input,
+        selected,
         ..
     } = &mut state.phase
     else {
@@ -2504,6 +2539,14 @@ fn on_question_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         KeyCode::Char(c) if c.is_ascii_digit() && c != '0' => {
             let idx = c as usize - '1' as usize;
             if let Some(opt) = options.get(idx) {
+                let label = opt.label.clone();
+                return resume_after_question(state, req_id, vec![label], None);
+            }
+        }
+        KeyCode::Up => *selected = selected.saturating_sub(1),
+        KeyCode::Down => *selected = (*selected + 1).min(options.len().saturating_sub(1)),
+        KeyCode::Enter => {
+            if let Some(opt) = options.get(*selected) {
                 let label = opt.label.clone();
                 return resume_after_question(state, req_id, vec![label], None);
             }
@@ -4807,6 +4850,52 @@ mod tests {
         press(&mut s, KeyCode::Esc); // Insert → Normal (0042 D2)
         press(&mut s, KeyCode::Esc); // interrupt
         assert!(matches!(ctrl(&mut s, 'c')[..], [Cmd::Quit]));
+    }
+
+    /// 0049 T6 (LD5): `↓` moves the cursor and `Enter` picks exactly what
+    /// the digit would; PageDown scrolls the body without answering.
+    #[test]
+    fn question_options_list_with_a_cursor_and_enter_picks() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::QuestionRequest {
+                req_id: 9,
+                question: Question {
+                    header: "h".into(),
+                    prompt: "p".into(),
+                    options: vec![
+                        QuestionOption {
+                            label: "A".into(),
+                            description: Some("first".into()),
+                        },
+                        QuestionOption {
+                            label: "B".into(),
+                            description: None,
+                        },
+                    ],
+                    multi: false,
+                },
+            },
+        );
+        press(&mut s, KeyCode::PageDown);
+        assert_eq!(s.modal_scroll, MODAL_PAGE, "pgdn scrolls, never answers");
+        assert!(matches!(s.phase, Phase::WaitingQuestion { .. }));
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::Down);
+        assert!(
+            matches!(s.phase, Phase::WaitingQuestion { selected: 1, .. }),
+            "clamped at the last option: {:?}",
+            s.phase
+        );
+        let cmds = press(&mut s, KeyCode::Enter);
+        // The same reply shape the digit path produces for option 2.
+        assert!(matches!(s.phase, Phase::Sampling { .. }));
+        assert!(
+            matches!(&cmds[..], [Cmd::ReplyQuestion { req_id: 9, selected, free_text: None }, ..]
+                if selected == &vec!["B".to_string()]),
+            "{cmds:?}"
+        );
     }
 
     #[test]
