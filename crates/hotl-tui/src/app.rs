@@ -1131,7 +1131,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     children: Vec::new(),
                 });
             }
-            enter_streaming(state);
+            settle_phase(state);
         }
         // Denied tools never get a `tool_start` (the engine returns before
         // running them) — the denial itself is the card, its one call
@@ -1151,7 +1151,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 }],
                 children: Vec::new(),
             });
-            enter_streaming(state);
+            settle_phase(state);
         }
         // A sub-agent's forwarded tool activity (0039): nests under its own
         // spawn card, routed by parent_id. No parent card → drop silently
@@ -2607,10 +2607,10 @@ fn on_tick(state: &mut State) {
         Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
     ) {
         state.work_ticks += 1;
-        // EVERY running card ticks (0037), not just the newest: with
-        // concurrent calls, a sibling's tool_done flips the phase to
-        // Streaming while others still run — their elapsed must stay honest.
-        // Bounded to this turn: running cards cannot predate the last prompt.
+        // EVERY running card ticks (0037), not just the newest: a sibling's
+        // tool_done keeps the phase in `Tool` on the oldest card's clock
+        // (0049 T1b); running cards tick regardless. Bounded to this turn:
+        // running cards cannot predate the last prompt.
         for item in state.transcript.iter_mut().rev() {
             if matches!(item, TranscriptItem::User { .. }) {
                 break;
@@ -2637,8 +2637,51 @@ fn append_assistant(state: &mut State, text: &str) {
     }
 }
 
+/// Cards still running this turn, transcript order, as `(name, count,
+/// oldest ticks)` — bounded to the turn: cards cannot predate the last prompt.
+pub fn running_cards(state: &State) -> Vec<(String, usize, u64)> {
+    let mut out: Vec<(String, usize, u64)> = Vec::new();
+    for item in state.transcript.iter().rev() {
+        match item {
+            TranscriptItem::User { .. } => break,
+            TranscriptItem::Tool {
+                name,
+                ticks,
+                status: ToolStatus::Running | ToolStatus::AutoAllowed { .. },
+                ..
+            } => match out.iter_mut().find(|(n, ..)| n == name) {
+                Some((_, count, oldest)) => {
+                    *count += 1;
+                    *oldest = (*oldest).max(*ticks);
+                }
+                None => out.push((name.clone(), 1, *ticks)),
+            },
+            _ => {}
+        }
+    }
+    out.reverse();
+    out
+}
+
+/// After a tool settles: another card still running keeps the turn in the
+/// tool phase (on the oldest one's clock, so the strip's timer never resets
+/// while work continues); none left → the model is sampling its next step.
+/// Only `text_delta` enters `Streaming` (0049 T1b) — before this, a sibling
+/// finishing read `writing · ~0 tok` over cards still running.
+fn settle_phase(state: &mut State) {
+    let running = running_cards(state);
+    state.phase = match running.iter().max_by_key(|(_, _, t)| *t) {
+        Some((name, _, ticks)) => Phase::Tool {
+            name: name.clone(),
+            ticks: *ticks,
+        },
+        None => Phase::Sampling { ticks: 0 },
+    };
+}
+
 /// Streaming resumes with this turn's running char total (chars survive a
-/// tool interlude by recount, not by stashing).
+/// tool interlude by recount, not by stashing — the recount happens at the
+/// first delta after the interlude).
 fn enter_streaming(state: &mut State) {
     let ticks = match state.phase {
         Phase::Streaming { ticks, .. } => ticks,
@@ -3502,8 +3545,91 @@ mod tests {
             })
         ));
         assert!(
-            matches!(s.phase, Phase::Streaming { chars: 6, .. }),
-            "chars survive the tool interlude"
+            matches!(s.phase, Phase::Sampling { .. }),
+            "nothing runs, so the model is thinking: {:?}",
+            s.phase
+        );
+    }
+
+    /// 0049 T1b: `tool_done` settles into the tool phase while a sibling
+    /// still runs (the strip lists every running card on the oldest clock),
+    /// into sampling once none does, and only a delta writes.
+    #[test]
+    fn a_sibling_settling_keeps_the_tool_phase_while_others_run() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"s1","name":"spawn","summary":"explore a"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"s2","name":"spawn","summary":"explore b"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"g1","name":"grep","summary":"grep foo"}),
+        );
+        update(&mut s, Msg::Tick);
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"g1","name":"grep","ok":true}),
+        );
+        assert!(
+            matches!(&s.phase, Phase::Tool { name, .. } if name == "spawn"),
+            "{:?}",
+            s.phase
+        );
+        assert!(
+            crate::anim::strip_text(&s).starts_with("spawn ×2 · "),
+            "{}",
+            crate::anim::strip_text(&s)
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"s1","name":"spawn","ok":true}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"s2","name":"spawn","ok":true}),
+        );
+        assert!(
+            matches!(s.phase, Phase::Sampling { ticks: 0 }),
+            "nothing runs → thinking: {:?}",
+            s.phase
+        );
+        assert!(crate::anim::strip_text(&s).starts_with("thinking · 0s"));
+        upd(&mut s, json!({"type":"text_delta","text":"done"}));
+        assert!(
+            matches!(s.phase, Phase::Streaming { chars: 4, .. }),
+            "only a delta writes: {:?}",
+            s.phase
+        );
+    }
+
+    #[test]
+    fn chars_still_survive_a_tool_interlude_by_recount() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(&mut s, json!({"type":"text_delta","text":"hi you"}));
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"t1","name":"bash","summary":"echo hi"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"t1","name":"bash","ok":true}),
+        );
+        assert!(
+            matches!(s.phase, Phase::Sampling { .. }),
+            "settled, sampling: {:?}",
+            s.phase
+        );
+        upd(&mut s, json!({"type":"text_delta","text":"!"}));
+        assert!(
+            matches!(s.phase, Phase::Streaming { chars: 7, .. }),
+            "{:?}",
+            s.phase
         );
     }
 
@@ -4214,12 +4340,12 @@ mod tests {
                 json!({"type":"tool_start","id":id,"name":"read","summary":format!("read {id}.rs")}),
             );
         }
-        // p3 settles; p1/p2 keep running while the phase moves to Streaming.
+        // p3 settles; p1/p2 keep running and keep the phase in `Tool`.
         upd(
             &mut s,
             json!({"type":"tool_done","id":"p3","name":"read","ok":true}),
         );
-        assert!(matches!(s.phase, Phase::Streaming { .. }));
+        assert!(matches!(&s.phase, Phase::Tool { name, .. } if name == "read"));
         update(&mut s, Msg::Tick);
         update(&mut s, Msg::Tick);
         let ticks: Vec<(String, u64)> = s

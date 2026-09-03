@@ -425,8 +425,29 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
             chars / 4,
             secs(*ticks)
         ))),
+        // Every running card, not just the phase's name: `spawn ×2 · grep ·
+        // 41s` on the oldest card's clock (0049 T1b).
         Phase::Tool { name, ticks } => {
-            segs.push(Segment::keep(format!("{name} · {}s", secs(*ticks))));
+            let running = crate::app::running_cards(state);
+            let (list, secs_of) = if running.is_empty() {
+                // A phase set by hand (tests) or a start whose card has not
+                // landed yet.
+                (name.clone(), *ticks)
+            } else {
+                let names: Vec<String> = running
+                    .iter()
+                    .map(|(n, c, _)| {
+                        if *c > 1 {
+                            format!("{n} ×{c}")
+                        } else {
+                            n.clone()
+                        }
+                    })
+                    .collect();
+                let oldest = running.iter().map(|(_, _, t)| *t).max().unwrap_or(*ticks);
+                (names.join(" · "), oldest)
+            };
+            segs.push(Segment::keep(format!("{list} · {}s", secs(secs_of))));
         }
         Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
             segs.push(Segment::keep("waiting on you"));
