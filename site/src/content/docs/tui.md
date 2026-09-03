@@ -48,7 +48,7 @@ Two knobs, one in each table:
 
 Top to bottom:
 
-1. **Transcript** — every turn carries a marker in the left gutter, so you can see the shape of the conversation by scanning straight down: `❯` your prompts, `●` the assistant (with a `│` bar down a long answer), `✓ ✗ ⛔` tool cards (`✓ bash  cargo test · 2s`), `⤷` steers, `·` dim notices (retries, fallbacks, compaction). Inside an assistant answer, headings, bullets, and code get light styling so a long reply is scannable. On a wide terminal prose wraps at `[settings] measure` (110 columns by default) so lines stay readable; cards, code and reports keep the full width. With the input empty and no agent band showing, vim Normal `j`/`k` scroll it one item at a time; it snaps back to following the bottom on your next prompt.
+1. **Transcript** — every turn carries a marker in the left gutter, so you can see the shape of the conversation by scanning straight down: `❯` your prompts, `●` the assistant (with a `│` bar down a long answer), `✓ ✗ ⊘` tool cards (`✓ bash  cargo test · 2s`), `⤷` steers, `·` dim notices (retries, fallbacks, compaction). In the default `comfortable` density a blank row falls only where the *speaker* changes — you, the model, the harness — so a run of tool cards reads as one block and an answer follows the work it came from without a gap; `spacious` puts one between every item. A session shorter than the screen sits against the strip, so your first prompt appears where the newest row will always be. Inside an assistant answer, headings, bullets, and code get light styling so a long reply is scannable. On a wide terminal prose wraps at `[settings] measure` (110 columns by default) so lines stay readable; cards, code and reports keep the full width. With the input empty and no agent band showing, vim Normal `j`/`k` scroll it one item at a time; it snaps back to following the bottom on your next prompt.
 2. **Activity strip** — one line that tells you what the turn is doing, animated as a loop drawing itself:
 
    | You see | It means |
@@ -66,7 +66,7 @@ Top to bottom:
    can see plan progress at a glance without opening the transcript. An
    empty or never-started list shows nothing extra.
 
-3. **Input** — bordered editor, title shows `-- INSERT --` / `-- NORMAL --`.
+3. **Input** — a bordered editor sitting on the gutter, its text aligned with your `❯` prompts; on terminals of 30 rows or more a blank row separates it from the strip. The draft grows to a third of the screen before it scrolls. With vim mode on, the title shows `-- INSERT --` / `-- NORMAL --`.
 4. **Agent band** — appears below the input while the turn has sub-agents
    *running*: `● main` plus one summary row per running spawn — `●` marks
    the stream you are watching. A spawn drops off the band the moment it
@@ -410,13 +410,13 @@ reach for the skill you had in mind, this is how you hand it over directly.
 
 ## Permission asks
 
-An ask freezes the loop (the gap glyph) and opens a modal with the tool summary — and a loud `⚠` line when a protected path is involved. `y` allows. `n` starts a deny: type an optional reason, `Enter` sends it (the reason goes to the model verbatim; `Esc` backs out of the deny).
+An ask freezes the loop (the gap glyph) and opens a modal with the tool summary — and a loud `⚠` line when a protected path is involved. `y` allows. `n` starts a deny: type an optional reason, `Enter` sends it (the reason goes to the model verbatim; `Esc` backs out of the deny). The modal sizes itself to its content; a long command or diff line clips at its edge with `…` rather than wrapping, and `PgUp`/`PgDn` scroll a diff taller than the screen.
 
 ## Questions
 
 The agent can also ask a **structured question** (`ask_user`) — a header, a prompt, and 2–4 numbered options — when it hits a genuine ambiguity instead of guessing. It freezes the loop the same way a permission ask does (same gap glyph, same "waiting on you" strip), but **it is not a permission ask**: answering it never authorizes any tool, it only supplies text the model reads on its next turn.
 
-Press a digit (`1`–`4`) to pick that option — it submits immediately, no confirm step. To answer with something not listed, just start typing: the modal switches to free text, `Enter` submits it, `Esc` clears it back to the picker.
+Press a digit (`1`–`4`) to pick that option, or move the `›` cursor with `↑`/`↓` and press `Enter` — either submits immediately, no confirm step. To answer with something not listed, just start typing: the modal switches to free text, `Enter` submits it, `Esc` clears it back to the picker.
 
 In headless (`-p`) or JSON mode there is no one to ask, so the question resolves immediately to a documented "no human available" answer and the model proceeds on its own judgment — it never hangs a scripted run.
 

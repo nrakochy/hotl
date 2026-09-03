@@ -18,6 +18,38 @@ semver promise of their own.
 
 ### Changed
 
+- **The console grid has rules of its own** (plan 0049, the UX redesign's
+  layout phase). The activity strip is three zones with a drop order: the
+  phase and its elapsed on the left, the todo count in the middle, and a
+  chip cluster on the right (session name, mode, context share, `⚑ N`).
+  When width runs out, the todo label folds to its count, then usage
+  detail, the name and the model drop — the mode, context and flag chips
+  never do, and nothing is ever painted over the text, so the flag count
+  no longer vanishes under a long usage line and `esc to interrupt` has
+  left the strip for the hint row. The strip now reports the *state*, not
+  the last event: while any card runs it lists them (`spawn ×2 · 41s`) on
+  the oldest one's clock, says `thinking` once none does, and says
+  `writing` only when text actually streams — before this a sibling
+  finishing read `writing · ~0 tok` over cards still running. In the
+  default `comfortable` density a blank row falls only where the speaker
+  changes (you, the model, the harness) and before every prompt, so a run
+  of tool cards is one block; `spacious` keeps a blank between every item.
+  The input box sits on the gutter with its text under your `❯` prompts, a
+  gap row separates it from the strip on terminals of 30 rows or more, and
+  the draft grows to a third of the screen. A session shorter than the
+  screen anchors to the strip, so the first prompt appears where the
+  newest row always will and the first overflow moves nothing. Prose wraps
+  at a new `[settings] measure` (110 columns; `0` = full width) while
+  cards, code and reports keep the width. Modals size themselves to their
+  content (60–90% of the frame) with a cell of padding, clip commands and
+  diff lines with `…` instead of wrapping them, and scroll with
+  `PgUp`/`PgDn`; the `ask_user` modal lists its options with a `›` cursor
+  that `↑`/`↓` move and `Enter` picks. `?` is a labeled table that fits
+  80×24 with vim off and scrolls when it must. Denied cards wear a
+  one-cell `⊘` instead of the two-cell `⛔` that pushed them out of line;
+  the idle hint no longer says `esc interrupt`, and every hint cuts at a
+  separator on a narrow terminal; a queued steer reads `· queued`; one
+  child call is `1 call`.
 - **A turn can be told "keep going" eight times per prompt, not three**
   (plan 0048). The shared budget the `stop` hook's `block` and hotl's own
   todo-list nudge draw from (`TURN_EXTENSION_MAX`) now matches Claude

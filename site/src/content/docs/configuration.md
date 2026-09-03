@@ -156,11 +156,11 @@ accent = "#88c0d0"         # optional per-slot #rrggbb overrides: active blocked
 **`density`** controls how much room the console TUI gives the transcript
 (colors live under `[settings.theme]`; the two are independent):
 
-| Value | Between turns | Left gutter |
+| Value | Blank rows | Left gutter |
 |---|---|---|
-| `compact` | no blank line | none — edge to edge |
-| `comfortable` *(default)* | one blank line | 2 columns |
-| `spacious` | one blank line | 4 columns |
+| `compact` | none | none — edge to edge |
+| `comfortable` *(default)* | between speakers (you, the model, the harness) | 2 columns |
+| `spacious` | between every item | 4 columns |
 
 An unrecognized value warns and falls back to `comfortable`. The gutter is
 where the role spine is drawn (see [tui.md](../tui/)).
