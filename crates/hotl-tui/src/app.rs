@@ -1536,7 +1536,7 @@ fn on_prompt_result(
     let n = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
     let live = n("input_tokens") + n("cache_read_input_tokens") + n("cache_creation_input_tokens");
     state.live_context = Some(live);
-    state.usage_line = Some(format_usage(state, usage, live));
+    state.usage_line = Some(format_usage(state, usage));
     state.phase = Phase::Idle;
     band_tidy(state);
     state.work_ticks = 0;
@@ -1611,13 +1611,13 @@ pub(crate) fn tok(n: u64) -> String {
 /// populates it (see the plan's RQ table). Enforced by
 /// `cost_is_shown_only_when_the_payload_carries_it`.
 /// Context fullness as a whole percentage, capped at 100; `None` on a zero
-/// window. Shared by `format_usage` and the strip's at-open rendering
-/// (`anim::strip_text`) so the two figures cannot drift.
+/// window. The one fullness formula: the strip's ctx chip
+/// (`view::strip_chips`) and `/context` cannot drift.
 pub(crate) fn ctx_pct(live: u64, window: u64) -> Option<u64> {
     (live * 100).checked_div(window).map(|pct| pct.min(100))
 }
 
-fn format_usage(state: &State, usage: &Value, live: u64) -> String {
+fn format_usage(state: &State, usage: &Value) -> String {
     let u = &state.session_usage;
     let mut parts = vec![
         format!("{} in", tok(u.input)),
@@ -1636,12 +1636,8 @@ fn format_usage(state: &State, usage: &Value, live: u64) -> String {
     if let Some(ratio) = usage.get("hit_ratio").and_then(Value::as_f64) {
         parts.push(format!("{:.0}% hit", ratio * 100.0));
     }
-    // `live` is what the *next* turn starts from — this turn's resident
-    // context, not the session's running total. The caller computes it: it is
-    // also `State.live_context`, which `/context` reports.
-    if let Some(pct) = ctx_pct(live, state.context_window) {
-        parts.push(format!("{pct}% ctx"));
-    }
+    // The context share is the strip's ctx chip (0049 T1), read from
+    // `State.live_context` — not a part of this line.
     if let Some(cost) = u.cost_usd {
         parts.push(format!("${cost:.2}"));
     }
@@ -2977,8 +2973,10 @@ mod tests {
             line.contains("12.0k cached"),
             "cache reads must show: {line}"
         );
-        // (2_000 + 8_000) / 200_000 of the window is live in the latest turn.
-        assert!(line.contains("5% ctx"), "context gauge: {line}");
+        // (2_000 + 8_000) / 200_000 of the window is live in the latest turn
+        // — the strip's ctx chip reads it from here, never from the line.
+        assert_eq!(s.live_context, Some(10_000));
+        assert!(!line.contains("ctx"), "the gauge is a chip: {line}");
     }
 
     #[test]
@@ -3118,8 +3116,7 @@ mod tests {
         let mut s = State::test_default();
         s.context_window = 0;
         on_result(&mut s, "done", None, &json!({"input_tokens": 10}));
-        let line = s.usage_line.clone().unwrap();
-        assert!(!line.contains("ctx"), "no window, no gauge: {line}");
+        assert_eq!(ctx_pct(s.live_context.unwrap(), s.context_window), None);
     }
 
     #[test]
@@ -4735,9 +4732,10 @@ mod tests {
             },
         );
         assert_eq!(s.phase, Phase::Idle);
-        // Session totals plus the context gauge; no cache segment (this turn
-        // read none) and no cost (the payload carried none).
-        assert_eq!(s.usage_line.as_deref(), Some("120 in · 45 out · 0% ctx"));
+        // Session totals; no cache segment (this turn read none), no cost
+        // (the payload carried none), and the gauge is the strip's chip.
+        assert_eq!(s.usage_line.as_deref(), Some("120 in · 45 out"));
+        assert_eq!(s.live_context, Some(120));
         assert!(matches!(&cmds[..], [Cmd::SetTitle(t)] if t == "hotl"));
     }
 

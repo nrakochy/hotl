@@ -346,14 +346,54 @@ pub fn snake_ramp(phase: &Phase, p: &Palette) -> Vec<Color> {
     hotl_theme::ramp(a, b, WIDTH)
 }
 
-/// Everything on the strip after the snake. Rendered as one span in the
-/// phase's text color, so it is kept separate from the gradient-lit body.
+/// One strip segment and its drop rank: rank 0 goes first when width runs
+/// out, `KEEP` never goes. `short` is the fold form (`2/4 running the
+/// suite` → `2/4`), tried before the segment is dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    pub text: String,
+    pub short: Option<String>,
+    pub rank: u8,
+}
+
+/// The rank that never folds and never drops.
+pub const KEEP: u8 = u8::MAX;
+
+// Drop order, lowest first (0049 T1). Rank 2 is reserved for P1's output
+// line count; rank 4 is the view's session-name chip.
+const RANK_TODO: u8 = 1;
+const RANK_USAGE: u8 = 3;
+const RANK_MODEL: u8 = 5;
+const RANK_GOAL: u8 = 6;
+
+impl Segment {
+    fn keep(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            short: None,
+            rank: KEEP,
+        }
+    }
+
+    fn rank(text: impl Into<String>, rank: u8) -> Self {
+        Self {
+            text: text.into(),
+            short: None,
+            rank,
+        }
+    }
+}
+
+/// The strip's left zone, in display order. `strip_text` joins the full
+/// forms; `view::render_strip` folds and drops by rank to fit.
 ///
 /// Empty only at idle before the first turn with no model known — the view
-/// drops the separator rather than leaving a dangling space.
-pub fn strip_text(state: &State) -> String {
+/// drops the separator rather than leaving a dangling space. The context
+/// share and the flag count are chips in the view's right zone, not here.
+pub fn strip_segments(state: &State) -> Vec<Segment> {
     let secs = |ticks: u64| ticks / TICK_HZ;
-    let base = match &state.phase {
+    let mut segs = Vec::new();
+    match &state.phase {
         // Idle is the only phase with room to spare, and the only one where
         // "which model is this?" is still an open question — every other arm
         // is already reporting on a turn that model is running.
@@ -361,73 +401,74 @@ pub fn strip_text(state: &State) -> String {
             // Pre-open (0033 Task 8b): no session behind the composer yet —
             // the strip says so quietly. `mode` is never empty once open.
             if state.mode.is_empty() {
-                return "starting…".to_string();
+                return vec![Segment::keep("starting…")];
             }
-            let mut parts = Vec::new();
             let model = hotl_types::bare_model(&state.model);
             if !model.is_empty() {
-                parts.push(model.to_string());
+                segs.push(Segment::rank(model, RANK_MODEL));
             }
             if let Some(usage) = &state.usage_line {
-                parts.push(usage.clone());
-            } else if let Some(pct) = state
-                .open_context
-                .and_then(|l| crate::app::ctx_pct(l, state.context_window))
-            {
-                // At-open reality (0040): a session has context before its
-                // first turn — resume inherits real fullness, a fresh seed
-                // occupies tokens. Only the gauge, never a synthesized usage
-                // line: "0 in · 0 out" would claim a turn happened.
-                parts.push(format!("{pct}% ctx"));
+                segs.push(Segment::rank(usage.clone(), RANK_USAGE));
             }
             // Undo-point chip (0035 decision 11): opacity must not be
             // silence — the strip says whether `hotl undo` has a restore
             // point right now.
             if let Some(undo) = &state.undo_status {
-                parts.push(format!("undo {undo}"));
+                segs.push(Segment::keep(format!("undo {undo}")));
             }
-            // Flag chip (0036): how many calls ran (or were refused) on a ⚑
-            // notice instead of an ask. A running count, never cleared
-            // mid-session, so an unattended run's flags survive scrollback.
-            if state.flag_count > 0 {
-                parts.push(format!("⚑ flags: {}", state.flag_count));
-            }
-            parts.join(" · ")
         }
-        Phase::Sampling { ticks } => format!("thinking · {}s · esc to interrupt", secs(*ticks)),
-        Phase::Streaming { ticks, chars } => format!(
-            "writing · ~{} tok · {}s · esc to interrupt",
+        Phase::Sampling { ticks } => {
+            segs.push(Segment::keep(format!("thinking · {}s", secs(*ticks))));
+        }
+        Phase::Streaming { ticks, chars } => segs.push(Segment::keep(format!(
+            "writing · ~{} tok · {}s",
             chars / 4,
             secs(*ticks)
-        ),
-        Phase::Tool { name, ticks } => format!("{name} · {}s · esc to interrupt", secs(*ticks)),
-        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => "waiting on you".to_string(),
+        ))),
+        Phase::Tool { name, ticks } => {
+            segs.push(Segment::keep(format!("{name} · {}s", secs(*ticks))));
+        }
+        Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
+            segs.push(Segment::keep("waiting on you"));
+        }
         // Named on the strip, not just "waiting on you": the difference from
         // the tool ask is the whole point of the prompt.
-        Phase::WaitingEgress { .. } => "waiting on you · network".to_string(),
-    };
-    let mut out = base;
-    for suffix in [todos_summary(&state.todos), goal_summary(state)]
-        .into_iter()
-        .flatten()
-    {
-        if out.is_empty() {
-            out = suffix;
-        } else {
-            out = format!("{out} · {suffix}");
-        }
+        Phase::WaitingEgress { .. } => segs.push(Segment::keep("waiting on you · network")),
     }
-    out
+    if let Some(count) = todos_count(&state.todos) {
+        segs.push(Segment {
+            text: format!("{count} {}", todos_label(&state.todos)),
+            short: Some(count),
+            rank: RANK_TODO,
+        });
+    }
+    if let Some(mins) = goal_minutes(state) {
+        segs.push(Segment {
+            text: format!("◎ /goal active · {mins}m"),
+            short: Some(format!("◎ {mins}m")),
+            rank: RANK_GOAL,
+        });
+    }
+    segs
 }
 
-/// The goal's compact strip suffix: `◎ /goal active · 3m`. `None` when no
-/// goal is set. Minutes come from the goal's own tick clock, which advances
-/// only while a turn runs — exactly the time the loop is spending.
-fn goal_summary(state: &State) -> Option<String> {
+/// Everything on the strip after the snake, every segment in full — the
+/// form tests pin and any non-styled consumer wants.
+pub fn strip_text(state: &State) -> String {
+    strip_segments(state)
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Minutes on the goal's own tick clock, which advances only while a turn
+/// runs — exactly the time the loop is spending. `None` with no goal set.
+fn goal_minutes(state: &State) -> Option<u64> {
     state
         .goal
         .as_ref()
-        .map(|_| format!("◎ /goal active · {}m", state.goal_ticks / (60 * TICK_HZ)))
+        .map(|_| state.goal_ticks / (60 * TICK_HZ))
 }
 
 /// Snake and text as one plain string — what the strip reads as, minus color.
@@ -441,27 +482,28 @@ pub fn strip_line(state: &State) -> String {
     }
 }
 
-/// The todo checklist's compact strip suffix: `"2/5 todos"`, or — while
-/// exactly one item is `in_progress` — `"2/5 · wiring the gate"` (its
-/// `active_form`, falling back to `content`). `None` when the list is empty:
-/// nothing rides the strip until there's something to show progress on.
-fn todos_summary(todos: &[hotl_tools::todo::Todo]) -> Option<String> {
+/// The todo checklist's progress count, `"2/5"` — the segment's fold form.
+/// `None` when the list is empty: nothing rides the strip until there's
+/// something to show progress on.
+fn todos_count(todos: &[hotl_tools::todo::Todo]) -> Option<String> {
     if todos.is_empty() {
         return None;
     }
-    use hotl_tools::todo::TodoStatus;
     let done = todos
         .iter()
-        .filter(|t| t.status == TodoStatus::Completed)
+        .filter(|t| t.status == hotl_tools::todo::TodoStatus::Completed)
         .count();
-    let total = todos.len();
-    match todos.iter().find(|t| t.status == TodoStatus::InProgress) {
-        Some(t) => Some(format!(
-            "{done}/{total} {}",
-            t.active_form.as_deref().unwrap_or(&t.content)
-        )),
-        None => Some(format!("{done}/{total} todos")),
-    }
+    Some(format!("{done}/{}", todos.len()))
+}
+
+/// What follows the count in full: the in-progress item's `active_form`
+/// (falling back to `content`), or `todos` when nothing is in progress.
+fn todos_label(todos: &[hotl_tools::todo::Todo]) -> String {
+    todos
+        .iter()
+        .find(|t| t.status == hotl_tools::todo::TodoStatus::InProgress)
+        .map(|t| t.active_form.as_deref().unwrap_or(&t.content).to_string())
+        .unwrap_or_else(|| "todos".to_string())
 }
 
 #[cfg(test)]
@@ -683,10 +725,7 @@ mod tests {
         s.phase = Phase::Sampling { ticks: TICK_HZ };
         assert_eq!(
             strip_line(&s),
-            format!(
-                "{} thinking · 1s · esc to interrupt",
-                snake(&s.phase, s.work_ticks)
-            )
+            format!("{} thinking · 1s", snake(&s.phase, s.work_ticks))
         );
         s.phase = Phase::Streaming {
             ticks: 2 * TICK_HZ,
@@ -694,14 +733,15 @@ mod tests {
         };
         assert_eq!(
             strip_text(&s),
-            "writing · ~50 tok · 2s · esc to interrupt",
+            "writing · ~50 tok · 2s",
             "chars are shown as ~tokens, seconds as whole seconds"
         );
         s.phase = Phase::Tool {
             name: "bash".into(),
             ticks: 4,
         };
-        assert_eq!(strip_text(&s), "bash · 0s · esc to interrupt");
+        // `esc to interrupt` lives in the hint row, never here (0049 T1).
+        assert_eq!(strip_text(&s), "bash · 0s");
         s.phase = Phase::WaitingAsk {
             req_id: 1,
             summary: "s".into(),
@@ -713,22 +753,50 @@ mod tests {
         assert_eq!(strip_line(&s), format!("{w} waiting on you"));
     }
 
-    /// 0040 §5.7 at open: before any turn completes, the idle strip shows
-    /// the at-open context estimate as a bare `% ctx` — and yields to the
-    /// real usage line the moment one exists, never showing both.
+    /// 0040 §5.7 at open: the at-open context estimate is the view's ctx
+    /// chip (0049 T1), never a left-zone segment — the text stays the model
+    /// alone until a usage line exists.
     #[test]
-    fn the_at_open_context_rides_the_idle_strip_until_a_usage_line_exists() {
+    fn the_at_open_context_is_a_chip_not_a_segment() {
         let mut s = State::test_default();
         s.open_context = Some(24_000);
         s.context_window = 200_000;
-        assert_eq!(strip_line(&s), resting("12% ctx"));
+        assert_eq!(strip_line(&s), resting(""));
 
-        s.usage_line = Some("120 in · 45 out · 12% ctx".into());
+        s.usage_line = Some("120 in · 45 out".into());
+        assert_eq!(strip_line(&s), resting("120 in · 45 out"));
+    }
+
+    /// Ranks are the drop order the view folds and drops by: the todo label
+    /// folds to its count first, usage detail goes before the model name,
+    /// and the phase text and undo chip never go.
+    #[test]
+    fn segments_carry_their_fold_forms_and_ranks() {
+        let mut s = State::test_default();
+        s.usage_line = Some("1 in · 2 out".into());
+        s.undo_status = Some("ready".into());
+        s.todos = vec![todo("wire", TodoStatus::InProgress, Some("wiring"))];
+        s.goal = Some("done".into());
+        let segs = strip_segments(&s);
+        let ranks: Vec<(&str, Option<&str>, u8)> = segs
+            .iter()
+            .map(|g| (g.text.as_str(), g.short.as_deref(), g.rank))
+            .collect();
         assert_eq!(
-            strip_line(&s),
-            resting("120 in · 45 out · 12% ctx"),
-            "the estimate is superseded, not appended"
+            ranks,
+            vec![
+                ("test-model", None, RANK_MODEL),
+                ("1 in · 2 out", None, RANK_USAGE),
+                ("undo ready", None, KEEP),
+                ("0/1 wiring", Some("0/1"), RANK_TODO),
+                ("◎ /goal active · 0m", Some("◎ 0m"), RANK_GOAL),
+            ]
         );
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 0,
+        };
+        assert_eq!(strip_segments(&s)[0].rank, KEEP, "the phase never drops");
     }
 
     /// 0034: an active goal rides the strip as its own suffix — after the

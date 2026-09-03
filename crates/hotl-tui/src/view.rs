@@ -1454,84 +1454,205 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         .zip(anim::snake_ramp(&state.phase, p))
         .map(|(c, color)| Span::styled(c.to_string(), Style::new().fg(color)))
         .collect();
-    let text = anim::strip_text(state);
-    if !text.is_empty() {
-        spans.push(Span::raw(format!(" {text}")));
+    // Three zones on one row (0049 T1): the snake, the left text, and the
+    // chip cluster at the right edge. Width runs out by rank — fold, then
+    // drop, then elide the text — so a chip is never painted over a word.
+    let (left, chips) = fit_strip(
+        anim::strip_segments(state),
+        strip_chips(state, p),
+        anim::WIDTH,
+        area.width as usize,
+    );
+    if !left.is_empty() {
+        spans.push(Span::raw(format!(" {left}")));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(style), area);
-
-    // Session-name chip, right-aligned on the strip (the Claude-style badge
-    // just above the input). The left side stays reserved for the activity
-    // glyphs; too-narrow terminals drop the chip rather than collide.
-    if let Some(name) = &state.session_name {
-        let avail = area.width.saturating_sub(14) as usize;
-        if avail >= 8 {
-            let mut label: String = name.chars().take(avail - 2).collect();
-            if label.chars().count() < name.chars().count() {
-                label.pop();
-                label.push('…');
-            }
-            let chip = format!(" {label} ");
-            let w = chip.chars().count() as u16;
-            let rect = Rect {
-                x: area.x + area.width - w,
-                y: area.y,
-                width: w,
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(chip).style(Style::new().fg(p.band).bg(p.accent).bold()),
-                rect,
-            );
-        }
+    let mut x = area.right();
+    for chip in &chips {
+        let w = chip.text.chars().count() as u16;
+        x = x.saturating_sub(w);
+        let rect = Rect {
+            x,
+            y: area.y,
+            width: w,
+            height: 1,
+        };
+        frame.render_widget(Paragraph::new(chip.text.as_str()).style(chip.style), rect);
     }
+}
 
-    // Mode badge, just left of the name chip. Always drawn: silence used to
-    // mean "ask", but a narrow terminal drops the chip too, so absence was
-    // ambiguous — and the mode it implied was wrong (`hotl setup` writes
-    // `mode = "bypass"`, evaluation §5.7). A supervision tool states its
-    // posture; it does not imply it by omission.
-    //
-    // Both axes ride one chip (`plan · bypass`): they are independent, and a
-    // badge showing only the mode would hide half the posture.
+/// A right-zone chip: text with its own style, plus a drop rank.
+struct Chip {
+    text: String,
+    style: Style,
+    rank: u8,
+}
+
+/// The name chip's text cap: a long name truncates before it ranks, so it
+/// still fits at 80 columns instead of dropping.
+const NAME_CHIP_MAX: usize = 40;
+
+/// The name chip's rank — between usage detail and the model name.
+const RANK_NAME_CHIP: u8 = 4;
+
+/// The strip's right zone, right-to-left: session name, mode, context
+/// share, flag count — the flags nearest the text. Only the name may drop.
+fn strip_chips(state: &State, p: &Palette) -> Vec<Chip> {
+    let mut chips = Vec::new();
+    // The Claude-style badge just above the input.
+    if let Some(name) = &state.session_name {
+        let mut label: String = name.chars().take(NAME_CHIP_MAX).collect();
+        if label.chars().count() < name.chars().count() {
+            label.push('…');
+        }
+        chips.push(Chip {
+            text: format!(" {label} "),
+            style: Style::new().fg(p.band).bg(p.accent).bold(),
+            rank: RANK_NAME_CHIP,
+        });
+    }
+    // Always drawn: silence used to mean "ask", but a narrow terminal
+    // dropped the chip too, so absence was ambiguous — and the mode it
+    // implied was wrong (`hotl setup` writes `mode = "bypass"`, evaluation
+    // §5.7). A supervision tool states its posture; it does not imply it
+    // by omission.
     // INVARIANT: every mode renders its own name. Enforced by
     // `the_mode_badge_is_always_drawn`. The one badge-less state is
     // pre-open (0033 Task 8b, `mode` empty): no session exists yet, and
     // rendering *no* mode is the only honest option — never a guessed one.
     if !state.mode.is_empty() {
-        let chip = if state.plan {
-            format!(" plan · {} ", state.mode)
-        } else {
-            format!(" {} ", state.mode)
-        };
-        let w = chip.chars().count() as u16;
-        if w <= area.width {
-            let name_w = state
-                .session_name
-                .as_ref()
-                .map(|n| (n.chars().count() as u16 + 2).min(area.width.saturating_sub(14).max(2)))
-                .unwrap_or(0);
-            if w + name_w <= area.width {
-                // Unattended postures wear the blocked color: nobody is being
-                // consulted on this session's tool calls. Plan outranks that —
-                // it is the posture the user deliberately chose.
-                let style = if state.plan {
-                    Style::new().fg(p.band).bg(p.accent).bold()
-                } else {
-                    match state.mode.as_str() {
-                        "bypass" | "dontask" => Style::new().fg(p.band).bg(p.blocked).bold(),
-                        _ => Style::new().fg(p.muted).bg(p.band),
-                    }
-                };
-                let rect = Rect {
-                    x: area.x + area.width - name_w - w,
-                    y: area.y,
-                    width: w,
-                    height: 1,
-                };
-                frame.render_widget(Paragraph::new(chip).style(style), rect);
-            }
+        chips.push(Chip {
+            text: mode_chip_text(state),
+            style: mode_chip_style(state, p),
+            rank: anim::KEEP,
+        });
+    }
+    // The context share (0040): the last turn's resident context, or the
+    // at-open estimate before any turn completes — a resumed session
+    // inherits real fullness, a fresh seed occupies tokens.
+    if let Some(pct) = state
+        .live_context
+        .or(state.open_context)
+        .and_then(|l| crate::app::ctx_pct(l, state.context_window))
+    {
+        chips.push(Chip {
+            text: format!(" {pct}% "),
+            style: Style::new().fg(p.muted).bg(p.band),
+            rank: anim::KEEP,
+        });
+    }
+    // Flag chip (0036): how many calls ran (or were refused) on a ⚑ notice
+    // instead of an ask. A running count, never cleared mid-session, so an
+    // unattended run's flags survive scrollback.
+    if state.flag_count > 0 {
+        chips.push(Chip {
+            text: format!(" ⚑ {} ", state.flag_count),
+            style: Style::new().fg(p.band).bg(p.blocked).bold(),
+            rank: anim::KEEP,
+        });
+    }
+    chips
+}
+
+/// `plan · bypass` — both posture axes on one chip: they are independent,
+/// and a badge showing only the mode would hide half the posture.
+fn mode_chip_text(state: &State) -> String {
+    if state.plan {
+        format!(" plan · {} ", state.mode)
+    } else {
+        format!(" {} ", state.mode)
+    }
+}
+
+/// Unattended postures wear the blocked color: nobody is being consulted
+/// on this session's tool calls. Plan outranks that — it is the posture the
+/// user deliberately chose.
+fn mode_chip_style(state: &State, p: &Palette) -> Style {
+    if state.plan {
+        Style::new().fg(p.band).bg(p.accent).bold()
+    } else {
+        match state.mode.as_str() {
+            "bypass" | "dontask" => Style::new().fg(p.band).bg(p.blocked).bold(),
+            _ => Style::new().fg(p.muted).bg(p.band),
         }
+    }
+}
+
+/// Fold, then drop, by rank until the left text and the chips fit `width`
+/// with at least two cells between them; as a last resort elide the left
+/// text at a ` · ` boundary. Returns (left text, surviving chips).
+fn fit_strip(
+    mut segs: Vec<anim::Segment>,
+    mut chips: Vec<Chip>,
+    snake_w: usize,
+    width: usize,
+) -> (String, Vec<Chip>) {
+    let join = |segs: &[anim::Segment]| {
+        segs.iter()
+            .map(|s| s.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" · ")
+    };
+    let chips_w = |chips: &[Chip]| chips.iter().map(|c| c.text.chars().count()).sum::<usize>();
+    let fits = |segs: &[anim::Segment], chips: &[Chip]| {
+        snake_w + 1 + join(segs).chars().count() + 2 + chips_w(chips) <= width
+    };
+    while !fits(&segs, &chips) {
+        // Lowest rank first; a foldable segment folds before anything drops.
+        let seg = segs
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.rank != anim::KEEP)
+            .min_by_key(|(_, s)| s.rank)
+            .map(|(i, _)| i);
+        let chip = chips
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.rank != anim::KEEP)
+            .min_by_key(|(_, c)| c.rank)
+            .map(|(i, _)| i);
+        match (seg, chip) {
+            (Some(i), c) if c.is_none_or(|j| segs[i].rank <= chips[j].rank) => {
+                if let Some(short) = segs[i].short.take() {
+                    segs[i].text = short;
+                } else {
+                    segs.remove(i);
+                }
+            }
+            (_, Some(j)) => {
+                chips.remove(j);
+            }
+            // Nothing droppable is left; the elision below takes over.
+            _ => break,
+        }
+    }
+    let mut left = join(&segs);
+    let room = width.saturating_sub(snake_w + 1 + 2 + chips_w(&chips));
+    if left.chars().count() > room {
+        left = elide_at_separator(&left, room);
+    }
+    (left, chips)
+}
+
+/// Cut at the last ` · ` that leaves room for `…`; a single overlong token
+/// is cut hard.
+fn elide_at_separator(text: &str, room: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= room {
+        return text.to_string();
+    }
+    if room == 0 {
+        return String::new();
+    }
+    // `head …` — the head ends where a separator began.
+    let cut = text
+        .match_indices(" · ")
+        .map(|(at, _)| text[..at].chars().count())
+        .filter(|&n| n + 2 <= room)
+        .last();
+    match cut {
+        Some(n) => format!("{} …", chars[..n].iter().collect::<String>()),
+        None => format!("{}…", chars[..room - 1].iter().collect::<String>()),
     }
 }
 
@@ -1991,8 +2112,32 @@ mod tests {
     use super::*;
     use crate::app::State;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use hotl_tools::todo::{Todo, TodoStatus};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    /// The rows of a frame drawn at `w`×`h` — `draw` at 80×24.
+    fn draw_at(state: &State, w: u16, h: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal
+            .draw(|f| {
+                view(
+                    state,
+                    &Palette::default(),
+                    &mut TranscriptCache::default(),
+                    f,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect()
+    }
 
     fn draw_buffer(state: &State) -> ratatui::buffer::Buffer {
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -2029,14 +2174,7 @@ mod tests {
     }
 
     fn draw(state: &State) -> Vec<String> {
-        let buffer = draw_buffer(state);
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
-                    .collect()
-            })
-            .collect()
+        draw_at(state, 80, 24)
     }
 
     /// A minimal tool card — 0039 gave `Tool` its `calls`/`children` vecs,
@@ -2465,12 +2603,116 @@ mod tests {
     fn strip_shows_the_flag_chip_at_idle() {
         let mut s = State::new(true, "m".into());
         assert!(
-            !draw(&s)[STRIP].contains("flags"),
+            !draw(&s)[STRIP].contains('⚑'),
             "no chip before the first flag"
         );
         s.flag_count = 3;
         let rows = draw(&s);
-        assert!(rows[STRIP].contains("⚑ flags: 3"), "{}", rows[STRIP]);
+        assert!(rows[STRIP].contains("⚑ 3"), "{}", rows[STRIP]);
+    }
+
+    // ---- 0049 T1: strip zones and the drop order ----
+
+    /// The strip row of a frame — the one row carrying the mode chip.
+    /// Located by content, not index: T3 adds a gap row above the box on
+    /// tall terminals.
+    fn strip_row(rows: &[String], mode: &str) -> String {
+        rows.iter()
+            .find(|r| r.contains(mode))
+            .cloned()
+            .expect("a strip row")
+    }
+
+    /// The busy state every strip test starts from: a running bash, a
+    /// four-item todo list with one in progress, a name, bypass mode.
+    fn busy_strip_state() -> State {
+        let mut s = State::new(false, "claude-opus-5".into());
+        s.session_name = Some("retry-dedupe".into());
+        s.mode = "bypass".into();
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 95,
+        };
+        let todo = |content: &str, status, active_form: Option<&str>| Todo {
+            content: content.into(),
+            status,
+            active_form: active_form.map(str::to_string),
+        };
+        s.todos = vec![
+            todo("a", TodoStatus::Completed, None),
+            todo("b", TodoStatus::Completed, None),
+            todo("c", TodoStatus::InProgress, Some("running the suite")),
+            todo("d", TodoStatus::Pending, None),
+        ];
+        s
+    }
+
+    #[test]
+    fn the_strip_never_draws_a_chip_over_its_text() {
+        let s = busy_strip_state();
+        for (w, h) in [(80u16, 24u16), (60, 18), (120, 40)] {
+            let row = strip_row(&draw_at(&s, w, h), "bypass");
+            // Every ` · `-separated token on the left is a whole token: the
+            // label is there in full or folded away, never cut.
+            let left = row.split("bypass").next().unwrap();
+            assert!(
+                left.contains("running the suite") || !left.contains("running"),
+                "{w}: cut mid-word: {row}"
+            );
+            assert!(row.contains("bash · 3s"), "{w}: phase survives: {row}");
+            assert!(row.contains("2/4"), "{w}: todo count survives: {row}");
+            assert!(row.contains("bypass"), "{w}: mode chip survives: {row}");
+        }
+    }
+
+    #[test]
+    fn the_todo_label_folds_to_its_count_at_60_cols() {
+        let row = strip_row(&draw_at(&busy_strip_state(), 60, 18), "bypass");
+        assert!(row.contains("2/4") && !row.contains("running"), "{row}");
+        assert!(
+            row.contains("retry-dedupe"),
+            "the name still fits once the label folds: {row}"
+        );
+    }
+
+    #[test]
+    fn the_flag_chip_outranks_usage_detail_at_120_cols_idle() {
+        let mut s = busy_strip_state();
+        s.phase = Phase::Idle;
+        s.usage_line = Some("12.4k in · 1.8k out · 9.1k cached · 71% hit · $0.42".into());
+        s.undo_status = Some("ready".into());
+        s.flag_count = 2;
+        s.plan = true;
+        s.mode = "ask".into();
+        let row = strip_row(&draw_at(&s, 120, 40), "plan · ask");
+        assert!(row.contains("⚑ 2"), "flags: {row}");
+        assert!(row.contains("plan · ask"), "mode: {row}");
+        assert!(row.contains("undo ready"), "undo is KEEP: {row}");
+    }
+
+    #[test]
+    fn esc_to_interrupt_left_the_strip() {
+        let rows = draw(&busy_strip_state());
+        assert!(!rows[STRIP].contains("esc"), "{}", rows[STRIP]);
+    }
+
+    #[test]
+    fn the_ctx_chip_shows_open_context_before_the_first_turn() {
+        let mut s = State::new(true, "m".into());
+        s.open_context = Some(s.context_window / 8); // 12%
+        let rows = draw(&s);
+        assert!(rows[STRIP].contains(" 12% "), "{}", rows[STRIP]);
+    }
+
+    /// The last resort when nothing droppable is left: the text is cut at a
+    /// separator, never mid-token, and a lone overlong token is cut hard.
+    #[test]
+    fn elision_cuts_at_a_separator() {
+        assert_eq!(elide_at_separator("bash · 3s · 2/4", 20), "bash · 3s · 2/4");
+        assert_eq!(elide_at_separator("bash · 3s · 2/4", 12), "bash · 3s …");
+        assert_eq!(elide_at_separator("bash · 3s · 2/4", 8), "bash …");
+        assert_eq!(elide_at_separator("longtoken", 5), "long…");
+        assert_eq!(elide_at_separator("x", 0), "");
     }
 
     #[test]
