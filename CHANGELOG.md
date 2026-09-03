@@ -6,6 +6,43 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **`Ctrl-E` no longer opens `$EDITOR` — `Ctrl-G` does** (plan 0047 P0, the
+  UX redesign's table-stakes phase). `Ctrl-E` takes its readline meaning,
+  end of line, so the whole readline vocabulary reads the same in hotl as
+  in your shell; `Ctrl-G` is the editor chord Codex, opencode and Droid
+  converged on. `:e` in vim Normal is unchanged. Muscle memory on the old
+  chord now parks the cursor at the end of the line instead of suspending
+  the console.
+- **The composer is a real line editor in the default (non-vim) mode**
+  (plan 0047 P0). `←`/`→` move, across line breaks; `Delete` deletes
+  forward — a whole `[Image #N]` token when one starts at the cursor, as
+  `Backspace` already did behind one; `Alt-←`/`Alt-→` move by word; and
+  `Ctrl-A`/`Ctrl-E`/`Ctrl-K`/`Ctrl-U`/`Ctrl-W` do what they do in readline,
+  in both vim modes. No kill ring: killed text is gone. Before this the
+  arrows and `Delete` were dead keys and every `Ctrl` chord but two was
+  silently swallowed.
+- **`Ctrl-V` pastes the system clipboard, images included** (plan 0047 P0;
+  tracker #39). A copied screenshot — a bitmap, not a file — is written to
+  a temp PNG and lands as `[Image #N]` through the path a dropped file
+  already takes; copied text inserts as an ordinary paste; an empty
+  clipboard leaves a one-line notice. New dependency `arboard` (pure Rust
+  on every platform: X11 + Wayland, AppKit, Win32). Terminals that own
+  `Ctrl-V` themselves keep delivering text as a bracketed paste but never
+  an image.
+- **`/effort` is offered by the `/` completion popup** (plan 0047 P0). It
+  was dispatched but never listed, so the docs were the only way to find it.
+- **The `?` help overlay is generated from the command table and the
+  keymap** (plan 0047 P0), so it can no longer drift: it lists every
+  builtin (`/goal` and `/workflows` were missing), shows vim keys only when
+  `vim_mode` is on, and names `ctrl-g` for the editor.
+- **The `ask_user` question modal no longer dresses as a permission ask**
+  (plan 0047 P0): its own title, `a question for you`, and the accent
+  border instead of the blocked color. Blocked + `waiting on you` are now
+  exclusive to prompts where your key grants authority; the strip's phase
+  text is untouched — the turn is halted either way.
+
 ## [0.24.0] - 2026-08-20
 
 ### Fixed

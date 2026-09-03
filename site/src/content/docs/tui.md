@@ -186,6 +186,13 @@ total all degrade to an inline note on that one attachment — never an error,
 and the rest of the prompt still sends. Models whose catalog entry cannot
 take images get the text with a one-line omission note instead.
 
+`Ctrl-V` pastes the system clipboard directly. A copied screenshot — a
+bitmap, not a file — is written to a temp PNG and lands as `[Image #1]`
+exactly like a dropped file; copied text inserts as an ordinary paste;
+nothing pastable leaves a one-line notice. Linux needs X11 or Wayland.
+Terminals that own `Ctrl-V` themselves (Windows Terminal) still deliver text
+as a bracketed paste but never an image.
+
 Past roughly 24MB of base64 (~18MB of image data) alive in the session's
 live context, hotl folds older history to make room.
 
@@ -210,6 +217,23 @@ There is **no bell, ever** — salience is visual only. `hotl watch` is the thin
 
 Type and press `Enter` to prompt. **Typing while a turn runs is steering**: submit and it becomes a pinned `⤷` chip — dim while queued, and the engine folds it in at the next step. `Shift`/`Alt`+`Enter` inserts a newline.
 
+### Editing the prompt
+
+The input is a real line editor whether or not [vim keys](#vim-keys) are on:
+
+| Key | Effect |
+|---|---|
+| `←` `→` / `Home` `End` | Move one character (across line breaks) / to the line's ends |
+| `Alt-←` / `Alt-→` | Move by one word |
+| `Ctrl-A` / `Ctrl-E` | Line start / line end, as in readline |
+| `Ctrl-K` / `Ctrl-U` | Delete to the end / to the start of the line |
+| `Ctrl-W` | Delete the word before the cursor |
+| `Delete` | Delete forward — a whole `[Image #N]` / `[Pasted text …]` token when one starts at the cursor, as `Backspace` does behind one |
+| `Ctrl-G` | Open the input in `$EDITOR` (see [below](#the-editor-escape-hatch)) |
+| `Ctrl-V` | Paste the system clipboard — an image lands as `[Image #N]` (see [Pasting](#pasting)) |
+
+There is no kill ring: `Ctrl-K`/`Ctrl-U`/`Ctrl-W` discard what they delete. Vim mode's registers are the power path. Under a tmux `Ctrl-A` prefix the terminal eats line-start; `Home` remains.
+
 ## History recall
 
 Your submitted prompts are remembered across sessions (shell-style), stored under `[history]` in `config.toml` ([configuration.md](../configuration/)).
@@ -232,7 +256,7 @@ own.
 | `/effort [level]` | Set the reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`, or `default` to hand it back to the provider. Bare `/effort` reports the current rung rather than cycling — five rungs are not a toggle. Recorded durably, so `hotl resume` keeps it. See [configuration.md](../configuration/#reasoning-effort-provider-effort). |
 | `/goal [condition]` | Run until a condition is met: after each turn a small fast evaluator judges the condition against the conversation — *not yet* and the agent keeps going with the verdict's reason as guidance, *met* or *impossible* and the goal clears with a transcript notice. `◎ /goal active · Nm` rides the status strip meanwhile. Bare `/goal` reports the condition, elapsed time and turns taken; `/goal clear` (or `stop`/`off`/`reset`/`none`/`cancel`) ends it early. There is no built-in turn cap — bound it in the condition itself ("…or stop after 20 turns"). An active goal survives `hotl resume` (counters restart); an achieved or cleared one does not. Headless: `hotl -p --goal "<condition>" "<prompt>"` runs the loop in one invocation. |
 | `/reload` | Re-read `config.toml` without losing the session (see [Reloading config](#reloading-config)). |
-| `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. |
+| `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. The overlay is generated from the live command table and the keymap, so it lists every command and shows vim keys only when `vim_mode` is on. |
 | `/status` | What this session is running: name, model, permission mode and plan state, reasoning effort, context window, todo count. |
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
 | `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
@@ -421,7 +445,8 @@ In headless (`-p`) or JSON mode there is no one to ask, so the question resolves
 | `↑ ↓` | Recall prompt history at the buffer's edges (see [History recall](#history-recall)); `Ctrl-R` searches it; move the agent-band highlight from Normal with the input empty |
 | `/` then `↑ ↓` | Pick from the command menu; `Tab` completes, `Enter` runs it, `Esc` dismisses |
 | `Enter` | Submit (either mode) |
+| arrows, `Ctrl-A/E/K/U/W` | The [line-editor keys](#editing-the-prompt) work in both modes |
 
 ## The `$EDITOR` escape hatch
 
-`Ctrl-E` (any mode) or `:e` (normal mode) suspends the console and opens the current input in `$EDITOR` (falls back to `vi`). Save and quit to bring the text back into the input; quit without saving to leave it unchanged.
+`Ctrl-G` (any mode) or `:e` (normal mode) suspends the console and opens the current input in `$EDITOR` (falls back to `vi`). Save and quit to bring the text back into the input; quit without saving to leave it unchanged. (`Ctrl-E` used to do this; it is end-of-line now, as in readline.)
