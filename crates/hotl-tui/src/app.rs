@@ -1733,8 +1733,17 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         notice(state, "interrupting — ctrl-c again quits".into());
         return vec![Cmd::Cancel];
     }
+    // The help table scrolls on the arrow and page keys (0049 T7); every
+    // other key closes it.
     if state.help_open {
-        state.help_open = false;
+        match key.code {
+            KeyCode::PageUp | KeyCode::PageDown => {
+                modal_page(state, key);
+            }
+            KeyCode::Up => state.modal_scroll = state.modal_scroll.saturating_sub(1),
+            KeyCode::Down => state.modal_scroll = state.modal_scroll.saturating_add(1),
+            _ => state.help_open = false,
+        }
         return Vec::new();
     }
     // Ctrl-T expands model reasoning. Above the editor for the same reason as
@@ -4896,6 +4905,25 @@ mod tests {
                 if selected == &vec!["B".to_string()]),
             "{cmds:?}"
         );
+    }
+
+    /// 0049 T7: the help table scrolls on ↓/pgdn and closes on anything else.
+    #[test]
+    fn help_scrolls_on_arrows_and_page_keys_and_closes_on_any_other_key() {
+        let mut s = State::test_default();
+        press(&mut s, KeyCode::Char('?'));
+        assert!(s.help_open);
+        press(&mut s, KeyCode::Down);
+        press(&mut s, KeyCode::PageDown);
+        assert!(s.help_open, "scroll keys keep it open");
+        assert_eq!(s.modal_scroll, 1 + MODAL_PAGE);
+        press(&mut s, KeyCode::Up);
+        assert_eq!(s.modal_scroll, MODAL_PAGE);
+        press(&mut s, KeyCode::Char('x'));
+        assert!(!s.help_open, "any other key closes");
+        assert!(s.editor.is_empty(), "the closing key is swallowed");
+        press(&mut s, KeyCode::Char('?'));
+        assert_eq!(s.modal_scroll, 0, "reopening starts at the top");
     }
 
     #[test]

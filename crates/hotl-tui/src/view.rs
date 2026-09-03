@@ -315,8 +315,10 @@ pub fn view(state: &State, p: &Palette, cache: &mut TranscriptCache, frame: &mut
     if matches!(state.phase, Phase::WaitingEgress { .. }) {
         render_egress(state, p, frame, transcript);
     }
+    // Over the whole frame (0049 T7): the table is wider and taller than
+    // the transcript band alone can hold at 80×24.
     if state.help_open {
-        render_help(state, p, frame, transcript);
+        render_help(state, p, frame, area);
     }
     if let Some(sel) = &state.selection {
         highlight(sel, frame);
@@ -1906,10 +1908,20 @@ enum Fold {
 /// A modal body: rows with their fold rule.
 type Body<'a> = Vec<(Line<'a>, Fold)>;
 
-/// Content width plus padding, clamped to 60–90% of `over`; centered.
-fn modal_rect(over: Rect, content_w: u16, rows: u16) -> Rect {
-    let lo = over.width * 60 / 100;
-    let hi = over.width * 90 / 100;
+/// The widest an ask/question/egress modal grows, as a share of the frame.
+const MODAL_MAX_PCT: u16 = 90;
+
+/// A modal's frame: its title, border style, and how wide it may grow.
+struct Chrome<'a> {
+    title: &'a str,
+    border: Style,
+    max_pct: u16,
+}
+
+/// Content width plus padding, clamped to 60–`max_pct`% of `over`; centered.
+fn modal_rect(over: Rect, content_w: u16, rows: u16, max_pct: u16) -> Rect {
+    let lo = (u32::from(over.width) * 60 / 100) as u16;
+    let hi = (u32::from(over.width) * u32::from(max_pct) / 100) as u16;
     let width = (content_w + 4)
         .clamp(lo.max(10), hi.max(10))
         .min(over.width);
@@ -1951,14 +1963,13 @@ fn draw_modal(
     frame: &mut Frame,
     p: &Palette,
     over: Rect,
-    title: &str,
-    border: Style,
+    chrome: Chrome,
     body: &[(Line, Fold)],
     scroll: usize,
 ) {
     let content_w = body.iter().map(|(l, _)| l.width()).max().unwrap_or(0) as u16;
     // Width first, so the rows can be laid out; the height follows them.
-    let inner_w = modal_rect(over, content_w, 0)
+    let inner_w = modal_rect(over, content_w, 0, chrome.max_pct)
         .width
         .saturating_sub(4)
         .max(1) as usize;
@@ -1982,9 +1993,11 @@ fn draw_modal(
             ));
         }
     }
-    let area = modal_rect(over, content_w, rows.len() as u16 + 2);
+    let area = modal_rect(over, content_w, rows.len() as u16 + 2, chrome.max_pct);
     frame.render_widget(Clear, area);
-    let block = Block::bordered().title(title).border_style(border);
+    let block = Block::bordered()
+        .title(chrome.title)
+        .border_style(chrome.border);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let inner = Rect {
@@ -2063,8 +2076,11 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
         frame,
         p,
         over,
-        " waiting on you ",
-        Style::new().fg(p.blocked),
+        Chrome {
+            title: " waiting on you ",
+            border: Style::new().fg(p.blocked),
+            max_pct: MODAL_MAX_PCT,
+        },
         &body,
         state.modal_scroll,
     );
@@ -2148,54 +2164,90 @@ fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
         frame,
         p,
         over,
-        " a question for you ",
-        Style::new().fg(p.accent),
+        Chrome {
+            title: " a question for you ",
+            border: Style::new().fg(p.accent),
+            max_pct: MODAL_MAX_PCT,
+        },
         &body,
         state.modal_scroll,
     );
 }
 
-/// Columns the command list wraps at: two lines for the builtin table on the
-/// 70%-of-80 overlay, with room for the border.
-const HELP_COLS: usize = 64;
+/// Columns the slash-command list wraps at inside the help table.
+const HELP_SLASH_COLS: usize = 58;
+
+/// The help table's label column: the widest label plus one space.
+const HELP_LABEL_COLS: usize = 11;
 
 /// Help content assembled from the live command table and the mode flags —
 /// never a hand-maintained list (it drifted: /goal and /workflows were
-/// missing, and a rebind made two lines false). Sections: composer, vim
-/// (only when on), transcript, agent band + esc ladder, asks, commands.
-pub(crate) fn help_lines(state: &State) -> Vec<String> {
-    let mut lines = vec![
-        "enter send · shift/alt-enter newline · ctrl-v paste (clipboard image or text)",
-        "← → home end · ctrl-a/e line start/end · alt-←/→ by word · delete forward",
-        "ctrl-k/u kill to end/start · ctrl-w delete word back · ctrl-g open $EDITOR",
-        "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
-        "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
+/// missing, and a rebind made two lines false). `(label, text)` rows, the
+/// label empty on continuation rows (0049 T7): a table 78 cells wide that
+/// fits 80×24 with vim off and scrolls when it must.
+pub(crate) fn help_lines(state: &State) -> Vec<(&'static str, String)> {
+    let row = |label: &'static str, text: &str| (label, text.to_string());
+    let mut rows = vec![
+        row(
+            "composer",
+            "enter send · shift-enter newline · ctrl-v paste image/text",
+        ),
+        row(
+            "",
+            "← → home end · ctrl-a/e line ends · alt-←/→ by word · del",
+        ),
+        row(
+            "",
+            "ctrl-k/u kill to end/start · ctrl-w word back · ctrl-g $EDITOR",
+        ),
     ];
     if state.vim_mode {
-        lines.extend([
-            "esc normal mode · i a I A o O insert · h l 0 $ w b e motions (+counts)",
-            "d c y operators · dd cc yy x p u · :e open $EDITOR · j k scroll (no band)",
+        rows.extend([
+            row(
+                "vim",
+                "esc normal · i a I A o O insert · h l 0 $ w b e (+counts)",
+            ),
+            row("", "d c y operators · dd cc yy x p u · :e $EDITOR"),
         ]);
     }
-    lines.extend([
-        "pgup pgdn scroll · ctrl-home/end jump · mouse wheel · ctrl-t expand thinking",
-        "drag to select and copy · shift-drag for the terminal's own select",
-        if state.vim_mode {
-            "↑↓ (j/k normal) agent band · enter open · esc back"
-        } else {
-            "↑↓ agent band · enter open · esc back"
-        },
-        "esc (empty) interrupt · esc again insist · ctrl-c quit (busy: cancel, again quit)",
-        "asks: y allow · n deny, then a reason · s allow + credential reads (bash)",
+    rows.extend([
+        row("history", "↑ ↓ recall (prefix-aware) · ctrl-r search"),
+        row(
+            "commands",
+            "/ opens completion · ↑↓ pick · tab complete · enter run",
+        ),
+        row(
+            "transcript",
+            "pgup pgdn · ctrl-home/end · wheel · ctrl-t thinking",
+        ),
+        row(
+            "",
+            "drag to copy · shift-drag for the terminal's own select",
+        ),
+        row(
+            "agents",
+            if state.vim_mode {
+                "↑↓ (j/k normal) band · enter open · esc back"
+            } else {
+                "↑↓ band · enter open · esc back"
+            },
+        ),
+        row("interrupt", "esc (empty) · esc again insists · ctrl-c quit"),
+        row(
+            "asks",
+            "y allow · n deny + reason · s allow + credential reads",
+        ),
     ]);
-    let mut out: Vec<String> = lines.into_iter().map(String::from).collect();
     let commands: Vec<String> = crate::complete::builtins()
         .into_iter()
         .map(|c| format!("/{}", c.name))
         .collect();
-    out.extend(pack(&commands, HELP_COLS));
-    out.push("any key closes this help".into());
-    out
+    for (i, line) in pack(&commands, HELP_SLASH_COLS).into_iter().enumerate() {
+        rows.push((if i == 0 { "slash" } else { "" }, line));
+    }
+    rows.push(row("", ""));
+    rows.push(row("", "any key closes this help"));
+    rows
 }
 
 /// Greedy word-wrap of `words` into lines no wider than `cols` chars.
@@ -2213,19 +2265,37 @@ fn pack(words: &[String], cols: usize) -> Vec<String> {
     out
 }
 
+/// The help table over the whole frame (0049 T7): label column muted, text
+/// in ink, sized from the widest row; `modal_scroll` is the window.
 fn render_help(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
-    let lines: Vec<Line> = help_lines(state)
+    let body: Body = help_lines(state)
         .into_iter()
-        .map(|l| Line::styled(l, Style::new().fg(p.ink)))
+        .map(|(label, text)| {
+            (
+                Line::from(vec![
+                    Span::styled(
+                        format!("{label:<HELP_LABEL_COLS$}"),
+                        Style::new().fg(p.muted),
+                    ),
+                    Span::styled(text, Style::new().fg(p.ink)),
+                ]),
+                Fold::Prose,
+            )
+        })
         .collect();
-    let area = centered(over, 70, lines.len() as u16 + 2);
-    frame.render_widget(Clear, area);
-    let block = Block::bordered()
-        .title(" keys ")
-        .border_style(Style::new().fg(p.accent));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-    frame.render_widget(Paragraph::new(lines), inner);
+    draw_modal(
+        frame,
+        p,
+        over,
+        Chrome {
+            title: " keys ",
+            border: Style::new().fg(p.accent),
+            // Wider than the other modals: the table is 78 cells by design.
+            max_pct: 100,
+        },
+        &body,
+        state.modal_scroll,
+    );
 }
 
 /// The egress modal (plan 0026). Rendered deliberately unlike `render_ask`:
@@ -2265,8 +2335,11 @@ fn render_egress(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
         frame,
         p,
         over,
-        " network egress ",
-        Style::new().fg(p.blocked),
+        Chrome {
+            title: " network egress ",
+            border: Style::new().fg(p.blocked),
+            max_pct: MODAL_MAX_PCT,
+        },
         &body,
         state.modal_scroll,
     );
@@ -2352,20 +2425,6 @@ fn above_input(over: Rect, width: u16, height: u16, gutter: u16) -> Rect {
     Rect {
         x: over.x + gutter,
         y: over.y + over.height - height,
-        width,
-        height,
-    }
-}
-
-/// A rect `pct`% of `over`'s width, `height` tall, centered in it.
-fn centered(over: Rect, pct: u16, height: u16) -> Rect {
-    let width = (over.width * pct / 100).max(10).min(over.width);
-    let height = height.min(over.height);
-    let x = over.x + (over.width - width) / 2;
-    let y = over.y + (over.height - height) / 2;
-    Rect {
-        x,
-        y,
         width,
         height,
     }
@@ -2617,10 +2676,7 @@ mod tests {
         let mut s = State::test_default();
         s.help_open = true;
         let rows = draw(&s);
-        assert!(
-            rows.iter().any(|r| r.contains("drag to select and copy")),
-            "{rows:?}"
-        );
+        assert!(rows.iter().any(|r| r.contains("drag to copy")), "{rows:?}");
     }
 
     #[test]
@@ -3763,9 +3819,18 @@ mod tests {
 
     /// The drift guard: `/goal` and `/workflows` were missing from the old
     /// hardcoded list.
+    /// The help texts joined — what a reader can find on the overlay.
+    fn help_text(state: &State) -> String {
+        help_lines(state)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn help_lists_every_builtin_command() {
-        let all = help_lines(&State::new(false, "m".into())).join("\n");
+        let all = help_text(&State::new(false, "m".into()));
         for cmd in crate::complete::builtins() {
             assert!(
                 all.contains(&format!("/{}", cmd.name)),
@@ -3778,31 +3843,52 @@ mod tests {
     #[test]
     fn help_hides_vim_keys_when_vim_is_off() {
         let off = help_lines(&State::new(false, "m".into()));
-        assert!(!off.iter().any(|l| l.contains("operators")), "{off:#?}");
-        assert!(!off.iter().any(|l| l.contains("j/k")), "{off:#?}");
+        assert!(off.iter().all(|(label, _)| *label != "vim"), "{off:#?}");
+        assert!(!off.iter().any(|(_, l)| l.contains("j/k")), "{off:#?}");
         let on = help_lines(&State::new(true, "m".into()));
-        assert!(on.iter().any(|l| l.contains("operators")), "{on:#?}");
+        assert!(on.iter().any(|(label, _)| *label == "vim"), "{on:#?}");
     }
 
     #[test]
     fn help_names_ctrl_g_not_ctrl_e_for_the_editor() {
-        let all = help_lines(&State::new(true, "m".into())).join("\n");
-        assert!(all.contains("ctrl-g open $EDITOR"), "{all}");
+        let all = help_text(&State::new(true, "m".into()));
+        assert!(all.contains("ctrl-g $EDITOR"), "{all}");
         assert!(!all.contains("ctrl-e"), "{all}");
         assert!(all.contains("ctrl-a/e"), "{all}");
     }
 
-    /// `centered(over, 70, len + 2)` must fit a 24-row terminal in both modes.
+    /// 0049 T7: every row of the table is on screen, whole, at 80×24 — vim
+    /// on and off — and the labels sit in their own column.
     #[test]
-    fn help_fits_the_overlay_budget_in_both_modes() {
+    fn every_help_row_is_whole_at_80x24_in_both_modes() {
         for vim in [false, true] {
-            let lines = help_lines(&State::new(vim, "m".into()));
-            assert!(lines.len() <= 16, "vim={vim}: {} lines", lines.len());
-            assert_eq!(
-                lines.last().map(String::as_str),
-                Some("any key closes this help")
-            );
+            let mut s = State::new(vim, "m".into());
+            s.help_open = true;
+            let rows = draw(&s);
+            let all = rows.join("\n");
+            for (_, text) in help_lines(&s) {
+                assert!(all.contains(&text), "vim={vim}: clipped: {text}");
+            }
+            let composer = rows.iter().find(|r| r.contains("composer")).unwrap();
+            assert!(composer.contains("composer   enter send"), "{composer:?}");
+            // Sized from its widest row: past the 90% the other modals get,
+            // never past 78 (the table's design width).
+            let top = rows.iter().find(|r| r.contains("┌ keys")).unwrap();
+            let width = top.trim().chars().count();
+            assert!((73..=78).contains(&width), "{width}: {top:?}");
         }
+    }
+
+    #[test]
+    fn help_scrolls_on_a_short_terminal() {
+        let mut s = State::new(true, "m".into());
+        s.help_open = true;
+        let rows = draw_at(&s, 80, 14);
+        assert!(rows.iter().any(|r| r.contains("more · pgdn")), "{rows:#?}");
+        s.modal_scroll = 6;
+        assert!(draw_at(&s, 80, 14)
+            .iter()
+            .any(|r| r.contains("any key closes")));
     }
 
     /// 0043: the help overlay names the agent band.
@@ -3812,7 +3898,7 @@ mod tests {
         s.help_open = true;
         let all = draw(&s).join("\n");
         assert!(
-            all.contains("↑↓ (j/k normal) agent band · enter open · esc back"),
+            all.contains("agents     ↑↓ (j/k normal) band · enter open · esc back"),
             "{all}"
         );
     }
