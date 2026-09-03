@@ -91,7 +91,10 @@ fn should_speculate(estimate: u64, window: u64, image_bytes: usize) -> bool {
 /// `an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the_combined_cap`
 /// (the combined cap) and `max_turns_is_enforced_across_a_compaction` (that
 /// per-turn counters survive a fold).
-const TURN_EXTENSION_MAX: u32 = 3;
+///
+/// 8 is Claude Code's Stop-hook block cap, owner-matched 2026-09-03 (0048
+/// OD2); it was 3. `TODO_GATE_MAX` keeps its own bound inside this budget.
+const TURN_EXTENSION_MAX: u32 = 8;
 /// The TodoGate's own bound within the shared budget (01 §agent-loop's
 /// `max_fires_per_prompt`).
 /// INVARIANT: the gate never blocks an unattended (`Auto`/`DontAsk`) run beyond

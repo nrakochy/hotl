@@ -18,6 +18,12 @@ semver promise of their own.
 
 ### Changed
 
+- **A turn can be told "keep going" eight times per prompt, not three**
+  (plan 0048). The shared budget the `stop` hook's `block` and hotl's own
+  todo-list nudge draw from (`TURN_EXTENSION_MAX`) now matches Claude
+  Code's Stop-hook block cap. The todo nudge keeps its own bound of two
+  within it; `max_turns`, the doom-loop detector and the tool failure
+  budget are unchanged.
 - **`Ctrl-E` no longer opens `$EDITOR` — `Ctrl-G` does** (plan 0047 P0, the
   UX redesign's table-stakes phase). `Ctrl-E` takes its readline meaning,
   end of line, so the whole readline vocabulary reads the same in hotl as

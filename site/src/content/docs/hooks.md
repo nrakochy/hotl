@@ -88,7 +88,7 @@ A `deny` becomes an error tool result carrying your message. A `rewrite` swaps t
 ```json
 {"decision":"block","reason":"tests haven't been run yet"}
 ```
-or `{"decision":"allow"}` (the default for anything else). A `block` injects your `reason` as a reminder and lets the model keep going — **bounded**: `stop` shares one small per-prompt budget with hotl's own todo-list nudge, so a hook that always blocks can never wedge a turn forever.
+or `{"decision":"allow"}` (the default for anything else). A `block` injects your `reason` as a reminder and lets the model keep going — **bounded**: `stop` shares one per-prompt budget of eight extensions (Claude Code's Stop-hook cap) with hotl's own todo-list nudge, so a hook that always blocks can never wedge a turn forever.
 
 **session_end** — stdin `{"event":"session_end","hookEventName":"SessionEnd"}`. Runs to completion at actor shutdown (bounded by its own timeout) rather than fire-and-forget — the process waits for it, so it's guaranteed to actually run before `hotl` exits.
 

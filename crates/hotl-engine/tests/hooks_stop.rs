@@ -111,7 +111,7 @@ async fn an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the
     // AND the stop hook always wants to Block — if the two gates had
     // separate budgets, worst-case extensions would be the SUM of their caps
     // (TODO_GATE_MAX=2 + something for stop). They must instead share ONE
-    // counter (TURN_EXTENSION_MAX=3 total), so this can never wedge the run.
+    // counter (TURN_EXTENSION_MAX=8 total), so this can never wedge the run.
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig::default();
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
@@ -119,13 +119,12 @@ async fn an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the
     // However many times the loop asks, always reply text-only — the
     // scripted provider errors if exhausted, which would itself fail the
     // test, so give it more samples than the combined budget could ever
-    // consume (4: 3 extensions + 1 final Done).
-    let provider = Arc::new(ScriptedProvider::new(vec![
-        ScriptedProvider::text_reply("still working"),
-        ScriptedProvider::text_reply("still working"),
-        ScriptedProvider::text_reply("still working"),
-        ScriptedProvider::text_reply("done"),
-    ]));
+    // consume (9: 8 extensions + 1 final Done).
+    let mut script: Vec<_> = (0..8)
+        .map(|_| ScriptedProvider::text_reply("still working"))
+        .collect();
+    script.push(ScriptedProvider::text_reply("done"));
+    let provider = Arc::new(ScriptedProvider::new(script));
     let hooks = InProcessHooks::new().on_stop(|_outcome| StopDecision::Block {
         reason: "owner policy: always keep going".into(),
     });
@@ -158,9 +157,9 @@ async fn an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the
     // The always-Block hook composed with an ever-unfinished TodoGate must
     // still let the turn end — never `TurnLimit`, never an infinite loop.
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
-    // Exactly 4 samples were drawn from the script (3 extended + 1 final) —
+    // Exactly 9 samples were drawn from the script (8 extended + 1 final) —
     // proof the combined budget capped it, not an unbounded run.
-    assert_eq!(provider.request_count(), 4);
+    assert_eq!(provider.request_count(), 9);
 
     let entries = logged_payloads(&log_path);
     let reminders = entries
@@ -178,8 +177,8 @@ async fn an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the
         })
         .count();
     assert_eq!(
-        reminders, 3,
-        "the combined TodoGate + Stop budget must cap at TURN_EXTENSION_MAX (3) total, \
+        reminders, 8,
+        "the combined TodoGate + Stop budget must cap at TURN_EXTENSION_MAX (8) total, \
          never the sum of each gate's own bound"
     );
 }
