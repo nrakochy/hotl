@@ -29,6 +29,19 @@ Local conventions on top of that:
 - **Rust practices** — idiomatic and warning-clean; no `unsafe` without a written justification.
 - **Tests are golden and deterministic.** The engine is tested by driving the real actor/turn/persistence stack with a scripted provider (`hotl-testkit`) and asserting on the normalized log. Add a scenario there for behavior changes.
 
+## Comments that assert a guarantee
+
+A comment claiming a behavioural or safety property must say which of two things it is:
+
+```rust
+// INVARIANT: <property>. Enforced by <test name>.
+// INVARIANT (unimplemented — see <plan>): <property>.
+```
+
+A bare prose guarantee with neither marker nor a named test is a defect. Name the test after the mechanism, not the aspiration — a test named for a property the code cannot have is worse than no test, because it stops the next reader from checking.
+
+The change that implements a deferred property retires its `(unimplemented …)` marker in the same commit, replacing it with the enforced form naming the test. An unretired marker is a stale claim and gets fixed like one.
+
 ## Security-relevant changes
 
 Read [docs/SECURITY.md](docs/SECURITY.md) first. Anything touching the permission gate, the sandbox, allow-rules, the untrusted-content envelope, or data-at-rest needs its routing-table row updated in the same PR. "Defaults are the safety design" — a change that weakens a default needs an explicit rationale.
