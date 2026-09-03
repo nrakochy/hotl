@@ -11,12 +11,12 @@
 //! `durable_append_fsyncs_before_it_acks` and, at the engine level, by
 //! `hotl-engine/tests/durability.rs`.
 //!
-//! INVARIANT (unimplemented — see
-//! specs/exec-plans/active/0018-remediation-session-lifecycle.md): the read
-//! path does not yet check `format_version`, and `apply_log` still hard-errors
-//! on a torn trailing line instead of tolerating it at EOF. The write path can
-//! no longer produce one (`seal_and_truncate`), but a log truncated by
-//! anything else still bricks on read.
+//! INVARIANT: a torn trailing line — which the write path can no longer
+//! produce (`seal_and_truncate`) — is recovered on read as a warning with only
+//! that entry lost, never a hard error. Enforced by
+//! `replay_recovers_the_prefix_of_a_torn_final_line`. The same read path
+//! warns on a newer `format_version` instead of refusing the log, enforced by
+//! `replay_warns_when_the_log_is_from_a_newer_format`.
 
 pub mod retention;
 pub mod shadow;
