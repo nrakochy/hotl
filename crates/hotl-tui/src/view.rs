@@ -1697,8 +1697,9 @@ fn mode_chip_style(state: &State, p: &Palette) -> Style {
 }
 
 /// Fold, then drop, by rank until the left text and the chips fit `width`
-/// with at least two cells between them; as a last resort elide the left
-/// text at a ` · ` boundary. Returns (left text, surviving chips).
+/// (each chip carries its own cell of padding, so no further gap is
+/// reserved); as a last resort elide the left text at a ` · ` boundary.
+/// Returns (left text, surviving chips).
 fn fit_strip(
     mut segs: Vec<anim::Segment>,
     mut chips: Vec<Chip>,
@@ -1713,7 +1714,7 @@ fn fit_strip(
     };
     let chips_w = |chips: &[Chip]| chips.iter().map(|c| c.text.chars().count()).sum::<usize>();
     let fits = |segs: &[anim::Segment], chips: &[Chip]| {
-        snake_w + 1 + join(segs).chars().count() + 2 + chips_w(chips) <= width
+        snake_w + 1 + join(segs).chars().count() + chips_w(chips) <= width
     };
     while !fits(&segs, &chips) {
         // Lowest rank first; a foldable segment folds before anything drops.
@@ -1745,7 +1746,7 @@ fn fit_strip(
         }
     }
     let mut left = join(&segs);
-    let room = width.saturating_sub(snake_w + 1 + 2 + chips_w(&chips));
+    let room = width.saturating_sub(snake_w + 1 + chips_w(&chips));
     if left.chars().count() > room {
         left = elide_at_separator(&left, room);
     }
@@ -1964,6 +1965,31 @@ fn modal_rect(over: Rect, content_w: u16, rows: u16, max_pct: u16) -> Rect {
     }
 }
 
+/// Prose wrap with a hanging indent: a row that starts with spaces (an
+/// option's description, a help continuation) keeps that indent on every
+/// row it wraps onto, so the text column stays a column.
+fn wrap_hanging<'a>(line: &Line<'a>, w: usize) -> Vec<Line<'a>> {
+    let indent = line
+        .spans
+        .first()
+        .map(|s| s.content.chars().take_while(|c| *c == ' ').count())
+        .unwrap_or(0);
+    // Too little room for a hanging column: wrap flat.
+    if indent == 0 || indent + 8 > w {
+        return wrap::line(line, w);
+    }
+    let mut stripped = line.clone();
+    let first = &mut stripped.spans[0];
+    *first = Span::styled(first.content[indent..].to_string(), first.style);
+    wrap::line(&stripped, w - indent)
+        .into_iter()
+        .map(|mut wl| {
+            wl.spans.insert(0, Span::raw(" ".repeat(indent)));
+            wl
+        })
+        .collect()
+}
+
 /// A row cut hard at `w` cells with `…`, keeping the line's own style.
 fn clip_line<'a>(line: &Line<'a>, w: usize) -> Line<'a> {
     if line.width() <= w {
@@ -2006,7 +2032,7 @@ fn draw_modal(
     let mut rows: Vec<Line> = Vec::new();
     for (line, fold) in body {
         match fold {
-            Fold::Prose => rows.extend(wrap::line(line, inner_w)),
+            Fold::Prose => rows.extend(wrap_hanging(line, inner_w)),
             Fold::Clip => rows.push(clip_line(line, inner_w)),
         }
     }
@@ -3329,6 +3355,46 @@ mod tests {
         assert!(
             rows.iter().any(|r| r.contains("↑↓ or 1-2 pick")),
             "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_description_keeps_its_indent() {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::WaitingQuestion {
+            req_id: 1,
+            header: "h".into(),
+            prompt: "p".into(),
+            input: String::new(),
+            selected: 0,
+            options: vec![hotl_tools::ask::QuestionOption {
+                label: "A".into(),
+                description: Some("word ".repeat(30).trim().into()),
+            }],
+        };
+        let rows = draw(&s);
+        let a = rows.iter().position(|r| r.contains("› 1  A")).unwrap();
+        let desc: Vec<&String> = rows[a + 1..]
+            .iter()
+            .take_while(|r| r.contains("word"))
+            .collect();
+        assert!(desc.len() >= 2, "wrapped: {desc:?}");
+        for r in &desc {
+            assert!(r.contains("│      word"), "hanging indent: {r:?}");
+        }
+    }
+
+    /// At 60 columns every chip fits beside `bash · 3s · 2/4` exactly — the
+    /// chips' own padding is the only gap the strip reserves.
+    #[test]
+    fn the_todo_count_survives_every_chip_at_60_cols() {
+        let mut s = busy_strip_state();
+        s.flag_count = 2;
+        s.live_context = Some(s.context_window * 38 / 100);
+        let row = strip_row(&draw_at(&s, 60, 18), "bypass");
+        assert!(
+            row.contains("bash · 3s · 2/4 ⚑ 2  38%  bypass  retry-dedupe"),
+            "{row}"
         );
     }
 

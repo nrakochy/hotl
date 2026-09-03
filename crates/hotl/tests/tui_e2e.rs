@@ -446,7 +446,8 @@ async fn ask_user_option_pick_golden() {
             let rows = draw(&state);
             let all = rows.join("\n");
             assert!(all.contains("Scope"), "header in modal: {all}");
-            assert!(all.contains("1) MVP"), "numbered option: {all}");
+            // The cursor rests on option 1 (0049 T6).
+            assert!(all.contains("› 1  MVP"), "numbered option: {all}");
             assert!(
                 rows[STRIP].contains("waiting on you"),
                 "halted strip: {}",
