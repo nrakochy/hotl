@@ -4841,7 +4841,7 @@ mod tests {
         let mut s = with_skills(&[("review", "review a pull request")]);
         type_str(&mut s, "/");
         // Twelve built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(13));
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(14));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename` and `review` prefix-match; no other built-in

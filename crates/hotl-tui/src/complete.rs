@@ -27,11 +27,12 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 12] = [
+const BUILTINS: [(&str, &str); 13] = [
     ("rename", "name this session"),
     ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
     ("goal", "run until a condition is met"),
+    ("effort", "set reasoning depth"),
     ("reload", "re-read config.toml"),
     ("help", "show the key bindings"),
     ("status", "what this session is running"),
@@ -196,6 +197,14 @@ mod tests {
             .collect()
     }
 
+    /// 0047 P0 T3: `/effort` was dispatched but never offered.
+    #[test]
+    fn effort_is_offered_from_slash() {
+        let cmds = builtins();
+        let c = recompute(&cmds, "/eff", (0, 4), false).expect("popup");
+        assert_eq!(names(&cmds, &c), vec!["effort"]);
+    }
+
     #[test]
     fn a_bare_slash_matches_every_command_builtins_first() {
         let cmds = table();
@@ -211,6 +220,7 @@ mod tests {
                 "plan",
                 "quit",
                 "clear",
+                "effort",
                 "reload",
                 "rename",
                 "status",
