@@ -6,6 +6,16 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **`/goal` starts working the moment you set it** (plan 0048). Typing
+  `/goal <condition>` while idle submits the condition as the prompt — the
+  Claude Code and Codex reading of "the condition itself as the directive" —
+  so a goal no longer waits for a second message. Set mid-turn, it only arms
+  the check for when that turn ends, as before. Headless, `hotl --goal
+  "<condition>"` now runs with no `-p`: the condition is the prompt, and an
+  explicit `-p` still wins.
+
 ### Changed
 
 - **`Ctrl-E` no longer opens `$EDITOR` — `Ctrl-G` does** (plan 0047 P0, the
