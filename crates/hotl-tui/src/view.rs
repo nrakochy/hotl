@@ -37,7 +37,7 @@ fn marker_frame(ticks: u64) -> usize {
 }
 
 /// How tall the input box may grow before it scrolls instead. Past this the
-/// buffer is long enough that `ctrl-e` is the better tool anyway.
+/// buffer is long enough that `ctrl-g` is the better tool anyway.
 const INPUT_MAX_ROWS: usize = 10;
 
 /// How many completion rows show at once before the list scrolls. Past this
@@ -1652,8 +1652,8 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         }
         _ if state.band_cursor.is_some() => "↑↓ move · enter open · esc back",
         _ if selected_spawn(state).is_some() => "↑↓ agents · esc back to main · pgup/pgdn scroll",
-        (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-e editor · esc interrupt · ? help",
-        _ => "↑↓ history · ctrl-r search · ctrl-e editor · esc interrupt · ? help",
+        (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-g editor · esc interrupt · ? help",
+        _ => "↑↓ history · ctrl-r search · ctrl-g editor · esc interrupt · ? help",
     };
     frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
 }
@@ -1796,7 +1796,7 @@ fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
         "/help /status /context /cost /clear /quit · /rename /plan /mode /effort /reload",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
-        "ctrl-e or :e open $EDITOR · ctrl-c quit (busy: cancel, again quit)",
+        "ctrl-g or :e open $EDITOR · ctrl-c quit (busy: cancel, again quit)",
         "any key closes this help",
     ]
     .into_iter()

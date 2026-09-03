@@ -1,6 +1,7 @@
 //! Modal vim input editor. Multi-line buffer, Insert/Normal modes, word
-//! motions with counts, `d c y` operators, single-level undo, and the
-//! `ctrl-e` / `:e` escape hatch to `$EDITOR`. `vim=false` pins Insert mode.
+//! motions with counts, `d c y` operators, single-level undo, readline
+//! chords (`ctrl-a/e/k/u/w`) in either mode, and the `ctrl-g` / `:e` escape
+//! hatch to `$EDITOR`. `vim=false` pins Insert mode.
 //! Column arithmetic is in char indices (never bytes) via the helpers at the
 //! bottom, so multibyte input can't split a codepoint.
 
@@ -127,15 +128,41 @@ impl Editor {
     }
 
     pub fn handle(&mut self, key: KeyEvent) -> EditorEvent {
+        // Readline chords, in every mode. No kill-ring: killed text is gone
+        // (vim registers are the power path — design 0047 D1).
         if key.modifiers.contains(KeyModifiers::CONTROL) {
+            let (row, col) = self.cursor;
             match key.code {
-                KeyCode::Char('e') => return EditorEvent::OpenExternal(self.text()),
-                KeyCode::Char('r') => {
-                    self.search_step();
-                    return EditorEvent::None;
+                KeyCode::Char('g') => return EditorEvent::OpenExternal(self.text()),
+                KeyCode::Char('r') => self.search_step(),
+                KeyCode::Char('a') => self.cursor.1 = 0,
+                KeyCode::Char('e') => {
+                    // Normal mode parks on the last char, as `$` does.
+                    let len = char_len(&self.lines[row]);
+                    self.cursor.1 = match self.mode {
+                        Mode::Insert => len,
+                        Mode::Normal => len.saturating_sub(1),
+                    };
                 }
-                _ => return EditorEvent::None,
+                KeyCode::Char('k') => {
+                    self.end_recall();
+                    let len = char_len(&self.lines[row]);
+                    char_remove_range(&mut self.lines[row], col, len);
+                }
+                KeyCode::Char('u') => {
+                    self.end_recall();
+                    char_remove_range(&mut self.lines[row], 0, col);
+                    self.cursor.1 = 0;
+                }
+                KeyCode::Char('w') => {
+                    self.end_recall();
+                    let start = word_left(&self.lines[row], col);
+                    char_remove_range(&mut self.lines[row], start, col);
+                    self.cursor.1 = start;
+                }
+                _ => {}
             }
+            return EditorEvent::None;
         }
         // A live reverse-i-search swallows ordinary keys (query edits, accept,
         // cancel) until it resolves.
@@ -1156,12 +1183,70 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_e_and_colon_e_open_external_with_full_text() {
+    fn ctrl_g_and_colon_e_open_external_with_full_text() {
         let mut e = Editor::new(true);
-        let evs = keys(&mut e, "<esc>ihi<c-e>");
+        let evs = keys(&mut e, "<esc>ihi<c-g>");
         assert_eq!(evs.last(), Some(&EditorEvent::OpenExternal("hi".into())));
         let evs = keys(&mut e, "<esc>:e<cr>");
         assert_eq!(evs.last(), Some(&EditorEvent::OpenExternal("hi".into())));
+    }
+
+    // ---- 0047 P0 T2: readline chords ----
+
+    #[test]
+    fn readline_chords_edit_the_line() {
+        let mut e = Editor::new(false);
+        keys(&mut e, "hello world<c-w>"); // delete word back
+        assert_eq!(e.text(), "hello ");
+        keys(&mut e, "there<c-a>x"); // line start
+        assert_eq!(e.text(), "xhello there");
+        keys(&mut e, "<c-e>y"); // line END now, not $EDITOR
+        assert_eq!(e.text(), "xhello therey");
+        keys(&mut e, "<c-u>"); // kill to start
+        assert_eq!(e.text(), "");
+        keys(&mut e, "ab<left><c-k>"); // kill to end
+        assert_eq!(e.text(), "a");
+        keys(&mut e, "b c<left><c-u>"); // kill to start keeps the tail
+        assert_eq!(e.text(), "c");
+        assert_eq!(e.cursor(), (0, 0));
+    }
+
+    #[test]
+    fn ctrl_w_skips_trailing_spaces_and_stops_at_the_line_start() {
+        let mut e = Editor::new(false);
+        keys(&mut e, "one two   <c-w>");
+        assert_eq!(e.text(), "one ");
+        keys(&mut e, "<c-w><c-w>"); // the second is a no-op at col 0
+        assert_eq!(e.text(), "");
+    }
+
+    #[test]
+    fn ctrl_g_opens_the_external_editor_and_ctrl_e_no_longer_does() {
+        let mut e = Editor::new(false);
+        keys(&mut e, "draft");
+        let ev = e.handle(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(matches!(ev, EditorEvent::OpenExternal(t) if t == "draft"));
+        let ev = e.handle(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(matches!(ev, EditorEvent::None)); // ctrl-e is line-end now
+        assert_eq!(e.text(), "draft");
+    }
+
+    #[test]
+    fn readline_chords_end_history_recall() {
+        let mut e = ed_hist(&["older prompt"]);
+        keys(&mut e, "<up><c-w>x");
+        assert_eq!(e.text(), "older x");
+        keys(&mut e, "<down>"); // recall ended at the first edit: ↓ is a no-op
+        assert_eq!(e.text(), "older x");
+    }
+
+    #[test]
+    fn ctrl_e_in_vim_normal_parks_on_the_last_char() {
+        let mut e = Editor::new(true);
+        keys(&mut e, "abc<esc>0<c-e>");
+        assert_eq!(e.cursor(), (0, 2));
+        keys(&mut e, "<c-a>");
+        assert_eq!(e.cursor(), (0, 0));
     }
 
     #[test]
