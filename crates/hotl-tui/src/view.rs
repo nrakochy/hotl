@@ -36,9 +36,12 @@ fn marker_frame(ticks: u64) -> usize {
     (ticks * MARKER_HZ / anim::TICK_HZ) as usize % WORKING_FRAMES.len()
 }
 
-/// How tall the input box may grow before it scrolls instead. Past this the
-/// buffer is long enough that `ctrl-g` is the better tool anyway.
-const INPUT_MAX_ROWS: usize = 10;
+/// The draft body's cap: a third of the terminal, never under 5 rows. A
+/// tall terminal earns a taller editor; a short one keeps its transcript.
+/// Past this the buffer scrolls — and `ctrl-g` is the better tool anyway.
+fn draft_cap(area: Rect) -> usize {
+    (area.height as usize / 3).max(5)
+}
 
 /// How many completion rows show at once before the list scrolls. Past this
 /// the human should type another character rather than scroll a menu.
@@ -48,20 +51,29 @@ const COMPLETE_MAX_ROWS: usize = 8;
 /// Reasoning is context for a decision, not the decision.
 const THINKING_COLLAPSED_LINES: usize = 3;
 
-/// The five horizontal bands: transcript, status strip, input, agent
+/// The six horizontal bands: transcript, status strip, gap, input, agent
 /// selector, hint. Shared by `view` and `selection_text` so the render and
 /// the copy can never disagree about where the transcript ends and the input
-/// box begins. The selector band is height 0 with no spawn cards (0039) —
-/// zero-height keeps every pre-existing row-indexed view test honest.
-fn regions(state: &State, area: Rect) -> [Rect; 5] {
-    Layout::vertical([
+/// box begins. The selector band is height 0 with no spawn cards (0039) and
+/// the gap row exists only from 30 rows up (0049 T3) — zero-height keeps
+/// every pre-existing 80×24 row-indexed view test honest.
+///
+/// The input band is inset by the gutter, so the box sits on the grid: its
+/// left edge at the spine column, its text at the transcript's text column.
+fn regions(state: &State, area: Rect) -> [Rect; 6] {
+    let [transcript, strip, gap, mut input, selector, hint] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(1),
+        Constraint::Length(u16::from(area.height >= 30)),
         Constraint::Length(input_height(state, area)),
         Constraint::Length(selector_height(state)),
         Constraint::Length(1),
     ])
-    .areas(area)
+    .areas(area);
+    let g = state.density.gutter() as u16;
+    input.x += g;
+    input.width = input.width.saturating_sub(g);
+    [transcript, strip, gap, input, selector, hint]
 }
 
 /// The selector's spawn-row window (0039); more spawns overflow to a count.
@@ -279,7 +291,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
 
 pub fn view(state: &State, p: &Palette, cache: &mut TranscriptCache, frame: &mut Frame) {
     let area = frame.area();
-    let [transcript, strip, input, selector, hint] = regions(state, area);
+    let [transcript, strip, _gap, input, selector, hint] = regions(state, area);
     // 0039: a selected spawn swaps the whole region above the strip for its
     // child stream (the Claude Code client pattern — full swap, no modal).
     // A dangling id falls back to the main transcript.
@@ -1735,11 +1747,14 @@ fn input_rows(text: &str, cursor: (usize, usize), width: usize) -> (Vec<String>,
 }
 
 /// The box grows with the wrapped buffer instead of clipping it — bounded so
-/// the transcript keeps its 3-row minimum.
+/// the transcript keeps its 3-row minimum. `area` is the whole frame.
 fn input_height(state: &State, area: Rect) -> u16 {
-    let width = (area.width.saturating_sub(2)).max(1) as usize;
+    // Gutter, two border cells, one cell of padding.
+    let width = (area.width as usize)
+        .saturating_sub(state.density.gutter() + 3)
+        .max(1);
     let (rows, _) = input_rows(&state.editor.text(), state.editor.cursor(), width);
-    let body = rows.len().clamp(1, INPUT_MAX_ROWS) as u16;
+    let body = rows.len().clamp(1, draft_cap(area)) as u16;
     (body + 2).min(area.height.saturating_sub(5)).max(3)
 }
 
@@ -1754,6 +1769,13 @@ fn render_input(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    // One cell of padding, so the text lands at `gutter + 2` — the
+    // transcript's text column (0049 T3).
+    let inner = Rect {
+        x: inner.x + 1,
+        width: inner.width.saturating_sub(1),
+        ..inner
+    };
     if inner.width == 0 || inner.height == 0 {
         return;
     }
@@ -2119,7 +2141,12 @@ fn render_completion(state: &State, p: &Palette, frame: &mut Frame, over: Rect) 
         })
         .collect();
     let width = lines.iter().map(Line::width).max().unwrap_or(0) as u16 + 2;
-    let area = above_input(over, width, lines.len() as u16 + 2);
+    let area = above_input(
+        over,
+        width,
+        lines.len() as u16 + 2,
+        state.density.gutter() as u16,
+    );
     frame.render_widget(Clear, area);
     let block = Block::bordered()
         .title(" commands ")
@@ -2131,12 +2158,14 @@ fn render_completion(state: &State, p: &Palette, frame: &mut Frame, over: Rect) 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-/// A rect `width`×`height`, pinned to `over`'s bottom-left corner.
-fn above_input(over: Rect, width: u16, height: u16) -> Rect {
-    let width = width.max(10).min(over.width);
+/// A rect `width`×`height`, pinned to `over`'s bottom-left corner, `gutter`
+/// cells in — so the popup's left border aligns with the box's.
+fn above_input(over: Rect, width: u16, height: u16, gutter: u16) -> Rect {
+    let gutter = gutter.min(over.width);
+    let width = width.max(10).min(over.width - gutter);
     let height = height.min(over.height);
     Rect {
-        x: over.x,
+        x: over.x + gutter,
         y: over.y + over.height - height,
         width,
         height,
@@ -2752,6 +2781,79 @@ mod tests {
         s.open_context = Some(s.context_window / 8); // 12%
         let rows = draw(&s);
         assert!(rows[STRIP].contains(" 12% "), "{}", rows[STRIP]);
+    }
+
+    // ---- 0049 T3: the box on the grid ----
+
+    #[test]
+    fn the_box_sits_on_the_gutter_and_its_text_at_the_transcript_column() {
+        let mut s = State::new(false, "m".into());
+        for c in "hi".chars() {
+            s.editor
+                .handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        }
+        let rows = draw(&s);
+        assert!(
+            rows[INPUT_TOP].starts_with("  ┌"),
+            "border at the gutter: {:?}",
+            rows[INPUT_TOP]
+        );
+        let body: Vec<char> = rows[INPUT_TOP + 1].chars().collect();
+        assert_eq!(body[2], '│');
+        assert_eq!(body[3], ' ', "one cell of padding");
+        assert_eq!(body[4], 'h', "text at column 4 = TEXT_COL");
+        assert_eq!(draw_cursor(&s), (TEXT_COL + 2, (INPUT_TOP + 1) as u16));
+    }
+
+    #[test]
+    fn compact_density_puts_the_box_at_column_0() {
+        let mut s = State::new(false, "m".into());
+        s.density = hotl_theme::Density::Compact;
+        assert!(draw(&s)[INPUT_TOP].starts_with('┌'));
+    }
+
+    #[test]
+    fn a_gap_row_separates_strip_and_box_from_30_rows_up() {
+        let s = State::new(false, "m".into());
+        let tall = draw_at(&s, 80, 40);
+        assert!(tall[34].contains(&still()), "strip at 34: {:?}", tall[34]);
+        assert_eq!(tall[35].trim(), "", "gap row");
+        assert!(tall[36].starts_with("  ┌"), "box at 36: {:?}", tall[36]);
+        let short = draw(&s);
+        assert!(short[INPUT_TOP].starts_with("  ┌"), "no gap at 24 rows");
+    }
+
+    #[test]
+    fn the_draft_cap_scales_with_height() {
+        let mut s = State::new(false, "m".into());
+        for i in 0..30 {
+            for c in format!("line {i}").chars() {
+                s.editor
+                    .handle(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            }
+            s.editor
+                .handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        }
+        let box_rows = |rows: &[String]| {
+            rows.iter()
+                .filter(|r| r.trim_start().starts_with('│'))
+                .count()
+        };
+        assert_eq!(box_rows(&draw_at(&s, 80, 24)), 8, "24/3");
+        assert_eq!(box_rows(&draw_at(&s, 80, 60)), 20, "60/3");
+        assert_eq!(box_rows(&draw_at(&s, 80, 12)), 5, "floor");
+    }
+
+    #[test]
+    fn the_completion_popup_aligns_with_the_box() {
+        let mut s = State::new(false, "m".into());
+        s.completion = Some(crate::complete::Completion {
+            matches: vec![0, 1],
+            selected: 0,
+        });
+        let rows = draw(&s);
+        let popup = rows.iter().find(|r| r.contains("commands")).unwrap();
+        assert!(popup.starts_with("  ┌"), "{popup:?}");
     }
 
     // ---- 0049 T2: blank rows between speakers, not items ----
@@ -3564,25 +3666,36 @@ mod tests {
         (p.x, p.y)
     }
 
-    /// The input box's rows, borders stripped.
+    /// The input box's rows, gutter, borders and the padding cell stripped.
     fn input_body(rows: &[String]) -> Vec<String> {
         rows.iter()
-            .filter(|r| r.starts_with('\u{2502}'))
-            .map(|r| r.trim_matches('\u{2502}').trim_end().to_string())
+            .filter(|r| r.trim_start().starts_with('\u{2502}'))
+            .map(|r| {
+                r.trim_start()
+                    .trim_matches('\u{2502}')
+                    .strip_prefix(' ')
+                    .unwrap_or_default()
+                    .trim_end()
+                    .to_string()
+            })
             .collect()
     }
 
     #[test]
     fn input_wraps_an_overlong_line_and_grows_the_box() {
         let mut s = State::new(true, "m".into());
-        let long = "abcdefghij".repeat(12); // 120 chars into a 78-col box
+        let long = "abcdefghij".repeat(12); // 120 chars into a 75-col box
         s.editor.set_text(&long);
         let rows = draw(&s);
         let body = input_body(&rows);
         assert_eq!(body.len(), 2, "box grew to two rows: {body:#?}");
         assert_eq!(body.concat(), long, "every typed char survives the wrap");
         // The cursor follows onto the second row instead of pinning to the edge.
-        assert_eq!(draw_cursor(&s), (1 + 42, 21), "cursor rides the wrap");
+        assert_eq!(
+            draw_cursor(&s),
+            (TEXT_COL + 45, 21),
+            "cursor rides the wrap"
+        );
     }
 
     #[test]
@@ -3591,7 +3704,11 @@ mod tests {
         s.editor.set_text("first line\nsecond line\nthird line");
         let body = input_body(&draw(&s));
         assert_eq!(body, ["first line", "second line", "third line"]);
-        assert_eq!(draw_cursor(&s), (1 + 10, 21), "cursor on the last line");
+        assert_eq!(
+            draw_cursor(&s),
+            (TEXT_COL + 10, 21),
+            "cursor on the last line"
+        );
     }
 
     #[test]
@@ -3601,7 +3718,7 @@ mod tests {
         s.editor.set_text(&text.join("\n"));
         let rows = draw(&s);
         let body = input_body(&rows);
-        assert_eq!(body.len(), INPUT_MAX_ROWS, "box stops growing");
+        assert_eq!(body.len(), 24 / 3, "box stops growing at a third");
         assert_eq!(
             body.last().unwrap(),
             "line19",
@@ -3829,9 +3946,9 @@ mod tests {
         let mut s = State::new(true, "m".into());
         s.editor.set_text(&"\u{65e5}".repeat(50)); // 50 chars, 100 columns
         let body = input_body(&draw(&s));
-        assert_eq!(body.len(), 2, "78 columns holds 39 wide glyphs: {body:#?}");
+        assert_eq!(body.len(), 2, "75 columns holds 37 wide glyphs: {body:#?}");
         // A wide glyph owns two cells, the second rendered as a blank.
-        assert_eq!(body[0].matches('\u{65e5}').count(), 39);
+        assert_eq!(body[0].matches('\u{65e5}').count(), 37);
     }
 
     // ---- the `/`-command completion popup ----
@@ -3934,8 +4051,12 @@ mod tests {
             .find(|r| r.contains("/bare"))
             .expect("the match renders");
         // `Block::bordered` adds no padding, so content butts against the
-        // left border: `│› /bare` and nothing after the name.
-        assert_eq!(row.trim_end().trim_end_matches('│').trim_end(), "│› /bare");
+        // left border: `│› /bare` and nothing after the name. The popup
+        // sits on the gutter, with the box (0049 T3).
+        assert_eq!(
+            row.trim_end().trim_end_matches('│').trim_end(),
+            "  │› /bare"
+        );
     }
 
     #[test]
