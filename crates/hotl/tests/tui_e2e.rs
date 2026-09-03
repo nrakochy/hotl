@@ -513,11 +513,10 @@ async fn deny_with_reason_reaches_engine() {
 
     assert_eq!(state.phase, Phase::Idle, "the turn ends after the deny");
     let rows = draw(&state);
-    // The denied card is now spine-marked: a ⛔ glyph in the gutter, the name
-    // no longer bracketed. "⛔" is width-2, so match the marker and the name
-    // separately rather than an exact "⛔ bash" run.
+    // The denied card is spine-marked: a one-cell ⊘ glyph in the gutter
+    // (0049 T8), the name no longer bracketed.
     assert!(
-        rows.iter().any(|r| r.contains('⛔') && r.contains("bash")),
+        rows.iter().any(|r| r.contains("⊘ bash")),
         "denied tool card renders: {:#?}",
         state.transcript
     );

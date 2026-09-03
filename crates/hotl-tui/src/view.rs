@@ -802,7 +802,7 @@ fn item_block<'a>(
                 cont_style: Style::new(),
             },
             prose(vec![token_line(
-                format!("{text} — steer queued, applies at next step"),
+                format!("{text} · queued"),
                 Style::new().fg(p.muted),
                 Style::new().fg(p.accent),
             )]),
@@ -839,7 +839,7 @@ fn item_block<'a>(
                 }
                 ToolStatus::Done => ("✓", p.idle),
                 ToolStatus::Failed => ("✗", p.blocked),
-                ToolStatus::Denied => ("⛔", p.blocked),
+                ToolStatus::Denied => ("⊘", p.blocked),
             };
             let (body, mut details) = split_summary(name, summary);
             if let ToolStatus::AutoAllowed { rule } = status {
@@ -852,7 +852,7 @@ fn item_block<'a>(
             // A spawn's children collapse to a count, running or settled
             // (0042 D3) — the full list lives in the drill-in.
             if !children.is_empty() {
-                details.push(format!("{} calls", children.len()));
+                details.push(call_count(children.len()));
             }
             if !matches!(status, ToolStatus::Denied) {
                 details.push(format!("{}s", ticks / anim::TICK_HZ));
@@ -970,6 +970,15 @@ fn item_block<'a>(
                 prose(lines),
             )
         }
+    }
+}
+
+/// `1 call` / `N calls` — a spawn's child count on its card and band row.
+fn call_count(n: usize) -> String {
+    if n == 1 {
+        "1 call".into()
+    } else {
+        format!("{n} calls")
     }
 }
 
@@ -1348,7 +1357,7 @@ fn status_glyph(status: &ToolStatus, ticks: u64, p: &Palette) -> (&'static str, 
         }
         ToolStatus::Done => ("✓", p.idle),
         ToolStatus::Failed => ("✗", p.blocked),
-        ToolStatus::Denied => ("⛔", p.blocked),
+        ToolStatus::Denied => ("⊘", p.blocked),
     }
 }
 
@@ -1433,7 +1442,7 @@ fn render_selector(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
             ticks / anim::TICK_HZ
         );
         if !children.is_empty() {
-            text.push_str(&format!(" · {} calls", children.len()));
+            text.push_str(&format!(" · {}", call_count(children.len())));
         }
         lines.push(styled(
             text.chars().take(area.width as usize).collect::<String>(),
@@ -1892,10 +1901,31 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         }
         _ if state.band_cursor.is_some() => "↑↓ move · enter open · esc back",
         _ if selected_spawn(state).is_some() => "↑↓ agents · esc back to main · pgup/pgdn scroll",
-        (_, true, Mode::Normal) => "i insert · j/k scroll · ctrl-g editor · esc interrupt · ? help",
-        _ => "↑↓ history · ctrl-r search · ctrl-g editor · esc interrupt · ? help",
+        // Phase-aware (0049 T8): `esc interrupt` only while something runs.
+        (Phase::Idle, true, Mode::Normal) => "i insert · j/k scroll · ? help · ctrl-g editor",
+        (_, true, Mode::Normal) => "esc interrupt · i insert · ? help",
+        (Phase::Idle, ..) => "? help · / commands · ↑↓ history · ctrl-r search · ctrl-g editor",
+        _ => "esc interrupt · enter steer · ? help",
     };
+    let hint = fit_hint(hint, area.width as usize);
     frame.render_widget(Paragraph::new(hint).style(Style::new().fg(p.faint)), area);
+}
+
+/// Cut a hint at the last ` · ` that fits `width`, so a narrow terminal
+/// drops whole keys rather than half of one.
+fn fit_hint(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let cut = text
+        .match_indices(" · ")
+        .map(|(at, _)| at)
+        .filter(|&at| text[..at].chars().count() <= width)
+        .last();
+    match cut {
+        Some(at) => text[..at].to_string(),
+        None => text.chars().take(width).collect(),
+    }
 }
 
 /// How a modal row meets the edge: prose folds, code and commands clip.
@@ -3148,6 +3178,56 @@ mod tests {
         assert!(popup.starts_with("  ┌"), "{popup:?}");
     }
 
+    // ---- 0049 T8: small repairs ----
+
+    #[test]
+    fn the_hint_is_phase_aware() {
+        let mut s = State::new(true, "m".into());
+        let idle = draw(&s)[HINT].clone();
+        assert!(!idle.contains("esc interrupt"), "{idle:?}");
+        assert!(idle.contains("? help"), "{idle:?}");
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 0,
+        };
+        let busy = draw(&s)[HINT].clone();
+        assert!(busy.starts_with("esc interrupt"), "{busy:?}");
+    }
+
+    #[test]
+    fn the_hint_truncates_at_a_separator() {
+        let s = State::new(false, "m".into());
+        let rows = draw_at(&s, 60, 18);
+        let hint = rows[17].trim_end().to_string();
+        assert!(hint.ends_with("ctrl-r search"), "whole token: {hint:?}");
+        assert!(!hint.ends_with('·'), "{hint:?}");
+        assert_eq!(fit_hint("a · b · c", 5), "a · b");
+        assert_eq!(fit_hint("abcdefgh", 4), "abcd");
+    }
+
+    #[test]
+    fn a_denied_card_wears_a_one_cell_glyph() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![
+            tool_item("t1", "write", "~/.ssh/config", ToolStatus::Denied, 0),
+            tool_item("t2", "read", "a.rs", ToolStatus::Done, 0),
+        ];
+        let rows = draw(&s);
+        assert!(rows[0].starts_with("  ⊘ write"), "{:?}", rows[0]);
+        // Same column as its neighbour: the name starts at TEXT_COL on both.
+        assert_eq!(rows[0].find("write"), rows[1].find("read"));
+    }
+
+    #[test]
+    fn a_single_call_is_singular() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(spawn_with_children(ToolStatus::Running, 1));
+        let all = draw(&s).join("\n");
+        assert!(all.contains("· 1 call ·"), "{all}");
+        assert!(!all.contains("1 calls"), "{all}");
+    }
+
     // ---- 0049 T6: modals sized to content; code clips; scroll; cursor ----
 
     fn ask_with_diff(n_lines: usize) -> State {
@@ -3619,7 +3699,9 @@ mod tests {
             .push(tool_item("s2", "spawn", "spawn b", ToolStatus::Failed, 0));
         assert_eq!(selector_height(&s), 0);
         let rows = draw(&s);
-        assert!(rows[HINT].contains("history"), "{}", rows[HINT]);
+        // The running-turn hint, not the band's.
+        assert!(rows[HINT].starts_with("esc interrupt"), "{}", rows[HINT]);
+        assert!(!rows[HINT].contains("enter open"), "{}", rows[HINT]);
     }
 
     /// 0043 D3: the band cursor is a band-background highlight on its row —
@@ -4075,17 +4157,14 @@ mod tests {
             queued: true,
         });
         let rows = draw(&s).join("\n");
-        assert!(rows.contains("⤷ go left — steer queued"), "pinned chip");
+        assert!(rows.contains("⤷ go left · queued"), "pinned chip");
         s.transcript[0] = TranscriptItem::Steer {
             text: "go left".into(),
             queued: false,
         };
         let rows = draw(&s).join("\n");
         assert!(rows.contains("⤷ go left"), "chip stays");
-        assert!(
-            !rows.contains("steer queued"),
-            "queued tag gone once admitted"
-        );
+        assert!(!rows.contains("queued"), "queued tag gone once admitted");
     }
 
     #[test]
