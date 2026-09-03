@@ -6,6 +6,16 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Dropped and pasted images land as `[Image #N]` on Windows** (tracker
+  #108). The drop classifier only knew POSIX path shapes (`/`, `~`, `./`,
+  `../`), so a Windows Terminal drag-and-drop and the temp PNG that `Ctrl-V`
+  writes under `%TEMP%` both inserted as literal text, and the bare-path
+  unescape would have eaten their backslashes. Drive-letter paths
+  (`C:\…`, bare or quoted, backslashes kept as separators) now compact like
+  any other drop; drive-relative and UNC forms still insert literally.
+
 ## [0.25.0] - 2026-09-03
 
 ### Added

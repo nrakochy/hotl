@@ -15,8 +15,8 @@
 //! At submit, paste tokens expand back to their content (the core holds it;
 //! no I/O), while image tokens stay inline and their paths ride the
 //! [`PromptPayload`] to the runtime, which alone may read the filesystem.
-//! `file://` URIs and Windows drive paths are out of scope for v1 — they fail
-//! the path-shape gate and insert literally, a safe degrade.
+//! `file://` URIs are out of scope for v1 — they fail the path-shape gate and
+//! insert literally, a safe degrade.
 
 use std::ops::Range;
 
@@ -306,34 +306,57 @@ fn token_len_at(s: &str) -> Option<usize> {
 /// - bare with backslash escapes: `/a/My\ Shot\ 2.png` (macOS Terminal, iTerm2)
 /// - single-quoted, `'` escaped as `'\''`: `'/a/My Shot.png'`
 /// - double-quoted with `\" \\ \$ \`` escapes: `"/a/My Shot.png"`
+/// - a Windows drive path, bare or double-quoted, never escaped:
+///   `C:\Users\me\shot.png`, `"C:\Users\me\My Shot.png"` (Windows Terminal)
 ///
 /// Two gates keep prose honest: the candidate must LOOK like a path (starts
-/// `/`, `~`, `./`, `../` — drops are always absolute, so a bare `logo.png`
-/// mentioned in a sentence stays literal), and its final component must end in
-/// a known image extension. Spaces inside the filename are fine (drops arrive
-/// with them literal); a space immediately before a `/` is the tell that a
-/// second path was appended, and keeps `/a/b.png /a/c.png` literal.
+/// `/`, `~`, `./`, `../`, or `X:\` — drops are always absolute, so a bare
+/// `logo.png` mentioned in a sentence stays literal), and its final component
+/// must end in a known image extension. Spaces inside the filename are fine
+/// (drops arrive with them literal); a space immediately before a `/` or a
+/// drive letter is the tell that a second path was appended, and keeps
+/// `/a/b.png /a/c.png` literal.
 fn dropped_path(text: &str) -> Option<(String, String)> {
     let t = text.trim();
     if t.is_empty() || t.contains('\n') {
         return None;
     }
-    let candidate = if t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'') {
-        t[1..t.len() - 1].replace("'\\''", "'")
-    } else if t.len() >= 2 && t.starts_with('"') && t.ends_with('"') {
-        unescape_double_quoted(&t[1..t.len() - 1])?
+    let single = t.len() >= 2 && t.starts_with('\'') && t.ends_with('\'');
+    let double = t.len() >= 2 && t.starts_with('"') && t.ends_with('"');
+    let inner = if single || double {
+        &t[1..t.len() - 1]
+    } else {
+        t
+    };
+    let candidate = if is_drive_path(inner) {
+        // Windows: every backslash is a separator and nothing is shell-escaped
+        // (`$` and `~` are ordinary name characters), so the unescapes below
+        // would mangle the path. `"` cannot appear in a Windows path, so one
+        // inside the quotes means two paths were dropped.
+        if inner.contains('"')
+            || inner.contains(" /")
+            || inner.split(' ').skip(1).any(is_drive_path)
+        {
+            return None;
+        }
+        inner.to_string()
+    } else if single {
+        inner.replace("'\\''", "'")
+    } else if double {
+        unescape_double_quoted(inner)?
     } else {
         // Bare drop: unescape backslashes, keep literal spaces. A space right
         // before a '/' means a second absolute path was appended (a multi-file
         // drop, or prose like "/a/b.png /a/c.png") — we only compact a single
         // file, so leave those literal.
-        let c = unescape_bare(t);
+        let c = unescape_bare(inner);
         if c.contains(" /") {
             return None;
         }
         c
     };
-    if !(candidate.starts_with('/')
+    if !(is_drive_path(&candidate)
+        || candidate.starts_with('/')
         || candidate.starts_with('~')
         || candidate.starts_with("./")
         || candidate.starts_with("../"))
@@ -342,6 +365,13 @@ fn dropped_path(text: &str) -> Option<(String, String)> {
     }
     let media_type = media_type_for(&candidate)?;
     Some((candidate, media_type.to_string()))
+}
+
+/// `X:\` or `X:/` for an ASCII letter `X`: an absolute Windows path. The
+/// drive-relative `C:shot.png` and UNC `\\server\share` forms stay literal.
+fn is_drive_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/')
 }
 
 /// Undo shell double-quoting. Only `\" \\ \$ \`` are escapes inside double
@@ -385,10 +415,10 @@ fn unescape_bare(t: &str) -> String {
     out
 }
 
-/// Media type for a path whose final component has a known image extension
-/// (ASCII case-insensitive) and a non-empty stem.
+/// Media type for a path whose final component (after the last `/` or `\`)
+/// has a known image extension (ASCII case-insensitive) and a non-empty stem.
 fn media_type_for(path: &str) -> Option<&'static str> {
-    let name = path.rsplit('/').next().unwrap_or(path);
+    let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
     let (stem, ext) = name.rsplit_once('.')?;
     if stem.is_empty() {
         return None;
@@ -447,6 +477,74 @@ mod tests {
             ),
         ] {
             assert_eq!(classify(paste), image(want_path, "image/png"), "{paste:?}");
+        }
+    }
+
+    #[test]
+    fn a_windows_drive_path_is_an_image_with_its_backslashes_kept() {
+        // Windows Terminal drops a path bare, or double-quoted when it has a
+        // space, and never shell-escapes it: a backslash is a separator. The
+        // last case is the ctrl-v temp file (`std::env::temp_dir()` on the
+        // CI runner) that rides this same classifier.
+        for (paste, want_path, want_mt) in [
+            (
+                "C:\\Users\\me\\shot.png",
+                "C:\\Users\\me\\shot.png",
+                "image/png",
+            ),
+            (
+                "C:\\Users\\me\\shot.png\n",
+                "C:\\Users\\me\\shot.png",
+                "image/png",
+            ),
+            ("c:/Users/me/shot.JPG", "c:/Users/me/shot.JPG", "image/jpeg"),
+            (
+                "C:\\Users\\me\\My Shot.png",
+                "C:\\Users\\me\\My Shot.png",
+                "image/png",
+            ),
+            (
+                "\"C:\\Users\\me\\My Shots\\shot 1.png\"",
+                "C:\\Users\\me\\My Shots\\shot 1.png",
+                "image/png",
+            ),
+            (
+                "'C:\\Users\\me\\shot.webp'",
+                "C:\\Users\\me\\shot.webp",
+                "image/webp",
+            ),
+            // `$` is legal in a Windows name and must not read as an escape.
+            (
+                "\"C:\\$Recycle.Bin\\x.gif\"",
+                "C:\\$Recycle.Bin\\x.gif",
+                "image/gif",
+            ),
+            (
+                "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpab12\\hotl-paste-01ABC.png",
+                "C:\\Users\\RUNNER~1\\AppData\\Local\\Temp\\.tmpab12\\hotl-paste-01ABC.png",
+                "image/png",
+            ),
+        ] {
+            assert_eq!(classify(paste), image(want_path, want_mt), "{paste:?}");
+        }
+    }
+
+    #[test]
+    fn a_windows_paste_that_is_not_one_image_path_stays_literal() {
+        for paste in [
+            "C:\\a\\b.png C:\\a\\c.png",
+            "C:\\a\\b.png D:/c.png",
+            "\"C:\\a\\b.png\" \"C:\\a\\c.png\"",
+            "C:\\a\\b.png /a/c.png",
+            "see C:\\a\\b.png thanks",
+            "C:\\a\\b.txt",
+            "C:\\a\\.png",
+            "C:\\a\\b.png\\",
+            "C:shot.png",
+            "CC:\\a\\b.png",
+            "1:\\a\\b.png",
+        ] {
+            assert_eq!(classify(paste), PasteKind::Literal, "{paste:?}");
         }
     }
 
