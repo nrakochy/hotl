@@ -302,7 +302,7 @@ pub fn view(state: &State, p: &Palette, cache: &mut TranscriptCache, frame: &mut
         render_egress(state, p, frame, transcript);
     }
     if state.help_open {
-        render_help(p, frame, transcript);
+        render_help(state, p, frame, transcript);
     }
     if let Some(sel) = &state.selection {
         highlight(sel, frame);
@@ -1782,26 +1782,69 @@ fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn render_help(p: &Palette, frame: &mut Frame, over: Rect) {
-    let lines: Vec<Line> = [
+/// Columns the command list wraps at: two lines for the builtin table on the
+/// 70%-of-80 overlay, with room for the border.
+const HELP_COLS: usize = 64;
+
+/// Help content assembled from the live command table and the mode flags —
+/// never a hand-maintained list (it drifted: /goal and /workflows were
+/// missing, and a rebind made two lines false). Sections: composer, vim
+/// (only when on), transcript, agent band + esc ladder, asks, commands.
+pub(crate) fn help_lines(state: &State) -> Vec<String> {
+    let mut lines = vec![
         "enter send · shift/alt-enter newline",
-        "esc normal mode · esc (empty) interrupt · esc again take control back",
-        "i a I A o O insert · h l 0 $ w b e motions (+counts)",
-        "d c y operators · dd cc yy x p u",
-        "j k scroll transcript when input is empty",
-        "pgup pgdn scroll · ctrl-home/end jump · mouse wheel",
-        "drag to select and copy · shift-drag for the terminal's own select",
-        "ctrl-t expand model thinking",
-        "↑↓ (j/k normal) agent band · enter open · esc back",
-        "/help /status /context /cost /clear /quit · /rename /plan /mode /effort /reload",
+        "← → home end · ctrl-a/e line start/end · alt-←/→ by word · delete forward",
+        "ctrl-k/u kill to end/start · ctrl-w delete word back · ctrl-g open $EDITOR",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",
         "/ opens command completion · ↑ ↓ pick · tab complete · enter run",
-        "ctrl-g or :e open $EDITOR · ctrl-c quit (busy: cancel, again quit)",
-        "any key closes this help",
-    ]
-    .into_iter()
-    .map(|l| Line::styled(l, Style::new().fg(p.ink)))
-    .collect();
+    ];
+    if state.vim_mode {
+        lines.extend([
+            "esc normal mode · i a I A o O insert · h l 0 $ w b e motions (+counts)",
+            "d c y operators · dd cc yy x p u · :e open $EDITOR · j k scroll (no band)",
+        ]);
+    }
+    lines.extend([
+        "pgup pgdn scroll · ctrl-home/end jump · mouse wheel · ctrl-t expand thinking",
+        "drag to select and copy · shift-drag for the terminal's own select",
+        if state.vim_mode {
+            "↑↓ (j/k normal) agent band · enter open · esc back"
+        } else {
+            "↑↓ agent band · enter open · esc back"
+        },
+        "esc (empty) interrupt · esc again insist · ctrl-c quit (busy: cancel, again quit)",
+        "asks: y allow · n deny, then a reason · s allow + credential reads (bash)",
+    ]);
+    let mut out: Vec<String> = lines.into_iter().map(String::from).collect();
+    let commands: Vec<String> = crate::complete::builtins()
+        .into_iter()
+        .map(|c| format!("/{}", c.name))
+        .collect();
+    out.extend(pack(&commands, HELP_COLS));
+    out.push("any key closes this help".into());
+    out
+}
+
+/// Greedy word-wrap of `words` into lines no wider than `cols` chars.
+fn pack(words: &[String], cols: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for w in words {
+        match out.last_mut() {
+            Some(line) if line.chars().count() + 1 + w.chars().count() <= cols => {
+                line.push(' ');
+                line.push_str(w);
+            }
+            _ => out.push(w.clone()),
+        }
+    }
+    out
+}
+
+fn render_help(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
+    let lines: Vec<Line> = help_lines(state)
+        .into_iter()
+        .map(|l| Line::styled(l, Style::new().fg(p.ink)))
+        .collect();
     let area = centered(over, 70, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
@@ -2768,6 +2811,52 @@ mod tests {
             "vim Normal hint: {}",
             rows[HINT]
         );
+    }
+
+    // ---- 0047 P0 T4: help is generated, never hand-maintained ----
+
+    /// The drift guard: `/goal` and `/workflows` were missing from the old
+    /// hardcoded list.
+    #[test]
+    fn help_lists_every_builtin_command() {
+        let all = help_lines(&State::new(false, "m".into())).join("\n");
+        for cmd in crate::complete::builtins() {
+            assert!(
+                all.contains(&format!("/{}", cmd.name)),
+                "/{} missing:\n{all}",
+                cmd.name
+            );
+        }
+    }
+
+    #[test]
+    fn help_hides_vim_keys_when_vim_is_off() {
+        let off = help_lines(&State::new(false, "m".into()));
+        assert!(!off.iter().any(|l| l.contains("operators")), "{off:#?}");
+        assert!(!off.iter().any(|l| l.contains("j/k")), "{off:#?}");
+        let on = help_lines(&State::new(true, "m".into()));
+        assert!(on.iter().any(|l| l.contains("operators")), "{on:#?}");
+    }
+
+    #[test]
+    fn help_names_ctrl_g_not_ctrl_e_for_the_editor() {
+        let all = help_lines(&State::new(true, "m".into())).join("\n");
+        assert!(all.contains("ctrl-g open $EDITOR"), "{all}");
+        assert!(!all.contains("ctrl-e"), "{all}");
+        assert!(all.contains("ctrl-a/e"), "{all}");
+    }
+
+    /// `centered(over, 70, len + 2)` must fit a 24-row terminal in both modes.
+    #[test]
+    fn help_fits_the_overlay_budget_in_both_modes() {
+        for vim in [false, true] {
+            let lines = help_lines(&State::new(vim, "m".into()));
+            assert!(lines.len() <= 16, "vim={vim}: {} lines", lines.len());
+            assert_eq!(
+                lines.last().map(String::as_str),
+                Some("any key closes this help")
+            );
+        }
     }
 
     /// 0043: the help overlay names the agent band.
