@@ -427,8 +427,12 @@ fn render_transcript(
     // Walking to the window beats `Paragraph::scroll`, whose offset is a u16 a
     // long session would overflow. Only the rows actually on screen are
     // cloned, so the per-frame cost is bounded by the terminal, not by the
-    // session.
-    let mut visible: Vec<Line> = Vec::with_capacity(height);
+    // session. A transcript shorter than the viewport anchors to the strip
+    // (0049 T4, LD2): the padding goes above it, so the newest row sits
+    // just over the strip from the first prompt on and the first overflow
+    // moves nothing that was already on screen.
+    let pad = height.saturating_sub(total);
+    let mut visible: Vec<Line> = (0..pad).map(|_| Line::raw("")).collect();
     let mut row = 0usize;
     'rows: for (i, cached) in cache.items.iter().enumerate() {
         for _ in 0..blanks[i] {
@@ -1495,7 +1499,10 @@ fn render_agent_stream(
         None => total.saturating_sub(height),
         Some(o) => o.min(total.saturating_sub(1)),
     };
-    let visible: Vec<Line> = rows.into_iter().skip(skip).take(height).collect();
+    // Anchored to the strip like the main transcript (0049 T4).
+    let pad = height.saturating_sub(total);
+    let mut visible: Vec<Line> = (0..pad).map(|_| Line::raw("")).collect();
+    visible.extend(rows.into_iter().skip(skip).take(height - pad));
     frame.render_widget(Paragraph::new(visible), area);
 }
 
@@ -2195,54 +2202,18 @@ mod tests {
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
 
-    /// The rows of a frame drawn at `w`×`h` — `draw` at 80×24.
-    fn draw_at(state: &State, w: u16, h: u16) -> Vec<String> {
+    type Buffer = ratatui::buffer::Buffer;
+
+    /// One frame at `w`×`h` through `cache`, as the raw buffer.
+    fn render_at(state: &State, cache: &mut TranscriptCache, w: u16, h: u16) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal
-            .draw(|f| {
-                view(
-                    state,
-                    &Palette::default(),
-                    &mut TranscriptCache::default(),
-                    f,
-                )
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
-        (0..buffer.area.height)
-            .map(|y| {
-                (0..buffer.area.width)
-                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
-                    .collect()
-            })
-            .collect()
-    }
-
-    fn draw_buffer(state: &State) -> ratatui::buffer::Buffer {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|f| {
-                view(
-                    state,
-                    &Palette::default(),
-                    &mut TranscriptCache::default(),
-                    f,
-                )
-            })
+            .draw(|f| view(state, &Palette::default(), cache, f))
             .unwrap();
         terminal.backend().buffer().clone()
     }
 
-    /// Draw twice through one cache and return the rows plus how many times
-    /// the transcript was actually re-wrapped. The rows come from the *second*
-    /// pass, so a cached render that differs from a fresh one fails whatever
-    /// assertion the caller makes.
-    fn draw_cached(state: &State, cache: &mut TranscriptCache) -> Vec<String> {
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|f| view(state, &Palette::default(), cache, f))
-            .unwrap();
-        let buffer = terminal.backend().buffer().clone();
+    fn rows_of(buffer: &Buffer) -> Vec<String> {
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
@@ -2250,6 +2221,82 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// Bottom anchoring (0049 T4) pads a short transcript from the top. So
+    /// the tests that index transcript rows from 0 keep their meaning, the
+    /// region's leading blank run is rotated to its end: a leading blank run
+    /// in the transcript is always anchoring padding — the first row of any
+    /// item carries a spine glyph, and separators sit between items, never
+    /// before the first. Skipped while an overlay (modal, popup, help) is
+    /// drawn over the region; the anchoring tests use `draw_raw`.
+    fn normalize(state: &State, buffer: &mut Buffer) {
+        let overlay = state.help_open
+            || state.completion.is_some()
+            || matches!(
+                state.phase,
+                Phase::WaitingAsk { .. }
+                    | Phase::WaitingQuestion { .. }
+                    | Phase::WaitingEgress { .. }
+            );
+        if overlay {
+            return;
+        }
+        let region = regions(state, buffer.area)[0];
+        let blank = |y: u16| {
+            (region.x..region.right())
+                .all(|x| buffer.cell((x, y)).unwrap().symbol().trim().is_empty())
+        };
+        let lead = (region.y..region.bottom())
+            .take_while(|&y| blank(y))
+            .count();
+        let height = region.height as usize;
+        if lead == 0 || lead == height {
+            return;
+        }
+        let rows: Vec<Vec<ratatui::buffer::Cell>> = (region.y..region.bottom())
+            .map(|y| {
+                (region.x..region.right())
+                    .map(|x| buffer.cell((x, y)).unwrap().clone())
+                    .collect()
+            })
+            .collect();
+        for (i, y) in (region.y..region.bottom()).enumerate() {
+            let src = &rows[(i + lead) % height];
+            for (j, x) in (region.x..region.right()).enumerate() {
+                *buffer.cell_mut((x, y)).unwrap() = src[j].clone();
+            }
+        }
+    }
+
+    /// The rows of a frame drawn at `w`×`h`, transcript normalized — `draw`
+    /// at 80×24.
+    fn draw_at(state: &State, w: u16, h: u16) -> Vec<String> {
+        draw_cached_at(state, &mut TranscriptCache::default(), w, h)
+    }
+
+    /// The rows exactly as rendered — for the anchoring tests.
+    fn draw_raw(state: &State, w: u16, h: u16) -> Vec<String> {
+        rows_of(&render_at(state, &mut TranscriptCache::default(), w, h))
+    }
+
+    /// The 80×24 buffer, transcript normalized, for cell-level assertions.
+    fn draw_buffer(state: &State) -> Buffer {
+        let mut buffer = render_at(state, &mut TranscriptCache::default(), 80, 24);
+        normalize(state, &mut buffer);
+        buffer
+    }
+
+    /// Draw through one cache and return the rows, so a cached render that
+    /// differs from a fresh one fails whatever assertion the caller makes.
+    fn draw_cached(state: &State, cache: &mut TranscriptCache) -> Vec<String> {
+        draw_cached_at(state, cache, 80, 24)
+    }
+
+    fn draw_cached_at(state: &State, cache: &mut TranscriptCache, w: u16, h: u16) -> Vec<String> {
+        let mut buffer = render_at(state, cache, w, h);
+        normalize(state, &mut buffer);
+        rows_of(&buffer)
     }
 
     fn draw(state: &State) -> Vec<String> {
@@ -2291,6 +2338,9 @@ mod tests {
     /// over at, and the transcript text used by the selection tests.
     const TEXT_COL: u16 = 4;
     const PROSE: &str = "alpha beta gamma";
+    /// Where one prose row lands under bottom anchoring (0049 T4): just
+    /// above the strip.
+    const PROSE_ROW: u16 = (STRIP - 1) as u16;
 
     /// One assistant turn, so transcript row 0 is `"  ● alpha beta gamma"`.
     fn state_with_prose() -> State {
@@ -2318,17 +2368,23 @@ mod tests {
             .collect()
     }
 
+    /// The 80×24 buffer exactly as rendered: a drag is painted at screen
+    /// cells, so these tests address the prose where anchoring put it.
+    fn raw_buffer(state: &State) -> Buffer {
+        render_at(state, &mut TranscriptCache::default(), 80, 24)
+    }
+
     #[test]
     fn a_drag_highlights_exactly_the_cells_it_covers() {
         let mut s = state_with_prose();
         s.selection = Some(crate::select::Selection {
-            anchor: (TEXT_COL, 0),
-            head: (TEXT_COL + 4, 0),
+            anchor: (TEXT_COL, PROSE_ROW),
+            head: (TEXT_COL + 4, PROSE_ROW),
         });
-        let buffer = draw_buffer(&s);
+        let buffer = raw_buffer(&s);
         assert_eq!(
             reversed_rows(&buffer),
-            vec![(0, "alpha".to_string())],
+            vec![(PROSE_ROW, "alpha".to_string())],
             "only the dragged cells may reverse"
         );
     }
@@ -2339,11 +2395,11 @@ mod tests {
         // text are read from the same buffer, so they cannot disagree.
         let mut s = state_with_prose();
         let sel = crate::select::Selection {
-            anchor: (TEXT_COL, 0),
-            head: (TEXT_COL + 9, 0),
+            anchor: (TEXT_COL, PROSE_ROW),
+            head: (TEXT_COL + 9, PROSE_ROW),
         };
         s.selection = Some(sel);
-        let buffer = draw_buffer(&s);
+        let buffer = raw_buffer(&s);
         let highlighted: String = reversed_rows(&buffer)
             .into_iter()
             .map(|(_, text)| text.trim_end().to_string())
@@ -2357,11 +2413,11 @@ mod tests {
     fn dragging_from_the_left_edge_copies_prose_without_the_spine() {
         let mut s = state_with_prose();
         let sel = crate::select::Selection {
-            anchor: (0, 0),
-            head: (79, 0),
+            anchor: (0, PROSE_ROW),
+            head: (79, PROSE_ROW),
         };
         s.selection = Some(sel);
-        assert_eq!(selection_text(&s, &draw_buffer(&s), &sel), PROSE);
+        assert_eq!(selection_text(&s, &raw_buffer(&s), &sel), PROSE);
     }
 
     #[test]
@@ -2854,6 +2910,52 @@ mod tests {
         let rows = draw(&s);
         let popup = rows.iter().find(|r| r.contains("commands")).unwrap();
         assert!(popup.starts_with("  ┌"), "{popup:?}");
+    }
+
+    // ---- 0049 T4: bottom anchoring ----
+
+    #[test]
+    fn a_short_session_touches_the_strip() {
+        let rows = draw_raw(&state_with_prose(), 80, 24);
+        assert!(
+            rows[STRIP - 1].contains(PROSE),
+            "newest row is just above the strip: {:?}",
+            rows[STRIP - 1]
+        );
+        assert_eq!(rows[0].trim(), "", "padding is at the top");
+    }
+
+    #[test]
+    fn the_first_overflow_moves_no_row_that_was_already_on_screen() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = (0..19)
+            .map(|i| TranscriptItem::Notice {
+                text: format!("n{i}").into(),
+            })
+            .collect();
+        let before = draw_raw(&s, 80, 24); // 19 harness rows, no blanks: exactly full
+        s.transcript
+            .push(TranscriptItem::Notice { text: "n19".into() });
+        let after = draw_raw(&s, 80, 24);
+        // Follow scrolled one row: every row that stayed is where the previous row was.
+        assert_eq!(&after[..STRIP - 1], &before[1..STRIP]);
+    }
+
+    #[test]
+    fn the_agent_stream_anchors_to_the_strip_too() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(spawn_with_children(ToolStatus::Running, 2));
+        s.selected_agent = Some("s1".into());
+        let rows = draw_raw(&s, 80, 24);
+        // The band (main + one spawn row) lifts the strip above row 19.
+        let strip = rows.iter().position(|r| r.contains(&still())).unwrap();
+        assert!(
+            rows[strip - 1].contains("read c2.rs"),
+            "{:?}",
+            rows[strip - 1]
+        );
+        assert_eq!(rows[0].trim(), "");
     }
 
     // ---- 0049 T2: blank rows between speakers, not items ----
