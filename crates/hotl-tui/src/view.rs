@@ -333,7 +333,17 @@ fn render_transcript(
     }
     let width = area.width as usize;
     let gutter = state.density.gutter();
-    let blanks = state.density.blank_lines();
+    // Blank rows above each item (0049 T2): one enum match per item per
+    // frame — cheaper than the fingerprint hash the loop below already does.
+    let blanks: Vec<usize> = (0..state.transcript.len())
+        .map(|i| {
+            blank_before(
+                i.checked_sub(1).map(|j| &state.transcript[j]),
+                &state.transcript[i],
+                state.density,
+            )
+        })
+        .collect();
     // A shorter transcript (`/clear`) drops the tail; the survivors keep their
     // rows, and any whose content changed is caught by its fingerprint below.
     cache.items.truncate(state.transcript.len());
@@ -384,15 +394,16 @@ fn render_transcript(
 
     let height = area.height as usize;
     let rows: usize = cache.items.iter().map(|c| c.rows.len()).sum();
-    let total = rows + blanks * cache.items.len().saturating_sub(1);
-    // Each item above `idx` contributes its own rows plus the blank run that
-    // follows it.
+    let total = rows + blanks.iter().sum::<usize>();
+    // Each item above `idx` contributes its own rows plus the blank run
+    // above it.
     let start_of = |idx: usize| -> usize {
         cache
             .items
             .iter()
+            .zip(&blanks)
             .take(idx)
-            .map(|c| c.rows.len() + blanks)
+            .map(|(c, b)| c.rows.len() + b)
             .sum()
     };
     let skip = match state.scroll {
@@ -408,7 +419,7 @@ fn render_transcript(
     let mut visible: Vec<Line> = Vec::with_capacity(height);
     let mut row = 0usize;
     'rows: for (i, cached) in cache.items.iter().enumerate() {
-        for _ in 0..(if i > 0 { blanks } else { 0 }) {
+        for _ in 0..blanks[i] {
             if visible.len() == height {
                 break 'rows;
             }
@@ -433,6 +444,45 @@ fn render_transcript(
         }
     }
     frame.render_widget(Paragraph::new(visible), area);
+}
+
+/// Who a transcript row belongs to. Blank rows fall only where this changes
+/// (comfortable density) — a run of tool cards is one block, and an answer
+/// follows the work it came from without a gap.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Speaker {
+    You,
+    Model,
+    Harness,
+}
+
+fn speaker(item: &TranscriptItem) -> Speaker {
+    match item {
+        TranscriptItem::User { .. } | TranscriptItem::Steer { .. } => Speaker::You,
+        TranscriptItem::Assistant { .. } => Speaker::Model,
+        TranscriptItem::Thinking { .. }
+        | TranscriptItem::Tool { .. }
+        | TranscriptItem::Notice { .. }
+        | TranscriptItem::Error { .. }
+        | TranscriptItem::Report(_)
+        | TranscriptItem::WorkflowsReport(_) => Speaker::Harness,
+    }
+}
+
+/// Blank rows above `cur`. Compact: none. Spacious: one before every item.
+/// Comfortable: one where the speaker changes, and always before a prompt.
+fn blank_before(prev: Option<&TranscriptItem>, cur: &TranscriptItem, density: Density) -> usize {
+    let Some(prev) = prev else { return 0 };
+    match density {
+        Density::Compact | Density::Spacious => density.blank_lines(),
+        Density::Comfortable => {
+            if speaker(prev) != speaker(cur) || matches!(cur, TranscriptItem::User { .. }) {
+                density.blank_lines()
+            } else {
+                0
+            }
+        }
+    }
 }
 
 /// The left-column signature of one turn: a marker glyph on the first visual
@@ -2702,6 +2752,63 @@ mod tests {
         s.open_context = Some(s.context_window / 8); // 12%
         let rows = draw(&s);
         assert!(rows[STRIP].contains(" 12% "), "{}", rows[STRIP]);
+    }
+
+    // ---- 0049 T2: blank rows between speakers, not items ----
+
+    #[test]
+    fn comfortable_blanks_between_speakers_not_items() {
+        let mut s = State::new(true, "m".into()); // Comfortable is the default
+        s.transcript = vec![
+            TranscriptItem::User { text: "hi".into() },
+            tool_item("t1", "read", "a.rs", ToolStatus::Done, 0),
+            tool_item("t2", "bash", "cargo test", ToolStatus::Failed, 0),
+            TranscriptItem::Notice {
+                text: "retrying".into(),
+            },
+            TranscriptItem::Assistant { text: "yo".into() },
+        ];
+        let rows = draw(&s);
+        assert!(rows[0].starts_with("  ❯ hi"), "{:?}", rows[0]);
+        assert_eq!(rows[1].trim(), "", "blank: you → harness");
+        assert!(rows[2].contains("read"), "{:?}", rows[2]);
+        assert!(rows[3].contains("bash"), "cards stack: {:?}", rows[3]);
+        assert!(
+            rows[4].contains("retrying"),
+            "notice rides the run: {:?}",
+            rows[4]
+        );
+        assert_eq!(rows[5].trim(), "", "blank: harness → model");
+        assert!(rows[6].starts_with("  ● yo"), "{:?}", rows[6]);
+    }
+
+    #[test]
+    fn a_prompt_always_gets_a_blank_before_it() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![
+            TranscriptItem::Steer {
+                text: "left".into(),
+                queued: false,
+            },
+            TranscriptItem::User {
+                text: "again".into(),
+            },
+        ];
+        let rows = draw(&s);
+        assert_eq!(rows[1].trim(), "", "same speaker, still a blank before ❯");
+    }
+
+    #[test]
+    fn spacious_keeps_a_blank_between_every_item() {
+        let mut s = State::new(true, "m".into());
+        s.density = hotl_theme::Density::Spacious;
+        s.transcript = vec![
+            tool_item("t1", "read", "a.rs", ToolStatus::Done, 0),
+            tool_item("t2", "read", "b.rs", ToolStatus::Done, 0),
+        ];
+        let rows = draw(&s);
+        assert_eq!(rows[1].trim(), "");
+        assert!(rows[2].contains("b.rs"));
     }
 
     /// The last resort when nothing droppable is left: the text is cut at a

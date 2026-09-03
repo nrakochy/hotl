@@ -65,7 +65,9 @@ impl Density {
         }
     }
 
-    /// Blank lines inserted between one turn and the next.
+    /// Blank lines the console inserts: Spacious's 1 between every item,
+    /// Comfortable's 1 only between *speakers* (you, the model, the harness)
+    /// and before every prompt.
     pub fn blank_lines(self) -> usize {
         match self {
             Density::Compact => 0,
