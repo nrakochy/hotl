@@ -97,7 +97,14 @@ const ADVISORY_P99_NS: u64 = 2_000_000; // 2ms
 static MEASUREMENT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn baseline_path() -> std::path::PathBuf {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("loop-baseline.json")
+    // Runtime first: Cargo's fingerprint never covers the compile-time value,
+    // so a target dir shared across worktrees hands this checkout a binary
+    // with the other tree's path baked in. cargo test and nextest set the
+    // live one for every test process.
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+        .join("loop-baseline.json")
 }
 
 fn read_baseline() -> (u64, u64) {
