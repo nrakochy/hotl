@@ -269,6 +269,14 @@ pub fn token_suffix_chars_in(s: &str, live: &[String]) -> Option<usize> {
     live.iter().any(|m| m == tok).then_some(n)
 }
 
+/// `token_suffix_chars_in`'s forward twin: the char length of the live token
+/// `s` *starts* with. The Delete arm calls it.
+pub fn token_prefix_chars_in(s: &str, live: &[String]) -> Option<usize> {
+    let len = token_len_at(s)?;
+    let tok = &s[..len];
+    live.iter().any(|m| m == tok).then(|| tok.chars().count())
+}
+
 /// Token length in bytes when `s` begins with a well-formed token.
 fn token_len_at(s: &str) -> Option<usize> {
     fn digits(s: &str) -> Option<usize> {
@@ -665,5 +673,17 @@ mod tests {
             token_suffix_chars_in("why does it render [Image #1]", &[]),
             None
         );
+    }
+
+    #[test]
+    fn token_prefix_chars_in_matches_a_live_token_at_the_start() {
+        let live = vec!["[Image #1]".to_string()];
+        assert_eq!(
+            token_prefix_chars_in("[Image #1] and more", &live),
+            Some(10)
+        );
+        assert_eq!(token_prefix_chars_in(" [Image #1]", &live), None);
+        assert_eq!(token_prefix_chars_in("[Image #2]", &live), None);
+        assert_eq!(token_prefix_chars_in("[Image #1]", &[]), None);
     }
 }

@@ -314,6 +314,56 @@ impl Editor {
                 }
                 EditorEvent::None
             }
+            // ALT arms first so they win the match over the bare arrows.
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.end_recall();
+                self.cursor.1 = word_left(&self.lines[self.cursor.0], self.cursor.1);
+                EditorEvent::None
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => {
+                self.end_recall();
+                self.cursor.1 = word_right(&self.lines[self.cursor.0], self.cursor.1);
+                EditorEvent::None
+            }
+            KeyCode::Left => {
+                self.end_recall();
+                let (row, col) = self.cursor;
+                if col > 0 {
+                    self.cursor.1 = col - 1;
+                } else if row > 0 {
+                    self.cursor = (row - 1, char_len(&self.lines[row - 1]));
+                }
+                EditorEvent::None
+            }
+            KeyCode::Right => {
+                self.end_recall();
+                let (row, col) = self.cursor;
+                if col < char_len(&self.lines[row]) {
+                    self.cursor.1 = col + 1;
+                } else if row + 1 < self.lines.len() {
+                    self.cursor = (row + 1, 0);
+                }
+                EditorEvent::None
+            }
+            KeyCode::Delete => {
+                self.end_recall();
+                let (row, col) = self.cursor;
+                let len = char_len(&self.lines[row]);
+                if col < len {
+                    // A live token starting at the cursor deletes as one
+                    // unit — the forward twin of Backspace's token rule.
+                    let rest = char_slice(&self.lines[row], col, len);
+                    if let Some(n) = crate::paste::token_prefix_chars_in(&rest, &self.live_tokens) {
+                        char_remove_range(&mut self.lines[row], col, col + n);
+                    } else {
+                        char_remove(&mut self.lines[row], col);
+                    }
+                } else if row + 1 < self.lines.len() {
+                    let tail = self.lines.remove(row + 1);
+                    self.lines[row].push_str(&tail);
+                }
+                EditorEvent::None
+            }
             _ => EditorEvent::None,
         }
     }
@@ -742,6 +792,32 @@ fn motion_col(line: &str, col: usize, m: char, n: u32) -> usize {
     }
 }
 
+/// Previous word start, readline-style: skip spaces left, then non-spaces.
+fn word_left(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col.min(chars.len());
+    while i > 0 && chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    while i > 0 && !chars[i - 1].is_whitespace() {
+        i -= 1;
+    }
+    i
+}
+
+/// Next word end's far side: skip non-spaces right, then spaces.
+fn word_right(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col.min(chars.len());
+    while i < chars.len() && !chars[i].is_whitespace() {
+        i += 1;
+    }
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    i
+}
+
 fn char_len(s: &str) -> usize {
     s.chars().count()
 }
@@ -791,7 +867,19 @@ mod tests {
                     "bs" => KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
                     "up" => KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
                     "down" => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+                    "left" => KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+                    "right" => KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+                    "del" => KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+                    "home" => KeyEvent::new(KeyCode::Home, KeyModifiers::NONE),
+                    "end" => KeyEvent::new(KeyCode::End, KeyModifiers::NONE),
+                    "a-left" => KeyEvent::new(KeyCode::Left, KeyModifiers::ALT),
+                    "a-right" => KeyEvent::new(KeyCode::Right, KeyModifiers::ALT),
+                    "c-a" => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
                     "c-e" => KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+                    "c-g" => KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+                    "c-k" => KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+                    "c-u" => KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+                    "c-w" => KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
                     "c-r" => KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
                     other => panic!("unknown key token <{other}>"),
                 }
@@ -865,6 +953,76 @@ mod tests {
         e.insert_text("look at [Image #1]");
         keys(&mut e, "<bs>");
         assert_eq!(e.text(), "look at ");
+    }
+
+    // ---- 0047 P0 T1: the composer as a line editor ----
+
+    #[test]
+    fn left_and_right_move_within_and_across_lines() {
+        let mut e = Editor::new(false);
+        keys(&mut e, "ab<left>x");
+        assert_eq!(e.text(), "axb");
+        // At col 0, ← joins the previous line's end; at line end, → the next start.
+        let mut e = Editor::new(false);
+        keys(&mut e, "ab");
+        e.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        keys(&mut e, "cd<left><left><left>x"); // the third ← crosses the line break
+        assert_eq!(e.text(), "abx\ncd");
+        keys(&mut e, "<right>y"); // → at line end lands on the next line's start
+        assert_eq!(e.text(), "abx\nycd");
+    }
+
+    #[test]
+    fn alt_arrows_move_by_word() {
+        let mut e = Editor::new(false);
+        keys(&mut e, "one two  three<a-left>x");
+        assert_eq!(e.text(), "one two  xthree");
+        keys(&mut e, "<a-left><a-left>y"); // over the x, then the spaces and "two"
+        assert_eq!(e.text(), "one ytwo  xthree");
+        keys(&mut e, "<a-right>z"); // skips the word and the spaces after it
+        assert_eq!(e.text(), "one ytwo  zxthree");
+    }
+
+    #[test]
+    fn delete_removes_forward_and_joins_lines() {
+        let mut e = Editor::new(false);
+        keys(&mut e, "abc<left><left><del>");
+        assert_eq!(e.text(), "ac");
+        let mut e = Editor::new(false);
+        keys(&mut e, "ab");
+        e.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        keys(&mut e, "cd<up>"); // cursor to row 0 (col clamps to end)
+        keys(&mut e, "<del>");
+        assert_eq!(e.text(), "abcd"); // Delete at line end joins the next line
+        keys(&mut e, "<end><del>"); // nothing after the last line: no-op
+        assert_eq!(e.text(), "abcd");
+    }
+
+    #[test]
+    fn delete_removes_a_whole_live_token_at_the_cursor() {
+        // Forward twin of `backspace_after_a_token_swallows_it_whole`.
+        let mut e = Editor::new(false);
+        e.set_live_tokens(vec!["[Image #1]".into()]);
+        e.set_text("say [Image #1] now");
+        e.cursor_to((0, 4));
+        keys(&mut e, "<del>");
+        assert_eq!(e.text(), "say  now");
+        assert_eq!(e.cursor(), (0, 4));
+        // No attachment behind it: one char, like anywhere else.
+        let mut e = Editor::new(false);
+        e.set_text("[Image #1]");
+        e.cursor_to((0, 0));
+        keys(&mut e, "<del>");
+        assert_eq!(e.text(), "Image #1]");
+    }
+
+    #[test]
+    fn arrows_work_while_a_recalled_prompt_is_up() {
+        let mut e = ed_hist(&["older"]);
+        keys(&mut e, "<up><left>x");
+        assert_eq!(e.text(), "oldexr"); // recall ends, the line is editable in place
+        keys(&mut e, "<down>"); // no longer recalling: ↓ is a no-op
+        assert_eq!(e.text(), "oldexr");
     }
 
     #[test]
