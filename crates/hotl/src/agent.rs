@@ -408,7 +408,8 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         keep: parsed.keep,
         keep_turns: parsed.keep_turns,
     });
-    match (parsed.schema, parsed.prompt) {
+    let prompt = headless_prompt(parsed.prompt, parsed.goal.as_deref());
+    match (parsed.schema, prompt) {
         (Some(schema), Some(prompt)) => match prompt.resolve() {
             Ok(text) => structured_main(&text, &schema, parsed.name).await,
             Err(code) => code,
@@ -421,11 +422,18 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
         // headless flag here); the interactive console is bare `hotl`.
         (_, None) => {
             eprintln!(
-                "hotl: -p \"prompt\" is required headless — the interactive console is bare `hotl` in a terminal"
+                "hotl: -p \"prompt\" (or --goal <condition>) is required headless — the interactive console is bare `hotl` in a terminal"
             );
             2
         }
     }
+}
+
+/// `--goal` alone is a run whose prompt is the condition — "the condition
+/// itself as the directive" (0048). An explicit `-p` wins; stdin is never
+/// consulted on the goal's behalf.
+fn headless_prompt(prompt: Option<Prompt>, goal: Option<&str>) -> Option<Prompt> {
+    prompt.or_else(|| goal.map(|g| Prompt::Text(g.to_string())))
 }
 
 /// `hotl -p "…" --json-schema <file>` (T2): run one headless turn, validate the
@@ -5880,6 +5888,29 @@ mod tests {
             let args: Vec<String> = bad.iter().map(|s| s.to_string()).collect();
             assert!(parse_args(args).is_err(), "{bad:?}");
         }
+    }
+
+    /// `--goal` alone is a headless run whose prompt is the condition
+    /// (0048): no `-p` needed, and stdin is never consulted.
+    #[test]
+    fn parse_args_accepts_goal_alone_as_the_prompt() {
+        let args: Vec<String> = ["--goal", "tests pass"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let parsed = parse_args(args).expect("parses");
+        assert_eq!(parsed.prompt, None);
+        assert_eq!(parsed.goal.as_deref(), Some("tests pass"));
+        assert_eq!(
+            headless_prompt(parsed.prompt, parsed.goal.as_deref()),
+            Some(Prompt::Text("tests pass".into()))
+        );
+        // An explicit prompt still wins; a missing goal still means no prompt.
+        assert_eq!(
+            headless_prompt(Some(Prompt::Stdin), Some("g")),
+            Some(Prompt::Stdin)
+        );
+        assert_eq!(headless_prompt(None, None), None);
     }
 
     /// Finding 1 (CRITICAL) regression. hotl's real `-p` one-shot binary

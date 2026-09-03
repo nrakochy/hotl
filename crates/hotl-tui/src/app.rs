@@ -2205,11 +2205,31 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     state.goal = Some(goal.clone());
                     state.goal_ticks = 0;
                     state.goal_turns = 0;
-                    notice(
-                        state,
-                        format!("◎ goal set — the turn keeps going until it is met: {goal}"),
-                    );
-                    vec![Cmd::SetGoal(Some(goal))]
+                    // Idle: the condition is the directive (0048), submitted
+                    // behind the set — the engine's command channel is FIFO,
+                    // so the goal is armed before the turn it gates is
+                    // admitted. Not via `submit`: a condition may begin with
+                    // `/` (a path) and must never read as a slash command.
+                    // Mid-turn: set only; the gate fires when this turn ends.
+                    if state.phase == Phase::Idle {
+                        notice(state, format!("◎ goal set — working toward it now: {goal}"));
+                        state.transcript.push(TranscriptItem::User {
+                            text: goal.clone().into(),
+                        });
+                        state.phase = Phase::Sampling { ticks: 0 };
+                        state.scroll = Scroll::Follow;
+                        vec![
+                            Cmd::SetGoal(Some(goal.clone())),
+                            Cmd::SendPrompt(paste::PromptPayload::text_only(goal)),
+                            Cmd::SetTitle(title(state, " — working")),
+                        ]
+                    } else {
+                        notice(
+                            state,
+                            format!("◎ goal set — the turn keeps going until it is met: {goal}"),
+                        );
+                        vec![Cmd::SetGoal(Some(goal))]
+                    }
                 }
                 None => {
                     notice(
@@ -5375,18 +5395,58 @@ mod tests {
     // --- /goal (plan 0034) ------------------------------------------
 
     #[test]
-    fn slash_goal_sets_normalizes_and_emits_the_cmd() {
+    fn slash_goal_when_idle_sets_and_submits_the_condition_as_the_prompt() {
         let mut s = State::test_default();
         let cmds = type_and_submit(&mut s, "/goal   all tests pass  ");
+        // Set first, then the prompt: the engine's command channel is FIFO,
+        // so the goal is armed before the turn it should gate is admitted.
         assert!(
-            matches!(&cmds[..], [Cmd::SetGoal(Some(g))] if g == "all tests pass"),
+            matches!(
+                &cmds[..],
+                [Cmd::SetGoal(Some(g)), Cmd::SendPrompt(p), Cmd::SetTitle(_)]
+                    if g == "all tests pass" && p.text == "all tests pass" && p.images.is_empty()
+            ),
             "got {cmds:?}"
         );
         assert_eq!(s.goal.as_deref(), Some("all tests pass"));
-        assert_eq!(
-            s.phase,
-            Phase::Idle,
-            "a goal set is bookkeeping, not a prompt"
+        assert_eq!(s.phase, Phase::Sampling { ticks: 0 });
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::User { text }) if text == "all tests pass"),
+            "the condition is the directive, and it shows as one"
+        );
+        // The notice precedes the directive it announces.
+        let n = s.transcript.len();
+        assert!(
+            matches!(&s.transcript[n - 2], TranscriptItem::Notice { text } if text.as_str().contains("working toward it now")),
+            "{:?}",
+            s.transcript[n - 2]
+        );
+    }
+
+    /// Mid-turn, `/goal` only arms the gate (it fires when this turn ends);
+    /// nothing is submitted and nothing is steered.
+    #[test]
+    fn slash_goal_while_a_turn_runs_only_sets() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 7 };
+        let before = s.transcript.len();
+        let cmds = type_and_submit(&mut s, "/goal ship it");
+        assert!(
+            matches!(&cmds[..], [Cmd::SetGoal(Some(g))] if g == "ship it"),
+            "got {cmds:?}"
+        );
+        assert_eq!(s.phase, Phase::Sampling { ticks: 7 });
+        assert!(
+            !s.transcript[before..].iter().any(|i| matches!(
+                i,
+                TranscriptItem::User { .. } | TranscriptItem::Steer { .. }
+            )),
+            "a mid-turn set neither prompts nor steers"
+        );
+        assert!(
+            last_notice(&s).contains("keeps going until it is met"),
+            "{}",
+            last_notice(&s)
         );
     }
 

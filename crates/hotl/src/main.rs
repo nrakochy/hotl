@@ -141,8 +141,12 @@ fn main() {
 /// Headless flags route to `agent.rs`; everything else in the catch-all is
 /// the TUI's (bare, an id-prefix, or --resume).
 fn is_headless(args: &[String]) -> bool {
-    args.iter()
-        .any(|a| matches!(a.as_str(), "-p" | "--print" | "--json" | "--json-schema"))
+    args.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-p" | "--print" | "--json" | "--json-schema" | "--goal"
+        )
+    })
 }
 
 fn print_help() {
@@ -154,6 +158,7 @@ fn print_help() {
          \x20                   --keep <items> / --keep-turns <n> fork at a prefix instead of the head\n  \
          hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          \x20                   --goal <condition> keeps the turn going until a fast evaluator judges it met\n  \
+         hotl --goal \"<cond>\"   headless goal loop with the condition as the prompt (no -p needed)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
          hotl watch           tmux agent dashboard (watch)\n  \
@@ -317,6 +322,8 @@ mod tests {
         assert!(is_headless(&v(&["-p", "hi"])));
         assert!(is_headless(&v(&["--json", "-p", "hi"])));
         assert!(is_headless(&v(&["-p", "hi", "--json-schema", "s.json"])));
+        // `--goal` alone is headless: the condition is the prompt (0048).
+        assert!(is_headless(&v(&["--goal", "tests pass"])));
     }
     #[test]
     fn tui_args_do_not() {
