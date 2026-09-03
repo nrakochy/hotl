@@ -212,6 +212,8 @@ struct Geometry {
     density: Density,
     thinking_expanded: bool,
     palette: Palette,
+    /// The prose measure (0049 T5) — a `/reload` that changes it re-wraps.
+    measure: usize,
 }
 
 /// A hash of everything about one item that reaches the screen.
@@ -338,6 +340,7 @@ fn render_transcript(
         density: state.density,
         thinking_expanded: state.thinking_expanded,
         palette: *p,
+        measure: state.measure,
     };
     if cache.geometry.as_ref() != Some(&geometry) {
         cache.items.clear();
@@ -384,7 +387,8 @@ fn render_transcript(
                         .map(|inc| (std::mem::take(&mut slot.rows), inc))
                 })
                 .unwrap_or_else(|| (Vec::new(), Incremental::new(text.seed())));
-            cache.line_wraps += assistant_append(&mut rows, &mut inc, text, p, width, gutter);
+            cache.line_wraps +=
+                assistant_append(&mut rows, &mut inc, text, p, width, gutter, state.measure);
             CachedItem {
                 fingerprint,
                 rows,
@@ -393,7 +397,14 @@ fn render_transcript(
         } else {
             CachedItem {
                 fingerprint,
-                rows: item_visual_lines(item, p, width, gutter, state.thinking_expanded),
+                rows: item_visual_lines(
+                    item,
+                    p,
+                    width,
+                    gutter,
+                    state.thinking_expanded,
+                    state.measure,
+                ),
                 incremental: None,
             }
         };
@@ -538,21 +549,24 @@ impl Spine {
 }
 
 /// One transcript item as it lands on screen: content wrapped to the width the
-/// gutter+spine leave, each row carrying its spine glyph. Used by both the
-/// render and the scroll math, so they can never disagree on row counts.
+/// gutter+spine leave — prose no wider than the measure (0049 T5, LD3),
+/// cards, code and reports at the full width — each row carrying its spine
+/// glyph. Used by both the render and the scroll math, so they can never
+/// disagree on row counts.
 fn item_visual_lines<'a>(
     item: &TranscriptItem,
     p: &Palette,
     width: usize,
     gutter: usize,
     thinking_expanded: bool,
+    measure: usize,
 ) -> Vec<Line<'a>> {
     // `gutter + 2` = the pad plus the one-column glyph and its trailing space.
     let inner = width.saturating_sub(gutter + 2).max(1);
     let (spine, content) = item_block(item, p, thinking_expanded, inner);
     let mut out = Vec::new();
-    for cl in &content {
-        for wl in wrap::line(cl, inner) {
+    for (cl, full) in &content {
+        for wl in wrap::line(cl, if *full { inner } else { inner.min(measure) }) {
             let first = out.is_empty();
             out.push(spine.wrap(wl, gutter, first));
         }
@@ -563,48 +577,68 @@ fn item_visual_lines<'a>(
     out
 }
 
+/// Content rows tagged with whether they keep the full width (`true`: cards,
+/// code, reports) or wrap at the prose measure (`false`).
+type Tagged<'a> = Vec<(Line<'a>, bool)>;
+
+fn prose(lines: Vec<Line<'_>>) -> Tagged<'_> {
+    lines.into_iter().map(|l| (l, false)).collect()
+}
+
+fn full(lines: Vec<Line<'_>>) -> Tagged<'_> {
+    lines.into_iter().map(|l| (l, true)).collect()
+}
+
 /// Assistant prose with light, line-level structure so an answer is scannable
 /// on its own, not just at the turn boundary. Deliberately NOT a markdown
 /// engine: each line is classified by how it begins, nothing spans lines
 /// except the fenced-code toggle. Anything unrecognized stays plain ink, so a
 /// stray `#` mid-sentence never turns into a heading.
-fn assistant_lines<'a>(text: &str, p: &Palette) -> Vec<Line<'a>> {
+fn assistant_lines<'a>(text: &str, p: &Palette) -> Tagged<'a> {
     let mut in_fence = false;
     text.split('\n')
         .map(|raw| assistant_line(raw, &mut in_fence, p))
         .collect()
 }
 
-/// One classified assistant line; `in_fence` is the only state carried across
-/// lines, which is what lets the incremental render re-enter mid-text.
-fn assistant_line<'a>(raw: &str, in_fence: &mut bool, p: &Palette) -> Line<'a> {
+/// One classified assistant line and whether it is full-width (a fence line,
+/// fenced code, or 4-space-indented code); `in_fence` is the only state
+/// carried across lines, which is what lets the incremental render re-enter
+/// mid-text.
+fn assistant_line<'a>(raw: &str, in_fence: &mut bool, p: &Palette) -> (Line<'a>, bool) {
     let lead = raw.trim_start();
     // ``` toggles a code fence; the fence line itself renders as a quiet
     // divider rather than literal backticks shouting on screen.
     if lead.starts_with("```") {
         *in_fence = !*in_fence;
-        return Line::styled(raw.to_string(), Style::new().fg(p.faint).dim());
+        return (
+            Line::styled(raw.to_string(), Style::new().fg(p.faint).dim()),
+            true,
+        );
     }
     if *in_fence {
-        return code_line(raw, p);
+        return (code_line(raw, p), true);
     }
     // `#`..`###`-led heading → bold, hashes stripped.
     if let Some(h) = heading_text(lead) {
-        return Line::styled(h, Style::new().fg(p.ink).bold());
+        return (Line::styled(h, Style::new().fg(p.ink).bold()), false);
     }
     // `- ` / `* ` bullet → a `•` marker in the accent, indentation kept.
     if let Some((indent, rest)) = bullet(raw) {
-        return Line::from(vec![
-            Span::raw(indent.to_string()),
-            Span::styled("• ", Style::new().fg(p.accent)),
-            Span::styled(rest.to_string(), Style::new().fg(p.ink)),
-        ]);
+        return (
+            Line::from(vec![
+                Span::raw(indent.to_string()),
+                Span::styled("• ", Style::new().fg(p.accent)),
+                Span::styled(rest.to_string(), Style::new().fg(p.ink)),
+            ]),
+            false,
+        );
     }
     // A 4-space indent is markdown's other code form.
     if raw.starts_with("    ") && !raw.trim().is_empty() {
-        return code_line(raw, p);
+        return (code_line(raw, p), true);
     }
-    Line::styled(raw.to_string(), Style::new().fg(p.ink))
+    (Line::styled(raw.to_string(), Style::new().fg(p.ink)), false)
 }
 
 /// Classify+wrap only what grew since the last frame: newly *completed* lines
@@ -622,8 +656,10 @@ fn assistant_append(
     p: &Palette,
     width: usize,
     gutter: usize,
+    measure: usize,
 ) -> u64 {
     let inner = width.saturating_sub(gutter + 2).max(1);
+    let width_of = |full: bool| if full { inner } else { inner.min(measure) };
     let spine = assistant_spine(p);
     let mut classified = 0u64;
     // Drop the previous frame's partial-line rows; the frozen prefix stands.
@@ -631,9 +667,9 @@ fn assistant_append(
     let tail = &text[inc.consumed..];
     if let Some(nl) = tail.rfind('\n') {
         for raw in tail[..nl].split('\n') {
-            let cl = assistant_line(raw, &mut inc.in_fence, p);
+            let (cl, full) = assistant_line(raw, &mut inc.in_fence, p);
             classified += 1;
-            for wl in wrap::line(&cl, inner) {
+            for wl in wrap::line(&cl, width_of(full)) {
                 let first = rows.is_empty();
                 rows.push(spine.wrap(wl, gutter, first));
             }
@@ -644,9 +680,9 @@ fn assistant_append(
     // The trailing (possibly partial) line. Its fence toggle must not leak
     // into frozen state — the line may still grow into something else.
     let mut fence = inc.in_fence;
-    let cl = assistant_line(&text[inc.consumed..], &mut fence, p);
+    let (cl, full) = assistant_line(&text[inc.consumed..], &mut fence, p);
     classified += 1;
-    for wl in wrap::line(&cl, inner) {
+    for wl in wrap::line(&cl, width_of(full)) {
         let first = rows.is_empty();
         rows.push(spine.wrap(wl, gutter, first));
     }
@@ -733,7 +769,7 @@ fn item_block<'a>(
     p: &Palette,
     thinking_expanded: bool,
     inner: usize,
-) -> (Spine, Vec<Line<'a>>) {
+) -> (Spine, Tagged<'a>) {
     match item {
         TranscriptItem::User { text } => (
             // You are the anchor: high-contrast caret, no continuation bar.
@@ -743,15 +779,17 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.ink).bold(),
                 cont_style: Style::new(),
             },
-            text.split('\n')
-                .map(|l| {
-                    token_line(
-                        l.to_string(),
-                        Style::new().fg(p.ink).bold(),
-                        Style::new().fg(p.accent).bold(),
-                    )
-                })
-                .collect(),
+            prose(
+                text.split('\n')
+                    .map(|l| {
+                        token_line(
+                            l.to_string(),
+                            Style::new().fg(p.ink).bold(),
+                            Style::new().fg(p.accent).bold(),
+                        )
+                    })
+                    .collect(),
+            ),
         ),
         TranscriptItem::Assistant { text } => (assistant_spine(p), assistant_lines(text, p)),
         TranscriptItem::Steer { text, queued: true } => (
@@ -761,11 +799,11 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.muted),
                 cont_style: Style::new(),
             },
-            vec![token_line(
+            prose(vec![token_line(
                 format!("{text} — steer queued, applies at next step"),
                 Style::new().fg(p.muted),
                 Style::new().fg(p.accent),
-            )],
+            )]),
         ),
         TranscriptItem::Steer {
             text,
@@ -777,11 +815,11 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.accent),
                 cont_style: Style::new(),
             },
-            vec![token_line(
+            prose(vec![token_line(
                 text.to_string(),
                 Style::new().fg(p.accent),
                 Style::new().fg(p.accent).bold(),
-            )],
+            )]),
         ),
         TranscriptItem::Tool {
             id: _,
@@ -841,7 +879,7 @@ fn item_block<'a>(
                     Style::new().fg(p.muted),
                 ));
             }
-            let lines = vec![Line::from(spans)];
+            let lines = full(vec![Line::from(spans)]);
             (
                 Spine {
                     marker,
@@ -859,10 +897,10 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.muted),
                 cont_style: Style::new(),
             },
-            vec![Line::styled(
+            prose(vec![Line::styled(
                 text.to_string(),
                 Style::new().fg(p.muted).italic(),
-            )],
+            )]),
         ),
         // A failed turn: red with a ✗, never the muted notice spine, so an
         // execution error cannot be mistaken for the routine chatter near it.
@@ -873,10 +911,10 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.blocked).bold(),
                 cont_style: Style::new(),
             },
-            vec![Line::styled(
+            prose(vec![Line::styled(
                 text.to_string(),
                 Style::new().fg(p.blocked).bold(),
-            )],
+            )]),
         ),
         // A `/context` report. Harness output, so it takes the `Notice` spine
         // rather than anything that reads as the model speaking.
@@ -887,7 +925,7 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.muted),
                 cont_style: Style::new().fg(p.muted),
             },
-            report_lines(r, p, inner),
+            full(report_lines(r, p, inner)),
         ),
         // A `/workflows` report (0044): one row per run, the same spine.
         TranscriptItem::WorkflowsReport(runs) => (
@@ -897,7 +935,7 @@ fn item_block<'a>(
                 marker_style: Style::new().fg(p.muted),
                 cont_style: Style::new().fg(p.muted),
             },
-            workflow_lines(runs, p),
+            full(workflow_lines(runs, p)),
         ),
         // Reasoning: dimmed italic behind a faint spine, collapsed by default.
         // The trailer names the toggle so it is discoverable without opening
@@ -927,7 +965,7 @@ fn item_block<'a>(
                     marker_style: Style::new().fg(p.faint),
                     cont_style: Style::new(),
                 },
-                lines,
+                prose(lines),
             )
         }
     }
@@ -2912,6 +2950,59 @@ mod tests {
         assert!(popup.starts_with("  ┌"), "{popup:?}");
     }
 
+    // ---- 0049 T5: a measure for prose ----
+
+    #[test]
+    fn prose_wraps_at_the_measure_on_a_wide_terminal() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![TranscriptItem::Assistant {
+            text: "word ".repeat(40).trim().into(), // 199 chars
+        }];
+        let rows = draw_at(&s, 200, 24);
+        let prose: Vec<&String> = rows.iter().filter(|r| r.contains("word")).collect();
+        assert_eq!(prose.len(), 2, "two rows at measure 110: {prose:?}");
+        assert!(
+            prose
+                .iter()
+                .all(|r| r.trim_end().chars().count() <= 4 + 110),
+            "{prose:?}"
+        );
+    }
+
+    #[test]
+    fn cards_and_code_ignore_the_measure() {
+        let mut s = State::new(true, "m".into());
+        let path = format!("crates/{}.rs", "x".repeat(150));
+        s.transcript = vec![
+            tool_item("t1", "read", &path, ToolStatus::Done, 0),
+            TranscriptItem::Assistant {
+                text: format!("```\n{}\n```", "y".repeat(150)).into(),
+            },
+        ];
+        let rows = draw_at(&s, 200, 24);
+        assert!(rows.iter().any(|r| r.contains(&path)), "card on one row");
+        assert!(
+            rows.iter().any(|r| r.contains(&"y".repeat(150))),
+            "code on one row"
+        );
+    }
+
+    #[test]
+    fn measure_zero_means_full_width_and_a_change_rewraps() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![TranscriptItem::Assistant {
+            // 149 chars: over the measure, under the 196 the width leaves.
+            text: "word ".repeat(30).trim().into(),
+        }];
+        let mut cache = TranscriptCache::default();
+        let _ = draw_cached_at(&s, &mut cache, 200, 24);
+        let n = cache.rewraps();
+        s.measure = usize::MAX;
+        let rows = draw_cached_at(&s, &mut cache, 200, 24);
+        assert!(cache.rewraps() > n, "measure is in Geometry");
+        assert_eq!(rows.iter().filter(|r| r.contains("word")).count(), 1);
+    }
+
     // ---- 0049 T4: bottom anchoring ----
 
     #[test]
@@ -3983,9 +4074,10 @@ mod tests {
         // carries the band at line level, so check there.
         let p = Palette::default();
         let lines = assistant_lines("```\nline in code\nstill code", &p);
-        // [fence marker, code, code]
-        assert_eq!(lines[1].style.bg, Some(p.band));
-        assert_eq!(lines[2].style.bg, Some(p.band));
+        // [fence marker, code, code] — every one full-width.
+        assert_eq!(lines[1].0.style.bg, Some(p.band));
+        assert_eq!(lines[2].0.style.bg, Some(p.band));
+        assert!(lines.iter().all(|(_, full)| *full));
     }
 
     #[test]
@@ -4406,8 +4498,8 @@ mod tests {
                 };
                 text.push_str(&corpus[fed..end]);
                 fed = end;
-                assistant_append(&mut rows, &mut inc, text.as_str(), &p, 40, 2);
-                let cold = item_visual_lines(&item, &p, 40, 2, false);
+                assistant_append(&mut rows, &mut inc, text.as_str(), &p, 40, 2, 30);
+                let cold = item_visual_lines(&item, &p, 40, 2, false, 30);
                 assert_eq!(rows, cold, "diverged at chunk={chunk} fed={fed}");
             }
         }
@@ -4493,7 +4585,7 @@ mod tests {
         assert_eq!(spine.marker_style.fg, Some(p.blocked));
         let shown: String = lines
             .iter()
-            .flat_map(|l| l.spans.iter())
+            .flat_map(|(l, _)| l.spans.iter())
             .map(|s| s.content.as_ref())
             .collect();
         assert!(
@@ -4502,7 +4594,7 @@ mod tests {
         );
         // `Line::styled` carries the color on the line, not its spans.
         assert!(
-            lines.iter().all(|l| l.style.fg == Some(p.blocked)),
+            lines.iter().all(|(l, _)| l.style.fg == Some(p.blocked)),
             "the error body is the blocked color, not muted: {lines:?}"
         );
     }
@@ -4533,6 +4625,9 @@ mod tests {
             inner,
         )
         .1
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect()
     }
 
     /// Every foreground a one-character `glyph` span was drawn in, in order.

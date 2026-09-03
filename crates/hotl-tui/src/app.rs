@@ -480,6 +480,8 @@ pub struct State {
     /// Transcript spacing, from `[settings] density`. Drives the blank line
     /// between turns and the left-gutter width the role spine lives in.
     pub density: hotl_theme::Density,
+    /// Prose wrap width from `[settings] measure`; `usize::MAX` = full width.
+    pub measure: usize,
     /// The `todo_write` checklist, from `todos_changed` updates. Empty means
     /// either no list yet or the model cleared it — both render as nothing.
     pub todos: Vec<hotl_tools::todo::Todo>,
@@ -566,6 +568,7 @@ impl State {
             workflow_roster: Vec::new(),
             pending_skill: None,
             density: hotl_theme::Density::default(),
+            measure: 110,
             todos: Vec::new(),
             goal: None,
             goal_ticks: 0,
@@ -712,10 +715,11 @@ pub enum Msg {
     },
     /// The runtime re-read the client-side half of `config.toml`
     /// (`Cmd::ReloadSettings`). Theme, mouse and copy-on-select live in the
-    /// runtime's own locals; these two live in `State`.
+    /// runtime's own locals; these three live in `State`.
     SettingsReloaded {
         vim_mode: bool,
         density: hotl_theme::Density,
+        measure: usize,
         warnings: Vec<String>,
     },
 }
@@ -1003,11 +1007,13 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
         Msg::SettingsReloaded {
             vim_mode,
             density,
+            measure,
             warnings,
         } => {
             state.vim_mode = vim_mode;
             state.editor.set_vim_mode(vim_mode);
             state.density = density;
+            state.measure = measure;
             for w in warnings {
                 notice(state, w);
             }
@@ -6306,11 +6312,13 @@ mod tests {
             Msg::SettingsReloaded {
                 vim_mode: false,
                 density: hotl_theme::Density::Compact,
+                measure: 80,
                 warnings: vec!["unknown density 'wat' — using comfortable".into()],
             },
         );
         assert!(!s.vim_mode);
         assert_eq!(s.density, hotl_theme::Density::Compact);
+        assert_eq!(s.measure, 80);
         assert!(last_notice(&s).contains("unknown density"));
         // The editor holds its own copy; a stale one would leave modal keys
         // live after vim mode was turned off.

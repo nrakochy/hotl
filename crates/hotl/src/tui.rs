@@ -78,6 +78,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     let mut state = State::new(settings.vim_mode, String::new());
     state.mode = String::new();
     state.density = settings.density;
+    state.measure = settings.measure;
     state.editor.load_history(history);
     let mut cache = TranscriptCache::default();
     let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
@@ -316,6 +317,8 @@ fn open_extras(
 struct ClientSettings {
     palette: Palette,
     density: hotl_theme::Density,
+    /// Prose wrap width (`[settings] measure`); `usize::MAX` = full width.
+    measure: usize,
     vim_mode: bool,
     mouse: bool,
     copy_on_select: bool,
@@ -340,6 +343,7 @@ fn client_settings() -> ClientSettings {
     ClientSettings {
         palette: Palette::from(&watch_cfg.settings.theme.resolve().0),
         density,
+        measure: watch_cfg.settings.measure(),
         vim_mode: cfg.behavior.vim_mode(),
         mouse,
         // Without capture there are no drag events at all, so the copy feature
@@ -534,6 +538,7 @@ async fn run_loop(
                         Msg::SettingsReloaded {
                             vim_mode: s.vim_mode,
                             density: s.density,
+                            measure: s.measure,
                             warnings: s.warnings,
                         },
                     ));

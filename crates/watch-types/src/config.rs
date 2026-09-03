@@ -20,6 +20,9 @@ pub struct Settings {
     /// `spacious`. Kept as the raw string so an unknown value warns rather
     /// than fails to parse the whole config; resolve via [`Settings::density`].
     pub density: String,
+    /// Widest a prose row may be, in columns; `0` = the terminal's width.
+    /// Cards, code and reports always use the full width.
+    pub measure: u64,
 }
 
 impl Default for Settings {
@@ -31,6 +34,7 @@ impl Default for Settings {
             vim_mode: true,
             theme: ThemeConfig::default(),
             density: "comfortable".into(),
+            measure: 110,
         }
     }
 }
@@ -45,6 +49,15 @@ impl Settings {
     /// The configured poll interval, floored at [`MIN_POLL_INTERVAL_MS`].
     pub fn poll_interval_ms_clamped(&self) -> u64 {
         self.poll_interval_ms.max(MIN_POLL_INTERVAL_MS)
+    }
+
+    /// The prose measure as a wrap width; `0` means unlimited.
+    pub fn measure(&self) -> usize {
+        if self.measure == 0 {
+            usize::MAX
+        } else {
+            self.measure as usize
+        }
     }
 
     /// Resolve `density`, warning (and falling back to the default) on an
@@ -131,6 +144,15 @@ mod tests {
         let (d, warn) = c.settings.density();
         assert_eq!(d, Density::Comfortable);
         assert!(warn.unwrap().contains("huge"));
+    }
+
+    #[test]
+    fn measure_defaults_to_110_and_zero_means_full_width() {
+        assert_eq!(HotlConfig::parse("").settings.measure(), 110);
+        let c = HotlConfig::parse("[settings]\nmeasure = 0\n");
+        assert_eq!(c.settings.measure(), usize::MAX);
+        let c = HotlConfig::parse("[settings]\nmeasure = 80\n");
+        assert_eq!(c.settings.measure(), 80);
     }
 
     #[test]

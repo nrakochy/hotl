@@ -145,6 +145,7 @@ rs = "cargo check -q --message-format=short"
 
 [settings]
 density = "comfortable"    # transcript spacing: compact | comfortable | spacious
+measure = 110              # widest prose row, columns; 0 = full width
 
 [settings.theme]           # palette for the console AND `hotl watch` (see tui.md)
 preset = "warm"            # tokyo-night (the default) | warm | catppuccin | gruvbox | nord | dracula
@@ -162,7 +163,12 @@ accent = "#88c0d0"         # optional per-slot #rrggbb overrides: active blocked
 | `spacious` | one blank line | 4 columns |
 
 An unrecognized value warns and falls back to `comfortable`. The gutter is
-where the role spine is drawn (see [tui.md](../tui/)). `warm` is a low-blue
+where the role spine is drawn (see [tui.md](../tui/)).
+
+**`measure`** caps how wide a prose row may run on a wide terminal (default
+`110` columns; `0` = the full width). Only prose wraps at it — your prompts,
+the model's answers, notices; tool cards, code blocks and `/context` reports
+always use the full width. `warm` is a low-blue
 palette — paper-white ink, amber accent, terracotta — for a less clinical
 feel; it's opt-in, the default stays `tokyo-night`.
 

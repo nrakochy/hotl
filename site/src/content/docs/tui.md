@@ -48,7 +48,7 @@ Two knobs, one in each table:
 
 Top to bottom:
 
-1. **Transcript** — every turn carries a marker in the left gutter, so you can see the shape of the conversation by scanning straight down: `❯` your prompts, `●` the assistant (with a `│` bar down a long answer), `✓ ✗ ⛔` tool cards (`✓ bash  cargo test · 2s`), `⤷` steers, `·` dim notices (retries, fallbacks, compaction). Inside an assistant answer, headings, bullets, and code get light styling so a long reply is scannable. With the input empty and no agent band showing, vim Normal `j`/`k` scroll it one item at a time; it snaps back to following the bottom on your next prompt.
+1. **Transcript** — every turn carries a marker in the left gutter, so you can see the shape of the conversation by scanning straight down: `❯` your prompts, `●` the assistant (with a `│` bar down a long answer), `✓ ✗ ⛔` tool cards (`✓ bash  cargo test · 2s`), `⤷` steers, `·` dim notices (retries, fallbacks, compaction). Inside an assistant answer, headings, bullets, and code get light styling so a long reply is scannable. On a wide terminal prose wraps at `[settings] measure` (110 columns by default) so lines stay readable; cards, code and reports keep the full width. With the input empty and no agent band showing, vim Normal `j`/`k` scroll it one item at a time; it snaps back to following the bottom on your next prompt.
 2. **Activity strip** — one line that tells you what the turn is doing, animated as a loop drawing itself:
 
    | You see | It means |
