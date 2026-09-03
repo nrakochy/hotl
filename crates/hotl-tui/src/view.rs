@@ -1792,7 +1792,7 @@ const HELP_COLS: usize = 64;
 /// (only when on), transcript, agent band + esc ladder, asks, commands.
 pub(crate) fn help_lines(state: &State) -> Vec<String> {
     let mut lines = vec![
-        "enter send · shift/alt-enter newline",
+        "enter send · shift/alt-enter newline · ctrl-v paste (clipboard image or text)",
         "← → home end · ctrl-a/e line start/end · alt-←/→ by word · delete forward",
         "ctrl-k/u kill to end/start · ctrl-w delete word back · ctrl-g open $EDITOR",
         "↑ ↓ recall prompt history (prefix-aware) · ctrl-r search history",

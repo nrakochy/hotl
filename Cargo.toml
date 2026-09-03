@@ -93,6 +93,12 @@ dunce = "1"
 getrandom = "0.3"
 dirs = "6"
 windows-sys = "0.61"
+# Clipboard image paste (plan 0047 P0). Pure Rust on every platform arboard
+# supports: X11 + Wayland on Linux, AppKit on macOS, Win32 on Windows. The
+# RGBA it hands back is encoded to PNG with `png` before it enters the
+# `[Image #N]` pipeline as a temp file.
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
+png = "0.18"
 
 [profile.release]
 strip = true

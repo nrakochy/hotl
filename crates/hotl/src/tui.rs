@@ -5,12 +5,12 @@
 
 use std::collections::VecDeque;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use crossterm::event::{Event, KeyEventKind};
+use crossterm::event::{Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::SetTitle;
 use hotl_platform::KnownPaths as _;
@@ -96,7 +96,12 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
             o = &mut open => break o,
             ev = keys.recv() => match ev {
                 Some(ev) => {
-                    if let Some(msg) = terminal_msg(ev, settings.copy_on_select) {
+                    let msg = if is_paste_key(&ev) {
+                        clipboard_msg(&mut state)
+                    } else {
+                        terminal_msg(ev, settings.copy_on_select)
+                    };
+                    if let Some(msg) = msg {
                         hotl_tui::app::pre_open_input(&mut state, msg);
                     }
                 }
@@ -547,6 +552,7 @@ async fn run_loop(
         }
         let msg = tokio::select! {
             ev = keys.recv() => match ev {
+                Some(ev) if is_paste_key(&ev) => clipboard_msg(&mut state),
                 Some(ev) => terminal_msg(ev, copy_on_select), // `None` = redraw-only (resize, mouse motion)
                 None => return Ok(1),
             },
@@ -747,6 +753,98 @@ fn terminal_msg(ev: Event, select: bool) -> Option<Msg> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Clipboard access behind a seam so tests never touch a real clipboard.
+trait ClipboardSource {
+    /// The clipboard's image as PNG bytes, when it holds one.
+    fn image_png(&mut self) -> Option<Vec<u8>>;
+    /// The clipboard's text, when it holds a non-empty string.
+    fn text(&mut self) -> Option<String>;
+}
+
+/// The OS clipboard via `arboard`. Every failure — no clipboard, no image,
+/// an unsupported display — reads as "nothing there"; the console never
+/// errors on a paste.
+struct SystemClipboard;
+
+impl ClipboardSource for SystemClipboard {
+    fn image_png(&mut self) -> Option<Vec<u8>> {
+        let img = arboard::Clipboard::new().ok()?.get_image().ok()?;
+        encode_png(img.width, img.height, &img.bytes)
+    }
+    fn text(&mut self) -> Option<String> {
+        arboard::Clipboard::new()
+            .ok()?
+            .get_text()
+            .ok()
+            .filter(|t| !t.is_empty())
+    }
+}
+
+/// RGBA8 rows → a PNG file's bytes. `None` when the dimensions and the
+/// buffer disagree (a clipboard handing back a truncated bitmap).
+fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Option<Vec<u8>> {
+    if rgba.len() != width.checked_mul(height)?.checked_mul(4)? {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut enc = png::Encoder::new(
+        &mut out,
+        u32::try_from(width).ok()?,
+        u32::try_from(height).ok()?,
+    );
+    enc.set_color(png::ColorType::Rgba);
+    enc.set_depth(png::BitDepth::Eight);
+    let mut w = enc.write_header().ok()?;
+    w.write_image_data(rgba).ok()?;
+    w.finish().ok()?;
+    Some(out)
+}
+
+/// The paste chord: a plain `Ctrl-V` press. Terminals that own the chord
+/// (Windows Terminal) never deliver it, and their bracketed paste still
+/// carries text; `Ctrl-Shift-V` is left to the emulator on purpose.
+fn is_paste_key(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                && k.code == KeyCode::Char('v')
+                && k.modifiers == KeyModifiers::CONTROL
+    )
+}
+
+/// What `Ctrl-V` injects (tracker #39). An image is written to a temp file
+/// and rides the same `Msg::Paste` a dropped file takes, so it compacts to
+/// `[Image #N]` and is read at submit like any other attachment; text is an
+/// ordinary paste; nothing pastable is the `Err` notice.
+fn clipboard_paste(src: &mut dyn ClipboardSource, dir: &Path) -> Result<Msg, String> {
+    if let Some(png) = src.image_png() {
+        let path = dir.join(format!("hotl-paste-{}.png", ulid::Ulid::new()));
+        return match std::fs::write(&path, png) {
+            Ok(()) => Ok(Msg::Paste(path.display().to_string())),
+            Err(e) => Err(format!("clipboard: could not save the image: {e}")),
+        };
+    }
+    if let Some(text) = src.text() {
+        return Ok(Msg::Paste(text));
+    }
+    Err("clipboard: nothing pastable".into())
+}
+
+/// `Ctrl-V` in either loop: the clipboard's message, or a transcript notice
+/// and no message when there was nothing to paste.
+fn clipboard_msg(state: &mut State) -> Option<Msg> {
+    match clipboard_paste(&mut SystemClipboard, &std::env::temp_dir()) {
+        Ok(msg) => Some(msg),
+        Err(text) => {
+            state
+                .transcript
+                .push(hotl_tui::app::TranscriptItem::Notice { text: text.into() });
+            None
+        }
     }
 }
 
@@ -1087,11 +1185,11 @@ fn age(t: SystemTime) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        defers_draw, parse_tui_args, parse_tui_flags, resolve_mouse, resolve_session_arg,
-        terminal_msg, WHEEL_LINES,
+        clipboard_paste, defers_draw, is_paste_key, parse_tui_args, parse_tui_flags, resolve_mouse,
+        resolve_session_arg, terminal_msg, ClipboardSource, WHEEL_LINES,
     };
-    use crossterm::event::{Event, KeyModifiers};
-    use hotl_tui::app::Msg;
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use hotl_tui::app::{update, Msg, State};
     use serde_json::json;
     use std::time::SystemTime;
 
@@ -1111,6 +1209,110 @@ mod tests {
             media_type: "image/png".into(),
             data: None,
         }
+    }
+
+    // ---- 0047 P0 T5: ctrl-v clipboard paste through the [Image #N] path ----
+
+    struct FakeClipboard {
+        image: Option<Vec<u8>>,
+        text: Option<String>,
+    }
+
+    impl ClipboardSource for FakeClipboard {
+        fn image_png(&mut self) -> Option<Vec<u8>> {
+            self.image.clone()
+        }
+        fn text(&mut self) -> Option<String> {
+            self.text.clone()
+        }
+    }
+
+    #[test]
+    fn a_clipboard_image_lands_as_a_temp_png_and_an_image_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let png = vec![0x89, b'P', b'N', b'G', 1, 2, 3];
+        let mut src = FakeClipboard {
+            image: Some(png.clone()),
+            text: Some("ignored: the image wins".into()),
+        };
+        let msg = clipboard_paste(&mut src, dir.path()).expect("an image pastes");
+        let Msg::Paste(path) = &msg else {
+            panic!("expected Msg::Paste, got {msg:?}");
+        };
+        assert!(path.starts_with(dir.path().to_str().unwrap()), "{path}");
+        assert!(path.ends_with(".png"), "{path}");
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            png,
+            "the bytes on disk are the clipboard's"
+        );
+        // The same pipeline a dropped file takes: the path compacts to a token.
+        let mut state = State::new(false, "m".into());
+        update(&mut state, msg);
+        assert_eq!(state.editor.text(), "[Image #1]");
+    }
+
+    #[test]
+    fn clipboard_text_pastes_literally_and_an_empty_clipboard_is_a_notice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut src = FakeClipboard {
+            image: None,
+            text: Some("hello".into()),
+        };
+        let msg = clipboard_paste(&mut src, dir.path()).expect("text pastes");
+        assert_eq!(msg, Msg::Paste("hello".into()));
+        let mut state = State::new(false, "m".into());
+        update(&mut state, msg);
+        assert_eq!(state.editor.text(), "hello");
+
+        let mut src = FakeClipboard {
+            image: None,
+            text: None,
+        };
+        assert_eq!(
+            clipboard_paste(&mut src, dir.path()),
+            Err("clipboard: nothing pastable".to_string())
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            0,
+            "no stray file"
+        );
+    }
+
+    #[test]
+    fn encode_png_round_trips_rgba_and_rejects_a_short_buffer() {
+        let rgba = [255, 0, 0, 255, 0, 0, 255, 128];
+        let bytes = super::encode_png(2, 1, &rgba).expect("2x1 encodes");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n");
+        let mut reader = png::Decoder::new(std::io::Cursor::new(&bytes))
+            .read_info()
+            .unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!((info.width, info.height), (2, 1));
+        assert_eq!(&buf[..info.buffer_size()], &rgba);
+        assert_eq!(super::encode_png(2, 2, &rgba), None, "dimensions disagree");
+    }
+
+    #[test]
+    fn only_a_plain_ctrl_v_press_is_the_paste_chord() {
+        let press = |code, mods| Event::Key(KeyEvent::new(code, mods));
+        assert!(is_paste_key(&press(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_paste_key(&press(
+            KeyCode::Char('v'),
+            KeyModifiers::NONE
+        )));
+        assert!(!is_paste_key(&press(
+            KeyCode::Char('v'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        )));
+        let mut release = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        release.kind = KeyEventKind::Release;
+        assert!(!is_paste_key(&Event::Key(release)));
     }
 
     /// 0033 Task 2: only streamed deltas ride the tick; every other message
