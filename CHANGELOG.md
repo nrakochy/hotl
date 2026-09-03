@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.25.0] - 2026-09-03
+
 ### Added
 
 - **`/goal` starts working the moment you set it** (plan 0048). Typing
