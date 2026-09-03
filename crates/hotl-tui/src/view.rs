@@ -1730,9 +1730,10 @@ fn render_ask(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
 
 /// `ask_user`'s option-picker modal (tier-1 gap #4) — generalizes
 /// `render_ask`'s y/n card to N labelled options (2-4, per the tool's own
-/// validation) plus free text. Not a permission card: no "waiting on you"
-/// urgency color beyond the shared blocked-phase band the strip already
-/// carries.
+/// validation) plus free text. Not a permission card, and dressed unlike
+/// one (0047 D3): its own title and the accent border, so blocked color +
+/// "waiting on you" stay exclusive to prompts where a key grants authority.
+/// The strip's blocked phase text is untouched — the turn *is* halted.
 fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let Phase::WaitingQuestion {
         header,
@@ -1775,8 +1776,8 @@ fn render_question(state: &State, p: &Palette, frame: &mut Frame, over: Rect) {
     let area = centered(over, 60, lines.len() as u16 + 2);
     frame.render_widget(Clear, area);
     let block = Block::bordered()
-        .title(" waiting on you ")
-        .border_style(Style::new().fg(p.blocked));
+        .title(" a question for you ")
+        .border_style(Style::new().fg(p.accent));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -2519,6 +2520,54 @@ mod tests {
             "description shown: {all}"
         );
         assert!(rows[STRIP].contains("waiting on you"), "halted strip");
+    }
+
+    /// 0047 P0 T6: a question a "yes" cannot authorize must not dress as a
+    /// permission ask — blocked + "waiting on you" are exclusive to
+    /// authority (design D3). The strip still says blocked, which is true.
+    #[test]
+    fn the_question_modal_wears_its_own_title_and_accent_border() {
+        let mut s = State::new(true, "m".into());
+        s.phase = Phase::WaitingQuestion {
+            req_id: 9,
+            header: "Scope".into(),
+            prompt: "How far?".into(),
+            options: vec![hotl_tools::ask::QuestionOption {
+                label: "MVP".into(),
+                description: None,
+            }],
+            input: String::new(),
+        };
+        let buf = draw_buffer(&s);
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf.cell((x, y)).unwrap().symbol())
+                    .collect()
+            })
+            .collect();
+        let all = rows.join("\n");
+        assert!(all.contains("┌ a question for you"), "{all}");
+        assert!(!all.contains("┌ waiting on you"), "{all}");
+        assert!(
+            rows[STRIP].contains("waiting on you"),
+            "the strip still says blocked"
+        );
+        let y = rows
+            .iter()
+            .position(|r| r.contains("┌ a question for you"))
+            .unwrap() as u16;
+        let x = rows[y as usize].chars().position(|c| c == '┌').unwrap() as u16;
+        let p = Palette::default();
+        assert_eq!(
+            buf.cell((x, y)).unwrap().style().fg,
+            Some(p.accent),
+            "accent border"
+        );
+        assert_ne!(
+            p.accent, p.blocked,
+            "the probe is only meaningful if the two differ"
+        );
     }
 
     #[test]
