@@ -63,6 +63,16 @@ always ask, never auto.** Everything else — `bash`, MCP servers, `web_fetch`,
 agent can shell out, hit your issue tracker, and read a docs page while it
 works out what to propose, and still stops before it changes a file.
 
+**The model is told, and it cannot see the edit tools.** Turning plan on
+drops `write` and `edit` from the tool list the model is offered and appends
+one reminder to the transcript saying what is unavailable and what a finished
+plan looks like — numbered steps naming the files to change and the command
+that verifies each. Turning plan off restores both tools and says so. A
+session that *starts* in plan (`--plan`, `HOTL_PLAN`, `[permissions] plan`,
+ACP `session/new`) carries the same reminder in its opening context. Before
+this the overlay was silent: the model was offered tools it would then be
+refused, and spent turns discovering the wall.
+
 Toggle it with `/plan` (or `/plan on` / `/plan off`), `--plan` on the command
 line, `[permissions] plan = true`, `HOTL_PLAN=1`, or `session/set_plan` over
 ACP. It composes with whichever mode you're in:

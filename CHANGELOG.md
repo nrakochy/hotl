@@ -20,7 +20,50 @@ semver promise of their own.
   The always-on safety floor is now: kernel sandbox, protected-path
   escalations, deny rules, secret masking, transcript visibility.
 
+### Added
+
+- **`bash` and `grep` take an optional `expect`** (plan 0050). State what you
+  predict a call returns — `{"exit": "zero"}`, `{"contains": "…"}`,
+  `{"empty": true}`, or `{"matches": "some"|"none"}` for `grep` — and a
+  result that misses the prediction stops the rest of that batch instead of
+  running every remaining call against a belief that is already wrong. The
+  surprising call keeps its real result plus an `[expectation failed: …]`
+  trailer; the calls after it report which call surprised the model; one
+  reminder says so in the transcript, and the turn carries on. A batch
+  without `expect` behaves exactly as before. Expectations are stated by the
+  model, never assumed by hotl — running tests to reproduce a failure is
+  routine, and a guessed "should pass" there would stop work you meant to
+  do. `turn_done` gains a `mispredictions` count (omitted when zero).
+
 ### Fixed
+
+- **1M-window models were compacting at 160K** (plan 0050). The model
+  catalog knew every model's context window and nothing ever asked it: a
+  session with no explicit `[context] window` got a hardcoded 200,000
+  regardless of the model, so Opus 4.8 folded its history at a sixth of the
+  window it actually had — and an 8K local model overflowed on turn two.
+  The catalog now decides, `HOTL_CONTEXT_WINDOW` and `[context] window`
+  still win outright, and a model the catalog does not know says so at
+  startup instead of guessing in silence.
+
+- **Plan mode was invisible to the model** (plan 0050). Plan put `write` and
+  `edit` behind an ask and told the model nothing, so it kept proposing
+  edits it could not make and burned turns discovering the wall. Turning
+  plan on now drops those two tools from the roster the model is offered and
+  says, in one reminder, what is unavailable and what a finished plan looks
+  like; turning it off restores both and says that too. Sessions started
+  with `--plan`, `HOTL_PLAN`, `[permissions] plan` or an ACP
+  `session/new` get the same reminder in their opening context. `bash` keeps
+  its existing ask.
+
+- **A provider stream that died mid-answer ended the turn** (plan 0050). The
+  retry ladder only covered the request *before* the first byte arrived, so
+  an overloaded provider (529) or a proxy dropping a live connection one
+  paragraph in cost the whole turn — the most expensive failure a long turn
+  can take. The sample is now re-sent against the same snapshot, at most
+  twice, with the partial answer taken back off the screen; a stream that
+  had already sealed a tool call is never re-sampled, and auth failures
+  still fail immediately.
 
 - **Dropped and pasted images land as `[Image #N]` on Windows** (tracker
   #108). The drop classifier only knew POSIX path shapes (`/`, `~`, `./`,
