@@ -3007,23 +3007,6 @@ mod tests {
         );
     }
 
-    /// 0035 decision 11: the idle strip carries the undo-point chip once the
-    /// wire reported one — opacity must not be silence.
-    #[test]
-    fn strip_shows_the_undo_chip_at_idle() {
-        let mut s = State::new(true, "m".into());
-        assert!(
-            !draw(&s)[STRIP].contains("undo"),
-            "no chip before the wire reports a status"
-        );
-        s.undo_status = Some("warming".into());
-        let rows = draw(&s);
-        assert!(rows[STRIP].contains("undo warming"), "{}", rows[STRIP]);
-        s.undo_status = Some("ready".into());
-        let rows = draw(&s);
-        assert!(rows[STRIP].contains("undo ready"), "{}", rows[STRIP]);
-    }
-
     /// 0036: the idle strip carries the ⚑ flag count once any bypass call ran
     /// (or was refused) on a notice instead of an ask — absent at zero.
     #[test]
@@ -3107,14 +3090,12 @@ mod tests {
         let mut s = busy_strip_state();
         s.phase = Phase::Idle;
         s.usage_line = Some("12.4k in · 1.8k out · 9.1k cached · 71% hit · $0.42".into());
-        s.undo_status = Some("ready".into());
         s.flag_count = 2;
         s.plan = true;
         s.mode = "ask".into();
         let row = strip_row(&draw_at(&s, 120, 40), "plan · ask");
         assert!(row.contains("⚑ 2"), "flags: {row}");
         assert!(row.contains("plan · ask"), "mode: {row}");
-        assert!(row.contains("undo ready"), "undo is KEEP: {row}");
     }
 
     #[test]

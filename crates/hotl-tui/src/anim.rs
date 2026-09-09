@@ -410,12 +410,6 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
             if let Some(usage) = &state.usage_line {
                 segs.push(Segment::rank(usage.clone(), RANK_USAGE));
             }
-            // Undo-point chip (0035 decision 11): opacity must not be
-            // silence — the strip says whether `hotl undo` has a restore
-            // point right now.
-            if let Some(undo) = &state.undo_status {
-                segs.push(Segment::keep(format!("undo {undo}")));
-            }
         }
         Phase::Sampling { ticks } => {
             segs.push(Segment::keep(format!("thinking · {}s", secs(*ticks))));
@@ -791,12 +785,11 @@ mod tests {
 
     /// Ranks are the drop order the view folds and drops by: the todo label
     /// folds to its count first, usage detail goes before the model name,
-    /// and the phase text and undo chip never go.
+    /// and the phase text never goes.
     #[test]
     fn segments_carry_their_fold_forms_and_ranks() {
         let mut s = State::test_default();
         s.usage_line = Some("1 in · 2 out".into());
-        s.undo_status = Some("ready".into());
         s.todos = vec![todo("wire", TodoStatus::InProgress, Some("wiring"))];
         s.goal = Some("done".into());
         let segs = strip_segments(&s);
@@ -809,7 +802,6 @@ mod tests {
             vec![
                 ("test-model", None, RANK_MODEL),
                 ("1 in · 2 out", None, RANK_USAGE),
-                ("undo ready", None, KEEP),
                 ("0/1 wiring", Some("0/1"), RANK_TODO),
                 ("◎ /goal active · 0m", Some("◎ 0m"), RANK_GOAL),
             ]
