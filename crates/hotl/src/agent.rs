@@ -991,7 +991,12 @@ async fn scaffold(
     let sandbox_enforced = matches!(sandbox_status, sandbox::SandboxStatus::Enforced(_))
         && hotl_tools::net::auto_allow_permitted(&sandbox_status);
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let config = engine_config(&model, secrets, &cfg);
+    let (config, config_warnings) = engine_config(&model, secrets, &cfg);
+    warnings.extend(
+        config_warnings
+            .into_iter()
+            .map(|w| format!("WARNING — {w}")),
+    );
     // The one process-wide SessionConcurrency (Layer-B budget): built once
     // here and cloned (shared Arc semaphores, not a fresh pool) into the
     // registry — today `web_fetch` is its only consumer.
@@ -2747,22 +2752,26 @@ const DEFAULT_FAST_MODEL: &str = "claude-haiku-4-5";
 /// HOTL_FAST_MODEL (housekeeping model for compaction summaries).
 /// Build the engine config from `config.toml` (`[context]`, plus `[behavior]
 /// max_turns`) with env overrides (env > config.toml > default).
+/// Build the engine config for `model`, plus any startup warnings it
+/// produced (today: an uncatalogued model whose context window had to be
+/// guessed). `scaffold()` folds those into its own warnings channel.
 fn engine_config(
     model: &str,
     secrets: &dyn SecretStore,
     cfg: &crate::config::Config,
-) -> EngineConfig {
+) -> (EngineConfig, Vec<String>) {
+    let mut warnings: Vec<String> = Vec::new();
     let mut config = EngineConfig {
         model: model.to_string(),
         ..Default::default()
     };
-    if let Some(window) = secrets
-        .get("HOTL_CONTEXT_WINDOW")
-        .and_then(|v| v.parse().ok())
-        .or(cfg.context.window)
-    {
-        config.context_window = window;
-    }
+    // Env > `[context] window` > the model catalog > the fallback. Before
+    // this call site existed every uncatalogued *and* catalogued model got
+    // the 200_000 default, so 1M models compacted at 160K (A1).
+    let env_window = secrets.get("HOTL_CONTEXT_WINDOW");
+    let (window, window_warning) = cfg.context.resolve_window(model, env_window.as_deref());
+    config.context_window = window;
+    warnings.extend(window_warning);
     if let Some(turns) = secrets
         .get("HOTL_MAX_TURNS")
         .and_then(|v| v.parse().ok())
@@ -2835,7 +2844,7 @@ fn engine_config(
     {
         config.effort = Some(DEFAULT_EFFORT);
     }
-    config
+    (config, warnings)
 }
 
 /// `[concurrency]` Layer-B budget: precedence is env (`HOTL_CONCURRENCY_*`),
@@ -4913,17 +4922,69 @@ mod tests {
     fn max_turns_precedence_env_then_config_then_default() {
         let cfg = config_from_toml("[behavior]\nmax_turns = 250\n");
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &cfg).max_turns,
+            engine_config("m", &MapSecrets::default(), &cfg).0.max_turns,
             250
         );
         // Env wins, and carries the `-1` = unlimited sentinel intact.
         let secrets = MapSecrets::from([("HOTL_MAX_TURNS", "-1")]);
-        assert_eq!(engine_config("m", &secrets, &cfg).max_turns, -1);
+        assert_eq!(engine_config("m", &secrets, &cfg).0.max_turns, -1);
         // Absent everywhere: the built-in default, which must be roomy enough
         // that ordinary agentic work never trips it.
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &config_from_toml("")).max_turns,
+            engine_config("m", &MapSecrets::default(), &config_from_toml(""))
+                .0
+                .max_turns,
             100
+        );
+    }
+
+    #[test]
+    fn engine_config_takes_the_catalog_window() {
+        // A1: a 1M-window model was compacting at the hardcoded 200_000
+        // because the catalog lookup had no caller.
+        let (config, warnings) = engine_config(
+            "claude-opus-4-8",
+            &MapSecrets::default(),
+            &config_from_toml(""),
+        );
+        assert_eq!(config.context_window, 1_000_000);
+        assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn engine_config_env_and_config_still_outrank_the_catalog() {
+        let cfg = config_from_toml("[context]\nwindow = 60000\n");
+        assert_eq!(
+            engine_config("claude-opus-4-8", &MapSecrets::default(), &cfg)
+                .0
+                .context_window,
+            60_000
+        );
+        let secrets = MapSecrets::from([("HOTL_CONTEXT_WINDOW", "50000")]);
+        assert_eq!(
+            engine_config("claude-opus-4-8", &secrets, &cfg)
+                .0
+                .context_window,
+            50_000
+        );
+    }
+
+    #[test]
+    fn uncatalogued_model_falls_back_and_warns() {
+        let (config, warnings) = engine_config(
+            "openai/llama3",
+            &MapSecrets::default(),
+            &config_from_toml(""),
+        );
+        assert_eq!(
+            config.context_window,
+            hotl_provider::catalog::FALLBACK_CONTEXT_WINDOW
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("not in the model catalog")),
+            "warnings: {warnings:?}"
         );
     }
 
@@ -5000,13 +5061,17 @@ mod tests {
     fn max_tokens_precedence_env_config_default() {
         let cfg = config_from_toml("[provider]\nmax_tokens = 48000\n");
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &cfg).max_tokens,
+            engine_config("m", &MapSecrets::default(), &cfg)
+                .0
+                .max_tokens,
             48_000
         );
         let secrets = MapSecrets::from([("HOTL_MAX_TOKENS", "24000")]);
-        assert_eq!(engine_config("m", &secrets, &cfg).max_tokens, 24_000);
+        assert_eq!(engine_config("m", &secrets, &cfg).0.max_tokens, 24_000);
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &config_from_toml("")).max_tokens,
+            engine_config("m", &MapSecrets::default(), &config_from_toml(""))
+                .0
+                .max_tokens,
             64_000
         );
     }
@@ -5016,12 +5081,16 @@ mod tests {
         // Haiku's catalogued cap is exactly 64_000; an over-ask clamps down.
         let secrets = MapSecrets::from([("HOTL_MAX_TOKENS", "999999")]);
         assert_eq!(
-            engine_config("claude-haiku-4-5", &secrets, &config_from_toml("")).max_tokens,
+            engine_config("claude-haiku-4-5", &secrets, &config_from_toml(""))
+                .0
+                .max_tokens,
             64_000
         );
         // An uncatalogued model has no cap to clamp to.
         assert_eq!(
-            engine_config("m", &secrets, &config_from_toml("")).max_tokens,
+            engine_config("m", &secrets, &config_from_toml(""))
+                .0
+                .max_tokens,
             999_999
         );
     }
@@ -5030,7 +5099,7 @@ mod tests {
     fn effort_parses_from_the_provider_table() {
         let cfg = config_from_toml("[provider]\neffort = \"xhigh\"\n");
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &cfg).effort,
+            engine_config("m", &MapSecrets::default(), &cfg).0.effort,
             Some(Effort::XHigh)
         );
     }
@@ -5042,7 +5111,7 @@ mod tests {
     fn an_unknown_effort_is_ignored_not_fatal() {
         let cfg = config_from_toml("[provider]\neffort = \"ultra\"\n");
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &cfg).effort,
+            engine_config("m", &MapSecrets::default(), &cfg).0.effort,
             None
         );
     }
@@ -5051,7 +5120,10 @@ mod tests {
     fn env_beats_the_config_file_for_effort() {
         let cfg = config_from_toml("[provider]\neffort = \"low\"\n");
         let secrets = MapSecrets::from([("HOTL_EFFORT", "max")]);
-        assert_eq!(engine_config("m", &secrets, &cfg).effort, Some(Effort::Max));
+        assert_eq!(
+            engine_config("m", &secrets, &cfg).0.effort,
+            Some(Effort::Max)
+        );
     }
 
     // `"m"` is uncatalogued, so this doubles as the proof the 0030 session
@@ -5059,7 +5131,9 @@ mod tests {
     #[test]
     fn an_unset_effort_stays_unset() {
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &config_from_toml("")).effort,
+            engine_config("m", &MapSecrets::default(), &config_from_toml(""))
+                .0
+                .effort,
             None
         );
     }
@@ -5072,6 +5146,7 @@ mod tests {
                 &MapSecrets::default(),
                 &config_from_toml("")
             )
+            .0
             .effort,
             Some(Effort::XHigh)
         );
@@ -5086,6 +5161,7 @@ mod tests {
                 &MapSecrets::default(),
                 &config_from_toml("")
             )
+            .0
             .effort,
             None
         );
@@ -5099,6 +5175,7 @@ mod tests {
                 &MapSecrets::default(),
                 &config_from_toml("")
             )
+            .0
             .fast_model
             .as_deref(),
             Some(DEFAULT_FAST_MODEL)
@@ -5115,11 +5192,14 @@ mod tests {
                 &MapSecrets::default(),
                 &config_from_toml("")
             )
+            .0
             .fast_model,
             None
         );
         assert_eq!(
-            engine_config("m", &MapSecrets::default(), &config_from_toml("")).fast_model,
+            engine_config("m", &MapSecrets::default(), &config_from_toml(""))
+                .0
+                .fast_model,
             None
         );
     }
@@ -5129,6 +5209,7 @@ mod tests {
         let cfg = config_from_toml("[provider]\nfast_model = \"my-own\"\n");
         assert_eq!(
             engine_config("claude-opus-4-8", &MapSecrets::default(), &cfg)
+                .0
                 .fast_model
                 .as_deref(),
             Some("my-own")
@@ -5136,6 +5217,7 @@ mod tests {
         let secrets = MapSecrets::from([("HOTL_FAST_MODEL", "env-pick")]);
         assert_eq!(
             engine_config("claude-opus-4-8", &secrets, &cfg)
+                .0
                 .fast_model
                 .as_deref(),
             Some("env-pick")
@@ -5148,7 +5230,9 @@ mod tests {
         // same outcome as absent. ("ultra" is 0029's unparseable fixture.)
         let secrets = MapSecrets::from([("HOTL_EFFORT", "ultra")]);
         assert_eq!(
-            engine_config("claude-opus-4-8", &secrets, &config_from_toml("")).effort,
+            engine_config("claude-opus-4-8", &secrets, &config_from_toml(""))
+                .0
+                .effort,
             Some(Effort::XHigh)
         );
     }

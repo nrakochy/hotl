@@ -409,12 +409,6 @@ pub struct ContextCfg {
     pub evict_tokens: Option<u64>,
 }
 
-// Dead until `agent.rs::engine_config` calls these — decision-log request #1
-// of specs/exec-plans/active/0014-remediation-model-registry.md, owned by R10.
-// `hotl` is a bin-only crate, so `pub` confers no reachability and the lint
-// fires despite the tests below exercising both. Remove this attribute when
-// that call site lands; the lint then holds the seam honest again.
-#[allow(dead_code)]
 impl ContextCfg {
     /// Resolve the compaction context window, in tokens.
     ///
@@ -454,6 +448,12 @@ impl ContextCfg {
     /// The token-estimation profile for `model`. An uncatalogued model gets
     /// the conservative default rather than a guessed ratio — overcounting is
     /// the only safe direction (see `hotl_context::tokens`).
+    ///
+    /// Still uncalled: `hotl` is a bin-only crate, so `pub` confers no
+    /// reachability and the lint fires despite the tests below. Its sibling
+    /// `resolve_window` landed its call site in 0050; drop this attribute
+    /// when this one does too.
+    #[allow(dead_code)]
     pub fn token_profile(&self, model: &str) -> hotl_context::TokenProfile {
         match hotl_provider::catalog::lookup(model) {
             Some(info) => {
