@@ -187,15 +187,7 @@ pub struct SessionOpen {
     /// this connection hands clients. `session/reload_config` resumes through
     /// this; resuming through the handle id silently fails to replay.
     pub session_id: String,
-    /// Polls the session's undo-point status for the prompt reply's additive
-    /// `undoStatus` field (0035 decision 11). A closure so the protocol layer
-    /// stays engine-agnostic; `None` = a session without snapshots, and the
-    /// field is then simply absent.
-    pub undo: Option<UndoProbe>,
 }
-
-/// See [`SessionOpen::undo`].
-pub type UndoProbe = Box<dyn Fn() -> Value + Send + Sync>;
 
 /// Builds a session per the client's request. The real binary wires engine
 /// deps here; tests inject a scripted-provider session.
@@ -986,7 +978,6 @@ fn install_session(
         pending_prompt.clone(),
         next_id,
         model.to_string(),
-        open.undo,
     );
     let sid = state.id.clone();
     *session = Some(state);
@@ -1004,7 +995,6 @@ fn start_session(
     pending_prompt: PendingPrompt,
     next_id: &mut u64,
     model: String,
-    undo: Option<UndoProbe>,
 ) -> SessionState {
     let id = format!("acp-{}", *next_id);
     // Permission/question request ids for this session are disjoint from
@@ -1023,7 +1013,6 @@ fn start_session(
         sid,
         req_id_seed,
         model,
-        undo,
     ));
     SessionState {
         id,
@@ -1052,7 +1041,6 @@ async fn drain_events(
     session_id: String,
     mut req_id: u64,
     model: String,
-    undo: Option<UndoProbe>,
 ) {
     let mut held: Option<EngineEvent> = None;
     loop {
@@ -1196,17 +1184,11 @@ async fn drain_events(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .pop_front();
                 if let Some(id) = prompt_id {
-                    let mut reply = json!({
+                    let reply = json!({
                         "schemaVersion": UPDATE_SCHEMA_VERSION,
                         "outcome": outcome_tag(&outcome),
                         "usage": crate::wire::usage_frame(&model, &usage),
                     });
-                    // Additive optional field (0035 decision 11): absent for
-                    // sessions without snapshots. Additive frames do NOT bump
-                    // `UPDATE_SCHEMA_VERSION` (breaking-only, per its doc).
-                    if let Some(probe) = &undo {
-                        reply["undoStatus"] = probe();
-                    }
                     reply_ok(&writer, id, reply).await;
                 }
             }
@@ -1285,7 +1267,6 @@ mod drain_tests {
             "acp-test".into(),
             0,
             "test-model".into(),
-            None,
         )
         .await;
         drop(writer); // close the duplex so read_to_string sees EOF

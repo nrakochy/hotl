@@ -80,7 +80,6 @@ fn scripted_factory() -> acp::SessionFactory {
             effort: None,
             previous_model: None,
             session_id,
-            undo: None,
         })
     })
 }
@@ -152,7 +151,6 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             effort: None,
             previous_model: None,
             session_id,
-            undo: None,
         })
     })
 }

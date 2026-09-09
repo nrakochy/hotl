@@ -1,7 +1,7 @@
-//! `hotl gc` — prune old session logs, blob dirs, and shadow snapshot repos
-//! (retention/GC). Also sweeps dead backgrounded-session sockets. Policy comes
-//! from `[retention]` in config.toml (see `crate::config`), overridable by
-//! flags; with no policy configured and no flags, GC is a no-op that says so.
+//! `hotl gc` — prune old session logs and blob dirs (retention/GC). Also
+//! sweeps dead backgrounded-session sockets. Policy comes from `[retention]`
+//! in config.toml (see `crate::config`), overridable by flags; with no policy
+//! configured and no flags, GC is a no-op that says so.
 
 use hotl_platform::Ipc as _;
 use std::time::Duration;

@@ -96,7 +96,7 @@ mode = \"bypass\"   # no per-action y/N; protected paths + sandbox still guard.
 # file_tools = \"workspace\"
 
 [retention]
-# Prune old sessions/shadows/blobs (run `hotl gc`, or auto at startup once set).
+# Prune old sessions/blobs (run `hotl gc`, or auto at startup once set).
 # max_age_days = 30
 # max_sessions = 200
 

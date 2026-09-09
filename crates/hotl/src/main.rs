@@ -7,13 +7,12 @@
 //!   fleet         reserved (orchestrate, M4+)
 //!   doctor        environment/setup checks (MD)
 //!   resume        continue an earlier session from its log (M3b)
-//!   undo          restore files to the agent's last clean snapshot (M3b)
 //!   acp           serve the ACP JSON-RPC protocol over stdio (M4)
 //!   bg            background a session as a detached socket server (attach later)
 //!   attach        connect to a backgrounded session (bare: list them)
 //!   serve         (internal) host a session on a unix socket — used by `bg`
 //!   setup         write default config (safe defaults; never silent) (MD)
-//!   gc            prune old sessions/shadows/blobs per [retention] (retention)
+//!   gc            prune old sessions/blobs per [retention] (retention)
 //!   mcp           inspect configured MCP servers and their trust grants (M3a)
 //!   update        install the latest release (or report one, with --check)
 
@@ -90,7 +89,6 @@ fn main() {
             std::process::exit(2);
         }
         Some("doctor") => std::process::exit(doctor::doctor_main()),
-        Some("undo") => std::process::exit(agent::undo_main(args[1..].to_vec())),
         Some("resume") => {
             let mut rest = vec!["--resume".to_string()];
             rest.extend(args[1..].iter().cloned());
@@ -165,14 +163,13 @@ fn print_help() {
          hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
-         hotl gc [--dry-run]  prune old sessions/shadows/blobs per [retention]\n  \
+         hotl gc [--dry-run]  prune old sessions/blobs per [retention]\n  \
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
          hotl mcp             list MCP servers and trust state; show/add/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
          hotl workflows       list saved workflows; show <name> [--mermaid]; check <file>\n  \
          hotl update          install the latest release (--check to only look)\n  \
          hotl resume [arg]    same as -r\n  \
-         hotl undo            restore files to the agent's last clean snapshot\n  \
          hotl fleet           reserved (orchestrate)\n  \
          hotl --version       print the version (-V, or `hotl version`)\n\n\
          PERMISSIONS: [permissions] mode = bypass (default, no per-action y/N) | ask |\n  \
