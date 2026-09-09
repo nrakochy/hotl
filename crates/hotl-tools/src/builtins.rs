@@ -1224,7 +1224,10 @@ impl Tool for GrepTool {
         "Search file contents in the working directory with ripgrep. `pattern` is a regular \
          expression. Optional `path` (relative), `glob` (e.g. \"*.rs\" to filter files), and \
          `files_only` (list matching file names only). Output is capped at 50KB; narrow the \
-         pattern or add `glob` if it truncates."
+         pattern or add `glob` if it truncates. \
+         Optional `expect`: state what you predict this call returns. If the result misses the \
+         prediction, the rest of this batch is not run and you are told which call surprised \
+         you. Use it when you are testing a belief, not on every call."
     }
     fn schema(&self) -> Value {
         json!({
@@ -1233,7 +1236,13 @@ impl Tool for GrepTool {
                 "pattern": {"type": "string", "description": "Regular expression to search for"},
                 "path": {"type": "string", "description": "Directory or file to search (relative to the working directory; defaults to \".\")"},
                 "glob": {"type": "string", "description": "Only search files matching this glob, e.g. \"*.rs\""},
-                "files_only": {"type": "boolean", "description": "List matching file paths instead of matching lines"}
+                "files_only": {"type": "boolean", "description": "List matching file paths instead of matching lines"},
+                "expect": {
+                    "type": "object",
+                    "description": "What you predict this search returns. A miss stops the rest of the batch.",
+                    "properties": {"matches": {"enum": ["some", "none"]}},
+                    "additionalProperties": false
+                }
             },
             "required": ["pattern"]
         })
@@ -1332,11 +1341,20 @@ async fn grep_search(
                 body.truncate(end);
                 body.push_str("\n[truncated at 50KB: narrow `pattern` or add a `glob` filter]");
             }
-            Ok(ToolOutcome::ok(body))
+            // `matched` is the typed half of "no matches is a success with
+            // prose" — an `expect: {matches: …}` reads this, never the text.
+            Ok(ToolOutcome::ok(body).with_facts(crate::OutcomeFacts {
+                matched: Some(true),
+                ..Default::default()
+            }))
         }
         Some(1) => Ok(ToolOutcome::ok(format!(
             "No matches for `{pattern}`. Try a looser pattern or a different `path`/`glob`."
-        ))),
+        ))
+        .with_facts(crate::OutcomeFacts {
+            matched: Some(false),
+            ..Default::default()
+        })),
         _ => Err(ToolOutcome::err(format!(
             "ripgrep error: {}. Check the pattern (it is a regex).",
             String::from_utf8_lossy(&output.stderr).trim()
@@ -1467,14 +1485,27 @@ impl Tool for BashTool {
          trailer: `[exit N]` or `[killed by SIGNAME]`. \
          Prefer the dedicated `read`, `grep`, and `glob` tools over `cat`/`grep`/`find`/`ls` \
          for reading and searching — they are faster and their output is budgeted. Use bash \
-         for what only a shell can do: builds, tests, git, package managers, running programs."
+         for what only a shell can do: builds, tests, git, package managers, running programs. \
+         Optional `expect`: state what you predict this call returns. If the result misses the \
+         prediction, the rest of this batch is not run and you are told which call surprised \
+         you. Use it when you are testing a belief, not on every call."
     }
     fn schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
                 "command": {"type": "string"},
-                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 120000, max 600000)"}
+                "timeout_ms": {"type": "integer", "description": "Timeout in milliseconds (default 120000, max 600000)"},
+                "expect": {
+                    "type": "object",
+                    "description": "What you predict this command returns. A miss stops the rest of the batch.",
+                    "properties": {
+                        "exit": {"enum": ["zero", "nonzero"]},
+                        "contains": {"type": "string"},
+                        "empty": {"type": "boolean"}
+                    },
+                    "additionalProperties": false
+                }
             },
             "required": ["command"]
         })
@@ -1705,17 +1736,24 @@ fn shell_outcome(
         Err(e) => return ToolOutcome::err(format!("Failed waiting on command: {e}.")),
     };
     let text = clip_output(&bytes);
+    // The typed half of the `[exit N]` trailer below (0050 T5). The trailer
+    // stays — it is what the model reads; this is what the engine checks an
+    // `expect` against, so nothing has to parse prose. A killed process left
+    // `code()` as `None`, and `None` is honestly "cannot say".
+    let facts = crate::OutcomeFacts {
+        exit: status.code(),
+        ..Default::default()
+    };
     if status.success() {
         return ToolOutcome::ok(if text.is_empty() {
             "(no output)".to_string()
         } else {
             text
-        });
+        })
+        .with_facts(facts);
     }
     // A structured trailer so the model can branch on *why* it failed without
-    // parsing the prose. (A typed field on `ToolOutcome` would be better still,
-    // but that type crosses into the engine and the surface — tracker #17's
-    // neighbour, deferred with the same reasoning.)
+    // parsing the prose.
     // Death first: on Windows a fatal exception *is* an exit code, so asking
     // for the code first would render `[exit 3221225477]` and lose the signal
     // the model branches on.
@@ -1731,7 +1769,7 @@ fn shell_outcome(
     if let Some(h) = sandbox_denial_hint(&text, sandbox) {
         content.push_str(h);
     }
-    ToolOutcome::err(content)
+    ToolOutcome::err(content).with_facts(facts)
 }
 
 /// How a child died, when it did not exit with a status of its own.
@@ -1844,6 +1882,93 @@ mod tests {
             .build()
             .unwrap()
             .block_on(tool.run(input, CancellationToken::new()))
+    }
+
+    /// 0050 T5: the `[exit N]` trailer is the model's; this field is the
+    /// engine's. Without it the expectation check would have to parse prose,
+    /// which is exactly what RELIABILITY.md forbids.
+    #[test]
+    fn shell_outcome_carries_the_exit_code() {
+        let zero = run(&BashTool::default(), json!({"command": "true"}));
+        assert_eq!(zero.facts.exit, Some(0));
+        assert!(!zero.is_error);
+        let three = run(&BashTool::default(), json!({"command": "exit 3"}));
+        assert_eq!(three.facts.exit, Some(3));
+        assert!(three.is_error);
+        assert!(three.content.contains("[exit 3]"), "{}", three.content);
+    }
+
+    /// A signalled child has no exit code of its own, and `None` says so
+    /// rather than inventing one — an `expect: {exit: "zero"}` against a
+    /// killed process is neither met nor missed.
+    #[test]
+    #[cfg(unix)]
+    fn a_killed_command_reports_no_exit_code() {
+        let killed = run(&BashTool::default(), json!({"command": "kill -9 $$"}));
+        assert_eq!(killed.facts.exit, None);
+        assert!(killed.is_error);
+    }
+
+    /// "No matches" is a *success* with prose, so `is_error` cannot answer
+    /// "did it find anything" — this field can.
+    #[test]
+    fn grep_outcome_carries_matched() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle here\n").unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let hit = rt.block_on(grep_search(
+            "needle",
+            dir.path(),
+            &json!({}),
+            CancellationToken::new(),
+        ));
+        let hit = match hit {
+            Ok(o) | Err(o) => o,
+        };
+        assert_eq!(hit.facts.matched, Some(true), "{}", hit.content);
+        let miss = rt.block_on(grep_search(
+            "haystack",
+            dir.path(),
+            &json!({}),
+            CancellationToken::new(),
+        ));
+        let miss = match miss {
+            Ok(o) | Err(o) => o,
+        };
+        assert_eq!(miss.facts.matched, Some(false), "{}", miss.content);
+        assert!(!miss.is_error, "no-match is a success: {}", miss.content);
+    }
+
+    /// The field is the model's only teaching. If it is not in the schema and
+    /// the description, nobody ever fills it.
+    #[test]
+    fn bash_and_grep_schemas_advertise_expect() {
+        for (schema, desc, keys) in [
+            (
+                BashTool::default().schema(),
+                BashTool::default().description().to_string(),
+                vec!["exit", "contains", "empty"],
+            ),
+            (
+                GrepTool::default().schema(),
+                GrepTool::default().description().to_string(),
+                vec!["matches"],
+            ),
+        ] {
+            let expect = &schema["properties"]["expect"];
+            assert!(expect.is_object(), "{schema}");
+            assert_eq!(expect["additionalProperties"], json!(false));
+            for key in keys {
+                assert!(expect["properties"][key].is_object(), "{key}: {schema}");
+            }
+            // Optional: never named in `required`.
+            let required = schema["required"].as_array().unwrap();
+            assert!(!required.iter().any(|r| r == "expect"), "{schema}");
+            assert!(desc.contains("Optional `expect`"), "{desc}");
+        }
     }
 
     #[test]

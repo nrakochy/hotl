@@ -312,7 +312,11 @@ impl McpTool {
                         // not go through `defang`, and it must not read as
                         // something the server said.
                         content.push_str(&staleness_notice(server_name, &client));
-                        ToolOutcome { content, is_error }
+                        if is_error {
+                            ToolOutcome::err(content)
+                        } else {
+                            ToolOutcome::ok(content)
+                        }
                     }
                     Err(e) => ToolOutcome::err(self.envelope(server_name, tool, &e)),
                 }

@@ -359,7 +359,7 @@ pub(crate) async fn drain_child(
                     let summary = format!("{name} (denied)");
                     forward_child_tool(&forward, id, name, summary, Some(false)).await;
                 }
-                Some(EngineEvent::TurnDone { outcome, usage: u }) => {
+                Some(EngineEvent::TurnDone { outcome, usage: u, .. }) => {
                     usage += u;
                     return Drained { outcome, usage };
                 }

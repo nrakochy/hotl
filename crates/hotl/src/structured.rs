@@ -95,7 +95,7 @@ async fn wait_for_done(handle: &mut SessionHandle) -> Result<(String, TokenUsage
             EngineEvent::EgressAsk { reply, .. } => {
                 let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
             }
-            EngineEvent::TurnDone { outcome, usage } => {
+            EngineEvent::TurnDone { outcome, usage, .. } => {
                 return match outcome {
                     Outcome::Done { text } => Ok((text, usage)),
                     Outcome::Refused => Err("the model refused the request".into()),

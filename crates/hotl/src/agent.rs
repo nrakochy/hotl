@@ -2362,7 +2362,11 @@ impl Surface {
                 eprintln!("hotl: no human available (headless): {}", question.header);
                 let _ = reply.send(hotl_engine::QuestionAnswer::NoHuman);
             }
-            EngineEvent::TurnDone { outcome, usage } => self.render_turn_done(outcome, usage),
+            EngineEvent::TurnDone {
+                outcome,
+                usage,
+                mispredictions,
+            } => self.render_turn_done(outcome, usage, mispredictions),
             EngineEvent::TodosChanged { items } => {
                 let done = items
                     .iter()
@@ -2398,7 +2402,12 @@ impl Surface {
         }
     }
 
-    fn render_turn_done(&mut self, outcome: Outcome, usage: hotl_types::TokenUsage) {
+    fn render_turn_done(
+        &mut self,
+        outcome: Outcome,
+        usage: hotl_types::TokenUsage,
+        mispredictions: u32,
+    ) {
         self.turn_running = false;
         match &outcome {
             Outcome::Done { .. } => {}
@@ -2427,8 +2436,16 @@ impl Surface {
         } else {
             format!("{model} · ")
         };
+        // The misprediction count rides the same line rather than a notice
+        // of its own: it is a property of the turn, like its token cost, and
+        // zero is the uninteresting case that says nothing.
+        let missed = if mispredictions > 0 {
+            format!(" · {mispredictions} mispredicted")
+        } else {
+            String::new()
+        };
         eprintln!(
-            "[{named}in {} out {} cache-read {}]",
+            "[{named}in {} out {} cache-read {}{missed}]",
             usage.input_tokens, usage.output_tokens, usage.cache_read_input_tokens
         );
     }

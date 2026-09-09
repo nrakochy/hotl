@@ -95,10 +95,24 @@ impl ProtectedClass {
     }
 }
 
+/// Machine-readable facts about a result, beside the prose the model reads.
+/// Every field is `None` when the tool cannot say — a killed process has no
+/// exit code, and a tool that does not search has nothing to report about
+/// matches. The engine's expectation check (0050 T5) is the only consumer;
+/// it never parses the content, which is the model's, not the harness's.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct OutcomeFacts {
+    /// The process's exit status, when it exited on its own.
+    pub exit: Option<i32>,
+    /// Whether a search found anything.
+    pub matched: Option<bool>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutcome {
     pub content: String,
     pub is_error: bool,
+    pub facts: OutcomeFacts,
 }
 
 impl ToolOutcome {
@@ -106,6 +120,7 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: false,
+            facts: OutcomeFacts::default(),
         }
     }
     /// Errors-as-prompts: `content` must tell the model how to proceed.
@@ -113,7 +128,14 @@ impl ToolOutcome {
         Self {
             content: content.into(),
             is_error: true,
+            facts: OutcomeFacts::default(),
         }
+    }
+    /// Attach the machine-readable half. Chained onto `ok`/`err` so no
+    /// construction site has to name every field.
+    pub fn with_facts(mut self, facts: OutcomeFacts) -> Self {
+        self.facts = facts;
+        self
     }
 }
 

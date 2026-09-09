@@ -212,11 +212,23 @@ pub fn json_frame(event: &EngineEvent, model: &str) -> Value {
     let mut v = match update_frame(event) {
         Some(v) => v,
         None => match event {
-            EngineEvent::TurnDone { outcome, usage } => json!({
-                "type": "turn_done",
-                "outcome": outcome_frame(outcome),
-                "usage": usage_frame(model, usage),
-            }),
+            EngineEvent::TurnDone {
+                outcome,
+                usage,
+                mispredictions,
+            } => {
+                let mut v = json!({
+                    "type": "turn_done",
+                    "outcome": outcome_frame(outcome),
+                    "usage": usage_frame(model, usage),
+                });
+                // Omitted at zero rather than written as `0`/`null` — the
+                // same rule `usage_frame` follows for absent fields.
+                if *mispredictions > 0 {
+                    v["mispredictions"] = json!(mispredictions);
+                }
+                v
+            }
             EngineEvent::Ask { summary, .. } => {
                 json!({"type": "ask_denied", "summary": summary})
             }

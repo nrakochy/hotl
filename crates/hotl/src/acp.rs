@@ -1155,7 +1155,11 @@ async fn drain_events(
                 )
                 .await;
             }
-            EngineEvent::TurnDone { outcome, usage } => {
+            EngineEvent::TurnDone {
+                outcome,
+                usage,
+                mispredictions,
+            } => {
                 // A turn that ended without its asks/questions being answered
                 // left dead reply channels behind — drop them so they can't
                 // leak.
@@ -1171,12 +1175,13 @@ async fn drain_events(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, tx| !tx.is_closed());
-                notify(
-                    &writer,
-                    &session_id,
-                    json!({"type": "turn_done", "outcome": outcome_tag(&outcome)}),
-                )
-                .await;
+                let mut done = json!({"type": "turn_done", "outcome": outcome_tag(&outcome)});
+                // Additive and omitted at zero, exactly as the JSON stream
+                // renders it (0050 T5).
+                if mispredictions > 0 {
+                    done["mispredictions"] = json!(mispredictions);
+                }
+                notify(&writer, &session_id, done).await;
                 // Take the id and drop the guard *before* awaiting (a
                 // std::sync guard held across .await would make this non-Send).
                 let prompt_id = pending_prompt
@@ -1184,11 +1189,14 @@ async fn drain_events(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .pop_front();
                 if let Some(id) = prompt_id {
-                    let reply = json!({
+                    let mut reply = json!({
                         "schemaVersion": UPDATE_SCHEMA_VERSION,
                         "outcome": outcome_tag(&outcome),
                         "usage": crate::wire::usage_frame(&model, &usage),
                     });
+                    if mispredictions > 0 {
+                        reply["mispredictions"] = json!(mispredictions);
+                    }
                     reply_ok(&writer, id, reply).await;
                 }
             }
@@ -1279,6 +1287,7 @@ mod drain_tests {
         EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
             usage: TokenUsage::default(),
+            mispredictions: 0,
         }
     }
 

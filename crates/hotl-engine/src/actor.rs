@@ -886,6 +886,10 @@ pub(crate) async fn run(
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
+    // The misprediction count's twin of `carry_usage` (0050 T5): a compaction
+    // respawn or a goal-loop continuation is still one prompt, and the single
+    // `TurnDone` reports the whole prompt's number.
+    let mut carry_mispredictions: u32 = 0;
     let mut compact_streak: u32 = 0;
     let mut pipeline = Pipeline::default();
 
@@ -1180,7 +1184,11 @@ pub(crate) async fn run(
                 };
                 let _ = reply.send(result);
             }
-            SessionCmd::TurnFinished { end, usage } => {
+            SessionCmd::TurnFinished {
+                end,
+                usage,
+                mispredictions,
+            } => {
                 // The turn is over, so nothing will answer an open batch now.
                 // Close it, then let held steers land before a queued prompt
                 // starts the next turn behind them.
@@ -1205,6 +1213,7 @@ pub(crate) async fn run(
                         queue: &mut queue,
                         running: &mut running,
                         carry_usage: &mut carry_usage,
+                        carry_mispredictions: &mut carry_mispredictions,
                         compact_streak: &mut compact_streak,
                         goal: &mut goal,
                         cmd_tx: &cmd_tx,
@@ -1213,6 +1222,7 @@ pub(crate) async fn run(
                     },
                     end,
                     usage,
+                    mispredictions,
                 )
                 .await;
             }
@@ -1254,6 +1264,8 @@ struct TurnFinishedCtx<'a> {
     queue: &'a mut VecDeque<QueuedPrompt>,
     running: &'a mut bool,
     carry_usage: &'a mut TokenUsage,
+    /// `carry_usage`'s twin for mispredictions (0050 T5).
+    carry_mispredictions: &'a mut u32,
     compact_streak: &'a mut u32,
     goal: &'a mut Option<GoalState>,
     cmd_tx: &'a mpsc::WeakSender<SessionCmd>,
@@ -1280,12 +1292,20 @@ impl GoalState {
 
 /// A turn ended: either report it (and promote the queue) or, on a compaction
 /// request, fold and respawn the continuation.
-async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: TokenUsage) {
+async fn on_turn_finished(
+    ctx: TurnFinishedCtx<'_>,
+    end: TurnEnd,
+    mut usage: TokenUsage,
+    mut mispredictions: u32,
+) {
     let outcome = match end {
         TurnEnd::Outcome(outcome) => Some(outcome),
         TurnEnd::Compact { spec, cont } => {
             *ctx.carry_usage += usage;
             usage = TokenUsage::default();
+            // The continuation carries its own running count in
+            // `TurnContinuation`, so folding it here too would double it.
+            mispredictions = 0;
             try_compact(
                 ctx.shared,
                 ctx.log,
@@ -1346,6 +1366,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
                         // carry like a compaction respawn so the single
                         // final TurnDone reports cumulative spend.
                         *ctx.carry_usage += usage;
+                        *ctx.carry_mispredictions += mispredictions;
                         let guidance = goal_guidance_text(&reason, &state.condition);
                         *ctx.running = start_turn(
                             ctx.shared,
@@ -1415,6 +1436,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
         }
         let mut total = usage;
         total += std::mem::take(ctx.carry_usage);
+        let total_mispredictions = mispredictions + std::mem::take(ctx.carry_mispredictions);
         *ctx.running = end_turn(
             ctx.shared,
             ctx.log,
@@ -1423,6 +1445,7 @@ async fn on_turn_finished(ctx: TurnFinishedCtx<'_>, end: TurnEnd, mut usage: Tok
             ctx.queue,
             outcome,
             total,
+            total_mispredictions,
             ctx.cmd_tx,
             ctx.events,
             ctx.current_turn,
@@ -1498,6 +1521,7 @@ async fn end_turn(
     queue: &mut VecDeque<QueuedPrompt>,
     outcome: Outcome,
     usage: TokenUsage,
+    mispredictions: u32,
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
@@ -1521,7 +1545,13 @@ async fn end_turn(
         },
         else {}
     );
-    let _ = events.send(EngineEvent::TurnDone { outcome, usage }).await;
+    let _ = events
+        .send(EngineEvent::TurnDone {
+            outcome,
+            usage,
+            mispredictions,
+        })
+        .await;
     match queue.pop_front() {
         Some(next) => {
             start_turn(
@@ -2424,6 +2454,7 @@ async fn start_turn(
                                 message: "session log is sealed".into(),
                             },
                             usage: TokenUsage::default(),
+                            mispredictions: 0,
                         })
                         .await;
                     return false;
@@ -2441,6 +2472,7 @@ async fn start_turn(
                     message: "session log is sealed".into(),
                 },
                 usage: TokenUsage::default(),
+                mispredictions: 0,
             })
             .await;
         return false;
@@ -2541,6 +2573,7 @@ fn respawn_turn(
                             .into(),
                     }),
                     usage: TokenUsage::default(),
+                    mispredictions: 0,
                 })
                 .await;
         }

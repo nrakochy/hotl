@@ -497,7 +497,11 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                     .insert(id, (reply, frame.clone()));
                 send(&shared, &frame).await; // no-op if detached; re-sent on attach
             }
-            EngineEvent::TurnDone { outcome, usage } => {
+            EngineEvent::TurnDone {
+                outcome,
+                usage,
+                mispredictions,
+            } => {
                 // A turn that ended without its asks being answered left dead
                 // reply channels behind — drop them so they never re-issue.
                 shared
@@ -510,16 +514,16 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .retain(|_, (tx, _)| !tx.is_closed());
-                send(
-                    &shared,
-                    &json!({
-                        "t": "turn_done",
-                        "schemaVersion": UPDATE_SCHEMA_VERSION,
-                        "outcome": outcome_tag(&outcome),
-                        "usage": crate::wire::usage_frame(&shared.model, &usage),
-                    }),
-                )
-                .await;
+                let mut done = json!({
+                    "t": "turn_done",
+                    "schemaVersion": UPDATE_SCHEMA_VERSION,
+                    "outcome": outcome_tag(&outcome),
+                    "usage": crate::wire::usage_frame(&shared.model, &usage),
+                });
+                if mispredictions > 0 {
+                    done["mispredictions"] = json!(mispredictions);
+                }
+                send(&shared, &done).await;
             }
             other => {
                 if let Some(update) = update_payload(&other) {
@@ -758,6 +762,7 @@ mod tests {
                     text: String::new(),
                 },
                 usage: Default::default(),
+                mispredictions: 0,
             })
             .await
             .unwrap();

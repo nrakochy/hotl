@@ -89,7 +89,7 @@ async fn not_yet_then_met_runs_two_turns_under_one_turn_done() {
     // The one suppression the whole design rests on: the not-yet turn ended
     // with NO TurnDone — the single final one carries the cumulative spend
     // of both turns (two text_reply samples at 10 in / 5 out each).
-    let Some(EngineEvent::TurnDone { outcome, usage }) = seen.last() else {
+    let Some(EngineEvent::TurnDone { outcome, usage, .. }) = seen.last() else {
         unreachable!()
     };
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");

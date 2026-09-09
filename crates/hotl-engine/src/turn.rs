@@ -129,11 +129,18 @@ pub(crate) async fn run(
     // errors included.
     let end = seal_end(end, turn.pipeline.drain().await);
     let usage = turn.usage;
+    let mispredictions = turn.mispredictions;
     // Flush the ledger (§S1) on the existing event channel — never the
     // canon log — before telling the actor the turn is over.
     let report = turn.ledger.summary(crate::ledger::max_rss_bytes());
     let _ = turn.events.send(EngineEvent::LedgerReport(report)).await;
-    let _ = cmd_tx.send(SessionCmd::TurnFinished { end, usage }).await;
+    let _ = cmd_tx
+        .send(SessionCmd::TurnFinished {
+            end,
+            usage,
+            mispredictions,
+        })
+        .await;
 }
 
 /// Reconcile a turn's end with what barrier (c) found. A commit that failed
@@ -746,6 +753,11 @@ struct Turn {
     /// *prompt*, not one `drive()` call); the TodoGate is the only consumer
     /// today, bounded further by [`TODO_GATE_MAX`].
     turn_extensions: u32,
+    /// Tool results that missed the `expect` the model stated (0050 T5).
+    /// Cumulative per prompt, so it crosses a fold like `turn_extensions` —
+    /// what the number measures is the model's calibration over one piece of
+    /// work, and a compaction is not the end of that work.
+    mispredictions: u32,
     /// Truncation-recovery continues spent ([`MAX_TOKENS_CONTINUE_MAX`]);
     /// crosses folds like `turn_extensions`.
     max_tokens_continues: u32,
@@ -827,6 +839,7 @@ impl Turn {
             last_snapshot: None,
             speculation: None,
             turn_extensions: cont.turn_extensions,
+            mispredictions: cont.mispredictions,
             max_tokens_continues: cont.max_tokens_continues,
             spent: cont.spent,
             // A continuation starts a fresh progress count: the value it
@@ -852,6 +865,7 @@ impl Turn {
             flagged: std::mem::take(&mut self.flagged),
             consecutive_failures: std::mem::take(&mut self.consecutive_failures),
             turn_extensions: self.turn_extensions,
+            mispredictions: self.mispredictions,
             max_tokens_continues: self.max_tokens_continues,
             samples_since_compact: self.samples_since_compact,
         }
@@ -1321,6 +1335,11 @@ impl Turn {
             .map_or(uses, |(unique, _)| unique.as_slice());
         let mut results = Vec::with_capacity(run_uses.len());
         let mut budget_blown: Option<String> = None;
+        // The first call whose result missed its stated `expect` (0050 T5).
+        // Same short-circuit shape as `budget_blown`: everything after it in
+        // the batch is reported "not executed" rather than run against a
+        // belief the model already knows is wrong.
+        let mut miss: Option<(usize, crate::expect::Miss)> = None;
         self.ledger.stamp(Phase::ToolsSpawned);
         // Barrier (a) again, as an assertion rather than a wait: the inline
         // path is the one the spec names explicitly, and this is what makes a
@@ -1341,13 +1360,25 @@ impl Turn {
             } else {
                 let gate = self.gate(only).await;
                 let executed = self.execute(only, gate).await;
-                results.push(self.finish_call(only, executed, &mut budget_blown).await);
+                results.push(
+                    self.finish_call(only, executed, &mut budget_blown, 1, &mut miss)
+                        .await,
+                );
             }
         } else {
+            let mut call_index = 0usize;
             for chunk in parallel_chunks(run_uses, &self.shared.registry) {
-                if self.cancel.is_cancelled() || budget_blown.is_some() {
+                if self.cancel.is_cancelled() || budget_blown.is_some() || miss.is_some() {
                     for tu in chunk {
-                        results.push(pair(tu, "Not executed (turn stopped).", true));
+                        call_index += 1;
+                        let text = match &miss {
+                            // Cancel and the failure budget keep their own
+                            // text; a misprediction names the call instead,
+                            // because "the turn stopped" would be a lie.
+                            Some((at, m)) if !self.cancel.is_cancelled() => m.skip_text(*at),
+                            _ => "Not executed (turn stopped).".to_string(),
+                        };
+                        results.push(pair(tu, &text, true));
                     }
                     continue;
                 }
@@ -1366,7 +1397,11 @@ impl Turn {
                 )
                 .await;
                 for (tu, executed) in chunk.iter().zip(outcomes) {
-                    results.push(self.finish_call(tu, executed, &mut budget_blown).await);
+                    call_index += 1;
+                    results.push(
+                        self.finish_call(tu, executed, &mut budget_blown, call_index, &mut miss)
+                            .await,
+                    );
                 }
             }
         }
@@ -1382,6 +1417,10 @@ impl Turn {
         // the next dispatch's doom check can tell repetition from polling.
         backfill_result_hashes(&mut self.call_sigs, &results);
         let cancelled = self.cancel.is_cancelled();
+        let not_run = results
+            .iter()
+            .filter(|r| r.content.starts_with("Not executed"))
+            .count();
         let mut entries = vec![EntryPayload::Item {
             item: Item::ToolResults { results },
         }];
@@ -1390,6 +1429,30 @@ impl Turn {
                 .into_iter()
                 .map(|item| EntryPayload::Item { item }),
         );
+        // The misprediction reminder rides in the SAME proposal as the
+        // results (the `subdir_hints` precedent), not `inject_reminder` —
+        // which would be a second proposal after `speculate()` and so a
+        // request the speculation never predicted.
+        if let Some((at, m)) = &miss {
+            let name = uses
+                .get(at.saturating_sub(1))
+                .map(|tu| tu.name.as_str())
+                .unwrap_or("the call");
+            entries.push(EntryPayload::Item {
+                item: Item::User {
+                    text: format!(
+                        "<system-reminder>Call {at} (`{name}`) did not match your \
+                         expectation: {}; observed {}. The remaining {not_run} call(s) in \
+                         this batch were not run. Revise your understanding of why before \
+                         continuing.</system-reminder>",
+                        m.what(),
+                        m.got(),
+                    ),
+                    synthetic: Some(hotl_types::SyntheticReason::Misprediction),
+                    images: Vec::new(),
+                },
+            });
+        }
         // The tail the next head will carry if nothing intervenes — recorded
         // before `entries` moves into the proposal.
         self.projected_tail
@@ -1436,12 +1499,32 @@ impl Turn {
         tu: &ToolUse,
         mut executed: Executed,
         budget_blown: &mut Option<String>,
+        call_index: usize,
+        miss: &mut Option<(usize, crate::expect::Miss)>,
     ) -> ToolResultItem {
         self.maybe_evict(tu, &mut executed.outcome).await;
-        let (content, failed) = self.apply_failure_budget(tu, executed, budget_blown);
+        // The expectation check (0050 T5), before the outcome moves into the
+        // failure budget. Only the *first* miss in a batch is recorded: the
+        // calls after it did not run, so nothing later can surprise anyone.
+        let found = miss
+            .is_none()
+            .then(|| crate::expect::check(&tu.name, &tu.input, &executed.outcome))
+            .flatten();
+        let (mut content, failed) = self.apply_failure_budget(tu, executed, budget_blown);
+        if let Some(m) = found {
+            content.push_str(&m.trailer());
+            // A malformed prediction is the model's own mistake, not a
+            // surprise about the world: it is reported and the batch runs on.
+            if !matches!(m, crate::expect::Miss::Malformed(_)) {
+                self.mispredictions += 1;
+                *miss = Some((call_index, m));
+            }
+        }
         ToolResultItem {
             tool_use_id: tu.id.clone(),
             content,
+            // A surprise is not an error: the call did exactly what it did,
+            // and `is_error` is the tool's own report of whether it worked.
             is_error: failed,
         }
     }

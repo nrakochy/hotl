@@ -88,6 +88,7 @@ fn every_frame_is_tagged_and_versioned() {
         EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
             usage: TokenUsage::default(),
+            mispredictions: 0,
         },
     ];
     for e in events {
@@ -108,6 +109,7 @@ fn turn_done_carries_a_structured_outcome() {
                 pattern: "read ./x".into(),
             },
             usage: TokenUsage::default(),
+            mispredictions: 0,
         },
         "test-model",
     );
@@ -312,6 +314,7 @@ fn turn_done_usage_carries_hit_ratio_when_cache_activity_is_present() {
         &EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
             usage,
+            mispredictions: 0,
         },
         "test-model",
     );
@@ -327,6 +330,7 @@ fn turn_done_usage_omits_hit_ratio_without_cache_activity() {
         &EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
             usage: TokenUsage::default(),
+            mispredictions: 0,
         },
         "test-model",
     );
@@ -334,6 +338,36 @@ fn turn_done_usage_omits_hit_ratio_without_cache_activity() {
         f["usage"].get("hit_ratio").is_none(),
         "no cache activity must mean no hit_ratio key: {f}"
     );
+}
+
+/// 0050 T5: the misprediction count is additive on `turn_done`, and omitted
+/// at zero rather than written as `0` — the same omitted-not-null rule
+/// `usage_frame` follows, so an existing client's bytes do not move.
+#[test]
+fn turn_done_carries_mispredictions_only_when_there_were_any() {
+    let with = wire::json_frame(
+        &EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "ok".into() },
+            usage: TokenUsage::default(),
+            mispredictions: 1,
+        },
+        "test-model",
+    );
+    assert_eq!(with["mispredictions"], json!(1));
+    let without = wire::json_frame(
+        &EngineEvent::TurnDone {
+            outcome: Outcome::Done { text: "ok".into() },
+            usage: TokenUsage::default(),
+            mispredictions: 0,
+        },
+        "test-model",
+    );
+    assert!(
+        without.get("mispredictions").is_none(),
+        "zero must be omitted, never null: {without}"
+    );
+    // Additive: the version does not move.
+    assert_eq!(with["schema_version"], without["schema_version"]);
 }
 
 /// Task 5: `cost_usd` rides the same `usage` object once the frame's model is
@@ -350,6 +384,7 @@ fn turn_done_usage_carries_cost_usd_for_a_catalogued_model() {
         &EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
             usage,
+            mispredictions: 0,
         },
         "claude-opus-4-8",
     );
@@ -372,6 +407,7 @@ fn turn_done_usage_omits_cost_usd_for_an_uncatalogued_model() {
         &EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
             usage,
+            mispredictions: 0,
         },
         "totally-unheard-of-model",
     );

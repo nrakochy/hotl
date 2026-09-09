@@ -40,6 +40,10 @@ pub enum SyntheticReason {
     /// Goal-loop continuation: the evaluator's "not yet met" reason,
     /// injected as the next turn's opening user item (0034).
     GoalGuidance,
+    /// A tool result missed the `expect` the model stated for it (0050 T5):
+    /// the rest of that batch was not run, and this reminder says which call
+    /// surprised it.
+    Misprediction,
     #[serde(other)]
     Unknown,
 }

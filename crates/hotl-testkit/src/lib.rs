@@ -42,6 +42,8 @@ pub struct Harness {
     /// [`Harness::with_paused_completion`], which holds the stream open long
     /// enough for the steer to reach the actor before the sample closes.
     pub steer_on_text_delta: Option<String>,
+    /// The last `TurnDone`'s misprediction count (0050 T5).
+    pub mispredictions: u32,
     /// Every `EngineEvent::LedgerReport` seen, in order (§S1 instrument).
     pub ledger_reports: Vec<LedgerSummary>,
     /// The session log's live `sync_data()` counter — the group-commit
@@ -397,6 +399,7 @@ impl Harness {
             ask_reply: AskReply::Allow,
             steer_on_tool_start: None,
             steer_on_text_delta: None,
+            mispredictions: 0,
             ledger_reports: Vec::new(),
             fsyncs,
             pause_acks,
@@ -451,7 +454,14 @@ impl Harness {
                         self.handle.steer(steer).await;
                     }
                 }
-                EngineEvent::TurnDone { outcome, .. } => return outcome,
+                EngineEvent::TurnDone {
+                    outcome,
+                    mispredictions,
+                    ..
+                } => {
+                    self.mispredictions = mispredictions;
+                    return outcome;
+                }
                 EngineEvent::LedgerReport(summary) => self.ledger_reports.push(summary),
                 _ => {}
             }

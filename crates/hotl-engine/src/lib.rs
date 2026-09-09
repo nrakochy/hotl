@@ -8,6 +8,7 @@
 //! asks are events carrying a oneshot reply.
 
 mod actor;
+mod expect;
 pub mod hooks;
 mod ledger;
 mod turn;
@@ -186,6 +187,8 @@ pub struct TurnContinuation {
     pub(crate) consecutive_failures: std::collections::HashMap<String, u32>,
     /// The shared per-prompt "reminder and continue" budget.
     pub(crate) turn_extensions: u32,
+    /// Tool results that missed a stated `expect` so far this prompt (0050 T5).
+    pub(crate) mispredictions: u32,
     /// Truncation-recovery continues already spent (MAX_TOKENS_CONTINUE_MAX).
     pub(crate) max_tokens_continues: u32,
     /// Completed samples since the last fold — the compaction streak's
@@ -341,6 +344,10 @@ pub enum EngineEvent {
     TurnDone {
         outcome: Outcome,
         usage: TokenUsage,
+        /// Tool results that missed a stated `expect` (0050 T5), cumulative
+        /// over the whole prompt — compaction respawns and goal-loop
+        /// continuations fold into this one number, like `usage`.
+        mispredictions: u32,
     },
     /// The `todo_write` checklist changed (a full-state replace committed).
     /// Ephemeral-context companion to the durable `Todos` entry: the surface
@@ -714,7 +721,13 @@ pub enum SessionCmd {
         reply: oneshot::Sender<Result<String, String>>,
     },
     /// Turn task → actor: the turn is over (or needs a compaction respawn).
-    TurnFinished { end: TurnEnd, usage: TokenUsage },
+    TurnFinished {
+        end: TurnEnd,
+        usage: TokenUsage,
+        /// Mispredicted tool results this turn (0050 T5), summed into the
+        /// goal loop's carry exactly like `usage`.
+        mispredictions: u32,
+    },
     /// Test-only: bump the actor's masking-rules epoch by one
     /// (commit-protocol.md §Proposal payloads' `rules_epoch` guard). Nothing
     /// in production sends this — the epoch is constant today — but an
