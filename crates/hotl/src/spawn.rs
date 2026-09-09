@@ -1060,7 +1060,7 @@ mod tests {
 
     /// A scratch git repo with one commit, or `None` when git is missing.
     fn scratch_repo() -> Option<tempfile::TempDir> {
-        if !hotl_store::shadow::git_available() {
+        if !hotl_store::worktree::git_available() {
             return None;
         }
         let tmp = tempfile::tempdir().ok()?;

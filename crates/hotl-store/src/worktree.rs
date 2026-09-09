@@ -2,9 +2,8 @@
 //! checkout instead of the parent's working tree, and its diff is applied
 //! back — whole, or not at all — when it finishes.
 //!
-//! Lives next to [`shadow`](crate::shadow) because that module already owns
-//! hotl's "shell out to the git CLI, degrade to `None` if it isn't there"
-//! posture, and exports [`shadow::git_available`], which this reuses.
+//! Owns hotl's "shell out to the git CLI, degrade to `None` if it isn't
+//! there" posture via [`git_available`].
 //!
 //! Two things about the location are load-bearing, not incidental:
 //!
@@ -12,12 +11,10 @@
 //!    write floor** (`hotl_tools::sandbox` builds that floor from the process
 //!    cwd, set once at startup — a path discovered later can never be added).
 //! 2. Under `.git/` specifically, so it is already invisible to `git status`,
-//!    `glob` (which skips `.git`), `rg`, and the undo snapshot's `EXCLUDES`
-//!    (which already begins with `.git/`). A worktree at `<workspace>/.hotl/`
-//!    would need a `.git/info/exclude` write *and* a new `EXCLUDES` entry,
-//!    both of which read as cosmetic and are not: delete either later and the
-//!    parent's `glob`/`grep` silently return one copy of the repo per live
-//!    child.
+//!    `glob` (which skips `.git`), and `rg`. A worktree at
+//!    `<workspace>/.hotl/` would need a `.git/info/exclude` write, which reads
+//!    as cosmetic and is not: delete it later and the parent's `glob`/`grep`
+//!    silently return one copy of the repo per live child.
 //!
 //! Every git invocation here passes an explicit `-C <path>` and never relies
 //! on an ambient `GIT_DIR`/`GIT_WORK_TREE` — a repo convention, earned when a
@@ -25,6 +22,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+
+/// Whether the git CLI is on PATH. Worktree isolation (and anything else
+/// that shells out to git) degrades to shared-cwd when it isn't.
+pub fn git_available() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
 
 /// Where child worktrees live, relative to the workspace root.
 const WORKTREE_DIR: &str = ".git/hotl-worktrees";
@@ -59,7 +65,7 @@ impl Worktree {
     /// the parent abandoned. Enforced by
     /// `create_removes_the_worktree_when_seeding_fails`.
     pub fn create(workspace: &Path, id: &str) -> Option<Self> {
-        if !crate::shadow::git_available() {
+        if !git_available() {
             return None;
         }
         // Not inside a git worktree ⇒ nothing to isolate against.
@@ -364,7 +370,7 @@ mod tests {
     /// A scratch repo with one commit. Returns `None` when git is missing, so
     /// every test here skips rather than fails on a host without it.
     fn repo() -> Option<tempfile::TempDir> {
-        if !crate::shadow::git_available() {
+        if !git_available() {
             return None;
         }
         let tmp = tempfile::tempdir().ok()?;
@@ -582,7 +588,7 @@ mod tests {
 
     #[test]
     fn create_returns_none_outside_a_git_repo() {
-        if !crate::shadow::git_available() {
+        if !git_available() {
             return;
         }
         let tmp = tempfile::tempdir().unwrap();

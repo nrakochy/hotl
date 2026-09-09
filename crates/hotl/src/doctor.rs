@@ -582,7 +582,7 @@ fn memory_check(config_dir: &Path) -> Check {
 /// separate process, so it reports what the newest session's shadow shows —
 /// the in-process worker's live view is the TUI strip's job.
 fn undo_check() -> Check {
-    if !hotl_store::shadow::git_available() {
+    if !hotl_store::worktree::git_available() {
         return warn("undo: git not found — `hotl undo` snapshots are disabled".into());
     }
     let root = crate::agent::shadow_root();

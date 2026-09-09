@@ -95,12 +95,7 @@ pub struct Shadow {
     work_tree: PathBuf,
 }
 
-pub fn git_available() -> bool {
-    Command::new("git")
-        .arg("--version")
-        .output()
-        .is_ok_and(|o| o.status.success())
-}
+pub use crate::worktree::git_available;
 
 impl Shadow {
     /// Create the shadow repo for a session. `None` = git unavailable or

@@ -4441,7 +4441,7 @@ mod tests {
     /// the model.
     #[tokio::test]
     async fn spawn_child_isolates_into_a_worktree_seeded_from_the_live_tree() {
-        if !hotl_store::shadow::git_available() {
+        if !hotl_store::worktree::git_available() {
             return;
         }
         let repo = tempfile::tempdir().unwrap();
