@@ -19,7 +19,6 @@
 //! `replay_warns_when_the_log_is_from_a_newer_format`.
 
 pub mod retention;
-pub mod shadow;
 pub mod worktree;
 
 use std::borrow::Cow;

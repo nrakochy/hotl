@@ -1,7 +1,7 @@
 //! Retention / GC (owed since M2/M3b): bound the growth of the append-only
 //! stores by age and count. Prunes a whole session as a unit — its `.jsonl`
-//! log, its `.blobs/` (evicted tool results), and its `.git` shadow snapshot
-//! repo — so nothing is left half-deleted. Never touches the workspace, never
+//! log, its `.blobs/` (evicted tool results), and, for sessions from before
+//! 0054, its legacy shadow snapshot repo — so nothing is left half-deleted. Never touches the workspace, never
 //! rewrites a file in place (append-only stays append-only; deletion is the
 //! only GC, per the retention row in SECURITY.md/RELIABILITY.md).
 //!
@@ -133,7 +133,9 @@ pub fn gc(data_dir: &Path, policy: &RetentionPolicy, dry_run: bool) -> GcReport 
     report
 }
 
-/// The three on-disk artifacts of one session: log, blob dir, shadow repo.
+/// The three on-disk artifacts of one session: log, blob dir, and the legacy
+/// shadow repo (undo was removed in 0054; the path is still swept so old
+/// installs drain).
 fn session_paths(log_path: &Path, shadow_dir: &Path, id: &str) -> Vec<PathBuf> {
     let mut v = vec![log_path.to_path_buf()];
     if let Some(stem) = log_path.file_stem().and_then(|s| s.to_str()) {
