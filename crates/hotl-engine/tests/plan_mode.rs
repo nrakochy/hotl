@@ -316,3 +316,153 @@ async fn plan_does_not_block_a_read_only_tool_that_still_asks() {
     assert!(!is_error, "peek must succeed: {content}");
     assert!(content.contains("thiserror"), "{content}");
 }
+
+/// A two-prompt session with no tool calls, so every request is a plain
+/// sample: the roster and the reminder items are all these tests read.
+struct Visible {
+    requests: Vec<hotl_provider::SamplingRequest>,
+    log: String,
+}
+
+/// `toggles[n]` is applied (if any) before prompt `n`.
+async fn run_visible(start_in_plan: bool, toggles: [Option<bool>; 2]) -> Visible {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = EngineConfig::default();
+    let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
+        .expect("session log");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("one"),
+        ScriptedProvider::text_reply("two"),
+    ]));
+    let handle = spawn_session(SessionDeps {
+        provider: provider.clone(),
+        registry: Arc::new(Registry::builtin()),
+        rules: Arc::new(
+            Rules::default()
+                .with_mode(PermissionMode::Ask)
+                .with_plan(start_in_plan),
+        ),
+        sandbox_enforced: true,
+        clock: Arc::new(SystemClock),
+        log,
+        system: "test-system".into(),
+        cwd: dir.path().to_path_buf(),
+        hooks: None,
+        initial_items: Vec::new(),
+        initial_todos: Vec::new(),
+        initial_goal: None,
+        config,
+    });
+    let mut s = Session { handle, dir };
+
+    for (round, toggle) in toggles.into_iter().enumerate() {
+        if let Some(plan) = toggle {
+            s.handle.set_plan(plan).await;
+        }
+        s.handle.prompt(format!("go {round}")).await;
+        loop {
+            if let EngineEvent::TurnDone { .. } = next_event(&mut s).await {
+                break;
+            }
+        }
+    }
+    drop(s.handle);
+
+    let log_path = std::fs::read_dir(s.dir.path())
+        .expect("session dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("session log");
+    Visible {
+        requests: provider.requests(),
+        log: std::fs::read_to_string(&log_path).expect("read log"),
+    }
+}
+
+fn tool_names(req: &hotl_provider::SamplingRequest) -> Vec<String> {
+    req.tools.iter().map(|t| t.name.clone()).collect()
+}
+
+/// Every synthetic user item in the log, in commit order.
+fn reminders(log: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in log.lines() {
+        let entry: hotl_types::Entry = serde_json::from_str(line).expect("entry");
+        if let EntryPayload::Item {
+            item:
+                Item::User {
+                    text,
+                    synthetic: Some(_),
+                    ..
+                },
+        } = entry.payload
+        {
+            out.push(text);
+        }
+    }
+    out
+}
+
+/// A2, first half: the overlay used to be invisible in the roster too — the
+/// model was offered `write`/`edit` and then refused at the gate.
+#[tokio::test]
+async fn plan_hides_write_and_edit_from_the_roster() {
+    let v = run_visible(true, [None, None]).await;
+    assert_eq!(v.requests.len(), 2, "one request per prompt");
+    for req in &v.requests {
+        let names = tool_names(req);
+        assert!(!names.contains(&"write".to_string()), "{names:?}");
+        assert!(!names.contains(&"edit".to_string()), "{names:?}");
+        assert!(names.contains(&"read".to_string()), "{names:?}");
+        assert!(names.contains(&"bash".to_string()), "{names:?}");
+    }
+}
+
+/// A2, second half: the toggle tells the model, both ways, and the roster it
+/// advertises next follows the same flag.
+#[tokio::test]
+async fn plan_toggle_tells_the_model_and_moves_the_roster() {
+    let v = run_visible(false, [Some(true), Some(false)]).await;
+    assert_eq!(v.requests.len(), 2, "one request per prompt");
+
+    let on = tool_names(&v.requests[0]);
+    assert!(!on.contains(&"write".to_string()), "{on:?}");
+    assert!(!on.contains(&"edit".to_string()), "{on:?}");
+    let off = tool_names(&v.requests[1]);
+    assert!(off.contains(&"write".to_string()), "{off:?}");
+    assert!(off.contains(&"edit".to_string()), "{off:?}");
+
+    let said = reminders(&v.log);
+    assert!(
+        said.iter().any(|t| t.contains("Plan mode is on")),
+        "no plan-on reminder in {said:?}"
+    );
+    assert!(
+        said.iter().any(|t| t.contains("Plan mode is off")),
+        "no plan-off reminder in {said:?}"
+    );
+}
+
+/// The reminder rides the projection the model actually sees, not just the
+/// log: a `SetPlan` that appended nowhere the request reads would pass the
+/// test above and teach the model nothing.
+#[tokio::test]
+async fn the_plan_reminder_reaches_the_next_request() {
+    let v = run_visible(false, [Some(true), None]).await;
+    let req = &v.requests[0];
+    let rendered: String = req
+        .items
+        .iter()
+        .chain(req.ephemeral_tail.iter())
+        .filter_map(|i| match i.as_ref() {
+            Item::User { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("Plan mode is on"),
+        "the first request never carried the reminder: {rendered}"
+    );
+}

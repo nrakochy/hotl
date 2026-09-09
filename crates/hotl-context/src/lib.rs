@@ -195,6 +195,19 @@ pub fn civil_date_utc(unix_ms: u64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// What the model is told when plan mode turns on (0050 T2). Plan is an
+/// overlay on permissions, and until this text existed it was invisible: the
+/// model kept proposing edits the roster no longer carried. The wording says
+/// what is gone, what is left, and what a finished plan looks like — a
+/// reminder that only forbids leaves the model guessing at the shape.
+pub const PLAN_ON_REMINDER: &str = "Plan mode is on: write and edit are \
+    unavailable until the user turns it off. Investigate with read, glob, grep \
+    and bash, then state a plan as numbered steps naming the files to change \
+    and the command that will verify each step.";
+
+/// The other half: the roster is back, said once, at the toggle.
+pub const PLAN_OFF_REMINDER: &str = "Plan mode is off: write and edit are available again.";
+
 /// Auto-memory (M2): `<config>/memory/MEMORY.md`, budget-capped, enveloped.
 /// Owner-authored, but it still rides in the envelope — memory files quote
 /// repo content and past sessions, so the same defense applies.

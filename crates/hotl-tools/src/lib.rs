@@ -288,6 +288,21 @@ impl Registry {
     /// of `keep`: the depth-1 cap is this method's job to preserve, not each
     /// caller's (see `hotl_tools::agents::filter_registry`, the only current
     /// caller).
+    /// The roster a session in plan mode advertises: every tool except the
+    /// ones that edit files. Deliberately **not** built on
+    /// [`Registry::filtered`], which also strips `spawn`/`workflow` — a
+    /// parent session in plan mode still delegates.
+    pub fn without_edit_tools(&self) -> Registry {
+        Registry {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| !t.edits_files())
+                .cloned()
+                .collect(),
+        }
+    }
+
     pub fn filtered(&self, keep: impl Fn(&dyn Tool) -> bool) -> Registry {
         Registry {
             tools: self
@@ -636,6 +651,52 @@ mod tests {
             _cancel: CancellationToken,
         ) -> BoxFuture<'a, ToolOutcome> {
             Box::pin(std::future::ready(ToolOutcome::ok("shadowed")))
+        }
+    }
+
+    /// A stand-in for the tools a parent session registers on top of the
+    /// builtins; `spawn` is the one plan mode must keep and `filtered` drops.
+    struct NamedTool(&'static str);
+    impl Tool for NamedTool {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "a registered tool"
+        }
+        fn schema(&self) -> Value {
+            serde_json::json!({"type": "object"})
+        }
+        fn permission(&self, _input: &Value) -> Permission {
+            Permission::None
+        }
+        fn run<'a>(
+            &'a self,
+            _input: Value,
+            _cancel: CancellationToken,
+        ) -> BoxFuture<'a, ToolOutcome> {
+            Box::pin(std::future::ready(ToolOutcome::ok("ran")))
+        }
+    }
+
+    #[test]
+    fn without_edit_tools_keeps_spawn_and_workflow() {
+        let mut reg = Registry::builtin();
+        reg.register(Box::new(NamedTool("spawn")));
+        reg.register(Box::new(NamedTool("workflow")));
+        let names: Vec<String> = reg
+            .without_edit_tools()
+            .defs()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(!names.contains(&"write".to_string()), "{names:?}");
+        assert!(!names.contains(&"edit".to_string()), "{names:?}");
+        for kept in ["read", "bash", "glob", "grep", "spawn", "workflow"] {
+            assert!(
+                names.contains(&kept.to_string()),
+                "{kept} missing: {names:?}"
+            );
         }
     }
 

@@ -1038,6 +1038,28 @@ pub(crate) async fn run(
                         EntryPayload::PlanSet { on: plan },
                     )
                     .await;
+                // The overlay was invisible before 0050 T2: the roster moves
+                // under the model at the next boundary, so it is told here,
+                // in the same arm, and the toggle stays one cache break.
+                let body = if plan {
+                    hotl_context::PLAN_ON_REMINDER
+                } else {
+                    hotl_context::PLAN_OFF_REMINDER
+                };
+                let _ = shared
+                    .append(
+                        &mut log,
+                        &mut pipeline,
+                        &mut head,
+                        EntryPayload::Item {
+                            item: Item::User {
+                                text: format!("<system-reminder>{body}</system-reminder>"),
+                                synthetic: Some(SyntheticReason::SystemReminder),
+                                images: Vec::new(),
+                            },
+                        },
+                    )
+                    .await;
             }
             SessionCmd::SetEffort(effort) => {
                 // Same shape as `SetPlan`: atomic first so the next request

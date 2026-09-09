@@ -755,7 +755,7 @@ pub(crate) async fn build_acp() -> Result<
             .to_string();
         let plan = plan_override.unwrap_or_else(|| scaffold.rules.plan());
         let session_id = log.session_id.clone();
-        let initial = session_context(&scaffold, &resumed);
+        let initial = session_context(&scaffold, &resumed, plan);
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
         }
@@ -879,7 +879,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         );
     }
     let session_id = log.session_id.clone();
-    let initial_items = session_context(&scaffold, &None);
+    let initial_items = session_context(&scaffold, &None, scaffold.rules.plan());
     record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
     let handle = spawn_interactive_session(
         (*scaffold.registry).clone(),
@@ -1262,7 +1262,7 @@ async fn run_session(
                                                                     // instructions are already items 0..k of it, so re-injecting them would
                                                                     // both duplicate the content and rewrite the very prefix the fork exists
                                                                     // to reuse (D-A6).
-    let initial_items = session_context(&scaffold, &lineage);
+    let initial_items = session_context(&scaffold, &lineage, scaffold.rules.plan());
     if lineage.is_none() {
         record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
     }
@@ -2050,16 +2050,46 @@ fn child_builder(
 /// Starting context for a session. A resumed session inherits the replayed
 /// projection verbatim (it already carries the original memory and
 /// instructions); fresh sessions assemble anew.
-fn session_context(scaffold: &Scaffold, resumed: &Option<Resumed>) -> Vec<hotl_types::Item> {
+fn session_context(
+    scaffold: &Scaffold,
+    resumed: &Option<Resumed>,
+    plan: bool,
+) -> Vec<hotl_types::Item> {
     match resumed {
         Some(r) => r.items.clone(),
-        None => initial_items(
+        None => fresh_context(
             &scaffold.config_dir,
             &scaffold.cwd,
             &scaffold.model,
             &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
+            plan,
         ),
     }
+}
+
+/// [`initial_items`] plus, for a session that *starts* in plan mode
+/// (`--plan`, `HOTL_PLAN`, `[permissions] plan`, ACP `session/new`), the
+/// reminder that says so. The runtime toggle says it from the actor's
+/// `SetPlan` arm instead; a resumed session replays whichever it already had.
+fn fresh_context(
+    config_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    model: &str,
+    date: &str,
+    plan: bool,
+) -> Vec<hotl_types::Item> {
+    let mut items = initial_items(config_dir, cwd, model, date);
+    if plan {
+        items.push(hotl_types::Item::User {
+            text: format!(
+                "<system-reminder>{}</system-reminder>",
+                hotl_context::PLAN_ON_REMINDER
+            ),
+            synthetic: Some(hotl_types::SyntheticReason::SystemReminder),
+            images: Vec::new(),
+        });
+    }
+    items
 }
 
 /// Lane-2 shell hooks from config.toml `[[hook]]`, or None (M5). Threads in
@@ -5000,6 +5030,29 @@ mod tests {
         assert!(text.contains("<env platform=") && text.contains("is_git_repo="));
         // Instructions still load, after it.
         assert!(items.len() > 1);
+    }
+
+    /// A2: a session that starts in plan mode says so in its own seed —
+    /// otherwise only the runtime toggle ever tells the model, and `--plan`
+    /// is silent for the whole session.
+    #[test]
+    fn a_session_that_starts_in_plan_mode_says_so_in_its_seed() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let plain = fresh_context(config_dir.path(), cwd.path(), "m", "2026-08-14", false);
+        let planned = fresh_context(config_dir.path(), cwd.path(), "m", "2026-08-14", true);
+        assert_eq!(planned.len(), plain.len() + 1);
+        let hotl_types::Item::User {
+            text, synthetic, ..
+        } = planned.last().unwrap()
+        else {
+            panic!("the reminder is a user item");
+        };
+        assert!(text.contains("Plan mode is on"), "{text}");
+        assert_eq!(
+            *synthetic,
+            Some(hotl_types::SyntheticReason::SystemReminder)
+        );
     }
 
     #[test]

@@ -697,7 +697,13 @@ struct Turn {
     cmd_tx: mpsc::Sender<SessionCmd>,
     events: mpsc::Sender<EngineEvent>,
     cancel: CancellationToken,
-    tool_defs: Arc<[ToolDef]>,
+    /// The two rosters, both built once per turn: plan mode drops the tools
+    /// that edit files, so what the model can see matches what it is allowed
+    /// to do. Picked per use by [`Turn::tool_defs`] — a mid-session `/plan`
+    /// has to move the roster, and rebuilding it per sample would cost a
+    /// cache break every time instead of once at the toggle.
+    tool_defs_all: Arc<[ToolDef]>,
+    tool_defs_plan: Arc<[ToolDef]>,
     models: Vec<String>,
     model_idx: usize,
     /// The trailing tool-call signatures the doom-loop detector reads —
@@ -783,7 +789,8 @@ impl Turn {
         models.extend(shared.config.fallback_models.iter().cloned());
         let head = shared.head();
         Self {
-            tool_defs: shared.registry.defs().into(),
+            tool_defs_all: shared.registry.defs().into(),
+            tool_defs_plan: shared.registry.without_edit_tools().defs().into(),
             shared,
             cmd_tx,
             events,
@@ -1029,6 +1036,16 @@ impl Turn {
 
     /// Commit one tagged `SystemReminder` user item at the sample boundary —
     /// the shared shape under the gate nudge and truncation recovery.
+    /// The roster this turn advertises right now — the live plan flag, not a
+    /// snapshot, so a `/plan` between samples moves it at the next boundary.
+    fn tool_defs(&self) -> &Arc<[ToolDef]> {
+        if self.shared.effective_plan() {
+            &self.tool_defs_plan
+        } else {
+            &self.tool_defs_all
+        }
+    }
+
     async fn inject_reminder(&mut self, body: String) -> Commit {
         self.propose_pipelined(
             vec![EntryPayload::Item {
@@ -1432,7 +1449,7 @@ impl Turn {
             // Chargeable: an invalid tool name is a model mistake the model can
             // fix, and repeating it is what the budget exists to stop.
             return Gate::Resolved {
-                outcome: unknown_tool(&self.tool_defs, &tu.name),
+                outcome: unknown_tool(self.tool_defs(), &tu.name),
                 chargeable: true,
             };
         };
@@ -1616,7 +1633,7 @@ impl Turn {
             // Gate checked; defensive. Chargeable for the same reason the gate's
             // own `unknown_tool` is: a bad name is a model mistake it can fix.
             return Executed {
-                outcome: unknown_tool(&self.tool_defs, &tu.name),
+                outcome: unknown_tool(self.tool_defs(), &tu.name),
                 chargeable: true,
             };
         };
@@ -1893,7 +1910,7 @@ impl Turn {
             system: Arc::clone(&self.shared.system),
             items: Arc::clone(&snapshot.durable),
             ephemeral_tail: Arc::clone(&snapshot.tail),
-            tools: Arc::clone(&self.tool_defs),
+            tools: Arc::clone(self.tool_defs()),
             thinking: self.shared.config.thinking,
             effort: self.shared.effective_effort(),
             cache: if self.shared.config.cache_static {
