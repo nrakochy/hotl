@@ -430,6 +430,7 @@ mod tests {
             EngineEvent::Retrying {
                 attempt: 1,
                 reason: "429".into(),
+                discarded_partial: false,
             },
             EngineEvent::FallbackModel { model: "m2".into() },
             EngineEvent::PromptQueued,

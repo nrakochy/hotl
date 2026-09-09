@@ -92,8 +92,18 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             }
             v
         }
-        EngineEvent::Retrying { attempt, reason } => {
-            json!({"type": "retrying", "attempt": attempt, "reason": reason})
+        EngineEvent::Retrying {
+            attempt,
+            reason,
+            discarded_partial,
+        } => {
+            let mut v = json!({"type": "retrying", "attempt": attempt, "reason": reason});
+            // Omitted, not `null`, when there is nothing to take back — the
+            // same additive rule `usage_frame` follows.
+            if *discarded_partial {
+                v["discarded_partial"] = json!(true);
+            }
+            v
         }
         EngineEvent::FallbackModel { model } => {
             json!({"type": "fallback_model", "model": model})

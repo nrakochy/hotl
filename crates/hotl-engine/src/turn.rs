@@ -103,6 +103,12 @@ const TODO_GATE_MAX: u32 = 2;
 /// budget's invariant is "end-turn intercept gates", and truncation recovery
 /// must not starve the TodoGate (or vice versa).
 const MAX_TOKENS_CONTINUE_MAX: u32 = 3;
+/// Mid-stream re-samples one sample may spend (0050 T3). Deliberately far
+/// short of the provider's pre-stream `MAX_ATTEMPTS`: a stream that dies
+/// after producing bytes has already cost the output tokens it emitted, and
+/// a wedged provider should surface as an error the human can see rather
+/// than as a turn that quietly re-bills itself five times.
+pub const STREAM_RETRY_MAX: u32 = 2;
 
 pub(crate) async fn run(
     shared: Arc<SharedDeps>,
@@ -689,6 +695,15 @@ enum SampleEnd {
     /// The next request won't fit (threshold or provider overflow): the turn
     /// ends and the actor compacts, then respawns a continuation.
     ContextFull,
+    /// The stream died after producing bytes but before sealing anything
+    /// irreversible. Handled entirely inside [`Turn::sample`] — `drive` never
+    /// sees it.
+    Interrupted {
+        attempt: u32,
+        delay: std::time::Duration,
+        reason: String,
+        discarded_partial: bool,
+    },
     Fatal(String),
 }
 
@@ -879,6 +894,13 @@ impl Turn {
                 SampleEnd::Unavailable(m) | SampleEnd::Fatal(m) => {
                     self.ledger.stamp(Phase::BoundaryEnd);
                     return TurnEnd::Outcome(Outcome::Error { message: m });
+                }
+                // `sample()` owns the whole re-sample loop; an `Interrupted`
+                // reaching here would mean it returned one it should have
+                // consumed.
+                SampleEnd::Interrupted { reason, .. } => {
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    return TurnEnd::Outcome(Outcome::Error { message: reason });
                 }
             };
             match stop {
@@ -1114,9 +1136,42 @@ impl Turn {
         self.last_snapshot = Some(snapshot.clone());
         self.projected_tail.clear();
 
-        let (stop, usage, mut blocks) = match self.collect_stream(stream).await {
-            Ok(completed) => completed,
-            Err(end) => return end,
+        // The re-sample loop (0050 T3). The snapshot is fixed: a rebuilt
+        // request is the *same* request, `sample_no` included — this is one
+        // step of the agent loop that had to be paid for twice, not two
+        // steps. Nothing here commits, so an interrupted attempt leaves the
+        // projection exactly as the boundary published it.
+        let mut stream = stream;
+        let mut attempt = 1;
+        let (stop, usage, mut blocks) = loop {
+            match self.collect_stream(stream, attempt).await {
+                Ok(completed) => break completed,
+                Err(SampleEnd::Interrupted {
+                    attempt: failed,
+                    delay,
+                    reason,
+                    discarded_partial,
+                }) => {
+                    self.emit(EngineEvent::Retrying {
+                        attempt: failed,
+                        reason,
+                        discarded_partial,
+                    })
+                    .await;
+                    tokio::select! {
+                        biased;
+                        _ = self.cancel.cancelled() => return SampleEnd::Cancelled,
+                        _ = tokio::time::sleep(retry::with_jitter(delay)) => {}
+                    }
+                    let request = match self.build_request(&snapshot) {
+                        Ok(request) => request,
+                        Err(end) => return end,
+                    };
+                    stream = self.shared.provider.stream(request);
+                    attempt = failed + 1;
+                }
+                Err(end) => return end,
+            }
         };
         if stop == StopReason::MaxTokens {
             prune_unsigned_trailing_thinking(&mut blocks);
@@ -1932,16 +1987,40 @@ impl Turn {
     async fn collect_stream(
         &mut self,
         stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
+        attempt: u32,
     ) -> Result<(StopReason, TokenUsage, Vec<Value>), SampleEnd> {
         let mut stream = stream;
         let mut completed = None;
+        // The two facts the re-sample decision needs. `saw_first_byte`
+        // separates "the provider never answered" (the availability ladder's
+        // job, model fallback and all) from "it answered and then died";
+        // `sealed_tool_use` is the veto — a closed `tool_use` block is the
+        // model's committed intent, and re-sampling would either duplicate
+        // its side effects or drop them silently.
+        let mut saw_first_byte = false;
+        let mut sealed_tool_use = false;
+        let mut open_tool_use: Option<usize> = None;
+        let mut forwarded_text = false;
         loop {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Err(SampleEnd::Cancelled),
                 next = stream.next() => match next {
                     Some(Ok(event)) => {
+                        saw_first_byte = true;
                         self.ledger.stamp(Phase::FirstByte);
+                        match &event {
+                            StreamEvent::BlockStart { index, kind } if kind == "tool_use" => {
+                                open_tool_use = Some(*index);
+                            }
+                            StreamEvent::BlockEnd { index } if open_tool_use == Some(*index) => {
+                                sealed_tool_use = true;
+                            }
+                            StreamEvent::TextDelta { .. } | StreamEvent::ThinkingDelta { .. } => {
+                                forwarded_text = true;
+                            }
+                            _ => {}
+                        }
                         if let StreamEvent::Completed { stop, usage, blocks } = event {
                             self.ledger.stamp(Phase::LastBlockEnd);
                             completed = Some((stop, usage, blocks));
@@ -1957,13 +2036,29 @@ impl Turn {
                         drain_to_end(&mut stream).await;
                         return Err(SampleEnd::ContextFull);
                     }
-                    Some(Err(e)) if retry::is_availability(&e) => {
-                        drain_to_end(&mut stream).await;
-                        return Err(SampleEnd::Unavailable(e.to_string()));
-                    }
                     Some(Err(e)) => {
+                        // A3: the provider's own ladder wraps only the
+                        // pre-stream send, so before this a 529 one byte in
+                        // ended the turn. Nothing before the first byte
+                        // changes — that path still falls through to the
+                        // availability rung below.
+                        if saw_first_byte && !sealed_tool_use && attempt <= STREAM_RETRY_MAX {
+                            if let retry::Decision::Retry { delay } = retry::classify(&e, attempt) {
+                                drain_to_end(&mut stream).await;
+                                return Err(SampleEnd::Interrupted {
+                                    attempt,
+                                    delay,
+                                    reason: format!("stream interrupted: {e}"),
+                                    discarded_partial: forwarded_text,
+                                });
+                            }
+                        }
                         drain_to_end(&mut stream).await;
-                        return Err(SampleEnd::Fatal(e.to_string()));
+                        return Err(if retry::is_availability(&e) {
+                            SampleEnd::Unavailable(e.to_string())
+                        } else {
+                            SampleEnd::Fatal(e.to_string())
+                        });
                     }
                     None => break,
                 }
@@ -2442,7 +2537,13 @@ impl Turn {
         let mapped = match event {
             StreamEvent::TextDelta { text, .. } => EngineEvent::TextDelta(text),
             StreamEvent::ThinkingDelta { text, .. } => EngineEvent::ThinkingDelta(text),
-            StreamEvent::Retrying { attempt, reason } => EngineEvent::Retrying { attempt, reason },
+            // The provider's own pre-stream ladder: nothing was rendered yet,
+            // so there is nothing to take back.
+            StreamEvent::Retrying { attempt, reason } => EngineEvent::Retrying {
+                attempt,
+                reason,
+                discarded_partial: false,
+            },
             _ => return,
         };
         self.emit(mapped).await;

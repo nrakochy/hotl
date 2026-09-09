@@ -440,6 +440,34 @@ impl ScriptedProvider {
         ]
     }
 
+    /// A sample that streams `events` and then dies. The engine's mid-stream
+    /// re-sample (0050 T3) only exists for this shape: bytes arrived, so the
+    /// pre-stream retry ladder is long past, and the turn used to end there.
+    pub fn error_after(
+        events: Vec<Result<StreamEvent, ProviderError>>,
+        err: ProviderError,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
+        let mut script = events;
+        script.push(Err(err));
+        script
+    }
+
+    /// `n` text deltas inside an open block — a stream that has started but
+    /// sealed nothing. Pair with [`Self::error_after`].
+    pub fn partial_text(text: &str) -> Vec<Result<StreamEvent, ProviderError>> {
+        vec![
+            Ok(StreamEvent::Started),
+            Ok(StreamEvent::BlockStart {
+                index: 0,
+                kind: "text".into(),
+            }),
+            Ok(StreamEvent::TextDelta {
+                index: 0,
+                text: text.into(),
+            }),
+        ]
+    }
+
     /// Convenience: a sample that calls one tool.
     pub fn tool_call(
         id: &str,
@@ -1302,7 +1330,9 @@ where
                 Err(_) => {
                     yield Err(ProviderError::Transport(format!(
                         "stream stalled: no data for {}s. The connection is likely dead \
-                         (a proxy dropped it without closing); retry the request.",
+                         (a proxy dropped it without closing). hotl re-samples an \
+                         interrupted stream on its own; if this keeps happening, check \
+                         the proxy or network path to the provider.",
                         idle.as_secs()
                     )));
                     return;
@@ -1370,7 +1400,7 @@ mod drive_sse_tests {
         match first {
             Err(ProviderError::Transport(m)) => {
                 assert!(m.contains("stalled"), "{m}");
-                assert!(m.contains("retry"), "errors are prompts: {m}");
+                assert!(m.contains("check the proxy"), "errors are prompts: {m}");
             }
             other => panic!("expected a transport timeout, got {other:?}"),
         }

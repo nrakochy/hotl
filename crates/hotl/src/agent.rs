@@ -2325,7 +2325,9 @@ impl Surface {
                 Some(false) => eprintln!("  ↳ (sub-agent tool error)"),
                 Some(true) => {}
             },
-            EngineEvent::Retrying { attempt, reason } => {
+            EngineEvent::Retrying {
+                attempt, reason, ..
+            } => {
                 eprintln!("· retrying ({attempt}): {reason}")
             }
             EngineEvent::FallbackModel { model } => eprintln!("· falling back to {model}"),

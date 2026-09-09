@@ -122,6 +122,14 @@ impl Streamed {
     pub fn rev(&self) -> u64 {
         self.rev
     }
+    /// Cut back to `len` bytes (a re-sample discarding partial text, 0050
+    /// T3). Bumps `rev` so every render cache treats it as new content.
+    pub fn truncate(&mut self, len: usize) {
+        if len < self.text.len() && self.text.is_char_boundary(len) {
+            self.text.truncate(len);
+            self.rev += 1;
+        }
+    }
     pub fn seed(&self) -> u64 {
         self.seed
     }
@@ -464,6 +472,12 @@ pub struct State {
     /// `reported` row — that row is provider-reported truth, this is an
     /// estimate (§5.7 in miniature).
     pub open_context: Option<u64>,
+    /// Length of the open assistant bubble at the start of the current
+    /// sample — where a mid-stream re-sample (0050 T3) truncates back to, so
+    /// a half-written answer is not left above the whole one. Marked on
+    /// every non-delta frame, which is the only sample boundary the wire
+    /// makes visible.
+    pub stream_mark: usize,
     /// Every loadable skill name, from the `initialize` result. `/<name>`
     /// resolves against this, so an unknown slash stays an unknown
     /// command instead of becoming a wasted turn.
@@ -564,6 +578,7 @@ impl State {
             context_window: DEFAULT_CONTEXT_WINDOW,
             live_context: None,
             open_context: None,
+            stream_mark: 0,
             skills: Vec::new(),
             workflows: Vec::new(),
             skill_roster: Vec::new(),
@@ -1033,7 +1048,13 @@ fn merge_key(summary: &str) -> &str {
 
 fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
     let text_of = |key: &str| v.get(key).and_then(Value::as_str).unwrap_or("").to_string();
-    match v.get("type").and_then(Value::as_str).unwrap_or("") {
+    let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+    // `retrying` is excluded: it is the frame that *reads* the mark, and the
+    // re-sample it announces resumes from the same place.
+    if !matches!(kind, "text_delta" | "thinking_delta" | "retrying") {
+        state.stream_mark = open_assistant_len(state);
+    }
+    match kind {
         "text_delta" => {
             append_assistant(state, &text_of("text"));
             enter_streaming(state);
@@ -1293,6 +1314,11 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         }
         "retrying" => {
             let attempt = v.get("attempt").and_then(Value::as_u64).unwrap_or(0);
+            // The re-sample regenerates from the mark, so anything rendered
+            // since is about to be said again (0050 T3).
+            if v.get("discarded_partial").and_then(Value::as_bool) == Some(true) {
+                truncate_open_assistant(state);
+            }
             notice(
                 state,
                 format!("retrying (attempt {attempt}) — {}", text_of("reason")),
@@ -2673,6 +2699,33 @@ fn append_assistant(state: &mut State, text: &str) {
         state
             .transcript
             .push(TranscriptItem::Assistant { text: text.into() });
+    }
+}
+
+/// The trailing open assistant bubble's length, or 0 when the last item is
+/// something else (a tool card, a notice) — then the next delta starts a new
+/// bubble and there is nothing to take back.
+fn open_assistant_len(state: &State) -> usize {
+    match state.transcript.last() {
+        Some(TranscriptItem::Assistant { text }) => text.as_str().len(),
+        _ => 0,
+    }
+}
+
+/// Cut the open assistant bubble back to [`State::stream_mark`], dropping it
+/// entirely when nothing was there before this sample.
+fn truncate_open_assistant(state: &mut State) {
+    let mark = state.stream_mark;
+    let Some(TranscriptItem::Assistant { text }) = state.transcript.last_mut() else {
+        return;
+    };
+    if text.as_str().len() <= mark {
+        return;
+    }
+    if mark == 0 {
+        state.transcript.pop();
+    } else {
+        text.truncate(mark);
     }
 }
 
@@ -4998,6 +5051,77 @@ mod tests {
         assert!(
             matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("overloaded"))
         );
+    }
+
+    /// 0050 T3: a re-sample regenerates the answer, so the half-written one
+    /// has to come off the screen — otherwise the turn reads as two replies.
+    #[test]
+    fn a_discarded_partial_is_taken_back_off_the_transcript() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"text_delta","text":"half a th"}));
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"stream interrupted","discarded_partial":true}),
+        );
+        assert!(
+            !s.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::Assistant { .. })),
+            "the partial bubble survived: {:?}",
+            s.transcript
+        );
+        upd(
+            &mut s,
+            json!({"type":"text_delta","text":"the whole answer"}),
+        );
+        let full: Vec<&str> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(full, vec!["the whole answer"]);
+    }
+
+    /// The retry only takes back what *this* sample wrote: text the previous
+    /// sample already finished stays.
+    #[test]
+    fn a_discarded_partial_keeps_the_text_that_came_before_it() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"text_delta","text":"settled. "}));
+        // Any non-delta frame closes the sample and marks the boundary.
+        upd(&mut s, json!({"type":"prompt_queued"}));
+        upd(&mut s, json!({"type":"text_delta","text":"half a th"}));
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"x","discarded_partial":true}),
+        );
+        let kept: Vec<&str> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Assistant { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec!["settled. "]);
+    }
+
+    /// A pre-stream retry rendered nothing, so it takes nothing back.
+    #[test]
+    fn a_retry_without_the_flag_leaves_the_transcript_alone() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"text_delta","text":"keep me"}));
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"429"}),
+        );
+        assert!(s
+            .transcript
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::Assistant { text } if text == "keep me")));
     }
 
     #[test]

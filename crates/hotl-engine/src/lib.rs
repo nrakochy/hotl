@@ -56,6 +56,10 @@ pub use actor::ProjectionHead;
 /// readers (`fork`'s history seed) name it to say which half they take.
 pub use actor::Snapshot;
 
+/// Re-exported so the cap is one number the tests and the docs both name:
+/// mid-stream re-samples one sample may spend (0050 T3).
+pub use turn::STREAM_RETRY_MAX;
+
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model: String,
@@ -294,6 +298,10 @@ pub enum EngineEvent {
     Retrying {
         attempt: u32,
         reason: String,
+        /// The re-sample threw away text the surface had already rendered
+        /// (0050 T3), so the surface must un-render it or the answer appears
+        /// twice — once half-written, once whole.
+        discarded_partial: bool,
     },
     FallbackModel {
         model: String,

@@ -66,6 +66,12 @@ fn every_frame_is_tagged_and_versioned() {
         EngineEvent::Retrying {
             attempt: 1,
             reason: "429".into(),
+            discarded_partial: false,
+        },
+        EngineEvent::Retrying {
+            attempt: 2,
+            reason: "stream interrupted: HTTP 529: overloaded_error".into(),
+            discarded_partial: true,
         },
         EngineEvent::FallbackModel { model: "m2".into() },
         EngineEvent::PromptQueued,
