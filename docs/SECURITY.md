@@ -1,6 +1,6 @@
 # SECURITY.md — stance
 
-**The floor is the safety design.** What ships ON in every mode and cannot be configured off: the kernel sandbox, protected-path escalations, deny rules, undo snapshots, secret masking, and transcript visibility of every silenced prompt. Per-action *prompting* is a mode (see "Permission modes" below): opt-in for the daily driver, mandatory in the `security-enforced` build. The cautionary example still binds — a control that can silently lapse is equivalent to nothing — which is why the floor has no off switch and every mode change is visible at startup.
+**The floor is the safety design.** What ships ON in every mode and cannot be configured off: the kernel sandbox, protected-path escalations, deny rules, secret masking, and transcript visibility of every silenced prompt. Per-action *prompting* is a mode (see "Permission modes" below): opt-in for the daily driver, mandatory in the `security-enforced` build. The cautionary example still binds — a control that can silently lapse is equivalent to nothing — which is why the floor has no off switch and every mode change is visible at startup.
 
 This document describes the controls as they exist in the code today. Gaps are listed at the end.
 
@@ -16,7 +16,7 @@ with it:
 | MCP/retrieval first-use trust screen | **still asks** (headless: denies) | always asks | always asks (headless: denies) | always asks |
 | Admin preapproved (`/etc/hotl/preapproved.toml`) | grants apply (redundant under bypass) | grants silence matching asks | grants are the only thing that runs | grants are the admin's no-prompt channel |
 | Admin/user deny rules | refuse the call outright, with the rule named in the tool result | same | same | same |
-| Kernel sandbox / egress / undo / masking | on | on | on | on |
+| Kernel sandbox / egress / masking | on | on | on | on |
 
 **Bypass never blocks on a human (0036).** A session started with
 `mode="bypass"` is a trust decision, and a permission prompt in it is a
@@ -60,7 +60,7 @@ mode and a shell redirect writes a file without the `write` tool. Do not treat
 allow-rules.
 
 In `bypass`, the boundary is **sandbox + flagged notices/refusals + deny
-rules + undo**, not per-action approval. The README's "safety" claim holds unconditionally
+rules**, not per-action approval. The README's "safety" claim holds unconditionally
 only for the `security-enforced` build; the default build's floor is the row
 above. `/etc/hotl/preapproved.toml` is trusted only when root-owned and not
 group/world-writable; otherwise it is refused loudly at startup and in
@@ -131,7 +131,7 @@ Two levers lift Tier B, and neither reaches Tier C. `[sandbox].readable = ["~/.s
 
 **`Enforced` is a runtime claim, not a configuration one.** At startup hotl spawns one sandboxed child that attempts to write outside the confinement, and reports the floor as enforced only if the write fails *and* leaves nothing on disk. The prior check — "does `/usr/bin/sandbox-exec` exist" — could not distinguish a working profile from one that silently failed to apply, and that single boolean is what gates `bash` allow-rules auto-approving without a human. The probe is memoized (one spawn per process) and bounded (2s, then fail-closed). It writes to `/var/tmp` or `$HOME`, uniquely named and deleted on every path; `HOTL_SANDBOX_PROBE_DIR` overrides the location and must be outside the working directory, `TMPDIR`, and every `[sandbox].writable` entry.
 
-**`[sandbox].writable` widens the floor without opening it to hotl itself.** The owner may list extra writable directories (bazel/ccache-style out-of-workspace caches) in `~/.config/hotl/config.toml`; they join the kernel re-allow set for every sandboxed spawn, and the probe's outside-the-floor target is chosen outside the *widened* set so `Enforced` still describes the floor children actually get. Validation is fail-closed per entry, on canonicalized paths (a symlink cannot smuggle a protected directory in): an entry that is, contains, or sits inside hotl's config dir or data dir is **refused** — a writable config dir is self-granted privilege escalation (the agent could rewrite its own allow-rules, hooks, or `api_key_helper`), and a writable data dir means tamperable session logs and snapshots. That refusal is what keeps `~` and `/` unlistable. Risky system roots (`/etc`, `/usr`, `/opt`, …) are honored with a loud warning. The separate `[sandbox].file_tools = "writable"` opt-in extends the same directories to the `write`/`edit` tool boundary (ordinary asks, same fd-descent symlink-refusing guard, anchored at the extra root); protected-path escalation always runs first, so the grant never downgrades an execute-later write. Defaults preserve today's posture exactly: no entries, `file_tools = "workspace"`.
+**`[sandbox].writable` widens the floor without opening it to hotl itself.** The owner may list extra writable directories (bazel/ccache-style out-of-workspace caches) in `~/.config/hotl/config.toml`; they join the kernel re-allow set for every sandboxed spawn, and the probe's outside-the-floor target is chosen outside the *widened* set so `Enforced` still describes the floor children actually get. Validation is fail-closed per entry, on canonicalized paths (a symlink cannot smuggle a protected directory in): an entry that is, contains, or sits inside hotl's config dir or data dir is **refused** — a writable config dir is self-granted privilege escalation (the agent could rewrite its own allow-rules, hooks, or `api_key_helper`), and a writable data dir means tamperable session logs. That refusal is what keeps `~` and `/` unlistable. Risky system roots (`/etc`, `/usr`, `/opt`, …) are honored with a loud warning. The separate `[sandbox].file_tools = "writable"` opt-in extends the same directories to the `write`/`edit` tool boundary (ordinary asks, same fd-descent symlink-refusing guard, anchored at the extra root); protected-path escalation always runs first, so the grant never downgrades an execute-later write. Defaults preserve today's posture exactly: no entries, `file_tools = "workspace"`.
 
 **Linux ABI floor: v3 (kernel 6.2).** Landlock restricts only the rights present in the *handled* mask, so a ruleset that does not handle `LANDLOCK_ACCESS_FS_TRUNCATE` leaves `truncate(2)` by path unconfined — an approved command can zero any file on the host. That right arrives at ABI v3. Kernels 5.13–6.1 therefore yield a genuinely partial floor and are **not certified**: they degrade fail-closed like an unsandboxed host unless the operator sets `HOTL_SANDBOX=best-effort`, which accepts the partial floor and renders `sandboxed:landlock(partial)` in every ask. (The gap is not reachable through `truncate -s 0` or a `>` redirect — both open the file for writing first, which `WriteFile` denies at ABI v1 — which is why it survived earlier review.) Landlock's network confinement independently requires ABI v4 / kernel ≥ 6.7.
 
@@ -308,7 +308,7 @@ in config.toml). The tool is absent when nothing is configured.
 
 | Limit | What it means |
 |---|---|
-| Sub-agent edits reach your working tree with **no second y/n gate** | The `spawn` call itself is gated (an ordinary ask), and `hotl undo`'s shadow snapshot still holds the pre-batch state. That snapshot covers the working tree only, which is why the merge-back uses plain `git apply` and **never** `--index`: a staging-area change is exactly what undo cannot reverse. The apply is all-or-nothing — on conflict nothing is written and the child's worktree is left in place at the reported path. |
+| Sub-agent edits reach your working tree with **no second y/n gate** | The `spawn` call itself is gated (an ordinary ask), and the child's diff is applied whole or not at all with plain `git apply` — never `--index` — so the parent's staging area is untouched and `git checkout` reverses it. On conflict nothing is written and the child's worktree is left in place at the reported path. |
 | Isolation confines the **file tools**, not `bash` | `read`/`write`/`edit`/`glob`/`grep` descend from the worktree's root fd and cannot name their way out. The *kernel* write floor is process-wide and set once at startup, so a child's `bash` can `cd ..` and write to the parent's tree. This is cooperative isolation against accidental collision, **not adversarial containment**. Narrowing the floor per child is tracked as debt. |
 
 **`hotl acp` (protocol surface).** The connected client answers `session/request_permission` round-trips — it *is* the human-on-the-loop for that session, exactly like the console. A missing or malformed reply, or a client that hangs up, resolves to deny.
@@ -326,11 +326,10 @@ Two lanes, both owner-authored in `~/.config/hotl/config.toml` — hotl does not
 |---|---|---|
 | session log (append-only JSONL, permanent by design) | `~/.local/share/hotl/sessions/` | secret masking at ingestion: values of secret-named env vars (`KEY`/`TOKEN`/`SECRET`/`PASSWORD`/`CREDENTIAL`/`AUTH`…, ≥ 8 chars) are replaced with `«masked:NAME»` — including their JSON-escaped forms — before bytes land |
 | evicted oversized tool results | `<session>.blobs/` | same masking; files written `0600`; blob filenames sanitized against path injection |
-| shadow snapshot store (powers `undo`) | per-session bare git repo | secret-bearing files are **excluded entirely, not masked** (`.env*`, `*.pem`, `*.key`, `id_*`, `*.p12`/`*.pfx`, `.ssh/`, `.aws/`, `.npmrc`, `.pypirc`, `.netrc`, `secrets.*`, `credentials`) — git history would keep a transient secret alive after the workspace file is deleted or rotated, so credentials never enter |
 
 The log carries a hash chain: replay verifies each entry chains to its parent and warns if a log was edited or truncated after being written. A secrets audit flags older logs that still contain a *current* secret value (append-only means they can't be scrubbed — the remedy is rotation, and the tool says so).
 
-Retention is explicit: `hotl gc` (with `--dry-run`) and a `[retention]` policy (`max_age_days` / `max_sessions`) prune whole sessions — log, blobs, and shadow repo together. The default is keep-everything; a configured policy also runs automatically at startup.
+Retention is explicit: `hotl gc` (with `--dry-run`) and a `[retention]` policy (`max_age_days` / `max_sessions`) prune whole sessions — log and blobs together (plus any legacy shadow repo from before 0.26). The default is keep-everything; a configured policy also runs automatically at startup.
 
 ## `hotl watch`
 

@@ -1,9 +1,10 @@
 //! Retention / GC (owed since M2/M3b): bound the growth of the append-only
 //! stores by age and count. Prunes a whole session as a unit — its `.jsonl`
 //! log, its `.blobs/` (evicted tool results), and, for sessions from before
-//! 0054, its legacy shadow snapshot repo — so nothing is left half-deleted. Never touches the workspace, never
-//! rewrites a file in place (append-only stays append-only; deletion is the
-//! only GC, per the retention row in SECURITY.md/RELIABILITY.md).
+//! 0054, its legacy shadow snapshot repo — so nothing is left half-deleted.
+//! Never touches the workspace, never rewrites a file in place (append-only
+//! stays append-only; deletion is the only GC, per the retention row in
+//! SECURITY.md/RELIABILITY.md).
 //!
 //! **Lineage-aware** (T2-5): resume is fork, so a resumed conversation is a
 //! chain whose ancestors are old by definition. GC never prunes a session that

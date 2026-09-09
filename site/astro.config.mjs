@@ -27,7 +27,7 @@ export default defineConfig({
 		starlight({
 			title: 'hotl',
 			description:
-				'A human-on-the-loop agent harness in one binary — fast, slim, secure, and extensible: a coding agent behind a permission gate with a kernel sandbox floor, an append-only session log with resume and undo, and a tmux dashboard for every agent you run.',
+				'A human-on-the-loop agent harness in one binary — fast, slim, secure, and extensible: a coding agent behind a permission gate with a kernel sandbox floor, an append-only session log with resume, and a tmux dashboard for every agent you run.',
 			head: [
 				{ tag: 'meta', attrs: { property: 'og:image', content: ogImageUrl } },
 				{ tag: 'meta', attrs: { property: 'og:image:width', content: '1200' } },

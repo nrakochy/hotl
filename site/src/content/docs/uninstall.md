@@ -3,7 +3,7 @@ title: 'Uninstalling hotl'
 description: Remove the hotl binary, the zsh plugin, and optionally config and session data.
 ---
 
-Remove the `hotl` agent and its data. `destructive:` the data steps delete session history and undo snapshots — read before running.
+Remove the `hotl` agent and its data. `destructive:` the data steps delete session history — read before running.
 
 ## 1. Remove the binary
 
@@ -24,9 +24,9 @@ Delete the `eval "$(hotl init zsh)"` line from your `~/.zshrc`. Details: [shell.
 rm -rf ~/.config/hotl
 ```
 
-## 4. Remove data — sessions and undo snapshots (optional)
+## 4. Remove data — sessions (optional)
 
-`destructive:` this deletes all session logs and the shadow-git snapshots backing `hotl undo`. Do this only if you don't need session history or the ability to undo past edits.
+`destructive:` this deletes all session logs (and any legacy `shadow/` snapshot repos left by releases before 0.26). Do this only if you don't need session history.
 
 ```
 rm -rf ~/.local/share/hotl

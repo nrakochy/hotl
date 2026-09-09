@@ -14,12 +14,11 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl -p "PROMPT" --json` | Headless with a JSONL event stream on stdout instead of prose. |
 | `hotl resume [id-prefix]` | Continue an earlier session in the console (bare: pick from a numbered list). The seeded session replays the earlier one's full context from its log and ancestry. |
 | `hotl --fork-from <n\|id\|name\|@last>` | Start a **new** session seeded with another's history, pinned to that session's state at fork time (the original can keep running). `--keep-turns <n>` / `--keep <items>` fork at a prefix instead of the head; `@last` is the newest session. Works headless too (`hotl -p "…" --fork-from …`). See [sessions.md](../sessions/). |
-| `hotl undo` | Restore the workspace to the newest session's last clean quiet-window snapshot — the agent's last checkpoint. Refuses when the agent made no mutations that session. Confirm-gated; `--force`/`-f` skips the prompt. |
 | `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](../backgrounding/). |
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
-| `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/shadows/blobs per `[retention]`. See [below](#hotl-gc). |
+| `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/blobs per `[retention]`. See [below](#hotl-gc). |
 | `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
-| `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, MCP trust, memory, secrets audit, undo/git. Exit 1 if any check FAILs. |
+| `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, MCP trust, memory, secrets audit. Exit 1 if any check FAILs. |
 | `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
 | `hotl skills [add\|update\|remove]` | List every discovered skill with its source; manage skill marketplaces. See [skills.md](../skills/). |
 | `hotl workflows [list\|show <name> [--mermaid]\|check <file>]` | Saved workflow recipes: list them, print one as TOML or a Mermaid flowchart, or validate a plan file and print the summary its ask will show (exit 1 on errors). See [workflows.md](../workflows/). |
@@ -278,7 +277,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_CONCURRENCY_BLOCKING_THREADS` | `[concurrency].blocking_threads` | `spawn_blocking` pool cap (bounds `glob`'s tree walk; default 16). |
 | `HOTL_MOUSE` | `[behavior].mouse` | `0` disables console mouse capture, keeping your terminal's own drag-select and middle-click paste. Anything else leaves the wheel scrolling the transcript and drags copying. |
 | `HOTL_THINKING` | *(pending `[behavior].thinking`)* | `0` turns off extended thinking. It is billed whether or not you read it, so this is the switch that matters if you don't. |
-| `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session/shadow store. |
+| `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | — | Bases for the config dir and the session store. |
 
 ### Allow-rules (`[[allow]]`)
 
@@ -563,7 +562,7 @@ Both are floors of one. Mutating agents that are not worktree-isolated still ser
 
 ### Retention (`[retention]`)
 
-Bounds the growth of the session/shadow/blob stores. `hotl gc` prunes on demand; with a `[retention]` policy set, a prune also runs quietly at startup. See [`hotl gc`](#hotl-gc).
+Bounds the growth of the session/blob stores. `hotl gc` prunes on demand; with a `[retention]` policy set, a prune also runs quietly at startup. See [`hotl gc`](#hotl-gc).
 
 ### History (`[history]`)
 
@@ -592,7 +591,7 @@ Protected paths outrank admin grants; admin denies outrank everything.
 
 ## hotl gc
 
-`hotl gc [--dry-run] [--days N] [--keep N]` prunes whole sessions (log + evicted-result blobs + shadow snapshot repo) older than `max_age_days` or beyond `max_sessions`, and sweeps dead backgrounded-session sockets. Flags override `[retention]`. With no policy and no flags it's a no-op that tells you so. `--dry-run` lists what would go without deleting.
+`hotl gc [--dry-run] [--days N] [--keep N]` prunes whole sessions (log + evicted-result blobs, plus any legacy `shadow/<ulid>.git` left by releases before 0.26) older than `max_age_days` or beyond `max_sessions`, and sweeps dead backgrounded-session sockets. Flags override `[retention]`. With no policy and no flags it's a no-op that tells you so. `--dry-run` lists what would go without deleting.
 
 ## hotl mcp
 
@@ -666,7 +665,6 @@ Consumers pinned to v1 must update.
 | Path | Contents |
 |---|---|
 | `~/.local/share/hotl/sessions/<ulid>.jsonl` | Append-only session logs. Permanent by design. Secret-named env values are masked at write time; the log is otherwise sensitive — treat it as such. |
-| `~/.local/share/hotl/shadow/<ulid>.git` | Per-session git snapshots backing `hotl undo`, taken at quiet windows by a background worker (never on the turn path); an `hotl-mutations` marker records that the agent mutated anything at all. Secret-bearing files (`.env`, `*.pem`, `*.key`, `id_*`, `.ssh/`, `.aws/`, `.npmrc`, `.pypirc`, `.netrc`, `secrets.*`, `credentials`) are excluded. No automatic cleanup yet. |
 
 **Engine defaults (not user-configurable via env yet):** max 25 turns per prompt, 32000 max output tokens, adaptive thinking on, static prompt caching on, a tool that fails 5 times consecutively stops the turn.
 

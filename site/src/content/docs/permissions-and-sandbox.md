@@ -24,8 +24,8 @@ notice; a **write outside the session root is refused** with a notice, no
 prompt — mirroring the kernel sandbox, which already lets `bash` read outside
 the working directory and denies it writes there. Writes into hotl's own
 config/data dirs and fetches of cloud-metadata addresses are refused with a
-notice too. Deny rules still refuse outright, every silenced prompt appears
-in the transcript, and `hotl undo` reverses any change. Two prompts survive
+notice too. Deny rules still refuse outright and every silenced prompt appears
+in the transcript. Two prompts survive
 in bypass, deliberately: the **first-use trust screen** for an MCP or
 retrieval server (a recorded, once-per-binary grant — auto-trusting a changed
 server binary would be a supply-chain hole) and **`bash` when the kernel
@@ -339,15 +339,15 @@ Even then, allow-rules are trust *grants*, not fine scopes, and hotl treats them
 - A `write`/`edit` path prefix is checked after resolving `..`, so `src/../../etc/x` doesn't sneak past a `src/` rule.
 - Protected paths ignore allow-rules entirely (above).
 
-## The safety net: snapshots and undo
+## Recovering from a change you didn't want
 
-Approval is a judgment call, and judgment is fallible. So hotl photographs your workspace at quiet windows — session start, and the end of each mutating tool batch — into a private git repo that never touches your project's own `.git`. All of it happens off the turn path on a background worker, so snapshots never delay a tool or a reply, whatever the repo size. `hotl undo` restores the newest clean snapshot — the agent's last checkpoint — and refuses when the agent hasn't mutated anything this session, so it can never trample edits that were only ever yours. A capture that raced a mutation is labeled tainted and never used as a restore target. Secret-bearing files are kept out of these snapshots. This doesn't prevent a bad change — it makes the work since the last checkpoint recoverable, which is what lets you approve steps at a reasonable pace instead of agonizing over each one.
+Approval is a judgment call, and judgment is fallible — but rolling an edit back is your own VCS's job, not hotl's. Every tool call that touches a file is in the transcript, so `git diff` shows exactly what the agent did and `git checkout` puts it back. Commit before you hand the agent a large task; that commit is the checkpoint. (Releases before 0.26 kept a shadow-git snapshot store for a `hotl undo` command. It was removed — it could not restore staged state, and it kept a second, history-retaining copy of your files under hotl's data dir.)
 
 ## The honest summary
 
 | Threat | What protects you | What does *not* |
 |---|---|---|
-| Agent changes a file you didn't intend | the y/N gate + undo | — |
+| Agent changes a file you didn't intend | the y/N gate | your VCS is what reverses it — hotl keeps no copy |
 | Agent writes outside the project | the sandbox floor (bash) | — |
 | Agent reads `~/.ssh` / `~/.aws` and exfiltrates it | the read carve (default on, at the kernel) | — |
 | Agent reads hotl's session token and approves its own calls | the Tier A carve — kernel for `bash`, flat refusal in the file tools | — |
@@ -356,6 +356,6 @@ Approval is a judgment call, and judgment is fallible. So hotl photographs your 
 | A benign-looking write that runs code later | protected-path escalation | — |
 | Ask-fatigue growing a blanket allowlist | file-only allow-rules, no in-console button | — |
 
-The gate is the wall. The sandbox, protected paths, and undo make the wall livable and the mistakes recoverable. None of them replaces you looking at what you approve.
+The gate is the wall. The sandbox and protected paths make the wall livable. None of them replaces you looking at what you approve.
 
 **Source of record:** [docs/SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md) is the authoritative stance and routing table; this file is its user-facing explanation.

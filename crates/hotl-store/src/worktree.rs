@@ -56,8 +56,7 @@ impl Worktree {
     ///
     /// `None` when git is unavailable, `workspace` is not inside a git
     /// worktree, `worktree add` fails, or seeding fails — in every case the
-    /// caller runs shared-cwd instead, exactly as `Shadow::create` returning
-    /// `None` means the session runs without undo.
+    /// caller runs shared-cwd instead.
     ///
     /// INVARIANT: a worktree that could not be seeded is removed before
     /// returning `None`. A stale-base child is worse than no isolation at all,
@@ -121,8 +120,8 @@ impl Worktree {
 
         // 4. Untracked-but-not-ignored files. Ignored files are deliberately
         //    left behind — that is what makes `target/` and `node_modules/`
-        //    free, and it is the same line the undo snapshot draws. The cost is
-        //    real and documented: a child cannot read `.env` either.
+        //    free. The cost is real and documented: a child cannot read
+        //    `.env` either.
         //    `-z` because a filename may contain a newline.
         let others = git_ok(
             &self.workspace,
@@ -572,8 +571,8 @@ mod tests {
     }
 
     /// Pins the no-`--index` property, which a working-tree-only assertion
-    /// cannot see. `hotl undo`'s snapshot restores the working tree; a staging
-    /// area silently mutated by a sub-agent is exactly what it cannot reverse.
+    /// cannot see: a staging area silently mutated by a sub-agent is what the
+    /// parent's own `git checkout` would not reverse.
     #[test]
     fn apply_to_workspace_stages_nothing_on_success() {
         let tmp = repo_or_skip!();

@@ -1,6 +1,6 @@
 ---
 title: hotl — human on the loop terminal AI agent
-description: 'A human-on-the-loop agent harness in one binary — fast, slim, secure, and extensible: a coding agent behind a permission gate with a kernel sandbox floor, an append-only session log with resume and undo, and a tmux dashboard for every agent you run.'
+description: 'A human-on-the-loop agent harness in one binary — fast, slim, secure, and extensible: a coding agent behind a permission gate with a kernel sandbox floor, an append-only session log with resume, and a tmux dashboard for every agent you run.'
 template: splash
 hero:
   tagline: It's fast, slim, secure, and extensible — plus a tmux dashboard for every agent you run.
@@ -45,8 +45,6 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		Sessions are append-only event logs that nothing rewrites:
 
 		- `hotl resume` picks any session back up where it stopped
-		- `hotl undo` restores the agent's last clean checkpoint via shadow-git
-		  snapshots taken at quiet windows, always off the turn path
 		- a long session keeps its thread: compaction folds the middle into a
 		  typed digest — goal, state, decisions, files, what's next — and
 		  leaves recent turns verbatim, a summary added *on top of* history
@@ -97,8 +95,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		  thread-pool spinup on the cold-start path that `hotl -p` and the zsh
 		  plugin live on
 		- work that genuinely blocks leaves the async path: `glob`'s tree walk
-		  via `spawn_blocking` (a pool that's yours to size), shadow-git
-		  snapshots on their own dedicated worker thread
+		  runs via `spawn_blocking`, a pool that's yours to size
 		- one actor per session is the sole committer, so there's no lock order
 		  to get wrong: parallel-safe calls overlap, anything that mutates runs
 		  alone in source order, and `Ctrl-c` trips a cancellation token
@@ -164,8 +161,7 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		  never auto-approve
 		- optional egress restriction is kernel-backed, not proxy-backed: a
 		  client that ignores the proxy hits a loopback-only wall
-		- secrets are masked at log ingestion, and secret-bearing files never
-		  enter the undo snapshot store at all
+		- secrets are masked at log ingestion, before any byte lands on disk
 
 		Stated honestly: this is write-confinement, not exfiltration prevention.
 		[Permissions & sandbox →](./permissions-and-sandbox/)

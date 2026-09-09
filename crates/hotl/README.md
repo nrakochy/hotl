@@ -9,7 +9,7 @@ that problem in three stages, with you on the loop at every stage:
 
 | Capability | Command | Status |
 |---|---|---|
-| **Execute** | `hotl` | **Shipped** — a personal agent harness: steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context, MCP client, ACP server, session resume + `undo`. Any Anthropic or OpenAI-compatible model. |
+| **Execute** | `hotl` | **Shipped** — a personal agent harness: steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context, MCP client, ACP server, session resume. Any Anthropic or OpenAI-compatible model. |
 | **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it. |
 | **Orchestrate** | `hotl fleet` | **Future** — drives fleets of agents over the same protocol any editor uses; only its seams exist today. |
 
@@ -72,9 +72,8 @@ the sandbox does and does not cover is written down honestly in
 [SECURITY.md](https://github.com/nrakochy/hotl/blob/master/docs/SECURITY.md).
 
 **Nothing is ever lost.** Every session is an append-only log that nothing
-rewrites. `hotl resume` continues an earlier session, `hotl undo` reverses
-the agent's file changes (git snapshots around every mutating step), and
-context compaction adds a summary on top instead of destroying history.
+rewrites. `hotl resume` continues an earlier session, and context compaction
+adds a summary on top instead of destroying history.
 
 Also aboard: MCP client for external tools, `hotl acp` to embed in
 ACP-speaking editors, `hotl bg` to background a session and re-attach later.

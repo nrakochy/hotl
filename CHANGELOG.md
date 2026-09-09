@@ -6,6 +6,20 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Removed
+
+- **`hotl undo` and the shadow-git snapshot store** (plan 0054). Session
+  close waited up to 2s for queued snapshots to drain — the one place the
+  feature still sat on a user-visible path — and the store kept a second,
+  history-retaining copy of workspace files under the data dir. Both are
+  gone: no per-session `shadow/<ulid>.git`, no `undoStatus` on the prompt
+  reply (an additive field; clients that read it see it absent, as they
+  already did for sessions without git), no `undo` strip chip, no doctor
+  undo check. Revert the agent's edits with your own VCS. `hotl gc` and
+  `[retention]` still sweep legacy `shadow/` dirs from earlier releases.
+  The always-on safety floor is now: kernel sandbox, protected-path
+  escalations, deny rules, secret masking, transcript visibility.
+
 ### Fixed
 
 - **Dropped and pasted images land as `[Image #N]` on Windows** (tracker

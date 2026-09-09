@@ -12,7 +12,7 @@ Layers depend upward, with one recorded exception: L3 _triggers_ compaction, L6 
 2. **Provider trait** — `stream(request) → EventStream`; two real providers (Anthropic, OpenAI-compatible) + a scripted test provider — a second real provider exists precisely to keep the trait honest; central `transformMessages`-style canonicalization pre-pass; a vendored per-model catalog (context window, pricing, caps, cache-prefix) ships, with the live `/v1/models` endpoint as the runtime authority; a reasoning-effort ladder rides the sampling request.
 3. **Turn engine** — one loop per session; typed steer/queue inbox (durable admission/promotion) on an **out-of-band control lane** so cancel/ask never wedge behind data commands; budgeted recovery; _triggers_ compaction (implemented in L6).
 4. **Tool system** — typed tools with one erasure boundary; edit cascade; post-mutation format+diagnostics injection; json-repair + schema coercion at the arg boundary; MCP client with deferred loading.
-5. **Persistence** — one append-only session log (tree with movable leaf); the model transcript and the UI replay are two _projections_ of it, per the Shape header — no second store; shadow-git snapshots for undo.
+5. **Persistence** — one append-only session log (tree with movable leaf); the model transcript and the UI replay are two _projections_ of it, per the Shape header — no second store.
 6. **Context assembly** — byte-stable prefix; AGENTS.md-as-map; auto memory with load budget (loaded in an untrusted-content envelope); **compaction** (typed digest + verbatim tail + last-resort degradation floor so a failed compaction can't brick the session); ephemeral per-turn context block (MOIM).
 7. **Headless/protocol surface before TUI** — ACP-shaped contract with permission mediation; `-p`/JSON modes; capability advertisement; shell-plugin mode early, TUI last.
 
@@ -65,7 +65,7 @@ flowchart TB
         NET["egress gate<br/>open (default) · off · allowlist + proxy<br/>allowlist → egress-ask"]
     end
 
-    LOG[("session log<br/>append-only JSONL · tree, movable leaf<br/>secrets masked at ingestion · big blobs spill beside<br/>shadow-git snapshots for undo")]
+    LOG[("session log<br/>append-only JSONL · tree, movable leaf<br/>secrets masked at ingestion · big blobs spill beside")]
     CTX["context assembly — hotl-context<br/>system-prompt file · AGENTS.md-as-map (untrusted envelope)<br/>auto-memory (budgeted) · MOIM per-turn block · compaction"]
 
     YOU -->|"① type a prompt — or a steer mid-turn"| CLIENT

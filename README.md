@@ -10,7 +10,7 @@ stages, with you on the loop at every stage:
 
 | Capability | Command | Status |
 |---|---|---|
-| **Execute** | `hotl` | **Shipped** — a personal agent harness (event-log-as-canon, ACP-native): steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context, skills, sub-agents, MCP, session resume + `undo`. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
+| **Execute** | `hotl` | **Shipped** — a personal agent harness (event-log-as-canon, ACP-native): steering console TUI + `-p` headless, gated tools under a kernel sandbox floor, managed context, skills, sub-agents, MCP, session resume. Any OpenAI-compatible or Anthropic model. **[User docs → nrakochy.github.io/hotl](https://nrakochy.github.io/hotl/)** |
 | **Watch** | `hotl watch` | **Shipped** — a tmux dashboard that discovers your AI-agent processes, shows live status, pings when one is blocked on you, and jumps focus to it |
 | **Orchestrate** | `hotl fleet` | **Reserved** — will drive fleets of agents over the same protocol any editor uses; exits 2 today, only its seams exist |
 
@@ -67,12 +67,11 @@ exfiltration, not a cleanroom. On Linux, egress confinement needs kernel
 ≥ 6.7 (TCP only); where it can't be enforced you get `NET:UNENFORCED(reason)`
 on every bash ask and allow-rules stop auto-approving.
 
-**Nothing is ever lost.** Resume any session, `undo` the agent's file
-changes, steer mid-turn without losing the thread. This works because every
-session is recorded as an append-only log that nothing rewrites — even
-context compaction adds a summary on top instead of destroying history, so
-a failed compaction can't brick a session. Secrets are masked at log write
-time, and secret-bearing files never enter the snapshot store.
+**Nothing is ever lost.** Resume any session and steer mid-turn without
+losing the thread. This works because every session is recorded as an
+append-only log that nothing rewrites — even context compaction adds a
+summary on top instead of destroying history, so a failed compaction can't
+brick a session. Secrets are masked at log write time.
 
 **Context stays slim by construction.** Tool results past a size threshold
 are evicted to files (`[context].evict_tokens`) — a preview stays inline and
@@ -162,13 +161,13 @@ Full tutorial: [quickstart](https://nrakochy.github.io/hotl/quickstart/).
 | Command | What it does |
 |---|---|
 | `hotl` | Console TUI; `-p "<prompt>"` headless, `--json` for a JSONL event stream |
-| `hotl resume` / `hotl undo` | Continue a session; reverse the agent's file edits |
+| `hotl resume` | Continue a session |
 | `hotl bg` / `hotl attach` | Run a session detached from any terminal, reconnect later |
 | `hotl acp` | Serve ACP over stdio so an ACP-speaking editor can embed the agent |
 | `hotl skills` | Manage skills and skill marketplaces |
 | `hotl mcp` | List MCP servers and their trust state; screen one, revoke a grant |
 | `hotl doctor` / `hotl setup` | Setup check (nonzero on failure); write a commented starter config |
-| `hotl gc` | Prune sessions and snapshots per `[retention]` |
+| `hotl gc` | Prune sessions per `[retention]` |
 | `hotl watch` | The tmux supervision dashboard |
 
 Exit codes: `0` turn completed · `130` interrupted · `1` any other outcome
@@ -192,8 +191,8 @@ in place — no porting.
 
 State lives in the open: config at `~/.config/hotl/config.toml` (the only
 settings file — permissions, MCP, hooks, and retrieval are all sections in
-it), append-only session logs at `~/.local/share/hotl/sessions/<ulid>.jsonl`,
-and per-session git snapshots under `~/.local/share/hotl/shadow/`.
+it), and append-only session logs at
+`~/.local/share/hotl/sessions/<ulid>.jsonl`.
 
 On Windows those live under `%LOCALAPPDATA%\hotl\` —
 `%LOCALAPPDATA%\hotl\config\config.toml` and

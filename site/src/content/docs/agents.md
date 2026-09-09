@@ -160,9 +160,9 @@ fan-out hot path.
 **What the child starts from.** A copy of your **current working tree** —
 including uncommitted and untracked files, so the child reads what you are
 actually looking at, not the last commit. **Gitignored files are not
-copied.** That is what keeps `target/` and `node_modules/` free, and it is
-the same line `hotl undo`'s snapshot draws — but it also means a child
-cannot read your `.env`, and a child that builds pays a cold build.
+copied.** That is what keeps `target/` and `node_modules/` free — but it
+also means a child cannot read your `.env`, and a child that builds pays a
+cold build.
 
 **What happens when it finishes.**
 
@@ -184,7 +184,7 @@ is isolation against *accidental* collision between children, not
 containment of a hostile one.
 
 **Where it lives.** `<workspace>/.git/hotl-worktrees/<id>` — inside `.git/`,
-so it never shows up in `git status`, `glob`, `grep`, or an undo snapshot.
+so it never shows up in `git status`, `glob`, or `grep`.
 Worktrees are removed when the child finishes; a conflicted one stays until
 you deal with it.
 

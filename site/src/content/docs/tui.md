@@ -21,7 +21,7 @@ semantics and for phase pipelines.
 
 Bare `hotl` **is** the console (the `tui` subcommand and the old line-based REPL are gone). It needs a real terminal: piped stdin/stdout exits with a pointer at `hotl -p "prompt"`, the headless path for scripts and CI.
 
-The console is a pure ACP client of the same engine `-p` headless uses — same permission gate, same session logs, same `hotl undo` afterwards.
+The console is a pure ACP client of the same engine `-p` headless uses — same permission gate, same session logs.
 
 ## Theming
 

@@ -1,6 +1,6 @@
 [package]
 name = "hotl"
-description = "Human-on-the-loop terminal AI agent: steering TUI + headless mode, gated tools under a kernel sandbox floor, session resume + undo, MCP/ACP, any Anthropic or OpenAI-compatible model — plus `hotl watch`, a tmux dashboard for the agents you already run."
+description = "Human-on-the-loop terminal AI agent: steering TUI + headless mode, gated tools under a kernel sandbox floor, session resume, MCP/ACP, any Anthropic or OpenAI-compatible model — plus `hotl watch`, a tmux dashboard for the agents you already run."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
