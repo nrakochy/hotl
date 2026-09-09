@@ -48,7 +48,6 @@ fn session_with_recall(provider: Arc<dyn Provider>) -> Session {
         log,
         system: "test-system".into(),
         cwd: dir.path().to_path_buf(),
-        snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),

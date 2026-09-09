@@ -60,7 +60,6 @@ fn session_logged(
         log,
         system: "sys".into(),
         cwd: dir.path().to_path_buf(),
-        snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),

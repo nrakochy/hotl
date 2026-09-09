@@ -34,7 +34,6 @@ async fn every_sample_in_a_turn_carries_the_session_id_as_cache_key() {
         log,
         system: "sys".into(),
         cwd: dir.path().to_path_buf(),
-        snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),

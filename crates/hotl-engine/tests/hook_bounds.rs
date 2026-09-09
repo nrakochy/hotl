@@ -42,7 +42,6 @@ fn session(provider: Arc<dyn Provider>, hooks: Arc<dyn Hooks>, config: EngineCon
         log,
         system: "test-system".into(),
         cwd: dir.path().to_path_buf(),
-        snapshots: None,
         hooks: Some(hooks),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),

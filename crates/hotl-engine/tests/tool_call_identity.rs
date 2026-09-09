@@ -48,7 +48,6 @@ fn session_of(provider: Arc<dyn Provider>, rules: Rules, registry: Registry) -> 
         log,
         system: "test-system".into(),
         cwd: dir.path().to_path_buf(),
-        snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),

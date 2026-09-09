@@ -43,7 +43,6 @@ fn spawn_with_ask_user(
             log,
             system: "sys".into(),
             cwd: cwd.to_path_buf(),
-            snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
             initial_todos: Vec::new(),

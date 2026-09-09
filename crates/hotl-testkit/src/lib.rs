@@ -42,8 +42,6 @@ pub struct Harness {
     /// [`Harness::with_paused_completion`], which holds the stream open long
     /// enough for the steer to reach the actor before the sample closes.
     pub steer_on_text_delta: Option<String>,
-    /// Labels of every shadow snapshot the engine requested, in order.
-    pub snapshots: Arc<std::sync::Mutex<Vec<String>>>,
     /// Every `EngineEvent::LedgerReport` seen, in order (§S1 instrument).
     pub ledger_reports: Vec<LedgerSummary>,
     /// The session log's live `sync_data()` counter — the group-commit
@@ -88,15 +86,6 @@ impl Provider for PausedCompletion {
 /// A wrapper the harness installs between the engine and the scripted
 /// provider — see [`Harness::build_wrapped`].
 type ProviderWrap = Box<dyn FnOnce(Arc<ScriptedProvider>) -> Arc<dyn Provider>>;
-
-/// Records snapshot labels instead of running git.
-struct RecordingSnapshotter(Arc<std::sync::Mutex<Vec<String>>>);
-
-impl hotl_engine::Snapshotter for RecordingSnapshotter {
-    fn snapshot(&self, label: String) {
-        self.0.lock().expect("snapshot log").push(label);
-    }
-}
 
 impl Harness {
     /// The harness working directory (the engine's `cwd` for subdir hints;
@@ -163,7 +152,6 @@ impl Harness {
             false,
             None,
             system,
-            None,
         )
     }
 
@@ -324,28 +312,6 @@ impl Harness {
     /// `wrap`, when present, sits between the engine and the scripted
     /// provider: the harness keeps the `ScriptedProvider` for `requests()`
     /// and `push_script`, while the engine talks to the wrapper.
-    /// Construct a harness with a custom registry AND a custom `Snapshotter`
-    /// (0035: the latency gate needs one that models a wedged worker).
-    pub fn with_registry_and_snapshotter(
-        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
-        config: EngineConfig,
-        registry: Registry,
-        snapshotter: Arc<dyn hotl_engine::Snapshotter>,
-    ) -> Self {
-        Self::build_wrapped_with_system(
-            scripts,
-            config,
-            Vec::new(),
-            None,
-            registry,
-            Rules::default(),
-            false,
-            None,
-            DEFAULT_TEST_SYSTEM,
-            Some(snapshotter),
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn build_wrapped(
         scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
@@ -367,7 +333,6 @@ impl Harness {
             sync_noop,
             wrap,
             DEFAULT_TEST_SYSTEM,
-            None,
         )
     }
 
@@ -382,7 +347,6 @@ impl Harness {
         sync_noop: bool,
         wrap: Option<ProviderWrap>,
         system: &str,
-        snapshotter: Option<Arc<dyn hotl_engine::Snapshotter>>,
     ) -> Self {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
@@ -403,7 +367,6 @@ impl Harness {
                 .expect("seed append");
         }
         let provider = Arc::new(ScriptedProvider::new(scripts));
-        let snapshots = Arc::new(std::sync::Mutex::new(Vec::new()));
         let engine_provider: Arc<dyn Provider> = match wrap {
             Some(wrap) => wrap(Arc::clone(&provider)),
             None => provider.clone(),
@@ -417,9 +380,6 @@ impl Harness {
             log,
             system: system.into(),
             cwd: dir.path().to_path_buf(),
-            snapshots: Some(
-                snapshotter.unwrap_or_else(|| Arc::new(RecordingSnapshotter(snapshots.clone()))),
-            ),
             hooks,
             initial_items,
             initial_todos: Vec::new(),
@@ -437,7 +397,6 @@ impl Harness {
             ask_reply: AskReply::Allow,
             steer_on_tool_start: None,
             steer_on_text_delta: None,
-            snapshots,
             ledger_reports: Vec::new(),
             fsyncs,
             pause_acks,
@@ -1166,8 +1125,6 @@ mod tests {
             "events: {:?}",
             h.seen
         );
-        // The undo safety net still captures the batch's quiet window.
-        assert_eq!(*h.snapshots.lock().unwrap(), vec!["state after batch 1"]);
     }
 
     #[tokio::test]
@@ -3025,34 +2982,6 @@ mod tests {
         let requests = h.provider.requests();
         let flat = format!("{:?}", requests[1].items);
         assert!(flat.contains("web subproject rules"));
-    }
-
-    #[tokio::test]
-    async fn mutating_batches_take_one_quiet_window_snapshot() {
-        let mut h = Harness::new(
-            vec![
-                ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
-                ScriptedProvider::text_reply("done"),
-            ],
-            cfg(),
-        );
-        h.prompt_and_wait("run it").await;
-        let labels = h.snapshots.lock().unwrap().clone();
-        assert_eq!(labels, ["state after batch 1"]);
-
-        // Read-only batches don't snapshot.
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("f.txt");
-        std::fs::write(&file, "x").unwrap();
-        let mut h = Harness::new(
-            vec![
-                ScriptedProvider::tool_call("t1", "read", json!({"path": file.to_str().unwrap()})),
-                ScriptedProvider::text_reply("read"),
-            ],
-            cfg(),
-        );
-        h.prompt_and_wait("read it").await;
-        assert!(h.snapshots.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

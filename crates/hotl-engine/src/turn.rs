@@ -34,8 +34,6 @@ const SPECULATE_TRIGGER: f64 = 0.6;
 /// stalled provider call, not a slow one — the inline summarize is then the
 /// faster path *and* the interruptible one.
 /// INVARIANT: no await in the turn path is unbounded or un-cancellable.
-/// (Shadow snapshots no longer await at all — the `Snapshotter` trait is
-/// sync-enqueue by construction, 0035.)
 /// Enforced by `the_speculation_bound_abandons_a_stalled_digest` (the bound),
 /// `hung_speculation_falls_back_to_the_inline_summarize` (end to end), and
 /// `interrupt_lands_during_the_speculative_summarize` (the cancel race).
@@ -996,12 +994,6 @@ impl Turn {
             self.shared.hook_mask(),
             crate::hooks::EventMask::STOP,
             |hooks| {
-                // A stop hook command runs outside any batch and may write
-                // the workspace: taint any capture whose staging overlaps it
-                // (0035 decision 7).
-                if let Some(snapshots) = &self.shared.snapshots {
-                    snapshots.mutation_started();
-                }
                 match crate::hooks::call_stop(hooks, outcome_text).await {
                     crate::hooks::StopDecision::Block { reason } => Some(reason),
                     crate::hooks::StopDecision::Allow => None,
@@ -1229,9 +1221,6 @@ impl Turn {
     /// chunks: contiguous runs of parallel-safe calls (pure reads, isolated
     /// children) execute concurrently; everything else runs alone, in
     /// order. Gating stays serial — asks are one-at-a-time human moments.
-    /// A batch that actually mutates ends with one detached quiet-window
-    /// snapshot plus a taint signal at its first mutating execute, so
-    /// `hotl undo` can restore batch-end state (M3b, 0035).
     async fn run_tool_batch(&mut self, uses: &[ToolUse]) -> Option<Outcome> {
         // Barrier (a) (commit-protocol.md §Pipelined commits): write-ahead
         // semantics — no external side effect until the `tool_use` blocks
@@ -1258,11 +1247,6 @@ impl Turn {
         let run_uses: &[ToolUse] = deduped
             .as_ref()
             .map_or(uses, |(unique, _)| unique.as_slice());
-        // Per-batch taint signal (0035 decision 7): fires once, after a
-        // gate resolves to Ready, before the first non-read-only execute —
-        // a minutes-long ask or a fully-denied batch never taints, and a
-        // batch where nothing mutating ran takes no snapshot at all.
-        let mut mutation_signaled = false;
         let mut results = Vec::with_capacity(run_uses.len());
         let mut budget_blown: Option<String> = None;
         self.ledger.stamp(Phase::ToolsSpawned);
@@ -1284,7 +1268,6 @@ impl Turn {
                 results.push(pair(only, "Not executed (turn stopped).", true));
             } else {
                 let gate = self.gate(only).await;
-                self.signal_mutation(only, &gate, &mut mutation_signaled);
                 let executed = self.execute(only, gate).await;
                 results.push(self.finish_call(only, executed, &mut budget_blown).await);
             }
@@ -1299,9 +1282,6 @@ impl Turn {
                 let mut gates = Vec::with_capacity(chunk.len());
                 for tu in chunk {
                     gates.push(self.gate(tu).await);
-                }
-                for (tu, gate) in chunk.iter().zip(&gates) {
-                    self.signal_mutation(tu, gate, &mut mutation_signaled);
                 }
                 // A chunk is one serial call or a run of parallel-safe calls
                 // that overlap; join_all returns outcomes in source order
@@ -1329,15 +1309,6 @@ impl Turn {
         // Results are final: stamp them onto this batch's window entries so
         // the next dispatch's doom check can tell repetition from polling.
         backfill_result_hashes(&mut self.call_sigs, &results);
-        // The quiet-window snapshot (0035 decision 1): one detached enqueue
-        // at batch end — between here and the next batch's first execute only
-        // the user mutates the tree, so this capture doubles as the next
-        // batch's pre-image. Skipped when nothing mutating actually ran.
-        if mutation_signaled {
-            if let Some(snapshots) = &self.shared.snapshots {
-                snapshots.snapshot(format!("state after batch {}", self.samples));
-            }
-        }
         let cancelled = self.cancel.is_cancelled();
         let mut entries = vec![EntryPayload::Item {
             item: Item::ToolResults { results },
@@ -2037,29 +2008,6 @@ impl Turn {
                     if text.contains(marker)
             )
         })
-    }
-
-    /// The per-batch taint signal (0035 decision 7): a `Gate::Resolved` call
-    /// never executes, so it cannot mutate; `Tool::read_only()` is the
-    /// tool's own answer, and an unknown tool counts as mutating — the
-    /// conservative direction, deliberately (T3-2). Sync and O(1): the
-    /// snapshotter only bumps a generation counter.
-    fn signal_mutation(&self, tu: &ToolUse, gate: &Gate, signaled: &mut bool) {
-        if *signaled || matches!(gate, Gate::Resolved { .. }) {
-            return;
-        }
-        if self
-            .shared
-            .registry
-            .get(&tu.name)
-            .is_some_and(|t| t.read_only())
-        {
-            return;
-        }
-        if let Some(snapshots) = &self.shared.snapshots {
-            snapshots.mutation_started();
-        }
-        *signaled = true;
     }
 
     /// Evict an oversized *successful* tool result to a masked blob (T4),

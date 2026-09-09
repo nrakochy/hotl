@@ -35,7 +35,6 @@ fn session(
         log,
         system: "sys".into(),
         cwd: dir.to_path_buf(),
-        snapshots: None,
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),

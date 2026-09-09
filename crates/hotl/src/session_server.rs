@@ -609,7 +609,6 @@ mod tests {
             log,
             system: "sys".into(),
             cwd: std::env::temp_dir(),
-            snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
             initial_todos: Vec::new(),

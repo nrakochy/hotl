@@ -33,7 +33,6 @@ fn session(provider: Arc<dyn Provider>, initial_items: Vec<Item>) -> Session {
         log,
         system: "test-system".into(),
         cwd: dir.path().to_path_buf(),
-        snapshots: None,
         hooks: None,
         initial_items,
         initial_todos: Vec::new(),

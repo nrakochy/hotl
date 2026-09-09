@@ -705,7 +705,6 @@ mod tests {
             log,
             system: "child".into(),
             cwd,
-            snapshots: None,
             hooks: None,
             initial_items: Vec::new(),
             initial_todos: Vec::new(),

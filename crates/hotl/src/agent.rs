@@ -502,7 +502,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         Some(scaffold.spawn_registration(session_id)),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, None, items, Inherited::default(), Vec::new(), None);
+            let mut deps = scaffold.deps(log, items, Inherited::default(), Vec::new(), None);
             deps.registry = registry;
             deps
         },
@@ -777,7 +777,6 @@ pub(crate) async fn build_acp() -> Result<
             |registry| {
                 let mut deps = scaffold.deps(
                     log,
-                    None,
                     initial,
                     Inherited {
                         mode: mode_override,
@@ -887,14 +886,8 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         Some(scaffold.spawn_registration(session_id.clone())),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(
-                log,
-                None,
-                initial_items,
-                Inherited::default(),
-                Vec::new(),
-                None,
-            );
+            let mut deps =
+                scaffold.deps(log, initial_items, Inherited::default(), Vec::new(), None);
             deps.registry = registry;
             deps
         },
@@ -904,7 +897,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
 
 /// The deps every session shares (provider, registry-with-spawn, rules, hooks,
 /// config, sandbox, cwd). Built once per process; `deps()` stamps a per-session
-/// log, snapshots, and initial items onto it.
+/// log and initial items onto it.
 struct Scaffold {
     provider: Arc<dyn hotl_provider::Provider>,
     model: String,
@@ -1112,7 +1105,6 @@ impl Scaffold {
     fn deps(
         &self,
         log: SessionLog,
-        snapshots: Option<Arc<dyn hotl_engine::Snapshotter>>,
         initial_items: Vec<hotl_types::Item>,
         inherited: Inherited,
         initial_todos: Vec<hotl_types::Todo>,
@@ -1149,7 +1141,6 @@ impl Scaffold {
             log,
             system: self.system.clone(),
             cwd: self.cwd.clone(),
-            snapshots,
             hooks: self.hooks.clone(),
             initial_items,
             initial_todos,
@@ -1290,7 +1281,6 @@ async fn run_session(
         |registry| {
             let mut deps = scaffold.deps(
                 log,
-                None,
                 initial_items,
                 Inherited {
                     mode: mode_override,
@@ -1704,8 +1694,8 @@ fn build_registry(
 }
 
 /// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
-/// provider/rules/config but with a builtins-only registry (no spawn, no MCP,
-/// no snapshots — a clean, non-recursive child). M4.
+/// provider/rules/config but with a builtins-only registry (no spawn, no MCP —
+/// a clean, non-recursive child). M4.
 struct HotlChildBuilder {
     provider: Arc<dyn hotl_provider::Provider>,
     rules: Arc<Rules>,
@@ -1925,7 +1915,6 @@ impl HotlChildBuilder {
                 log,
                 system,
                 cwd: root.clone(),
-                snapshots: None,
                 hooks: None,
                 initial_items,
                 initial_todos: Vec::new(),
@@ -4555,7 +4544,6 @@ mod tests {
                 log,
                 system: "sys".into(),
                 cwd: dir.path().to_path_buf(),
-                snapshots: None,
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
@@ -4608,7 +4596,6 @@ mod tests {
                 log,
                 system: "sys".into(),
                 cwd: dir.path().to_path_buf(),
-                snapshots: None,
                 hooks: None,
                 initial_items: vec![hotl_types::Item::User {
                     text: "earlier parent context".into(),
@@ -4715,7 +4702,6 @@ mod tests {
                 log,
                 system: "sys".into(),
                 cwd: dir.path().to_path_buf(),
-                snapshots: None,
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
@@ -4771,7 +4757,6 @@ mod tests {
                 log,
                 system: "sys".into(),
                 cwd: dir.path().to_path_buf(),
-                snapshots: None,
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
@@ -4828,7 +4813,6 @@ mod tests {
                 log,
                 system: "sys".into(),
                 cwd: dir.path().to_path_buf(),
-                snapshots: None,
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
@@ -5689,7 +5673,6 @@ mod tests {
                     log,
                     system: "sys".into(),
                     cwd: session_dir.path().to_path_buf(),
-                    snapshots: None,
                     hooks: Some(hooks_for_deps),
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),

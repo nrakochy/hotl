@@ -59,7 +59,6 @@ fn deps(dir: &std::path::Path, log: SessionLog, config: EngineConfig) -> Session
         log,
         system: "you are hotl".into(),
         cwd: dir.to_path_buf(),
-        snapshots: None,
         hooks: None,
         initial_items: vec![
             Item::User {
