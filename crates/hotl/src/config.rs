@@ -14,6 +14,8 @@
 
 use std::path::Path;
 
+use hotl_provider::effort::EFFORT_LEVELS;
+use hotl_provider::{Effort, EffortSchedule};
 use serde::Deserialize;
 
 #[derive(Debug, Default, Deserialize)]
@@ -390,11 +392,12 @@ pub struct ProviderCfg {
     pub auth: Option<String>,
     /// Cheap model for compaction summaries.
     pub fast_model: Option<String>,
-    /// Reasoning depth: `low | medium | high | xhigh | max`. Absent = the
-    /// provider's default. Text, not a typed enum: an unrecognized value warns
-    /// and is ignored rather than refusing to load the whole file (which would
-    /// take the `[[deny]]` rules down with it).
-    pub effort: Option<String>,
+    /// Reasoning depth: either one rung (`low | medium | high | xhigh | max`)
+    /// or a per-phase table (`{ plan = "xhigh", implement = "high" }`).
+    /// Absent = the provider's default. Text, not a typed enum: an
+    /// unrecognized value warns and is ignored rather than refusing to load
+    /// the whole file (which would take the `[[deny]]` rules down with it).
+    pub effort: Option<EffortSetting>,
     /// Command whose stdout (trimmed) is the API key. When set, it beats the
     /// static key env vars: configuring a helper is a deliberate act.
     pub api_key_helper: Option<String>,
@@ -410,6 +413,65 @@ pub struct ProviderCfg {
     /// endpoint rejects `prompt_cache_options` (hotl also probes once and backs
     /// off on its own).
     pub cache_breakpoints: Option<bool>,
+}
+
+/// `[provider] effort`, either spelling. Untagged: a bare string is the
+/// scalar the setting has always been, a table is the phase schedule (0059
+/// T1). Both stay text so a typo warns instead of failing the whole file.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum EffortSetting {
+    Scalar(String),
+    Table {
+        plan: Option<String>,
+        implement: Option<String>,
+        verify: Option<String>,
+    },
+}
+
+impl EffortSetting {
+    /// Split into `(scalar, schedule, warnings)`. A table contributes no
+    /// scalar; a rung that names no level warns and is dropped, so that phase
+    /// inherits the session's effort — the same posture the scalar has always
+    /// had, applied one cell at a time.
+    pub fn split(&self) -> (Option<String>, EffortSchedule, Vec<String>) {
+        match self {
+            EffortSetting::Scalar(s) => (Some(s.clone()), EffortSchedule::default(), Vec::new()),
+            EffortSetting::Table {
+                plan,
+                implement,
+                verify,
+            } => {
+                let mut warnings = Vec::new();
+                let mut rung = |phase: &str, raw: &Option<String>| -> Option<Effort> {
+                    let raw = raw.as_ref()?;
+                    match raw.trim().parse::<Effort>() {
+                        Ok(e) => Some(e),
+                        Err(_) => {
+                            warnings.push(format!(
+                                "hotl: [provider] effort.{phase} = \"{raw}\" is not a level \
+                                 ({EFFORT_LEVELS}) — that phase inherits the session's effort."
+                            ));
+                            None
+                        }
+                    }
+                };
+                let schedule = EffortSchedule {
+                    plan: rung("plan", plan),
+                    implement: rung("implement", implement),
+                    verify: rung("verify", verify),
+                };
+                if schedule.is_empty() && warnings.is_empty() {
+                    warnings.push(
+                        "hotl: [provider] effort is a table with no plan/implement/verify \
+                         rung — the session's effort applies throughout."
+                            .into(),
+                    );
+                }
+                (None, schedule, warnings)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -496,6 +558,9 @@ pub struct BehaviorCfg {
     /// agent loop's step budget. `-1` = unlimited (run until the model stops
     /// on its own). Absent = the engine default.
     pub max_turns: Option<i64>,
+    /// Extra command prefixes that count as verification when the effort
+    /// schedule picks a phase, on top of the built-in runner table.
+    pub verify_commands: Option<Vec<String>>,
 }
 
 impl BehaviorCfg {
@@ -1146,6 +1211,57 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), toml).unwrap();
         Config::load(dir.path())
+    }
+
+    #[test]
+    fn effort_accepts_a_scalar_or_a_phase_table() {
+        // The scalar spelling, unchanged: one rung, no schedule.
+        let (scalar, sched, warnings) = cfg_with("[provider]\neffort = \"high\"\n")
+            .provider
+            .effort
+            .expect("scalar parses")
+            .split();
+        assert_eq!(scalar.as_deref(), Some("high"));
+        assert!(sched.is_empty());
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // The table spelling: no scalar, three rungs.
+        let (scalar, sched, warnings) = cfg_with(
+            "[provider]\neffort = { plan = \"xhigh\", implement = \"high\", verify = \"xhigh\" }\n",
+        )
+        .provider
+        .effort
+        .expect("table parses")
+        .split();
+        assert_eq!(scalar, None);
+        assert_eq!(sched.plan, Some(Effort::XHigh));
+        assert_eq!(sched.implement, Some(Effort::High));
+        assert_eq!(sched.verify, Some(Effort::XHigh));
+        assert!(warnings.is_empty(), "{warnings:?}");
+
+        // A bad rung warns and inherits — the two good cells still apply.
+        let (_, sched, warnings) = cfg_with(
+            "[provider]\neffort = { plan = \"ultra\", implement = \"high\", verify = \"max\" }\n",
+        )
+        .provider
+        .effort
+        .expect("table parses")
+        .split();
+        assert_eq!(sched.plan, None, "a bad rung inherits rather than guessing");
+        assert_eq!(sched.implement, Some(Effort::High));
+        assert_eq!(sched.verify, Some(Effort::Max));
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("effort.plan"), "{warnings:?}");
+
+        // A table that names nothing hotl knows says so rather than silently
+        // being no table at all.
+        let (_, sched, warnings) = cfg_with("[provider]\neffort = { nonsense = \"high\" }\n")
+            .provider
+            .effort
+            .expect("table parses")
+            .split();
+        assert!(sched.is_empty());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

@@ -96,6 +96,78 @@ impl FromStr for Effort {
     }
 }
 
+/// Which phase of work a turn opens in — the axis an [`EffortSchedule`]
+/// indexes. Derived once, at turn start: a rung that moved mid-turn would
+/// bill two depths against one prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Plan,
+    Implement,
+    Verify,
+}
+
+impl Phase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Plan => "plan",
+            Phase::Implement => "implement",
+            Phase::Verify => "verify",
+        }
+    }
+}
+
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Per-phase reasoning depth. A `None` rung inherits the session's own effort
+/// — the same thing a rung that failed to parse gets, so a typo in one cell
+/// never silently re-rates the other two.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EffortSchedule {
+    pub plan: Option<Effort>,
+    pub implement: Option<Effort>,
+    pub verify: Option<Effort>,
+}
+
+impl EffortSchedule {
+    /// The rung for `phase`, or `None` to inherit.
+    pub fn rung(&self, phase: Phase) -> Option<Effort> {
+        match phase {
+            Phase::Plan => self.plan,
+            Phase::Implement => self.implement,
+            Phase::Verify => self.verify,
+        }
+    }
+
+    /// No cell parsed: the table is indistinguishable from no table at all.
+    pub fn is_empty(&self) -> bool {
+        self.plan.is_none() && self.implement.is_none() && self.verify.is_none()
+    }
+}
+
+/// `plan xhigh \u{b7} implement high \u{b7} verify xhigh` — inheriting cells are omitted.
+impl fmt::Display for EffortSchedule {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut first = true;
+        for (name, rung) in [
+            ("plan", self.plan),
+            ("implement", self.implement),
+            ("verify", self.verify),
+        ] {
+            let Some(rung) = rung else { continue };
+            if !first {
+                f.write_str(" \u{b7} ")?;
+            }
+            write!(f, "{name} {rung}")?;
+            first = false;
+        }
+        Ok(())
+    }
+}
+
 /// Absolute distance along the ladder.
 fn distance(a: Effort, b: Effort) -> u8 {
     a.rank().abs_diff(b.rank())
@@ -174,6 +246,32 @@ mod tests {
         for s in ["ultra", "", "HIGH ", "none", "minimal"] {
             assert!(s.parse::<Effort>().is_err(), "{s}");
         }
+    }
+
+    #[test]
+    fn a_schedule_reports_its_rungs_and_omits_the_inheriting_cells() {
+        let sched = EffortSchedule {
+            plan: Some(Effort::XHigh),
+            implement: Some(Effort::High),
+            verify: Some(Effort::XHigh),
+        };
+        assert_eq!(sched.rung(Phase::Plan), Some(Effort::XHigh));
+        assert_eq!(sched.rung(Phase::Implement), Some(Effort::High));
+        assert_eq!(sched.rung(Phase::Verify), Some(Effort::XHigh));
+        assert_eq!(
+            sched.to_string(),
+            "plan xhigh \u{b7} implement high \u{b7} verify xhigh"
+        );
+        assert!(!sched.is_empty());
+
+        // One cell set: the other two inherit and never render.
+        let partial = EffortSchedule {
+            implement: Some(Effort::Low),
+            ..Default::default()
+        };
+        assert_eq!(partial.to_string(), "implement low");
+        assert_eq!(partial.rung(Phase::Plan), None);
+        assert!(EffortSchedule::default().is_empty());
     }
 
     #[test]

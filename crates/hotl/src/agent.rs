@@ -823,6 +823,7 @@ pub(crate) async fn build_acp() -> Result<
             // Display-only: what a bare `/effort` reports as the session
             // default. The engine already holds the same resolved value.
             default_effort: scaffold.config.effort.map(|e| e.as_str().to_string()),
+            effort_schedule: scaffold.config.effort_schedule.map(|s| s.to_string()),
             // This log's own id — the one a later `session/load` (and so
             // `session/reload_config`) must name to replay this chain.
             session_id,
@@ -3193,12 +3194,20 @@ fn engine_config(
     if secrets.get("HOTL_THINKING").as_deref() == Some("0") {
         config.thinking = false;
     }
+    // `[provider] effort` is one rung or a per-phase table; `HOTL_EFFORT` stays
+    // scalar (0059 T1). The table contributes no session scalar, so the catalog
+    // default below still fills the base every inheriting phase reads.
+    let (cfg_effort, schedule, schedule_warnings) = match cfg.provider.effort.as_ref() {
+        Some(setting) => setting.split(),
+        None => (None, hotl_provider::EffortSchedule::default(), Vec::new()),
+    };
+    warnings.extend(schedule_warnings);
+    config.effort_schedule = (!schedule.is_empty()).then_some(schedule);
+    config.verify_commands = cfg.behavior.verify_commands.clone().unwrap_or_default();
     // Env beats config, like every other scalar here. A typo warns and is
     // ignored rather than refusing to start — same posture as `parse_isolation`.
-    config.effort = secrets
-        .get("HOTL_EFFORT")
-        .or_else(|| cfg.provider.effort.clone())
-        .and_then(|raw| match raw.trim().parse::<Effort>() {
+    config.effort = secrets.get("HOTL_EFFORT").or(cfg_effort).and_then(|raw| {
+        match raw.trim().parse::<Effort>() {
             Ok(e) => Some(e),
             Err(_) => {
                 eprintln!(
@@ -3206,7 +3215,8 @@ fn engine_config(
                 );
                 None
             }
-        });
+        }
+    });
     // Catalogued Anthropic models with effort support get the agentic default;
     // Haiku (caps.effort=false) and every uncatalogued model (the whole
     // OpenAI-compat family, gateway aliases) keep the provider's own default.

@@ -9,7 +9,7 @@ use futures_util::stream::BoxStream;
 use futures_util::StreamExt;
 use hotl_provider::{retry, CachePolicy, ProviderError, SamplingRequest, StreamEvent, ToolDef};
 use hotl_tools::rules::Verdict;
-use hotl_tools::{Permission, ToolOutcome};
+use hotl_tools::{Permission, Registry, ToolOutcome};
 use hotl_types::{
     assistant_text, assistant_tool_uses, EntryPayload, Item, StopReason, SyntheticReason,
     TokenUsage, ToolResultItem, ToolUse,
@@ -1359,6 +1359,13 @@ impl Turn {
         if !commit.ok() {
             return Some(commit.outcome());
         }
+        // The phase fact the next turn's effort schedule reads (0059 T1),
+        // recorded per batch so the *last* batch is what it sees.
+        self.shared.note_batch_verified(batch_is_verify(
+            uses,
+            &self.shared.registry,
+            &self.shared.config.verify_commands,
+        ));
         if let Some(pattern) = self.fold_doom_window(uses) {
             if let Some(outcome) = self.handle_doom_loop(uses, pattern).await {
                 return Some(outcome);
@@ -3131,6 +3138,65 @@ fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
         }
     }
     None
+}
+
+/// Commands that mean "check the work" rather than "change it". Deliberately
+/// short and prefix-matched at a word boundary: a table nobody can extend is
+/// worse than one that misses a niche runner, which is what
+/// `[behavior] verify_commands` is for.
+const VERIFY_PREFIXES: &[&str] = &[
+    "cargo test",
+    "cargo nextest",
+    "cargo check",
+    "cargo clippy",
+    "pytest",
+    "npm test",
+    "pnpm test",
+    "yarn test",
+    "go test",
+    "make test",
+    "just test",
+];
+
+/// Did this batch verify and nothing else? A batch that edited anything is
+/// implementation however it ends — the effort schedule's `verify` rung is
+/// for the read-and-check turn that follows the work, not the work itself.
+fn batch_is_verify(uses: &[ToolUse], registry: &Registry, extra: &[String]) -> bool {
+    let edited = uses
+        .iter()
+        .any(|tu| registry.get(&tu.name).is_some_and(|t| t.edits_files()));
+    let verified = uses.iter().any(|tu| {
+        tu.name == "bash"
+            && tu
+                .input
+                .get("command")
+                .and_then(Value::as_str)
+                .is_some_and(|c| is_verify_command(c, extra))
+    });
+    verified && !edited
+}
+
+/// Any `&&`/`||`/`;`/`|`-separated segment whose first words name a runner.
+/// Word-boundary matched, so `cargo testify` is not `cargo test`.
+fn is_verify_command(command: &str, extra: &[String]) -> bool {
+    command
+        .split(['&', '|', ';', '\n'])
+        .map(|seg| seg.split_whitespace().collect::<Vec<_>>().join(" "))
+        .any(|seg| {
+            VERIFY_PREFIXES
+                .iter()
+                .copied()
+                .chain(extra.iter().map(String::as_str))
+                .any(|p| {
+                    let p = p.trim();
+                    !p.is_empty()
+                        && seg.starts_with(p)
+                        && seg[p.len()..]
+                            .chars()
+                            .next()
+                            .is_none_or(char::is_whitespace)
+                })
+        })
 }
 
 /// A MaxTokens stream can end inside a thinking block, leaving it unsigned;

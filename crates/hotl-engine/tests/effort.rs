@@ -232,3 +232,182 @@ async fn unset_round_trips_through_the_log() {
     let replayed = hotl_store::replay(&log_path).expect("replay");
     assert_eq!(replayed.effort, Some(None));
 }
+
+// ---------------------------------------------------------------------------
+// 0059 T1 — effort as a schedule over phases.
+
+fn schedule() -> hotl_provider::EffortSchedule {
+    hotl_provider::EffortSchedule {
+        plan: Some(Effort::XHigh),
+        implement: Some(Effort::High),
+        verify: Some(Effort::Max),
+    }
+}
+
+fn scheduled_config() -> EngineConfig {
+    EngineConfig {
+        effort: Some(Effort::Low),
+        effort_schedule: Some(schedule()),
+        ..Default::default()
+    }
+}
+
+/// Plan mode alone decides the `plan` phase (0056's active node is the seam
+/// this will read when it lands).
+#[tokio::test]
+async fn plan_mode_opens_the_turn_at_the_plan_rung() {
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "ok",
+    )]));
+    let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+    handle.set_plan(true).await;
+    run_one_turn(&mut handle).await;
+    assert_eq!(
+        provider.last_request().expect("one request").effort,
+        Some(Effort::XHigh)
+    );
+}
+
+/// A turn that ran a `bash cargo test` and edited nothing puts the NEXT turn
+/// in `verify`; a batch that also edited does not.
+#[tokio::test]
+async fn a_verify_only_batch_puts_the_next_turn_at_the_verify_rung() {
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    provider.push_script(ScriptedProvider::tool_call(
+        "t1",
+        "bash",
+        json!({"command": "cargo test --workspace"}),
+    ));
+    provider.push_script(ScriptedProvider::text_reply("checked"));
+    provider.push_script(ScriptedProvider::text_reply("next"));
+    let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+    run_one_turn(&mut handle).await;
+    // Turn 1 opened in `implement` — nothing had run yet.
+    assert_eq!(provider.requests()[0].effort, Some(Effort::High));
+    run_one_turn(&mut handle).await;
+    assert_eq!(
+        provider.last_request().expect("a third request").effort,
+        Some(Effort::Max),
+        "a verify-only batch moves the next turn to the verify rung"
+    );
+}
+
+/// An edit in the same batch means the turn was implementing, whatever else
+/// it ran alongside.
+#[tokio::test]
+async fn a_batch_that_edits_stays_at_the_implement_rung() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("f.txt");
+    std::fs::write(&file, "body").expect("fixture");
+    let path = file.to_str().expect("utf8").to_string();
+    let mut batch =
+        ScriptedProvider::tool_call("t1", "bash", json!({"command": "cargo nextest run"}));
+    if let Some(Ok(StreamEvent::Completed { blocks, .. })) = batch.last_mut() {
+        blocks.push(json!({
+            "type": "tool_use", "id": "t2", "name": "write",
+            "input": {"path": path, "content": "new"}
+        }));
+    }
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    provider.push_script(batch);
+    provider.push_script(ScriptedProvider::text_reply("done"));
+    provider.push_script(ScriptedProvider::text_reply("next"));
+    let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+    run_one_turn(&mut handle).await;
+    run_one_turn(&mut handle).await;
+    assert_eq!(
+        provider.last_request().expect("a request").effort,
+        Some(Effort::High),
+        "a batch that edited is implementation, not verification"
+    );
+}
+
+/// The rung moves at turn start and nowhere else: every sample inside one
+/// turn carries the same depth even when plan mode flips mid-turn.
+#[tokio::test]
+async fn the_rung_changes_only_at_turn_start() {
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    provider.push_script(ScriptedProvider::tool_call(
+        "t1",
+        "bash",
+        json!({"command": "cargo test"}),
+    ));
+    provider.push_script(ScriptedProvider::tool_call(
+        "t2",
+        "bash",
+        json!({"command": "cargo test"}),
+    ));
+    provider.push_script(ScriptedProvider::text_reply("done"));
+    let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+    run_one_turn(&mut handle).await;
+    let rungs: Vec<_> = provider.requests().iter().map(|r| r.effort).collect();
+    assert!(rungs.len() >= 3, "{rungs:?}");
+    assert!(
+        rungs.iter().all(|r| *r == Some(Effort::High)),
+        "one turn, one rung: {rungs:?}"
+    );
+}
+
+/// `/effort` pins a scalar for the session: the schedule stops writing.
+#[tokio::test]
+async fn a_hand_set_rung_pins_the_session_and_stops_the_schedule() {
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("a"),
+        ScriptedProvider::text_reply("b"),
+    ]));
+    let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+    handle.set_effort(Some(Effort::Medium)).await;
+    run_one_turn(&mut handle).await;
+    handle.set_plan(true).await;
+    run_one_turn(&mut handle).await;
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .all(|r| r.effort == Some(Effort::Medium)),
+        "a pinned rung outranks the schedule"
+    );
+}
+
+/// A phase with no rung inherits the session's own effort rather than
+/// clearing it.
+#[tokio::test]
+async fn a_phase_with_no_rung_inherits_the_sessions_effort() {
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "ok",
+    )]));
+    let (mut handle, _dir) = session(
+        provider.clone(),
+        EngineConfig {
+            effort: Some(Effort::Max),
+            effort_schedule: Some(hotl_provider::EffortSchedule {
+                plan: Some(Effort::Low),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    run_one_turn(&mut handle).await;
+    assert_eq!(
+        provider.last_request().expect("one request").effort,
+        Some(Effort::Max)
+    );
+}
+
+/// No `EffortSet` entry: the schedule is configuration, not a user decision,
+/// and `hotl resume` re-derives it.
+#[tokio::test]
+async fn the_schedule_writes_no_effort_set_entry() {
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "ok",
+    )]));
+    let (mut handle, _dir, log_path) = session_logged(provider, scheduled_config());
+    run_one_turn(&mut handle).await;
+    let effort_sets = std::fs::read_to_string(&log_path)
+        .expect("read log")
+        .lines()
+        .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
+        .filter(|e| matches!(e.payload, hotl_types::EntryPayload::EffortSet { .. }))
+        .count();
+    assert_eq!(effort_sets, 0);
+}

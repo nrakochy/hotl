@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hotl_platform::Clock;
-use hotl_provider::{CacheTtl, Effort, Provider};
+use hotl_provider::{CacheTtl, Effort, EffortSchedule, Provider};
 use hotl_store::SessionLog;
 use hotl_tools::{
     rules::{PermissionMode, Rules},
@@ -94,6 +94,14 @@ pub struct EngineConfig {
     /// Reasoning depth for every sample this session takes. `None` = the
     /// provider's own default; the dialect decides the wire spelling.
     pub effort: Option<Effort>,
+    /// Per-phase rungs applied at turn start (0059 T1). `None` = one depth for
+    /// the whole session. A phase with no rung inherits [`Self::effort`], and
+    /// an explicit `/effort` pins the session and stops the schedule.
+    pub effort_schedule: Option<EffortSchedule>,
+    /// Extra command prefixes that count as verification when the schedule
+    /// derives its phase, on top of the built-in table
+    /// (`[behavior] verify_commands`).
+    pub verify_commands: Vec<String>,
     pub cache_static: bool,
     /// The lifetime `compose_request` asks explicit-cache breakpoints for
     /// when `cache_static` is set (`CachePolicy::Static { prefix_ttl }` —
@@ -162,6 +170,8 @@ impl Default for EngineConfig {
             max_turns: 100,
             thinking: true,
             effort: None,
+            effort_schedule: None,
+            verify_commands: Vec::new(),
             cache_static: true,
             cache_ttl: CacheTtl::FiveMinutes,
             fallback_models: Vec::new(),

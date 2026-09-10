@@ -487,6 +487,10 @@ pub struct State {
     /// set reports this instead of the lie "default". Never sent anywhere —
     /// the engine already holds the same resolved value.
     pub default_effort: Option<String>,
+    /// The per-phase effort schedule (0059 T1), pre-rendered by the server.
+    /// Reported by `/effort` and `/status` so a rung that moves between turns
+    /// reads as configuration, not drift.
+    pub effort_schedule: Option<String>,
     /// Model context window in tokens, from the handshake. What the context
     /// gauge divides by; `DEFAULT_CONTEXT_WINDOW` until a server reports one.
     pub context_window: u64,
@@ -625,6 +629,7 @@ impl State {
             plan: false,
             effort: None,
             default_effort: None,
+            effort_schedule: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
             live_context: None,
             open_context: None,
@@ -3070,10 +3075,16 @@ fn set_mode(state: &mut State, mode: &str) -> Vec<Cmd> {
 /// setting, else the session's resolved default marked as such, else the
 /// bare word for "the provider decides".
 fn effort_report(state: &State) -> String {
-    match (&state.effort, &state.default_effort) {
+    let base = match (&state.effort, &state.default_effort) {
         (Some(e), _) => e.clone(),
         (None, Some(d)) => format!("{d} (default)"),
         (None, None) => "default".into(),
+    };
+    // A pinned rung outranks the schedule, so naming the schedule beside it
+    // would be a lie — it is only shown while it still governs.
+    match (&state.effort_schedule, &state.effort) {
+        (Some(sched), None) => format!("{base} (schedule: {sched})"),
+        _ => base,
     }
 }
 

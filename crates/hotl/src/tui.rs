@@ -135,6 +135,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         mode,
         plan,
         default_effort,
+        effort_schedule,
         goal,
         context_window,
         context_tokens,
@@ -150,6 +151,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     state.mode = mode;
     state.plan = plan;
     state.default_effort = default_effort;
+    state.effort_schedule = effort_schedule;
     // A resumed goal's counters start at zero (reset-on-resume, per docs).
     state.goal = goal;
     state.context_window = context_window;
@@ -367,6 +369,9 @@ struct Opened {
     /// The session's resolved starting effort — display-only, what a bare
     /// `/effort` reports when the user has set nothing (0030 Task 8).
     default_effort: Option<String>,
+    /// The per-phase effort schedule as the server rendered it (0059 T1),
+    /// or `None` when one rung governs the session.
+    effort_schedule: Option<String>,
     /// The active goal a resume restored (0034); a fork's or a fresh
     /// session's is `None`. Counters start at zero — reset-on-resume.
     goal: Option<String>,
@@ -438,6 +443,10 @@ async fn handshake(
         plan,
         default_effort: v
             .get("defaultEffort")
+            .and_then(Value::as_str)
+            .map(String::from),
+        effort_schedule: v
+            .get("effortSchedule")
             .and_then(Value::as_str)
             .map(String::from),
         goal: v.get("goal").and_then(Value::as_str).map(String::from),

@@ -44,6 +44,8 @@ base_url = "http://localhost:11434/v1"      # endpoint for the active provider
 auth = "api_key"                            # or "subscription": hotl holds no credential (requires base_url)
 fast_model = "..."                          # cheap model for compaction summaries; absent = claude-haiku-4-5 on catalogued Anthropic models, else the session model
 effort = "high"                             # low | medium | high | xhigh | max; absent = xhigh on catalogued Anthropic models, else the provider's default
+                                            # or a per-phase table, applied at turn start:
+                                            # effort = { plan = "xhigh", implement = "high", verify = "xhigh" }
 api_key_helper = "..."                      # command whose trimmed stdout is the API key; beats static key env vars; 5s timeout, 64KB cap
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
 max_tokens = 64000                          # per-sample output cap (thinking + text); clamped to the model's catalogued maximum
@@ -69,6 +71,8 @@ copy_on_select = true      # false stops a mouse drag copying to the clipboard
 max_turns = 100            # model steps one prompt may spend (a tool round-trip
                            # costs one). -1 = unlimited: run until the model is
                            # done, the context fills, or you interrupt.
+verify_commands = []       # extra command prefixes that count as verification
+                           # when [provider] effort is a per-phase table
 
 [permissions]
 mode = "bypass"   # "bypass" | "ask" | "dontask"  ("auto" = the old name for bypass)
@@ -258,7 +262,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. Leave unset to get the [per-model window](#context-window-context-window). |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. Absent everywhere: catalogued Anthropic sessions digest on `claude-haiku-4-5`; anything else keeps the session model. |
-| `HOTL_EFFORT` | `[provider].effort` | Reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Unset defaults to `xhigh` on catalogued Anthropic models with effort support; other models get no depth field. An unrecognized value warns and is ignored. |
+| `HOTL_EFFORT` | `[provider].effort` | Reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Unset defaults to `xhigh` on catalogued Anthropic models with effort support; other models get no depth field. An unrecognized value warns and is ignored. The env var is always a scalar; the config key also takes a per-phase table. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `bypass` (default: no per-action asks) \| `ask` \| `dontask`; `auto` still parses as `bypass`, and a typo fails closed to `ask`. |
 | `HOTL_PLAN` | `[permissions].plan` | Any value but `0`/`false`/empty turns plan mode on. |
@@ -568,6 +572,23 @@ A model that accepts fewer rungs clamps to its nearest one rather than erroring,
 `effort` and `thinking` stay two knobs. `HOTL_THINKING=0` turns extended thinking off; on an OpenAI-compatible endpoint that is spelled `reasoning_effort: "none"` and wins over any rung you set.
 
 `/effort` in the console changes the rung mid-session and is recorded durably, so `hotl resume` keeps it. Sub-agents take their own rung from an `effort:` line in the agent def — see [agents.md](../agents/). Compaction never inherits the session's rung: folding your own history at `max` rates is a cost nobody opts into.
+
+#### A schedule over phases
+
+`effort` also takes a table, so the depth follows the kind of work rather than sitting at one rung all session:
+
+```toml
+[provider]
+effort = { plan = "xhigh", implement = "high", verify = "xhigh" }
+```
+
+The phase is derived once, **at turn start**, so every sample inside one turn is billed at one depth:
+
+- **`plan`** — plan mode is on.
+- **`verify`** — the previous turn's last tool batch ran a test runner and edited nothing. The built-in table is `cargo test`, `cargo nextest`, `cargo check`, `cargo clippy`, `pytest`, `npm|pnpm|yarn test`, `go test`, `make test`, `just test`; add your own with `[behavior] verify_commands = ["tox", "bazel test"]`. A batch that edited a file is implementation however it ends.
+- **`implement`** — everything else.
+
+A phase you leave out inherits the session's effort, and so does a rung that names no level (it warns at startup rather than failing the file). The schedule is configuration, not a decision: it writes no durable entry, `hotl resume` re-derives it, and `HOTL_EFFORT` stays a scalar. The moment you run `/effort <rung>` the session is **pinned** and the schedule stops — a rung you set by hand outranks a rung a table chose. A bare `/effort` names the schedule while it still governs.
 
 ### Concurrency (`[concurrency]`)
 

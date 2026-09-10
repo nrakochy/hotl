@@ -629,6 +629,15 @@ pub(crate) struct SharedDeps {
     /// ladder ascending — the sentinel is why this is an `AtomicU8` and not a
     /// packed `Option`, and it keeps the same shape as `mode`'s codec.
     effort: AtomicU8,
+    /// The human set a rung by hand (`/effort`, `session/set_effort`), so the
+    /// phase schedule stops writing over it — a deliberate pin outranks
+    /// config (0059 T1).
+    effort_pinned: AtomicBool,
+    /// Did the most recent tool batch run a verify-class command and no edit?
+    /// Written by the turn task, read at the next turn's start to pick the
+    /// schedule's phase. An atomic rather than a `TurnContinuation` field:
+    /// a compaction respawn is the same turn and must keep the same answer.
+    last_batch_verified: AtomicBool,
     pub sandbox_enforced: bool,
     pub clock: Arc<dyn Clock>,
     pub system: Arc<str>,
@@ -738,6 +747,8 @@ impl SharedDeps {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
         let plan = AtomicBool::new(deps.rules.plan());
         let effort = AtomicU8::new(effort_to_u8(deps.config.effort));
+        let effort_pinned = AtomicBool::new(false);
+        let last_batch_verified = AtomicBool::new(false);
         let hook_mask = deps
             .hooks
             .as_ref()
@@ -764,6 +775,8 @@ impl SharedDeps {
             mode,
             plan,
             effort,
+            effort_pinned,
+            last_batch_verified,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,
             system,
@@ -876,6 +889,43 @@ impl SharedDeps {
     /// `enforced_mode` counterpart: no build tightens effort.
     fn set_effort(&self, effort: Option<Effort>) {
         self.effort.store(effort_to_u8(effort), Ordering::Relaxed);
+        // A hand-set rung is a decision, and the schedule is configuration:
+        // the decision wins for the rest of the session.
+        self.effort_pinned.store(true, Ordering::Relaxed);
+    }
+
+    /// What the last tool batch was: a verify-class command with no edit
+    /// alongside it. The turn task's half of the phase derivation (0059 T1).
+    pub(crate) fn note_batch_verified(&self, verified: bool) {
+        self.last_batch_verified.store(verified, Ordering::Relaxed);
+    }
+
+    /// Which phase the next turn opens in. Plan mode alone decides `plan`
+    /// (0056's active node is the seam this would read when it lands); a
+    /// previous batch that only verified means `verify`; else `implement`.
+    fn turn_phase(&self) -> hotl_provider::Phase {
+        if self.effective_plan() {
+            hotl_provider::Phase::Plan
+        } else if self.last_batch_verified.load(Ordering::Relaxed) {
+            hotl_provider::Phase::Verify
+        } else {
+            hotl_provider::Phase::Implement
+        }
+    }
+
+    /// Write the schedule's rung for this turn's phase, at turn start only —
+    /// so every sample inside one turn carries one depth. Appends no
+    /// `EffortSet` entry: the schedule is config, and `hotl resume` re-derives
+    /// it. A pinned session is left alone.
+    fn apply_effort_schedule(&self) {
+        let Some(schedule) = self.config.effort_schedule else {
+            return;
+        };
+        if self.effort_pinned.load(Ordering::Relaxed) {
+            return;
+        }
+        let rung = schedule.rung(self.turn_phase()).or(self.config.effort);
+        self.effort.store(effort_to_u8(rung), Ordering::Relaxed);
     }
 
     /// Commit one entry: forward it to the writer at the `Durable` tier and
@@ -3056,6 +3106,9 @@ fn spawn_turn(
     *current_turn
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = token.clone();
+    // Turn start is the only place the phase schedule moves the rung —
+    // `respawn_turn` below is a continuation of the same turn and must not.
+    shared.apply_effort_schedule();
     // A fresh prompt is a fresh turn: no counters carry in.
     respawn_turn(
         shared,

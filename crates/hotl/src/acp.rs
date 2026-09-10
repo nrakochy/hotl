@@ -165,6 +165,11 @@ pub struct SessionOpen {
     /// `/effort` reports when the user has set nothing. `None` = the model
     /// gets no depth field (uncatalogued model, nothing configured).
     pub default_effort: Option<String>,
+    /// The per-phase effort schedule, pre-rendered (`plan xhigh \u{b7} implement
+    /// high`), or `None` when one rung governs the session (0059 T1). The
+    /// client shows it beside the effort so a rung that moves between turns
+    /// is explained rather than mysterious.
+    pub effort_schedule: Option<String>,
     /// The active goal at open (0034): resume restores it, a fork never
     /// does, a fresh session has none.
     pub goal: Option<String>,
@@ -445,6 +450,7 @@ async fn handle_request(
                     let mode = open.mode.clone();
                     let plan = open.plan;
                     let default_effort = open.default_effort.clone();
+                    let effort_schedule = open.effort_schedule.clone();
                     let goal = open.goal.clone();
                     let name = open.name.clone();
                     let todos = open.todos.clone();
@@ -515,6 +521,9 @@ async fn handle_request(
                     }
                     if let Some(m) = previous_model {
                         obj.insert("previousModel".into(), json!(m));
+                    }
+                    if let Some(sched) = effort_schedule {
+                        obj.insert("effortSchedule".into(), json!(sched));
                     }
                     reply_ok(writer, id, reply).await;
                 }

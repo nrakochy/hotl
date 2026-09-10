@@ -1316,7 +1316,7 @@ pub mod effort;
 pub mod key;
 pub mod openai_cache;
 
-pub use effort::{Effort, EffortLadder, ALL_EFFORTS};
+pub use effort::{Effort, EffortLadder, EffortSchedule, Phase, ALL_EFFORTS};
 
 /// Highest block index any assembler will materialize. Wire indices are
 /// attacker-controlled `u64`s; without a bound, `blocks.resize(index + 1, …)`
