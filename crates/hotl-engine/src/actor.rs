@@ -45,6 +45,10 @@ const COMPACT_SUMMARIZE_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// The goal evaluator's output is two short lines; the bound is generous.
 const GOAL_EVAL_MAX_TOKENS: u32 = 300;
 const GOAL_EVAL_ATTEMPTS: u32 = 2;
+/// Consecutive not-yet verdicts with no tool executed before the loop pauses
+/// (0051 G1, OD2) — Claude Code's Stop-hook block cap, and the same number
+/// `TURN_EXTENSION_MAX` bounds a single turn's nudges by.
+const GOAL_STALL_TURNS: u32 = 8;
 /// Wall-clock bound on the inline goal evaluation — the same posture as
 /// [`COMPACT_SUMMARIZE_TIMEOUT`] (the actor's loop blocks for its duration,
 /// and admission blocking during the call is its serialization working as
@@ -1192,7 +1196,8 @@ pub(crate) async fn run(
                 end,
                 usage,
                 mispredictions,
-                ..
+                tools_ran,
+                unrecoverable,
             } => {
                 // The turn is over, so nothing will answer an open batch now.
                 // Close it, then let held steers land before a queued prompt
@@ -1228,6 +1233,8 @@ pub(crate) async fn run(
                     end,
                     usage,
                     mispredictions,
+                    tools_ran,
+                    unrecoverable,
                 )
                 .await;
             }
@@ -1284,6 +1291,10 @@ struct TurnFinishedCtx<'a> {
 struct GoalState {
     condition: String,
     turns: u32,
+    /// Consecutive not-yet verdicts with no tool executed. Zeroed by any
+    /// turn that ran one, and by the stall itself — the pause is a rest, not
+    /// a tombstone, so the next prompt starts from a full budget again.
+    idle_turns: u32,
 }
 
 impl GoalState {
@@ -1291,6 +1302,7 @@ impl GoalState {
         Self {
             condition,
             turns: 0,
+            idle_turns: 0,
         }
     }
 }
@@ -1302,7 +1314,12 @@ async fn on_turn_finished(
     end: TurnEnd,
     mut usage: TokenUsage,
     mut mispredictions: u32,
+    tools_ran: u32,
+    unrecoverable: bool,
 ) {
+    // Compaction's own dead end (the streak cap) is the third unrecoverable
+    // class, and only `try_compact` knows it happened.
+    let mut unrecoverable = unrecoverable;
     let outcome = match end {
         TurnEnd::Outcome(outcome) => Some(outcome),
         TurnEnd::Compact { spec, cont } => {
@@ -1322,12 +1339,45 @@ async fn on_turn_finished(
                 ctx.cmd_tx,
                 ctx.events,
                 ctx.current_turn,
+                &mut unrecoverable,
             )
             .await
         }
     };
     if let Some(outcome) = outcome {
         *ctx.compact_streak = 0;
+        // The owner has to act (0051 G6): tombstone, so resume never re-arms
+        // the loop against a dead key. Before the Done gate deliberately —
+        // an error outcome never reaches it, and leaving the goal armed here
+        // is how a revoked credential burns a whole session's budget.
+        if let (true, Outcome::Error { message }) = (unrecoverable, &outcome) {
+            if let Some(state) = ctx.goal.take() {
+                let _ = ctx
+                    .shared
+                    .append(
+                        ctx.log,
+                        ctx.pipeline,
+                        ctx.head,
+                        EntryPayload::GoalSet {
+                            condition: None,
+                            outcome: Some("error".into()),
+                        },
+                    )
+                    .await;
+                let _ = ctx
+                    .events
+                    .send(EngineEvent::GoalChanged { condition: None })
+                    .await;
+                let _ = ctx
+                    .events
+                    .send(EngineEvent::GoalVerdict {
+                        verdict: GoalVerdictKind::Errored,
+                        reason: message.clone(),
+                        turns: state.turns,
+                    })
+                    .await;
+            }
+        }
         // The goal gate (0034): between outcome resolution and `end_turn`,
         // exactly where the compaction respawn sits. Fires only on Done +
         // active goal + empty queue — a user-queued prompt outranks the
@@ -1364,32 +1414,60 @@ async fn on_turn_finished(
                                 turns,
                             })
                             .await;
-                        // No `end_turn`, so no intermediate `TurnDone`: that
-                        // one suppression keeps every surface in "turn
-                        // running" (TUI phase machine, ACP's parked reply,
-                        // headless run_until_idle), and the usage folds into
-                        // carry like a compaction respawn so the single
-                        // final TurnDone reports cumulative spend.
-                        *ctx.carry_usage += usage;
-                        *ctx.carry_mispredictions += mispredictions;
-                        let guidance = goal_guidance_text(&reason, &state.condition);
-                        *ctx.running = start_turn(
-                            ctx.shared,
-                            ctx.log,
-                            ctx.head,
-                            ctx.pipeline,
-                            QueuedPrompt {
-                                text: guidance,
-                                images: Vec::new(),
-                                synthetic: Some(SyntheticReason::GoalGuidance),
-                            },
-                            ctx.cmd_tx,
-                            ctx.events,
-                            ctx.current_turn,
-                            ctx.steers_held,
-                        )
-                        .await;
-                        return;
+                        // A turn that only talked is idle (0051 decision 1);
+                        // judged after the verdict, since a talk-only turn
+                        // can legitimately be the one the evaluator calls met.
+                        if tools_ran == 0 {
+                            state.idle_turns += 1;
+                        } else {
+                            state.idle_turns = 0;
+                        }
+                        if state.idle_turns >= GOAL_STALL_TURNS {
+                            // A pause, not a tombstone: the goal stays set and
+                            // the next user prompt re-enters the gate with a
+                            // full idle budget.
+                            state.idle_turns = 0;
+                            let _ = ctx
+                                .events
+                                .send(EngineEvent::GoalVerdict {
+                                    verdict: GoalVerdictKind::Stalled,
+                                    reason: format!(
+                                        "no tool ran in the last {GOAL_STALL_TURNS} goal turns"
+                                    ),
+                                    turns,
+                                })
+                                .await;
+                            // Falls through to `end_turn`: one TurnDone, as
+                            // every other resolution.
+                        } else {
+                            // No `end_turn`, so no intermediate `TurnDone`:
+                            // that one suppression keeps every surface in
+                            // "turn running" (TUI phase machine, ACP's parked
+                            // reply, headless run_until_idle), and the usage
+                            // folds into carry like a compaction respawn so
+                            // the single final TurnDone reports cumulative
+                            // spend.
+                            *ctx.carry_usage += usage;
+                            *ctx.carry_mispredictions += mispredictions;
+                            let guidance = goal_guidance_text(&reason, &state.condition);
+                            *ctx.running = start_turn(
+                                ctx.shared,
+                                ctx.log,
+                                ctx.head,
+                                ctx.pipeline,
+                                QueuedPrompt {
+                                    text: guidance,
+                                    images: Vec::new(),
+                                    synthetic: Some(SyntheticReason::GoalGuidance),
+                                },
+                                ctx.cmd_tx,
+                                ctx.events,
+                                ctx.current_turn,
+                                ctx.steers_held,
+                            )
+                            .await;
+                            return;
+                        }
                     }
                     Some((v @ (GoalVerdict::Met | GoalVerdict::Impossible), reason)) => {
                         let (kind, word) = if v == GoalVerdict::Met {
@@ -1475,6 +1553,9 @@ async fn try_compact(
     cmd_tx: &mpsc::WeakSender<SessionCmd>,
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
+    // Set when the streak cap is what ended the turn: no retry, fallback or
+    // further fold can make room, so the goal gate must tombstone (0051 G6).
+    unrecoverable: &mut bool,
 ) -> Option<Outcome> {
     // INVARIANT: the streak counts folds with no intervening completed sample
     // — a long, productive turn folds as often as it needs to, and only a
@@ -1494,6 +1575,7 @@ async fn try_compact(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let compacted = if *compact_streak > MAX_COMPACT_STREAK {
+        *unrecoverable = true;
         Err("context window exhausted — compaction can no longer make room".into())
     } else {
         tokio::select! {

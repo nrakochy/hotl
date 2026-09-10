@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use hotl_engine::{
-    spawn_session, EngineConfig, EngineEvent, GoalVerdictKind, Outcome, SessionDeps, SessionHandle,
+    spawn_session, AskReply, EngineConfig, EngineEvent, GoalVerdictKind, Outcome, SessionDeps,
+    SessionHandle,
 };
 use hotl_platform::SystemClock;
 use hotl_provider::{Provider, ProviderError, SamplingRequest, ScriptedProvider, StreamEvent};
@@ -46,7 +47,9 @@ fn session(
 }
 
 /// Drain events until the first `TurnDone`, returning everything seen
-/// (the `TurnDone` included, as the last element).
+/// (the `TurnDone` included, as the last element). A permission ask is
+/// allowed and dropped rather than collected — its reply channel cannot be
+/// put back in the vec, and no test here asserts on the ask itself.
 async fn events_until_turn_done(handle: &mut SessionHandle) -> Vec<EngineEvent> {
     let mut seen = Vec::new();
     loop {
@@ -54,12 +57,24 @@ async fn events_until_turn_done(handle: &mut SessionHandle) -> Vec<EngineEvent> 
             .await
             .expect("event timeout")
             .expect("event channel closed");
+        if let EngineEvent::Ask { reply, .. } = ev {
+            let _ = reply.send(AskReply::Allow);
+            continue;
+        }
         let done = matches!(ev, EngineEvent::TurnDone { .. });
         seen.push(ev);
         if done {
             return seen;
         }
     }
+}
+
+/// One idle goal turn: the model talks, the evaluator says not yet.
+fn idle_turn() -> Vec<Vec<Result<StreamEvent, ProviderError>>> {
+    vec![
+        ScriptedProvider::text_reply("still thinking about it"),
+        ScriptedProvider::text_reply("VERDICT: not_yet\nREASON: nothing has run"),
+    ]
 }
 
 fn verdicts(events: &[EngineEvent]) -> Vec<(GoalVerdictKind, u32)> {
@@ -328,4 +343,189 @@ async fn clearing_an_active_goal_appends_the_tombstone_and_a_bare_clear_is_a_noo
 
     let replayed = hotl_store::replay(&log_path).expect("replay");
     assert_eq!(replayed.goal, None, "the cleared goal must not survive");
+}
+
+/// 0051 G1: a goal loop that never runs a tool is not making progress. Eight
+/// consecutive idle not-yet verdicts pause it — one `TurnDone`, and the goal
+/// stays set so the next prompt can re-arm it.
+#[tokio::test]
+async fn eight_idle_not_yet_turns_pause_the_loop_and_keep_the_goal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let script: Vec<_> = (0..8).flat_map(|_| idle_turn()).collect();
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let (mut handle, log_path) = session(provider.clone(), dir.path());
+
+    handle.set_goal(Some("the suite is green".into())).await;
+    handle.prompt("go".into()).await;
+
+    let seen = events_until_turn_done(&mut handle).await;
+    let mut expected: Vec<_> = (1..=8).map(|n| (GoalVerdictKind::NotYet, n)).collect();
+    expected.push((GoalVerdictKind::Stalled, 8));
+    assert_eq!(verdicts(&seen), expected);
+    assert_eq!(
+        seen.iter()
+            .filter(|e| matches!(e, EngineEvent::TurnDone { .. }))
+            .count(),
+        1,
+        "the pause ends the logical turn exactly once"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, EngineEvent::GoalChanged { condition: None })),
+        "a stall is a pause, not a tombstone"
+    );
+    assert_eq!(
+        hotl_store::replay(&log_path)
+            .expect("replay")
+            .goal
+            .as_deref(),
+        Some("the suite is green")
+    );
+    // Eight turn legs and eight evaluations, and no ninth leg.
+    assert_eq!(provider.request_count(), 16);
+}
+
+/// The reset is the proof the brake counts *idle* turns, not turns: one
+/// executed tool at turn 8 buys eight more, so the pause lands at turn 16.
+#[tokio::test]
+async fn a_tool_call_resets_the_idle_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut script: Vec<_> = (0..7).flat_map(|_| idle_turn()).collect();
+    // Turn 8 runs a tool, so it is not idle however little it says.
+    script.push(ScriptedProvider::tool_call(
+        "t1",
+        "bash",
+        serde_json::json!({"command": "echo ok"}),
+    ));
+    script.push(ScriptedProvider::text_reply("ran it"));
+    script.push(ScriptedProvider::text_reply(
+        "VERDICT: not_yet\nREASON: one step done",
+    ));
+    script.extend((0..8).flat_map(|_| idle_turn()));
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let (mut handle, log_path) = session(provider.clone(), dir.path());
+
+    handle.set_goal(Some("the suite is green".into())).await;
+    handle.prompt("go".into()).await;
+
+    let seen = events_until_turn_done(&mut handle).await;
+    let mut expected: Vec<_> = (1..=16).map(|n| (GoalVerdictKind::NotYet, n)).collect();
+    expected.push((GoalVerdictKind::Stalled, 16));
+    assert_eq!(verdicts(&seen), expected);
+    assert_eq!(
+        hotl_store::replay(&log_path)
+            .expect("replay")
+            .goal
+            .as_deref(),
+        Some("the suite is green")
+    );
+    // 15 talk-only legs + 15 evaluations + the tool turn's extra sample.
+    assert_eq!(provider.request_count(), 33);
+}
+
+/// 0051 G6: an unrecoverable provider failure tombstones the goal, so a
+/// resume never re-arms the loop against a dead credential.
+#[tokio::test]
+async fn an_unrecoverable_error_tombstones_the_goal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("working"),
+        ScriptedProvider::text_reply("VERDICT: not_yet\nREASON: nothing verified yet"),
+        vec![Err(ProviderError::Auth("revoked".into()))],
+    ]));
+    let (mut handle, log_path) = session(provider, dir.path());
+
+    handle.set_goal(Some("finish the work".into())).await;
+    handle.prompt("go".into()).await;
+
+    let seen = events_until_turn_done(&mut handle).await;
+    let Some(EngineEvent::TurnDone { outcome, .. }) = seen.last() else {
+        unreachable!()
+    };
+    assert!(matches!(outcome, Outcome::Error { .. }), "{outcome:?}");
+    assert_eq!(
+        verdicts(&seen),
+        vec![(GoalVerdictKind::NotYet, 1), (GoalVerdictKind::Errored, 1)]
+    );
+    assert!(seen
+        .iter()
+        .any(|e| matches!(e, EngineEvent::GoalChanged { condition: None })));
+    let replayed = hotl_store::replay(&log_path).expect("replay");
+    assert_eq!(replayed.goal, None);
+    // The tombstone names why, additively — `"error"` beside achieved and
+    // impossible. Read from the log itself: `replay` folds `GoalSet` down to
+    // the condition and drops the outcome word.
+    let raw = std::fs::read_to_string(&log_path).expect("log");
+    assert!(
+        raw.contains(r#""kind":"goal_set""#) && raw.contains(r#""outcome":"error""#),
+        "the goal tombstone must record why it ended: {raw}"
+    );
+}
+
+/// The other half of the rule: a transient failure is not the owner's to fix,
+/// so the goal stays armed and a later prompt picks it back up.
+#[tokio::test]
+async fn a_transient_error_leaves_the_goal_armed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("working"),
+        ScriptedProvider::text_reply("VERDICT: not_yet\nREASON: nothing verified yet"),
+        vec![Err(ProviderError::Http {
+            status: 429,
+            message: "slow down".into(),
+            retry_after: None,
+        })],
+    ]));
+    let (mut handle, log_path) = session(provider, dir.path());
+
+    handle.set_goal(Some("finish the work".into())).await;
+    handle.prompt("go".into()).await;
+
+    let seen = events_until_turn_done(&mut handle).await;
+    let Some(EngineEvent::TurnDone { outcome, .. }) = seen.last() else {
+        unreachable!()
+    };
+    assert!(matches!(outcome, Outcome::Error { .. }), "{outcome:?}");
+    assert_eq!(verdicts(&seen), vec![(GoalVerdictKind::NotYet, 1)]);
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, EngineEvent::GoalChanged { condition: None })),
+        "a rate limit must not clear the goal"
+    );
+    assert_eq!(
+        hotl_store::replay(&log_path)
+            .expect("replay")
+            .goal
+            .as_deref(),
+        Some("finish the work")
+    );
+}
+
+/// The pause hands control back without giving up: the next user prompt
+/// re-enters the gate with a fresh idle budget.
+#[tokio::test]
+async fn a_stalled_goal_re_arms_on_the_next_prompt() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut script: Vec<_> = (0..8).flat_map(|_| idle_turn()).collect();
+    script.push(ScriptedProvider::text_reply("done now"));
+    script.push(ScriptedProvider::text_reply(
+        "VERDICT: met\nREASON: the suite is green",
+    ));
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let (mut handle, log_path) = session(provider, dir.path());
+
+    handle.set_goal(Some("the suite is green".into())).await;
+    handle.prompt("go".into()).await;
+    let stalled = events_until_turn_done(&mut handle).await;
+    assert_eq!(
+        verdicts(&stalled).last(),
+        Some(&(GoalVerdictKind::Stalled, 8))
+    );
+
+    handle.prompt("again".into()).await;
+    let resolved = events_until_turn_done(&mut handle).await;
+    assert_eq!(verdicts(&resolved), vec![(GoalVerdictKind::Met, 9)]);
+    assert_eq!(hotl_store::replay(&log_path).expect("replay").goal, None);
 }
