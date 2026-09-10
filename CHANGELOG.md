@@ -6,6 +6,13 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Entry ids minted in one process now strictly increase**, even within a
+  single millisecond. A plain ULID orders same-millisecond ids by its random
+  half, so a log span could read as running backwards on a fast machine — the
+  nix leg of CI caught it in the fold-span test.
+
 ## [0.27.0] - 2026-09-10
 
 ### Changed

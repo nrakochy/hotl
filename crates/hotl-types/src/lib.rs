@@ -670,8 +670,16 @@ pub enum QuestionAnswer {
     NoHuman,
 }
 
+/// Ids minted in one process are strictly increasing, even within one
+/// millisecond: a plain `Ulid::new` orders same-ms ids by their random half,
+/// which broke the fold-span test on a fast nix builder. The generator only
+/// errs when the random half overflows; fall back to a fresh id then.
 pub fn new_ulid() -> String {
-    ulid::Ulid::new().to_string()
+    static GEN: std::sync::Mutex<ulid::Generator> = std::sync::Mutex::new(ulid::Generator::new());
+    let mut gen = GEN.lock().unwrap_or_else(|e| e.into_inner());
+    gen.generate()
+        .unwrap_or_else(|_| ulid::Ulid::new())
+        .to_string()
 }
 
 /// A model id with its `provider/` prefix dropped, for display only.
@@ -704,6 +712,15 @@ pub fn normalize_goal(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_minted_back_to_back_strictly_increase() {
+        // Thousands land in one millisecond; the random half must not decide.
+        let ids: Vec<String> = (0..5000).map(|_| new_ulid()).collect();
+        for w in ids.windows(2) {
+            assert!(w[1] > w[0], "{} then {}", w[0], w[1]);
+        }
+    }
 
     fn roundtrip<T: Serialize + for<'a> Deserialize<'a>>(v: &T) -> String {
         let a = serde_json::to_string(v).unwrap();
