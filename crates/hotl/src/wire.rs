@@ -57,6 +57,14 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         } => {
             json!({"type": "tool_done", "id": id, "name": name, "ok": ok, "lines": lines, "bytes": bytes})
         }
+        EngineEvent::ToolQueued {
+            id,
+            name,
+            summary,
+            ahead,
+        } => {
+            json!({"type": "tool_queued", "id": id, "name": name, "summary": summary, "ahead": ahead})
+        }
         EngineEvent::Compacting { items } => {
             json!({"type": "compacting", "items": items})
         }

@@ -426,6 +426,16 @@ pub enum EngineEvent {
         lines: u64,
         bytes: u64,
     },
+    /// A call that is approved but waiting on the `subprocs` permit (0061
+    /// T17). `ahead` is how many callers were already queued — process-wide,
+    /// since children share the budget. Emitted before `ToolStart`, which
+    /// still marks the real start.
+    ToolQueued {
+        id: String,
+        name: String,
+        summary: String,
+        ahead: usize,
+    },
     /// A running tool's newest output line and its raw counts (0061 T13).
     /// Never a log entry (the `ChildTool` precedent): it is a view of work in
     /// flight, and `ToolDone` is the record. Lossy by design — sent with
@@ -624,6 +634,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::ThinkingDelta(_) => write!(f, "ThinkingDelta"),
             Self::ToolStart { name, .. } => write!(f, "ToolStart({name})"),
             Self::ToolDone { name, ok, .. } => write!(f, "ToolDone({name},{ok})"),
+            Self::ToolQueued { name, ahead, .. } => write!(f, "ToolQueued({name},ahead={ahead})"),
             Self::Compacting { items } => write!(f, "Compacting({items})"),
             Self::ToolProgress { name, lines, .. } => write!(f, "ToolProgress({name},{lines})"),
             Self::ToolDenied { name, .. } => write!(f, "ToolDenied({name})"),

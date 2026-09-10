@@ -2687,7 +2687,9 @@ impl Surface {
                 }
             }
             // Liveness for an attached surface only; `-p` stays byte-identical.
-            EngineEvent::ToolProgress { .. } | EngineEvent::Compacting { .. } => {}
+            EngineEvent::ToolProgress { .. }
+            | EngineEvent::Compacting { .. }
+            | EngineEvent::ToolQueued { .. } => {}
             EngineEvent::ToolDenied { .. } => eprintln!("  (denied)"),
             EngineEvent::ToolAutoAllowed { name, rule, .. } => {
                 eprintln!("  (auto-allowed {name} by rule: {rule})");

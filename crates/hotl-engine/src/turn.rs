@@ -1547,10 +1547,7 @@ impl Turn {
                 results.push(pair(only, "Not executed (turn stopped).", true));
             } else {
                 let gate = self.gate(only).await;
-                let executed = {
-                    let _permit = self.subproc_permit(&only.name).await;
-                    self.execute(only, gate).await
-                };
+                let executed = self.execute(only, gate).await;
                 results.push(
                     self.finish_call(only, executed, &mut budget_blown, 1, &mut miss)
                         .await,
@@ -1588,10 +1585,7 @@ impl Turn {
                         // Inside the future, not the closure: gating stays
                         // serial, dispatch order and join order are unchanged,
                         // and only the execution itself queues on the budget.
-                        async move {
-                            let _permit = this.subproc_permit(&tu.name).await;
-                            this.execute(tu, gate).await
-                        }
+                        async move { this.execute(tu, gate).await }
                     }))
                     .await;
                 for (tu, executed) in chunk.iter().zip(outcomes) {
@@ -2009,16 +2003,37 @@ impl Turn {
     /// the call runs. `None` for a tool that blocks on a nested session
     /// (`spawn`, `workflow`): a parent holding a leaf permit across its
     /// child's own tool calls deadlocks a small `subprocs` budget.
-    async fn subproc_permit(&self, name: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    ///
+    /// A call that has to wait says so first (0061 T17): the permit is the
+    /// one wait that produced no event at all, so a queued `bash` looked
+    /// exactly like a hung session.
+    async fn subproc_permit(
+        &self,
+        tu: &ToolUse,
+        summary: &str,
+    ) -> Option<tokio::sync::OwnedSemaphorePermit> {
         if self
             .shared
             .registry
-            .get(name)
+            .get(&tu.name)
             .is_some_and(hotl_tools::Tool::awaits_child_session)
         {
             return None;
         }
-        Some(self.shared.concurrency.subproc().await)
+        if let Some(permit) = self.shared.concurrency.try_subproc() {
+            return Some(permit);
+        }
+        // Joined the queue before the announcement, so `ahead` is the depth
+        // the caller really found and not a later re-read.
+        let queue = self.shared.concurrency.subproc_queued();
+        self.emit(EngineEvent::ToolQueued {
+            id: tu.id.clone(),
+            name: tu.name.clone(),
+            summary: summary.to_string(),
+            ahead: queue.ahead,
+        })
+        .await;
+        Some(queue.acquire().await)
     }
 
     /// Execute an approved call: ToolStart → run → PostToolUse hook →
@@ -2047,6 +2062,11 @@ impl Turn {
                 }
             }
         };
+        // The permit is drawn here, after the gate resolved (0061 T17): a
+        // denied or hook-refused call used to take one and never run, and the
+        // summary a queued card shows is only in hand once the gate is past.
+        // `ToolStart` still marks the real start, so no card's clock moves.
+        let _permit = self.subproc_permit(tu, &summary).await;
         self.emit(EngineEvent::ToolStart {
             id: tu.id.clone(),
             name: tu.name.clone(),

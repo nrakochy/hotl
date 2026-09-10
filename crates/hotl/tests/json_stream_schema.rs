@@ -41,6 +41,12 @@ fn every_frame_is_tagged_and_versioned() {
             bytes: 480,
         },
         EngineEvent::Compacting { items: 42 },
+        EngineEvent::ToolQueued {
+            id: "t1".into(),
+            name: "bash".into(),
+            summary: "bash: cargo test".into(),
+            ahead: 2,
+        },
         EngineEvent::ToolDenied {
             id: "t2".into(),
             name: "write".into(),
@@ -425,6 +431,24 @@ fn tool_progress_is_a_tagged_frame_with_tail_and_counts() {
     assert_eq!(f["tail"], "Compiling hotl-engine");
     assert_eq!(f["lines"], 12);
     assert_eq!(f["bytes"], 480);
+}
+
+/// 0061 T17: the `subprocs` permit was the one wait that emitted nothing at
+/// all, so a queued `bash` looked exactly like a hung session.
+#[test]
+fn tool_queued_carries_summary_and_ahead() {
+    let f = wire::update_frame(&EngineEvent::ToolQueued {
+        id: "t1".into(),
+        name: "bash".into(),
+        summary: "bash: cargo test".into(),
+        ahead: 2,
+    })
+    .expect("tool_queued is a stream frame");
+    assert_eq!(f["type"], "tool_queued");
+    assert_eq!(f["id"], "t1");
+    assert_eq!(f["name"], "bash");
+    assert_eq!(f["summary"], "bash: cargo test");
+    assert_eq!(f["ahead"], 2);
 }
 
 /// 0061 T15: a backoff is dead air, so the frame carries everything a

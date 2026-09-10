@@ -294,6 +294,7 @@ fn update_line(update: &Value) -> Option<String> {
             // liveness. The console renders these on the card instead.
             "tool_progress" => return None,
             "compacting" => format!("(folding history — {} items)", n("items")),
+            "tool_queued" => format!("· queued: {} (behind {})", s("summary"), n("ahead")),
             // Mirrors `tool_done`'s success exemption: a child that worked
             // needs no line (0039).
             "child_tool" => match update.get("ok").and_then(Value::as_bool) {
@@ -432,6 +433,12 @@ mod tests {
                 tail: "Compiling hotl-engine".into(),
                 lines: 12,
                 bytes: 480,
+            },
+            EngineEvent::ToolQueued {
+                id: "t1".into(),
+                name: "bash".into(),
+                summary: "bash: cargo test".into(),
+                ahead: 2,
             },
             EngineEvent::ToolDenied {
                 id: "t2".into(),

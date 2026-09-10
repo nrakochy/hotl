@@ -80,6 +80,8 @@ pub struct SessionConcurrency {
     /// Children admitted and waiting for an `agents` permit. Shared with
     /// every clone, like the semaphores beside it.
     agents_queued: Arc<AtomicUsize>,
+    /// Callers waiting on a `subprocs` permit right now (0061 T17).
+    subprocs_queued: Arc<AtomicUsize>,
     requests: Arc<Semaphore>,
     subprocs: Arc<Semaphore>,
 }
@@ -102,6 +104,7 @@ impl SessionConcurrency {
             agents: mk(limits.agents),
             agents_width: limits.agents.max(1),
             agents_queued: Arc::new(AtomicUsize::new(0)),
+            subprocs_queued: Arc::new(AtomicUsize::new(0)),
             requests: mk(limits.requests),
             subprocs: mk(limits.subprocs),
         }
@@ -142,11 +145,81 @@ impl SessionConcurrency {
     pub async fn subproc(&self) -> OwnedSemaphorePermit {
         self.subprocs.clone().acquire_owned().await.unwrap()
     }
+
+    /// A `subprocs` permit if one is free right now (0061 T17). `None` means
+    /// the call is about to wait, which is the surface's cue to say so.
+    pub fn try_subproc(&self) -> Option<OwnedSemaphorePermit> {
+        self.subprocs.clone().try_acquire_owned().ok()
+    }
+
+    /// Enter the `subprocs` queue. The handle reports how many callers were
+    /// already waiting *before* anything is awaited — which is what lets a
+    /// surface announce the wait before it starts. Process-wide: children
+    /// draw from the same budget, so the depth counts every waiter in the
+    /// process, not just this session's.
+    pub fn subproc_queued(&self) -> SubprocQueue {
+        let ahead = self.subprocs_queued.fetch_add(1, Ordering::SeqCst);
+        SubprocQueue {
+            ahead,
+            queued: Arc::clone(&self.subprocs_queued),
+            subprocs: Arc::clone(&self.subprocs),
+        }
+    }
+}
+
+/// A place in the `subprocs` queue (0061 T17). Leaves the queue on drop, so
+/// a cancelled wait is not counted forever.
+pub struct SubprocQueue {
+    /// Callers already waiting when this one joined.
+    pub ahead: usize,
+    queued: Arc<AtomicUsize>,
+    subprocs: Arc<Semaphore>,
+}
+
+impl SubprocQueue {
+    pub async fn acquire(self) -> OwnedSemaphorePermit {
+        self.subprocs.clone().acquire_owned().await.unwrap()
+    }
+}
+
+impl Drop for SubprocQueue {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0061 T17: `try_subproc` is what tells a call it is about to wait, and
+    /// the queue handle reports the depth it found — before anything awaits,
+    /// so the announcement can precede the wait.
+    #[tokio::test]
+    async fn try_subproc_fails_when_exhausted_and_subproc_queued_reports_waiters_ahead() {
+        let c = SessionConcurrency::new(ConcurrencyLimits {
+            agents: 1,
+            requests: 1,
+            subprocs: 1,
+        });
+        let held = c.try_subproc().expect("the only permit is free");
+        assert!(c.try_subproc().is_none(), "the budget is exhausted");
+
+        let first = c.subproc_queued();
+        assert_eq!(first.ahead, 0, "nobody was waiting yet");
+        let second = c.subproc_queued();
+        assert_eq!(second.ahead, 1, "one caller was already in the queue");
+
+        // Leaving the queue without acquiring must not leak the count.
+        drop(second);
+        let third = c.subproc_queued();
+        assert_eq!(third.ahead, 1, "the abandoned wait left the queue");
+        drop(third);
+
+        drop(held);
+        let _permit = first.acquire().await;
+    }
+
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
