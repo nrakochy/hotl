@@ -22,6 +22,32 @@ semver promise of their own.
 
 ### Added
 
+- **A context ladder: hotl reclaims cheapest-first before it summarizes**
+  (plan 0057). At 60% of the window, tool results older than the last four
+  user turns become one-line `<cleared tool_use_id="…"/>` stubs — no model
+  call, no history lost, the session log still holds every byte — and only
+  if that isn't enough does the 80% fold pay for a summary. Clearing never
+  touches the last four turns, the turn in flight, or a `skill` result, and
+  happens at most once per prompt. `[context] keep_results` tunes the window
+  (`0` turns the rung off). The strip says `cleared N results`.
+- **`recall` is always available, over your own session history** (plan
+  0057). A built-in `session-log` backend indexes the session log — this
+  session's and every session it was resumed from — so the model can go and
+  look at what it can no longer see: a result the ladder cleared, a detail a
+  summary flattened, the exact words you used fifty turns ago. Hits are
+  reported as `session:<id>#<entry-id>` and carry one clause the model is
+  meant to act on: they are historical and untrusted, true when written, so
+  verify against the workspace first. Nothing is configured and nothing
+  leaves your machine. **If you had configured a `[[retrieval]]` backend you
+  now have two, so `recall` calls must name one with `backend`.**
+- **`PreCompact` and `PostCompact` hooks** (plan 0057). A `pre_compact` hook
+  is told which tool results are about to be folded away
+  (`{"foldedIds":[…],"keptFrom":…,"estimatePct":…}`) and answers
+  `{"pin":["t7"]}` to keep them verbatim through the fold; `post_compact`
+  receives the digest the model will read from then on. A hook can pin,
+  never veto — a fold the window needs is not a hook's to refuse — and a
+  hung one folds with no pins. See [hooks.md](https://hotl.dev/hooks/).
+
 - **`/goal` pauses instead of spinning, and gives up when only you can fix
   it** (plan 0051). Eight consecutive goal turns in which no tool ran now end
   the loop with `◎ goal paused …` — the goal stays set, and your next prompt
@@ -50,6 +76,15 @@ semver promise of their own.
   do. `turn_done` gains a `mispredictions` count (omitted when zero).
 
 ### Fixed
+
+- **A model with a denser tokenizer was budgeted as if it were ASCII** (plan
+  0057, tech-debt #63). The per-model chars-per-token ratio from the model
+  catalog now drives every estimate hotl makes — the compaction trigger, the
+  clear trigger, the spill threshold and `/context` — so the fullness number
+  you see and the number that folds your history read the same ruler. No
+  fold point moves for the models where the catalog agreed with the old
+  fixed ratio; models the catalog rates as denser-per-character now fold
+  slightly later rather than slightly early.
 
 - **A parallel tool batch no longer forks a child per call** (plan 0055). The
   concurrency budget's `subprocs` limit existed but nothing drew on it: a
@@ -106,6 +141,23 @@ semver promise of their own.
   any other drop; drive-relative and UNC forms still insert literally.
 
 ### Changed
+
+- **`bash` and `grep` results spill at 6,000 tokens** (plan 0057), rather
+  than the session-wide `[context] evict_tokens`: their output is a haystack
+  you wanted one needle out of, unlike a `read`, which is a file you asked
+  for in full. `[context] evict_tokens_per_tool = { bash = 12000 }` merges
+  over those defaults. A spilled result now keeps its first 1,536 *and* last
+  512 characters with the gap marked, so a build log's verdict and a stack
+  trace's cause survive alongside the command that produced them — and the
+  pointer names the line offset to `read` from.
+- **Compaction summaries copy your constraints and decisions verbatim**
+  (plan 0057). The summarizer works from two explicit lists: things to
+  reproduce word for word — your corrections and constraints (anything
+  spelled MUST, never, always, only), the plan's decisions, validation
+  results still open, every path created or modified — and things to
+  compress. The digest gains a `CONSTRAINTS` section, the newest eight tool
+  results are read at 2,048 bytes instead of 600, and each fold records the
+  log span it covers so `recall` can fetch it back.
 
 - **The goal loop says where it stands, and counts what it costs**
   (plan 0051). Both the agent's guidance and the evaluator's prompt now carry
