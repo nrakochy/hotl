@@ -6,6 +6,60 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Changed
+
+- **The transcript is quieter, and work reads as a second voice** (plan 0061).
+  Tool cards sit a column in from prose, muted, wearing a title-cased verb
+  (`Bash`, `Read`, `Wrote`) and a quiet `→` on success — only failure (`✗`) and
+  denial (`⊘`) stay loud. A settled card moves its clock to a faint result row
+  that also says how much came back (`└ 1,204 lines · 8s`). A `bash` card
+  elides the `cd …&&` prefix to the directory it lands in
+  (`hotl ❯ cargo test`). A closed run of settled, successful cards folds into
+  one line — `→ ran 2 shell commands, read 1 file · 3s` — and **Ctrl-O**
+  unfolds every rollup, the way Ctrl-T unfolds reasoning. A sub-agent card is
+  now a two-row block under a bar: the brief on top, `N calls · 43s ·
+  Read c5.rs · ↑↓ agents` beneath it. Every turn closes with one faint line
+  saying what it cost: `✻ 2m 14s · 6 calls · done 10:27`.
+- **Assistant prose renders inline `code` and `**bold**`** (plan 0061), and
+  `1.` numbered lists take the accent the way bullets do. Themes gain a ninth
+  role, `strong`, for emphasis — set it under `[theme]` like any other slot.
+
+### Added
+
+- **The console says what it is waiting for** (plan 0061). A running `bash`
+  shows its newest output line on one faint row, with a live line count on the
+  card and on the strip; ten seconds of silence reads `quiet 12s` in the
+  blocked color, on the card and on the strip alike. A call queued behind the
+  subprocess budget parks a hollow card that says how many are ahead of it.
+  Esc now shows: the strip reads `interrupting · 3s` and the hint names the
+  second press. A provider backoff shows its countdown — `retrying 2/5 ·
+  HTTP 429 · 4s left` — with the wave at rest, because nothing is computing.
+  A history fold says `folding history…` for the whole time the actor is
+  blocked on it, and a goal evaluation says `◎ evaluating`. A paused goal
+  finally reads `◎ /goal paused` instead of `active`.
+- **`thinking` counts thinking** (plan 0061). Reasoning deltas no longer flip
+  the strip to `writing · ~0 tok`; the phase stays `thinking` and reports the
+  tokens it actually thought.
+- **New stream frames**, all additive (plan 0061): `tool_progress` (a running
+  bash's newest line and raw counts, never persisted), `tool_queued`,
+  `compacting`, `goal_evaluating`; `tool_done` gained `lines`/`bytes`, and
+  `retrying` gained `delay_ms`, `max`, `status` and `scope` — so the digest's
+  and the goal evaluator's own retries are reported instead of swallowed.
+  `hotl attach` renders each of them; `hotl -p` output is unchanged.
+
+### Fixed
+
+- **A dead session server said nothing** (plan 0061). The console exited with a
+  bare code; it now prints one line — `hotl: the session server closed the
+  connection` — after the screen is restored. A failed write to the server is
+  treated the same way instead of being discarded.
+- **The echo of what you typed waited behind image loading** (plan 0061). The
+  frame is painted before the command queue drains, so a dropped 4MB image no
+  longer holds your own prompt off the screen.
+- **A running sub-agent call showed no elapsed time** in the drill-in (plan
+  0061) — the one place a stuck child could hide. It now reads on the parent's
+  clock.
+
 ## [0.26.0] - 2026-09-10
 
 ### Removed
