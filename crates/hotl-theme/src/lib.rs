@@ -15,6 +15,9 @@ pub struct Theme {
     pub faint: String,
     pub accent: String,
     pub band: String,
+    /// Emphasis in prose (0061 T10): `**bold**` takes this rather than
+    /// borrowing `active`, which means "a tool is working".
+    pub strong: String,
 }
 
 impl Default for Theme {
@@ -39,6 +42,7 @@ pub struct ThemeConfig {
     pub faint: Option<String>,
     pub accent: Option<String>,
     pub band: Option<String>,
+    pub strong: Option<String>,
 }
 
 /// Transcript spacing. A terminal can't change point size, so "roomier" is
@@ -139,6 +143,7 @@ impl ThemeConfig {
         apply(&mut base.faint, "faint", &self.faint);
         apply(&mut base.accent, "accent", &self.accent);
         apply(&mut base.band, "band", &self.band);
+        apply(&mut base.strong, "strong", &self.strong);
 
         let color_warn = (!bad.is_empty())
             .then(|| format!("ignoring invalid theme color(s): {}", bad.join(", ")));
@@ -166,6 +171,7 @@ pub fn preset(name: &str) -> Option<Theme> {
             faint: "#565f89".into(),
             accent: "#7aa2f7".into(),
             band: "#292e42".into(),
+            strong: "#ff9e64".into(),
         },
         "catppuccin" => Theme {
             active: "#f9e2af".into(),
@@ -176,6 +182,7 @@ pub fn preset(name: &str) -> Option<Theme> {
             faint: "#6c7086".into(),
             accent: "#89b4fa".into(),
             band: "#313244".into(),
+            strong: "#fab387".into(),
         },
         "gruvbox" => Theme {
             active: "#d79921".into(),
@@ -186,6 +193,7 @@ pub fn preset(name: &str) -> Option<Theme> {
             faint: "#665c54".into(),
             accent: "#458588".into(),
             band: "#3c3836".into(),
+            strong: "#fe8019".into(),
         },
         "nord" => Theme {
             active: "#ebcb8b".into(),
@@ -196,6 +204,7 @@ pub fn preset(name: &str) -> Option<Theme> {
             faint: "#4c566a".into(),
             accent: "#88c0d0".into(),
             band: "#3b4252".into(),
+            strong: "#d08770".into(),
         },
         "dracula" => Theme {
             active: "#f1fa8c".into(),
@@ -206,6 +215,7 @@ pub fn preset(name: &str) -> Option<Theme> {
             faint: "#6272a4".into(),
             accent: "#bd93f9".into(),
             band: "#44475a".into(),
+            strong: "#ffb86c".into(),
         },
         // Warm, low-blue palette — paper-white ink on a soft brown band,
         // amber accent, terracotta "active". Deliberately the antidote to
@@ -219,6 +229,7 @@ pub fn preset(name: &str) -> Option<Theme> {
             faint: "#8a7355".into(),   // soft brown — continuation bar
             accent: "#e0a458".into(),  // amber — the assistant marker, bullets
             band: "#3a2f28".into(),    // warm dark — strip/code background
+            strong: "#f2b880".into(),  // brighter amber — emphasis
         },
         _ => return None,
     })
@@ -240,6 +251,7 @@ mod palette {
         pub faint: Color,
         pub accent: Color,
         pub band: Color,
+        pub strong: Color,
     }
 
     impl From<&Theme> for Palette {
@@ -262,6 +274,7 @@ mod palette {
                 faint: slot(&t.faint, &d.faint),
                 accent: slot(&t.accent, &d.accent),
                 band: slot(&t.band, &d.band),
+                strong: slot(&t.strong, &d.strong),
             }
         }
     }
@@ -327,6 +340,29 @@ pub use palette::{blend, ramp, Palette};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0061 T10: `**bold**` needs a role of its own — borrowing `active`
+    /// would mean "a tool is working" in the middle of a sentence.
+    #[test]
+    fn every_preset_defines_strong() {
+        for name in [
+            "default",
+            "tokyo-night",
+            "catppuccin",
+            "gruvbox",
+            "nord",
+            "dracula",
+            "warm",
+        ] {
+            let t = preset(name).unwrap_or_else(|| panic!("preset {name}"));
+            assert!(
+                parse_hex(&t.strong).is_some(),
+                "{name} has no valid strong: {}",
+                t.strong
+            );
+            assert_ne!(t.strong, t.ink, "{name}: strong must read as emphasis");
+        }
+    }
 
     #[test]
     fn preset_default_equals_theme_default() {

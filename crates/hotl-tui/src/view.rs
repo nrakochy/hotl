@@ -828,20 +828,91 @@ fn assistant_line<'a>(raw: &str, in_fence: &mut bool, p: &Palette) -> (Line<'a>,
     }
     // `- ` / `* ` bullet → a `•` marker in the accent, indentation kept.
     if let Some((indent, rest)) = bullet(raw) {
-        return (
-            Line::from(vec![
-                Span::raw(indent.to_string()),
-                Span::styled("• ", Style::new().fg(p.accent)),
-                Span::styled(rest.to_string(), Style::new().fg(p.ink)),
-            ]),
-            false,
-        );
+        let mut spans = vec![
+            Span::raw(indent.to_string()),
+            Span::styled("• ", Style::new().fg(p.accent)),
+        ];
+        spans.extend(inline_spans(rest, Style::new().fg(p.ink), p));
+        return (Line::from(spans), false);
+    }
+    // `1. ` numbered item → the number in the accent, the same as a bullet's
+    // marker. Deliberately after the bullet check and before the code form.
+    if let Some((indent, marker, rest)) = numbered(raw) {
+        let mut spans = vec![
+            Span::raw(indent.to_string()),
+            Span::styled(format!("{marker} "), Style::new().fg(p.accent)),
+        ];
+        spans.extend(inline_spans(rest, Style::new().fg(p.ink), p));
+        return (Line::from(spans), false);
     }
     // A 4-space indent is markdown's other code form.
     if raw.starts_with("    ") && !raw.trim().is_empty() {
         return (code_line(raw, p), true);
     }
-    (Line::styled(raw.to_string(), Style::new().fg(p.ink)), false)
+    (
+        Line::from(inline_spans(raw, Style::new().fg(p.ink), p)),
+        false,
+    )
+}
+
+/// `(leading_indent, marker, item_text)` for a `1. ` / `12) ` numbered item.
+/// Requires digits then `.`/`)` then a space, so `3.14` in prose is not a
+/// list — the same conservatism as `heading_text`.
+fn numbered(raw: &str) -> Option<(&str, &str, &str)> {
+    let indent = &raw[..raw.len() - raw.trim_start().len()];
+    let lead = &raw[indent.len()..];
+    let digits = lead.len() - lead.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if digits == 0 {
+        return None;
+    }
+    let rest = &lead[digits..];
+    let punct = rest.chars().next()?;
+    if punct != '.' && punct != ')' {
+        return None;
+    }
+    let body = rest[punct.len_utf8()..].strip_prefix(' ')?;
+    Some((indent, &lead[..digits + punct.len_utf8()], body))
+}
+
+/// One prose line's spans: `` `code` `` in the accent (backticks stripped) and
+/// `**bold**` bold in the `strong` role. An unbalanced marker is literal text
+/// — half a span pair is a typo, not markup, and eating it would lose
+/// characters the model wrote.
+fn inline_spans<'a>(raw: &str, base: Style, p: &Palette) -> Vec<Span<'a>> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut plain = String::new();
+    let mut rest = raw;
+    while !rest.is_empty() {
+        let marker = rest
+            .find("**")
+            .map(|at| (at, "**"))
+            .into_iter()
+            .chain(rest.find('`').map(|at| (at, "`")))
+            .min_by_key(|(at, _)| *at);
+        let Some((at, mark)) = marker else { break };
+        let after = &rest[at + mark.len()..];
+        let Some(end) = after.find(mark).filter(|e| *e > 0) else {
+            // Unbalanced (or empty `` `` ``): the marker is literal.
+            plain.push_str(&rest[..at + mark.len()]);
+            rest = after;
+            continue;
+        };
+        plain.push_str(&rest[..at]);
+        if !plain.is_empty() {
+            spans.push(Span::styled(std::mem::take(&mut plain), base));
+        }
+        let inner = after[..end].to_string();
+        spans.push(match mark {
+            "`" => Span::styled(inner, Style::new().fg(p.accent)),
+            _ => Span::styled(inner, Style::new().fg(p.strong).bold()),
+        });
+        rest = &after[end + mark.len()..];
+    }
+    plain.push_str(rest);
+    if !plain.is_empty() || spans.is_empty() {
+        spans.push(Span::styled(plain, base));
+    }
+    spans
 }
 
 /// Classify+wrap only what grew since the last frame: newly *completed* lines
@@ -4769,6 +4840,124 @@ mod tests {
         item
     }
 
+    // ---- 0061 T10: inline spans in prose ----
+
+    /// The spans one prose line renders as `(text, fg, bold)`.
+    fn spans_of(raw: &str) -> Vec<(String, Option<Color>, bool)> {
+        let p = Palette::default();
+        let mut fence = false;
+        assistant_line(raw, &mut fence, &p)
+            .0
+            .spans
+            .iter()
+            .map(|s| {
+                (
+                    s.content.to_string(),
+                    s.style.fg,
+                    s.style.add_modifier.contains(Modifier::BOLD),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn inline_code_spans_render_in_the_accent() {
+        let p = Palette::default();
+        assert_eq!(
+            spans_of("run `cargo test` now"),
+            vec![
+                ("run ".to_string(), Some(p.ink), false),
+                ("cargo test".to_string(), Some(p.accent), false),
+                (" now".to_string(), Some(p.ink), false),
+            ],
+            "the backticks are stripped, not styled"
+        );
+    }
+
+    /// Half a marker pair is a typo, not markup — eating it would lose
+    /// characters the model wrote.
+    #[test]
+    fn an_unbalanced_backtick_stays_plain() {
+        let p = Palette::default();
+        assert_eq!(
+            spans_of("half ` open"),
+            vec![("half ` open".to_string(), Some(p.ink), false)]
+        );
+        assert_eq!(
+            spans_of("a ** b"),
+            vec![("a ** b".to_string(), Some(p.ink), false)]
+        );
+        // An empty pair is nothing to emphasize.
+        assert_eq!(
+            spans_of("a `` b"),
+            vec![("a `` b".to_string(), Some(p.ink), false)]
+        );
+    }
+
+    #[test]
+    fn bold_spans_render_bold_in_the_strong_role() {
+        let p = Palette::default();
+        assert_eq!(
+            spans_of("this **matters** a lot"),
+            vec![
+                ("this ".to_string(), Some(p.ink), false),
+                ("matters".to_string(), Some(p.strong), true),
+                (" a lot".to_string(), Some(p.ink), false),
+            ]
+        );
+    }
+
+    #[test]
+    fn numbered_list_markers_render_in_the_accent() {
+        let p = Palette::default();
+        assert_eq!(
+            spans_of("1. first"),
+            vec![
+                (String::new(), None, false),
+                ("1. ".to_string(), Some(p.accent), false),
+                ("first".to_string(), Some(p.ink), false),
+            ]
+        );
+        // `12) ` counts too; `3.14` in prose does not.
+        assert_eq!(spans_of("12) twelfth")[1].0, "12) ");
+        assert_eq!(
+            spans_of("3.14 is pi"),
+            vec![("3.14 is pi".to_string(), Some(p.ink), false)]
+        );
+    }
+
+    #[test]
+    fn spans_compose_inside_bullets_and_numbered_items() {
+        let p = Palette::default();
+        let bullet = spans_of("- run `cargo test`");
+        assert_eq!(bullet[1], ("• ".to_string(), Some(p.accent), false));
+        assert_eq!(bullet[3], ("cargo test".to_string(), Some(p.accent), false));
+        let numbered = spans_of("2. **do** it");
+        assert_eq!(numbered[1], ("2. ".to_string(), Some(p.accent), false));
+        assert_eq!(numbered[2], ("do".to_string(), Some(p.strong), true));
+    }
+
+    /// Headings and code keep their own treatment: a `#` line is bold ink and
+    /// a fenced line is code, markers and all.
+    #[test]
+    fn headings_and_code_lines_keep_their_markers() {
+        let p = Palette::default();
+        assert_eq!(
+            spans_of("# a `b` heading"),
+            vec![("a `b` heading".to_string(), None, false)],
+            "a heading keeps its backticks and stays one line-styled span"
+        );
+        let heading = assistant_line("# a `b` heading", &mut false, &p).0;
+        assert_eq!(
+            heading.style.fg,
+            Some(p.ink),
+            "heading colour is line-level"
+        );
+        let mut fence = true;
+        let code = assistant_line("let x = `y`;", &mut fence, &p).0;
+        assert_eq!(code.spans.len(), 1, "fenced code is untouched");
+    }
+
     /// 0061 T9: the closing line is Harness voice at the prose column, in the
     /// quietest role — a full stop, not a result.
     #[test]
@@ -6132,7 +6321,9 @@ mod tests {
     /// text — same split, classifier, wrap, and spine-first rule.
     #[test]
     fn incremental_assistant_rows_equal_cold_render() {
-        let corpus = "# h\ntext **b**\n```rust\nlet x = 1;\n```\n- a\n- b\n    code\nplain\n";
+        // 0061 T10 extends the corpus with the inline forms: a code span, a
+        // bold run, an unbalanced marker and a numbered item.
+        let corpus = "# h\ntext **b**\n```rust\nlet x = 1;\n```\n- a `x`\n- **b**\n    code\nplain `y` and **z**\nhalf ` open\n1. first `f`\n2) second\n";
         let p = Palette::default();
         for chunk in 1..=9usize {
             let mut item = TranscriptItem::Assistant { text: "".into() };
