@@ -274,7 +274,9 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
                 ToolStatus::Done => 1u8.hash(&mut h),
                 ToolStatus::Failed => 2u8.hash(&mut h),
                 ToolStatus::Denied => 3u8.hash(&mut h),
-                ToolStatus::AutoAllowed { rule } => (4u8, rule).hash(&mut h),
+                // The depth is rendered, so it is hashed (0061 T24).
+                ToolStatus::Queued { ahead } => (4u8, ahead).hash(&mut h),
+                ToolStatus::AutoAllowed { rule } => (5u8, rule).hash(&mut h),
             }
             // 0039: everything `item_block` reads from the merged calls and
             // nested children. `started_at`/`settled_at` deliberately NOT
@@ -1142,6 +1144,12 @@ fn item_block<'a>(
             if let ToolStatus::AutoAllowed { rule } = status {
                 details.push(format!("auto-allowed: {rule}"));
             }
+            if let ToolStatus::Queued { ahead } = status {
+                details.push(match ahead {
+                    0 => "queued · next".to_string(),
+                    n => format!("queued behind {n}"),
+                });
+            }
             // The merged multiplier (0039 D3): one card, N absorbed calls.
             if calls.len() > 1 {
                 details.push(format!("×{}", calls.len()));
@@ -1937,6 +1945,8 @@ fn status_glyph(status: &ToolStatus, ticks: u64, p: &Palette) -> (&'static str, 
         ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
             (WORKING_FRAMES[marker_frame(ticks)], p.active)
         }
+        // Hollow and faint: parked, not working (0061 T24).
+        ToolStatus::Queued { .. } => ("○", p.faint),
         ToolStatus::Done => (SETTLED_OK_GLYPH, p.muted),
         ToolStatus::Failed => ("✗", p.blocked),
         ToolStatus::Denied => ("⊘", p.blocked),
@@ -3250,7 +3260,9 @@ mod tests {
         ticks: u64,
     ) -> TranscriptItem {
         let ok = match status {
-            ToolStatus::Running | ToolStatus::AutoAllowed { .. } => None,
+            ToolStatus::Queued { .. } | ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
+                None
+            }
             ToolStatus::Done => Some(true),
             ToolStatus::Failed | ToolStatus::Denied => Some(false),
         };
@@ -3876,6 +3888,83 @@ mod tests {
         assert!(rows[0].starts_with("   ⊘ Wrote"), "{:?}", rows[0]);
         // Same column as its neighbour: the verb starts at TEXT_COL on both.
         assert_eq!(rows[0].find("Wrote"), rows[1].find("Read"));
+    }
+
+    /// 0061 T24: parked, not working — a hollow glyph in the quietest role,
+    /// and the depth it is waiting behind.
+    #[test]
+    fn a_queued_card_wears_a_hollow_glyph_and_its_queue_depth() {
+        let p = Palette::default();
+        assert_eq!(
+            status_glyph(&ToolStatus::Queued { ahead: 2 }, 0, &p),
+            ("○", p.faint)
+        );
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(tool_item(
+            "t1",
+            "bash",
+            "bash: cargo test",
+            ToolStatus::Queued { ahead: 2 },
+            0,
+        ));
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(
+            all.contains("○ Bash  cargo test · queued behind 2"),
+            "{all}"
+        );
+
+        // Next in line reads as next, not as "behind 0".
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(tool_item(
+            "t1",
+            "bash",
+            "bash: cargo test",
+            ToolStatus::Queued { ahead: 0 },
+            0,
+        ));
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(all.contains("queued · next"), "{all}");
+    }
+
+    /// Nothing has started, so there is no clock and no result.
+    #[test]
+    fn a_queued_card_has_no_elapsed_and_no_result_row() {
+        let mut s = State::new(true, "m".into());
+        let mut item = tool_item(
+            "t1",
+            "bash",
+            "bash: cargo test",
+            ToolStatus::Queued { ahead: 1 },
+            9 * anim::TICK_HZ,
+        );
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            calls[0].lines = Some(3);
+            calls[0].bytes = Some(9);
+        }
+        s.transcript.push(item);
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(!all.contains("9s"), "{all}");
+        assert!(!all.contains('└'), "{all}");
+    }
+
+    /// The depth is rendered, so it must invalidate the cached rows.
+    #[test]
+    fn a_queue_depth_change_enters_the_fingerprint() {
+        let a = tool_item(
+            "t1",
+            "bash",
+            "bash: cargo test",
+            ToolStatus::Queued { ahead: 1 },
+            0,
+        );
+        let b = tool_item(
+            "t1",
+            "bash",
+            "bash: cargo test",
+            ToolStatus::Queued { ahead: 2 },
+            0,
+        );
+        assert_ne!(item_fingerprint(&a), item_fingerprint(&b));
     }
 
     /// 0061 T3: a settled card's clock moves to a faint `└` row that also
@@ -6019,6 +6108,13 @@ mod tests {
             tool_item("b", "bash", "bash: slow", ToolStatus::Running, 0),
             tool_item("b", "bash", "bash: bad", ToolStatus::Failed, 0),
             tool_item("b", "write", "write ~/.ssh/config", ToolStatus::Denied, 0),
+            tool_item(
+                "b",
+                "bash",
+                "bash: waiting",
+                ToolStatus::Queued { ahead: 1 },
+                0,
+            ),
             spawn_with_children(ToolStatus::Done, 1),
         ] {
             let transcript = vec![
@@ -6378,6 +6474,26 @@ mod tests {
             }
             if step == 20 {
                 s.scroll = Scroll::At(1);
+            }
+            // 0061 T24: a queue→promote step, so the walk covers the parked
+            // card and the promotion that replaces it.
+            if step == 5 {
+                s.transcript.push(tool_item(
+                    "q1",
+                    "bash",
+                    "bash: cargo test",
+                    ToolStatus::Queued { ahead: 1 },
+                    0,
+                ));
+            }
+            if step == 7 {
+                if let Some(TranscriptItem::Tool { status, .. }) = s
+                    .transcript
+                    .iter_mut()
+                    .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == "q1"))
+                {
+                    *status = ToolStatus::Running;
+                }
             }
             if let Some(TranscriptItem::Tool {
                 calls, children, ..

@@ -348,11 +348,18 @@ pub struct ContextReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolStatus {
+    /// Approved, but waiting on the subprocess budget (0061 T24). `ahead` is
+    /// how many callers were queued in front. No clock: nothing has started.
+    Queued {
+        ahead: usize,
+    },
     Running,
     Done,
     Failed,
     Denied,
-    AutoAllowed { rule: String },
+    AutoAllowed {
+        rule: String,
+    },
 }
 
 /// A backoff the surface is counting down (0061 T22).
@@ -1212,6 +1219,23 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 None => ToolStatus::Running,
             };
             let name = text_of("name");
+            // A queued card promotes in place (0061 T24), never at the tail:
+            // it is the same call, and moving it would reorder the transcript
+            // around whatever landed while it waited. A promoted card does not
+            // merge — a queued run of same-key reads is N cards, not `×N`.
+            if let Some(TranscriptItem::Tool {
+                status: prev,
+                ticks,
+                ..
+            }) = state.transcript.iter_mut().rev().find(|i| {
+                matches!(i, TranscriptItem::Tool { id: card, status, .. }
+                    if *card == id && matches!(status, ToolStatus::Queued { .. }))
+            }) {
+                *prev = status;
+                *ticks = 0;
+                state.phase = Phase::Tool { name, ticks: 0 };
+                return Vec::new();
+            }
             let summary = text_of("summary");
             // 0039 D3: a consecutive same-key call absorbs into the previous
             // card instead of stacking an identical row — adjacency alone
@@ -1327,6 +1351,27 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 });
             }
             settle_phase(state);
+        }
+        // Approved but waiting on the subprocess budget (0061 T24). Its own
+        // card, parked without a clock, promoted in place by its `tool_start`.
+        "tool_queued" => {
+            let id = text_of("id");
+            let ahead = v.get("ahead").and_then(Value::as_u64).unwrap_or(0) as usize;
+            state.transcript.push(TranscriptItem::Tool {
+                id: id.clone(),
+                name: text_of("name"),
+                summary: text_of("summary"),
+                status: ToolStatus::Queued { ahead },
+                ticks: 0,
+                calls: vec![ToolCall {
+                    id,
+                    ok: None,
+                    lines: None,
+                    bytes: None,
+                }],
+                children: Vec::new(),
+                child_text: String::new(),
+            });
         }
         // Denied tools never get a `tool_start` (the engine returns before
         // running them) — the denial itself is the card, its one call
@@ -3844,6 +3889,78 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T24: a call waiting on the subprocess budget gets a parked card
+    /// that its own `tool_start` promotes — the same card, not a second one.
+    #[test]
+    fn a_tool_queued_frame_parks_a_queued_card_that_its_tool_start_promotes() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_queued","id":"p1","name":"bash","summary":"bash: cargo test","ahead":2}),
+        );
+        assert_eq!(
+            tool_statuses(&s),
+            vec![("p1".into(), ToolStatus::Queued { ahead: 2 })]
+        );
+        assert!(
+            matches!(s.phase, Phase::Sampling { .. }),
+            "a queued card is not a running tool: {:?}",
+            s.phase
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: cargo test"}),
+        );
+        assert_eq!(
+            tool_statuses(&s),
+            vec![("p1".into(), ToolStatus::Running)],
+            "one card, promoted"
+        );
+        assert!(matches!(s.phase, Phase::Tool { .. }));
+    }
+
+    /// No clock and no place on the strip: nothing has started.
+    #[test]
+    fn a_queued_card_never_ticks_or_enters_the_strip() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_queued","id":"p1","name":"bash","summary":"bash: ls","ahead":0}),
+        );
+        update(&mut s, Msg::Tick);
+        update(&mut s, Msg::Tick);
+        let Some(TranscriptItem::Tool { ticks, .. }) = s.transcript.last() else {
+            panic!("the queued card is the last item")
+        };
+        assert_eq!(*ticks, 0, "a parked card has no clock");
+        assert!(running_cards(&s).is_empty(), "it is not running");
+    }
+
+    /// Promoting at the tail would reorder the transcript around whatever
+    /// landed while the call waited.
+    #[test]
+    fn a_queued_card_promotes_in_place_not_at_the_tail() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_queued","id":"p1","name":"bash","summary":"bash: cargo test","ahead":0}),
+        );
+        upd(&mut s, json!({"type":"text_delta","text":"meanwhile"}));
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: cargo test"}),
+        );
+        assert_eq!(tool_statuses(&s).len(), 1, "no second card");
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Assistant { .. })),
+            "the prose that landed while it waited stays last: {:?}",
+            s.transcript.last()
+        );
     }
 
     /// 0061 T23 (tracker #35): the fold blocks the actor for a hook and a
