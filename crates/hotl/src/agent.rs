@@ -4947,6 +4947,54 @@ mod tests {
         assert!(reg.get("spawn").is_none(), "children never recurse");
     }
 
+    /// 0058 T7 × 0059 T5: a sub-agent's tool calls draw against **its own**
+    /// session budget, never the parent's. `count_tool_calls` has exactly one
+    /// call site and it is `self.shared` — the turn's own session — and a
+    /// child is a separate `spawn_session`, so one wide fan-out can never end
+    /// the parent's turn on `max_tool_calls`.
+    #[tokio::test]
+    async fn a_childs_tool_calls_draw_against_its_own_budget() {
+        let (mut cb, _store) = test_child_builder();
+        cb.config.max_tool_calls = 1;
+        cb.provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::tool_call(
+                "c1",
+                "glob",
+                serde_json::json!({"pattern": "*.rs"}),
+            ),
+            hotl_provider::ScriptedProvider::tool_call(
+                "c2",
+                "glob",
+                serde_json::json!({"pattern": "*.md"}),
+            ),
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let mut handle = cb
+            .spawn_child(&general, Vec::new(), None, None)
+            .expect("child spawns")
+            .handle;
+        handle.prompt("go".into()).await;
+        let outcome = loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if let EngineEvent::TurnDone { outcome, .. } = ev {
+                break outcome;
+            }
+        };
+        // The child blew its *own* cap of one, and says so in 0059's
+        // vocabulary — never the spawn queue's.
+        match outcome {
+            hotl_engine::Outcome::Budget { kind, cap, .. } => {
+                assert_eq!(kind, "tool_calls");
+                assert_eq!(cap, 1.0);
+            }
+            other => panic!("expected the session budget outcome, got {other:?}"),
+        }
+    }
+
     /// 0058 T9: `ask_user` inside a child does not park and does not invent
     /// an assumption — it tells the child to escalate through its typed
     /// return, which its caller (a model) can act on.

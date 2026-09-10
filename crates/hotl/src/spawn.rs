@@ -1807,6 +1807,50 @@ mod tests {
         assert!(after.contains("`exit 3` failed"), "{}", out.content);
     }
 
+    /// 0058 T8 × 0059 T5: a child never *parks* on an ask, so the hour-long
+    /// `ask_expiry` cannot reach one and no child is ever reported twice —
+    /// once expired, once reaped idle. `drain_child` denies a child's ask on
+    /// arrival (headless posture), and the event resets the idle clock like
+    /// any other, so a child that asks keeps its full window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_childs_ask_is_denied_on_arrival_not_parked_against_a_clock() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            // A write with no allow rule: the gate asks, and only `drain_child`
+            // can answer.
+            ScriptedProvider::tool_call("c1", "write", json!({"path": "x.txt", "content": "hi"})),
+            reports("blocked", "could not write"),
+            ScriptedProvider::text_reply("stopping"),
+        ]));
+        let tool = typed_tool(builder, spawn_dir.path().to_path_buf())
+            .with_prefix_stagger(std::time::Duration::ZERO)
+            // A one-second idle clock: if the ask parked, this would reap it.
+            .with_deadlines(1, 0);
+        let at = std::time::Instant::now();
+        let out = tool
+            .run(json!({"task": "write a file"}), CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        // Reported exactly once, as the child's own typed result — never an
+        // idle reap, and never an expiry denial.
+        assert!(
+            out.content.contains("\"outcome\": \"blocked\""),
+            "{}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("\"reason\": \"idle\""),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains("expired after"), "{}", out.content);
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(1),
+            "the ask was answered on arrival, not waited out: {:?}",
+            at.elapsed()
+        );
+    }
+
     /// 0058 T8: a child that goes silent is stopped on the idle clock and
     /// comes back `unverifiable` naming the clock, not left hanging.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
