@@ -22,6 +22,35 @@ semver promise of their own.
 
 ### Added
 
+- **Typed plan steps** (plan 0056). A `todo_write` item is a plan node now: a
+  stable id, the ids of the steps it depends on (resolved and cycle-checked
+  when you send them), an `acceptance` sentence, the exact `validate_cmd` that
+  proves it, and a `replan` flag. Two new statuses — `failed` and
+  `needs_more_steps` — join the three you had. The strip shows a failed step
+  as its own number (`3/7 ·1!`).
+- **The plan outlives the session** (plan 0056). Every `todo_write` writes
+  `<xdg-data>/hotl/plans/<project-id>/current.json` and `current.md`, filed by
+  the repo's `origin` remote (so two worktrees share one plan) or the working
+  directory. A fresh session in a project whose plan still has open steps gets
+  one reminder naming the file. `[plan] repo_dir` mirrors the markdown into
+  your repo as `hotl-plan.md`. Compaction summaries read the live plan and its
+  decisions, so a fold cannot lose the plan it was working to.
+- **A decisions log** (plan 0056). `todo_write` takes `decisions` — what you
+  chose and why — which append rather than replace, and ride the plan
+  artifact.
+- **`present_plan`** (plan 0056). In plan mode the model gets one extra tool:
+  the only way a plan reaches you. The TUI shows a card — press `a` to approve
+  (plan mode drops and the model implements one step at a time) or `r` to say
+  what to change. ACP clients approve with `session/set_plan`; `-p --plan`
+  prints the summary and the numbered steps, and exits 3 naming the paths if
+  the tree changed anyway.
+- **`/goal` conditions the harness decides itself** (plan 0056), with no model
+  and no tokens: `tests_green("<cmd>")`, `file_exists("<path>")`,
+  `output_matches("<cmd>", "<glob>")`, `no_edits_since_verify`, `turns <= N`,
+  joined with `and`/`or` and parentheses. A false check settles the turn on the
+  spot; only the prose remainder reaches the evaluator. A wholly prose
+  condition behaves as before.
+
 - **A context ladder: hotl reclaims cheapest-first before it summarizes**
   (plan 0057). At 60% of the window, tool results older than the last four
   user turns become one-line `<cleared tool_use_id="…"/>` stubs — no model
@@ -141,6 +170,18 @@ semver promise of their own.
   any other drop; drive-relative and UNC forms still insert literally.
 
 ### Changed
+
+- **The `/goal` evaluator cannot approve work the validations refute** (plan
+  0056). It works to a rubric — results not intent, a claim without a command
+  result is not evidence — and reads the harness's own record of what each
+  step's `validate_cmd` did. A `met` verdict any evidence line contradicts is
+  downgraded to *not yet*, naming the command. `goal_verdict` carries those
+  lines, and bare `/goal` shows them.
+- **A step marked `needs_more_steps` counts as open work** (plan 0056). The
+  todo gate treats `[?]` as unfinished — the model said the step needs
+  splitting, and splitting it is the next action. A `failed` step does not:
+  it was attempted and reported, and sending the model back at a step it just
+  said did not work is how a bounded gate becomes a loop.
 
 - **`bash` and `grep` results spill at 6,000 tokens** (plan 0057), rather
   than the session-wide `[context] evict_tokens`: their output is a haystack
