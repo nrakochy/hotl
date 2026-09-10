@@ -12,6 +12,7 @@ pub mod clearing;
 mod expect;
 pub mod hooks;
 mod ledger;
+mod nudge;
 pub mod plan_state;
 mod turn;
 
@@ -255,6 +256,9 @@ pub struct TurnContinuation {
     pub(crate) model_idx: usize,
     /// The doom detector's trailing signature window.
     pub(crate) call_sigs: std::collections::VecDeque<crate::turn::CallSig>,
+    /// The stagnation detectors' per-turn memo (0059 T4). Carried, so a fold
+    /// does not let an already-named pattern be named again.
+    pub(crate) nudges: crate::nudge::Detectors,
     /// Flagged decisions already notified this prompt (0037 D5). Carried so a
     /// mid-prompt compaction doesn't repeat every notice; a NEW prompt starts
     /// from `default()`, so nothing stays buried across a long session.

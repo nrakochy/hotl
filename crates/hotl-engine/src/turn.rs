@@ -748,6 +748,9 @@ struct Turn {
     /// The trailing tool-call signatures the doom-loop detector reads —
     /// bounded to [`DOOM_WINDOW`], not the whole turn.
     call_sigs: VecDeque<CallSig>,
+    /// The softer stagnation detectors (0059 T4) — each says its piece once
+    /// per turn, and the doom detector above stays the hard stop.
+    nudges: crate::nudge::Detectors,
     /// Flagged decisions already notified this prompt (0037 D5) — the floor
     /// still evaluates every call; only the notice fan-out is coalesced.
     flagged: HashSet<FlagKey>,
@@ -858,6 +861,7 @@ impl Turn {
             models,
             model_idx: cont.model_idx,
             call_sigs: cont.call_sigs,
+            nudges: cont.nudges,
             flagged: cont.flagged,
             consecutive_failures: cont.consecutive_failures,
             usage: TokenUsage::default(),
@@ -900,6 +904,7 @@ impl Turn {
             started_ms: Some(self.started_ms),
             model_idx: self.model_idx,
             call_sigs: std::mem::take(&mut self.call_sigs),
+            nudges: std::mem::take(&mut self.nudges),
             flagged: std::mem::take(&mut self.flagged),
             consecutive_failures: std::mem::take(&mut self.consecutive_failures),
             turn_extensions: self.turn_extensions,
@@ -1482,6 +1487,7 @@ impl Turn {
         // Results are final: stamp them onto this batch's window entries so
         // the next dispatch's doom check can tell repetition from polling.
         backfill_result_hashes(&mut self.call_sigs, &results);
+        let nudge_calls = nudge_ledger(uses, &results, &self.shared.registry);
         let cancelled = self.cancel.is_cancelled();
         let not_run = results
             .iter()
@@ -1516,6 +1522,19 @@ impl Turn {
                         m.got(),
                     ),
                     synthetic: Some(hotl_types::SyntheticReason::Misprediction),
+                    images: Vec::new(),
+                },
+            });
+        }
+        // The stagnation nudges (0059 T4). They ride in the SAME proposal as
+        // the results, for the misprediction reminder's reason: a second
+        // proposal after `speculate()` is a request the speculation never
+        // predicted, and so a billed mispredict.
+        for body in self.nudges.observe(&nudge_calls) {
+            entries.push(EntryPayload::Item {
+                item: Item::User {
+                    text: format!("<system-reminder>{body}</system-reminder>"),
+                    synthetic: Some(hotl_types::SyntheticReason::SystemReminder),
                     images: Vec::new(),
                 },
             });
@@ -3159,6 +3178,32 @@ fn detect_doom_loop(sigs: &[CallSig]) -> Option<String> {
         }
     }
     None
+}
+
+/// This batch's finished calls, in the shape [`crate::nudge`] reads. Only
+/// calls that actually paired with a result are folded in — a batch cut short
+/// after the first `expect` miss reports fewer results than uses.
+fn nudge_ledger(
+    uses: &[ToolUse],
+    results: &[ToolResultItem],
+    registry: &Registry,
+) -> Vec<crate::nudge::Call> {
+    uses.iter()
+        .zip(results)
+        .map(|(tu, r)| crate::nudge::Call {
+            tool: tu.name.clone(),
+            args_hash: content_hash(&tu.input.to_string()),
+            result_hash: content_hash(&r.content),
+            is_error: r.is_error,
+            target: registry
+                .get(&tu.name)
+                .filter(|t| t.edits_files())
+                .and_then(|_| tu.input.get("path"))
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            error_line: r.content.lines().next().unwrap_or_default().to_string(),
+        })
+        .collect()
 }
 
 /// Commands that mean "check the work" rather than "change it". Deliberately
