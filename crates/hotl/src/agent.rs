@@ -1709,6 +1709,7 @@ fn spawn_session_inner(
             )
             .with_prefix_stagger(prefix_stagger)
             .with_deadlines(child_deadlines.0, child_deadlines.1)
+            .with_plan(plan_provider(Arc::clone(&head_cell)))
             .with_snapshot(snapshot)
             .with_events(event_tx.downgrade()),
         ));
@@ -1814,6 +1815,21 @@ fn snapshot_provider(cell: HeadCell, session_id: String) -> crate::spawn::Snapsh
                 parent_tip_entry_id: published.leaf().map(str::to_string),
             })
         })
+    })
+}
+
+/// Reads *this session's own* plan for a child's brief (0058 T1). The same
+/// published-head read `snapshot_provider` does, and a read rather than a
+/// mailbox round trip for the same reason: writing a brief must not queue
+/// behind an in-flight turn.
+fn plan_provider(cell: HeadCell) -> crate::spawn::PlanFn {
+    Arc::new(move || {
+        let head = cell
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()?;
+        let plan = head.borrow().plan_state();
+        (!plan.is_empty()).then_some(plan)
     })
 }
 

@@ -100,6 +100,12 @@ pub struct ForkSeed {
 /// child's own log, so an ephemeral item in it would stop being ephemeral.
 pub type SnapshotFn = Arc<dyn Fn() -> BoxFuture<'static, Option<ForkSeed>> + Send + Sync>;
 
+/// Reads the parent's plan for a child's brief (0058 T1). The same
+/// published-head read [`SnapshotFn`] does, and a read for the same reason:
+/// nothing is asked of the actor, so writing a brief cannot queue behind a
+/// turn. `None` where no session is bound (a standalone test).
+pub type PlanFn = Arc<dyn Fn() -> Option<hotl_engine::plan_state::PlanState> + Send + Sync>;
+
 /// How long a later identical sibling waits for the first one's first
 /// response byte before starting anyway (`[agents] prefix_stagger_ms`, env
 /// `SPAWN_PREFIX_STAGGER_MS`). `0` disables the gate entirely.
@@ -276,6 +282,8 @@ pub struct SpawnTool {
     stagger: std::time::Duration,
     /// The child's idle and completion clocks (0058 T8).
     deadlines: ChildDeadlines,
+    /// Reads the parent's plan for the brief; `None` outside a live session.
+    plan: Option<PlanFn>,
 }
 
 impl SpawnTool {
@@ -301,6 +309,7 @@ impl SpawnTool {
                     DEFAULT_COMPLETION_GRACE_SECS,
                 )),
             },
+            plan: None,
         }
     }
 
@@ -325,6 +334,13 @@ impl SpawnTool {
     /// place that has this session's own (weak) command sender in scope.
     pub fn with_snapshot(mut self, snapshot: SnapshotFn) -> Self {
         self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Attach the parent's plan reader (0058 T1). Same registration-time
+    /// story as [`Self::with_snapshot`], and the same head cell behind it.
+    pub fn with_plan(mut self, plan: PlanFn) -> Self {
+        self.plan = Some(plan);
         self
     }
 
@@ -422,7 +438,7 @@ impl SpawnTool {
             .filter(|c| !c.trim().is_empty());
         let child_ulid = hotl_types::new_ulid();
         let scratch = self.spawn_dir.join(&child_ulid);
-        let brief = match write_task_md(&scratch, task) {
+        let brief = match write_task_md(&scratch, task, self.plan.as_ref().and_then(|p| p())) {
             Ok(path) => format!(
                 "Your brief is in {}. Read it before doing anything else; end by calling \
                  report_result.\n\n{task}",
@@ -674,20 +690,80 @@ impl SpawnTool {
 /// reason: two nudges, then take what there is).
 const MAX_REPORT_RETRIES: usize = 2;
 
+/// The slice of the parent's plan a child should see (0058 T1).
+///
+/// **Not the whole plan, deliberately.** A child briefed on one file that
+/// reads twenty unrelated steps is being invited to overstep, and a
+/// self-contained subtask is the entire premise of `spawn` — its
+/// `report_result {outcome: "completed"}` has to mean "my brief is done", not
+/// "the plan is done". Handing a child the parent's whole plan is worse than
+/// handing it none.
+///
+/// What travels:
+/// - **Every decision.** They are short, cross-cutting, and the one thing a
+///   child cannot rediscover — re-litigating or contradicting a settled
+///   choice is the expensive failure, and the cheap fix is four lines.
+/// - **Only the steps the brief names, plus the one in progress.** That is
+///   where this child's work fits; the rest is the parent's business.
+///
+/// `None` when neither half has anything, so an ordinary spawn writes exactly
+/// the two-section brief it wrote before this existed.
+fn plan_for_child(
+    plan: &hotl_engine::plan_state::PlanState,
+    brief: &str,
+) -> Option<hotl_engine::plan_state::PlanState> {
+    // Word-boundary match: a brief mentioning `n1` must not pull in `n12`.
+    let mentioned: std::collections::HashSet<&str> = brief
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let todos: Vec<hotl_types::Todo> = plan
+        .todos
+        .iter()
+        .filter(|t| {
+            t.status == hotl_types::TodoStatus::InProgress
+                || t.id.as_deref().is_some_and(|id| mentioned.contains(id))
+        })
+        .cloned()
+        .collect();
+    let slice = hotl_engine::plan_state::PlanState {
+        todos,
+        decisions: plan.decisions.clone(),
+    };
+    (!slice.is_empty()).then_some(slice)
+}
+
 /// Write the child's brief to `<scratch>/TASK.md` and return its path.
 ///
-/// `## Plan steps` / `## Decisions` are not written: the parent-side
-/// `PlanState` they would be read from is 0056's and is not in this tree
-/// (see the plan's decision log, 2026-09-09).
-fn write_task_md(scratch: &Path, brief: &str) -> std::io::Result<PathBuf> {
+/// The plan block is rendered by `PlanState::markdown` — the same renderer
+/// behind the durable artifact and the compaction digest. A brief that
+/// described the plan differently from those two would be a third source of
+/// truth about the same thing.
+fn write_task_md(
+    scratch: &Path,
+    brief: &str,
+    plan: Option<hotl_engine::plan_state::PlanState>,
+) -> std::io::Result<PathBuf> {
     use hotl_platform::PrivateFs;
     use std::io::Write;
     hotl_platform::PRIVATE_FS.create_dir_all(scratch)?;
     let path = scratch.join(hotl_tools::report_tool::TASK_FILE);
     let mut f = hotl_platform::PRIVATE_FS.create_file_truncate(&path)?;
+    write!(f, "# Brief\n\n{brief}\n")?;
+    if let Some(slice) = plan.as_ref().and_then(|p| plan_for_child(p, brief)) {
+        // Demoted to an H2 so `# Brief` stays the file's only H1; the text
+        // itself is `PlanState::markdown`'s, unchanged.
+        let md = slice.markdown();
+        write!(
+            f,
+            "\n{}\nYou are contributing to the steps above, not completing them. \
+             Report on your own brief.\n",
+            md.replacen("# Plan\n", "## Plan\n", 1)
+        )?;
+    }
     write!(
         f,
-        "# Brief\n\n{brief}\n\n## Return\n\nEnd by calling `report_result` exactly once with \
+        "\n## Return\n\nEnd by calling `report_result` exactly once with \
          `outcome` (completed | blocked | needs_input | unverifiable), a `summary` of at most \
          {} characters, `files_touched`, `commits` and `citations` (`path:line`). Prose after \
          that call is not read.\n",
@@ -1448,6 +1524,106 @@ mod tests {
             brief.contains("survey the parser"),
             "and still carries the brief inline: {brief}"
         );
+    }
+
+    /// 0058 T1 + 0056: the brief carries the parent's **decisions** whole and
+    /// only the plan steps this child's work touches. Handing a child the
+    /// parent's entire plan invites it to overstep; handing it none loses the
+    /// settled choices it cannot rediscover.
+    #[tokio::test]
+    async fn the_brief_carries_the_decisions_and_only_the_relevant_steps() {
+        use hotl_types::{Decision, Todo, TodoStatus};
+        let node = |id: &str, content: &str, status: TodoStatus| Todo {
+            content: content.into(),
+            status,
+            active_form: None,
+            id: Some(id.into()),
+            dependencies: Vec::new(),
+            acceptance: None,
+            validate_cmd: None,
+            replan: false,
+        };
+        let plan = hotl_engine::plan_state::PlanState {
+            todos: vec![
+                node("n1", "carve the parser", TodoStatus::Completed),
+                node("n2", "wire the gate", TodoStatus::InProgress),
+                node("n3", "survey the lexer", TodoStatus::Pending),
+                node("n12", "unrelated work", TodoStatus::Pending),
+            ],
+            decisions: vec![Decision {
+                when_ms: 0,
+                what: "tokio, not async-std".into(),
+                why: "the store already depends on it".into(),
+            }],
+        };
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            reports("completed", "found it"),
+            ScriptedProvider::text_reply("stopping"),
+        ]));
+        let tool = typed_tool(builder.clone(), spawn_dir.path().to_path_buf())
+            .with_prefix_stagger(std::time::Duration::ZERO)
+            .with_plan(Arc::new(move || Some(plan.clone())));
+        let out = tool
+            .run(
+                json!({"task": "do n3 for the lexer"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let scratch: Vec<_> = std::fs::read_dir(spawn_dir.path())
+            .unwrap()
+            .flatten()
+            .collect();
+        let body = std::fs::read_to_string(scratch[0].path().join("TASK.md")).unwrap();
+        // The named step and the one in progress travel.
+        assert!(body.contains("survey the lexer"), "{body}");
+        assert!(body.contains("wire the gate"), "{body}");
+        // Nothing else does — `n12` must not ride in on `n1`'s coat-tails.
+        assert!(!body.contains("carve the parser"), "{body}");
+        assert!(!body.contains("unrelated work"), "{body}");
+        // Decisions travel whole.
+        assert!(body.contains("tokio, not async-std"), "{body}");
+        assert!(body.contains("the store already depends on it"), "{body}");
+        // One H1, and the child is told the steps are not its to complete.
+        assert_eq!(
+            body.matches("\n# ").count() + body.starts_with("# ") as usize,
+            1,
+            "{body}"
+        );
+        assert!(
+            body.contains("## Plan") && body.contains("## Return"),
+            "{body}"
+        );
+        assert!(body.contains("contributing to the steps above"), "{body}");
+    }
+
+    /// An empty plan, or a brief that touches nothing, writes exactly the
+    /// two-section file it wrote before the plan block existed.
+    #[tokio::test]
+    async fn a_brief_that_touches_no_step_gets_no_plan_block() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            reports("completed", "done"),
+            ScriptedProvider::text_reply("stopping"),
+        ]));
+        let empty = hotl_engine::plan_state::PlanState::default();
+        let tool = typed_tool(builder, spawn_dir.path().to_path_buf())
+            .with_prefix_stagger(std::time::Duration::ZERO)
+            .with_plan(Arc::new(move || Some(empty.clone())));
+        let out = tool
+            .run(json!({"task": "summarize a.rs"}), CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        let scratch: Vec<_> = std::fs::read_dir(spawn_dir.path())
+            .unwrap()
+            .flatten()
+            .collect();
+        let body = std::fs::read_to_string(scratch[0].path().join("TASK.md")).unwrap();
+        assert!(body.starts_with("# Brief\n"), "{body}");
+        assert!(!body.contains("## Plan"), "{body}");
+        assert!(body.contains("## Return"), "{body}");
     }
 
     /// A child that calls `report_result` answers with the file, not its prose.

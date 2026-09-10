@@ -117,6 +117,15 @@ there because a long brief is recalled better when the child can go back and
 re-read it; the inline copy is what makes the first turn actionable without
 one.
 
+`TASK.md` also carries a **slice** of your plan, when you have one: every
+decision you have recorded, and only the steps the brief names by id plus the
+one in progress. Not the whole plan — a child briefed on one file that reads
+twenty unrelated steps is being invited to overstep, and a self-contained
+subtask is the point. Decisions travel whole because they are short and a
+child cannot rediscover them: re-litigating a settled choice is the expensive
+failure. The child is told it is *contributing to* those steps, not
+completing them, so `completed` keeps meaning "my brief is done".
+
 It answers through a tool, not through prose. Every child carries
 `report_result`, registered past whatever `tools:` its def names — it is how
 the child speaks at all, so a narrow tool list cannot remove it:
