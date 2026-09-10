@@ -893,6 +893,14 @@ pub mod retry {
         ) || matches!(err, ProviderError::Transport(_))
     }
 
+    /// Failures no retry, fallback or compaction can clear: the owner has to
+    /// act (0051 G6). Attempt exhaustion of a retryable class is deliberately
+    /// NOT here — rate limits and outages are transient.
+    pub fn is_unrecoverable(err: &ProviderError) -> bool {
+        matches!(err, ProviderError::Auth(_))
+            || matches!(err, ProviderError::Http { status, .. } if matches!(status, 401..=404))
+    }
+
     /// Context-overflow detection (M2 compaction trigger). Both dialects
     /// report overflow as a 400 whose message names the context/length limit;
     /// this matches on *wire error* text (structured API data, not model
@@ -1026,6 +1034,25 @@ pub mod retry {
                 parse_retry_after("Mon, 29 Feb 2016 00:00:01 GMT", 1_456_704_000),
                 Some(1)
             );
+        }
+
+        #[test]
+        fn unrecoverable_is_the_owner_must_act_set() {
+            let http = |status| ProviderError::Http {
+                status,
+                message: String::new(),
+                retry_after: None,
+            };
+            assert!(is_unrecoverable(&ProviderError::Auth("revoked".into())));
+            for status in [401, 402, 403, 404] {
+                assert!(is_unrecoverable(&http(status)), "{status}");
+            }
+            // Transient or model-fixable: the loop stays armed.
+            for status in [400, 429, 500, 529] {
+                assert!(!is_unrecoverable(&http(status)), "{status}");
+            }
+            assert!(!is_unrecoverable(&ProviderError::Transport("reset".into())));
+            assert!(!is_unrecoverable(&ProviderError::Parse("junk".into())));
         }
 
         #[test]

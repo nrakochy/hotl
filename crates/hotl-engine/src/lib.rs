@@ -195,6 +195,9 @@ pub struct TurnContinuation {
     /// "intervening completed sample" (T2-3). Read by `actor::try_compact`;
     /// a fresh continuation restarts the count at zero.
     pub(crate) samples_since_compact: u32,
+    /// Calls that executed this logical turn (0051 G1) — carried, because a
+    /// fold does not undo the work already done.
+    pub(crate) tools_ran: u32,
 }
 
 /// A compaction digest computed speculatively *during* the turn, overlapping
@@ -735,6 +738,12 @@ pub enum SessionCmd {
         /// Mispredicted tool results this turn (0050 T5), summed into the
         /// goal loop's carry exactly like `usage`.
         mispredictions: u32,
+        /// Calls that executed this logical turn, denials excluded — the
+        /// goal gate's "did anything happen?" (0051 G1).
+        tools_ran: u32,
+        /// The error outcome, if any, is one the owner must fix (auth,
+        /// 401/402/403/404) rather than one a retry could clear (0051 G6).
+        unrecoverable: bool,
     },
     /// Test-only: bump the actor's masking-rules epoch by one
     /// (commit-protocol.md §Proposal payloads' `rules_epoch` guard). Nothing

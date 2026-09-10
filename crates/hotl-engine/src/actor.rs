@@ -1192,6 +1192,7 @@ pub(crate) async fn run(
                 end,
                 usage,
                 mispredictions,
+                ..
             } => {
                 // The turn is over, so nothing will answer an open batch now.
                 // Close it, then let held steers land before a queued prompt
@@ -2578,6 +2579,9 @@ fn respawn_turn(
                     }),
                     usage: TokenUsage::default(),
                     mispredictions: 0,
+                    tools_ran: 0,
+                    // A panic is a hotl bug, not a dead credential.
+                    unrecoverable: false,
                 })
                 .await;
         }

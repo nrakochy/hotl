@@ -130,6 +130,8 @@ pub(crate) async fn run(
     let end = seal_end(end, turn.pipeline.drain().await);
     let usage = turn.usage;
     let mispredictions = turn.mispredictions;
+    let tools_ran = turn.tools_ran;
+    let unrecoverable = turn.unrecoverable;
     // Flush the ledger (§S1) on the existing event channel — never the
     // canon log — before telling the actor the turn is over.
     let report = turn.ledger.summary(crate::ledger::max_rss_bytes());
@@ -139,6 +141,8 @@ pub(crate) async fn run(
             end,
             usage,
             mispredictions,
+            tools_ran,
+            unrecoverable,
         })
         .await;
 }
@@ -767,6 +771,14 @@ struct Turn {
     /// Completed samples since the last fold — the "intervening progress" the
     /// compaction streak is defined against (T2-3).
     samples_since_compact: u32,
+    /// Calls that executed this logical turn, denials and hook blocks
+    /// excluded (0051 G1). Crosses a fold: the goal gate reads it to tell a
+    /// turn that did something from one that only talked.
+    tools_ran: u32,
+    /// The turn's error, if it has one, is the owner's to fix (0051 G6).
+    /// Set where the `ProviderError` is still typed; never carried across a
+    /// fold, because a continuation has not failed yet.
+    unrecoverable: bool,
     /// Loop-overhead instrument (§S1) — one per `Turn`, flushed once as an
     /// `EngineEvent::LedgerReport` when [`run`] returns.
     ledger: crate::ledger::LoopLedger,
@@ -846,6 +858,8 @@ impl Turn {
             // inherited was already read by `try_compact`, and re-carrying it
             // would let one productive stretch excuse every later fold.
             samples_since_compact: 0,
+            tools_ran: cont.tools_ran,
+            unrecoverable: false,
             // Deliberately NOT carried across a compaction respawn: each
             // `Turn` task flushes its own report when it ends (see `run`).
             ledger: crate::ledger::LoopLedger::new(),
@@ -868,6 +882,7 @@ impl Turn {
             mispredictions: self.mispredictions,
             max_tokens_continues: self.max_tokens_continues,
             samples_since_compact: self.samples_since_compact,
+            tools_ran: self.tools_ran,
         }
     }
 
@@ -1520,7 +1535,12 @@ impl Turn {
             .is_none()
             .then(|| crate::expect::check(&tu.name, &tu.input, &executed.outcome))
             .flatten();
+        // Read before `executed` moves into the failure budget.
+        let chargeable = executed.chargeable;
         let (mut content, failed) = self.apply_failure_budget(tu, executed, budget_blown);
+        if call_executed(failed, chargeable) {
+            self.tools_ran += 1;
+        }
         if let Some(m) = found {
             content.push_str(&m.trailer());
             // A malformed prediction is the model's own mistake, not a
@@ -2162,6 +2182,10 @@ impl Turn {
                                 });
                             }
                         }
+                        // The one place the error is still typed (0050 T3
+                        // moved this arm out of `sample`), so it is where the
+                        // goal gate's "the owner must act" fact is decided.
+                        self.unrecoverable = retry::is_unrecoverable(&e);
                         drain_to_end(&mut stream).await;
                         return Err(if retry::is_availability(&e) {
                             SampleEnd::Unavailable(e.to_string())
@@ -2956,10 +2980,34 @@ fn prune_unsigned_trailing_thinking(blocks: &mut Vec<Value>) {
     }
 }
 
+/// Did the call actually run (0051 decision 1)? Everything except the
+/// not-a-malfunction-and-not-retryable branch of [`Turn::apply_failure_budget`]
+/// — a human denial, a hook block, an interrupted turn. `failed` is the
+/// tool's own `is_error`; `chargeable` is whether the model could fix it by
+/// trying again.
+fn call_executed(failed: bool, chargeable: bool) -> bool {
+    !(failed && !chargeable)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The goal gate's stall brake rests on this line: a denied tool is not
+    /// progress, so plan mode and `dontask` stall out cleanly. The
+    /// end-to-end proof is `goal_gate::a_tool_call_resets_the_idle_count`.
+    #[test]
+    fn only_a_denial_fails_to_count_as_execution() {
+        // A denial / hook block: `is_error`, not chargeable.
+        assert!(!call_executed(true, false));
+        // An ok result, and a genuine tool failure the model can retry.
+        assert!(call_executed(false, true));
+        assert!(call_executed(true, true));
+        // A non-error the gate resolved without running (no such outcome
+        // today) would still count — "it answered" is the weaker claim.
+        assert!(call_executed(false, false));
+    }
 
     fn sig(name: &str, input: Value) -> CallSig {
         CallSig::new(&ToolUse {
