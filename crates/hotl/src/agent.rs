@@ -1934,6 +1934,11 @@ fn build_registry(
 /// a clean, non-recursive child). M4.
 struct HotlChildBuilder {
     provider: Arc<dyn hotl_provider::Provider>,
+    /// What the *spawning* session could do. A def narrows against it and
+    /// never past it (0058 T4) — `All` for the main session, which is the
+    /// only parent that exists today, but the intersection is where the
+    /// invariant lives, not in that fact.
+    parent_scope: hotl_tools::agents::ToolScope,
     /// The parent's hooks, run inside every child under a `child:<ulid>`
     /// actor (0058 T3). A hook is the operator's policy, and a policy that
     /// stops applying the moment work is delegated is not one.
@@ -2032,7 +2037,8 @@ impl HotlChildBuilder {
             .map(hotl_tools::diagnostics::Diagnostics::from_toml)
             .unwrap_or_default();
         let full = Registry::builtin_with_root(diagnostics, self.minify.clone(), root.into());
-        let mut registry = hotl_tools::agents::filter_registry(def, &full);
+        let mut registry =
+            hotl_tools::agents::filter_registry_under(def, &self.parent_scope, &full);
         // Registered *after* the def's filter, not through it: `report_result`
         // is how this child answers at all, so a `tools:` list must not be
         // able to leave it out (0058 T1).
@@ -2175,7 +2181,7 @@ impl HotlChildBuilder {
             |registry| SessionDeps {
                 provider: self.provider.clone(),
                 registry,
-                rules: self.rules.clone(),
+                rules: child_rules(&self.rules),
                 sandbox_enforced: self.sandbox_enforced,
                 clock: self.clock.clone(),
                 log,
@@ -2236,6 +2242,21 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
             report,
         )
     }
+}
+
+/// The parent's rules as a child must run them (0058 T4): the same allow and
+/// deny lists, forced to `dontask`.
+///
+/// A child has no human on the loop, so `ask` would deadlock and `bypass`
+/// would let a sub-agent do without a human what the human is standing right
+/// there to authorize. Inheriting the parent's mode was the bug: a `bypass`
+/// session handed every child bypass.
+fn child_rules(parent: &Arc<Rules>) -> Arc<Rules> {
+    use hotl_tools::rules::PermissionMode;
+    if parent.mode() == PermissionMode::DontAsk {
+        return parent.clone();
+    }
+    Arc::new((**parent).clone().with_mode(PermissionMode::DontAsk))
 }
 
 /// Render the parent's projection into a background block for a fork whose
@@ -2303,6 +2324,7 @@ fn child_builder(
     Arc::new(HotlChildBuilder {
         provider,
         hooks,
+        parent_scope: hotl_tools::agents::ToolScope::All,
         rules,
         clock,
         config,
@@ -4555,6 +4577,7 @@ mod tests {
         let store = tempfile::tempdir().unwrap();
         let cb = HotlChildBuilder {
             hooks: None,
+            parent_scope: hotl_tools::agents::ToolScope::All,
             minify: hotl_tools::MinifyConfig::default(),
             provider: Arc::new(hotl_provider::ScriptedProvider::new(vec![])),
             rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -4875,6 +4898,89 @@ mod tests {
         let reg = cb.child_registry(&general, &cb.cwd, None);
         assert!(reg.get("write").is_some() && reg.get("bash").is_some());
         assert!(reg.get("spawn").is_none(), "children never recurse");
+    }
+
+    /// 0058 T4: a child never inherits bypass. The parent's allow and deny
+    /// rules travel; the mode does not — a sub-agent doing without a human
+    /// what the human is standing right there to authorize is the whole
+    /// thing the envelope exists to prevent.
+    #[test]
+    fn child_never_inherits_bypass() {
+        use hotl_tools::rules::PermissionMode;
+        let parent = Arc::new(
+            hotl_tools::rules::Rules::from_toml("[[allow]]\ntool = \"bash\"\nprefix = \"ls \"\n")
+                .expect("rules parse")
+                .with_mode(PermissionMode::Bypass),
+        );
+        assert_eq!(parent.mode(), PermissionMode::Bypass);
+        let child = child_rules(&parent);
+        assert_eq!(child.mode(), PermissionMode::DontAsk);
+
+        let facts = |read_only: bool| hotl_tools::rules::CallFacts {
+            sandbox_enforced: true,
+            protected: None,
+            read_only,
+            edits_files: !read_only,
+        };
+        // The parent's own allow rule still fires inside the child.
+        assert!(matches!(
+            child.evaluate(
+                child.mode(),
+                false,
+                "bash",
+                &serde_json::json!({"command": "ls -la"}),
+                facts(false)
+            ),
+            hotl_tools::rules::Verdict::Auto { .. }
+        ));
+        // Anything mutating without a rule is denied, and the denial tells
+        // the model what to do instead.
+        let hotl_tools::rules::Verdict::Deny { rule } = child.evaluate(
+            child.mode(),
+            false,
+            "write",
+            &serde_json::json!({"path": "x", "content": "y"}),
+            facts(false),
+        ) else {
+            panic!("an unapproved mutating call must be denied, never asked")
+        };
+        assert!(rule.contains("no human to ask"), "{rule}");
+        assert!(rule.contains("read-only"), "{rule}");
+    }
+
+    /// A def narrows and never widens: `tools:` intersects with what the
+    /// spawning session itself could do.
+    #[test]
+    fn def_tools_only_narrow() {
+        use hotl_tools::agents::ToolScope;
+        let (mut cb, _store) = test_child_builder();
+        let all = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let explore = hotl_tools::agents::builtin("explore").unwrap();
+
+        // read-only def under an all parent → read-only.
+        let reg = cb.child_registry(&explore, &cb.cwd, None);
+        assert!(reg.get("read").is_some() && reg.get("write").is_none());
+
+        // all def under a read-only parent → read-only, not all.
+        cb.parent_scope = ToolScope::ReadOnly;
+        let reg = cb.child_registry(&all, &cb.cwd, None);
+        assert!(reg.get("read").is_some());
+        assert!(
+            reg.get("write").is_none() && reg.get("bash").is_none(),
+            "a def cannot widen past the session that spawned it"
+        );
+
+        // A name list intersects both ways, and read-only prunes it.
+        assert_eq!(
+            ToolScope::Only(vec!["read".into(), "bash".into()]).narrow(&ToolScope::ReadOnly),
+            ToolScope::Only(vec!["read".into()])
+        );
+        assert_eq!(
+            ToolScope::Only(vec!["read".into(), "write".into()])
+                .narrow(&ToolScope::Only(vec!["write".into(), "glob".into()])),
+            ToolScope::Only(vec!["write".into()])
+        );
+        assert_eq!(ToolScope::All.narrow(&ToolScope::All), ToolScope::All);
     }
 
     /// 0058 T3: the parent's hooks run inside a child. A hook is the

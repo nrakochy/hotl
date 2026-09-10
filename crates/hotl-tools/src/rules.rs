@@ -482,7 +482,9 @@ impl Rules {
         // read-only tools still run under dontask.
         if mode == PermissionMode::DontAsk && !facts.read_only {
             return Verdict::Deny {
-                rule: "dontask mode: not pre-approved".into(),
+                rule: "dontask mode: this call is not pre-approved and there is no human to \
+                     ask. Do only read-only work, or work an allow rule already covers"
+                    .into(),
             };
         }
         Verdict::Ask

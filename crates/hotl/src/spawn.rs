@@ -185,6 +185,20 @@ impl SpawnTool {
         // Captured at entry: the task-local is scoped around exactly this
         // future (turn.rs), so this is the spawn call's own card id.
         let parent_id = hotl_tools::current_call_id();
+        // Unknown keys are refused, not ignored: `isolation` in particular is
+        // a property of the agent def, and silently dropping it here would
+        // let a caller believe it asked for something it did not get.
+        const FIELDS: [&str; 4] = ["agent_type", "task", "fork", "validate_cmd"];
+        if let Some(obj) = input.as_object() {
+            if let Some(unknown) = obj.keys().find(|k| !FIELDS.contains(&k.as_str())) {
+                return ToolOutcome::err(format!(
+                    "`{unknown}` is not a `spawn` argument. Accepted: {}. Worktree isolation and \
+                     the tool set come from the agent def (`agents/*.md` frontmatter) or config, \
+                     never from the call — pick an `agent_type` that has what you need.",
+                    FIELDS.join(", ")
+                ));
+            }
+        }
         if input.get("agent_type").and_then(Value::as_str) == Some("teammate") {
             return ToolOutcome::err(
                 "`teammate` (a peer topology) is reserved and not available yet. \
@@ -737,7 +751,8 @@ impl Tool for SpawnTool {
                         the command."
                 }
             },
-            "required": ["task"]
+            "required": ["task"],
+            "additionalProperties": false
         })
     }
     fn permission(&self, input: &Value) -> Permission {
@@ -1261,6 +1276,34 @@ mod tests {
         // The warning is hotl's own word, outside the untrusted envelope.
         let after = out.content.split("</subagent-result>").nth(1).unwrap_or("");
         assert!(after.contains("`exit 3` failed"), "{}", out.content);
+    }
+
+    /// Isolation and the tool set are properties of the agent def, not of the
+    /// call. An unknown key is refused rather than dropped — a caller that
+    /// believes it asked for isolation and silently did not get it is worse
+    /// off than one that is told.
+    #[tokio::test]
+    async fn isolation_comes_from_the_def_not_the_call() {
+        let tool = tool(Arc::new(ScriptedChild::new()));
+        let out = tool
+            .run(
+                json!({"task": "t", "isolation": "none"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("`isolation` is not"),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("agent def"), "{}", out.content);
+        assert_eq!(
+            tool.schema()["additionalProperties"],
+            json!(false),
+            "the schema says so too, so a schema-aware client rejects it first"
+        );
+        assert!(tool.schema()["properties"].get("isolation").is_none());
     }
 
     /// The command is in the ask or it never runs — this is the only place a

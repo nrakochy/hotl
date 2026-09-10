@@ -143,6 +143,24 @@ nobody made.
 JSON schema, so they are not given `report_result`. Two return contracts in
 one roster is just a way to lose the reply.
 
+## The permission envelope
+
+What a sub-agent may do is fixed before it starts, and every axis of it only
+ever narrows:
+
+| | Where it comes from | Rule |
+| --- | --- | --- |
+| Permission mode | forced, never inherited | always `dontask` — a child has no human on the loop, so `ask` would deadlock and `bypass` would let a sub-agent do without a human what you are standing right there to authorize |
+| Allow / deny rules | inherited verbatim | your `[[allow]]`/`[[deny]]` apply inside children exactly as they do to you |
+| Tool set | the def's `tools:`, intersected with yours | `tools: all` under a read-only parent is read-only; a name you don't have is not one the child gains |
+| `spawn` / `workflow` | never present | depth-1 is structural — naming them in `tools:` does nothing |
+| Worktree isolation | the def's `isolation:`, then `[agents] isolation` | not a call argument; `spawn {isolation: …}` is refused as an unknown key |
+| Hooks | inherited | they run inside children too, under `actor: "child:<id>"` — and, as everywhere, a hook can only deny |
+
+So a mutating call inside a child runs only if one of your own allow rules
+already covered it. Anything else is denied with a message the sub-agent can
+act on, never a prompt nobody is there to answer.
+
 ## Depth, isolation, and trust
 
 - **Depth is capped at one level, structurally.** A child's registry is

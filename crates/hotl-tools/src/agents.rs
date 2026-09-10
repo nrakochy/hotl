@@ -48,6 +48,42 @@ pub enum ToolScope {
     Only(Vec<String>),
 }
 
+impl ToolScope {
+    /// This scope as seen from inside `parent`'s: the intersection, never the
+    /// union. A def can only ever narrow what the session that spawned it
+    /// could do — `tools: all` under a read-only parent is read-only, and a
+    /// name the parent does not have is not a name the child gains.
+    pub fn narrow(&self, parent: &ToolScope) -> ToolScope {
+        match (self, parent) {
+            (ToolScope::All, p) => p.clone(),
+            (c, ToolScope::All) => c.clone(),
+            (ToolScope::ReadOnly, ToolScope::ReadOnly) => ToolScope::ReadOnly,
+            (ToolScope::ReadOnly, ToolScope::Only(names))
+            | (ToolScope::Only(names), ToolScope::ReadOnly) => {
+                ToolScope::Only(read_only_names(names))
+            }
+            (ToolScope::Only(child), ToolScope::Only(parent)) => ToolScope::Only(
+                child
+                    .iter()
+                    .filter(|n| parent.contains(n))
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// The read-only members of a name list, resolved against the builtin roster
+/// — the same set `ToolScope::ReadOnly` selects.
+fn read_only_names(names: &[String]) -> Vec<String> {
+    let builtin = Registry::builtin();
+    names
+        .iter()
+        .filter(|n| builtin.get(n).is_some_and(|t| t.read_only()))
+        .cloned()
+        .collect()
+}
+
 /// Whether a child gets its own git worktree to work in.
 ///
 /// A def's `isolation:` frontmatter wins; `[agents] isolation` in config.toml
@@ -389,7 +425,14 @@ pub fn list(config_dir: &Path, include_claude: bool) -> Vec<(String, String)> {
 /// depth-1 is a structural invariant, not something a `tools:` list can
 /// override.
 pub fn filter_registry(def: &AgentDef, full: &Registry) -> Registry {
-    match &def.tools {
+    filter_registry_under(def, &ToolScope::All, full)
+}
+
+/// [`filter_registry`] against a parent whose own scope may already be
+/// narrower than everything (0058 T4). A def never widens: the roster is
+/// `def.tools.narrow(parent)`.
+pub fn filter_registry_under(def: &AgentDef, parent: &ToolScope, full: &Registry) -> Registry {
+    match def.tools.narrow(parent) {
         ToolScope::All => full.filtered(|_| true),
         ToolScope::ReadOnly => full.filtered(|t| t.read_only()),
         ToolScope::Only(names) => full.filtered(|t| names.iter().any(|n| n == t.name())),
