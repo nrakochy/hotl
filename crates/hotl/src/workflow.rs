@@ -205,7 +205,38 @@ impl WorkflowTool {
             Ok(p) => p,
             Err(e) => return ToolOutcome::err(e),
         };
-        let run_id = hotl_types::new_ulid();
+        let digest = hotl_workflow::recipe_sha256(&plan);
+        // A resume keeps the earlier run's directory: same journal, appended
+        // to, so a second resume sees everything the first one settled.
+        let (run_id, journal) = match input.get("resume").and_then(Value::as_str) {
+            Some(prior) => {
+                let dir = self.data_dir.join("workflows").join(prior);
+                match recorded_digest(&dir) {
+                    None => {
+                        return ToolOutcome::err(format!(
+                            "No run `{prior}` to resume — `{}` has no plan.json. Start a fresh \
+                             run instead.",
+                            dir.display()
+                        ))
+                    }
+                    Some(was) if was != digest => {
+                        return ToolOutcome::err(format!(
+                            "The recipe changed since run `{prior}`: it recorded {was}, this \
+                             plan is {digest}. An old run's answers do not belong to a \
+                             rewritten plan — start a fresh run, or resume the plan as it was."
+                        ))
+                    }
+                    Some(_) => (
+                        prior.to_string(),
+                        Arc::new(hotl_workflow::Journal::load(&dir)),
+                    ),
+                }
+            }
+            None => (
+                hotl_types::new_ulid(),
+                Arc::new(hotl_workflow::Journal::disabled()),
+            ),
+        };
         let summary = Arc::new(Mutex::new(RunSummary::new(&run_id, &plan)));
         lock(runs()).push(summary.clone());
         let dir = self.data_dir.join("workflows").join(&run_id);
@@ -213,11 +244,21 @@ impl WorkflowTool {
         if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
             std::fs::write(
                 dir.join("plan.json"),
-                serde_json::to_string_pretty(&plan).unwrap_or_default(),
+                serde_json::to_string_pretty(&json!({
+                    "recipe_sha256": digest,
+                    "plan": &plan,
+                }))
+                .unwrap_or_default(),
             )
         }) {
             notes.push(format!("(could not write {}: {e})", dir.display()));
         }
+        // Recording starts now for a fresh run too: this run's journal is the
+        // next resume's input.
+        let journal = match journal.is_empty() {
+            true => Arc::new(hotl_workflow::Journal::load(&dir)),
+            false => journal,
+        };
         let obs = Forwarder::new(self.events.clone().zip(parent_id));
         let runner = ChildRunner {
             prefix_stagger: self.prefix_stagger,
@@ -230,6 +271,7 @@ impl WorkflowTool {
         let outcome = hotl_workflow::run_plan(
             Run {
                 plan: &plan,
+                journal,
                 args,
                 run_id: run_id.clone(),
                 limits: self.limits,
@@ -498,6 +540,16 @@ fn fail(message: impl Into<String>) -> AgentReply {
         note: None,
         unverifiable: false,
     }
+}
+
+/// The `recipe_sha256` an earlier run recorded, or `None` if there is no
+/// readable `plan.json` there.
+fn recorded_digest(dir: &std::path::Path) -> Option<String> {
+    let raw = std::fs::read_to_string(dir.join("plan.json")).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    v.get("recipe_sha256")
+        .and_then(Value::as_str)
+        .map(str::to_string)
 }
 
 /// A terminal outcome as the structured loop wants it.
@@ -775,6 +827,13 @@ impl Tool for WorkflowTool {
                 "args": {
                     "type": "object",
                     "description": "Values the plan reads as {{args.x}} / args.x."
+                },
+                "resume": {
+                    "type": "string",
+                    "description": "A previous run id. Agents whose phase, label, prompt and \
+                        schema are unchanged replay from that run instead of running again; \
+                        everything from the first changed call onward re-runs. Refused if the \
+                        recipe itself changed."
                 }
             }
         })
@@ -996,6 +1055,141 @@ mod tests {
             config_dir,
             data_dir,
         }
+    }
+
+    /// 0058 T10: a resumed run replays the calls whose *content* is
+    /// unchanged, and re-runs from the first one that differs. Replaying by
+    /// position would be a lie — different `args` mean a different question.
+    #[tokio::test]
+    async fn journal_replays_cached_agent_results_by_content_key() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let builder = Arc::new(ScriptedBuilder::new(move |_def, brief| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            let text = brief.rsplit(' ').next().unwrap_or("?").to_string();
+            vec![ScriptedProvider::text_reply(&format!("did {text}"))]
+        }));
+        let f = fixture(builder);
+        let plan = json!({
+            "name": "one",
+            "phases": [{"title": "A", "agents": [
+                {"label": "a", "prompt": "handle {{args.x}}"}
+            ]}]
+        });
+
+        let first = f
+            .tool
+            .run(
+                json!({"plan": plan, "args": {"x": "alpha"}}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!first.is_error, "{}", first.content);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let run_id = first
+            .content
+            .split("run=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .expect("the run id is in the envelope")
+            .to_string();
+
+        // Same recipe, same args: nothing runs again.
+        let again = f
+            .tool
+            .run(
+                json!({"plan": plan, "args": {"x": "alpha"}, "resume": run_id}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!again.is_error, "{}", again.content);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "an unchanged call must replay, not re-run"
+        );
+        assert!(again.content.contains("did alpha"), "{}", again.content);
+
+        // Same recipe, different args: the rendered prompt changed, so the
+        // call is a different call and it runs.
+        let changed = f
+            .tool
+            .run(
+                json!({"plan": plan, "args": {"x": "beta"}, "resume": run_id}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!changed.is_error, "{}", changed.content);
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "a changed call re-runs");
+        assert!(changed.content.contains("did beta"), "{}", changed.content);
+    }
+
+    /// The recipe digest is the guard resume needs: an old run's answers do
+    /// not belong to a plan someone has since rewritten, and the refusal
+    /// names both hashes so it can be checked.
+    #[tokio::test]
+    async fn resume_refuses_a_changed_recipe() {
+        let builder = Arc::new(ScriptedBuilder::new(|_def, _brief| {
+            vec![ScriptedProvider::text_reply("ok")]
+        }));
+        let f = fixture(builder);
+        let plan = |title: &str| {
+            json!({
+                "name": "one",
+                "phases": [{"title": title, "agents": [{"label": "a", "prompt": "p"}]}]
+            })
+        };
+        let first = f
+            .tool
+            .run(json!({"plan": plan("A")}), CancellationToken::new())
+            .await;
+        assert!(!first.is_error, "{}", first.content);
+        let run_id = first
+            .content
+            .split("run=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap()
+            .to_string();
+
+        let refused = f
+            .tool
+            .run(
+                json!({"plan": plan("B"), "resume": run_id.clone()}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(refused.is_error, "{}", refused.content);
+        assert!(
+            refused.content.contains("The recipe changed"),
+            "{}",
+            refused.content
+        );
+        // Both hashes, so the refusal is checkable rather than an assertion.
+        let hashes: Vec<&str> = refused
+            .content
+            .split_whitespace()
+            .map(|w| w.trim_end_matches([',', '.']))
+            .filter(|w| w.len() == 64 && w.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
+        assert_eq!(hashes.len(), 2, "both hashes named: {}", refused.content);
+        assert_ne!(hashes[0], hashes[1]);
+
+        // And a run id that never existed says so, rather than resuming
+        // silently from nothing.
+        let missing = f
+            .tool
+            .run(
+                json!({"plan": plan("A"), "resume": "01NOPE"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(missing.is_error);
+        assert!(
+            missing.content.contains("No run `01NOPE`"),
+            "{}",
+            missing.content
+        );
     }
 
     fn two_phase_plan() -> Value {

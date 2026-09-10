@@ -106,6 +106,10 @@ pub struct Limits {
 
 pub struct Run<'a> {
     pub plan: &'a Plan,
+    /// The resume journal (0058 T10). A fresh run passes an empty one and
+    /// only records; a resumed run passes one loaded from the earlier run's
+    /// directory and replays the calls whose content is unchanged.
+    pub journal: Arc<crate::journal::Journal>,
     pub args: Value,
     pub run_id: String,
     pub limits: Limits,
@@ -381,6 +385,7 @@ struct Exec<'a> {
     cap: usize,
     started: AtomicUsize,
     summary: Arc<Mutex<RunSummary>>,
+    journal: Arc<crate::journal::Journal>,
 }
 
 /// How many times a run may route between phases before it is called a
@@ -390,6 +395,7 @@ const MAX_ROUTE_JUMPS: usize = 32;
 pub async fn run_plan(run: Run<'_>, runner: &dyn AgentRunner, obs: &dyn Observer) -> RunOutcome {
     let Run {
         plan,
+        journal,
         args,
         run_id,
         limits,
@@ -423,6 +429,7 @@ pub async fn run_plan(run: Run<'_>, runner: &dyn AgentRunner, obs: &dyn Observer
         cap,
         started: AtomicUsize::new(0),
         summary: summary.clone(),
+        journal,
     };
     let mut scope = Scope {
         args,
@@ -811,6 +818,34 @@ impl Exec<'_> {
             isolation: spec.isolation,
             max_turns: spec.max_turns,
         };
+        // A call whose content is unchanged from an earlier run replays from
+        // the journal (0058 T10) — no agent starts, and no permit is held
+        // for one. Recorded `Done` so the summary accounts for it.
+        let key =
+            crate::journal::content_key(&phase.title, &label, &req.prompt, req.schema.as_ref());
+        if let Some(cached) = self.journal.cached(&key) {
+            let reply = AgentReply {
+                value: Ok(cached.clone()),
+                tokens: None,
+                note: Some("replayed from the run journal".into()),
+                unverifiable: false,
+            };
+            lock(&self.summary).record(
+                &phase.title,
+                AgentRecord {
+                    id: id.clone(),
+                    label: label.clone(),
+                    status: AgentStatus::Done,
+                    tokens: None,
+                    started: Instant::now(),
+                    settled: Some(Instant::now()),
+                    error: None,
+                    note: reply.note.clone(),
+                },
+            );
+            self.obs.finished(&id, true, None);
+            return Ok(reply.value.unwrap_or(Value::Null));
+        }
         lock(&self.summary).record(
             &phase.title,
             AgentRecord {
@@ -833,6 +868,11 @@ impl Exec<'_> {
             (Err(_), false, false) => AgentStatus::Failed,
         };
         lock(&self.summary).settle(&id, status, &reply);
+        self.journal.record(
+            &key,
+            status.as_str(),
+            reply.value.as_ref().unwrap_or(&Value::Null),
+        );
         self.obs.finished(&id, reply.value.is_ok(), reply.tokens);
         if self.cancel.is_cancelled() {
             return Err(CANCELLED);
@@ -981,6 +1021,7 @@ pub(crate) mod tests {
         pub gate: Arc<Semaphore>,
         pub cancel: CancellationToken,
         pub args: Value,
+        pub journal: Arc<crate::journal::Journal>,
     }
 
     impl Default for Harness {
@@ -993,6 +1034,7 @@ pub(crate) mod tests {
                 gate: Arc::new(Semaphore::new(8)),
                 cancel: CancellationToken::new(),
                 args: json!({}),
+                journal: Arc::new(crate::journal::Journal::disabled()),
             }
         }
     }
@@ -1008,6 +1050,7 @@ pub(crate) mod tests {
             let out = run_plan(
                 Run {
                     plan,
+                    journal: self.journal.clone(),
                     args: self.args.clone(),
                     run_id: "r1".into(),
                     limits: self.limits,

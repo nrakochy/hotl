@@ -167,6 +167,26 @@ anything else as compact JSON. Inside an `each` phase, `item` is the current
 element and `prev` the previous stage's value. A template that reads a phase
 not yet run fails validation, before any agent starts.
 
+## Resuming a run
+
+A run that died on its fourth phase should not re-run the first three.
+
+```json
+{"name": "review-changes", "args": {"target": "src/"}, "resume": "01J8Z…"}
+```
+
+Every settled agent is journalled under a key made from what it was actually
+asked — phase, label, **rendered** prompt, schema. On resume, a call whose key
+matches replays from the journal and starts no agent; the first call that
+differs runs for real, and so does everything downstream of it, because those
+prompts are templated from its answer. Replaying by position would be a lie:
+different `args` mean a different question.
+
+The recipe itself is guarded by a `recipe_sha256` recorded beside the run. If
+the plan changed, resume is refused and names both hashes — an old run's
+answers do not belong to a rewritten plan. Changing `args` is not changing the
+recipe, which is exactly the case the content keys handle.
+
 ## What comes back
 
 One hotl-authored line, then the value as JSON inside the envelope, then

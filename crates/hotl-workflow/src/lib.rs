@@ -5,6 +5,7 @@
 
 pub mod discover;
 pub mod exec;
+pub mod journal;
 pub mod mermaid;
 pub mod plan;
 pub mod select;
@@ -17,6 +18,7 @@ pub use exec::{
     run_plan, AgentReply, AgentRequest, AgentRunner, AgentStatus, HumanAnswer, HumanQuestion,
     Limits, Observer, Run, RunError, RunOutcome, RunStatus, RunSummary, Silent,
 };
+pub use journal::{content_key, recipe_sha256, Journal};
 pub use plan::{
     json_schema, AgentSpec, Effort, FieldKind, HumanAction, HumanField, HumanInput, Isolation,
     Phase, Plan, PlanError, Severity, Shape,
