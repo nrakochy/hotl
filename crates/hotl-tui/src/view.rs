@@ -425,18 +425,46 @@ fn render_transcript(
         cache.rewraps += 1;
     }
 
+    // Closed runs of settled cards collapse to one line each (0061 T6). This
+    // is a row-selection pass over rows already cached, so folding and
+    // unfolding costs nothing — the cached rows are identical either way,
+    // which is why `Geometry` deliberately does not carry `tools_expanded`.
+    let folds = fold_plan(&state.transcript, state.tools_expanded);
+    let rollups: Vec<Option<Vec<Line>>> = folds
+        .iter()
+        .enumerate()
+        .map(|(i, f)| match *f {
+            RunFold::Head { end } => {
+                Some(rollup_lines(&state.transcript[i..end], p, width, gutter))
+            }
+            _ => None,
+        })
+        .collect();
+    let rows_for = |i: usize| -> &[Line] {
+        match folds[i] {
+            RunFold::Hidden => &[],
+            RunFold::Head { .. } => rollups[i].as_deref().unwrap_or(&[]),
+            RunFold::Show => &cache.items[i].rows,
+        }
+    };
+    let blank_of = |i: usize| -> usize {
+        if matches!(folds[i], RunFold::Hidden) {
+            0
+        } else {
+            blanks[i]
+        }
+    };
+
     let height = area.height as usize;
-    let rows: usize = cache.items.iter().map(|c| c.rows.len()).sum();
-    let total = rows + blanks.iter().sum::<usize>();
+    let total: usize = (0..cache.items.len())
+        .map(|i| rows_for(i).len() + blank_of(i))
+        .sum();
     // Each item above `idx` contributes its own rows plus the blank run
-    // above it.
+    // above it. A hidden item contributes neither, so `Scroll::At` on one
+    // resolves to the row just after its rollup head.
     let start_of = |idx: usize| -> usize {
-        cache
-            .items
-            .iter()
-            .zip(&blanks)
-            .take(idx)
-            .map(|(c, b)| c.rows.len() + b)
+        (0..idx.min(cache.items.len()))
+            .map(|i| rows_for(i).len() + blank_of(i))
             .sum()
     };
     let skip = match state.scroll {
@@ -455,8 +483,8 @@ fn render_transcript(
     let pad = height.saturating_sub(total);
     let mut visible: Vec<Line> = (0..pad).map(|_| Line::raw("")).collect();
     let mut row = 0usize;
-    'rows: for (i, cached) in cache.items.iter().enumerate() {
-        for _ in 0..blanks[i] {
+    'rows: for i in 0..cache.items.len() {
+        for _ in 0..blank_of(i) {
             if visible.len() == height {
                 break 'rows;
             }
@@ -465,12 +493,13 @@ fn render_transcript(
             }
             row += 1;
         }
+        let item_rows = rows_for(i);
         // Items entirely above the window are counted, never cloned.
-        if row + cached.rows.len() <= skip {
-            row += cached.rows.len();
+        if row + item_rows.len() <= skip {
+            row += item_rows.len();
             continue;
         }
-        for line in &cached.rows {
+        for line in item_rows {
             if visible.len() == height {
                 break 'rows;
             }
@@ -481,6 +510,148 @@ fn render_transcript(
         }
     }
     frame.render_widget(Paragraph::new(visible), area);
+}
+
+/// A lone settled card is already one line; folding it would only cost the
+/// reader its detail.
+const MIN_FOLD: usize = 2;
+
+/// What the fold pass decided for one transcript item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunFold {
+    /// Render this item's own rows.
+    Show,
+    /// Render one rollup line standing in for `self..end`.
+    Head { end: usize },
+    /// Folded into the head above; no rows, no blank.
+    Hidden,
+}
+
+/// Whether a card may disappear into a rollup: settled, successful, plain
+/// work. Running, failed, denied and agent cards all say something a rollup
+/// cannot, so they break a run.
+fn foldable(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::Tool { name, status, children, .. }
+            if matches!(status, ToolStatus::Done)
+                && !crate::app::is_agent_card(name)
+                && children.is_empty()
+    )
+}
+
+/// Maximal runs of foldable cards, collapsed to one line each. A run folds
+/// only when it is *closed* — something follows it — so the work you are
+/// watching right now never collapses under you; and only at `MIN_FOLD` or
+/// more, because folding one card saves nothing.
+///
+/// Deliberately a view-time pass over the transcript rather than a reducer
+/// item: a `ToolRun` item would force settle-by-id, `on_tick`, `band_spawns`
+/// and `Scroll::At` to descend into runs, and closure depends on the *next*
+/// item, which the reducer does not have when the card lands.
+fn fold_plan(transcript: &[TranscriptItem], expanded: bool) -> Vec<RunFold> {
+    let mut plan = vec![RunFold::Show; transcript.len()];
+    if expanded {
+        return plan;
+    }
+    let mut i = 0;
+    while i < transcript.len() {
+        if !foldable(&transcript[i]) {
+            i += 1;
+            continue;
+        }
+        let mut end = i;
+        while end < transcript.len() && foldable(&transcript[end]) {
+            end += 1;
+        }
+        let closed = end < transcript.len();
+        if closed && end - i >= MIN_FOLD {
+            plan[i] = RunFold::Head { end };
+            for f in &mut plan[i + 1..end] {
+                *f = RunFold::Hidden;
+            }
+        }
+        i = end;
+    }
+    plan
+}
+
+/// `ran 4 shell commands, read 1 file · 12s` — one phrase per tool, in the
+/// order the tools first appear, then the run's own elapsed. That elapsed is
+/// tool time, not wall time: cards carry ticks, not absolute stamps.
+fn rollup_text(run: &[TranscriptItem]) -> String {
+    let mut order: Vec<&str> = Vec::new();
+    let mut counts: Vec<usize> = Vec::new();
+    let mut ticks = 0u64;
+    for item in run {
+        let TranscriptItem::Tool {
+            name,
+            calls,
+            ticks: t,
+            ..
+        } = item
+        else {
+            continue;
+        };
+        ticks += t;
+        let verb = tool_verb(name);
+        let n = match &verb.fold {
+            Some(spec) if spec.per_card => 1,
+            _ => calls.len(),
+        };
+        match order.iter().position(|o| *o == name.as_str()) {
+            Some(at) => counts[at] += n,
+            None => {
+                order.push(name);
+                counts.push(n);
+            }
+        }
+    }
+    let phrases: Vec<String> = order
+        .iter()
+        .zip(&counts)
+        .filter_map(|(name, n)| tool_verb(name).phrase(*n))
+        .collect();
+    format!(
+        "{} · {}",
+        phrases.join(", "),
+        fmt_elapsed(ticks / anim::TICK_HZ)
+    )
+}
+
+/// `12s` · `2m 14s` · `1h 02m`. Shared with the turn summary so two readouts
+/// of the same number never disagree.
+fn fmt_elapsed(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m {}s", s / 60, s % 60),
+        s => format!("{}h {:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// The rows one rollup occupies. Synthesized per frame and never cached: the
+/// cards behind it keep their own cached rows, so a fold costs no re-wrap.
+fn rollup_lines(
+    run: &[TranscriptItem],
+    p: &Palette,
+    width: usize,
+    gutter: usize,
+) -> Vec<Line<'static>> {
+    let spine = Spine {
+        indent: 1,
+        marker: SETTLED_OK_GLYPH,
+        cont: " ",
+        marker_style: Style::new().fg(p.muted),
+        cont_style: Style::new(),
+    };
+    let inner = width.saturating_sub(gutter + spine.indent + 2).max(1);
+    let content = Line::styled(rollup_text(run), Style::new().fg(p.muted));
+    let mut out = Vec::new();
+    for wl in wrap::line(&content, inner) {
+        let first = out.is_empty();
+        out.push(spine.wrap(wl, gutter, first));
+    }
+    out
 }
 
 /// Who a transcript row belongs to. Blank rows fall only where this changes
@@ -912,7 +1083,7 @@ fn item_block<'a>(
             // Name in the status color (so it stays identifiable now the
             // marker moved to the spine); body and details both muted, so the
             // whole card reads as a second voice under the prose (0061 T3).
-            let mut spans = vec![Span::styled(tool_verb(name), Style::new().fg(color))];
+            let mut spans = vec![Span::styled(tool_verb(name).label, Style::new().fg(color))];
             if !body.is_empty() {
                 spans.push(Span::styled(format!("  {body}"), Style::new().fg(p.muted)));
             }
@@ -1451,25 +1622,75 @@ fn total_line<'a>(name: &str, n: u64, window: u64, note: &str, p: &Palette) -> L
     )
 }
 
-/// The card's verb for a tool name: title-case, past tense where the tool
-/// leaves something behind. `split_summary`, `merge_key`, settle-by-id, the
-/// ask modal and the drill-in header all keep the raw lowercase name — this
-/// is a rendering choice, never an identity one.
-fn tool_verb(name: &str) -> String {
+/// A card's verb and the phrase a rollup uses for a run of them — one table,
+/// so the collapsed line and the expanded card can never disagree about what
+/// a tool is called. `split_summary`, `merge_key`, settle-by-id, the ask modal
+/// and the drill-in header all keep the raw lowercase name: this is a
+/// rendering choice, never an identity one.
+struct ToolVerb {
+    /// Title-case, past tense where the tool leaves something behind.
+    label: String,
+    /// `None` = never folds into a rollup (agent and workflow cards).
+    fold: Option<FoldSpec>,
+}
+
+/// How a run of one tool's cards reads once folded. An empty `noun` takes the
+/// fallback form — `3 Skill calls` — for tools with no natural verb.
+struct FoldSpec {
+    verb: &'static str,
+    noun: &'static str,
+    /// Count cards, not absorbed calls: a merged read is one file read
+    /// several ways, and saying "read 5 files" of it would be a lie.
+    per_card: bool,
+}
+
+impl ToolVerb {
+    /// The rollup phrase for `n` of these.
+    fn phrase(&self, n: usize) -> Option<String> {
+        let spec = self.fold.as_ref()?;
+        let s = if n == 1 { "" } else { "s" };
+        Some(if spec.noun.is_empty() {
+            format!("{n} {} call{s}", self.label)
+        } else {
+            format!("{} {n} {}{s}", spec.verb, spec.noun)
+        })
+    }
+}
+
+fn tool_verb(name: &str) -> ToolVerb {
+    let known = |label: &str, verb, noun, per_card| ToolVerb {
+        label: label.into(),
+        fold: Some(FoldSpec {
+            verb,
+            noun,
+            per_card,
+        }),
+    };
     match name {
-        "bash" => "Bash".into(),
-        "read" => "Read".into(),
-        "write" => "Wrote".into(),
-        "edit" => "Edited".into(),
-        "grep" => "Searched".into(),
-        "glob" => "Listed".into(),
-        "spawn" => "Agent".into(),
-        "workflow" => "Workflow".into(),
-        other => other
-            .split('_')
-            .map(title_case)
-            .collect::<Vec<_>>()
-            .join(" "),
+        "bash" => known("Bash", "ran", "shell command", false),
+        "read" => known("Read", "read", "file", true),
+        "write" => known("Wrote", "wrote", "file", true),
+        "edit" => known("Edited", "edited", "file", true),
+        "grep" => known("Searched", "searched", "pattern", false),
+        "glob" => known("Listed", "listed", "pattern", false),
+        "spawn" => ToolVerb {
+            label: "Agent".into(),
+            fold: None,
+        },
+        "workflow" => ToolVerb {
+            label: "Workflow".into(),
+            fold: None,
+        },
+        other => known(
+            &other
+                .split('_')
+                .map(title_case)
+                .collect::<Vec<_>>()
+                .join(" "),
+            "",
+            "",
+            false,
+        ),
     }
 }
 
@@ -4531,9 +4752,6 @@ mod tests {
         assert_eq!(cache.rewraps(), 5, "the settle re-wraps only the card");
     }
 
-    /// 0061 T4: one table for every card verb. Known tools get past tense
-    /// where they leave something behind; anything else is title-cased per
-    /// `_` word rather than shouting its raw identifier.
     /// 0061 T5: the repeated `cd` prefix is the least informative thing on a
     /// bash card and the widest. Only `&&` elides; a `;` and a bare command
     /// pass through untouched.
@@ -4582,22 +4800,34 @@ mod tests {
         );
     }
 
+    /// 0061 T4/T6: one table for every card verb and the phrase its rollup
+    /// uses. Known tools get past tense where they leave something behind;
+    /// anything else is title-cased per `_` word and takes the `N X calls`
+    /// fallback. Agent cards never fold.
     #[test]
     fn tool_verb_table() {
-        for (name, want) in [
-            ("bash", "Bash"),
-            ("read", "Read"),
-            ("write", "Wrote"),
-            ("edit", "Edited"),
-            ("grep", "Searched"),
-            ("glob", "Listed"),
-            ("spawn", "Agent"),
-            ("workflow", "Workflow"),
-            ("todo_write", "Todo Write"),
-            ("skill", "Skill"),
+        for (name, label, folded) in [
+            ("bash", "Bash", Some("ran 4 shell commands")),
+            ("read", "Read", Some("read 4 files")),
+            ("write", "Wrote", Some("wrote 4 files")),
+            ("edit", "Edited", Some("edited 4 files")),
+            ("grep", "Searched", Some("searched 4 patterns")),
+            ("glob", "Listed", Some("listed 4 patterns")),
+            ("spawn", "Agent", None),
+            ("workflow", "Workflow", None),
+            ("todo_write", "Todo Write", Some("4 Todo Write calls")),
+            ("skill", "Skill", Some("4 Skill calls")),
         ] {
-            assert_eq!(tool_verb(name), want, "verb for {name}");
+            let verb = tool_verb(name);
+            assert_eq!(verb.label, label, "verb for {name}");
+            assert_eq!(verb.phrase(4).as_deref(), folded, "rollup for {name}");
         }
+        // Singulars carry no `s`.
+        assert_eq!(
+            tool_verb("bash").phrase(1).as_deref(),
+            Some("ran 1 shell command")
+        );
+        assert_eq!(tool_verb("read").phrase(1).as_deref(), Some("read 1 file"));
     }
 
     /// The card names the verb; the identity the reducer settles by is still
@@ -5231,6 +5461,238 @@ mod tests {
             unreachable!("the fixture ends with a tool card")
         };
         *ticks = to;
+    }
+
+    // ---- 0061 T6: closed runs of settled cards fold to one line ----
+
+    fn settled(id: &str, name: &str, summary: &str, secs: u64) -> TranscriptItem {
+        let mut item = tool_item(id, name, summary, ToolStatus::Done, secs * anim::TICK_HZ);
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            calls[0].lines = Some(10);
+            calls[0].bytes = Some(40);
+        }
+        item
+    }
+
+    /// The run reads as one quiet line naming what happened, not four cards
+    /// competing with the prose around them.
+    #[test]
+    fn a_closed_run_of_settled_cards_folds_to_one_muted_line() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![
+            settled("t1", "bash", "bash: echo a", 1),
+            settled("t2", "bash", "bash: echo b", 2),
+            settled("t3", "read", "read app.rs", 0),
+            TranscriptItem::Assistant {
+                text: "done".into(),
+            },
+        ];
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(
+            all.contains("→ ran 2 shell commands, read 1 file · 3s"),
+            "{all}"
+        );
+        assert!(!all.contains("echo a"), "the cards are gone: {all}");
+        let buf = draw_buffer(&s);
+        let rows = draw(&s);
+        let r = rows.iter().position(|r| r.contains("→ ran")).unwrap() as u16;
+        let col = rows[r as usize].find("ran").unwrap() as u16;
+        assert_eq!(
+            buf.cell((col, r)).unwrap().style().fg,
+            Some(Palette::default().muted),
+            "the rollup is muted"
+        );
+    }
+
+    /// Work you are still watching never collapses under you: a run only
+    /// folds once something follows it.
+    #[test]
+    fn a_run_at_the_transcript_tail_stays_open() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![
+            settled("t1", "bash", "bash: echo a", 1),
+            settled("t2", "bash", "bash: echo b", 1),
+        ];
+        assert_eq!(
+            fold_plan(&s.transcript, false),
+            vec![RunFold::Show, RunFold::Show]
+        );
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(all.contains("echo a") && all.contains("echo b"), "{all}");
+    }
+
+    /// Folding one card saves no rows and loses its detail.
+    #[test]
+    fn a_single_settled_card_never_folds() {
+        let transcript = vec![
+            settled("t1", "bash", "bash: echo a", 1),
+            TranscriptItem::Assistant { text: "ok".into() },
+        ];
+        assert_eq!(
+            fold_plan(&transcript, false),
+            vec![RunFold::Show, RunFold::Show]
+        );
+    }
+
+    /// Anything a rollup could not honestly summarize breaks the run.
+    #[test]
+    fn running_failed_denied_and_agent_cards_break_a_run() {
+        for breaker in [
+            tool_item("b", "bash", "bash: slow", ToolStatus::Running, 0),
+            tool_item("b", "bash", "bash: bad", ToolStatus::Failed, 0),
+            tool_item("b", "write", "write ~/.ssh/config", ToolStatus::Denied, 0),
+            spawn_with_children(ToolStatus::Done, 1),
+        ] {
+            let transcript = vec![
+                settled("t1", "bash", "bash: echo a", 1),
+                breaker.clone(),
+                settled("t2", "bash", "bash: echo b", 1),
+                TranscriptItem::Assistant { text: "ok".into() },
+            ];
+            assert_eq!(
+                fold_plan(&transcript, false),
+                vec![RunFold::Show; 4],
+                "no run of two survives {breaker:?}"
+            );
+        }
+    }
+
+    /// D3 merges several reads of one file into one card. The rollup counts
+    /// files, so it says `read 1 file` rather than inventing four.
+    #[test]
+    fn a_merged_read_counts_files_not_pages() {
+        let mut merged = settled("t1", "read", "read app.rs", 1);
+        if let TranscriptItem::Tool { calls, .. } = &mut merged {
+            for id in ["t2", "t3", "t4"] {
+                calls.push(crate::app::ToolCall {
+                    id: id.into(),
+                    ok: Some(true),
+                    lines: Some(10),
+                    bytes: Some(40),
+                });
+            }
+        }
+        assert_eq!(rollup_text(&[merged]), "read 1 file · 1s");
+        // A merged bash card really did run four commands.
+        let mut bash = settled("t1", "bash", "bash: echo", 1);
+        if let TranscriptItem::Tool { calls, .. } = &mut bash {
+            for id in ["t2", "t3", "t4"] {
+                calls.push(crate::app::ToolCall {
+                    id: id.into(),
+                    ok: Some(true),
+                    lines: Some(10),
+                    bytes: Some(40),
+                });
+            }
+        }
+        assert_eq!(rollup_text(&[bash]), "ran 4 shell commands · 1s");
+    }
+
+    /// The fold is row selection over rows already cached: toggling it must
+    /// not re-wrap anything.
+    #[test]
+    fn folding_changes_no_cached_rows() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![
+            settled("t1", "bash", "bash: echo a", 1),
+            settled("t2", "bash", "bash: echo b", 1),
+            TranscriptItem::Assistant { text: "ok".into() },
+        ];
+        let mut cache = TranscriptCache::default();
+        draw_cached(&s, &mut cache);
+        let after_first = cache.rewraps();
+        assert_eq!(after_first, 3, "three items, wrapped once each");
+        s.tools_expanded = true;
+        draw_cached(&s, &mut cache);
+        s.tools_expanded = false;
+        draw_cached(&s, &mut cache);
+        assert_eq!(
+            cache.rewraps(),
+            after_first,
+            "unfolding and refolding re-wrapped something"
+        );
+    }
+
+    #[test]
+    fn rollup_text_grammar() {
+        assert_eq!(
+            rollup_text(&[settled("t1", "bash", "bash: echo a", 12)]),
+            "ran 1 shell command · 12s"
+        );
+        assert_eq!(
+            rollup_text(&[
+                settled("t1", "grep", "grep TODO", 0),
+                settled("t2", "skill", "skill brainstorm", 0),
+            ]),
+            "searched 1 pattern, 1 Skill call · 0s"
+        );
+        // First-appearance order, not alphabetical.
+        assert_eq!(
+            rollup_text(&[
+                settled("t1", "read", "read a.rs", 0),
+                settled("t2", "bash", "bash: echo", 0),
+                settled("t3", "read", "read b.rs", 0),
+            ]),
+            "read 2 files, ran 1 shell command · 0s"
+        );
+    }
+
+    #[test]
+    fn fmt_elapsed_table() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(12), "12s");
+        assert_eq!(fmt_elapsed(59), "59s");
+        assert_eq!(fmt_elapsed(134), "2m 14s");
+        assert_eq!(fmt_elapsed(3600), "1h 00m");
+        assert_eq!(fmt_elapsed(3720), "1h 02m");
+    }
+
+    /// Follow still lands on the last row when rows above it disappeared.
+    #[test]
+    fn follow_scroll_lands_on_the_last_line_with_a_folded_run() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![TranscriptItem::User { text: "go".into() }];
+        for i in 0..40 {
+            s.transcript.push(settled(
+                &format!("t{i}"),
+                "bash",
+                &format!("bash: echo {i}"),
+                1,
+            ));
+        }
+        s.transcript.push(TranscriptItem::Assistant {
+            text: "the last word".into(),
+        });
+        let rows = draw(&s);
+        assert!(
+            rows[..STRIP].iter().any(|r| r.contains("the last word")),
+            "follow lost the tail: {rows:?}"
+        );
+        assert!(
+            rows[..STRIP].join("\n").contains("→ ran 40 shell commands"),
+            "{rows:?}"
+        );
+    }
+
+    /// Spacious puts a blank above every item. A hidden item is not an item.
+    #[test]
+    fn hidden_items_add_no_blank_at_spacious() {
+        let mut s = State::new(true, "m".into());
+        s.density = Density::Spacious;
+        s.transcript = vec![
+            settled("t1", "bash", "bash: echo a", 1),
+            settled("t2", "bash", "bash: echo b", 1),
+            settled("t3", "bash", "bash: echo c", 1),
+            TranscriptItem::Assistant { text: "ok".into() },
+        ];
+        let rows = draw(&s);
+        let at = rows.iter().position(|r| r.contains("→ ran")).unwrap();
+        let next = rows.iter().position(|r| r.contains("● ok")).unwrap();
+        assert_eq!(
+            next - at,
+            2,
+            "one rollup row plus one blank before the answer: {rows:?}"
+        );
     }
 
     /// 0061 T2: unlike a child's tokens, a call's line count IS rendered —

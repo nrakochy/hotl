@@ -592,6 +592,9 @@ pub struct State {
     /// Reasoning is context for a decision, not the decision — collapsed is
     /// the default posture.
     pub thinking_expanded: bool,
+    /// `Ctrl-O`: show every tool card instead of folding settled runs into
+    /// one rollup line. The twin of `thinking_expanded` for work (0061 T6).
+    pub tools_expanded: bool,
     /// Compacted pastes riding the current draft (`paste::Attachment`),
     /// keyed positionally to their `[Image #N]` / `[Pasted text #N …]`
     /// tokens. Lives here rather than in `Editor` so `$EDITOR` round-trips
@@ -671,6 +674,7 @@ impl State {
             completion: None,
             dismissed: false,
             thinking_expanded: false,
+            tools_expanded: false,
             attachments: Vec::new(),
             selection: None,
             copy_notice: None,
