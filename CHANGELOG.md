@@ -22,6 +22,30 @@ semver promise of their own.
 
 ### Added
 
+- **`[provider] effort` also takes a per-phase table** (plan 0059) — `effort =
+  { plan = "xhigh", implement = "high", verify = "xhigh" }` — applied once at
+  turn start, so every sample in a turn is billed at one depth. `plan` when
+  plan mode is on or the plan has open steps and none is in progress, `verify`
+  when the previous turn's last batch ran a test runner and edited nothing
+  (`[behavior] verify_commands` extends the built-in table), else `implement`.
+  `/effort <rung>` pins the session and stops the schedule; a bare `/effort`
+  names the schedule while it governs.
+- **`[provider] utility_model`** (`HOTL_UTILITY_MODEL`, plan 0059): the model
+  for one-off calls you pay for and never see — compaction digests and
+  `/goal` evaluations. Resolves `utility_model` → `fast_model` → the session
+  model, from one place, so the two cannot drift onto different models.
+- **`[behavior] max_tool_calls` and `max_cost_usd`** (`HOTL_MAX_TOOL_CALLS`,
+  `HOTL_MAX_COST_USD`, plan 0059): session-level caps, not per-turn. The cost
+  cap is checked before each sample goes out, priced at that sample's worst
+  case; an uncatalogued model has no price and is never refused (hotl warns
+  once at startup instead of guessing). Crossing 50%, 80% or 100% raises one
+  notice each, and the console strip carries a spend meter that turns amber at
+  80%.
+- **`[behavior] ask_expiry_secs`** (default 3600, plan 0059): a permission ask
+  parked while no client is attached is denied after this long, the denial is
+  recorded in the session log, and the turn carries on. `0` restores the old
+  wait-forever behaviour.
+
 - **Typed plan steps** (plan 0056). A `todo_write` item is a plan node now: a
   stable id, the ids of the steps it depends on (resolved and cycle-checked
   when you send them), an `acceptance` sentence, the exact `validate_cmd` that
@@ -170,6 +194,21 @@ semver promise of their own.
   any other drop; drive-relative and UNC forms still insert literally.
 
 ### Changed
+
+- **The model sees its step budget once it is nearly spent** (plan 0059). The
+  ephemeral turn-context block carries `turn_budget="80/100"` and `elapsed_s`,
+  and past 80% of `max_turns` a fixed sentence saying not to finish early
+  because the budget is low. Nothing appears below that threshold, and none of
+  it reaches the durable, cached history.
+- **Repeated identical failures, unproductive A-B-A-B cycles and four edits to
+  one file are each named once per turn** as a system reminder (plan 0059).
+  These are nudges, not stops — the doom-loop detector remains the hard stop,
+  and fires only on identical results.
+- **Three denied tool calls in a row, or twenty in one turn, end the turn**
+  with a `denial_spiral` outcome naming both counts (plan 0059). A denial has
+  never drawn down the per-tool failure budget and still does not.
+- The JSON stream gains `budget_notice` frames and `denial_spiral`/`budget`
+  turn outcomes (plan 0059). All additive; the schema version is unchanged.
 
 - **The `/goal` evaluator cannot approve work the validations refute** (plan
   0056). It works to a rubric — results not intent, a claim without a command
