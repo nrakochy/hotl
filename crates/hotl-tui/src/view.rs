@@ -2139,16 +2139,14 @@ fn render_agent_stream(
             Span::styled(format!("{cg} {}", c.name), Style::new().fg(cc)),
             Span::styled(format!("  {}", c.summary), Style::new().fg(p.ink)),
         ];
-        // Per-call duration from the parent-tick stamps, settled calls only.
-        if let Some(settled) = c.settled_at {
-            spans.push(Span::styled(
-                format!(
-                    " · {}s",
-                    settled.saturating_sub(c.started_at) / anim::TICK_HZ
-                ),
-                Style::new().fg(p.muted),
-            ));
-        }
+        // Per-call duration from the parent-tick stamps. A running child
+        // reads on the parent's live clock (0061 T29) — it used to show
+        // nothing at all, which is where a stuck child hides.
+        let end = c.settled_at.unwrap_or(*ticks);
+        spans.push(Span::styled(
+            format!(" · {}s", end.saturating_sub(c.started_at) / anim::TICK_HZ),
+            Style::new().fg(p.muted),
+        ));
         if let Some(n) = c.tokens {
             spans.push(Span::styled(
                 format!(" · {} tok", crate::app::tok(n)),
@@ -5022,6 +5020,27 @@ mod tests {
             "stream hint: {}",
             rows[HINT]
         );
+    }
+
+    /// 0061 T29: a running child used to show no elapsed at all, which is
+    /// exactly where a stuck one hides. It reads on the parent's live clock.
+    #[test]
+    fn a_running_child_shows_its_elapsed_on_the_parents_clock() {
+        let mut s = State::new(true, "m".into());
+        let mut item = spawn_with_children(ToolStatus::Running, 1);
+        if let TranscriptItem::Tool {
+            ticks, children, ..
+        } = &mut item
+        {
+            *ticks = 30 + 2 * anim::TICK_HZ;
+            children[0].started_at = 30;
+            children[0].settled_at = None;
+            children[0].ok = None;
+        }
+        s.transcript.push(item);
+        s.selected_agent = Some("s1".into());
+        let all = draw(&s).join("\n");
+        assert!(all.contains("read c1.rs · 2s"), "{all}");
     }
 
     /// 0044: a settled child that reported a token total shows it after its
