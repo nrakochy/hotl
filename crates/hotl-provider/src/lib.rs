@@ -152,7 +152,15 @@ pub enum StreamEvent {
     },
     Retrying {
         attempt: u32,
+        /// The attempt ceiling this ladder is counting toward, so a surface
+        /// can say `2/5` without knowing the policy.
+        max: u32,
         reason: String,
+        /// The jittered sleep actually about to be taken — 0 for the
+        /// re-sends that are capability probes, not backoffs (0061 T15).
+        delay_ms: u64,
+        /// The HTTP status behind it, when there was one.
+        status: Option<u16>,
     },
     /// Terminal event: the provider-assembled verbatim assistant blocks
     /// (echo these back on the next request — replay-safe by construction).
@@ -767,6 +775,15 @@ pub mod retry {
     /// hour with only Ctrl-C as an exit (T2-16).
     pub const RETRY_AFTER_CAP: Duration = Duration::from_secs(60);
 
+    /// The HTTP status behind an error, when it had one. What a surface
+    /// shows instead of a whole reason sentence (0061 T15).
+    pub fn status_of(err: &ProviderError) -> Option<u16> {
+        match err {
+            ProviderError::Http { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
     /// `attempt` is 1-based (the attempt that just failed). Deterministic and
     /// jitter-free on purpose, so the policy is exactly assertable.
     pub fn classify(err: &ProviderError, attempt: u32) -> Decision {
@@ -991,6 +1008,23 @@ pub mod retry {
                 );
             }
             assert_eq!(classify(&overload, MAX_ATTEMPTS), Decision::Fatal);
+        }
+
+        /// 0061 T15: `HTTP 429` is what a surface shows instead of a whole
+        /// sentence; a transport error has no status and must not be given a
+        /// made-up one.
+        #[test]
+        fn status_of_table() {
+            assert_eq!(
+                status_of(&ProviderError::Http {
+                    status: 429,
+                    message: "slow".into(),
+                    retry_after: None
+                }),
+                Some(429)
+            );
+            assert_eq!(status_of(&ProviderError::Transport("reset".into())), None);
+            assert_eq!(status_of(&ProviderError::Auth("bad key".into())), None);
         }
 
         /// INVARIANT (T2-16): retries are jittered, so N processes backing off

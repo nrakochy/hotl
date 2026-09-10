@@ -21,6 +21,8 @@ use hotl_types::{StopReason, TokenUsage};
 struct Ran {
     outcome: Outcome,
     retries: Vec<(u32, String, bool)>,
+    /// `(max, delay_ms, status)` per retry (0061 T15).
+    reported: Vec<(u32, u64, Option<u16>)>,
     text: String,
     log: String,
     requests: usize,
@@ -61,6 +63,7 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
     handle.prompt("go".into()).await;
 
     let mut retries = Vec::new();
+    let mut reported = Vec::new();
     let mut text = String::new();
     let outcome = loop {
         let event = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
@@ -70,9 +73,16 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
         match event {
             EngineEvent::Retrying {
                 attempt,
+                max,
                 reason,
+                delay_ms,
+                status,
                 discarded_partial,
-            } => retries.push((attempt, reason, discarded_partial)),
+                ..
+            } => {
+                retries.push((attempt, reason, discarded_partial));
+                reported.push((max, delay_ms, status));
+            }
             EngineEvent::TextDelta(t) => text.push_str(&t),
             EngineEvent::TurnDone { outcome, .. } => break outcome,
             _ => {}
@@ -90,6 +100,7 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
     Ran {
         outcome,
         retries,
+        reported,
         text,
         log: std::fs::read_to_string(&log_path).expect("read log"),
         requests,
@@ -142,6 +153,26 @@ async fn a_529_after_the_first_byte_is_resampled() {
         "the discarded partial must never reach the log"
     );
     assert!(r.text.contains("the whole answer"), "{}", r.text);
+}
+
+/// 0061 T15: nothing is computing during a backoff, so the countdown is the
+/// only liveness there is — and it has to be the sleep actually taken, not
+/// the un-jittered base.
+#[tokio::test]
+async fn a_mid_stream_retry_reports_status_and_the_delay_it_will_sleep() {
+    let r = run(vec![
+        ScriptedProvider::error_after(ScriptedProvider::partial_text("half a th"), overloaded()),
+        ScriptedProvider::text_reply("the whole answer"),
+    ])
+    .await;
+    assert_eq!(r.reported.len(), 1, "{:?}", r.reported);
+    let (max, delay_ms, status) = r.reported[0];
+    assert_eq!(status, Some(529), "the status is what the strip shows");
+    assert!(max >= 1, "the ceiling rides the frame: {max}");
+    assert!(
+        (500..=1000).contains(&delay_ms),
+        "full jitter of the 1s base: {delay_ms}"
+    );
 }
 
 /// A dead connection is the same class as a 529 — the idle watchdog reports

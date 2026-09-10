@@ -795,6 +795,8 @@ enum Attempt {
     Retry {
         reason: String,
         wait: std::time::Duration,
+        /// The status behind it, when there was one (0061 T15).
+        status: Option<u16>,
     },
     Fail(ProviderError),
 }
@@ -804,6 +806,7 @@ fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
         hotl_provider::retry::Decision::Retry { delay } => Attempt::Retry {
             reason,
             wait: hotl_provider::retry::with_jitter(delay),
+            status: hotl_provider::retry::status_of(&err),
         },
         hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
     }
@@ -959,9 +962,17 @@ impl Provider for OpenAiResponsesProvider {
                 };
                 match outcome {
                     Attempt::Ok(resp) => break resp,
-                    Attempt::Retry { reason, wait } => {
+                    Attempt::Retry { reason, wait, status } => {
                         attempts_used = attempt;
-                        yield Ok(StreamEvent::Retrying { attempt, reason });
+                        // The delay reported is the one about to be slept, so
+                        // a countdown on screen is the truth.
+                        yield Ok(StreamEvent::Retrying {
+                            attempt,
+                            max: hotl_provider::retry::MAX_ATTEMPTS,
+                            reason,
+                            delay_ms: wait.as_millis() as u64,
+                            status,
+                        });
                         tokio::time::sleep(wait).await;
                     }
                     Attempt::Fail(ProviderError::Auth(msg)) => {
@@ -971,7 +982,11 @@ impl Provider for OpenAiResponsesProvider {
                                 Ok(()) => {
                                     yield Ok(StreamEvent::Retrying {
                                         attempt,
+                                        max: hotl_provider::retry::MAX_ATTEMPTS,
                                         reason: "auth failed — re-running api_key_helper".into(),
+                                        // A probe or an auth refresh, not a backoff.
+                                        delay_ms: 0,
+                                        status: None,
                                     });
                                 }
                                 Err(ke) => {
@@ -998,8 +1013,12 @@ impl Provider for OpenAiResponsesProvider {
                         body = body_for(&req, false);
                         yield Ok(StreamEvent::Retrying {
                             attempt,
+                            max: hotl_provider::retry::MAX_ATTEMPTS,
                             reason: "endpoint rejects prompt-cache breakpoints — retrying \
                                      without; caching falls back to implicit".into(),
+                            // A probe or an auth refresh, not a backoff.
+                            delay_ms: 0,
+                            status: None,
                         });
                     }
                     Attempt::Fail(e) => {
@@ -2150,7 +2169,9 @@ mod tests {
         let events: Vec<_> = p.stream(static_req()).collect::<Vec<_>>().await;
         let oks: Vec<_> = events.into_iter().map(|e| e.expect("no error")).collect();
         assert!(
-            matches!(&oks[0], StreamEvent::Retrying { reason, .. }
+            // 0061 T15: a probe re-send sleeps nothing and has no status of
+            // its own — a countdown here would be a lie.
+            matches!(&oks[0], StreamEvent::Retrying { reason, delay_ms: 0, status: None, .. }
                 if reason.contains("prompt-cache breakpoints")),
             "{oks:?}"
         );

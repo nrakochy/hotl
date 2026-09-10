@@ -310,7 +310,27 @@ fn update_line(update: &Value) -> Option<String> {
                     format!("⚑ allowed with notice: {} — {}", s("summary"), s("why"))
                 }
             }
-            "retrying" => format!("· retrying (attempt {}) — {}", n("attempt"), s("reason")),
+            "retrying" => {
+                // 0061 T15: the countdown is the liveness — nothing is
+                // computing during a backoff. A scope off `sample` says whose
+                // ladder it is; the sample one stays as it read before.
+                let mut line = match update.get("max").and_then(Value::as_u64) {
+                    Some(max) => format!("· retrying ({}/{max})", n("attempt")),
+                    None => format!("· retrying (attempt {})", n("attempt")),
+                };
+                if let Some(scope) = update.get("scope").and_then(Value::as_str) {
+                    if scope != "sample" {
+                        line.push_str(&format!(" [{scope}]"));
+                    }
+                }
+                line.push_str(&format!(" — {}", s("reason")));
+                if let Some(ms) = update.get("delay_ms").and_then(Value::as_u64) {
+                    if ms > 0 {
+                        line.push_str(&format!(" · in {}s", ms.div_ceil(1000)));
+                    }
+                }
+                line
+            }
             "fallback_model" => format!("· model fallback → {}", s("model")),
             "prompt_queued" => "· queued".to_string(),
             "compacted" => {
@@ -456,7 +476,11 @@ mod tests {
             },
             EngineEvent::Retrying {
                 attempt: 1,
+                max: 5,
                 reason: "429".into(),
+                delay_ms: 1_500,
+                status: Some(429),
+                scope: hotl_engine::RetryScope::Sample,
                 discarded_partial: false,
             },
             EngineEvent::FallbackModel { model: "m2".into() },

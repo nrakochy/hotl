@@ -501,7 +501,18 @@ pub enum EngineEvent {
     },
     Retrying {
         attempt: u32,
+        /// The attempt ceiling, so a surface reads `2/5` without knowing the
+        /// policy (0061 T15).
+        max: u32,
         reason: String,
+        /// The jittered sleep about to be taken, so a countdown on screen is
+        /// the truth. 0 for the re-sends that are capability probes.
+        delay_ms: u64,
+        /// The HTTP status behind it, when there was one.
+        status: Option<u16>,
+        /// Which ladder this is: the human is waiting on all three, and only
+        /// the sample one used to say so.
+        scope: RetryScope,
         /// The re-sample threw away text the surface had already rendered
         /// (0050 T3), so the surface must un-render it or the answer appears
         /// twice — once half-written, once whole.
@@ -628,7 +639,7 @@ impl std::fmt::Debug for EngineEvent {
             }
             Self::ChildText { text, .. } => write!(f, "ChildText(n={})", text.len()),
             Self::Delegation { subagent_runs, .. } => write!(f, "Delegation({subagent_runs})"),
-            Self::Retrying { attempt, .. } => write!(f, "Retrying({attempt})"),
+            Self::Retrying { attempt, scope, .. } => write!(f, "Retrying({attempt},{scope:?})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),
             Self::BudgetNotice { pct, .. } => write!(f, "BudgetNotice({pct}%)"),
@@ -649,6 +660,15 @@ impl std::fmt::Debug for EngineEvent {
             Self::LedgerReport(s) => write!(f, "LedgerReport(samples={})", s.sample_count),
         }
     }
+}
+
+/// Which retry ladder a `Retrying` came from (0061 T15). The human is
+/// waiting on all three; only the sample one used to say anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryScope {
+    Sample,
+    Summarize,
+    GoalEval,
 }
 
 /// What the goal evaluator concluded, engine-side vocabulary: the parser

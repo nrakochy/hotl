@@ -832,6 +832,8 @@ enum Attempt {
     Retry {
         reason: String,
         wait: std::time::Duration,
+        /// The status behind it, when there was one (0061 T15).
+        status: Option<u16>,
     },
     Fail(ProviderError),
 }
@@ -841,6 +843,7 @@ fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
         hotl_provider::retry::Decision::Retry { delay } => Attempt::Retry {
             reason,
             wait: hotl_provider::retry::with_jitter(delay),
+            status: hotl_provider::retry::status_of(&err),
         },
         hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
     }
@@ -1047,15 +1050,23 @@ impl Provider for AnthropicProvider {
                 };
                 match outcome {
                     Attempt::Ok(resp) => break resp,
-                    Attempt::Retry { reason, wait } => {
+                    Attempt::Retry { reason, wait, status } => {
                         attempts_used = attempt;
-                        yield Ok(StreamEvent::Retrying { attempt, reason });
+                        // The delay reported is the one about to be slept, so
+                        // a countdown on screen is the truth.
+                        yield Ok(StreamEvent::Retrying {
+                            attempt,
+                            max: hotl_provider::retry::MAX_ATTEMPTS,
+                            reason,
+                            delay_ms: wait.as_millis() as u64,
+                            status,
+                        });
                         tokio::time::sleep(wait).await;
                     }
                     Attempt::Fail(ProviderError::Auth(msg)) => {
                         // attempts_used deliberately unchanged.
                         match handle_auth_fail(&source, &mut auth_retry, msg).await {
-                            Ok(reason) => yield Ok(StreamEvent::Retrying { attempt, reason }),
+                            Ok(reason) => yield Ok(StreamEvent::Retrying { attempt, max: hotl_provider::retry::MAX_ATTEMPTS, reason, delay_ms: 0, status: None }),
                             Err(e) => {
                                 yield Err(e);
                                 return;
@@ -1362,6 +1373,9 @@ mod tests {
     const SSE_OK: &str = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\nevent: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":1}}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
     const AUTH_401: &str = "HTTP/1.1 401 Unauthorized\r\ncontent-type: text/plain\r\ncontent-length: 11\r\nconnection: close\r\n\r\nbad api key";
     const RETRY_429: &str = "HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/plain\r\nretry-after: 0\r\ncontent-length: 5\r\nconnection: close\r\n\r\nslow!";
+    /// No `retry-after`, so the ladder's own 1 s base applies — and is
+    /// jittered before it is reported (0061 T15).
+    const RETRY_500: &str = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\ncontent-length: 4\r\nconnection: close\r\n\r\nboom";
 
     /// Serve `responses` to consecutive connections; record each request's
     /// `x-api-key` header (lowercased) into `seen`.
@@ -1519,13 +1533,54 @@ mod tests {
         let attempts: Vec<u32> = events
             .iter()
             .filter_map(|e| match e {
-                Ok(StreamEvent::Retrying { attempt, reason }) if reason.starts_with("HTTP") => {
-                    Some(*attempt)
-                }
+                Ok(StreamEvent::Retrying {
+                    attempt, reason, ..
+                }) if reason.starts_with("HTTP") => Some(*attempt),
                 _ => None,
             })
             .collect();
         assert_eq!(attempts, vec![1]);
+        // 0061 T15: the auth pass is a re-send, not a backoff — no sleep, no
+        // status to report.
+        let refresh = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Retrying {
+                    reason,
+                    delay_ms,
+                    status,
+                    ..
+                }) if reason.starts_with("auth") => Some((*delay_ms, *status)),
+                _ => None,
+            })
+            .expect("the refresh announced itself");
+        assert_eq!(refresh, (0, None));
+    }
+
+    /// 0061 T15: with no `retry-after`, the ladder's 1 s base is jittered to
+    /// somewhere in `[500ms, 1s]` — and what the event reports is the sleep
+    /// actually taken, so a countdown on screen never outlives the wait.
+    #[tokio::test]
+    async fn a_500_reports_the_jittered_delay_it_sleeps() {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![RETRY_500, SSE_OK], seen.clone()).await;
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some("k".into()))))
+            .with_base_url(&base);
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        let (delay_ms, status) = events
+            .iter()
+            .find_map(|e| match e {
+                Ok(StreamEvent::Retrying {
+                    delay_ms, status, ..
+                }) => Some((*delay_ms, *status)),
+                _ => None,
+            })
+            .expect("the 500 was retried");
+        assert_eq!(status, Some(500));
+        assert!(
+            (500..=1000).contains(&delay_ms),
+            "full jitter of a 1s base: {delay_ms}"
+        );
     }
 
     /// End-to-end retry: 429 → backoff → success, over a real socket.
@@ -1539,11 +1594,25 @@ mod tests {
         let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
         assert!(events.iter().all(|e| e.is_ok()), "{events:?}");
         assert_eq!(seen.lock().unwrap().len(), 2, "the request was not retried");
-        let retrying = events
+        let retrying: Vec<_> = events
             .iter()
-            .filter(|e| matches!(e, Ok(StreamEvent::Retrying { .. })))
-            .count();
-        assert_eq!(retrying, 1, "the user must be told a retry happened");
+            .filter_map(|e| match e {
+                Ok(StreamEvent::Retrying {
+                    max,
+                    delay_ms,
+                    status,
+                    ..
+                }) => Some((*max, *delay_ms, *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(retrying.len(), 1, "the user must be told a retry happened");
+        // 0061 T15: the status is what a surface shows, and `retry-after: 0`
+        // means there is no countdown to run.
+        assert_eq!(
+            retrying[0],
+            (hotl_provider::retry::MAX_ATTEMPTS, 0, Some(429))
+        );
         assert!(matches!(
             events.last(),
             Some(Ok(StreamEvent::Completed { .. }))

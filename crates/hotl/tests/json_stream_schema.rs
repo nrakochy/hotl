@@ -84,12 +84,20 @@ fn every_frame_is_tagged_and_versioned() {
         },
         EngineEvent::Retrying {
             attempt: 1,
+            max: 5,
             reason: "429".into(),
+            delay_ms: 1_500,
+            status: Some(429),
+            scope: hotl_engine::RetryScope::Sample,
             discarded_partial: false,
         },
         EngineEvent::Retrying {
             attempt: 2,
+            max: 3,
             reason: "stream interrupted: HTTP 529: overloaded_error".into(),
+            delay_ms: 800,
+            status: Some(529),
+            scope: hotl_engine::RetryScope::Summarize,
             discarded_partial: true,
         },
         EngineEvent::FallbackModel { model: "m2".into() },
@@ -417,6 +425,63 @@ fn tool_progress_is_a_tagged_frame_with_tail_and_counts() {
     assert_eq!(f["tail"], "Compiling hotl-engine");
     assert_eq!(f["lines"], 12);
     assert_eq!(f["bytes"], 480);
+}
+
+/// 0061 T15: a backoff is dead air, so the frame carries everything a
+/// countdown needs — how long, how far through the ladder, and why.
+#[test]
+fn retrying_carries_delay_max_status_and_scope() {
+    let f = wire::update_frame(&EngineEvent::Retrying {
+        attempt: 2,
+        max: 5,
+        reason: "HTTP 429".into(),
+        delay_ms: 4_000,
+        status: Some(429),
+        scope: hotl_engine::RetryScope::Sample,
+        discarded_partial: false,
+    })
+    .expect("retrying is a stream frame");
+    assert_eq!(f["type"], "retrying");
+    assert_eq!(f["attempt"], 2);
+    assert_eq!(f["max"], 5);
+    assert_eq!(f["delay_ms"], 4_000);
+    assert_eq!(f["status"], 429);
+    assert_eq!(f["scope"], "sample");
+
+    for (scope, tag) in [
+        (hotl_engine::RetryScope::Summarize, "summarize"),
+        (hotl_engine::RetryScope::GoalEval, "goal_eval"),
+    ] {
+        let f = wire::update_frame(&EngineEvent::Retrying {
+            attempt: 1,
+            max: 3,
+            reason: "boom".into(),
+            delay_ms: 0,
+            status: None,
+            scope,
+            discarded_partial: false,
+        })
+        .expect("retrying is a stream frame");
+        assert_eq!(f["scope"], tag);
+    }
+}
+
+/// Omitted, not `null`: a transport error has no status, and a client must be
+/// able to tell that from "the status was zero".
+#[test]
+fn retrying_omits_status_when_the_error_had_none() {
+    let f = wire::update_frame(&EngineEvent::Retrying {
+        attempt: 1,
+        max: 5,
+        reason: "stream idle for 300s".into(),
+        delay_ms: 900,
+        status: None,
+        scope: hotl_engine::RetryScope::Sample,
+        discarded_partial: false,
+    })
+    .expect("retrying is a stream frame");
+    assert!(f.get("status").is_none(), "{f}");
+    assert_eq!(f["delay_ms"], 900);
 }
 
 /// 0061 T14: a fold blocks the actor for a hook and a model call. The size

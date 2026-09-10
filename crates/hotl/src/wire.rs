@@ -131,10 +131,25 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         }),
         EngineEvent::Retrying {
             attempt,
+            max,
             reason,
+            delay_ms,
+            status,
+            scope,
             discarded_partial,
         } => {
-            let mut v = json!({"type": "retrying", "attempt": attempt, "reason": reason});
+            let mut v = json!({
+                "type": "retrying",
+                "attempt": attempt,
+                "max": max,
+                "reason": reason,
+                "delay_ms": delay_ms,
+                "scope": retry_scope_tag(*scope),
+            });
+            // Omitted, not `null`, when the error carried no status.
+            if let Some(status) = status {
+                v["status"] = json!(status);
+            }
             // Omitted, not `null`, when there is nothing to take back — the
             // same additive rule `usage_frame` follows.
             if *discarded_partial {
@@ -222,6 +237,15 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
 }
 
 /// The `goal_verdict` frame's stable wire tag — never a `Debug` rendering.
+/// Which ladder a `retrying` frame came from (0061 T15).
+fn retry_scope_tag(scope: hotl_engine::RetryScope) -> &'static str {
+    match scope {
+        hotl_engine::RetryScope::Sample => "sample",
+        hotl_engine::RetryScope::Summarize => "summarize",
+        hotl_engine::RetryScope::GoalEval => "goal_eval",
+    }
+}
+
 fn goal_verdict_tag(verdict: hotl_engine::GoalVerdictKind) -> &'static str {
     match verdict {
         hotl_engine::GoalVerdictKind::NotYet => "not_yet",

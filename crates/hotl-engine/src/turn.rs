@@ -782,6 +782,8 @@ enum SampleEnd {
         attempt: u32,
         delay: std::time::Duration,
         reason: String,
+        /// The status behind it, when there was one (0061 T15).
+        status: Option<u16>,
         discarded_partial: bool,
     },
     Fatal(String),
@@ -1310,18 +1312,26 @@ impl Turn {
                     attempt: failed,
                     delay,
                     reason,
+                    status,
                     discarded_partial,
                 }) => {
+                    // Jitter first, then report: what the surface counts down
+                    // has to be the sleep actually taken.
+                    let wait = retry::with_jitter(delay);
                     self.emit(EngineEvent::Retrying {
                         attempt: failed,
+                        max: STREAM_RETRY_MAX,
                         reason,
+                        delay_ms: wait.as_millis() as u64,
+                        status,
+                        scope: crate::RetryScope::Sample,
                         discarded_partial,
                     })
                     .await;
                     tokio::select! {
                         biased;
                         _ = self.cancel.cancelled() => return SampleEnd::Cancelled,
-                        _ = tokio::time::sleep(retry::with_jitter(delay)) => {}
+                        _ = tokio::time::sleep(wait) => {}
                     }
                     let request = match self.build_request(&snapshot) {
                         Ok(request) => request,
@@ -2502,6 +2512,7 @@ impl Turn {
                                     attempt,
                                     delay,
                                     reason: format!("stream interrupted: {e}"),
+                                    status: retry::status_of(&e),
                                     discarded_partial: forwarded_text,
                                 });
                             }
@@ -3032,9 +3043,19 @@ impl Turn {
             StreamEvent::ThinkingDelta { text, .. } => EngineEvent::ThinkingDelta(text),
             // The provider's own pre-stream ladder: nothing was rendered yet,
             // so there is nothing to take back.
-            StreamEvent::Retrying { attempt, reason } => EngineEvent::Retrying {
+            StreamEvent::Retrying {
                 attempt,
+                max,
                 reason,
+                delay_ms,
+                status,
+            } => EngineEvent::Retrying {
+                attempt,
+                max,
+                reason,
+                delay_ms,
+                status,
+                scope: crate::RetryScope::Sample,
                 discarded_partial: false,
             },
             _ => return,
