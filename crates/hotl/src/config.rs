@@ -455,12 +455,6 @@ impl ContextCfg {
     /// The token-estimation profile for `model`. An uncatalogued model gets
     /// the conservative default rather than a guessed ratio — overcounting is
     /// the only safe direction (see `hotl_context::tokens`).
-    ///
-    /// Still uncalled: `hotl` is a bin-only crate, so `pub` confers no
-    /// reachability and the lint fires despite the tests below. Its sibling
-    /// `resolve_window` landed its call site in 0050; drop this attribute
-    /// when this one does too.
-    #[allow(dead_code)]
     pub fn token_profile(&self, model: &str) -> hotl_context::TokenProfile {
         match hotl_provider::catalog::lookup(model) {
             Some(info) => {

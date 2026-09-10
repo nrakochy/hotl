@@ -2264,12 +2264,14 @@ impl Turn {
     /// `tail` are equal by construction. The totals are identical to what a
     /// flat snapshot produced.
     fn estimate_tokens(&self, snapshot: &crate::actor::Snapshot) -> u64 {
+        let profile = &self.shared.config.token_profile;
         anchored_estimate(
             self.anchor,
             self.shared.system_estimate,
             &snapshot.durable,
             snapshot.durable_estimate,
-        ) + hotl_context::tokens::estimate_items(&snapshot.tail)
+            profile,
+        ) + hotl_context::tokens::estimate_items_with(&snapshot.tail, profile)
     }
 
     /// Just-in-time nested AGENTS.md injection (M2), deduped per turn and
@@ -2319,7 +2321,11 @@ impl Turn {
         if threshold == 0 || outcome.is_error {
             return;
         }
-        if hotl_context::tokens::estimate_text(&outcome.content) <= threshold {
+        if hotl_context::tokens::estimate_text_with(
+            &outcome.content,
+            &self.shared.config.token_profile,
+        ) <= threshold
+        {
             return;
         }
         // Cut the preview before the content moves; on any failure the
@@ -2497,7 +2503,12 @@ impl Turn {
                 + self
                     .projected_tail
                     .iter()
-                    .map(|i| hotl_context::tokens::estimate_item(i))
+                    .map(|i| {
+                        hotl_context::tokens::estimate_item_with(
+                            i,
+                            &self.shared.config.token_profile,
+                        )
+                    })
                     .sum::<u64>(),
             tail: Arc::clone(&last.tail),
         })
@@ -2768,11 +2779,12 @@ fn anchored_estimate<I: std::borrow::Borrow<Item>>(
     system_estimate: u64,
     durable: &[I],
     durable_estimate: u64,
+    profile: &hotl_context::TokenProfile,
 ) -> u64 {
     use hotl_context::tokens;
     match anchor {
         Some((reported, len)) if durable.len() >= len => {
-            reported + tokens::estimate_items(&durable[len..])
+            reported + tokens::estimate_items_with(&durable[len..], profile)
         }
         _ => system_estimate + durable_estimate,
     }
@@ -3469,11 +3481,40 @@ mod tests {
             hotl_context::tokens::estimate_text("sys"),
             &sample2,
             hotl_context::tokens::estimate_items(&sample2),
+            &hotl_context::TokenProfile::CONSERVATIVE,
         );
         assert!(
             estimate >= 500 + 1_000,
             "tool results must be inside the estimate, got {estimate}"
         );
+    }
+
+    /// The whole ladder reads one ruler (0057 T6, tracker #63): a denser
+    /// profile raises the estimate, so the fold point moves earlier.
+    #[test]
+    fn the_estimate_follows_the_model_profile() {
+        let durable = vec![tool_results(&"ordinary English prose. ".repeat(200))];
+        let dense = hotl_context::TokenProfile {
+            ascii_chars_per_token: 2.0,
+            ..hotl_context::TokenProfile::CONSERVATIVE
+        };
+        let est = |p: &hotl_context::TokenProfile| {
+            anchored_estimate(
+                Some((0, 0)),
+                0,
+                &durable,
+                hotl_context::tokens::estimate_items_with(&durable, p),
+                p,
+            )
+        };
+        let loose = est(&hotl_context::TokenProfile::CONSERVATIVE);
+        let tight = est(&dense);
+        assert!(tight > loose, "{tight} !> {loose}");
+        // A window whose 80% trigger falls between the two estimates: the
+        // same history folds under the denser ruler and not under the looser
+        // one, which is exactly the behaviour tracker #63 deferred.
+        let window = 2_500;
+        assert!(must_compact(tight, window, 0) && !must_compact(loose, window, 0));
     }
 
     /// The tail is a separate term, and it is the SAME term: splitting a flat
@@ -3501,12 +3542,14 @@ mod tests {
                     tokens::estimate_text("sys"),
                     &durable,
                     tokens::estimate_items(&durable),
+                    &hotl_context::TokenProfile::CONSERVATIVE,
                 ) + tokens::estimate_items(&tail),
                 anchored_estimate(
                     anchor,
                     tokens::estimate_text("sys"),
                     &flat,
                     tokens::estimate_items(&flat),
+                    &hotl_context::TokenProfile::CONSERVATIVE,
                 ),
                 "anchor {anchor:?}"
             );

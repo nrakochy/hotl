@@ -9,7 +9,7 @@
 //! constant across sessions (so two reports diff line-for-line) and the
 //! decision to hide a row lives in one place, client-side.
 
-use crate::tokens::{estimate_item, estimate_text, IMAGE_TOKENS_ESTIMATE};
+use crate::tokens::{estimate_item_with, estimate_text_with, TokenProfile, IMAGE_TOKENS_ESTIMATE};
 use hotl_types::{ContextBreakdown, ContextKind, ContextRow, Item, SyntheticReason};
 
 /// The three tool rows, pre-summed by the caller. Counts rather than
@@ -95,6 +95,7 @@ pub fn breakdown<I: std::borrow::Borrow<Item>>(
     durable: &[I],
     tail: &[I],
     window: u64,
+    profile: &TokenProfile,
 ) -> ContextBreakdown {
     let mut acc = [0u64; ROWS.len()];
     let mut add = |kind: ContextKind, n: u64| {
@@ -102,7 +103,10 @@ pub fn breakdown<I: std::borrow::Borrow<Item>>(
         acc[i] += n;
     };
 
-    add(ContextKind::SystemPrompt, estimate_text(system));
+    add(
+        ContextKind::SystemPrompt,
+        estimate_text_with(system, profile),
+    );
     add(ContextKind::ToolSchemas, tools.schemas);
     add(ContextKind::SkillsRoster, tools.skills);
     add(ContextKind::AgentsRoster, tools.agents);
@@ -110,13 +114,16 @@ pub fn breakdown<I: std::borrow::Borrow<Item>>(
     for item in durable {
         let item = item.borrow();
         let images = image_term(item);
-        add(classify(item), estimate_item(item) - images);
+        add(classify(item), estimate_item_with(item, profile) - images);
         add(ContextKind::Images, images);
     }
     for item in tail {
         let item = item.borrow();
         let images = image_term(item);
-        add(ContextKind::Todos, estimate_item(item) - images);
+        add(
+            ContextKind::Todos,
+            estimate_item_with(item, profile) - images,
+        );
         add(ContextKind::Images, images);
     }
 
@@ -209,16 +216,67 @@ mod tests {
     fn rows_sum_to_the_flat_estimate() {
         let durable = kitchen_sink();
         let tail = vec![user("<todos>…</todos>", Some(SyntheticReason::Todos))];
-        let b = breakdown("", ToolTokens::default(), &durable, &tail, 200_000);
+        let b = breakdown(
+            "",
+            ToolTokens::default(),
+            &durable,
+            &tail,
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
         let sum: u64 = b.rows.iter().map(|r| r.tokens).sum();
         assert_eq!(sum, estimate_items(&durable) + estimate_items(&tail));
+    }
+
+    /// Tracker #63's other half: `/context` reads the same ruler the
+    /// compaction trigger does, so the number a user sees and the number that
+    /// folds their history can never disagree.
+    #[test]
+    fn the_report_follows_the_model_profile() {
+        let items = vec![user(&"ordinary English prose. ".repeat(50), None)];
+        let dense = TokenProfile {
+            ascii_chars_per_token: 2.0,
+            ..TokenProfile::CONSERVATIVE
+        };
+        let a = breakdown(
+            "system prompt",
+            ToolTokens::default(),
+            &items,
+            &[],
+            200_000,
+            &dense,
+        );
+        let b = breakdown(
+            "system prompt",
+            ToolTokens::default(),
+            &items,
+            &[],
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
+        assert!(row(&a, ContextKind::Messages) > row(&b, ContextKind::Messages));
+        assert!(row(&a, ContextKind::SystemPrompt) > row(&b, ContextKind::SystemPrompt));
+        // And the rows still sum to a walk under the same profile.
+        let sum: u64 = a.rows.iter().map(|r| r.tokens).sum();
+        assert_eq!(
+            sum,
+            crate::tokens::estimate_items_with(&items, &dense)
+                + estimate_text_with("system prompt", &dense)
+        );
     }
 
     #[test]
     fn every_synthetic_reason_lands_in_exactly_one_row() {
         for r in ALL_REASONS {
             let items = vec![user("some meaningful body text here", Some(r))];
-            let b = breakdown("", ToolTokens::default(), &items, &[], 200_000);
+            let b = breakdown(
+                "",
+                ToolTokens::default(),
+                &items,
+                &[],
+                200_000,
+                &TokenProfile::CONSERVATIVE,
+            );
             let hit: Vec<_> = b.rows.iter().filter(|row| row.tokens > 0).collect();
             assert_eq!(hit.len(), 1, "{r:?} landed in {hit:?}");
             assert_eq!(hit[0].kind, classify(&items[0]));
@@ -231,7 +289,14 @@ mod tests {
             "a tag from the future",
             Some(SyntheticReason::Unknown),
         )];
-        let b = breakdown("", ToolTokens::default(), &items, &[], 200_000);
+        let b = breakdown(
+            "",
+            ToolTokens::default(),
+            &items,
+            &[],
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
         assert!(row(&b, ContextKind::HarnessInjections) > 0);
     }
 
@@ -247,9 +312,23 @@ mod tests {
             images: vec![img.clone(), img],
         }];
         let without = vec![user("two pictures", None)];
-        let b = breakdown("", ToolTokens::default(), &with, &[], 200_000);
+        let b = breakdown(
+            "",
+            ToolTokens::default(),
+            &with,
+            &[],
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
         assert_eq!(row(&b, ContextKind::Images), 2 * IMAGE_TOKENS_ESTIMATE);
-        let plain = breakdown("", ToolTokens::default(), &without, &[], 200_000);
+        let plain = breakdown(
+            "",
+            ToolTokens::default(),
+            &without,
+            &[],
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
         assert_eq!(
             row(&b, ContextKind::Messages),
             row(&plain, ContextKind::Messages)
@@ -262,7 +341,14 @@ mod tests {
             "<todo-reminder/>",
             Some(SyntheticReason::SystemReminder),
         )];
-        let b = breakdown("", ToolTokens::default(), &[], &tail, 200_000);
+        let b = breakdown(
+            "",
+            ToolTokens::default(),
+            &[],
+            &tail,
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
         // Even a system-reminder-tagged tail item is billed to todos: the tail
         // IS the reminder, and re-classifying it would scatter one line across
         // two rows.
@@ -274,7 +360,14 @@ mod tests {
 
     #[test]
     fn an_empty_session_emits_every_row_at_zero() {
-        let b = breakdown::<Item>("", ToolTokens::default(), &[], &[], 200_000);
+        let b = breakdown::<Item>(
+            "",
+            ToolTokens::default(),
+            &[],
+            &[],
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
         assert_eq!(b.rows.len(), ROWS.len());
         assert!(b.rows.iter().all(|r| r.tokens == 0));
         assert_eq!(b.window, 200_000);
@@ -282,7 +375,14 @@ mod tests {
 
     #[test]
     fn rows_arrive_in_canonical_order() {
-        let b = breakdown("sys", ToolTokens::default(), &kitchen_sink(), &[], 0);
+        let b = breakdown(
+            "sys",
+            ToolTokens::default(),
+            &kitchen_sink(),
+            &[],
+            0,
+            &TokenProfile::CONSERVATIVE,
+        );
         let kinds: Vec<_> = b.rows.iter().map(|r| r.kind).collect();
         let mut sorted = kinds.clone();
         sorted.sort();
@@ -297,13 +397,20 @@ mod tests {
             skills: 20,
             agents: 3,
         };
-        let b = breakdown::<Item>("system prompt text", tools, &[], &[], 200_000);
+        let b = breakdown::<Item>(
+            "system prompt text",
+            tools,
+            &[],
+            &[],
+            200_000,
+            &TokenProfile::CONSERVATIVE,
+        );
         assert_eq!(row(&b, ContextKind::ToolSchemas), 100);
         assert_eq!(row(&b, ContextKind::SkillsRoster), 20);
         assert_eq!(row(&b, ContextKind::AgentsRoster), 3);
         assert_eq!(
             row(&b, ContextKind::SystemPrompt),
-            estimate_text("system prompt text")
+            estimate_text_with("system prompt text", &TokenProfile::CONSERVATIVE)
         );
     }
 }

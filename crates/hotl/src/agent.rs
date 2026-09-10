@@ -2907,6 +2907,10 @@ fn engine_config(
     let (window, window_warning) = cfg.context.resolve_window(model, env_window.as_deref());
     config.context_window = window;
     warnings.extend(window_warning);
+    // The same catalog row's chars-per-token ratio (tracker #63). One ruler
+    // for the compaction trigger, the clear trigger, the spill threshold and
+    // `/context` — a denser tokenizer is budgeted as denser, not as ASCII.
+    config.token_profile = cfg.context.token_profile(model);
     if let Some(turns) = secrets
         .get("HOTL_MAX_TURNS")
         .and_then(|v| v.parse().ok())
@@ -5103,6 +5107,30 @@ mod tests {
         );
         assert_eq!(config.context_window, 1_000_000);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn engine_config_takes_the_catalog_token_profile() {
+        // Tracker #63: the profile reached no engine call site, so a model
+        // with a denser tokenizer was budgeted as ASCII-at-3-chars.
+        let cfg = config_from_toml("");
+        let profile = engine_config("claude-opus-4-8", &MapSecrets::default(), &cfg)
+            .0
+            .token_profile;
+        assert_eq!(profile, cfg.context.token_profile("claude-opus-4-8"));
+        assert_eq!(
+            hotl_provider::catalog::lookup("claude-opus-4-8")
+                .expect("catalogued")
+                .ascii_chars_per_token,
+            profile.ascii_chars_per_token
+        );
+        // An uncatalogued model keeps the conservative default, never a guess.
+        assert_eq!(
+            engine_config("openai/llama3", &MapSecrets::default(), &cfg)
+                .0
+                .token_profile,
+            hotl_context::TokenProfile::CONSERVATIVE
+        );
     }
 
     #[test]

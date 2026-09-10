@@ -110,6 +110,12 @@ pub struct EngineConfig {
     /// Evict a successful tool result larger than this (estimated tokens) to a
     /// masked blob, leaving a head preview + read pointer (T4). `0` disables.
     pub evict_threshold_tokens: u64,
+    /// How this model's tokenizer trades characters for tokens (0057 T6,
+    /// tracker #63). Every estimate in the engine — the compaction trigger,
+    /// the clear trigger, the spill threshold and `/context` — reads this one
+    /// ruler, so the number a user sees and the number that folds their
+    /// history can never disagree.
+    pub token_profile: hotl_context::TokenProfile,
     /// Per-tool spill thresholds that override [`Self::evict_threshold_tokens`]
     /// (0057 T2). A `bash` or `grep` result is a haystack the model wanted one
     /// needle out of, so it spills far earlier than a `read` — which is a
@@ -151,6 +157,7 @@ impl Default for EngineConfig {
             compaction_reset: false,
             show_context_pct: false,
             evict_threshold_tokens: 20_000,
+            token_profile: hotl_context::TokenProfile::CONSERVATIVE,
             evict_overrides: vec![("bash".into(), 6_000), ("grep".into(), 6_000)],
             keep_results_turns: 4,
             ack_mode: AckMode::Pipelined,

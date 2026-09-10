@@ -175,19 +175,20 @@ const SKILLS_TOOL: &str = "skill";
 const AGENTS_TOOLS: [&str; 2] = ["spawn", "workflow"];
 
 /// A tool definition's share of the request: the three strings that go on the
-/// wire, under the same profile-less estimator every other call site uses.
-fn estimate_tool_def(def: &ToolDef) -> u64 {
-    tokens::estimate_text(&def.name)
-        + tokens::estimate_text(&def.description)
-        + tokens::estimate_text(&def.input_schema.to_string())
+/// wire, under the session's own [`tokens::TokenProfile`] — the same ruler the
+/// compaction trigger reads, so `/context` and the fold cannot disagree.
+fn estimate_tool_def(def: &ToolDef, profile: &tokens::TokenProfile) -> u64 {
+    tokens::estimate_text_with(&def.name, profile)
+        + tokens::estimate_text_with(&def.description, profile)
+        + tokens::estimate_text_with(&def.input_schema.to_string(), profile)
 }
 
 /// The three tool rows of a `/context` report. Split by name, never by index:
 /// registry order is a registration detail.
-fn tool_tokens(registry: &Registry) -> ToolTokens {
+fn tool_tokens(registry: &Registry, profile: &tokens::TokenProfile) -> ToolTokens {
     let mut out = ToolTokens::default();
     for def in registry.defs() {
-        let n = estimate_tool_def(&def);
+        let n = estimate_tool_def(&def, profile);
         match def.name.as_str() {
             SKILLS_TOOL => out.skills += n,
             name if AGENTS_TOOLS.contains(&name) => out.agents += n,
@@ -253,6 +254,10 @@ struct Head {
     todos: Arc<Vec<Todo>>,
     leaf: Option<String>,
     epoch: u64,
+    /// The session's token profile (0057 T6). The running `estimated` sum must
+    /// be keyed to the same ruler the compaction trigger reads, or the O(1)
+    /// pre-anchor estimate and the trigger disagree.
+    profile: tokens::TokenProfile,
     /// First entry id this head ever applied, and the id of the newest
     /// `Compaction` entry — together they bound the log span a fold's digest
     /// was computed from (`EntryPayload::Compaction::source_range`, 0057 T4).
@@ -271,9 +276,10 @@ impl Head {
         tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
         items: Vec<Item>,
         todos: Vec<Todo>,
+        profile: tokens::TokenProfile,
     ) -> Self {
         let items: Vec<Arc<Item>> = items.into_iter().map(Arc::new).collect();
-        let estimated = tokens::estimate_items(&items);
+        let estimated = tokens::estimate_items_with(&items, &profile);
         let mut head = Self {
             tx,
             items: Arc::new(items),
@@ -281,6 +287,7 @@ impl Head {
             todos: Arc::new(todos),
             leaf: None,
             epoch: 0,
+            profile,
             first_entry: None,
             last_fold: None,
         };
@@ -312,7 +319,7 @@ impl Head {
     /// `release_steers`), or a turn's refresh could observe the commit
     /// without the steer that overtook it.
     fn apply(&mut self, item: Item) {
-        self.estimated += tokens::estimate_item(&item);
+        self.estimated += tokens::estimate_item_with(&item, &self.profile);
         Arc::make_mut(&mut self.items).push(Arc::new(item));
     }
 
@@ -346,7 +353,7 @@ impl Head {
     /// committing a compaction (§Read invariant).
     fn repoint(&mut self, items: Vec<Arc<Item>>) {
         // O(folded list), rare, and correct by construction.
-        self.estimated = tokens::estimate_items(&items);
+        self.estimated = tokens::estimate_items_with(&items, &self.profile);
         self.items = Arc::new(items);
         self.publish();
     }
@@ -700,7 +707,7 @@ impl SharedDeps {
         let masker = deps.log.masker_handle();
         let session_id: Arc<str> = deps.log.session_id.as_str().into();
         let system: Arc<str> = deps.system.into();
-        let system_estimate = tokens::estimate_text(&system);
+        let system_estimate = tokens::estimate_text_with(&system, &deps.config.token_profile);
         let shared = Self {
             provider: deps.provider,
             registry: deps.registry,
@@ -904,6 +911,7 @@ pub(crate) async fn run(
         head_tx,
         close_dangling_batches(pair_tool_results(std::mem::take(&mut deps.initial_items))),
         std::mem::take(&mut deps.initial_todos),
+        deps.config.token_profile,
     );
     let mut running = false;
     // The active goal (0034). In-memory beyond the seed, so the turn counter
@@ -1162,10 +1170,11 @@ pub(crate) async fn run(
                 let snap = head.snapshot();
                 let _ = reply.send(hotl_context::breakdown::breakdown(
                     &shared.system,
-                    tool_tokens(&shared.registry),
+                    tool_tokens(&shared.registry, &shared.config.token_profile),
                     &snap.durable,
                     &snap.tail,
                     shared.config.context_window,
+                    &shared.config.token_profile,
                 ));
             }
             SessionCmd::Propose { entries, reply } => {
@@ -2731,7 +2740,8 @@ async fn start_turn(
                     // pending items always do — the projection invariant is
                     // untouched.
                     let mut durable: Vec<Arc<Item>> = (**head.items()).clone();
-                    let durable_estimate = head.estimated + tokens::estimate_item(&item);
+                    let durable_estimate =
+                        head.estimated + tokens::estimate_item_with(&item, &head.profile);
                     durable.push(Arc::new(item));
                     let predicted = Snapshot {
                         durable: Arc::new(durable),
@@ -2943,6 +2953,7 @@ mod tests {
                 text: "seed".into(),
             }],
             Vec::new(),
+            tokens::TokenProfile::CONSERVATIVE,
         );
         let mix: Vec<hotl_types::Item> = vec![
             hotl_types::Item::User {
@@ -3027,6 +3038,7 @@ mod tests {
                 images: vec![img],
             }],
             Vec::new(),
+            hotl_context::TokenProfile::CONSERVATIVE,
         );
         head.apply(Item::Assistant { blocks: Vec::new() });
         let Item::User { images, .. } = &*head.items()[0] else {
@@ -3356,7 +3368,12 @@ mod tests {
     fn test_shared(dir: &std::path::Path) -> (Arc<SharedDeps>, SessionLog, super::Head) {
         let log = SessionLog::create(dir, "m", None, hotl_store::Masker::empty(), 0).expect("log");
         let (head_tx, head_rx) = super::head_channel();
-        let head = super::Head::new(head_tx, Vec::new(), Vec::new());
+        let head = super::Head::new(
+            head_tx,
+            Vec::new(),
+            Vec::new(),
+            hotl_context::TokenProfile::CONSERVATIVE,
+        );
         let (shared, log) = SharedDeps::new(
             test_deps(dir, log),
             crate::hooks::NotificationDrain::new(),
