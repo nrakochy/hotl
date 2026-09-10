@@ -488,12 +488,7 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
         };
         segs.push(Segment::blocked(format!("interrupting · {}s", secs(ticks))));
         if let Some(mins) = goal_minutes(state) {
-            segs.push(Segment {
-                text: format!("◎ /goal active · {mins}m"),
-                short: Some(format!("◎ {mins}m")),
-                rank: RANK_GOAL,
-                tone: Tone::Plain,
-            });
+            segs.push(goal_segment(state, mins));
         }
         return segs;
     }
@@ -587,14 +582,28 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
         });
     }
     if let Some(mins) = goal_minutes(state) {
-        segs.push(Segment {
-            text: format!("◎ /goal active · {mins}m"),
-            short: Some(format!("◎ {mins}m")),
-            rank: RANK_GOAL,
-            tone: Tone::Plain,
-        });
+        segs.push(goal_segment(state, mins));
     }
     segs
+}
+
+/// The goal's own segment (0061 T26). Precedence is evaluating > paused >
+/// active: an evaluation in flight is what the human is waiting on, and a
+/// paused loop is not running whatever the last verdict said.
+fn goal_segment(state: &State, mins: u64) -> Segment {
+    let (text, short) = if state.goal_evaluating {
+        (format!("◎ evaluating · {mins}m"), "◎ eval…".to_string())
+    } else if state.goal_stalled {
+        (format!("◎ /goal paused · {mins}m"), "◎ paused".to_string())
+    } else {
+        (format!("◎ /goal active · {mins}m"), format!("◎ {mins}m"))
+    };
+    Segment {
+        text,
+        short: Some(short),
+        rank: RANK_GOAL,
+        tone: Tone::Plain,
+    }
 }
 
 /// Everything on the strip after the snake, every segment in full — the
@@ -1187,6 +1196,33 @@ mod tests {
             ticks: 0,
         };
         assert_eq!(strip_segments(&s)[0].rank, KEEP, "the phase never drops");
+    }
+
+    /// 0061 T26: `goal_stalled` was stored and never drawn — the strip said
+    /// `/goal active` for a loop that had stopped advancing.
+    #[test]
+    fn a_stalled_goal_reads_paused_on_the_strip() {
+        let mut s = State::new(true, "m".into());
+        s.goal = Some("all tests pass".into());
+        s.goal_ticks = 3 * 60 * TICK_HZ;
+        s.goal_stalled = true;
+        assert_eq!(strip_text(&s), "m · ◎ /goal paused · 3m");
+        let seg = strip_segments(&s).pop().expect("the goal segment");
+        assert_eq!(seg.short.as_deref(), Some("◎ paused"));
+    }
+
+    /// An evaluation in flight is what the human is waiting on, so it outranks
+    /// both of the other two.
+    #[test]
+    fn an_evaluating_goal_outranks_paused() {
+        let mut s = State::new(true, "m".into());
+        s.goal = Some("all tests pass".into());
+        s.goal_ticks = 3 * 60 * TICK_HZ;
+        s.goal_stalled = true;
+        s.goal_evaluating = true;
+        assert_eq!(strip_text(&s), "m · ◎ evaluating · 3m");
+        let seg = strip_segments(&s).pop().expect("the goal segment");
+        assert_eq!(seg.short.as_deref(), Some("◎ eval…"));
     }
 
     /// 0034: an active goal rides the strip as its own suffix — after the

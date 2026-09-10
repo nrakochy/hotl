@@ -620,6 +620,10 @@ pub struct State {
     /// Set by a `stalled` verdict, cleared by the next one: the goal is armed
     /// but resting, which the status line has to say out loud.
     pub goal_stalled: bool,
+    /// A model-backed goal evaluation is running (0061 T26). The turn is over
+    /// and the phase is Sampling, so without this the strip says `thinking`
+    /// for a call the human did not ask for.
+    pub goal_evaluating: bool,
     /// The last goal that resolved this session: condition, outcome word,
     /// turns. Bare `/goal` shows it when nothing is active.
     pub goal_resolved: Option<(String, String, u64)>,
@@ -729,6 +733,7 @@ impl State {
             goal_evidence: Vec::new(),
             goal_usage: SessionUsage::default(),
             goal_stalled: false,
+            goal_evaluating: false,
             goal_resolved: None,
             goal_resolving: None,
             commands: complete::builtins(),
@@ -1582,7 +1587,9 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // another attached surface AND the engine's own clears (a met or
         // impossible verdict). A confirmation of this surface's optimistic
         // update leaves the counters alone.
+        "goal_evaluating" => state.goal_evaluating = true,
         "goal_changed" => {
+            state.goal_evaluating = false;
             let goal = v.get("goal").and_then(Value::as_str).map(str::to_string);
             if goal != state.goal {
                 state.goal_ticks = 0;
@@ -1607,6 +1614,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // not local state: on met/impossible the `goal_changed` clear (which
         // resets counters) lands first.
         "goal_verdict" => {
+            state.goal_evaluating = false;
             let turns = v.get("turns").and_then(Value::as_u64).unwrap_or(0);
             state.goal_turns = turns;
             let reason = text_of("reason");
@@ -1828,6 +1836,26 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             let count = v.get("count").and_then(Value::as_u64).unwrap_or(0);
             notice(state, format!("cleared {count} results"));
         }
+        // 0061 T26: an ask or a question that reached no human is a fact the
+        // model acted on, and the surface used to drop it on the floor.
+        // Harness voice, past tense.
+        "ask_denied" => notice(
+            state,
+            format!(
+                "ask skipped — no human was attached to answer: {}",
+                text_of("summary")
+            ),
+        ),
+        "question_no_human" => notice(
+            state,
+            format!(
+                "question skipped — no human was attached to answer: {}",
+                text_of("header")
+            ),
+        ),
+        // Dropped by name (0061 decision 12): both are telemetry with no
+        // `/status` consumer yet, and a notice each would be noise.
+        "delegation" | "ledger_report" => {}
         // `turn_done` rides in the prompt result; thinking stays in Sampling.
         _ => {}
     }
@@ -1994,6 +2022,7 @@ fn on_prompt_result(
     state.interrupt_sent = false;
     state.retry = None;
     state.compacting = false;
+    state.goal_evaluating = false;
     vec![Cmd::SetTitle(title(state, ""))]
 }
 
@@ -3965,6 +3994,74 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T26: an ask or question that reached no human is a fact the model
+    /// acted on. Four frames hit `on_update`'s catch-all; two of them said
+    /// something the human needed to know.
+    #[test]
+    fn ask_denied_and_question_no_human_become_notices() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type":"ask_denied","summary":"bash: rm -rf build"}),
+        );
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text })
+                if text.contains("ask skipped") && text.contains("rm -rf build")),
+            "{:?}",
+            s.transcript.last()
+        );
+        upd(
+            &mut s,
+            json!({"type":"question_no_human","header":"Which scope?","prompt":"","options":[]}),
+        );
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { text })
+                if text.contains("question skipped") && text.contains("Which scope?")),
+            "{:?}",
+            s.transcript.last()
+        );
+    }
+
+    /// The other two stay dropped — telemetry with no consumer yet, and a
+    /// notice each would be noise (decision 12).
+    #[test]
+    fn delegation_and_ledger_report_stay_dropped() {
+        let mut s = State::test_default();
+        let before = s.transcript.len();
+        upd(&mut s, json!({"type":"delegation","runs":2}));
+        upd(&mut s, json!({"type":"ledger_report","samples":1}));
+        assert_eq!(s.transcript.len(), before);
+    }
+
+    /// The evaluation holds the strip until its verdict lands — or until
+    /// something else says the loop moved on.
+    #[test]
+    fn goal_evaluating_holds_until_the_verdict() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"goal_evaluating","turn":3}));
+        assert!(s.goal_evaluating);
+        upd(
+            &mut s,
+            json!({"type":"goal_verdict","verdict":"not_yet","reason":"more to do","turns":3}),
+        );
+        assert!(!s.goal_evaluating);
+
+        for clearing in [
+            json!({"type":"goal_changed","goal":"something else"}),
+            json!({"type":"goal_changed"}),
+        ] {
+            let mut s = State::test_default();
+            upd(&mut s, json!({"type":"goal_evaluating","turn":1}));
+            upd(&mut s, clearing);
+            assert!(!s.goal_evaluating);
+        }
+
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"goal_evaluating","turn":1}));
+        on_result(&mut s, "done", None, &json!({}));
+        assert!(!s.goal_evaluating);
     }
 
     /// 0061 T25: liveness lands on the card and nowhere else — it is not a

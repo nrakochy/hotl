@@ -295,6 +295,15 @@ fn update_line(update: &Value) -> Option<String> {
             "tool_progress" => return None,
             "compacting" => format!("(folding history — {} items)", n("items")),
             "goal_evaluating" => format!("· evaluating goal (turn {})", n("turn")),
+            // 0061 T26: the same text the console shows.
+            "ask_denied" => format!(
+                "· ask skipped — no human was attached to answer: {}",
+                s("summary")
+            ),
+            "question_no_human" => format!(
+                "· question skipped — no human was attached to answer: {}",
+                s("header")
+            ),
             "tool_queued" => format!("· queued: {} (behind {})", s("summary"), n("ahead")),
             // Mirrors `tool_done`'s success exemption: a child that worked
             // needs no line (0039).
