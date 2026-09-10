@@ -287,6 +287,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
         TranscriptItem::Report(r) => (6u8, r).hash(&mut h),
         TranscriptItem::Error { text } => (7u8, text_key(text)).hash(&mut h),
         TranscriptItem::WorkflowsReport(runs) => (8u8, runs).hash(&mut h),
+        TranscriptItem::Plan(plan) => (9u8, plan).hash(&mut h),
     }
     h.finish()
 }
@@ -494,7 +495,8 @@ fn speaker(item: &TranscriptItem) -> Speaker {
         | TranscriptItem::Notice { .. }
         | TranscriptItem::Error { .. }
         | TranscriptItem::Report(_)
-        | TranscriptItem::WorkflowsReport(_) => Speaker::Harness,
+        | TranscriptItem::WorkflowsReport(_)
+        | TranscriptItem::Plan(_) => Speaker::Harness,
     }
 }
 
@@ -939,6 +941,17 @@ fn item_block<'a>(
             },
             full(workflow_lines(runs, p)),
         ),
+        // The plan card (0056 T3). A live one carries its two keys; an
+        // answered one keeps the plan and drops them.
+        TranscriptItem::Plan(plan) => (
+            Spine {
+                marker: "◆",
+                cont: "│",
+                marker_style: Style::new().fg(p.accent).bold(),
+                cont_style: Style::new().fg(p.accent),
+            },
+            full(plan_lines(plan, p)),
+        ),
         // Reasoning: dimmed italic behind a faint spine, collapsed by default.
         // The trailer names the toggle so it is discoverable without opening
         // the help overlay.
@@ -985,6 +998,48 @@ fn call_count(n: usize) -> String {
 /// `name · status · Review 4/4 ✓ → Verify 6/7 ✗ · 41.2k tok · 3m12s` per run.
 /// A phase is `✓` once every started agent settled without failure, `✗`
 /// when any failed, and bare while it is still running.
+fn plan_lines<'a>(plan: &crate::app::PresentedPlan, p: &Palette) -> Vec<Line<'a>> {
+    let mut out = vec![Line::styled(
+        format!("Plan — {} steps", plan.steps.len()),
+        Style::new().fg(p.ink).bold(),
+    )];
+    for l in plan.summary.split('\n') {
+        out.push(Line::styled(l.to_string(), Style::new().fg(p.ink)));
+    }
+    out.push(Line::raw(""));
+    for (i, step) in plan.steps.iter().enumerate() {
+        out.push(Line::styled(
+            format!("{}. {}", i + 1, step.content),
+            Style::new().fg(p.ink),
+        ));
+        if let Some(proof) = &step.proof {
+            out.push(Line::styled(
+                format!("   → {proof}"),
+                Style::new().fg(p.muted),
+            ));
+        }
+        if !step.after.is_empty() {
+            out.push(Line::styled(
+                format!("   ⇐ after {}", step.after.join(", ")),
+                Style::new().fg(p.muted),
+            ));
+        }
+    }
+    if let Some(path) = &plan.path {
+        out.push(Line::styled(
+            format!("saved to {path}"),
+            Style::new().fg(p.faint),
+        ));
+    }
+    if plan.live {
+        out.push(Line::styled(
+            "a approve · r revise (or just say what to change)",
+            Style::new().fg(p.accent).bold(),
+        ));
+    }
+    out
+}
+
 fn workflow_lines<'a>(runs: &[crate::app::WorkflowRun], p: &Palette) -> Vec<Line<'a>> {
     let mut out = vec![Line::styled(
         format!(

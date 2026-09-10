@@ -250,6 +250,37 @@ pub enum TranscriptItem {
     /// `/workflows` (0044): every run of the `workflow` tool this process has
     /// started, one row each. Parsed ad hoc from the payload like `ContextRow`.
     WorkflowsReport(Vec<WorkflowRun>),
+    /// A plan the model handed over (`present_plan`, 0056 T3). Its own item
+    /// rather than a `Notice`: it carries the two answers, and a plan the
+    /// human is meant to act on must not read as muted chatter.
+    Plan(PresentedPlan),
+}
+
+/// What approving a plan sends. One sentence, and it says *how* to work the
+/// plan — an approval that only said "go" would leave the model to guess
+/// whether to batch the steps.
+pub const PLAN_APPROVED_PROMPT: &str =
+    "Approved. Implement the plan, one step at a time, verifying each.";
+
+/// The plan card's content, plus whether it is still the live one — an
+/// answered card stays in the transcript as a record, without the keys.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PresentedPlan {
+    pub summary: String,
+    /// `(content, verify-or-acceptance, dependencies)` per step, resolved on
+    /// the way in so the view renders rather than reasons.
+    pub steps: Vec<PlanStep>,
+    pub path: Option<String>,
+    /// Cleared the moment the human approves, revises, or sends anything.
+    pub live: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PlanStep {
+    pub content: String,
+    /// The command that proves it, else the acceptance sentence.
+    pub proof: Option<String>,
+    pub after: Vec<String>,
 }
 
 /// One `workflow` run as `/workflows` shows it.
@@ -880,6 +911,9 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
                         | "todos_changed"
                         | "goal_changed"
                         | "goal_verdict"
+                        // A plan presented while detached must be on screen
+                        // when you come back: it is waiting on you.
+                        | "plan_presented"
                         | "config_reloaded"
                         | "config_reload_failed"
                 ) {
@@ -1463,6 +1497,30 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // about a session both surfaces share.
         "context_report" => push_context_report(state, v),
         "workflows_report" => push_workflows_report(state, v),
+        // 0056 T3. Only one plan is ever live: a second `present_plan`
+        // supersedes the first, so the old card loses its keys.
+        "plan_presented" => {
+            for item in state.transcript.iter_mut() {
+                if let TranscriptItem::Plan(p) = item {
+                    p.live = false;
+                }
+            }
+            let steps = v
+                .get("nodes")
+                .and_then(Value::as_array)
+                .map(|ns| ns.iter().map(plan_step).collect())
+                .unwrap_or_default();
+            state.transcript.push(TranscriptItem::Plan(PresentedPlan {
+                summary: v
+                    .get("summary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                steps,
+                path: v.get("path").and_then(Value::as_str).map(str::to_string),
+                live: true,
+            }));
+        }
         "prompt_queued" => clear_newest_queued_steer(state),
         "compacted" => {
             let degraded = v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
@@ -1882,6 +1940,31 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             return interrupt_or_detach(state);
         }
     }
+    // The plan card's two answers (0056 T3). Guarded on an empty draft like
+    // `?` above, so a human mid-sentence still just types an `a`.
+    if state.editor.is_empty() && live_plan(state).is_some() {
+        match key.code {
+            KeyCode::Char('a') => {
+                settle_plan(state);
+                notice(state, "plan approved — leaving plan mode".into());
+                return vec![
+                    Cmd::SetPlan(false),
+                    Cmd::SendPrompt(crate::paste::PromptPayload::text_only(
+                        PLAN_APPROVED_PROMPT.into(),
+                    )),
+                ];
+            }
+            KeyCode::Char('r') => {
+                settle_plan(state);
+                notice(
+                    state,
+                    "revising — say what to change and the model replans".into(),
+                );
+                return Vec::new();
+            }
+            _ => {}
+        }
+    }
     if key.code == KeyCode::Char('?') && state.editor.is_empty() {
         state.help_open = true;
         state.modal_scroll = 0;
@@ -2169,6 +2252,8 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
     if let Some(rest) = text.trim().strip_prefix('/') {
         return slash_command(state, rest, payload);
     }
+    // Anything the human sends answers a live plan card — usually a revision.
+    settle_plan(state);
     if state.phase == Phase::Idle {
         state
             .transcript
@@ -2888,6 +2973,42 @@ fn turn_chars(transcript: &[TranscriptItem]) -> u64 {
             _ => 0,
         })
         .sum()
+}
+
+fn plan_step(v: &Value) -> PlanStep {
+    let text = |k: &str| v.get(k).and_then(Value::as_str).map(str::to_string);
+    PlanStep {
+        content: text("content").unwrap_or_default(),
+        proof: text("validate_cmd").or_else(|| text("acceptance")),
+        after: v
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .map(|d| {
+                d.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    }
+}
+
+/// The live plan card, if one is still awaiting an answer.
+fn live_plan(state: &State) -> Option<&PresentedPlan> {
+    state.transcript.iter().rev().find_map(|i| match i {
+        TranscriptItem::Plan(p) if p.live => Some(p),
+        _ => None,
+    })
+}
+
+/// Retire the live plan card. Called by the two answers and by any ordinary
+/// prompt — a human who typed something answered the card by doing so.
+fn settle_plan(state: &mut State) {
+    for item in state.transcript.iter_mut() {
+        if let TranscriptItem::Plan(p) = item {
+            p.live = false;
+        }
+    }
 }
 
 fn notice(state: &mut State, text: String) {
@@ -3666,6 +3787,76 @@ mod tests {
             cmds[..],
             [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(_)]
         ));
+    }
+
+    /// 0056 T3: the plan arrives as a card, `a` approves it (leaving plan
+    /// mode and sending the implement prompt), and the card stops offering
+    /// its keys once answered.
+    #[test]
+    fn a_presented_plan_becomes_a_card_that_a_approves() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type":"plan_presented","summary":"swap the parser","path":"/p/current.md",
+                   "nodes":[
+                       {"content":"write the lexer","status":"pending",
+                        "validate_cmd":"cargo test -p lex","id":"n1"},
+                       {"content":"wire it up","status":"pending","dependencies":["n1"]}]}),
+        );
+        let Some(TranscriptItem::Plan(plan)) = s.transcript.last() else {
+            panic!("no plan card: {:?}", s.transcript);
+        };
+        assert!(plan.live);
+        assert_eq!(plan.summary, "swap the parser");
+        assert_eq!(plan.steps.len(), 2);
+        assert_eq!(plan.steps[0].proof.as_deref(), Some("cargo test -p lex"));
+        assert_eq!(plan.steps[1].after, vec!["n1".to_string()]);
+        assert_eq!(plan.path.as_deref(), Some("/p/current.md"));
+
+        let cmds = press(&mut s, KeyCode::Char('a'));
+        assert!(
+            cmds.iter().any(|c| matches!(c, Cmd::SetPlan(false))),
+            "approve must leave plan mode: {cmds:?}"
+        );
+        let Some(Cmd::SendPrompt(p)) = cmds.iter().find(|c| matches!(c, Cmd::SendPrompt(_))) else {
+            panic!("approve must send the implement prompt: {cmds:?}");
+        };
+        assert_eq!(p.text, PLAN_APPROVED_PROMPT);
+        assert!(live_plan(&s).is_none(), "an answered card keeps no keys");
+        // …and the key is an ordinary character again.
+        press(&mut s, KeyCode::Char('a'));
+        assert_eq!(s.editor.text(), "a");
+    }
+
+    /// `r` dismisses the card and hands the keyboard back — the revision is
+    /// just the next thing you type.
+    #[test]
+    fn r_dismisses_the_plan_card_without_sending_anything() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type":"plan_presented","summary":"x","nodes":[
+                {"content":"a","status":"pending"}]}),
+        );
+        let cmds = press(&mut s, KeyCode::Char('r'));
+        assert!(cmds.is_empty(), "revise sends nothing: {cmds:?}");
+        assert!(live_plan(&s).is_none());
+    }
+
+    /// A draft in progress owns its own letters: `a` mid-sentence types.
+    #[test]
+    fn the_plan_keys_never_steal_from_a_draft() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type":"plan_presented","summary":"x","nodes":[
+                {"content":"a","status":"pending"}]}),
+        );
+        press(&mut s, KeyCode::Char('w'));
+        let cmds = press(&mut s, KeyCode::Char('a'));
+        assert!(cmds.is_empty());
+        assert_eq!(s.editor.text(), "wa");
+        assert!(live_plan(&s).is_some(), "the card is still waiting");
     }
 
     #[test]

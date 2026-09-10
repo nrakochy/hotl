@@ -90,6 +90,16 @@ Top to bottom:
    [Navigating the agent band](#navigating-the-agent-band).
 5. **Hint row** — the keys that matter right now.
 
+### The plan card
+
+In plan mode the model hands you a plan through `present_plan`, which renders
+as a `◆` card: the summary, the numbered steps with the command that verifies
+each, and where it was saved. Press `a` to approve — plan mode turns off and
+the model starts implementing, one step at a time, verifying each — or `r` to
+dismiss the card and say what to change. Typing anything dismisses it, so a
+revision is just the next thing you send. A second plan supersedes the first,
+and an answered card keeps the plan but drops its keys.
+
 ### Tool cards that stay readable
 
 Consecutive same-tool calls on the same target absorb into one accumulating

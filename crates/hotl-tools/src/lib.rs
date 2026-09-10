@@ -30,7 +30,7 @@ pub mod winfloor;
 pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use minified::MinifyConfig;
-pub use todo::TodoWriteTool;
+pub use todo::{PresentPlanTool, TodoWriteTool};
 pub use web::{WebFetchTool, WebSearchTool};
 
 use std::sync::{Arc, OnceLock};
@@ -172,6 +172,12 @@ pub trait Tool: Send + Sync {
     /// which is exactly what plan mode promises for everything it can't prove.
     /// Defaulting true would block MCP-backed tools, which cannot know.
     fn edits_files(&self) -> bool {
+        false
+    }
+    /// Is this tool only offered while plan mode is on (`present_plan`)?
+    /// Plan mode's roster is otherwise a strict subset of the ordinary one;
+    /// this is the single tool that goes the other way.
+    fn plan_only(&self) -> bool {
         false
     }
     /// Does this tool block on a nested hotl session (`spawn`, `workflow`)?
@@ -326,6 +332,21 @@ impl Registry {
                 .tools
                 .iter()
                 .filter(|t| !t.edits_files())
+                .cloned()
+                .collect(),
+        }
+    }
+
+    /// The ordinary roster: everything except the tools that only exist
+    /// inside plan mode (`present_plan`). The complement of the filter above
+    /// — the two together are what make the plan toggle move the roster in
+    /// both directions.
+    pub fn without_plan_tools(&self) -> Registry {
+        Registry {
+            tools: self
+                .tools
+                .iter()
+                .filter(|t| !t.plan_only())
                 .cloned()
                 .collect(),
         }

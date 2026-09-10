@@ -844,7 +844,7 @@ impl Turn {
         models.extend(shared.config.fallback_models.iter().cloned());
         let head = shared.head();
         Self {
-            tool_defs_all: shared.registry.defs().into(),
+            tool_defs_all: shared.registry.without_plan_tools().defs().into(),
             tool_defs_plan: shared.registry.without_edit_tools().defs().into(),
             shared,
             cmd_tx,

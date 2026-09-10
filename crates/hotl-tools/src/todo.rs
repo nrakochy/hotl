@@ -379,6 +379,120 @@ impl Tool for TodoWriteTool {
     }
 }
 
+/// `present_plan` (0056 T3) — the one channel from thinking to a plan the
+/// human sees. Advertised only while plan mode is on: in plan mode the model
+/// cannot write or edit, so without this it has no way to *deliver* anything
+/// but prose the user has to read out of the transcript.
+///
+/// `read_only` and `Permission::None`: it writes the plan artifact through
+/// the actor, which is session state, not the workspace.
+pub struct PresentPlanTool {
+    sink: PlanSink,
+    /// Where the artifact lands, for the reply text. `None` when this session
+    /// files no artifact — the plan still reaches the user through the event.
+    path: Option<String>,
+}
+
+type PlanSink = Arc<dyn Fn(String, Vec<Todo>) + Send + Sync>;
+
+impl PresentPlanTool {
+    pub fn new(sink: PlanSink, path: Option<String>) -> Self {
+        Self { sink, path }
+    }
+}
+
+impl Tool for PresentPlanTool {
+    fn name(&self) -> &'static str {
+        "present_plan"
+    }
+    fn description(&self) -> &str {
+        "Hand the user a finished plan to approve or revise. This is the only way a plan \
+         reaches the user; nothing you wrote before calling it counts as a plan. Call it \
+         once, when you have investigated enough to name the files to change and the \
+         command that verifies each step — then stop and wait. `summary` is one paragraph \
+         of what you propose and why; `nodes` are the steps, in the `todo_write` shape."
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "one paragraph: what you propose, and why this way"
+                },
+                "todos": {
+                    "type": "array",
+                    "description": "the steps, same shape as todo_write's `todos`",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "failed", "needs_more_steps"]},
+                            "id": {"type": "string"},
+                            "dependencies": {"type": "array", "items": {"type": "string"}},
+                            "acceptance": {"type": "string"},
+                            "validate_cmd": {"type": "string"},
+                            "replan": {"type": "boolean"}
+                        },
+                        "required": ["content", "status"]
+                    }
+                }
+            },
+            "required": ["summary", "todos"]
+        })
+    }
+    fn permission(&self, _input: &Value) -> Permission {
+        Permission::None
+    }
+    fn read_only(&self) -> bool {
+        true
+    }
+    fn plan_only(&self) -> bool {
+        true
+    }
+    fn display_summary(&self, input: &Value) -> Option<String> {
+        input
+            .get("summary")
+            .and_then(Value::as_str)
+            .map(|s| format!("present_plan: {}", s.lines().next().unwrap_or(s)))
+    }
+    fn run<'a>(&'a self, input: Value, _cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            let summary = match str_field(&input, "summary") {
+                Some(s) => s,
+                None => {
+                    return ToolOutcome::err(
+                        "`summary` must be a non-empty paragraph saying what you propose \
+                         and why. Re-send the call with one.",
+                    )
+                }
+            };
+            let nodes = match parse_todos(&input) {
+                Ok(n) if n.is_empty() => {
+                    return ToolOutcome::err(
+                        "A plan needs at least one step. Send `todos` with the steps you \
+                         propose.",
+                    )
+                }
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let count = nodes.len();
+            (self.sink)(summary, nodes);
+            ToolOutcome::ok(match &self.path {
+                Some(p) => format!(
+                    "Plan recorded at {p} ({count} steps). Stop here; the user will \
+                     approve or revise it."
+                ),
+                None => format!(
+                    "Plan recorded ({count} steps). Stop here; the user will approve or \
+                     revise it."
+                ),
+            })
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -77,6 +77,11 @@ fn every_frame_is_tagged_and_versioned() {
         EngineEvent::PromptQueued,
         EngineEvent::Compacted { degraded: false },
         EngineEvent::TodosChanged { items: Vec::new() },
+        EngineEvent::PlanPresented {
+            summary: "swap the parser".into(),
+            nodes: Vec::new(),
+            path: Some("/tmp/plans/x/current.md".into()),
+        },
         EngineEvent::GoalChanged {
             condition: Some("tests pass".into()),
         },
@@ -100,6 +105,32 @@ fn every_frame_is_tagged_and_versioned() {
         let text = f.to_string();
         assert!(!text.contains(" { "), "Debug-formatted payload in {f}");
     }
+}
+
+/// 0056 T3: the plan reaches a headless client as data, not as prose it
+/// would have to scrape out of `text_delta`.
+#[test]
+fn plan_presented_carries_the_summary_nodes_and_path() {
+    let f = wire::json_frame(
+        &EngineEvent::PlanPresented {
+            summary: "swap the parser".into(),
+            nodes: vec![hotl_types::Todo {
+                content: "write the lexer".into(),
+                status: hotl_types::TodoStatus::Pending,
+                id: Some("n1".into()),
+                validate_cmd: Some("cargo test -p lex".into()),
+                ..Default::default()
+            }],
+            path: Some("/tmp/plans/x/current.md".into()),
+        },
+        "test-model",
+    );
+    assert_eq!(f["type"], "plan_presented");
+    assert_eq!(f["summary"], "swap the parser");
+    assert_eq!(f["path"], "/tmp/plans/x/current.md");
+    assert_eq!(f["nodes"][0]["content"], "write the lexer");
+    assert_eq!(f["nodes"][0]["id"], "n1");
+    assert_eq!(f["nodes"][0]["validate_cmd"], "cargo test -p lex");
 }
 
 #[test]

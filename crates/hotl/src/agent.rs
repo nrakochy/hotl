@@ -507,6 +507,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         Some(scaffold.spawn_registration(session_id.clone())),
         Some(scaffold.recall_registration(session_id)),
         scaffold.hooks.clone(),
+        scaffold.plan_artifact_path(),
         |registry| {
             let mut deps = scaffold.deps(
                 log,
@@ -792,6 +793,7 @@ pub(crate) async fn build_acp() -> Result<
             Some(scaffold.spawn_registration(session_id.clone())),
             Some(scaffold.recall_registration(session_id.clone())),
             scaffold.hooks.clone(),
+            scaffold.plan_artifact_path(),
             |registry| {
                 let mut deps = scaffold.deps(
                     log,
@@ -905,6 +907,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         Some(scaffold.spawn_registration(session_id.clone())),
         Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
+        scaffold.plan_artifact_path(),
         |registry| {
             let mut deps = scaffold.deps(
                 log,
@@ -1120,6 +1123,13 @@ impl Scaffold {
         masker_with_helper(self.initial_helper_key.as_deref())
     }
 
+    /// The plan artifact's human half, for `present_plan`'s reply text.
+    fn plan_artifact_path(&self) -> Option<String> {
+        self.plan_files
+            .as_ref()
+            .map(|f| f.dir.join("current.md").display().to_string())
+    }
+
     /// What every top-level session's `spawn_session_with_todos` call needs
     /// to register a per-session `spawn` tool (never used for a child's own
     /// session — see `HotlChildBuilder`, which always passes `None`).
@@ -1232,6 +1242,61 @@ fn plan_files_for(
         dir,
         repo_mirror,
     })
+}
+
+/// One numbered plan step as `-p --plan` prints it: the content, then the
+/// command that will prove it (or the acceptance sentence, when no command
+/// can).
+fn plan_line(n: &hotl_types::Todo) -> String {
+    let mut s = n.content.clone();
+    if let Some(cmd) = &n.validate_cmd {
+        s.push_str(&format!("  → verify: {cmd}"));
+    } else if let Some(a) = &n.acceptance {
+        s.push_str(&format!("  → done when: {a}"));
+    }
+    if !n.dependencies.is_empty() {
+        s.push_str(&format!("  ⇐ after {}", n.dependencies.join(", ")));
+    }
+    s
+}
+
+/// A headless plan-mode run's exit code (0056 T3). Plan mode promises it
+/// changes no files, so a run that leaves a dirty tree exits 3 and names the
+/// paths. Outside a git repo there is nothing to compare against — say so
+/// rather than claiming a clean tree.
+///
+/// Amended 2026-09-09: this was the shadow-git diff until 0054 deleted the
+/// snapshot subsystem; `git status --porcelain` is the check now.
+fn plan_exit_code(workspace: &std::path::Path) -> i32 {
+    let out = std::process::Command::new("git")
+        .args(["--no-optional-locks", "status", "--porcelain"])
+        .current_dir(workspace)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout);
+            let dirty: Vec<&str> = text
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                // Porcelain v1 is `XY <path>`; the status letters are noise
+                // to a human reading "which files did you touch".
+                .map(|l| l.split_once(' ').map_or(l, |(_, p)| p.trim()))
+                .collect();
+            if dirty.is_empty() {
+                0
+            } else {
+                eprintln!("hotl: plan mode changed files: {}", dirty.join(", "));
+                3
+            }
+        }
+        _ => {
+            eprintln!("hotl: not a git repository — cannot verify that plan mode changed no files");
+            0
+        }
+    }
 }
 
 /// Env-named secrets plus, when a helper minted this process's key, that
@@ -1367,6 +1432,7 @@ async fn run_session(
         Some(scaffold.spawn_registration(session_id.clone())),
         Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
+        scaffold.plan_artifact_path(),
         |registry| {
             let mut deps = scaffold.deps(
                 log,
@@ -1391,6 +1457,9 @@ async fn run_session(
         scaffold.config.max_turns,
         scaffold.model.clone(),
     );
+    if scaffold.rules.plan() {
+        surface = surface.in_plan_mode(scaffold.cwd.clone());
+    }
     surface
         .handle
         .prompt(crate::setup::expand_file_refs(&prompt))
@@ -1484,9 +1553,18 @@ fn spawn_interactive_session(
     spawn: Option<SpawnRegistration>,
     recall: Option<RecallRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    plan_artifact_path: Option<String>,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
-    spawn_session_inner(registry, spawn, recall, hooks, true, build_deps)
+    spawn_session_inner(
+        registry,
+        spawn,
+        recall,
+        hooks,
+        true,
+        plan_artifact_path,
+        build_deps,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -1495,9 +1573,18 @@ fn spawn_session_with_todos(
     spawn: Option<SpawnRegistration>,
     recall: Option<RecallRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
+    plan_artifact_path: Option<String>,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
-    spawn_session_inner(registry, spawn, recall, hooks, false, build_deps)
+    spawn_session_inner(
+        registry,
+        spawn,
+        recall,
+        hooks,
+        false,
+        plan_artifact_path,
+        build_deps,
+    )
 }
 
 #[allow(clippy::type_complexity)]
@@ -1507,6 +1594,7 @@ fn spawn_session_inner(
     recall: Option<RecallRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     egress_ask: bool,
+    plan_artifact_path: Option<String>,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
     let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
@@ -1528,6 +1616,18 @@ fn spawn_session_inner(
             }
         },
     ))));
+    // `present_plan` is per-session for the same reason `todo_write` is: its
+    // sink holds a sender to *this* actor. The roster hides it whenever plan
+    // mode is off (`Registry::without_plan_tools`).
+    let weak = cmd_tx.downgrade();
+    registry.register(Box::new(hotl_tools::PresentPlanTool::new(
+        Arc::new(move |summary, nodes| {
+            if let Some(tx) = weak.upgrade() {
+                let _ = tx.try_send(hotl_engine::SessionCmd::PresentPlan { summary, nodes });
+            }
+        }),
+        plan_artifact_path.clone(),
+    )));
     registry.register(Box::new(hotl_tools::AskUserTool::new(
         hotl_engine::question_sink(
             cmd_tx.downgrade(),
@@ -2040,6 +2140,7 @@ impl HotlChildBuilder {
             // the parent's would leak history the parent chose not to pass.
             None,
             None, // children never get hooks either — see `hooks: None` below
+            None, // …and no plan artifact: a child's plan is its parent's business
             |registry| SessionDeps {
                 provider: self.provider.clone(),
                 registry,
@@ -2394,6 +2495,9 @@ struct Surface {
     /// One interrupt stream for the surface's lifetime — registered once,
     /// not per select iteration.
     sigint: crate::signals::Interrupt,
+    /// The workspace, when this headless run is in plan mode (0056 T3).
+    /// `Some` arms the end-of-run check that plan mode changed no files.
+    plan_workspace: Option<PathBuf>,
 }
 
 impl Surface {
@@ -2406,7 +2510,14 @@ impl Surface {
             max_turns,
             model,
             sigint: crate::signals::Interrupt::new().expect("interrupt handler"),
+            plan_workspace: None,
         }
+    }
+
+    /// Arm the plan-mode end-of-run check (`-p --plan`).
+    fn in_plan_mode(mut self, workspace: PathBuf) -> Self {
+        self.plan_workspace = Some(workspace);
+        self
     }
 
     /// Headless: drain events until the (single) turn completes.
@@ -2424,7 +2535,12 @@ impl Surface {
                     };
                     self.render(event).await;
                     if let Some(code) = done_code {
-                        return code;
+                        return match self.plan_workspace.take() {
+                            // A clean exit that changed files is not a clean
+                            // exit: plan mode promised it would not.
+                            Some(ws) if code == 0 => plan_exit_code(&ws),
+                            _ => code,
+                        };
                     }
                 }
                 _ = self.sigint.recv() => {
@@ -2532,6 +2648,20 @@ impl Surface {
                 usage,
                 mispredictions,
             } => self.render_turn_done(outcome, usage, mispredictions),
+            EngineEvent::PlanPresented {
+                summary,
+                nodes,
+                path,
+            } => {
+                println!("{summary}\n");
+                for (i, n) in nodes.iter().enumerate() {
+                    println!("{}. {}", i + 1, plan_line(n));
+                }
+                if let Some(p) = path {
+                    eprintln!("· plan written to {p}");
+                }
+                let _ = std::io::stdout().flush();
+            }
             EngineEvent::TodosChanged { items } => {
                 let done = items
                     .iter()
@@ -4791,7 +4921,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
                 SessionDeps {
                     concurrency: Default::default(),
                     provider,
@@ -4847,35 +4977,36 @@ mod tests {
         let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
-        let handle = spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
-            SessionDeps {
-                concurrency: Default::default(),
-                provider,
-                registry,
-                rules: Arc::new(hotl_tools::rules::Rules::default()),
-                sandbox_enforced: false,
-                clock: Arc::new(SystemClock),
-                log,
-                system: "sys".into(),
-                cwd: dir.path().to_path_buf(),
-                hooks: None,
-                initial_items: vec![hotl_types::Item::User {
-                    text: "earlier parent context".into(),
-                    synthetic: None,
-                    images: Vec::new(),
-                }],
-                initial_todos: vec![hotl_types::Todo {
-                    content: "wire the gate".into(),
-                    status: hotl_types::TodoStatus::InProgress,
-                    active_form: None,
-                    ..Default::default()
-                }],
-                initial_decisions: Vec::new(),
-                plan_files: None,
-                initial_goal: None,
-                config,
-            }
-        });
+        let handle =
+            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
+                SessionDeps {
+                    concurrency: Default::default(),
+                    provider,
+                    registry,
+                    rules: Arc::new(hotl_tools::rules::Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: dir.path().to_path_buf(),
+                    hooks: None,
+                    initial_items: vec![hotl_types::Item::User {
+                        text: "earlier parent context".into(),
+                        synthetic: None,
+                        images: Vec::new(),
+                    }],
+                    initial_todos: vec![hotl_types::Todo {
+                        content: "wire the gate".into(),
+                        status: hotl_types::TodoStatus::InProgress,
+                        active_form: None,
+                        ..Default::default()
+                    }],
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
+                    initial_goal: None,
+                    config,
+                }
+            });
 
         // The actor publishes its seeded head at startup; wait for that rather
         // than racing it.
@@ -4959,7 +5090,7 @@ mod tests {
         // *before* the assertion below, not merely by the time the test
         // function itself ends).
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
                 SessionDeps {
                     concurrency: Default::default(),
                     provider,
@@ -5019,7 +5150,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
                 SessionDeps {
                     concurrency: Default::default(),
                     provider,
@@ -5080,7 +5211,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, None, |registry| {
                 SessionDeps {
                     concurrency: Default::default(),
                     provider,
@@ -5357,6 +5488,44 @@ mod tests {
             *synthetic,
             Some(hotl_types::SyntheticReason::SystemReminder)
         );
+    }
+
+    /// 0056 T3: plan mode promises it changes no files, and a headless run
+    /// that broke that promise must not exit 0.
+    #[test]
+    fn a_headless_plan_run_exits_3_when_it_changed_files() {
+        if std::process::Command::new("git")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let cwd = tempfile::tempdir().unwrap();
+        // Not a repo yet: nothing to compare against, and saying so beats
+        // claiming a clean tree.
+        assert_eq!(plan_exit_code(cwd.path()), 0);
+
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(cwd.path())
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(cwd.path().join("a.txt"), "x").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "seed"]);
+        assert_eq!(plan_exit_code(cwd.path()), 0, "a clean tree exits 0");
+
+        std::fs::write(cwd.path().join("a.txt"), "y").unwrap();
+        assert_eq!(plan_exit_code(cwd.path()), 3, "a dirty tree exits 3");
     }
 
     /// 0056 T2: a plan the last session left open reaches the next fresh
@@ -6194,6 +6363,7 @@ mod tests {
                 None,
                 None,
                 Some(hooks.clone()),
+                None,
                 move |registry| SessionDeps {
                     concurrency: Default::default(),
                     provider,

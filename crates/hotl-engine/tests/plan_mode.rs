@@ -337,10 +337,17 @@ async fn run_visible(start_in_plan: bool, toggles: [Option<bool>; 2]) -> Visible
         ScriptedProvider::text_reply("one"),
         ScriptedProvider::text_reply("two"),
     ]));
+    // `present_plan` is per-session in the binary (its sink holds a sender to
+    // one actor), so a roster test has to register it the same way.
+    let mut registry = Registry::builtin();
+    registry.register(Box::new(hotl_tools::PresentPlanTool::new(
+        Arc::new(|_, _| {}),
+        None,
+    )));
     let handle = spawn_session(SessionDeps {
         concurrency: Default::default(),
         provider: provider.clone(),
-        registry: Arc::new(Registry::builtin()),
+        registry: Arc::new(registry),
         rules: Arc::new(
             Rules::default()
                 .with_mode(PermissionMode::Ask)
@@ -471,4 +478,129 @@ async fn the_plan_reminder_reaches_the_next_request() {
         rendered.contains("Plan mode is on"),
         "the first request never carried the reminder: {rendered}"
     );
+}
+
+/// 0056 T3, the roster's other direction: plan mode is normally a strict
+/// subset, and `present_plan` is the one tool that only exists inside it.
+#[tokio::test]
+async fn present_plan_is_advertised_only_in_plan_mode() {
+    let v = run_visible(true, [None, Some(false)]).await;
+    let on = tool_names(&v.requests[0]);
+    assert!(on.contains(&"present_plan".to_string()), "{on:?}");
+    let off = tool_names(&v.requests[1]);
+    assert!(
+        !off.contains(&"present_plan".to_string()),
+        "plan off must not advertise present_plan: {off:?}"
+    );
+}
+
+/// The tool's whole point: the plan becomes durable state and reaches the
+/// surface as an event, rather than prose the human has to find in the
+/// transcript.
+#[tokio::test]
+async fn present_plan_writes_the_artifact_and_emits_the_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let data = tempfile::tempdir().expect("tempdir");
+    let plan_dir = data.path().join("plans").join("proj");
+    let config = EngineConfig::default();
+    let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
+        .expect("session log");
+    let mut registry = Registry::builtin();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<hotl_types::Todo>)>(4);
+    registry.register(Box::new(hotl_tools::PresentPlanTool::new(
+        Arc::new(move |summary, nodes| {
+            let _ = tx.try_send((summary, nodes));
+        }),
+        Some(plan_dir.join("current.md").display().to_string()),
+    )));
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call(
+            "t1",
+            "present_plan",
+            json!({
+                "summary": "swap the parser",
+                "todos": [
+                    {"content": "write the lexer", "status": "pending",
+                     "validate_cmd": "cargo test -p lex"},
+                    {"content": "wire it up", "status": "pending", "dependencies": ["n1"]}
+                ]
+            }),
+        ),
+        ScriptedProvider::text_reply("waiting"),
+    ]));
+    let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
+        provider,
+        registry: Arc::new(registry),
+        rules: Arc::new(Rules::default().with_plan(true)),
+        sandbox_enforced: true,
+        clock: Arc::new(SystemClock),
+        log,
+        system: "test-system".into(),
+        cwd: dir.path().to_path_buf(),
+        hooks: None,
+        initial_items: Vec::new(),
+        initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: Some(hotl_engine::PlanFiles {
+            project: "proj".into(),
+            dir: plan_dir.clone(),
+            repo_mirror: None,
+        }),
+        initial_goal: None,
+        config,
+    });
+    let mut s = Session { handle, dir };
+    s.handle.prompt("plan it".into()).await;
+
+    // The tool's own sink is a test double here, so the actor is driven the
+    // way the binary drives it — the command, not the tool internals.
+    let (summary, nodes) = tokio::time::timeout(Duration::from_secs(30), rx.recv())
+        .await
+        .expect("sink timeout")
+        .expect("sink closed");
+    assert_eq!(summary, "swap the parser");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(nodes[1].dependencies, vec!["n1".to_string()]);
+    s.handle.present_plan(summary, nodes).await;
+
+    let mut presented = None;
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::PlanPresented {
+                summary,
+                nodes,
+                path,
+            } => presented = Some((summary, nodes, path)),
+            EngineEvent::TurnDone { .. } if presented.is_some() => break,
+            EngineEvent::TurnDone { .. } => {}
+            _ => {}
+        }
+    }
+    let (summary, nodes, path) = presented.expect("no PlanPresented event");
+    assert_eq!(summary, "swap the parser");
+    assert_eq!(nodes.len(), 2);
+    assert_eq!(
+        path.as_deref(),
+        Some(plan_dir.join("current.md").display().to_string().as_str())
+    );
+
+    let a = hotl_engine::plan_state::read_artifact(&plan_dir).expect("artifact");
+    assert_eq!(a.nodes.len(), 2);
+    let md = std::fs::read_to_string(plan_dir.join("current.md")).expect("md");
+    assert!(md.contains("write the lexer"), "{md}");
+    assert!(md.contains("→ verify: cargo test -p lex"), "{md}");
+
+    // The reply tells the model to stop — a plan mode that kept going would
+    // spend the whole budget re-planning.
+    let log_path = std::fs::read_dir(s.dir.path())
+        .expect("session dir")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .expect("session log");
+    let (is_error, content) = result_of(&std::fs::read_to_string(&log_path).expect("read log"));
+    assert!(!is_error, "{content}");
+    assert!(content.contains("Stop here"), "{content}");
+    assert!(content.contains("current.md"), "{content}");
 }

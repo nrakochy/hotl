@@ -790,6 +790,14 @@ impl SharedDeps {
         }
     }
 
+    /// The human-readable half of the artifact, for the `present_plan` reply
+    /// and the surfaces' card. `None` when this session files none.
+    pub(crate) fn plan_artifact_path(&self) -> Option<String> {
+        self.plan_files
+            .as_ref()
+            .map(|f| f.dir.join("current.md").display().to_string())
+    }
+
     /// A turn's read side of the published head — see the `head_rx` field
     /// doc. Cloned per turn task; `watch::Receiver` clones observe the same
     /// value, so this grants no second source of truth.
@@ -1182,6 +1190,41 @@ pub(crate) async fn run(
                             effort: effort.map(|e| e.as_str().to_string()),
                         },
                     )
+                    .await;
+            }
+            SessionCmd::PresentPlan { summary, nodes } => {
+                // The same durable path a `todo_write` takes — a presented
+                // plan IS the plan, not a proposal held somewhere else — plus
+                // the event that puts it in front of the human.
+                head.set_todos(nodes);
+                let items = (**head.todos()).clone();
+                let decisions = (**head.decisions()).clone();
+                let _ = shared
+                    .append(
+                        &mut log,
+                        &mut pipeline,
+                        &mut head,
+                        EntryPayload::Todos {
+                            items: items.clone(),
+                            decisions: decisions.clone(),
+                        },
+                    )
+                    .await;
+                shared.write_plan_artifact(&crate::plan_state::PlanState {
+                    todos: items.clone(),
+                    decisions,
+                });
+                let _ = events
+                    .send(EngineEvent::TodosChanged {
+                        items: items.clone(),
+                    })
+                    .await;
+                let _ = events
+                    .send(EngineEvent::PlanPresented {
+                        summary,
+                        nodes: items,
+                        path: shared.plan_artifact_path(),
+                    })
                     .await;
             }
             SessionCmd::SetTodos {

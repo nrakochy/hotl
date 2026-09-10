@@ -423,6 +423,15 @@ pub enum EngineEvent {
     GoalChanged {
         condition: Option<String>,
     },
+    /// The model handed the user a plan to approve or revise (`present_plan`,
+    /// 0056 T3). The nodes are already durable — this is the surface's cue to
+    /// show them and offer the two answers, not a request the engine waits on.
+    PlanPresented {
+        summary: String,
+        nodes: Vec<Todo>,
+        /// The artifact the plan was written to, when this session files one.
+        path: Option<String>,
+    },
     /// The goal evaluator's per-turn judgment (0034). `turns` counts
     /// evaluated turns since the goal was set (in-memory; resets on resume).
     /// `usage` is the loop's cumulative spend since then, the evaluator's own
@@ -468,6 +477,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::EgressAsk { host, .. } => write!(f, "EgressAsk({host})"),
             Self::TurnDone { outcome, .. } => write!(f, "TurnDone({outcome:?})"),
             Self::TodosChanged { items } => write!(f, "TodosChanged(n={})", items.len()),
+            Self::PlanPresented { nodes, .. } => write!(f, "PlanPresented(n={})", nodes.len()),
             Self::GoalChanged { condition } => {
                 write!(f, "GoalChanged(set={})", condition.is_some())
             }
@@ -737,6 +747,11 @@ pub enum SessionCmd {
     /// to the log as `Todos`, last-wins on replay — same shape as
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
     /// only ever forwards a validated `Vec<Todo>` here.
+    /// `present_plan` (0056 T3): the same durable write `SetTodos` makes,
+    /// plus the summary and the `PlanPresented` event the surfaces turn into
+    /// an approve/revise card. A separate command rather than a flag on
+    /// `SetTodos`: only this one hands the turn back to the human.
+    PresentPlan { summary: String, nodes: Vec<Todo> },
     SetTodos {
         todos: Vec<Todo>,
         /// New decisions to append. Their `when_ms` arrives zero — the actor
@@ -960,6 +975,13 @@ impl SessionHandle {
     /// entry point is the `todo_write` tool's sink.
     pub async fn set_todos(&self, items: Vec<Todo>) {
         self.set_plan_nodes(items, Vec::new()).await;
+    }
+    /// Hand the user a plan (`present_plan`, 0056 T3).
+    pub async fn present_plan(&self, summary: String, nodes: Vec<Todo>) {
+        let _ = self
+            .cmd
+            .send(SessionCmd::PresentPlan { summary, nodes })
+            .await;
     }
     /// The full-state replace plus decisions to append (0056 T2).
     pub async fn set_plan_nodes(&self, todos: Vec<Todo>, decisions: Vec<hotl_types::Decision>) {
