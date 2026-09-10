@@ -22,6 +22,20 @@ semver promise of their own.
 
 ### Added
 
+- **`/goal` pauses instead of spinning, and gives up when only you can fix
+  it** (plan 0051). Eight consecutive goal turns in which no tool ran now end
+  the loop with `◎ goal paused …` — the goal stays set, and your next prompt
+  re-arms it with a full budget. The brake caps *idle* turns, not turns: a
+  turn that ran a tool resets the count, so a goal making progress is still
+  unbounded and the condition text remains the way to bound it. A denied or
+  hook-blocked call is not progress, so plan mode and a `dontask` session
+  stall out cleanly rather than burning tokens on talk. Separately, an error
+  only you can clear — a revoked key, a 401/402/403/404, a context window
+  compaction can no longer make room in — now clears the goal with
+  "run /goal again to continue" instead of leaving the loop armed against a
+  dead credential across a resume. A rate limit or an outage still leaves it
+  armed, because retrying is what fixes those.
+
 - **`bash` and `grep` take an optional `expect`** (plan 0050). State what you
   predict a call returns — `{"exit": "zero"}`, `{"contains": "…"}`,
   `{"empty": true}`, or `{"matches": "some"|"none"}` for `grep` — and a
@@ -92,6 +106,20 @@ semver promise of their own.
   any other drop; drive-relative and UNC forms still insert literally.
 
 ### Changed
+
+- **The goal loop says where it stands, and counts what it costs**
+  (plan 0051). Both the agent's guidance and the evaluator's prompt now carry
+  `turn 3 · 12m elapsed · 41.2k in / 3.1k out`, so a turn or time bound
+  written into the condition is judged against real numbers instead of a
+  guess. The condition itself moved out of the harness's system-reminder
+  voice into its own `<goal-condition>` tag, quoted as data like every other
+  untrusted input. The evaluator is no longer free: its tokens fold into the
+  goal's running spend, into the turn's final `turn_done`, and onto the
+  `goal_verdict` frame (new additive `usage` field) — and the same fix makes
+  the compaction summarizer report its own spend, inline and speculative
+  alike. Bare `/goal` now shows condition, elapsed, turns, spend and the
+  evaluator's last reason; with nothing active it shows the goal that
+  resolved last; `/goal clear` echoes what it ended.
 
 - CI's harness job now runs `hotl-provider-openai-responses` and
   `hotl-retrieval`, neither of which had ever been in the PR gate.
