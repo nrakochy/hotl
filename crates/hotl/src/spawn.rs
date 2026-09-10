@@ -1822,10 +1822,14 @@ mod tests {
             reports("blocked", "could not write"),
             ScriptedProvider::text_reply("stopping"),
         ]));
+        // If the ask parked, this clock would reap it — so answering on arrival
+        // means finishing strictly inside the window. Kept well above the work
+        // itself: a loaded 2-core runner spends most of a second just starting
+        // the child, and that is not the parking this asserts against.
+        const IDLE_SECS: u64 = 5;
         let tool = typed_tool(builder, spawn_dir.path().to_path_buf())
             .with_prefix_stagger(std::time::Duration::ZERO)
-            // A one-second idle clock: if the ask parked, this would reap it.
-            .with_deadlines(1, 0);
+            .with_deadlines(IDLE_SECS, 0);
         let at = std::time::Instant::now();
         let out = tool
             .run(json!({"task": "write a file"}), CancellationToken::new())
@@ -1845,7 +1849,7 @@ mod tests {
         );
         assert!(!out.content.contains("expired after"), "{}", out.content);
         assert!(
-            at.elapsed() < std::time::Duration::from_secs(1),
+            at.elapsed() < std::time::Duration::from_secs(IDLE_SECS),
             "the ask was answered on arrival, not waited out: {:?}",
             at.elapsed()
         );
