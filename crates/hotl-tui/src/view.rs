@@ -523,6 +523,9 @@ fn blank_before(prev: Option<&TranscriptItem>, cur: &TranscriptItem, density: De
 /// row, a continuation glyph on the rest, each with its own color. This is
 /// what lets the eye track who is speaking by scanning straight down.
 struct Spine {
+    /// Columns of extra pad between the gutter and the glyph. Cards sit one
+    /// column in from prose (0061 T3), so tool work reads as a second voice.
+    indent: usize,
     marker: &'static str,
     cont: &'static str,
     marker_style: Style,
@@ -532,14 +535,14 @@ struct Spine {
 impl Spine {
     /// Prepend the gutter pad and this row's spine glyph to a content line.
     /// The glyph occupies one column; a trailing space separates it from the
-    /// text, so content always starts at `gutter + 2`.
+    /// text, so content always starts at `gutter + indent + 2`.
     fn wrap<'a>(&self, mut content: Line<'a>, gutter: usize, first: bool) -> Line<'a> {
         let (glyph, style) = if first {
             (self.marker, self.marker_style)
         } else {
             (self.cont, self.cont_style)
         };
-        let lead = format!("{}{glyph} ", " ".repeat(gutter));
+        let lead = format!("{}{glyph} ", " ".repeat(gutter + self.indent));
         let mut spans = Vec::with_capacity(content.spans.len() + 1);
         spans.push(Span::styled(lead, style));
         spans.append(&mut content.spans);
@@ -568,8 +571,10 @@ fn item_visual_lines<'a>(
     thinking_expanded: bool,
     measure: usize,
 ) -> Vec<Line<'a>> {
-    // `gutter + 2` = the pad plus the one-column glyph and its trailing space.
-    let inner = width.saturating_sub(gutter + 2).max(1);
+    // `gutter + 2` = the pad plus the one-column glyph and its trailing space;
+    // a card's own indent narrows it further, so `inner` is known before the
+    // block is built and `item_block` can clip to the width it will get.
+    let inner = width.saturating_sub(gutter + item_indent(item) + 2).max(1);
     let (spine, content) = item_block(item, p, thinking_expanded, inner);
     let mut out = Vec::new();
     for (cl, full) in &content {
@@ -702,6 +707,7 @@ fn assistant_spine(p: &Palette) -> Spine {
     // The warm dot + a faint bar down the whole answer, so a long reply
     // reads as one block rather than a wall of flat text.
     Spine {
+        indent: 0,
         marker: "●",
         cont: "│",
         marker_style: Style::new().fg(p.accent),
@@ -769,6 +775,25 @@ fn token_line<'a>(row: String, base: Style, token: Style) -> Line<'a> {
     Line::from(spans)
 }
 
+/// Columns a card sits in from the prose column. One source of truth with
+/// `Spine::indent` — `every_items_indent_matches_its_spine` holds them equal.
+fn item_indent(item: &TranscriptItem) -> usize {
+    usize::from(matches!(item, TranscriptItem::Tool { .. }))
+}
+
+/// A count with thousands separators — `1204` reads as `1,204` at a glance.
+fn group_digits(n: u64) -> String {
+    let raw = n.to_string();
+    let mut out = String::with_capacity(raw.len() + raw.len() / 3);
+    for (i, c) in raw.chars().enumerate() {
+        if i > 0 && (raw.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// The spine and the content spans for one item — the content no longer
 /// carries its own marker prefix; the spine owns that column now.
 fn item_block<'a>(
@@ -781,6 +806,7 @@ fn item_block<'a>(
         TranscriptItem::User { text } => (
             // You are the anchor: high-contrast caret, no continuation bar.
             Spine {
+                indent: 0,
                 marker: "❯",
                 cont: " ",
                 marker_style: Style::new().fg(p.ink).bold(),
@@ -801,6 +827,7 @@ fn item_block<'a>(
         TranscriptItem::Assistant { text } => (assistant_spine(p), assistant_lines(text, p)),
         TranscriptItem::Steer { text, queued: true } => (
             Spine {
+                indent: 0,
                 marker: "⤷",
                 cont: " ",
                 marker_style: Style::new().fg(p.muted),
@@ -817,6 +844,7 @@ fn item_block<'a>(
             queued: false,
         } => (
             Spine {
+                indent: 0,
                 marker: "⤷",
                 cont: " ",
                 marker_style: Style::new().fg(p.accent),
@@ -860,7 +888,9 @@ fn item_block<'a>(
             if !children.is_empty() {
                 details.push(call_count(children.len()));
             }
-            if !matches!(status, ToolStatus::Denied) {
+            // Elapsed rides the header only while the tool is still running;
+            // a settled card moves it to the result row (0061 T3).
+            if running {
                 details.push(format!("{}s", ticks / anim::TICK_HZ));
             }
             // Running only: the newest outstanding (else last) child call as
@@ -876,10 +906,11 @@ fn item_block<'a>(
                 }
             }
             // Name in the status color (so it stays identifiable now the
-            // marker moved to the spine), body ink, details muted.
+            // marker moved to the spine); body and details both muted, so the
+            // whole card reads as a second voice under the prose (0061 T3).
             let mut spans = vec![Span::styled(name.clone(), Style::new().fg(color))];
             if !body.is_empty() {
-                spans.push(Span::styled(format!("  {body}"), Style::new().fg(p.ink)));
+                spans.push(Span::styled(format!("  {body}"), Style::new().fg(p.muted)));
             }
             if !details.is_empty() {
                 spans.push(Span::styled(
@@ -887,19 +918,26 @@ fn item_block<'a>(
                     Style::new().fg(p.muted),
                 ));
             }
-            let lines = full(vec![Line::from(spans)]);
+            let mut rows = vec![Line::from(spans)];
+            // The result row (0061 T3): what the model got, and how long it
+            // took. Settled cards only — a running one still owns its clock.
+            if let Some(text) = result_row(status, calls, *ticks) {
+                rows.push(Line::styled(text, Style::new().fg(p.faint)));
+            }
             (
                 Spine {
+                    indent: 1,
                     marker,
                     cont: " ",
                     marker_style: Style::new().fg(color),
                     cont_style: Style::new(),
                 },
-                lines,
+                full(rows),
             )
         }
         TranscriptItem::Notice { text } => (
             Spine {
+                indent: 0,
                 marker: "·",
                 cont: " ",
                 marker_style: Style::new().fg(p.muted),
@@ -914,6 +952,7 @@ fn item_block<'a>(
         // execution error cannot be mistaken for the routine chatter near it.
         TranscriptItem::Error { text } => (
             Spine {
+                indent: 0,
                 marker: "✗",
                 cont: " ",
                 marker_style: Style::new().fg(p.blocked).bold(),
@@ -928,6 +967,7 @@ fn item_block<'a>(
         // rather than anything that reads as the model speaking.
         TranscriptItem::Report(r) => (
             Spine {
+                indent: 0,
                 marker: "·",
                 cont: "·",
                 marker_style: Style::new().fg(p.muted),
@@ -938,6 +978,7 @@ fn item_block<'a>(
         // A `/workflows` report (0044): one row per run, the same spine.
         TranscriptItem::WorkflowsReport(runs) => (
             Spine {
+                indent: 0,
                 marker: "·",
                 cont: "·",
                 marker_style: Style::new().fg(p.muted),
@@ -949,6 +990,7 @@ fn item_block<'a>(
         // answered one keeps the plan and drops them.
         TranscriptItem::Plan(plan) => (
             Spine {
+                indent: 0,
                 marker: "◆",
                 cont: "│",
                 marker_style: Style::new().fg(p.accent).bold(),
@@ -979,6 +1021,7 @@ fn item_block<'a>(
             }
             (
                 Spine {
+                    indent: 0,
                     marker: "·",
                     cont: " ",
                     marker_style: Style::new().fg(p.faint),
@@ -988,6 +1031,29 @@ fn item_block<'a>(
             )
         }
     }
+}
+
+/// The `└ N lines · Ns` row under a settled card: what the model received
+/// and how long the call took. `None` for a running card (its clock is still
+/// in the header), for a denial (nothing ran), and for an older peer that
+/// sent no counts — absent counts are not a claim of zero.
+fn result_row(status: &ToolStatus, calls: &[crate::app::ToolCall], ticks: u64) -> Option<String> {
+    if !matches!(status, ToolStatus::Done | ToolStatus::Failed) {
+        return None;
+    }
+    if !calls.iter().any(|c| c.lines.is_some()) {
+        return None;
+    }
+    let lines: u64 = calls.iter().filter_map(|c| c.lines).sum();
+    let bytes: u64 = calls.iter().filter_map(|c| c.bytes).sum();
+    let what = if bytes == 0 {
+        "no output".to_string()
+    } else if lines == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{} lines", group_digits(lines))
+    };
+    Some(format!("└ {what} · {}s", ticks / anim::TICK_HZ))
 }
 
 /// `1 call` / `N calls` — a spawn's child count on its card and band row.
@@ -1597,6 +1663,7 @@ fn render_agent_stream(
     let gutter = state.density.gutter();
     let inner = (area.width as usize).saturating_sub(gutter + 2).max(1);
     let spine = Spine {
+        indent: 0,
         marker: "·",
         cont: " ",
         marker_style: Style::new().fg(p.muted),
@@ -3311,9 +3378,160 @@ mod tests {
             tool_item("t2", "read", "a.rs", ToolStatus::Done, 0),
         ];
         let rows = draw(&s);
-        assert!(rows[0].starts_with("  ⊘ write"), "{:?}", rows[0]);
+        // Cards sit one column in from prose (0061 T3).
+        assert!(rows[0].starts_with("   ⊘ write"), "{:?}", rows[0]);
         // Same column as its neighbour: the name starts at TEXT_COL on both.
         assert_eq!(rows[0].find("write"), rows[1].find("read"));
+    }
+
+    /// 0061 T3: a settled card's clock moves to a faint `└` row that also
+    /// says how much the model got back.
+    #[test]
+    fn a_settled_card_with_counts_moves_elapsed_to_a_faint_result_row() {
+        let mut s = State::new(true, "m".into());
+        let mut item = tool_item(
+            "t1",
+            "bash",
+            "cargo build",
+            ToolStatus::Done,
+            8 * anim::TICK_HZ,
+        );
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            calls[0].lines = Some(1204);
+            calls[0].bytes = Some(51_233);
+        }
+        s.transcript.push(item);
+        let rows = draw(&s);
+        assert!(
+            !rows[0].contains("8s"),
+            "the header let go of the clock: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1].trim_start().starts_with("└ 1,204 lines · 8s"),
+            "result row: {:?}",
+            rows[1]
+        );
+        let buf = draw_buffer(&s);
+        let col = rows[1].find('└').unwrap() as u16;
+        assert_eq!(
+            buf.cell((col, 1)).unwrap().style().fg,
+            Some(Palette::default().faint),
+            "the result row is the quietest thing on the card"
+        );
+    }
+
+    /// Zero bytes is a real answer, and it is not `0 lines`.
+    #[test]
+    fn a_silent_command_says_no_output() {
+        let mut s = State::new(true, "m".into());
+        let mut item = tool_item("t1", "bash", "true", ToolStatus::Done, anim::TICK_HZ);
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            calls[0].lines = Some(0);
+            calls[0].bytes = Some(0);
+        }
+        s.transcript.push(item);
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(all.contains("└ no output · 1s"), "{all}");
+    }
+
+    /// An older peer sends no counts: no row, and no elapsed anywhere — the
+    /// card must not invent `0 lines` for a result it never heard about.
+    #[test]
+    fn a_card_without_counts_has_no_elapsed_and_no_row() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(tool_item(
+            "t1",
+            "read",
+            "app.rs",
+            ToolStatus::Done,
+            3 * anim::TICK_HZ,
+        ));
+        // The input box draws its own `└`, so only the transcript counts.
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(!all.contains('└'), "no result row: {all}");
+        assert!(!all.contains("3s"), "no elapsed: {all}");
+    }
+
+    /// A running card still owns its clock — the result row does not exist
+    /// yet, so the header is the only place the elapsed can live.
+    #[test]
+    fn a_running_card_keeps_elapsed_in_its_header() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(tool_item(
+            "t1",
+            "bash",
+            "cargo build",
+            ToolStatus::Running,
+            4 * anim::TICK_HZ,
+        ));
+        let rows = draw(&s);
+        assert!(rows[0].contains("· 4s"), "{:?}", rows[0]);
+        assert!(!rows[..STRIP].join("\n").contains('└'), "{:?}", rows);
+    }
+
+    /// Nothing ran, so there is nothing to count and no time to report.
+    #[test]
+    fn a_denied_card_has_no_result_row() {
+        let mut s = State::new(true, "m".into());
+        let mut item = tool_item(
+            "t1",
+            "write",
+            "~/.ssh/config",
+            ToolStatus::Denied,
+            5 * anim::TICK_HZ,
+        );
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            calls[0].lines = Some(9);
+            calls[0].bytes = Some(9);
+        }
+        s.transcript.push(item);
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(!all.contains('└'), "{all}");
+        assert!(!all.contains("5s"), "{all}");
+    }
+
+    /// D2: work is a second voice. A card's body is muted and its glyph sits
+    /// one column in from the prose column.
+    #[test]
+    fn a_card_body_is_muted_and_indented_one_column_past_prose() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::Assistant {
+            text: "looking".into(),
+        });
+        s.transcript
+            .push(tool_item("t1", "read", "app.rs", ToolStatus::Done, 0));
+        let rows = draw(&s);
+        let prose = rows.iter().find_map(|r| r.find('●')).expect("prose marker");
+        let card = rows.iter().find_map(|r| r.find('✓')).expect("card marker");
+        assert_eq!(card, prose + 1, "cards sit one column in: {rows:?}");
+    }
+
+    /// One source of truth for the card indent: the width `item_visual_lines`
+    /// reserves and the pad `Spine::wrap` writes must agree, or a card's rows
+    /// wrap one column short of where they are drawn.
+    #[test]
+    fn every_items_indent_matches_its_spine() {
+        let p = Palette::default();
+        let items = [
+            TranscriptItem::User { text: "hi".into() },
+            TranscriptItem::Assistant { text: "hi".into() },
+            TranscriptItem::Thinking { text: "mm".into() },
+            TranscriptItem::Notice {
+                text: "note".into(),
+            },
+            TranscriptItem::Error { text: "bad".into() },
+            tool_item("t1", "read", "app.rs", ToolStatus::Done, 0),
+            spawn_with_children(ToolStatus::Running, 1),
+        ];
+        for item in items {
+            let (spine, _) = item_block(&item, &p, false, 40);
+            assert_eq!(
+                spine.indent,
+                item_indent(&item),
+                "indent disagrees for {item:?}"
+            );
+        }
     }
 
     #[test]
@@ -4142,8 +4360,8 @@ mod tests {
         s.transcript.push(item);
         let rows = draw(&s);
         assert!(
-            rows.iter().any(|r| r.contains("read  app.rs · ×4 · 1s")),
-            "multiplier before the duration: {:?}",
+            rows.iter().any(|r| r.contains("read  app.rs · ×4")),
+            "the multiplier rides the settled header: {:?}",
             rows.first()
         );
     }
@@ -4197,7 +4415,7 @@ mod tests {
         let rows = draw(&s);
         let all = rows.join("\n");
         assert!(
-            all.contains("spawn  survey · 5 calls · 0s"),
+            all.contains("spawn  survey · 5 calls"),
             "collapsed count: {all}"
         );
         assert!(!all.contains("read c5.rs"), "no child rows: {all}");
@@ -4270,7 +4488,7 @@ mod tests {
         // Comfortable gutter (2) + the ✓ spine glyph; the name is no longer
         // bracketed, and the duplicate leading "bash" is peeled off the body.
         assert!(
-            rows[0].starts_with("  ✓ bash  echo hi · sandboxed:seatbelt · 1s"),
+            rows[0].starts_with("   ✓ bash  echo hi · sandboxed:seatbelt"),
             "spine card: {}",
             rows[0]
         );
@@ -4279,8 +4497,8 @@ mod tests {
         let col = |needle: &str| rows[0][..rows[0].find(needle).unwrap()].chars().count() as u16;
         assert_eq!(
             buf.cell((col("echo"), 0)).unwrap().style().fg,
-            Some(p.ink),
-            "command body is primary"
+            Some(p.muted),
+            "the whole card is a second voice under the prose"
         );
         assert_eq!(
             buf.cell((col("sandboxed"), 0)).unwrap().style().fg,
