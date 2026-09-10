@@ -75,6 +75,7 @@ fn done_todo(content: &str) -> hotl_types::Todo {
         content: content.into(),
         status: hotl_types::TodoStatus::Completed,
         active_form: None,
+        ..Default::default()
     }
 }
 

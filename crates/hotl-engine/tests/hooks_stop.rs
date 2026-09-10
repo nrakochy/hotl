@@ -149,6 +149,7 @@ async fn an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the
             content: "wire the gate".into(),
             status: TodoStatus::InProgress,
             active_form: None,
+            ..Default::default()
         }])
         .await;
 

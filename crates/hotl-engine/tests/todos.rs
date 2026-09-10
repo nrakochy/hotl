@@ -19,6 +19,7 @@ fn todo(content: &str, status: TodoStatus) -> Todo {
         content: content.into(),
         status,
         active_form: None,
+        ..Default::default()
     }
 }
 

@@ -2443,6 +2443,7 @@ mod tests {
                     content: "first".into(),
                     status: TodoStatus::Pending,
                     active_form: None,
+                    ..Todo::default()
                 }],
             },
             2,
@@ -2453,11 +2454,13 @@ mod tests {
                 content: "second".into(),
                 status: TodoStatus::InProgress,
                 active_form: None,
+                ..Todo::default()
             },
             Todo {
                 content: "third".into(),
                 status: TodoStatus::Pending,
                 active_form: None,
+                ..Todo::default()
             },
         ];
         log.append(

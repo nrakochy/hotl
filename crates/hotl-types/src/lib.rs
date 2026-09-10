@@ -167,23 +167,58 @@ pub const IMAGE_B64_BUDGET: usize = 24 * 1024 * 1024;
 /// A session checklist item (`todo_write`, M4/tier-1 gap #3). Full-state
 /// replace: the model rewrites the whole list each call, so there is no
 /// separate id/patch shape to reconcile.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Failed`/`NeedsMoreSteps` (0056 T1) sit **before** the `#[serde(other)]`
+/// arm, so an older binary reads them as `Unknown` — which every renderer
+/// already tolerates — rather than failing the whole entry.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TodoStatus {
+    #[default]
     Pending,
     InProgress,
     Completed,
+    /// Tried and did not work. Distinct from `Pending`: it has been attempted.
+    Failed,
+    /// The step turned out to be bigger than one step — it needs splitting.
+    NeedsMoreSteps,
     #[serde(other)]
     Unknown,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A plan node. Everything past `active_form` is 0056 T1 — all defaulted and
+/// skipped when empty, so a v0.25 `Todos` entry still deserializes and a list
+/// that uses none of it serializes to the same bytes it always did.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Todo {
     pub content: String,
     pub status: TodoStatus,
     /// Present-tense form shown while in progress ("wiring the gate"); optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_form: Option<String>,
+    /// `n1..nN`, assigned by `parse_todos` when absent and preserved when the
+    /// model sends one back — that stability is what makes `dependencies`
+    /// survive a full-state rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Ids of nodes whose output this one needs. Resolved and cycle-checked
+    /// at parse time.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<String>,
+    /// One sentence describing what "done" looks like when no command can say.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<String>,
+    /// The exact command that proves this node. Informational to `todo_write`
+    /// — nothing refuses a completion; the goal gate (T4) reads it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validate_cmd: Option<String>,
+    /// The node's own result is expected to change the rest of the plan.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub replan: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A tool invocation extracted from assistant blocks.
@@ -911,6 +946,7 @@ mod tests {
             content: "wire the gate".into(),
             status: TodoStatus::InProgress,
             active_form: Some("wiring the gate".into()),
+            ..Todo::default()
         };
         let j = serde_json::to_string(&t).unwrap();
         assert!(j.contains("\"status\":\"in_progress\""));
@@ -922,6 +958,42 @@ mod tests {
         let ej = serde_json::to_string(&e).unwrap();
         assert!(ej.contains("\"kind\":\"todos\""));
         assert_eq!(serde_json::from_str::<EntryPayload>(&ej).unwrap(), e);
+    }
+
+    /// 0056 T1's serde contract in both directions: a v0.25 entry (no new
+    /// fields at all) still parses, a node using none of them serializes to
+    /// the same bytes it always did, and one using all of them round-trips.
+    #[test]
+    fn todo_round_trips_new_fields_and_old_logs_still_parse() {
+        // A `Todos` entry exactly as v0.25 wrote it.
+        let old = r#"{"kind":"todos","items":[{"content":"wire","status":"pending"}]}"#;
+        let back: EntryPayload = serde_json::from_str(old).unwrap();
+        let EntryPayload::Todos { items } = &back else {
+            panic!("not a todos entry: {back:?}");
+        };
+        assert_eq!(items[0].id, None);
+        assert!(items[0].dependencies.is_empty());
+        assert!(!items[0].replan);
+        // …and re-serializing it adds nothing: the skip-when-empty attributes
+        // are what keep an untouched list byte-identical in the request.
+        assert_eq!(serde_json::to_string(&back).unwrap(), old);
+
+        let rich = Todo {
+            content: "run the suite".into(),
+            status: TodoStatus::Failed,
+            active_form: None,
+            id: Some("n2".into()),
+            dependencies: vec!["n1".into()],
+            acceptance: Some("the suite is green".into()),
+            validate_cmd: Some("cargo nextest run -p fx".into()),
+            replan: true,
+        };
+        let j = serde_json::to_string(&rich).unwrap();
+        assert!(j.contains("\"status\":\"failed\""), "{j}");
+        assert_eq!(serde_json::from_str::<Todo>(&j).unwrap(), rich);
+
+        let ns: TodoStatus = serde_json::from_str("\"needs_more_steps\"").unwrap();
+        assert_eq!(ns, TodoStatus::NeedsMoreSteps);
     }
 
     #[test]

@@ -2244,6 +2244,7 @@ mod tests {
             content: content.into(),
             status: hotl_types::TodoStatus::Completed,
             active_form: None,
+            ..Default::default()
         }
     }
 
@@ -2535,6 +2536,7 @@ mod tests {
                 content: "already done".into(),
                 status: hotl_types::TodoStatus::Completed,
                 active_form: None,
+                ..Default::default()
             }])
             .await;
         let outcome = h.prompt_and_wait("go").await;

@@ -350,6 +350,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             content: "wire the gate".into(),
             status: hotl_types::TodoStatus::Pending,
             active_form: None,
+            ..Default::default()
         }];
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {

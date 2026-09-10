@@ -2991,11 +2991,13 @@ mod tests {
                 content: "done thing".into(),
                 status: hotl_tools::todo::TodoStatus::Completed,
                 active_form: None,
+                ..Default::default()
             },
             hotl_tools::todo::Todo {
                 content: "wire the gate".into(),
                 status: hotl_tools::todo::TodoStatus::InProgress,
                 active_form: Some("wiring the gate".into()),
+                ..Default::default()
             },
         ];
         let rows = draw(&s);
@@ -3047,6 +3049,7 @@ mod tests {
             content: content.into(),
             status,
             active_form: active_form.map(str::to_string),
+            ..Default::default()
         };
         s.todos = vec![
             todo("a", TodoStatus::Completed, None),

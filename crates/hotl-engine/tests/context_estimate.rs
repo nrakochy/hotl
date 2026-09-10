@@ -116,6 +116,7 @@ async fn compaction_still_triggers_with_todos_active() {
             content: "already done".into(),
             status: TodoStatus::Completed,
             active_form: None,
+            ..Default::default()
         }])
         .await;
 

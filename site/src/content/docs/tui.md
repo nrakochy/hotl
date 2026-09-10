@@ -64,7 +64,18 @@ Top to bottom:
    carries a compact `done/total` count — and, while one item is
    `in_progress`, that item's own label (e.g. `2/5 wiring the gate`) — so you
    can see plan progress at a glance without opening the transcript. An
-   empty or never-started list shows nothing extra.
+   empty or never-started list shows nothing extra. A step the model marked
+   `failed` gets a third number (`3/7 ·1!`): it is neither done nor still
+   ahead, and it is the one count worth acting on.
+
+   Steps are typed plan nodes, not bare lines. Each one can carry a stable
+   id (`n1`, `n2`, …), the ids of the steps it depends on, a `validate_cmd`
+   (the exact command that proves it) or a one-sentence `acceptance`, and
+   `replan` for a step whose result is expected to change the rest of the
+   plan. Beyond `pending` / `in_progress` / `completed`, a step can be
+   `failed` (tried, did not work) or `needs_more_steps` (bigger than one
+   step). The model sees the same list back as `[x] [~] [ ] [!] [?]` marks
+   with `→ verify: <cmd>` and `⇐ after n1` suffixes.
 
 3. **Input** — a bordered editor sitting on the gutter, its text aligned with your `❯` prompts; on terminals of 30 rows or more a blank row separates it from the strip. The draft grows to a third of the screen before it scrolls. With vim mode on, the title shows `-- INSERT --` / `-- NORMAL --`.
 4. **Agent band** — appears below the input while the turn has sub-agents

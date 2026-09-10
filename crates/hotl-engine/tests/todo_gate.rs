@@ -49,6 +49,7 @@ async fn the_gate_fires_at_most_twice_then_lets_the_turn_end() {
             content: "wire the gate".into(),
             status: TodoStatus::InProgress,
             active_form: None,
+            ..Default::default()
         }])
         .await;
     handle.prompt("go".into()).await;

@@ -3601,6 +3601,7 @@ mod fork_tests {
                         content: "finish turn 3's follow-up".into(),
                         status: hotl_types::TodoStatus::Pending,
                         active_form: None,
+                        ..Default::default()
                     }],
                 },
                 3,
@@ -4772,6 +4773,7 @@ mod tests {
                     content: "wire the gate".into(),
                     status: hotl_types::TodoStatus::InProgress,
                     active_form: None,
+                    ..Default::default()
                 }],
                 initial_goal: None,
                 config,

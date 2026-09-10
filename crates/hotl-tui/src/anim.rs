@@ -499,16 +499,22 @@ pub fn strip_line(state: &State) -> String {
 
 /// The todo checklist's progress count, `"2/5"` — the segment's fold form.
 /// `None` when the list is empty: nothing rides the strip until there's
-/// something to show progress on.
+/// something to show progress on. A failed step is a third number (`3/7 ·1!`)
+/// rather than a share of `done`: it is neither done nor still ahead of you,
+/// and folding it into either would hide the one number worth acting on.
 fn todos_count(todos: &[hotl_tools::todo::Todo]) -> Option<String> {
     if todos.is_empty() {
         return None;
     }
-    let done = todos
-        .iter()
-        .filter(|t| t.status == hotl_tools::todo::TodoStatus::Completed)
-        .count();
-    Some(format!("{done}/{}", todos.len()))
+    let count = |s| todos.iter().filter(|t| t.status == s).count();
+    let done = count(hotl_tools::todo::TodoStatus::Completed);
+    let failed = count(hotl_tools::todo::TodoStatus::Failed);
+    let base = format!("{done}/{}", todos.len());
+    Some(if failed > 0 {
+        format!("{base} ·{failed}!")
+    } else {
+        base
+    })
 }
 
 /// What follows the count in full: the in-progress item's `active_form`
@@ -531,6 +537,7 @@ mod tests {
             content: content.into(),
             status,
             active_form: active_form.map(str::to_string),
+            ..Default::default()
         }
     }
 
@@ -578,6 +585,20 @@ mod tests {
         // Cleared list: strip goes back to exactly the no-todos baseline.
         s.todos.clear();
         assert_eq!(strip_line(&s), resting(""));
+    }
+
+    /// 0056 T1: a failed step gets its own number, and only when there is one.
+    #[test]
+    fn the_strip_count_carries_failed_steps_as_a_third_number() {
+        let mut s = State::test_default();
+        s.todos = vec![
+            todo("a", TodoStatus::Completed, None),
+            todo("b", TodoStatus::Failed, None),
+            todo("c", TodoStatus::Pending, None),
+        ];
+        assert_eq!(strip_line(&s), resting("1/3 ·1! todos"));
+        s.todos[1].status = TodoStatus::Pending;
+        assert_eq!(strip_line(&s), resting("1/3 todos"));
     }
 
     #[test]
