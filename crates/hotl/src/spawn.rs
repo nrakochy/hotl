@@ -100,6 +100,118 @@ pub struct ForkSeed {
 /// child's own log, so an ephemeral item in it would stop being ephemeral.
 pub type SnapshotFn = Arc<dyn Fn() -> BoxFuture<'static, Option<ForkSeed>> + Send + Sync>;
 
+/// How long a later identical sibling waits for the first one's first
+/// response byte before starting anyway (`[agents] prefix_stagger_ms`, env
+/// `SPAWN_PREFIX_STAGGER_MS`). `0` disables the gate entirely.
+pub const DEFAULT_PREFIX_STAGGER_MS: u64 = 5000;
+
+/// Fan out three identical `explore` children and all three send the same
+/// system prompt and tool roster at once: the provider has nothing cached
+/// yet, so every one of them pays full input price to write the same prefix.
+/// Letting the first sibling's first byte land before the rest start turns
+/// N cache writes into one write and N−1 reads.
+///
+/// Process-wide, like every other budget here: siblings dispatched from
+/// different sessions are still siblings to the provider's cache.
+///
+/// The wait is bounded and the key is narrow. A first sibling that dies
+/// without ever emitting frees its peers on the timeout, and a sibling whose
+/// prefix differs at all — a different model, def, or tool set — is not held
+/// behind a cache entry it could never read.
+#[derive(Default)]
+pub(crate) struct StaggerGate {
+    inner: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+}
+
+/// What one arrival got from the gate.
+pub(crate) enum Stagger {
+    /// First for this key: proceed, and notify when the child speaks.
+    Lead(Arc<tokio::sync::Notify>),
+    /// A later sibling that already waited (or timed out); nothing to signal.
+    Follower,
+}
+
+impl StaggerGate {
+    pub(crate) fn get() -> &'static StaggerGate {
+        static GATE: std::sync::OnceLock<StaggerGate> = std::sync::OnceLock::new();
+        GATE.get_or_init(StaggerGate::default)
+    }
+
+    /// Register for `key`, waiting for the leader's first byte (or `wait`,
+    /// whichever comes first) when one is already in flight.
+    pub(crate) async fn arrive(&self, key: &str, wait: std::time::Duration) -> Stagger {
+        if wait.is_zero() {
+            return Stagger::Follower;
+        }
+        let existing = {
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            match inner.get(key) {
+                Some(n) => Some(n.clone()),
+                None => {
+                    inner.insert(key.to_string(), Arc::new(tokio::sync::Notify::new()));
+                    None
+                }
+            }
+        };
+        match existing {
+            None => {
+                Stagger::Lead(self.inner.lock().unwrap_or_else(|e| e.into_inner())[key].clone())
+            }
+            Some(notify) => {
+                // `notified()` before the timeout so a signal that arrives
+                // while this future is being built is not missed.
+                let _ = tokio::time::timeout(wait, notify.notified()).await;
+                Stagger::Follower
+            }
+        }
+    }
+
+    /// The leader's child spoke (or died): release the peers and retire the
+    /// key, so the next batch leads afresh rather than inheriting a spent
+    /// notify.
+    pub(crate) fn release(&self, key: &str, lead: &Arc<tokio::sync::Notify>) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+        lead.notify_waiters();
+    }
+}
+
+/// Releases this key's followers when the leader's child first speaks, and
+/// again on drop — a leader that dies without a byte must not strand its
+/// peers for the whole timeout.
+pub(crate) struct LeadGuard {
+    key: String,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl LeadGuard {
+    pub(crate) fn new(key: String, notify: Arc<tokio::sync::Notify>) -> Self {
+        Self { key, notify }
+    }
+
+    fn release(&self) {
+        StaggerGate::get().release(&self.key, &self.notify);
+    }
+}
+
+impl Drop for LeadGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// The prefix a child will send, as a key: same key, same cached bytes.
+/// `fork` gets its own namespace — a fork's prefix is the *parent's* history,
+/// which no plain sibling shares.
+pub(crate) fn stagger_key(def: &AgentDef, fork: bool) -> String {
+    format!(
+        "{}|{:?}|{:?}|{:?}|{}",
+        def.name, def.model, def.effort, def.tools, fork
+    )
+}
+
 /// Process-wide guard for children that **share the parent's working tree**:
 /// two of those editing it concurrently would corrupt each other, so they are
 /// serialized for the child's whole lifetime.
@@ -145,6 +257,9 @@ pub struct SpawnTool {
     /// registry-held sink is (`spawn_session_inner`'s reference-cycle note).
     /// `None` (a context with no live parent stream) means no forwarding.
     events: Option<tokio::sync::mpsc::WeakSender<EngineEvent>>,
+    /// How long an identical later sibling waits for the first one's first
+    /// byte ([`DEFAULT_PREFIX_STAGGER_MS`]); zero disables the gate.
+    stagger: std::time::Duration,
 }
 
 impl SpawnTool {
@@ -163,7 +278,14 @@ impl SpawnTool {
             concurrency,
             snapshot: None,
             events: None,
+            stagger: std::time::Duration::from_millis(DEFAULT_PREFIX_STAGGER_MS),
         }
+    }
+
+    /// Override the prefix-stagger wait (`[agents] prefix_stagger_ms`).
+    pub fn with_prefix_stagger(mut self, wait: std::time::Duration) -> Self {
+        self.stagger = wait;
+        self
     }
 
     /// Attach the per-session snapshot query `fork` needs. Set once, at
@@ -233,6 +355,18 @@ impl SpawnTool {
         // calls is still *enqueued* concurrently (Layer A, uncapped) but only
         // `agents` (default 4) hold a permit and run at once.
         let _permit = self.concurrency.agent().await;
+
+        // Identical siblings queue behind the first one's first byte (0058
+        // T6) so the provider writes this prefix once and the rest read it.
+        // After the `agents` permit, not before: a child that is not going to
+        // run yet has nothing to wait for.
+        let key = stagger_key(&def, fork);
+        let lead = match StaggerGate::get().arrive(&key, self.stagger).await {
+            Stagger::Lead(n) => Some(n),
+            Stagger::Follower => None,
+        };
+        // Released on every exit from here, including an early error return.
+        let _lead = lead.map(|n| LeadGuard::new(key, n));
 
         // The brief goes to disk and inline both (0058 T1): recall of a long
         // brief improves when the model has a file it can re-read, and the
@@ -309,7 +443,7 @@ impl SpawnTool {
         // None` (0044 leaves that to the workflow tool).
         let forward = self.events.clone().zip(parent_id);
         let Drained { outcome, mut usage } =
-            drain_child(&mut child, &cancel, forward.clone()).await;
+            drain_child(&mut child, &cancel, forward.clone(), _lead.as_ref()).await;
         // The typed return (0058 T1). Only for a child that was actually given
         // `report_result`: re-prompting one that never had the tool would just
         // burn turns asking for the impossible.
@@ -489,7 +623,7 @@ async fn collect_report(
         child
             .prompt(hotl_tools::report_tool::REPROMPT.to_string())
             .await;
-        let drained = drain_child(child, cancel, forward.clone()).await;
+        let drained = drain_child(child, cancel, forward.clone(), None).await;
         *usage += drained.usage;
         if let Outcome::Done { text } = &drained.outcome {
             last = text.clone();
@@ -521,8 +655,22 @@ pub(crate) async fn drain_child(
     child: &mut SessionHandle,
     cancel: &CancellationToken,
     forward: Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
+    lead: Option<&LeadGuard>,
 ) -> Drained {
     let mut usage = hotl_types::TokenUsage::default();
+    // Released on the child's first frame of any kind (0058 T6): that byte is
+    // the evidence the prefix is now in the provider's cache.
+    let mut spoke = false;
+    macro_rules! first_byte {
+        () => {
+            if !spoke {
+                spoke = true;
+                if let Some(l) = lead {
+                    l.release();
+                }
+            }
+        };
+    }
     loop {
         tokio::select! {
             biased;
@@ -547,9 +695,11 @@ pub(crate) async fn drain_child(
                     let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
                 }
                 Some(EngineEvent::TextDelta(text)) | Some(EngineEvent::ThinkingDelta(text)) => {
+                    first_byte!();
                     forward_child_text(&forward, text).await;
                 }
                 Some(EngineEvent::ToolStart { id, name, summary }) => {
+                    first_byte!();
                     forward_child_tool(&forward, id, name, summary, None).await;
                 }
                 Some(EngineEvent::ToolDone { id, name, ok }) => {
@@ -1278,6 +1428,125 @@ mod tests {
         assert!(after.contains("`exit 3` failed"), "{}", out.content);
     }
 
+    /// 0058 T6: three identical siblings do not all write the same prefix.
+    /// The first proceeds; the rest are held until its first response byte,
+    /// and only then start — as cache reads.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn identical_siblings_wait_for_the_first_response_byte() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let gate = Arc::new(StaggerGate::default());
+        let wait = std::time::Duration::from_secs(30);
+        let released = Arc::new(AtomicUsize::new(0));
+
+        let Stagger::Lead(notify) = gate.arrive("k", wait).await else {
+            panic!("the first arrival leads")
+        };
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..2 {
+            let (gate, released) = (gate.clone(), released.clone());
+            set.spawn(async move {
+                let got = gate.arrive("k", wait).await;
+                released.fetch_add(1, Ordering::SeqCst);
+                matches!(got, Stagger::Follower)
+            });
+        }
+        // Long enough that a gate which did not hold would have let both
+        // through; short enough to keep the test quick.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            released.load(Ordering::SeqCst),
+            0,
+            "no sibling may start before the leader's first byte"
+        );
+
+        // The leader's child speaks.
+        gate.release("k", &notify);
+        while let Some(joined) = set.join_next().await {
+            assert!(
+                joined.expect("task"),
+                "a held sibling arrives as a follower"
+            );
+        }
+        assert_eq!(released.load(Ordering::SeqCst), 2, "both then started");
+        // The key retired with the release, so the next batch leads afresh
+        // instead of inheriting a spent notify.
+        assert!(matches!(gate.arrive("k", wait).await, Stagger::Lead(_)));
+    }
+
+    /// A follower that waits does not wait forever: the timeout is the floor
+    /// under a leader that dies without ever emitting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_leader_frees_its_peers_on_the_timeout() {
+        let gate = StaggerGate::default();
+        assert!(matches!(
+            gate.arrive("silent", std::time::Duration::from_millis(30))
+                .await,
+            Stagger::Lead(_)
+        ));
+        let at = std::time::Instant::now();
+        assert!(matches!(
+            gate.arrive("silent", std::time::Duration::from_millis(30))
+                .await,
+            Stagger::Follower
+        ));
+        assert!(
+            at.elapsed() >= std::time::Duration::from_millis(25),
+            "it waited"
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(2),
+            "and stopped waiting: {:?}",
+            at.elapsed()
+        );
+    }
+
+    /// Zero disables the gate entirely — every arrival is a follower with
+    /// nothing to wait on — and a different prefix is never held behind one
+    /// it could not read.
+    #[tokio::test]
+    async fn a_zero_stagger_disables_and_a_different_prefix_is_never_held() {
+        let gate = StaggerGate::default();
+        assert!(matches!(
+            gate.arrive("k", std::time::Duration::ZERO).await,
+            Stagger::Follower
+        ));
+        assert!(matches!(
+            gate.arrive("k", std::time::Duration::ZERO).await,
+            Stagger::Follower
+        ));
+
+        let explore = hotl_tools::agents::builtin("explore").unwrap();
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        assert_ne!(
+            stagger_key(&explore, false),
+            stagger_key(&general, false),
+            "a different def is a different prefix"
+        );
+        assert_ne!(
+            stagger_key(&explore, false),
+            stagger_key(&explore, true),
+            "a fork inherits the parent's prefix, not a sibling's"
+        );
+        let mut other_model = explore.clone();
+        other_model.model = Some("some-other-model".into());
+        assert_ne!(
+            stagger_key(&explore, false),
+            stagger_key(&other_model, false)
+        );
+
+        // Two different keys both lead: neither waits on the other.
+        let wait = std::time::Duration::from_secs(30);
+        assert!(matches!(
+            gate.arrive(&stagger_key(&explore, false), wait).await,
+            Stagger::Lead(_)
+        ));
+        assert!(matches!(
+            gate.arrive(&stagger_key(&general, false), wait).await,
+            Stagger::Lead(_)
+        ));
+    }
+
     /// Isolation and the tool set are properties of the agent def, not of the
     /// call. An unknown key is refused rather than dropped — a caller that
     /// believes it asked for isolation and silently did not get it is worse
@@ -1344,7 +1613,7 @@ mod tests {
         let def = hotl_tools::agents::builtin("general-purpose").unwrap();
         let mut child = ScriptedChild::new().build(&def, "go", None).unwrap().handle;
         child.prompt("go".into()).await;
-        let drained = drain_child(&mut child, &CancellationToken::new(), None).await;
+        let drained = drain_child(&mut child, &CancellationToken::new(), None, None).await;
         assert!(matches!(drained.outcome, Outcome::Done { .. }));
         // `ScriptedProvider::text_reply` bills 10 in / 5 out.
         assert_eq!(drained.usage.input_tokens, 10);

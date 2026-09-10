@@ -58,6 +58,8 @@ pub struct WorkflowTool {
     /// its own run below this, never raise it.
     gate: Arc<Semaphore>,
     events: Option<tokio::sync::mpsc::WeakSender<EngineEvent>>,
+    /// `[agents] prefix_stagger_ms`; zero disables the gate.
+    prefix_stagger: std::time::Duration,
 }
 
 impl WorkflowTool {
@@ -74,10 +76,19 @@ impl WorkflowTool {
             config_dir,
             include_claude,
             data_dir,
+            prefix_stagger: std::time::Duration::from_millis(
+                crate::spawn::DEFAULT_PREFIX_STAGGER_MS,
+            ),
             limits,
             gate,
             events: None,
         }
+    }
+
+    /// Override the prefix-stagger wait (`[agents] prefix_stagger_ms`).
+    pub fn with_prefix_stagger(mut self, wait: std::time::Duration) -> Self {
+        self.prefix_stagger = wait;
+        self
     }
 
     /// The parent stream per-agent progress is forwarded on (`ChildTool`
@@ -196,6 +207,7 @@ impl WorkflowTool {
         }
         let obs = Forwarder::new(self.events.clone().zip(parent_id));
         let runner = ChildRunner {
+            prefix_stagger: self.prefix_stagger,
             builder: self.builder.clone(),
             config_dir: self.config_dir.clone(),
             include_claude: self.include_claude,
@@ -420,6 +432,10 @@ struct ChildRunner {
     /// `.git` are the known-flaky concurrent pair, degrading silently to
     /// `isolation_unavailable` — so creation and removal serialise here.
     creation: tokio::sync::Mutex<()>,
+    /// The prefix-stagger wait (0058 T6). A phase's agents share a system
+    /// prompt and tool roster by construction, so they are exactly the case
+    /// the gate exists for.
+    prefix_stagger: std::time::Duration,
 }
 
 impl AgentRunner for ChildRunner {
@@ -502,6 +518,21 @@ impl ChildRunner {
             ),
             None => req.prompt.clone(),
         };
+        // Same prefix gate as `spawn`, keyed per phase: one phase's agents
+        // send the same prefix, so the first one's first byte is what makes
+        // the rest cache reads instead of writes.
+        let key = format!(
+            "wf|{}|{}",
+            req.phase,
+            crate::spawn::stagger_key(&def, false)
+        );
+        let lead = match crate::spawn::StaggerGate::get()
+            .arrive(&key, self.prefix_stagger)
+            .await
+        {
+            crate::spawn::Stagger::Lead(n) => Some(crate::spawn::LeadGuard::new(key, n)),
+            crate::spawn::Stagger::Follower => None,
+        };
         let built = {
             let _creating = self.creation.lock().await;
             self.builder.build(&def, &brief, None)
@@ -538,7 +569,8 @@ impl ChildRunner {
                     schema,
                     crate::structured::MAX_RETRIES,
                     async move |h: &mut hotl_engine::SessionHandle| {
-                        let (text, usage) = settle(drain_child(h, &cancel, None).await);
+                        let (text, usage) =
+                            settle(drain_child(h, &cancel, None, lead.as_ref()).await);
                         *lock(&used) += usage;
                         if text.is_ok() {
                             answered.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -550,7 +582,8 @@ impl ChildRunner {
                 .map(|(v, _)| v)
             }
             None => {
-                let (text, usage) = settle(drain_child(&mut child, &cancel, None).await);
+                let (text, usage) =
+                    settle(drain_child(&mut child, &cancel, None, lead.as_ref()).await);
                 *lock(&used) += usage;
                 text.map(Value::String)
             }

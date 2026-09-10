@@ -962,6 +962,8 @@ struct Scaffold {
     /// `[agents] claude` — whether `spawn`'s agent_type resolution also reads
     /// `~/.claude/agents/*.md` (mirrors `[skills] claude`).
     agents_include_claude: bool,
+    /// `[agents] prefix_stagger_ms`, resolved once at startup.
+    prefix_stagger: std::time::Duration,
     /// `[workflows]` (0044): the process-wide agent gate every run shares,
     /// built once here like `concurrency`, and the limits a plan may lower.
     workflow_gate: Arc<tokio::sync::Semaphore>,
@@ -1081,6 +1083,7 @@ async fn scaffold(
     warnings.extend(discovery_warnings);
     let registry = Arc::new(registry);
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
+    let prefix_stagger = cfg.agents.prefix_stagger();
     let (wf_concurrency, wf_max_agents) = cfg.workflows.limits();
     let workflow_limits = hotl_workflow::Limits {
         concurrency: wf_concurrency,
@@ -1106,6 +1109,7 @@ async fn scaffold(
         spawn_builder,
         concurrency,
         agents_include_claude,
+        prefix_stagger,
         workflow_gate,
         workflow_limits,
         retrieval,
@@ -1143,6 +1147,7 @@ impl Scaffold {
     fn spawn_registration(&self, session_id: String) -> SpawnRegistration {
         SpawnRegistration {
             builder: self.spawn_builder.clone(),
+            prefix_stagger: self.prefix_stagger,
             concurrency: self.concurrency.clone(),
             config_dir: self.config_dir.clone(),
             include_claude: self.agents_include_claude,
@@ -1521,6 +1526,9 @@ async fn run_session(
 /// children never get a `spawn` tool at all.
 struct SpawnRegistration {
     builder: Arc<dyn crate::spawn::ChildBuilder>,
+    /// `[agents] prefix_stagger_ms` — how long identical siblings queue
+    /// behind the first one's first byte.
+    prefix_stagger: std::time::Duration,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
     config_dir: PathBuf,
     include_claude: bool,
@@ -1663,6 +1671,7 @@ fn spawn_session_inner(
     }
     if let Some(SpawnRegistration {
         builder,
+        prefix_stagger,
         concurrency,
         config_dir,
         include_claude,
@@ -1683,6 +1692,7 @@ fn spawn_session_inner(
                 include_claude,
                 concurrency,
             )
+            .with_prefix_stagger(prefix_stagger)
             .with_snapshot(snapshot)
             .with_events(event_tx.downgrade()),
         ));
@@ -1697,6 +1707,7 @@ fn spawn_session_inner(
                 workflow_limits,
                 workflow_gate,
             )
+            .with_prefix_stagger(prefix_stagger)
             .with_events(event_tx.downgrade()),
         ));
     }

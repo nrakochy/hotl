@@ -119,6 +119,9 @@ claude = true               # false: skip ~/.claude/agents
 isolation = "none"          # "worktree": every mutating child gets its own
                             # git worktree and they run in parallel; a def's
                             # own `isolation:` frontmatter wins
+prefix_stagger_ms = 5000    # identical siblings wait this long for the first
+                            # one's first response byte, so their shared
+                            # prefix is cached once instead of N times; 0 off
 
 [workflows]                 # the workflow tool's fan-out caps (see workflows.md)
 concurrency = 8             # agents one process runs at once across every workflow

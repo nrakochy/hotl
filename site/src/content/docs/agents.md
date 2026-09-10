@@ -185,6 +185,14 @@ act on, never a prompt nobody is there to answer.
   other. **Isolated children are the exception**: they each edit their own
   worktree, so they run at full width. Read-only fan-out (`explore`) has
   never been affected.
+- **Identical siblings start staggered.** Fan out three `explore` children at
+  once and all three would send the same system prompt and tool roster before
+  the provider has cached any of it — three cache *writes* of the same bytes.
+  The first one goes; the rest wait for its first response byte (up to
+  `[agents] prefix_stagger_ms`, default 5s) and then start as cache reads. A
+  sibling whose prefix differs at all — a different def, model or tool set —
+  is never held, and a first child that dies without speaking frees its peers
+  on the timeout. Set `prefix_stagger_ms = 0` to turn it off.
 - **`teammate` (a peer topology, not a child) is reserved** — not available
   yet.
 

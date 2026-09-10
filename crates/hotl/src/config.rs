@@ -239,9 +239,21 @@ pub struct AgentsCfg {
     /// default. A def's own `isolation:` frontmatter wins over this. Unknown
     /// values fail closed to no isolation. Default: off.
     pub isolation: Option<String>,
+    /// How long an identical later sibling waits for the first one's first
+    /// response byte, so the provider writes their shared prefix once instead
+    /// of N times (0058 T6). `0` disables. Default: 5000ms.
+    pub prefix_stagger_ms: Option<u64>,
 }
 
 impl AgentsCfg {
+    /// `[agents] prefix_stagger_ms`, or the built-in default.
+    pub fn prefix_stagger(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.prefix_stagger_ms
+                .unwrap_or(crate::spawn::DEFAULT_PREFIX_STAGGER_MS),
+        )
+    }
+
     /// The configured default, resolved through the one fail-closed parse
     /// `agents.rs` also uses for frontmatter — deliberately not a second match
     /// arm, so the two spellings can never drift apart.
@@ -1284,6 +1296,26 @@ mod tests {
             .split();
         assert!(sched.is_empty());
         assert_eq!(warnings.len(), 1, "{warnings:?}");
+    }
+
+    #[test]
+    fn agents_prefix_stagger_has_a_default_and_zero_disables() {
+        assert_eq!(
+            cfg_with("").agents.prefix_stagger(),
+            std::time::Duration::from_millis(crate::spawn::DEFAULT_PREFIX_STAGGER_MS)
+        );
+        assert_eq!(
+            cfg_with("[agents]\nprefix_stagger_ms = 0\n")
+                .agents
+                .prefix_stagger(),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            cfg_with("[agents]\nprefix_stagger_ms = 250\n")
+                .agents
+                .prefix_stagger(),
+            std::time::Duration::from_millis(250)
+        );
     }
 
     #[test]
