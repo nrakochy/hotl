@@ -572,8 +572,9 @@ impl ChildRunner {
                     schema,
                     crate::structured::MAX_RETRIES,
                     async move |h: &mut hotl_engine::SessionHandle| {
-                        let (text, usage) =
-                            settle(drain_child(h, &cancel, None, lead.as_ref()).await);
+                        let (text, usage) = settle(
+                            drain_child(h, &cancel, None, lead.as_ref(), Default::default()).await,
+                        );
                         *lock(&used) += usage;
                         if text.is_ok() {
                             answered.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -585,8 +586,9 @@ impl ChildRunner {
                 .map(|(v, _)| v)
             }
             None => {
-                let (text, usage) =
-                    settle(drain_child(&mut child, &cancel, None, lead.as_ref()).await);
+                let (text, usage) = settle(
+                    drain_child(&mut child, &cancel, None, lead.as_ref(), Default::default()).await,
+                );
                 *lock(&used) += usage;
                 text.map(Value::String)
             }

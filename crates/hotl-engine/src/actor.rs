@@ -629,6 +629,12 @@ pub(crate) struct SharedDeps {
     /// invariant couples them, so there is nothing to keep consistent across
     /// a single load. Seeded from `rules.plan()` at session start.
     plan: AtomicBool,
+    /// Wrap-up mode (0058 T8): the session is out of turn budget and has one
+    /// prompt left to record a result. A third roster axis rather than a
+    /// second meaning for `plan`, because it narrows further — everything
+    /// that is not a read or `report_result` disappears — and the two are set
+    /// by different callers for different reasons.
+    wrapup: AtomicBool,
     /// The session's current effort, separate from `config.effort` (the
     /// startup default) so `SetEffort` can flip it without rebuilding
     /// `EngineConfig`. Encoded `0` = unset (provider default), `1..=5` = the
@@ -794,6 +800,7 @@ impl SharedDeps {
             rules: deps.rules,
             mode,
             plan,
+            wrapup: AtomicBool::new(false),
             effort,
             effort_pinned,
             tool_calls,
@@ -892,6 +899,16 @@ impl SharedDeps {
     /// Plan mode right now — the second axis `evaluate` gates against.
     pub(crate) fn effective_plan(&self) -> bool {
         self.plan.load(Ordering::Relaxed)
+    }
+
+    /// Wrap-up right now (0058 T8). Not durable: it belongs to one prompt at
+    /// the end of a child's life, and a resumed session has a fresh budget.
+    pub(crate) fn effective_wrapup(&self) -> bool {
+        self.wrapup.load(Ordering::Relaxed)
+    }
+
+    fn set_wrapup(&self, on: bool) {
+        self.wrapup.store(on, Ordering::Relaxed);
     }
 
     /// Runtime plan-mutation entry point (`SessionCmd::SetPlan`, reachable via
@@ -1303,6 +1320,7 @@ pub(crate) async fn run(
                     )
                     .await;
             }
+            SessionCmd::SetWrapUp(on) => shared.set_wrapup(on),
             SessionCmd::SetPlan(plan) => {
                 // The plan axis, same shape as `SetMode`: atomic first so it
                 // gates the running session immediately, then the durable

@@ -105,6 +105,20 @@ pub type SnapshotFn = Arc<dyn Fn() -> BoxFuture<'static, Option<ForkSeed>> + Sen
 /// `SPAWN_PREFIX_STAGGER_MS`). `0` disables the gate entirely.
 pub const DEFAULT_PREFIX_STAGGER_MS: u64 = 5000;
 
+/// No event of any kind from a child for this long and it is stopped
+/// (`[agents] child_idle_secs`). Generous: a long `bash` inside a child emits
+/// nothing while it runs, and a false stop costs the whole subtask.
+pub const DEFAULT_CHILD_IDLE_SECS: u64 = 300;
+
+/// After a child reports, this long to actually exit
+/// (`[agents] completion_grace_secs`). Short, because the answer is already
+/// on disk — what is being waited on is only the process.
+pub const DEFAULT_COMPLETION_GRACE_SECS: u64 = 20;
+
+/// The one prompt a child that ran out of turns gets.
+pub const WRAPUP_PROMPT: &str =
+    "Turn budget exhausted. Call report_result now with what you have; do not start new work.";
+
 /// Fan out three identical `explore` children and all three send the same
 /// system prompt and tool roster at once: the provider has nothing cached
 /// yet, so every one of them pays full input price to write the same prefix.
@@ -260,6 +274,8 @@ pub struct SpawnTool {
     /// How long an identical later sibling waits for the first one's first
     /// byte ([`DEFAULT_PREFIX_STAGGER_MS`]); zero disables the gate.
     stagger: std::time::Duration,
+    /// The child's idle and completion clocks (0058 T8).
+    deadlines: ChildDeadlines,
 }
 
 impl SpawnTool {
@@ -279,7 +295,23 @@ impl SpawnTool {
             snapshot: None,
             events: None,
             stagger: std::time::Duration::from_millis(DEFAULT_PREFIX_STAGGER_MS),
+            deadlines: ChildDeadlines {
+                idle: Some(std::time::Duration::from_secs(DEFAULT_CHILD_IDLE_SECS)),
+                grace: Some(std::time::Duration::from_secs(
+                    DEFAULT_COMPLETION_GRACE_SECS,
+                )),
+            },
         }
+    }
+
+    /// Override the child clocks (`[agents] child_idle_secs`,
+    /// `completion_grace_secs`). Zero on either disables that clock.
+    pub fn with_deadlines(mut self, idle: u64, grace: u64) -> Self {
+        self.deadlines = ChildDeadlines {
+            idle: (idle > 0).then(|| std::time::Duration::from_secs(idle)),
+            grace: (grace > 0).then(|| std::time::Duration::from_secs(grace)),
+        };
+        self
     }
 
     /// Override the prefix-stagger wait (`[agents] prefix_stagger_ms`).
@@ -455,16 +487,65 @@ impl SpawnTool {
         // `usage` is summed but unused here: the spawn card keeps `tokens:
         // None` (0044 leaves that to the workflow tool).
         let forward = self.events.clone().zip(parent_id);
-        let Drained { outcome, mut usage } =
-            drain_child(&mut child, &cancel, forward.clone(), _lead.as_ref()).await;
-        // The typed return (0058 T1). Only for a child that was actually given
-        // `report_result`: re-prompting one that never had the tool would just
-        // burn turns asking for the impossible.
-        let typed = match (&outcome, &report_path) {
-            (Outcome::Done { text }, Some(path)) => {
-                Some(collect_report(&mut child, &cancel, &forward, path, text, &mut usage).await)
+        let Drained {
+            outcome,
+            mut usage,
+            idle,
+        } = drain_child(
+            &mut child,
+            &cancel,
+            forward.clone(),
+            _lead.as_ref(),
+            self.deadlines,
+        )
+        .await;
+        // One wrap-up turn for a child that ran out of budget (0058 T8): the
+        // roster narrows to reads plus `report_result`, so "do not start new
+        // work" is the shape of what is on offer, not just a sentence.
+        let (outcome, idle) = match (&outcome, &report_path) {
+            (Outcome::TurnLimit, Some(_)) if !cancel.is_cancelled() => {
+                child.set_wrapup(true).await;
+                child.prompt(WRAPUP_PROMPT.to_string()).await;
+                let d =
+                    drain_child(&mut child, &cancel, forward.clone(), None, self.deadlines).await;
+                usage += d.usage;
+                (d.outcome, d.idle)
             }
-            _ => None,
+            _ => (outcome, idle),
+        };
+        // The typed return (0058 T1). Only for a child that was actually
+        // given `report_result`: re-prompting one that never had the tool
+        // would just burn turns asking for the impossible.
+        let typed = match &report_path {
+            None => None,
+            // A report on disk is the answer, whatever ended the turn — a
+            // child that said its piece and then hit a clock or a limit has
+            // still answered.
+            Some(path) => match hotl_tools::report_tool::read_response(path) {
+                Some(v) => Some(v),
+                None => match &outcome {
+                    // It stopped talking without reporting: nudge, then take
+                    // its last words.
+                    Outcome::Done { text } => Some(
+                        collect_report(&mut child, &cancel, &forward, path, text, &mut usage).await,
+                    ),
+                    // A clock or the budget ended it with nothing recorded.
+                    _ if idle => Some(hotl_tools::report_tool::unverifiable_because(
+                        "idle",
+                        &format!(
+                            "The sub-agent sent nothing for {}s and was stopped. Nothing it \
+                             did was verified.",
+                            self.deadlines.idle.map_or(0, |d| d.as_secs())
+                        ),
+                    )),
+                    Outcome::TurnLimit => Some(hotl_tools::report_tool::unverifiable_because(
+                        "turn_limit",
+                        "The sub-agent ran out of turns without recording a result, including \
+                         its wrap-up turn. Nothing it did was verified.",
+                    )),
+                    _ => None,
+                },
+            },
         };
         // One `agent` frame per child, carrying its whole token bill — the
         // same shape the workflow tool's per-agent frames use (0044), so the
@@ -491,11 +572,13 @@ impl SpawnTool {
             }
             _ => false,
         };
+        // A typed result *is* the answer, whatever clock or limit ended the
+        // child: the parent gets a shape rather than "did not finish".
         let outcome = match (outcome, &typed) {
-            (Outcome::Done { .. }, Some(v)) => Outcome::Done {
+            (_, Some(v)) => Outcome::Done {
                 text: serde_json::to_string_pretty(v).unwrap_or_default(),
             },
-            (other, _) => other,
+            (other, None) => other,
         };
         let note = isolation_unavailable.then_some(
             "Note: this agent def asked for worktree isolation, which is unavailable here \
@@ -636,7 +719,14 @@ async fn collect_report(
         child
             .prompt(hotl_tools::report_tool::REPROMPT.to_string())
             .await;
-        let drained = drain_child(child, cancel, forward.clone(), None).await;
+        let drained = drain_child(
+            child,
+            cancel,
+            forward.clone(),
+            None,
+            ChildDeadlines::default(),
+        )
+        .await;
         *usage += drained.usage;
         if let Outcome::Done { text } = &drained.outcome {
             last = text.clone();
@@ -648,6 +738,20 @@ async fn collect_report(
         .unwrap_or_else(|| hotl_tools::report_tool::unverifiable(&last))
 }
 
+/// The two clocks a child runs against (0058 T8). Both `None` (the workflow
+/// runner, and every test that does not exercise them) means "wait forever",
+/// which is the pre-0058 behaviour.
+#[derive(Default, Clone, Copy)]
+pub(crate) struct ChildDeadlines {
+    /// No event of any kind for this long: the child is stuck, and there is
+    /// nothing to keep. Ends it `unverifiable`.
+    pub(crate) idle: Option<std::time::Duration>,
+    /// After it reports, this long to actually exit. A child holding stdout
+    /// open behind an MCP server has already said its piece — reap it and
+    /// keep the result rather than waiting out the idle clock.
+    pub(crate) grace: Option<std::time::Duration>,
+}
+
 /// What [`drain_child`] saw: the terminal outcome plus every `TurnDone`'s
 /// usage summed — one turn for a plain child, more when a caller re-prompts
 /// the same handle before draining again.
@@ -655,6 +759,9 @@ pub(crate) struct Drained {
     pub(crate) outcome: Outcome,
     /// Read by the workflow tool; `spawn` ignores it.
     pub(crate) usage: hotl_types::TokenUsage,
+    /// Ended on a clock, not on an answer (0058 T8): the idle deadline
+    /// expired without the child ever reporting.
+    pub(crate) idle: bool,
 }
 
 /// Drain the child to its terminal outcome. The child has no human on the
@@ -669,8 +776,16 @@ pub(crate) async fn drain_child(
     cancel: &CancellationToken,
     forward: Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
     lead: Option<&LeadGuard>,
+    deadlines: ChildDeadlines,
 ) -> Drained {
     let mut usage = hotl_types::TokenUsage::default();
+    // Switches to the (shorter) completion grace the moment the child reports.
+    let mut reported = false;
+    let window = |reported: bool| match reported {
+        true => deadlines.grace.or(deadlines.idle),
+        false => deadlines.idle,
+    };
+    let mut deadline = window(false).map(|d| tokio::time::Instant::now() + d);
     // Released on the child's first frame of any kind (0058 T6): that byte is
     // the evidence the prefix is now in the provider's cache.
     let mut spoke = false;
@@ -685,11 +800,26 @@ pub(crate) async fn drain_child(
         };
     }
     loop {
+        // `far` is only ever reached when there is no deadline at all; the
+        // branch is then disabled by its guard, so it never fires.
+        let far = deadline.unwrap_or_else(|| {
+            tokio::time::Instant::now() + std::time::Duration::from_secs(86_400)
+        });
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 child.interrupt();
-                return Drained { outcome: Outcome::Cancelled, usage };
+                return Drained { outcome: Outcome::Cancelled, usage, idle: false };
+            }
+            _ = tokio::time::sleep_until(far), if deadline.is_some() => {
+                child.interrupt();
+                // A child that already reported has an answer on disk; one
+                // that never spoke has nothing, and says so.
+                return Drained {
+                    outcome: if reported { Outcome::Done { text: String::new() } } else { Outcome::Cancelled },
+                    usage,
+                    idle: !reported,
+                };
             }
             event = child.events.recv() => match event {
                 Some(EngineEvent::Ask { reply, .. }) => {
@@ -716,6 +846,9 @@ pub(crate) async fn drain_child(
                     forward_child_tool(&forward, id, name, summary, None).await;
                 }
                 Some(EngineEvent::ToolDone { id, name, ok }) => {
+                    if ok && name == "report_result" {
+                        reported = true;
+                    }
                     forward_child_tool(&forward, id, name, String::new(), Some(ok)).await;
                 }
                 Some(EngineEvent::ToolDenied { id, name }) => {
@@ -726,15 +859,19 @@ pub(crate) async fn drain_child(
                 }
                 Some(EngineEvent::TurnDone { outcome, usage: u, .. }) => {
                     usage += u;
-                    return Drained { outcome, usage };
+                    return Drained { outcome, usage, idle: false };
                 }
                 Some(_) => {}
                 None => return Drained {
                     outcome: Outcome::Error { message: "sub-agent ended without an outcome".into() },
                     usage,
+                    idle: false,
                 },
             }
         }
+        // Every event pushes the clock out; a reported child moves to the
+        // shorter grace window and stays there.
+        deadline = window(reported).map(|d| tokio::time::Instant::now() + d);
     }
 }
 
@@ -1097,10 +1234,36 @@ mod tests {
     /// `replies` is its whole script; `Vec::new()` means it never reports.
     type Script = Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>>;
 
+    /// Serves its scripts, then **hangs** — the shape a genuinely stuck child
+    /// has. An exhausted `ScriptedProvider` returns a transport error, which
+    /// ends the turn promptly and would test nothing about a clock.
+    struct HangsWhenSpent(Arc<ScriptedProvider>, std::sync::atomic::AtomicUsize);
+
+    impl hotl_provider::Provider for HangsWhenSpent {
+        fn stream(
+            &self,
+            req: hotl_provider::SamplingRequest,
+        ) -> futures_util::stream::BoxStream<
+            'static,
+            Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>,
+        > {
+            use std::sync::atomic::Ordering;
+            if self.1.load(Ordering::SeqCst) > 0 {
+                self.1.fetch_sub(1, Ordering::SeqCst);
+                self.0.stream(req)
+            } else {
+                Box::pin(futures_util::stream::pending())
+            }
+        }
+    }
+
     struct TypedChild {
         replies: Mutex<Vec<Vec<Script>>>,
         provider: Mutex<Option<Arc<ScriptedProvider>>>,
         briefs: Mutex<Vec<String>>,
+        max_turns: i64,
+        /// Hang once the scripts run out, instead of erroring.
+        hangs: bool,
     }
 
     impl TypedChild {
@@ -1109,7 +1272,26 @@ mod tests {
                 replies: Mutex::new(vec![scripts]),
                 provider: Mutex::new(None),
                 briefs: Mutex::new(Vec::new()),
+                max_turns: 8,
+                hangs: false,
             }
+        }
+        /// After the scripts are spent, stall forever rather than erroring.
+        fn hanging(mut self) -> Self {
+            self.hangs = true;
+            self
+        }
+        fn with_max_turns(mut self, n: i64) -> Self {
+            self.max_turns = n;
+            self
+        }
+        fn requests_seen(&self) -> Vec<hotl_provider::SamplingRequest> {
+            self.provider
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|p| p.requests())
+                .unwrap_or_default()
         }
         fn last_brief(&self) -> String {
             self.briefs.lock().unwrap().last().cloned().unwrap()
@@ -1132,8 +1314,16 @@ mod tests {
             let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
             std::mem::forget(dir);
             let scripts = self.replies.lock().unwrap().pop().unwrap_or_default();
+            let n = scripts.len();
             let provider = Arc::new(ScriptedProvider::new(scripts));
             *self.provider.lock().unwrap() = Some(provider.clone());
+            let provider: Arc<dyn hotl_provider::Provider> = match self.hangs {
+                true => Arc::new(HangsWhenSpent(
+                    provider,
+                    std::sync::atomic::AtomicUsize::new(n),
+                )),
+                false => provider,
+            };
             let mut registry = Registry::builtin();
             if let Some(d) = report {
                 registry.register(Box::new(hotl_tools::ReportResultTool::new(
@@ -1158,7 +1348,7 @@ mod tests {
                     plan_files: None,
                     initial_goal: None,
                     config: EngineConfig {
-                        max_turns: 8,
+                        max_turns: self.max_turns,
                         ..Default::default()
                     },
                 }),
@@ -1441,6 +1631,127 @@ mod tests {
         assert!(after.contains("`exit 3` failed"), "{}", out.content);
     }
 
+    /// 0058 T8: a child that goes silent is stopped on the idle clock and
+    /// comes back `unverifiable` naming the clock, not left hanging.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_silent_child_is_ended_unverifiable_with_the_reason_idle() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        // A provider that answers nothing at all: the child sits there.
+        let builder = Arc::new(TypedChild::new(Vec::new()).hanging());
+        let tool = typed_tool(builder, spawn_dir.path().to_path_buf())
+            .with_prefix_stagger(std::time::Duration::ZERO)
+            // A whole second of idle is plenty when the child never speaks.
+            .with_deadlines(1, 0);
+        let at = std::time::Instant::now();
+        let out = tool
+            .run(json!({"task": "survey"}), CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("\"outcome\": \"unverifiable\""),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("\"reason\": \"idle\""),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("sent nothing for 1s"),
+            "{}",
+            out.content
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(20),
+            "the idle clock must be what ended it: {:?}",
+            at.elapsed()
+        );
+    }
+
+    /// A child that reported and then hangs is reaped on the (shorter)
+    /// completion grace, and its result is kept — the answer is already on
+    /// disk, so waiting out the idle clock buys nothing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_that_reported_then_hangs_is_reaped_and_its_result_kept() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        // It reports, then the next sample never answers.
+        let builder =
+            Arc::new(TypedChild::new(vec![reports("completed", "I did the thing")]).hanging());
+        let tool = typed_tool(builder, spawn_dir.path().to_path_buf())
+            .with_prefix_stagger(std::time::Duration::ZERO)
+            // A long idle clock, so only the grace can be what ends this.
+            .with_deadlines(600, 1);
+        let at = std::time::Instant::now();
+        let out = tool
+            .run(json!({"task": "survey"}), CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("I did the thing"), "{}", out.content);
+        assert!(
+            out.content.contains("\"outcome\": \"completed\""),
+            "{}",
+            out.content
+        );
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(30),
+            "the grace clock must be what ended it: {:?}",
+            at.elapsed()
+        );
+    }
+
+    /// A child that hits `max_turns` gets exactly one wrap-up prompt, and the
+    /// roster it sees for that prompt is reads plus `report_result` — nothing
+    /// it could start new work with.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_child_out_of_turns_gets_one_wrapup_prompt_and_returns_typed() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        // `max_turns: 1` in TypedChild::spawn_with_turns: the first sample
+        // uses the budget, so the turn ends `TurnLimit`.
+        let builder = Arc::new(
+            TypedChild::new(vec![
+                // A tool call: the turn wants another step it has no budget
+                // for, which is what `TurnLimit` means.
+                // Two tool calls burn the turn's whole budget, so it wants a
+                // third step it has none for — which is what `TurnLimit` is.
+                ScriptedProvider::tool_call("t1", "glob", json!({"pattern": "*.rs"})),
+                ScriptedProvider::tool_call("t2", "glob", json!({"pattern": "*.md"})),
+                reports("blocked", "ran out of room"),
+                ScriptedProvider::text_reply("stopping"),
+            ])
+            .with_max_turns(2),
+        );
+        let tool = typed_tool(builder.clone(), spawn_dir.path().to_path_buf())
+            .with_prefix_stagger(std::time::Duration::ZERO);
+        let out = tool
+            .run(json!({"task": "survey"}), CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("\"outcome\": \"blocked\""),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("ran out of room"), "{}", out.content);
+
+        let requests = builder.requests_seen();
+        assert!(
+            requests.len() >= 2,
+            "a wrap-up sample ran: {}",
+            requests.len()
+        );
+        let wrapup = requests.last().expect("the wrap-up request");
+        let names: Vec<&str> = wrapup.tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(
+            names.contains(&"report_result") && names.contains(&"read"),
+            "the wrap-up roster keeps reads and the way out: {names:?}"
+        );
+        assert!(
+            !names.contains(&"write") && !names.contains(&"bash") && !names.contains(&"edit"),
+            "and advertises nothing it could start new work with: {names:?}"
+        );
+    }
+
     /// 0058 T7: the queue refuses out loud, naming both numbers and the
     /// knob. A runaway fan-out that queued silently would leave the model
     /// unable to tell a stalled child from a working one.
@@ -1697,7 +2008,14 @@ mod tests {
         let def = hotl_tools::agents::builtin("general-purpose").unwrap();
         let mut child = ScriptedChild::new().build(&def, "go", None).unwrap().handle;
         child.prompt("go".into()).await;
-        let drained = drain_child(&mut child, &CancellationToken::new(), None, None).await;
+        let drained = drain_child(
+            &mut child,
+            &CancellationToken::new(),
+            None,
+            None,
+            Default::default(),
+        )
+        .await;
         assert!(matches!(drained.outcome, Outcome::Done { .. }));
         // `ScriptedProvider::text_reply` bills 10 in / 5 out.
         assert_eq!(drained.usage.input_tokens, 10);

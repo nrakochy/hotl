@@ -243,6 +243,12 @@ pub struct AgentsCfg {
     /// response byte, so the provider writes their shared prefix once instead
     /// of N times (0058 T6). `0` disables. Default: 5000ms.
     pub prefix_stagger_ms: Option<u64>,
+    /// A child that sends nothing for this long is stopped and reported
+    /// `unverifiable` (0058 T8). `0` disables. Default: 300s.
+    pub child_idle_secs: Option<u64>,
+    /// After a child reports, how long it gets to actually exit before it is
+    /// reaped — its result is kept either way. `0` disables. Default: 20s.
+    pub completion_grace_secs: Option<u64>,
 }
 
 impl AgentsCfg {
@@ -251,6 +257,16 @@ impl AgentsCfg {
         std::time::Duration::from_millis(
             self.prefix_stagger_ms
                 .unwrap_or(crate::spawn::DEFAULT_PREFIX_STAGGER_MS),
+        )
+    }
+
+    /// `(child_idle_secs, completion_grace_secs)` with their defaults.
+    pub fn child_deadlines(&self) -> (u64, u64) {
+        (
+            self.child_idle_secs
+                .unwrap_or(crate::spawn::DEFAULT_CHILD_IDLE_SECS),
+            self.completion_grace_secs
+                .unwrap_or(crate::spawn::DEFAULT_COMPLETION_GRACE_SECS),
         )
     }
 
@@ -1315,6 +1331,23 @@ mod tests {
                 .agents
                 .prefix_stagger(),
             std::time::Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn agents_child_deadlines_have_defaults_and_zero_disables() {
+        assert_eq!(
+            cfg_with("").agents.child_deadlines(),
+            (
+                crate::spawn::DEFAULT_CHILD_IDLE_SECS,
+                crate::spawn::DEFAULT_COMPLETION_GRACE_SECS
+            )
+        );
+        assert_eq!(
+            cfg_with("[agents]\nchild_idle_secs = 0\ncompletion_grace_secs = 5\n")
+                .agents
+                .child_deadlines(),
+            (0, 5)
         );
     }
 

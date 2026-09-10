@@ -793,6 +793,8 @@ struct Turn {
     /// cache break every time instead of once at the toggle.
     tool_defs_all: Arc<[ToolDef]>,
     tool_defs_plan: Arc<[ToolDef]>,
+    /// The wrap-up roster (0058 T8): reads plus `report_result`, nothing else.
+    tool_defs_wrapup: Arc<[ToolDef]>,
     models: Vec<String>,
     model_idx: usize,
     /// The trailing tool-call signatures the doom-loop detector reads —
@@ -914,6 +916,11 @@ impl Turn {
         Self {
             tool_defs_all: shared.registry.without_plan_tools().defs().into(),
             tool_defs_plan: shared.registry.without_edit_tools().defs().into(),
+            tool_defs_wrapup: shared
+                .registry
+                .filtered(|t| t.read_only() || t.name() == "report_result")
+                .defs()
+                .into(),
             shared,
             cmd_tx,
             events,
@@ -1199,7 +1206,10 @@ impl Turn {
     /// The roster this turn advertises right now — the live plan flag, not a
     /// snapshot, so a `/plan` between samples moves it at the next boundary.
     fn tool_defs(&self) -> &Arc<[ToolDef]> {
-        if self.shared.effective_plan() {
+        // Wrap-up outranks plan: it is the strictly narrower of the two.
+        if self.shared.effective_wrapup() {
+            &self.tool_defs_wrapup
+        } else if self.shared.effective_plan() {
             &self.tool_defs_plan
         } else {
             &self.tool_defs_all

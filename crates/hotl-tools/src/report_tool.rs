@@ -52,6 +52,12 @@ pub fn unverifiable(summary: &str) -> Value {
     json!({"outcome": "unverifiable", "summary": summary})
 }
 
+/// [`unverifiable`] naming what ended the child (`idle`, …), so the parent
+/// model can tell a stuck sub-agent from one that simply never reported.
+pub fn unverifiable_because(reason: &str, summary: &str) -> Value {
+    json!({"outcome": "unverifiable", "reason": reason, "summary": summary})
+}
+
 /// What a parent tells a child that finished without reporting.
 pub const REPROMPT: &str = "Call report_result now with what you have.";
 

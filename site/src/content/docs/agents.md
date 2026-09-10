@@ -139,6 +139,19 @@ itself: `{"outcome": "unverifiable", "summary": <the child's last words>}`.
 The parent always gets a shape — what it never gets is a claim of success
 nobody made.
 
+**Two clocks bound a child**, and neither one throws away an answer. A child
+that sends nothing at all for `[agents] child_idle_secs` (default 300s) is
+stopped and comes back `{"outcome": "unverifiable", "reason": "idle"}` — a
+stuck sub-agent is reported, not waited on. A child that has already reported
+and then hangs (an MCP server holding stdout open, say) is reaped after
+`completion_grace_secs` (default 20s) **and its result is kept**: the answer
+is on disk, and what was being waited for was only the process.
+
+A child that runs out of turns gets exactly one more prompt — "call
+report_result now with what you have; do not start new work" — and for that
+prompt the only tools it is offered are reads and `report_result`. "Do not
+start new work" is the shape of the roster, not just a sentence in a prompt.
+
 `workflow` agents are the exception: they answer against their phase's own
 JSON schema, so they are not given `report_result`. Two return contracts in
 one roster is just a way to lose the reply.

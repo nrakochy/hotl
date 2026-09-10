@@ -875,6 +875,10 @@ pub enum SessionCmd {
     /// Toggle plan mode, the second permission axis (durable: appended to the
     /// log as `PlanSet`; takes effect immediately, same shape as `SetMode`).
     SetPlan(bool),
+    /// Wrap-up (0058 T8): narrow the advertised roster to reads plus
+    /// `report_result` for the next prompt. Not durable — it is one prompt at
+    /// the end of a child's turn budget, not session state a resume replays.
+    SetWrapUp(bool),
     /// Set the session's reasoning depth (durable: appended to the log as
     /// `EffortSet`; takes effect on the next request). `None` = the provider's
     /// own default, which must round-trip so a user can clear the setting.
@@ -1097,6 +1101,14 @@ impl SessionHandle {
     }
     /// Toggle plan mode durably (a `plan_set` log entry; last one wins).
     /// Immediate, atomic-backed, same as [`Self::set_mode`].
+    /// Narrow this session's advertised roster to reads plus `report_result`
+    /// (0058 T8). The parent sets it before the one wrap-up prompt it gives a
+    /// child that ran out of turns: with nothing else on offer, "do not start
+    /// new work" is the shape of the roster, not just a sentence in a prompt.
+    pub async fn set_wrapup(&self, on: bool) {
+        let _ = self.cmd.send(SessionCmd::SetWrapUp(on)).await;
+    }
+
     pub async fn set_plan(&self, plan: bool) {
         let _ = self.cmd.send(SessionCmd::SetPlan(plan)).await;
     }

@@ -964,6 +964,8 @@ struct Scaffold {
     agents_include_claude: bool,
     /// `[agents] prefix_stagger_ms`, resolved once at startup.
     prefix_stagger: std::time::Duration,
+    /// `[agents] child_idle_secs` / `completion_grace_secs`, likewise.
+    child_deadlines: (u64, u64),
     /// `[workflows]` (0044): the process-wide agent gate every run shares,
     /// built once here like `concurrency`, and the limits a plan may lower.
     workflow_gate: Arc<tokio::sync::Semaphore>,
@@ -1084,6 +1086,7 @@ async fn scaffold(
     let registry = Arc::new(registry);
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
     let prefix_stagger = cfg.agents.prefix_stagger();
+    let child_deadlines = cfg.agents.child_deadlines();
     let (wf_concurrency, wf_max_agents) = cfg.workflows.limits();
     let workflow_limits = hotl_workflow::Limits {
         concurrency: wf_concurrency,
@@ -1110,6 +1113,7 @@ async fn scaffold(
         concurrency,
         agents_include_claude,
         prefix_stagger,
+        child_deadlines,
         workflow_gate,
         workflow_limits,
         retrieval,
@@ -1148,6 +1152,7 @@ impl Scaffold {
         SpawnRegistration {
             builder: self.spawn_builder.clone(),
             prefix_stagger: self.prefix_stagger,
+            child_deadlines: self.child_deadlines,
             concurrency: self.concurrency.clone(),
             config_dir: self.config_dir.clone(),
             include_claude: self.agents_include_claude,
@@ -1529,6 +1534,8 @@ struct SpawnRegistration {
     /// `[agents] prefix_stagger_ms` — how long identical siblings queue
     /// behind the first one's first byte.
     prefix_stagger: std::time::Duration,
+    /// `[agents] child_idle_secs` / `completion_grace_secs`.
+    child_deadlines: (u64, u64),
     concurrency: hotl_tools::concurrency::SessionConcurrency,
     config_dir: PathBuf,
     include_claude: bool,
@@ -1672,6 +1679,7 @@ fn spawn_session_inner(
     if let Some(SpawnRegistration {
         builder,
         prefix_stagger,
+        child_deadlines,
         concurrency,
         config_dir,
         include_claude,
@@ -1693,6 +1701,7 @@ fn spawn_session_inner(
                 concurrency,
             )
             .with_prefix_stagger(prefix_stagger)
+            .with_deadlines(child_deadlines.0, child_deadlines.1)
             .with_snapshot(snapshot)
             .with_events(event_tx.downgrade()),
         ));

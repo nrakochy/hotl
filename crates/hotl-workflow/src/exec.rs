@@ -124,6 +124,10 @@ pub enum AgentStatus {
     Cancelled,
     /// Ran and answered; the answer never validated.
     Unverifiable,
+    /// Never admitted: the run was cancelled before this agent started
+    /// (0058 T8). Only ever set *before* an agent is recorded `Running`, so
+    /// nothing in flight can be marked skipped.
+    Skipped,
 }
 
 impl RunStatus {
@@ -145,6 +149,7 @@ impl AgentStatus {
             AgentStatus::Failed => "failed",
             AgentStatus::Cancelled => "cancelled",
             AgentStatus::Unverifiable => "unverifiable",
+            AgentStatus::Skipped => "skipped",
         }
     }
 }
@@ -617,6 +622,25 @@ impl Exec<'_> {
     }
 
     /// Start one agent: render, count against the cap, take both permits,
+    /// Record an agent the cancel reached before it ever ran. Settled on
+    /// arrival: it has no duration to report and never will.
+    fn skip(&self, phase: &str, id: &str, label: &str) -> RunError {
+        lock(&self.summary).record(
+            phase,
+            AgentRecord {
+                id: id.to_string(),
+                label: label.to_string(),
+                status: AgentStatus::Skipped,
+                tokens: None,
+                started: Instant::now(),
+                settled: Some(Instant::now()),
+                error: None,
+                note: None,
+            },
+        );
+        CANCELLED
+    }
+
     /// run, record. `null` for any failure — the run continues.
     async fn dispatch(
         &self,
@@ -636,8 +660,12 @@ impl Exec<'_> {
         };
         let label = render(&spec.label)?;
         let prompt = render(&spec.prompt)?;
+        let id = format!("{}:{}:{label}:{n}", self.run_id, phase.title);
+        // Cancelled before admission: recorded `Skipped`, not dropped. A
+        // summary that simply omits four of six agents cannot be read — the
+        // human cannot tell "never started" from "lost".
         if self.cancel.is_cancelled() {
-            return Err(CANCELLED);
+            return Err(self.skip(&phase.title, &id, &label));
         }
         if self.started.fetch_add(1, Ordering::SeqCst) >= self.cap {
             return Err(RunError::AgentCap {
@@ -649,15 +677,14 @@ impl Exec<'_> {
         // gate slot it cannot use yet.
         let _local = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => return Err(CANCELLED),
+            _ = self.cancel.cancelled() => return Err(self.skip(&phase.title, &id, &label)),
             p = self.local.acquire() => p.expect("never closed"),
         };
         let _gate = tokio::select! {
             biased;
-            _ = self.cancel.cancelled() => return Err(CANCELLED),
+            _ = self.cancel.cancelled() => return Err(self.skip(&phase.title, &id, &label)),
             p = self.gate.acquire() => p.expect("never closed"),
         };
-        let id = format!("{}:{}:{label}:{n}", self.run_id, phase.title);
         let req = AgentRequest {
             id: id.clone(),
             phase: phase.title.clone(),
@@ -1353,6 +1380,84 @@ pub(crate) mod tests {
         assert_eq!(j["phases"][0]["agents"][0]["tokens"], 1200);
         assert_eq!(j["phases"][0]["agents"][0]["note"], "kept");
         assert!(j["phases"][0]["agents"][0]["elapsed_ms"].is_u64());
+    }
+
+    /// 0058 T8: a cancel drains rather than truncating. The agents already
+    /// running settle normally; the ones never admitted are recorded
+    /// `Skipped`, so a summary that lists six agents accounts for all six.
+    /// Nothing in flight is ever marked skipped.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelling_a_phase_settles_what_ran_and_skips_the_rest() {
+        use std::sync::atomic::AtomicUsize;
+        /// Two agents run at a time; the second one to start cancels the run,
+        /// so exactly two are in flight when it lands.
+        struct CancelOnSecond {
+            started: AtomicUsize,
+            cancel: CancellationToken,
+        }
+        impl AgentRunner for CancelOnSecond {
+            fn run(&self, req: AgentRequest, _c: CancellationToken) -> BoxFuture<'_, AgentReply> {
+                Box::pin(async move {
+                    if self.started.fetch_add(1, Ordering::SeqCst) + 1 == 2 {
+                        self.cancel.cancel();
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    AgentReply {
+                        value: Ok(json!(req.label)),
+                        tokens: None,
+                        note: None,
+                        unverifiable: false,
+                    }
+                })
+            }
+        }
+        let agents: Vec<Value> = (0..6)
+            .map(|i| json!({"label": format!("a{i}"), "prompt": "p"}))
+            .collect();
+        let plan = plan(json!({"name": "p", "phases": [{"title": "A", "agents": agents}]}));
+        let cancel = CancellationToken::new();
+        let harness = Harness {
+            // Width 2, so exactly two are admitted before the cancel lands.
+            limits: Limits {
+                concurrency: 2,
+                max_agents: 1000,
+            },
+            gate: Arc::new(Semaphore::new(2)),
+            cancel: cancel.clone(),
+            ..Default::default()
+        };
+        let runner = CancelOnSecond {
+            started: AtomicUsize::new(0),
+            cancel,
+        };
+        let (_out, summary) = harness.run(&plan, &runner, &Silent).await;
+        let s = lock(&summary);
+        let by_status = |want: AgentStatus| {
+            s.phases[0]
+                .agents
+                .iter()
+                .filter(|a| a.status == want)
+                .count()
+        };
+        assert_eq!(by_status(AgentStatus::Done), 2, "the two in flight settled");
+        assert_eq!(
+            by_status(AgentStatus::Skipped),
+            4,
+            "the rest are accounted for"
+        );
+        assert_eq!(
+            by_status(AgentStatus::Running),
+            0,
+            "no agent may be left running, and none may be skipped while it was"
+        );
+        assert_eq!(s.phases[0].agents.len(), 6, "all six are in the summary");
+        // Skipped never counts as finished, and never as failed.
+        assert_eq!(s.counts(), (6, 2, 0));
+        assert!(s.to_json()["phases"][0]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a["status"] == "skipped"));
     }
 
     /// An agent that answered but never validated is its own status: it ran,
