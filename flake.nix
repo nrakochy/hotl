@@ -69,7 +69,12 @@
           # nixpkgs build (tests on) would want. Nothing reaches runtime: a
           # nix-installed hotl still finds `rg` only if the user has it, and
           # degrades to a legible error if not.
-          nativeCheckInputs = [ pkgs.ripgrep ];
+          #
+          # `git` is here for the same reason: project ids read `git remote`,
+          # and without it `project_id_is_stable_for_remote_and_falls_back_to_cwd`
+          # silently takes the cwd fallback in both temp checkouts and fails the
+          # one assertion it exists to make.
+          nativeCheckInputs = [ pkgs.ripgrep pkgs.git ];
 
           # Nothing here demands $HOME, but /homeless-shelter is not writable
           # and a single test reaching for it would be an opaque failure.

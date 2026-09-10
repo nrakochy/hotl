@@ -719,11 +719,17 @@ mod tests {
 
     /// A unique endpoint id per test, so two tests never collide on the
     /// machine-wide pipe namespace Windows has and Unix does not.
+    ///
+    /// Short on purpose, and it has to stay that way: a unix socket path is
+    /// capped at 103 bytes on macOS, and under `nix flake check` the run dir
+    /// alone eats 78 of them, leaving 20 for the whole id. `tag` is a label,
+    /// not a sentence — the test's own name carries the meaning. Overrun it and
+    /// hotl-platform's socket-path check names the path and the overage.
     fn endpoint_id(tag: &str) -> String {
         use std::sync::atomic::{AtomicU32, Ordering};
         static SEQ: AtomicU32 = AtomicU32::new(0);
         format!(
-            "test-{tag}-{}-{}",
+            "t-{tag}-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, Ordering::Relaxed)
         )
@@ -836,7 +842,7 @@ mod tests {
     /// which is how a `human_input` phase would have been answered by nobody.
     #[tokio::test]
     async fn question_frames_park_and_are_re_issued_on_attach() {
-        let (client_side, server_side) = connected_pair("question").await;
+        let (client_side, server_side) = connected_pair("ques").await;
         let (_cr, cw) = tokio::io::split(client_side);
         let (sr, _sw) = tokio::io::split(server_side);
         let mut lines = tokio::io::BufReader::new(sr).lines();
@@ -914,7 +920,7 @@ mod tests {
     /// made-up selection.
     #[tokio::test]
     async fn a_malformed_question_reply_is_no_human() {
-        let (client_side, server_side) = connected_pair("question-bad").await;
+        let (client_side, server_side) = connected_pair("qbad").await;
         let (_cr, cw) = tokio::io::split(client_side);
         let (sr, _sw) = tokio::io::split(server_side);
         let mut lines = tokio::io::BufReader::new(sr).lines();

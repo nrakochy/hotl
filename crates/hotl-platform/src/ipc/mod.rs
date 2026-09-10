@@ -110,7 +110,9 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let ipc = crate::IPC;
-            let id = format!("hotl-ipc-test-{}", std::process::id());
+            // Short: this path is capped at 103 bytes on macOS, and a nix build dir
+            // spends most of that before the id starts.
+            let id = format!("hotl-ipc-{}", std::process::id());
             assert_eq!(ipc.liveness(&id), Liveness::Dead, "nothing bound yet");
 
             let mut listener = ipc.bind_private(&id).unwrap();
