@@ -23,6 +23,9 @@ bytes = { workspace = true }
 # its ack (commit-protocol.md §Durability ordering). `sync` is the only
 # feature this crate uses.
 tokio = { workspace = true }
+# `project::id`'s cwd fallback: on Windows `std::fs::canonicalize` yields a
+# `\\?\` path, which is a different string for the same directory.
+dunce = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

@@ -12,7 +12,7 @@ use crate::{Permission, Tool, ToolOutcome};
 
 // Re-exported so tools/engine/surfaces share one definition (hotl-types is
 // the canonical home; this module is where the tool-facing API lives).
-pub use hotl_types::{Todo, TodoStatus};
+pub use hotl_types::{Decision, Todo, TodoStatus};
 
 /// The tool doesn't hold the list itself — it forwards the validated list to
 /// the actor (the single owner) via this sink and returns a confirmation the
@@ -20,7 +20,7 @@ pub use hotl_types::{Todo, TodoStatus};
 /// depends on hotl-engine: the binary supplies a closure that reaches the
 /// session's actor (mirrors how the `spawn` tool's `ChildBuilder` decouples
 /// hotl-tools from the engine crate it ultimately talks to).
-type Sink = Arc<dyn Fn(Vec<Todo>) + Send + Sync>;
+type Sink = Arc<dyn Fn(Vec<Todo>, Vec<Decision>) + Send + Sync>;
 
 pub struct TodoWriteTool {
     sink: Sink,
@@ -240,14 +240,46 @@ pub fn render_reminder(items: &[Todo]) -> Option<Item> {
     })
 }
 
-fn summary(items: &[Todo]) -> String {
+fn summary(items: &[Todo], decisions: usize) -> String {
     let c = |s| items.iter().filter(|t| t.status == s).count();
-    format!(
+    let mut s = format!(
         "Todos updated: {} in progress, {} pending, {} done",
         c(TodoStatus::InProgress),
         c(TodoStatus::Pending),
         c(TodoStatus::Completed)
-    )
+    );
+    let failed = c(TodoStatus::Failed);
+    if failed > 0 {
+        s.push_str(&format!(", {failed} failed"));
+    }
+    if decisions > 0 {
+        s.push_str(&format!(" · {decisions} decision(s) recorded"));
+    }
+    s
+}
+
+/// The decisions half of a `todo_write` call. Malformed entries are dropped
+/// rather than refused: the nodes are the load-bearing half, and failing the
+/// whole call over a missing `why` would cost the plan update too. `when_ms`
+/// is zero here — the actor stamps it.
+fn parse_decisions(input: &Value) -> Vec<Decision> {
+    input
+        .get("decisions")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| {
+                    let what = str_field(v, "what")?;
+                    let why = str_field(v, "why")?;
+                    Some(Decision {
+                        when_ms: 0,
+                        what,
+                        why,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 impl Tool for TodoWriteTool {
@@ -310,6 +342,18 @@ impl Tool for TodoWriteTool {
                         },
                         "required": ["content", "status"]
                     }
+                },
+                "decisions": {
+                    "type": "array",
+                    "description": "choices worth remembering, APPENDED (not replaced) to the plan's decisions log — record one when you pick an approach a later reader would otherwise have to re-derive",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "what": {"type": "string", "description": "the choice, in a few words"},
+                            "why": {"type": "string", "description": "the reason it beat the alternative"}
+                        },
+                        "required": ["what", "why"]
+                    }
                 }
             },
             "required": ["todos"]
@@ -324,8 +368,9 @@ impl Tool for TodoWriteTool {
         Box::pin(async move {
             match parse_todos(&input) {
                 Ok(items) => {
-                    let s = summary(&items);
-                    (self.sink)(items);
+                    let decisions = parse_decisions(&input);
+                    let s = summary(&items, decisions.len());
+                    (self.sink)(items, decisions);
                     ToolOutcome::ok(s)
                 }
                 Err(e) => e,
@@ -469,7 +514,7 @@ mod tests {
     async fn tool_forwards_and_confirms() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let s = seen.clone();
-        let tool = TodoWriteTool::new(Arc::new(move |items| *s.lock().unwrap() = items));
+        let tool = TodoWriteTool::new(Arc::new(move |items, _d| *s.lock().unwrap() = items));
         let out = tool
             .run(
                 json!({"todos":[{"content":"x","status":"completed"}]}),
@@ -484,7 +529,7 @@ mod tests {
     async fn tool_reports_validation_errors_without_forwarding() {
         let seen = Arc::new(Mutex::new(Vec::<Todo>::new()));
         let s = seen.clone();
-        let tool = TodoWriteTool::new(Arc::new(move |items| *s.lock().unwrap() = items));
+        let tool = TodoWriteTool::new(Arc::new(move |items, _d| *s.lock().unwrap() = items));
         let out = tool
             .run(
                 json!({"todos":[{"content":"","status":"pending"}]}),

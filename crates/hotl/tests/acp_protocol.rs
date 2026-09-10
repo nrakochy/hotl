@@ -109,6 +109,8 @@ fn scripted_factory_recording(
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: None,
                 config: EngineConfig {
                     max_turns: 6,
@@ -173,6 +175,8 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
                     images: Vec::new(),
                 }],
                 initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: None,
                 config: EngineConfig {
                     max_turns: 6,
@@ -372,6 +376,8 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
                     images: Vec::new(),
                 }],
                 initial_todos: todos.clone(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: None,
                 config: EngineConfig {
                     max_turns: 6,
@@ -932,6 +938,8 @@ async fn overlapping_prompts_resolve_in_order() {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: None,
                 config: EngineConfig {
                     max_turns: 6,
@@ -1150,6 +1158,8 @@ async fn prompt_images_are_validated_at_the_wire() {
                 hooks: None,
                 initial_items: Vec::new(),
                 initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: None,
                 config: EngineConfig::default(),
             }),
@@ -1342,6 +1352,8 @@ async fn ask_user_round_trip_via_session_request_question() {
                     hooks: None,
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
                     initial_goal: None,
                     config: EngineConfig {
                         max_turns: 6,
@@ -1843,6 +1855,8 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
                     blocks: vec![json!({"type":"text","text":"done"})],
                 }],
                 initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: goal.clone(),
                 config: EngineConfig::default(),
             }),

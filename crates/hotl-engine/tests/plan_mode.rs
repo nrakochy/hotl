@@ -86,6 +86,8 @@ async fn run_one(
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -352,6 +354,8 @@ async fn run_visible(start_in_plan: bool, toggles: [Option<bool>; 2]) -> Visible
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });

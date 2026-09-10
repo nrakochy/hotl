@@ -54,6 +54,8 @@ async fn set_todos_appends_a_durable_entry_and_emits_todos_changed() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -86,7 +88,7 @@ async fn set_todos_appends_a_durable_entry_and_emits_todos_changed() {
         .lines()
         .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
         .filter_map(|e| match e.payload {
-            EntryPayload::Todos { items } => Some(items),
+            EntryPayload::Todos { items, .. } => Some(items),
             _ => None,
         })
         .collect();
@@ -115,6 +117,8 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -186,6 +190,7 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
     parent_log
         .append(
             &EntryPayload::Todos {
+                decisions: Vec::new(),
                 items: restored.clone(),
             },
             1,
@@ -220,6 +225,8 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: replayed.todos,
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -263,7 +270,7 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
         .lines()
         .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
         .filter_map(|e| match e.payload {
-            EntryPayload::Todos { items } => Some(items),
+            EntryPayload::Todos { items, .. } => Some(items),
             _ => None,
         })
         .collect();

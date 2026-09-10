@@ -617,6 +617,8 @@ mod tests {
             hooks: None,
             initial_items: Vec::new(),
             initial_todos: Vec::new(),
+            initial_decisions: Vec::new(),
+            plan_files: None,
             initial_goal: None,
             config: EngineConfig {
                 max_turns: 6,

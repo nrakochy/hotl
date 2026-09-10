@@ -115,6 +115,8 @@ async fn run_one_turn(
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
         concurrency,

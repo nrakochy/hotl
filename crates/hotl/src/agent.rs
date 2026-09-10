@@ -57,6 +57,8 @@ pub(crate) struct Resumed {
     /// same inheritance shape as `mode`/`name`). Empty = the parent never
     /// had a list, so the resumed session starts with none, same as fresh.
     pub todos: Vec<hotl_types::Todo>,
+    /// The decisions log that rode that same `Todos` entry (0056 T2).
+    pub decisions: Vec<hotl_types::Decision>,
     /// The chain's active goal, if any (last `GoalSet`, tombstones applied).
     /// Resume adopts it; a **fork** deliberately drops it — see decision 6
     /// (0034): a fork exists to be redirected.
@@ -167,6 +169,7 @@ pub(crate) fn load_lineage(
         plan,
         effort,
         todos,
+        decisions,
         goal,
         tip_entry_id,
         ..
@@ -187,6 +190,8 @@ pub(crate) fn load_lineage(
         // an earlier prefix would inherit a checklist about work its own
         // history no longer contains — actively misleading, so drop it.
         todos: if truncated { Vec::new() } else { todos },
+        // Same reasoning: a decisions log about work the fork no longer has.
+        decisions: if truncated { Vec::new() } else { decisions },
         // The goal is the same shape as todos (a claim about the parent's
         // final state); the fork arms drop it even untruncated.
         goal: if truncated { None } else { goal },
@@ -503,7 +508,14 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
         Some(scaffold.recall_registration(session_id)),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps = scaffold.deps(log, items, Inherited::default(), Vec::new(), None);
+            let mut deps = scaffold.deps(
+                log,
+                items,
+                Inherited::default(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
             deps.registry = registry;
             deps
         },
@@ -734,6 +746,10 @@ pub(crate) async fn build_acp() -> Result<
             .as_ref()
             .map(|r| r.todos.clone())
             .unwrap_or_default();
+        let inherited_decisions = resumed
+            .as_ref()
+            .map(|r| r.decisions.clone())
+            .unwrap_or_default();
         // Like todos, the goal seeds the actor directly and is never
         // copy-forwarded (chain replay already finds the parent's `GoalSet`).
         // A fork never inherits it, even at the head (0034 decision 6): a
@@ -786,6 +802,7 @@ pub(crate) async fn build_acp() -> Result<
                         effort: effort_override,
                     },
                     inherited_todos,
+                    inherited_decisions,
                     inherited_goal.clone(),
                 );
                 deps.registry = registry;
@@ -889,8 +906,14 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
         |registry| {
-            let mut deps =
-                scaffold.deps(log, initial_items, Inherited::default(), Vec::new(), None);
+            let mut deps = scaffold.deps(
+                log,
+                initial_items,
+                Inherited::default(),
+                Vec::new(),
+                Vec::new(),
+                None,
+            );
             deps.registry = registry;
             deps
         },
@@ -940,6 +963,9 @@ struct Scaffold {
     /// `recall` is per-session, because its built-in `session-log` backend
     /// indexes the session's own log.
     retrieval: Vec<hotl_retrieval::config::BackendConfig>,
+    /// Where every session in this process files its plan artifact (0056 T2)
+    /// — one project id per process, computed once at scaffold time.
+    plan_files: Option<hotl_engine::PlanFiles>,
     /// Startup warnings, collected rather than printed: `/reload` rebuilds a
     /// scaffold with the alternate screen up, where a stray `eprintln!` would
     /// corrupt the display. Startup callers print these verbatim; the reload
@@ -1051,7 +1077,9 @@ async fn scaffold(
         max_agents: wf_max_agents,
     };
     let workflow_gate = Arc::new(tokio::sync::Semaphore::new(wf_concurrency));
+    let plan_files = plan_files_for(&cfg, &cwd);
     Ok(Scaffold {
+        plan_files,
         provider,
         model,
         clock,
@@ -1134,6 +1162,7 @@ impl Scaffold {
         initial_items: Vec<hotl_types::Item>,
         inherited: Inherited,
         initial_todos: Vec<hotl_types::Todo>,
+        initial_decisions: Vec<hotl_types::Decision>,
         initial_goal: Option<String>,
     ) -> SessionDeps {
         let Inherited {
@@ -1170,11 +1199,39 @@ impl Scaffold {
             hooks: self.hooks.clone(),
             initial_items,
             initial_todos,
+            initial_decisions,
+            plan_files: self.plan_files.clone(),
             initial_goal,
             config,
             concurrency: self.concurrency.clone(),
         }
     }
+}
+
+/// Where this process files plan artifacts (0056 T2): `<data>/plans/<project
+/// id>`, plus the optional in-repo mirror `[plan] repo_dir` asks for. A
+/// relative `repo_dir` is resolved against the workspace; the mirror is the
+/// markdown only.
+fn plan_files_for(
+    cfg: &crate::config::Config,
+    cwd: &std::path::Path,
+) -> Option<hotl_engine::PlanFiles> {
+    let project = hotl_store::project::id(cwd);
+    let dir = data_dir().join("plans").join(&project);
+    let repo_mirror = cfg.plan.repo_dir.as_ref().map(|d| {
+        let base = std::path::Path::new(d);
+        let base = if base.is_absolute() {
+            base.to_path_buf()
+        } else {
+            cwd.join(base)
+        };
+        base.join("hotl-plan.md")
+    });
+    Some(hotl_engine::PlanFiles {
+        project,
+        dir,
+        repo_mirror,
+    })
 }
 
 /// Env-named secrets plus, when a helper minted this process's key, that
@@ -1292,6 +1349,10 @@ async fn run_session(
         .as_ref()
         .map(|l| l.todos.clone())
         .unwrap_or_default();
+    let initial_decisions = lineage
+        .as_ref()
+        .map(|l| l.decisions.clone())
+        .unwrap_or_default();
     let mode_override = lineage
         .as_ref()
         .and_then(|l| l.mode.as_deref())
@@ -1316,6 +1377,7 @@ async fn run_session(
                     effort: effort_override,
                 },
                 initial_todos,
+                initial_decisions,
                 goal,
             );
             deps.registry = registry;
@@ -1460,9 +1522,9 @@ fn spawn_session_inner(
     let head_cell: HeadCell = Arc::new(std::sync::Mutex::new(None));
     let weak = cmd_tx.downgrade();
     registry.register(Box::new(hotl_tools::TodoWriteTool::new(Arc::new(
-        move |items| {
+        move |todos, decisions| {
             if let Some(tx) = weak.upgrade() {
-                let _ = tx.try_send(hotl_engine::SessionCmd::SetTodos(items));
+                let _ = tx.try_send(hotl_engine::SessionCmd::SetTodos { todos, decisions });
             }
         },
     ))));
@@ -1990,6 +2052,8 @@ impl HotlChildBuilder {
                 hooks: None,
                 initial_items,
                 initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: None,
                 config,
                 concurrency: self.concurrency.clone(),
@@ -2133,6 +2197,7 @@ fn session_context(
             &scaffold.model,
             &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
             plan,
+            scaffold.plan_files.as_ref(),
         ),
     }
 }
@@ -2147,6 +2212,7 @@ fn fresh_context(
     model: &str,
     date: &str,
     plan: bool,
+    plan_files: Option<&hotl_engine::PlanFiles>,
 ) -> Vec<hotl_types::Item> {
     let mut items = initial_items(config_dir, cwd, model, date);
     if plan {
@@ -2159,7 +2225,33 @@ fn fresh_context(
             images: Vec::new(),
         });
     }
+    if let Some(item) = plan_files.and_then(carryover_reminder) {
+        items.push(item);
+    }
     items
+}
+
+/// A plan the last session in this project left open (0056 T2). Fresh
+/// sessions only — a resume already carries the list itself, and a second
+/// copy would read as two plans. The reminder names the file rather than
+/// inlining it: the model reads what it needs, and the context cost of a
+/// stale plan stays one sentence.
+fn carryover_reminder(files: &hotl_engine::PlanFiles) -> Option<hotl_types::Item> {
+    let artifact = hotl_engine::plan_state::read_artifact(&files.dir)?;
+    if !hotl_engine::plan_state::has_open_nodes(&artifact.nodes) {
+        return None;
+    }
+    let (done, total) = hotl_engine::plan_state::progress(&artifact.nodes);
+    let path = files.dir.join("current.md").display().to_string();
+    Some(hotl_types::Item::User {
+        text: format!(
+            "<system-reminder>A plan from an earlier session exists at {path} \
+             ({done} of {total} steps done). Read it and call todo_write to adopt or \
+             replace it before starting new work.</system-reminder>"
+        ),
+        synthetic: Some(hotl_types::SyntheticReason::SystemReminder),
+        images: Vec::new(),
+    })
 }
 
 /// Lane-2 shell hooks from config.toml `[[hook]]`, or None (M5). Threads in
@@ -3597,6 +3689,7 @@ mod fork_tests {
         parent
             .append(
                 &EntryPayload::Todos {
+                    decisions: Vec::new(),
                     items: vec![hotl_types::Todo {
                         content: "finish turn 3's follow-up".into(),
                         status: hotl_types::TodoStatus::Pending,
@@ -4712,6 +4805,8 @@ mod tests {
                     hooks: None,
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
                     initial_goal: None,
                     config,
                 }
@@ -4775,6 +4870,8 @@ mod tests {
                     active_form: None,
                     ..Default::default()
                 }],
+                initial_decisions: Vec::new(),
+                plan_files: None,
                 initial_goal: None,
                 config,
             }
@@ -4876,6 +4973,8 @@ mod tests {
                     hooks: None,
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
                     initial_goal: None,
                     config,
                 }
@@ -4934,6 +5033,8 @@ mod tests {
                     hooks: None,
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
                     initial_goal: None,
                     config,
                 }
@@ -4993,6 +5094,8 @@ mod tests {
                     hooks: None,
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
                     initial_goal: None,
                     config,
                 }
@@ -5233,8 +5336,15 @@ mod tests {
     fn a_session_that_starts_in_plan_mode_says_so_in_its_seed() {
         let config_dir = tempfile::tempdir().unwrap();
         let cwd = tempfile::tempdir().unwrap();
-        let plain = fresh_context(config_dir.path(), cwd.path(), "m", "2026-08-14", false);
-        let planned = fresh_context(config_dir.path(), cwd.path(), "m", "2026-08-14", true);
+        let plain = fresh_context(
+            config_dir.path(),
+            cwd.path(),
+            "m",
+            "2026-08-14",
+            false,
+            None,
+        );
+        let planned = fresh_context(config_dir.path(), cwd.path(), "m", "2026-08-14", true, None);
         assert_eq!(planned.len(), plain.len() + 1);
         let hotl_types::Item::User {
             text, synthetic, ..
@@ -5246,6 +5356,94 @@ mod tests {
         assert_eq!(
             *synthetic,
             Some(hotl_types::SyntheticReason::SystemReminder)
+        );
+    }
+
+    /// 0056 T2: a plan the last session left open reaches the next fresh
+    /// session in the same project — once, by path, and only while a step is
+    /// still open.
+    #[test]
+    fn an_open_plan_from_an_earlier_session_reminds_the_next_one() {
+        let config_dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let files = hotl_engine::PlanFiles {
+            project: "p".into(),
+            dir: data.path().join("plans").join("p"),
+            repo_mirror: None,
+        };
+        let base = fresh_context(
+            config_dir.path(),
+            cwd.path(),
+            "m",
+            "2026-08-14",
+            false,
+            None,
+        );
+        // No artifact yet: nothing extra rides.
+        assert_eq!(
+            fresh_context(
+                config_dir.path(),
+                cwd.path(),
+                "m",
+                "2026-08-14",
+                false,
+                Some(&files)
+            )
+            .len(),
+            base.len()
+        );
+
+        let node = |status| hotl_types::Todo {
+            content: "wire the gate".into(),
+            status,
+            ..Default::default()
+        };
+        let write = |nodes: Vec<hotl_types::Todo>| {
+            let state = hotl_engine::plan_state::PlanState {
+                todos: nodes,
+                decisions: Vec::new(),
+            };
+            let a = hotl_engine::plan_state::PlanArtifact::new("p".into(), "s".into(), 1, &state);
+            hotl_engine::plan_state::write_artifact(&files.dir, &a).unwrap();
+        };
+
+        write(vec![
+            node(hotl_types::TodoStatus::Completed),
+            node(hotl_types::TodoStatus::Failed),
+        ]);
+        let items = fresh_context(
+            config_dir.path(),
+            cwd.path(),
+            "m",
+            "2026-08-14",
+            false,
+            Some(&files),
+        );
+        assert_eq!(items.len(), base.len() + 1, "exactly one reminder");
+        let hotl_types::Item::User { text, .. } = items.last().unwrap() else {
+            panic!("the reminder is a user item");
+        };
+        assert!(text.contains("A plan from an earlier session"), "{text}");
+        assert!(text.contains("1 of 2 steps done"), "{text}");
+        assert!(
+            text.contains(&files.dir.join("current.md").display().to_string()),
+            "the reminder names the file: {text}"
+        );
+
+        // Everything done: finished work, not an unfinished plan.
+        write(vec![node(hotl_types::TodoStatus::Completed)]);
+        assert_eq!(
+            fresh_context(
+                config_dir.path(),
+                cwd.path(),
+                "m",
+                "2026-08-14",
+                false,
+                Some(&files)
+            )
+            .len(),
+            base.len()
         );
     }
 
@@ -6009,6 +6207,8 @@ mod tests {
                     hooks: Some(hooks_for_deps),
                     initial_items: Vec::new(),
                     initial_todos: Vec::new(),
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
                     initial_goal: None,
                     config,
                 },

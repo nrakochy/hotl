@@ -43,6 +43,8 @@ fn session_with_session_log(provider: Arc<dyn Provider>) -> Session {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         concurrency: Default::default(),
         config,
@@ -83,6 +85,8 @@ fn session_with_recall(provider: Arc<dyn Provider>) -> Session {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });

@@ -135,6 +135,8 @@ fn session() -> Session {
         hooks: None,
         initial_items: seeded(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         concurrency: Default::default(),
         config,

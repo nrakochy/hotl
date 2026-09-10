@@ -588,6 +588,19 @@ The `workflow` tool's own caps, separate from `[concurrency] agents` (which pace
 
 Both are floors of one. Mutating agents that are not worktree-isolated still serialise on the shared-tree lock regardless of width. See [workflows.md](../workflows/).
 
+### Plan artifact (`[plan]`)
+
+The `todo_write` checklist is a durable per-project plan. Every write renders `<xdg-data>/hotl/plans/<project-id>/current.json` (machine) and `current.md` (human), temp-then-rename, alongside the decisions the model recorded. The project id is the `origin` remote's URL when there is one, else the canonical working directory — so two worktrees of the same repo share one plan, and two unrelated checkouts do not.
+
+A fresh session in a project whose plan still has open steps gets one reminder naming the file. A resumed session does not: it already carries the list.
+
+- `repo_dir` mirrors `current.md` into your repo as `hotl-plan.md` (relative paths resolve against the workspace). Absent by default — the plan lives in the data dir, and committing it is your choice. Only the markdown is mirrored; the JSON is harness state.
+
+```toml
+[plan]
+repo_dir = "docs/exec-plans/active"
+```
+
 ### Retention (`[retention]`)
 
 Bounds the growth of the session/blob stores. `hotl gc` prunes on demand; with a `[retention]` policy set, a prune also runs quietly at startup. See [`hotl gc`](#hotl-gc).

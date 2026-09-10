@@ -65,6 +65,8 @@ async fn run_one(mode: PermissionMode, tool: &str, input: Value, answer: AskRepl
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -250,6 +252,8 @@ async fn run_flag_batches(batches: Vec<Vec<(String, &str, Value)>>) -> Vec<(Stri
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });

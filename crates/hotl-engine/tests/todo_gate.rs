@@ -40,6 +40,8 @@ async fn the_gate_fires_at_most_twice_then_lets_the_turn_end() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });

@@ -221,6 +221,17 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// One decision the session made, kept beside the plan (0056 T2). Why a
+/// choice was made is the half a re-read of the diff cannot recover, and the
+/// half a fold drops first. Rewritten full-state with the todos; the actor
+/// stamps `when_ms`, so the model cannot backdate one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Decision {
+    pub when_ms: u64,
+    pub what: String,
+    pub why: String,
+}
+
 /// A tool invocation extracted from assistant blocks.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolUse {
@@ -484,6 +495,11 @@ pub enum EntryPayload {
     /// reminder (`SyntheticReason::Todos`), never committed as an `Item`.
     Todos {
         items: Vec<Todo>,
+        /// The decisions log (0056 T2), rewritten full-state with the items.
+        /// Defaulted and skipped when empty, so a v0.25 entry still replays
+        /// and a session that records none writes the bytes it always did.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        decisions: Vec<Decision>,
     },
     /// Sets or resolves the session's goal (`/goal`, 0034). Log-only, last
     /// one wins, like `ModeSet`. `condition: None` is the tombstone: an
@@ -954,7 +970,10 @@ mod tests {
         assert_eq!(back, t);
         let unk: TodoStatus = serde_json::from_str("\"blocked_on_ci\"").unwrap();
         assert_eq!(unk, TodoStatus::Unknown);
-        let e = EntryPayload::Todos { items: vec![t] };
+        let e = EntryPayload::Todos {
+            items: vec![t],
+            decisions: Vec::new(),
+        };
         let ej = serde_json::to_string(&e).unwrap();
         assert!(ej.contains("\"kind\":\"todos\""));
         assert_eq!(serde_json::from_str::<EntryPayload>(&ej).unwrap(), e);
@@ -968,7 +987,7 @@ mod tests {
         // A `Todos` entry exactly as v0.25 wrote it.
         let old = r#"{"kind":"todos","items":[{"content":"wire","status":"pending"}]}"#;
         let back: EntryPayload = serde_json::from_str(old).unwrap();
-        let EntryPayload::Todos { items } = &back else {
+        let EntryPayload::Todos { items, .. } = &back else {
             panic!("not a todos entry: {back:?}");
         };
         assert_eq!(items[0].id, None);

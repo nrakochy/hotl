@@ -12,6 +12,7 @@ pub mod clearing;
 mod expect;
 pub mod hooks;
 mod ledger;
+pub mod plan_state;
 mod turn;
 
 use std::path::PathBuf;
@@ -52,6 +53,19 @@ pub use ledger::{LedgerSummary, Phase, PhaseDeltaSummary};
 /// (commit-protocol.md §Read invariant). It lives in [`actor`], next to the
 /// only thing that may publish it.
 pub use actor::ProjectionHead;
+
+/// Where a session writes its plan artifact (0056 T2). Injected, never
+/// derived: the engine has no opinion about XDG, and testkit sessions must
+/// never touch the real data dir.
+#[derive(Debug, Clone)]
+pub struct PlanFiles {
+    /// The project id the plan is filed under (`hotl_store::project::id`).
+    pub project: String,
+    /// `<data>/plans/<project>` — holds `current.json` and `current.md`.
+    pub dir: PathBuf,
+    /// Optional in-repo mirror of `current.md` (`[plan] repo_dir`).
+    pub repo_mirror: Option<PathBuf>,
+}
 
 /// Re-exported alongside [`ProjectionHead`]: what a read of it yields, split
 /// into the durable projection and the ephemeral per-sample tail. Out-of-crate
@@ -723,7 +737,12 @@ pub enum SessionCmd {
     /// to the log as `Todos`, last-wins on replay — same shape as
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
     /// only ever forwards a validated `Vec<Todo>` here.
-    SetTodos(Vec<Todo>),
+    SetTodos {
+        todos: Vec<Todo>,
+        /// New decisions to append. Their `when_ms` arrives zero — the actor
+        /// stamps it from the session clock, so the model cannot backdate one.
+        decisions: Vec<hotl_types::Decision>,
+    },
     /// Set (`Some`) or clear (`None`) the session's goal (durable: appended
     /// to the log as `GoalSet`, last-wins on replay). Clearing an *active*
     /// goal appends the tombstone (outcome `"cleared"`); clearing when none
@@ -829,6 +848,13 @@ pub struct SessionDeps {
     /// re-enter through it, and seeding here (vs. a post-spawn `SetTodos`)
     /// means resume never appends a duplicate `Todos` log entry.
     pub initial_todos: Vec<Todo>,
+    /// The decisions log a resumed session starts with (0056 T2) — same
+    /// seed-not-replay shape as `initial_todos`.
+    pub initial_decisions: Vec<hotl_types::Decision>,
+    /// Where this session's plan artifact is filed, when it is filed at all.
+    /// `None` in tests and anywhere without a data dir; the engine never
+    /// derives an XDG path itself.
+    pub plan_files: Option<PlanFiles>,
     /// The goal a resumed session starts with (the replayed chain's last
     /// `GoalSet`, tombstones applied — see `hotl_store::Replayed::goal`).
     /// `None` for a fresh session. A seed, never a post-spawn `SetGoal`, so
@@ -933,7 +959,14 @@ impl SessionHandle {
     /// entry). Exposed mainly for tests that pre-seed a list; the real
     /// entry point is the `todo_write` tool's sink.
     pub async fn set_todos(&self, items: Vec<Todo>) {
-        let _ = self.cmd.send(SessionCmd::SetTodos(items)).await;
+        self.set_plan_nodes(items, Vec::new()).await;
+    }
+    /// The full-state replace plus decisions to append (0056 T2).
+    pub async fn set_plan_nodes(&self, todos: Vec<Todo>, decisions: Vec<hotl_types::Decision>) {
+        let _ = self
+            .cmd
+            .send(SessionCmd::SetTodos { todos, decisions })
+            .await;
     }
     /// Set or clear the session's goal (a durable `goal_set` log entry;
     /// last one wins, and the tombstone means an achieved/cleared goal never

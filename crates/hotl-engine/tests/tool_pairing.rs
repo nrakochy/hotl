@@ -37,6 +37,8 @@ fn session(provider: Arc<dyn Provider>, initial_items: Vec<Item>) -> Session {
         hooks: None,
         initial_items,
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });

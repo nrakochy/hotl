@@ -112,6 +112,10 @@ pub struct ProjectionHead {
     /// A todo change is itself a durable `Todos` entry, so it moves
     /// `leaf`/`epoch` like any other commit.
     todos: Arc<Vec<Todo>>,
+    /// The decisions log beside them (0056 T2). Rides the head for the same
+    /// reason `todos` does — it is durable as a `Todos` entry, but it is not
+    /// a projection item and must never become one.
+    decisions: Arc<Vec<hotl_types::Decision>>,
     /// Running CONSERVATIVE-profile estimate of `items` (0033 Task 7),
     /// maintained at the two mutation sites so the pre-anchor estimate is
     /// O(1) instead of a per-char walk of the session. If a model-keyed
@@ -135,6 +139,14 @@ impl ProjectionHead {
     /// `seq` of that entry — the session-global commit order.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The plan as it stands — what the goal gate's machine leaves read.
+    pub fn plan_state(&self) -> crate::plan_state::PlanState {
+        crate::plan_state::PlanState {
+            todos: (*self.todos).clone(),
+            decisions: (*self.decisions).clone(),
+        }
     }
 
     /// The snapshot a turn task samples against, as **two channels**: the
@@ -234,6 +246,7 @@ pub(crate) fn head_channel() -> (
     tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
 ) {
     tokio::sync::watch::channel(Arc::new(ProjectionHead {
+        decisions: Arc::new(Vec::new()),
         items: Arc::new(Vec::new()),
         todos: Arc::new(Vec::new()),
         estimated: 0,
@@ -252,6 +265,7 @@ struct Head {
     /// See [`ProjectionHead::estimated`] — maintained here, published there.
     estimated: u64,
     todos: Arc<Vec<Todo>>,
+    decisions: Arc<Vec<hotl_types::Decision>>,
     leaf: Option<String>,
     epoch: u64,
     /// The session's token profile (0057 T6). The running `estimated` sum must
@@ -276,6 +290,7 @@ impl Head {
         tx: tokio::sync::watch::Sender<Arc<ProjectionHead>>,
         items: Vec<Item>,
         todos: Vec<Todo>,
+        decisions: Vec<hotl_types::Decision>,
         profile: tokens::TokenProfile,
     ) -> Self {
         let items: Vec<Arc<Item>> = items.into_iter().map(Arc::new).collect();
@@ -285,6 +300,7 @@ impl Head {
             items: Arc::new(items),
             estimated,
             todos: Arc::new(todos),
+            decisions: Arc::new(decisions),
             leaf: None,
             epoch: 0,
             profile,
@@ -301,6 +317,10 @@ impl Head {
 
     fn todos(&self) -> &Arc<Vec<Todo>> {
         &self.todos
+    }
+
+    fn decisions(&self) -> &Arc<Vec<hotl_types::Decision>> {
+        &self.decisions
     }
 
     /// The same two-channel read a turn takes off the published head, taken
@@ -346,6 +366,20 @@ impl Head {
         self.todos = Arc::new(todos);
     }
 
+    /// Append decisions, stamping each with the session clock — the model
+    /// supplies `what`/`why` and never the time.
+    fn append_decisions(&mut self, new: Vec<hotl_types::Decision>, now_ms: u64) {
+        if new.is_empty() {
+            return;
+        }
+        let mut all = (*self.decisions).clone();
+        all.extend(new.into_iter().map(|d| hotl_types::Decision {
+            when_ms: now_ms,
+            ..d
+        }));
+        self.decisions = Arc::new(all);
+    }
+
     /// Re-point the projection after a fold. The published head moves without
     /// an epoch bump: the compaction entry's own commit already advanced
     /// `leaf`/`epoch`, and this is that entry taking effect. Unobservable
@@ -364,6 +398,7 @@ impl Head {
         let _ = self.tx.send(Arc::new(ProjectionHead {
             items: Arc::clone(&self.items),
             todos: Arc::clone(&self.todos),
+            decisions: Arc::clone(&self.decisions),
             estimated: self.estimated,
             leaf: self.leaf.clone(),
             epoch: self.epoch,
@@ -630,6 +665,8 @@ pub(crate) struct SharedDeps {
     /// mid-session, so this is constant for the life of a `SharedDeps` — the
     /// guard is implemented anyway, ahead of whatever eventually bumps it.
     rules_epoch: std::sync::atomic::AtomicU32,
+    /// Where this session files its plan artifact, if anywhere (0056 T2).
+    plan_files: Option<crate::PlanFiles>,
     /// The read side of the published head (commit-protocol.md §Read
     /// invariant): a turn's sample-boundary refresh. Only a `Receiver` is
     /// shared — the `Sender` lives in [`run`]'s [`Head`], so the actor stays
@@ -729,8 +766,28 @@ impl SharedDeps {
             session_id,
             rules_epoch: std::sync::atomic::AtomicU32::new(0),
             head_rx,
+            plan_files: deps.plan_files,
         };
         (shared, deps.log)
+    }
+
+    /// Render the plan artifact for this session, if it files one. Every
+    /// failure is swallowed: a read-only data dir must not fail a
+    /// `todo_write`, and the log already holds the truth.
+    fn write_plan_artifact(&self, state: &crate::plan_state::PlanState) {
+        let Some(files) = self.plan_files.as_ref() else {
+            return;
+        };
+        let artifact = crate::plan_state::PlanArtifact::new(
+            files.project.clone(),
+            self.session_id.to_string(),
+            self.clock.now_ms(),
+            state,
+        );
+        let _ = crate::plan_state::write_artifact(&files.dir, &artifact);
+        if let Some(mirror) = files.repo_mirror.as_ref() {
+            let _ = crate::plan_state::mirror_markdown(mirror, &artifact);
+        }
     }
 
     /// A turn's read side of the published head — see the `head_rx` field
@@ -911,6 +968,7 @@ pub(crate) async fn run(
         head_tx,
         close_dangling_batches(pair_tool_results(std::mem::take(&mut deps.initial_items))),
         std::mem::take(&mut deps.initial_todos),
+        std::mem::take(&mut deps.initial_decisions),
         deps.config.token_profile,
     );
     let mut running = false;
@@ -1126,9 +1184,18 @@ pub(crate) async fn run(
                     )
                     .await;
             }
-            SessionCmd::SetTodos(new_todos) => {
+            SessionCmd::SetTodos {
+                todos: new_todos,
+                decisions: new_decisions,
+            } => {
+                // Nodes replace, decisions append: the model rewrites the
+                // whole list every call, but "why we chose this" is a fact
+                // that happened — a rewrite must not be able to erase one.
+                let now_ms = shared.clock.now_ms();
                 head.set_todos(new_todos);
+                head.append_decisions(new_decisions, now_ms);
                 let items = (**head.todos()).clone();
+                let decisions = (**head.decisions()).clone();
                 let _ = shared
                     .append(
                         &mut log,
@@ -1136,9 +1203,17 @@ pub(crate) async fn run(
                         &mut head,
                         EntryPayload::Todos {
                             items: items.clone(),
+                            decisions: decisions.clone(),
                         },
                     )
                     .await;
+                // After the durable append, never before: the artifact is a
+                // convenience view of the log, and a file that leads it would
+                // be a second source of truth for the plan.
+                shared.write_plan_artifact(&crate::plan_state::PlanState {
+                    todos: items.clone(),
+                    decisions,
+                });
                 let _ = events.send(EngineEvent::TodosChanged { items }).await;
             }
             SessionCmd::SetGoal(condition) => {
@@ -2959,6 +3034,7 @@ mod tests {
                 text: "seed".into(),
             }],
             Vec::new(),
+            Vec::new(),
             tokens::TokenProfile::CONSERVATIVE,
         );
         let mix: Vec<hotl_types::Item> = vec![
@@ -3025,6 +3101,7 @@ mod tests {
     #[test]
     fn appending_to_the_head_shares_existing_image_payloads() {
         let (tx, _rx) = tokio::sync::watch::channel(Arc::new(ProjectionHead {
+            decisions: Arc::new(Vec::new()),
             estimated: 0,
             items: Arc::new(Vec::new()),
             todos: Arc::new(Vec::new()),
@@ -3043,6 +3120,7 @@ mod tests {
                 synthetic: None,
                 images: vec![img],
             }],
+            Vec::new(),
             Vec::new(),
             hotl_context::TokenProfile::CONSERVATIVE,
         );
@@ -3363,6 +3441,8 @@ mod tests {
             hooks: None,
             initial_items: Vec::new(),
             initial_todos: Vec::new(),
+            initial_decisions: Vec::new(),
+            plan_files: None,
             initial_goal: None,
             config: crate::EngineConfig::default(),
         }
@@ -3376,6 +3456,7 @@ mod tests {
         let (head_tx, head_rx) = super::head_channel();
         let head = super::Head::new(
             head_tx,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             hotl_context::TokenProfile::CONSERVATIVE,

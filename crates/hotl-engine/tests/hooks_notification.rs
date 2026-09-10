@@ -51,6 +51,8 @@ async fn notification_hook_sees_blocked_then_done_then_idle_in_order() {
         hooks: Some(Arc::new(hooks)),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -141,6 +143,8 @@ async fn a_slow_notification_hook_never_stalls_turn_done() {
         hooks: Some(Arc::new(hooks)),
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -221,6 +225,8 @@ async fn ask_user_question_fires_a_blocked_notification() {
             hooks: Some(hooks),
             initial_items: Vec::new(),
             initial_todos: Vec::new(),
+            initial_decisions: Vec::new(),
+            plan_files: None,
             initial_goal: None,
             config,
         },

@@ -53,6 +53,8 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });
@@ -293,6 +295,8 @@ async fn cancel_during_the_backoff_ends_the_turn() {
         hooks: None,
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
         initial_goal: None,
         config,
     });

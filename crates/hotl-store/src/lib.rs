@@ -18,6 +18,7 @@
 //! warns on a newer `format_version` instead of refusing the log, enforced by
 //! `replay_warns_when_the_log_is_from_a_newer_format`.
 
+pub mod project;
 pub mod retention;
 pub mod worktree;
 
@@ -1334,6 +1335,8 @@ pub struct Replayed {
     /// wins) — same last-wins, log-only shape as `mode`/`name`. Empty = no
     /// list was ever set (a resumed session starts with none, same as fresh).
     pub todos: Vec<hotl_types::Todo>,
+    /// The decisions log carried by that same last `Todos` entry (0056 T2).
+    pub decisions: Vec<hotl_types::Decision>,
     /// The active goal condition (last `GoalSet` in the chain, child wins).
     /// A *single* Option, unlike `effort`'s double: replay never needs
     /// cleared-vs-never-set, because a cleared goal behaves identically to
@@ -1358,6 +1361,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut plan = None;
     let mut effort = None;
     let mut todos = Vec::new();
+    let mut decisions = Vec::new();
     let mut goal = None;
     let applied = apply_log(
         path,
@@ -1368,6 +1372,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut plan,
         &mut effort,
         &mut todos,
+        &mut decisions,
         &mut goal,
         None,
     )?;
@@ -1379,6 +1384,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         plan,
         effort,
         todos,
+        decisions,
         goal,
         warnings,
         tip_entry_id: applied.last_entry_id,
@@ -1493,6 +1499,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut plan = None;
     let mut effort = None;
     let mut todos = Vec::new();
+    let mut decisions = Vec::new();
     let mut goal = None;
     let mut tip_entry_id = None;
     for (depth, (path, _)) in lineage.iter().enumerate().rev() {
@@ -1510,6 +1517,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut plan,
             &mut effort,
             &mut todos,
+            &mut decisions,
             &mut goal,
             stop_after,
         )?;
@@ -1525,6 +1533,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         plan,
         effort,
         todos,
+        decisions,
         goal,
         warnings,
         tip_entry_id,
@@ -1564,6 +1573,7 @@ fn apply_log(
     plan: &mut Option<bool>,
     effort: &mut Option<Option<String>>,
     todos: &mut Vec<hotl_types::Todo>,
+    decisions: &mut Vec<hotl_types::Decision>,
     goal: &mut Option<String>,
     stop_after: Option<&str>,
 ) -> Result<Applied, String> {
@@ -1690,7 +1700,13 @@ fn apply_log(
             // projection, last one wins. The resumed actor's *starting* list
             // is seeded from this (see `SessionDeps::initial_todos`), not
             // replayed into `items`.
-            EntryPayload::Todos { items: list } => *todos = list,
+            EntryPayload::Todos {
+                items: list,
+                decisions: log,
+            } => {
+                *todos = list;
+                *decisions = log;
+            }
             // Log-only, last one wins; the tombstone's `condition: None`
             // clears, so chain/fork replay inherits child-wins for free.
             EntryPayload::GoalSet { condition, .. } => *goal = condition,
@@ -2439,6 +2455,7 @@ mod tests {
         let path = log.path().to_path_buf();
         log.append(
             &EntryPayload::Todos {
+                decisions: Vec::new(),
                 items: vec![Todo {
                     content: "first".into(),
                     status: TodoStatus::Pending,
@@ -2466,6 +2483,7 @@ mod tests {
         log.append(
             &EntryPayload::Todos {
                 items: second.clone(),
+                decisions: Vec::new(),
             },
             3,
         )

@@ -44,9 +44,20 @@ pub struct Config {
     pub concurrency: ConcurrencyCfg,
     #[serde(default)]
     pub sandbox: SandboxCfg,
+    #[serde(default)]
+    pub plan: PlanCfg,
     /// Raw document, for reserializing the domain sections to their loaders.
     #[serde(skip)]
     raw: Option<toml::Value>,
+}
+
+/// `[plan]` (0056 T2). Absent by default: the plan artifact lives in the data
+/// dir, and mirroring it into someone's repo is opt-in.
+#[derive(Debug, Default, Deserialize)]
+pub struct PlanCfg {
+    /// Directory to mirror `current.md` into as `hotl-plan.md`, relative to
+    /// the workspace unless absolute.
+    pub repo_dir: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
