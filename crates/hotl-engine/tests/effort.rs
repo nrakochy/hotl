@@ -411,3 +411,98 @@ async fn the_schedule_writes_no_effort_set_entry() {
         .count();
     assert_eq!(effort_sets, 0);
 }
+
+// ---------------------------------------------------------------------------
+// 0059 T1 + 0056: the plan's own state decides the `plan` phase.
+
+fn node(content: &str, status: hotl_types::TodoStatus) -> hotl_types::Todo {
+    hotl_types::Todo {
+        content: content.into(),
+        status,
+        ..Default::default()
+    }
+}
+
+/// Work left with nothing in progress is the planning moment: the last step
+/// landed and the next has not been chosen.
+#[tokio::test]
+async fn a_plan_between_steps_opens_the_turn_at_the_plan_rung() {
+    use hotl_types::TodoStatus::{Completed, InProgress, Pending};
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("a"),
+        ScriptedProvider::text_reply("b"),
+        ScriptedProvider::text_reply("c"),
+    ]));
+    let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+
+    // Between steps: one done, one still to do, none in progress.
+    handle
+        .set_todos(vec![node("first", Completed), node("second", Pending)])
+        .await;
+    run_one_turn(&mut handle).await;
+    // The last request of a turn, not an index into the whole run: a turn's
+    // first sample may be built twice (speculated, then rebuilt), and every
+    // request inside one turn carries one rung anyway.
+    assert_eq!(
+        provider.last_request().expect("a request").effort,
+        Some(Effort::XHigh),
+        "open work and nothing in progress is planning"
+    );
+
+    // A step in progress is implementation, plan mode off.
+    handle
+        .set_todos(vec![node("first", Completed), node("second", InProgress)])
+        .await;
+    run_one_turn(&mut handle).await;
+    assert_eq!(
+        provider.last_request().expect("a request").effort,
+        Some(Effort::High),
+        "a step in progress is implementation"
+    );
+
+    // Every node completed is finished work, not an unfinished plan.
+    handle
+        .set_todos(vec![node("first", Completed), node("second", Completed)])
+        .await;
+    run_one_turn(&mut handle).await;
+    assert_eq!(
+        provider.last_request().expect("a request").effort,
+        Some(Effort::High),
+        "an all-completed plan is finished work, not planning"
+    );
+}
+
+/// A session that never writes a plan must not sit in `plan` forever — an
+/// empty list trivially has no node in progress.
+#[tokio::test]
+async fn an_empty_plan_is_not_a_plan() {
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "ok",
+    )]));
+    let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+    run_one_turn(&mut handle).await;
+    assert_eq!(
+        provider.last_request().expect("one request").effort,
+        Some(Effort::High)
+    );
+}
+
+/// A node that failed, or turned out to need splitting, is open work — and
+/// precisely the kind worth thinking about rather than grinding at.
+#[tokio::test]
+async fn a_failed_or_oversized_node_counts_as_open_work() {
+    use hotl_types::TodoStatus::{Failed, NeedsMoreSteps};
+    for status in [Failed, NeedsMoreSteps] {
+        let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+            "ok",
+        )]));
+        let (mut handle, _dir) = session(provider.clone(), scheduled_config());
+        handle.set_todos(vec![node("stuck", status)]).await;
+        run_one_turn(&mut handle).await;
+        assert_eq!(
+            provider.last_request().expect("one request").effort,
+            Some(Effort::XHigh),
+            "{status:?} is open work"
+        );
+    }
+}

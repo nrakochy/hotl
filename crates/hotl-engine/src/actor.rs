@@ -141,6 +141,12 @@ impl ProjectionHead {
         self.epoch
     }
 
+    /// The plan's nodes, borrowed. `plan_state` clones both halves; the
+    /// effort schedule's phase check runs at every turn start and only reads.
+    pub(crate) fn nodes(&self) -> &[Todo] {
+        &self.todos
+    }
+
     /// The plan as it stands — what the goal gate's machine leaves read.
     pub fn plan_state(&self) -> crate::plan_state::PlanState {
         crate::plan_state::PlanState {
@@ -966,17 +972,38 @@ impl SharedDeps {
         self.last_batch_verified.store(verified, Ordering::Relaxed);
     }
 
-    /// Which phase the next turn opens in. Plan mode alone decides `plan`
-    /// (0056's active node is the seam this would read when it lands); a
-    /// previous batch that only verified means `verify`; else `implement`.
+    /// Which phase the next turn opens in. `plan` when plan mode is on, or
+    /// when the plan is between steps; a previous batch that only verified
+    /// means `verify`; else `implement`. Plan outranks verify deliberately —
+    /// deciding what a green test run means is planning, not verifying.
     fn turn_phase(&self) -> hotl_provider::Phase {
-        if self.effective_plan() {
+        if self.effective_plan() || self.plan_is_between_steps() {
             hotl_provider::Phase::Plan
         } else if self.last_batch_verified.load(Ordering::Relaxed) {
             hotl_provider::Phase::Verify
         } else {
             hotl_provider::Phase::Implement
         }
+    }
+
+    /// Work left, and nothing being worked on (0056 T1) — the moment the last
+    /// step landed and the next has not been chosen.
+    ///
+    /// Both guards are load-bearing. An **empty** plan is not a plan: without
+    /// the `has_open_nodes` clause every session that never calls `todo_write`
+    /// would sit in `plan` forever, since a list of nothing trivially has no
+    /// node in progress. An **all-completed** plan is finished work, not an
+    /// unfinished one. `Failed` and `NeedsMoreSteps` count as open, which is
+    /// exactly right: those are the nodes worth thinking about rather than
+    /// grinding at. A `replan` node needs no special case — while it runs it
+    /// is implementation, and when it lands the plan is between steps again.
+    fn plan_is_between_steps(&self) -> bool {
+        let head = self.head_rx.borrow();
+        let nodes = head.nodes();
+        crate::plan_state::has_open_nodes(nodes)
+            && !nodes
+                .iter()
+                .any(|n| n.status == hotl_types::TodoStatus::InProgress)
     }
 
     /// Write the schedule's rung for this turn's phase, at turn start only —
