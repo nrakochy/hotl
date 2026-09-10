@@ -365,7 +365,7 @@ async fn prompt_stream_ask_allow_done_golden() {
     );
     let rows = draw(&state);
     assert!(
-        rows.iter().any(|r| r.contains("✓ bash")),
+        rows.iter().any(|r| r.contains("→ Bash")),
         "tool card resolved"
     );
     assert!(
@@ -521,7 +521,7 @@ async fn deny_with_reason_reaches_engine() {
     // The denied card is spine-marked: a one-cell ⊘ glyph in the gutter
     // (0049 T8), the name no longer bracketed.
     assert!(
-        rows.iter().any(|r| r.contains("⊘ bash")),
+        rows.iter().any(|r| r.contains("⊘ Bash")),
         "denied tool card renders: {:#?}",
         state.transcript
     );

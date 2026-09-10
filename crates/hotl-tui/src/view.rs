@@ -19,6 +19,10 @@ use crate::app::{
 use crate::vim::Mode;
 use crate::wrap;
 
+/// A settled, successful card's glyph. Deliberately not a tick: success is
+/// the common case and should read as a quiet hand-off to the next thing.
+const SETTLED_OK_GLYPH: &str = "→";
+
 // Twin of watch-tui's WORKING_FRAMES — keep in sync.
 const WORKING_FRAMES: [&str; 16] = [
     "⠑", "⠔", "⣄", "⣠", "⡠", "⠢", "⠚", "⠜", "⠔", "⠤", "⣠", "⣄", "⢄", "⠆", "⠃", "⠑",
@@ -867,14 +871,7 @@ fn item_block<'a>(
             child_text: _,
         } => {
             let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
-            let (marker, color) = match status {
-                ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
-                    (WORKING_FRAMES[marker_frame(*ticks)], p.active)
-                }
-                ToolStatus::Done => ("✓", p.idle),
-                ToolStatus::Failed => ("✗", p.blocked),
-                ToolStatus::Denied => ("⊘", p.blocked),
-            };
+            let (marker, color) = status_glyph(status, *ticks, p);
             let (body, mut details) = split_summary(name, summary);
             if let ToolStatus::AutoAllowed { rule } = status {
                 details.push(format!("auto-allowed: {rule}"));
@@ -908,7 +905,7 @@ fn item_block<'a>(
             // Name in the status color (so it stays identifiable now the
             // marker moved to the spine); body and details both muted, so the
             // whole card reads as a second voice under the prose (0061 T3).
-            let mut spans = vec![Span::styled(name.clone(), Style::new().fg(color))];
+            let mut spans = vec![Span::styled(tool_verb(name), Style::new().fg(color))];
             if !body.is_empty() {
                 spans.push(Span::styled(format!("  {body}"), Style::new().fg(p.muted)));
             }
@@ -1447,6 +1444,37 @@ fn total_line<'a>(name: &str, n: u64, window: u64, note: &str, p: &Palette) -> L
     )
 }
 
+/// The card's verb for a tool name: title-case, past tense where the tool
+/// leaves something behind. `split_summary`, `merge_key`, settle-by-id, the
+/// ask modal and the drill-in header all keep the raw lowercase name — this
+/// is a rendering choice, never an identity one.
+fn tool_verb(name: &str) -> String {
+    match name {
+        "bash" => "Bash".into(),
+        "read" => "Read".into(),
+        "write" => "Wrote".into(),
+        "edit" => "Edited".into(),
+        "grep" => "Searched".into(),
+        "glob" => "Listed".into(),
+        "spawn" => "Agent".into(),
+        "workflow" => "Workflow".into(),
+        other => other
+            .split('_')
+            .map(title_case)
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
+/// One `_`-separated word of a tool name, title-cased.
+fn title_case(word: &str) -> String {
+    let mut c = word.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Permission summaries lead with the tool name — "bash [sandboxed:seatbelt]:
 /// cargo test", "write ./x". The card already names the tool in its bracket,
 /// so peel that prefix off and demote a bracket tag to a muted detail.
@@ -1474,13 +1502,14 @@ fn split_summary(name: &str, summary: &str) -> (String, Vec<String>) {
 }
 
 /// Marker glyph + color for a tool status; running wears the wanderer frame
-/// the card's own ticks select.
+/// the card's own ticks select. Success is quiet — an arrow in the muted role,
+/// not a tick in ink — so only failure and denial catch the eye (0061 T4).
 fn status_glyph(status: &ToolStatus, ticks: u64, p: &Palette) -> (&'static str, Color) {
     match status {
         ToolStatus::Running | ToolStatus::AutoAllowed { .. } => {
             (WORKING_FRAMES[marker_frame(ticks)], p.active)
         }
-        ToolStatus::Done => ("✓", p.idle),
+        ToolStatus::Done => (SETTLED_OK_GLYPH, p.muted),
         ToolStatus::Failed => ("✗", p.blocked),
         ToolStatus::Denied => ("⊘", p.blocked),
     }
@@ -3379,9 +3408,9 @@ mod tests {
         ];
         let rows = draw(&s);
         // Cards sit one column in from prose (0061 T3).
-        assert!(rows[0].starts_with("   ⊘ write"), "{:?}", rows[0]);
-        // Same column as its neighbour: the name starts at TEXT_COL on both.
-        assert_eq!(rows[0].find("write"), rows[1].find("read"));
+        assert!(rows[0].starts_with("   ⊘ Wrote"), "{:?}", rows[0]);
+        // Same column as its neighbour: the verb starts at TEXT_COL on both.
+        assert_eq!(rows[0].find("Wrote"), rows[1].find("Read"));
     }
 
     /// 0061 T3: a settled card's clock moves to a faint `└` row that also
@@ -3503,7 +3532,7 @@ mod tests {
             .push(tool_item("t1", "read", "app.rs", ToolStatus::Done, 0));
         let rows = draw(&s);
         let prose = rows.iter().find_map(|r| r.find('●')).expect("prose marker");
-        let card = rows.iter().find_map(|r| r.find('✓')).expect("card marker");
+        let card = rows.iter().find_map(|r| r.find('→')).expect("card marker");
         assert_eq!(card, prose + 1, "cards sit one column in: {rows:?}");
     }
 
@@ -3811,8 +3840,8 @@ mod tests {
         let rows = draw(&s);
         assert!(rows[0].starts_with("  ❯ hi"), "{:?}", rows[0]);
         assert_eq!(rows[1].trim(), "", "blank: you → harness");
-        assert!(rows[2].contains("read"), "{:?}", rows[2]);
-        assert!(rows[3].contains("bash"), "cards stack: {:?}", rows[3]);
+        assert!(rows[2].contains("Read"), "{:?}", rows[2]);
+        assert!(rows[3].contains("Bash"), "cards stack: {:?}", rows[3]);
         assert!(
             rows[4].contains("retrying"),
             "notice rides the run: {:?}",
@@ -3980,7 +4009,7 @@ mod tests {
             rows[STRIP]
         );
         assert!(
-            rows.iter().any(|r| r.contains("bash  echo hi · 2s")),
+            rows.iter().any(|r| r.contains("Bash  echo hi · 2s")),
             "card elapsed"
         );
     }
@@ -4360,7 +4389,7 @@ mod tests {
         s.transcript.push(item);
         let rows = draw(&s);
         assert!(
-            rows.iter().any(|r| r.contains("read  app.rs · ×4")),
+            rows.iter().any(|r| r.contains("Read  app.rs · ×4")),
             "the multiplier rides the settled header: {:?}",
             rows.first()
         );
@@ -4396,7 +4425,7 @@ mod tests {
         let rows = draw(&s);
         let all = rows.join("\n");
         assert!(
-            all.contains("spawn  survey · 5 calls · 0s · read read c5.rs"),
+            all.contains("Agent  survey · 5 calls · 0s · read read c5.rs"),
             "one line, count then latest call: {all}"
         );
         assert!(!all.contains("earlier"), "no tail block: {all}");
@@ -4415,7 +4444,7 @@ mod tests {
         let rows = draw(&s);
         let all = rows.join("\n");
         assert!(
-            all.contains("spawn  survey · 5 calls"),
+            all.contains("Agent  survey · 5 calls"),
             "collapsed count: {all}"
         );
         assert!(!all.contains("read c5.rs"), "no child rows: {all}");
@@ -4450,6 +4479,51 @@ mod tests {
         }
         draw_cached(&s, &mut cache);
         assert_eq!(cache.rewraps(), 5, "the settle re-wraps only the card");
+    }
+
+    /// 0061 T4: one table for every card verb. Known tools get past tense
+    /// where they leave something behind; anything else is title-cased per
+    /// `_` word rather than shouting its raw identifier.
+    #[test]
+    fn tool_verb_table() {
+        for (name, want) in [
+            ("bash", "Bash"),
+            ("read", "Read"),
+            ("write", "Wrote"),
+            ("edit", "Edited"),
+            ("grep", "Searched"),
+            ("glob", "Listed"),
+            ("spawn", "Agent"),
+            ("workflow", "Workflow"),
+            ("todo_write", "Todo Write"),
+            ("skill", "Skill"),
+        ] {
+            assert_eq!(tool_verb(name), want, "verb for {name}");
+        }
+    }
+
+    /// The card names the verb; the identity the reducer settles by is still
+    /// the raw name, which `split_summary` keeps peeling.
+    #[test]
+    fn cards_wear_title_cased_verbs() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![
+            tool_item("t1", "write", "write ./x", ToolStatus::Done, 0),
+            tool_item("t2", "grep", "grep TODO", ToolStatus::Done, 0),
+        ];
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(all.contains("Wrote  ./x"), "{all}");
+        assert!(all.contains("Searched  TODO"), "{all}");
+    }
+
+    /// Success is quiet, failure is loud: the settled-ok glyph takes the muted
+    /// role, a failure the blocked one.
+    #[test]
+    fn a_settled_ok_glyph_is_quiet_and_a_failure_is_loud() {
+        let p = Palette::default();
+        assert_eq!(status_glyph(&ToolStatus::Done, 0, &p), ("→", p.muted));
+        assert_eq!(status_glyph(&ToolStatus::Failed, 0, &p), ("✗", p.blocked));
+        assert_eq!(status_glyph(&ToolStatus::Denied, 0, &p), ("⊘", p.blocked));
     }
 
     #[test]
@@ -4488,7 +4562,7 @@ mod tests {
         // Comfortable gutter (2) + the ✓ spine glyph; the name is no longer
         // bracketed, and the duplicate leading "bash" is peeled off the body.
         assert!(
-            rows[0].starts_with("   ✓ bash  echo hi · sandboxed:seatbelt"),
+            rows[0].starts_with("   → Bash  echo hi · sandboxed:seatbelt"),
             "spine card: {}",
             rows[0]
         );
