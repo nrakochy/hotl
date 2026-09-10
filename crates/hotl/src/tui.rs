@@ -475,7 +475,7 @@ async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, St
 fn defers_draw(msg: &Msg) -> bool {
     matches!(msg, Msg::Update(v)
         if matches!(v.get("type").and_then(Value::as_str),
-            Some("text_delta" | "thinking_delta" | "child_tool")))
+            Some("text_delta" | "thinking_delta" | "child_tool" | "tool_progress")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1775,6 +1775,20 @@ mod tests {
         } else {
             assert!(finished_at.is_none());
         }
+    }
+
+    /// 0061 T13: progress rides the animation tick like the other deltas —
+    /// four frames a second must not each force a draw.
+    #[test]
+    fn tool_progress_defers_its_draw_to_the_tick() {
+        assert!(defers_draw(&Msg::Update(json!({
+            "type": "tool_progress",
+            "id": "t1",
+            "name": "bash",
+            "tail": "Compiling",
+            "lines": 12,
+            "bytes": 480
+        }))));
     }
 
     /// Every other message passes through untouched.

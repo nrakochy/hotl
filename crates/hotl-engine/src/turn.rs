@@ -2043,6 +2043,21 @@ impl Turn {
             summary,
         })
         .await;
+        // The sink captures the id `ToolStart` just carried, so every frame is
+        // paired with its call by construction rather than by lookup. Lossy:
+        // a full channel drops the frame — `ToolDone` is the truth.
+        let sink: hotl_tools::ProgressSink = {
+            let (events, id, name) = (self.events.clone(), tu.id.clone(), tu.name.clone());
+            std::sync::Arc::new(move |p: hotl_tools::Progress| {
+                let _ = events.try_send(EngineEvent::ToolProgress {
+                    id: id.clone(),
+                    name: name.clone(),
+                    tail: p.tail,
+                    lines: p.lines,
+                    bytes: p.bytes,
+                });
+            })
+        };
         let Some(tool) = self.shared.registry.get(&tu.name) else {
             // Gate checked; defensive. Chargeable for the same reason the gate's
             // own `unknown_tool` is: a bad name is a model mistake it can fix.
@@ -2056,11 +2071,14 @@ impl Turn {
         // no other. A later call in the same turn re-enters with `false`.
         // 0039: the call id rides the same shape, so `spawn` can stamp
         // forwarded child events with its own card's id.
-        let mut outcome = hotl_tools::CURRENT_CALL_ID
+        let mut outcome = hotl_tools::PROGRESS_SINK
             .scope(
-                tu.id.clone(),
-                hotl_tools::sandbox::SECRET_READS
-                    .scope(secret_reads, tool.run(input, self.cancel.clone())),
+                sink,
+                hotl_tools::CURRENT_CALL_ID.scope(
+                    tu.id.clone(),
+                    hotl_tools::sandbox::SECRET_READS
+                        .scope(secret_reads, tool.run(input, self.cancel.clone())),
+                ),
             )
             .await;
         // PostToolUse: a node-style proposal may replace a successful result.

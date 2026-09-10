@@ -289,6 +289,10 @@ fn update_line(update: &Value) -> Option<String> {
                     return None;
                 }
             }
+            // 0061 decision 15: plain `attach` is a line printer, so a frame
+            // every 250 ms would be one line per output line — spam, not
+            // liveness. The console renders these on the card instead.
+            "tool_progress" => return None,
             // Mirrors `tool_done`'s success exemption: a child that worked
             // needs no line (0039).
             "child_tool" => match update.get("ok").and_then(Value::as_bool) {
@@ -401,6 +405,13 @@ mod tests {
                 lines: 3,
                 bytes: 5,
             },
+            EngineEvent::ToolProgress {
+                id: "t1".into(),
+                name: "bash".into(),
+                tail: "Compiling hotl-engine".into(),
+                lines: 12,
+                bytes: 480,
+            },
             EngineEvent::ToolDenied {
                 id: "t2".into(),
                 name: "write".into(),
@@ -474,7 +485,9 @@ mod tests {
         // The two deliberate `None`s, each for a stated reason: `text_delta`
         // is the answer itself (streamed to stdout unadorned), and a tool that
         // *succeeded* needs no line — its output already spoke.
-        let exempt = ["text_delta", "tool_done"];
+        // `tool_progress` is exempt by decision 15: a tail row is a console
+        // affordance, and a line printer cannot show one without spamming.
+        let exempt = ["text_delta", "tool_done", "tool_progress"];
         for e in every_streamable_event() {
             let Some(frame) = crate::wire::update_frame(&e) else {
                 continue;

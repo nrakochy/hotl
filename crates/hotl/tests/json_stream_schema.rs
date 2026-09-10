@@ -33,6 +33,13 @@ fn every_frame_is_tagged_and_versioned() {
             lines: 3,
             bytes: 5,
         },
+        EngineEvent::ToolProgress {
+            id: "t1".into(),
+            name: "bash".into(),
+            tail: "Compiling hotl-engine".into(),
+            lines: 12,
+            bytes: 480,
+        },
         EngineEvent::ToolDenied {
             id: "t2".into(),
             name: "write".into(),
@@ -389,6 +396,26 @@ fn tool_done_carries_result_line_and_byte_counts() {
     .expect("tool_done is a stream frame");
     assert_eq!(empty["lines"], 0);
     assert_eq!(empty["bytes"], 0);
+}
+
+/// 0061 T13: liveness for a running tool. Additive and never persisted, like
+/// `child_tool` — a client that ignores it sees exactly today's stream.
+#[test]
+fn tool_progress_is_a_tagged_frame_with_tail_and_counts() {
+    let f = wire::update_frame(&EngineEvent::ToolProgress {
+        id: "t1".into(),
+        name: "bash".into(),
+        tail: "Compiling hotl-engine".into(),
+        lines: 12,
+        bytes: 480,
+    })
+    .expect("tool_progress is a stream frame");
+    assert_eq!(f["type"], "tool_progress");
+    assert_eq!(f["id"], "t1");
+    assert_eq!(f["name"], "bash");
+    assert_eq!(f["tail"], "Compiling hotl-engine");
+    assert_eq!(f["lines"], 12);
+    assert_eq!(f["bytes"], 480);
 }
 
 /// 0039 D1: `child_tool` frames route by `parent_id`, carry an explicit

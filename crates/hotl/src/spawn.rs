@@ -927,6 +927,9 @@ pub(crate) async fn drain_child(
                     }
                     forward_child_tool(&forward, id, name, String::new(), Some(ok)).await;
                 }
+                // No `ToolProgress` arm: a child's bash tail is dropped by
+                // the catch-all below (0061 decision 3) — the parent's agent
+                // block has no row for it.
                 Some(EngineEvent::ToolDenied { id, name }) => {
                     // Settled-failed in one frame — a denied child never got
                     // a start.

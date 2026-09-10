@@ -2686,6 +2686,8 @@ impl Surface {
                     eprintln!("  (tool error — fed back to the model)");
                 }
             }
+            // Liveness for an attached surface only; `-p` stays byte-identical.
+            EngineEvent::ToolProgress { .. } => {}
             EngineEvent::ToolDenied { .. } => eprintln!("  (denied)"),
             EngineEvent::ToolAutoAllowed { name, rule, .. } => {
                 eprintln!("  (auto-allowed {name} by rule: {rule})");

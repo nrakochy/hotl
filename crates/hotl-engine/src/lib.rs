@@ -426,6 +426,18 @@ pub enum EngineEvent {
         lines: u64,
         bytes: u64,
     },
+    /// A running tool's newest output line and its raw counts (0061 T13).
+    /// Never a log entry (the `ChildTool` precedent): it is a view of work in
+    /// flight, and `ToolDone` is the record. Lossy by design — sent with
+    /// `try_send`, so a full channel drops a frame rather than parking the
+    /// turn.
+    ToolProgress {
+        id: String,
+        name: String,
+        tail: String,
+        lines: u64,
+        bytes: u64,
+    },
     ToolDenied {
         id: String,
         name: String,
@@ -594,6 +606,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::ThinkingDelta(_) => write!(f, "ThinkingDelta"),
             Self::ToolStart { name, .. } => write!(f, "ToolStart({name})"),
             Self::ToolDone { name, ok, .. } => write!(f, "ToolDone({name},{ok})"),
+            Self::ToolProgress { name, lines, .. } => write!(f, "ToolProgress({name},{lines})"),
             Self::ToolDenied { name, .. } => write!(f, "ToolDenied({name})"),
             Self::ToolAutoAllowed { name, rule, .. } => {
                 write!(f, "ToolAutoAllowed({name},{rule})")
