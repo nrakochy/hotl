@@ -157,6 +157,12 @@ semver promise of their own.
 
 ### Fixed
 
+- **A `/goal` loop that folds or clears no longer under-reports its own
+  spend.** The compaction summarizer's tokens, the segment a respawn ended,
+  and a clear's abandoned digest now reach `GoalState::spent`, so the progress
+  line and `goal_verdict.usage` match the turn's reported total. The session
+  cost cap is unchanged — its meter still reads the turn's own samples.
+
 - **A sub-agent could hang forever** (plan 0058). Two clocks bound one now, and
   neither discards an answer: a silent child ends `unverifiable`; a child that
   reported and then hung is reaped and its result kept. A child out of turns
