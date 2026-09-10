@@ -1188,6 +1188,7 @@ dependencies = [
  "hotl-provider",
  "hotl-provider-anthropic",
  "hotl-provider-openai-responses",
+ "hotl-retrieval",
  "hotl-store",
  "hotl-tools",
  "hotl-types",

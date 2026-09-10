@@ -22,6 +22,8 @@ hotl-types = { path = "../hotl-types", version = "0.25.0" }
 hotl-platform = { path = "../hotl-platform", version = "0.25.0" }
 hotl-provider = { path = "../hotl-provider", version = "0.25.0" }
 hotl-tools = { path = "../hotl-tools", version = "0.25.0", default-features = false }
+# The roster scenario prices the two per-session tools the binary registers.
+hotl-retrieval = { path = "../hotl-retrieval", version = "0.25.0" }
 hotl-store = { path = "../hotl-store", version = "0.25.0" }
 hotl-engine = { path = "../hotl-engine", version = "0.25.0", default-features = false }
 # The `wire` module states its claims over *provider-serialized* request bytes,

@@ -803,6 +803,15 @@ impl SharedDeps {
         }
     }
 
+    /// The session's plan as markdown, for the compaction digest (0057's
+    /// COPY VERBATIM list names the plan's DECISIONS, and the model cannot
+    /// copy what it was not shown). Read off the published head, so it is the
+    /// plan as it stands at the fold. `None` when there is no plan yet.
+    pub(crate) fn plan_markdown(&self) -> Option<String> {
+        let state = self.head_rx.borrow().plan_state();
+        (!state.is_empty()).then(|| state.markdown())
+    }
+
     /// The human-readable half of the artifact, for the `present_plan` reply
     /// and the surfaces' card. `None` when this session files none.
     pub(crate) fn plan_artifact_path(&self) -> Option<String> {
@@ -2700,9 +2709,10 @@ pub(crate) async fn summarize(
         max_tokens: SUMMARIZE_MAX_TOKENS,
         system: compaction::SUMMARIZE_SYSTEM.into(),
         items: Arc::new(vec![Arc::new(Item::User {
-            // `None`: the plan artifact (0056) does not exist yet. When it
-            // does, its DECISIONS are on the digest's COPY VERBATIM list.
-            text: compaction::summarize_prompt(folded, None),
+            // The plan rides along (0056 T2): its DECISIONS are on the
+            // digest's COPY VERBATIM list, and the model cannot copy what it
+            // was not shown.
+            text: compaction::summarize_prompt(folded, shared.plan_markdown().as_deref()),
             synthetic: None,
             images: Vec::new(),
         })]),

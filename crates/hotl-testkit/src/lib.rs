@@ -261,15 +261,20 @@ impl Harness {
         config: EngineConfig,
         rules: Rules,
     ) -> Self {
-        Self::build_full(
-            scripts,
-            config,
-            Vec::new(),
-            None,
-            Registry::builtin(),
-            rules,
-            false,
-        )
+        Self::with_rules_and_registry(scripts, config, rules, Registry::builtin())
+    }
+
+    /// Rules *and* a custom registry. The per-session tools (`recall`,
+    /// `present_plan`) are registered by the binary, not by
+    /// `Registry::builtin`, so a roster scenario that means to price them has
+    /// to hand them in.
+    pub fn with_rules_and_registry(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        rules: Rules,
+        registry: Registry,
+    ) -> Self {
+        Self::build_full(scripts, config, Vec::new(), None, registry, rules, false)
     }
 
     fn build_with(

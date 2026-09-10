@@ -19,6 +19,35 @@ pub struct PlanState {
     pub decisions: Vec<Decision>,
 }
 
+impl PlanState {
+    /// Is there anything to render? An empty plan is not a plan.
+    pub fn is_empty(&self) -> bool {
+        self.todos.is_empty() && self.decisions.is_empty()
+    }
+
+    /// The human half: the same marks the model reads, plus the decisions.
+    /// One renderer — the artifact's `current.md`, the repo mirror and the
+    /// compaction digest's plan block are all this text.
+    pub fn markdown(&self) -> String {
+        let mut s = String::from("# Plan\n\n");
+        if let Some(hotl_types::Item::User { text, .. }) =
+            hotl_tools::todo::render_reminder(&self.todos)
+        {
+            s.push_str(&text);
+            s.push('\n');
+        } else {
+            s.push_str("(no open steps)\n");
+        }
+        if !self.decisions.is_empty() {
+            s.push_str("\n## Decisions\n\n");
+            for d in &self.decisions {
+                s.push_str(&format!("- {} — {}\n", d.what, d.why));
+            }
+        }
+        s
+    }
+}
+
 /// The on-disk shape. `version` is its own number, independent of
 /// `FORMAT_VERSION`: this file is not a session log and is not replayed —
 /// a reader that does not know a version simply ignores the file.
@@ -50,24 +79,13 @@ impl PlanArtifact {
         }
     }
 
-    /// The human half: the same marks the model reads, plus the decisions.
+    /// The human half, via the one renderer [`PlanState::markdown`].
     pub fn markdown(&self) -> String {
-        let mut s = String::from("# Plan\n\n");
-        if let Some(hotl_types::Item::User { text, .. }) =
-            hotl_tools::todo::render_reminder(&self.nodes)
-        {
-            s.push_str(&text);
-            s.push('\n');
-        } else {
-            s.push_str("(no open steps)\n");
+        PlanState {
+            todos: self.nodes.clone(),
+            decisions: self.decisions.clone(),
         }
-        if !self.decisions.is_empty() {
-            s.push_str("\n## Decisions\n\n");
-            for d in &self.decisions {
-                s.push_str(&format!("- {} — {}\n", d.what, d.why));
-            }
-        }
-        s
+        .markdown()
     }
 }
 

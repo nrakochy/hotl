@@ -2970,7 +2970,7 @@ fn unfinished_todos<I: std::borrow::Borrow<Item>>(tail: &[I]) -> bool {
             text,
             synthetic: Some(SyntheticReason::Todos),
             ..
-        }) if text.contains("[ ]") || text.contains("[~]")
+        }) if text.contains("[ ]") || text.contains("[~]") || text.contains("[?]")
     )
 }
 
@@ -3622,6 +3622,15 @@ mod tests {
         assert!(unfinished_todos(&[todos_item("<todos>\n[ ] a\n</todos>")]));
         assert!(unfinished_todos(&[todos_item("<todos>\n[~] a\n</todos>")]));
         assert!(!unfinished_todos(&[todos_item("<todos>\n[x] a\n</todos>")]));
+        // 0056 T1's two new marks. `needs_more_steps` IS open work — the
+        // model said the step needs splitting, and splitting it is the next
+        // action. `failed` is not: it was attempted and reported, and nudging
+        // the model back at a step it just said did not work is how a gate
+        // becomes a loop.
+        assert!(unfinished_todos(&[todos_item("<todos>\n[?] a\n</todos>")]));
+        assert!(!unfinished_todos(&[todos_item(
+            "<todos failed=\"1\">\n[!] a\n</todos>"
+        )]));
     }
 
     // --- Task 8 (S2a PreparedPayload) --------------------------------

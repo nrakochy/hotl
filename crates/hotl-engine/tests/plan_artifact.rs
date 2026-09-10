@@ -244,3 +244,96 @@ fn walkdir(root: &Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+/// 0057's digest puts "every line of the plan's DECISIONS" on its COPY
+/// VERBATIM list, and the model cannot copy what it was not shown. The seam
+/// 0057 left (`summarize_prompt`'s `plan_md`) reads this plan's state, so a
+/// fold carries the plan and its decisions into the summarize call.
+#[tokio::test]
+async fn a_fold_shows_the_summarizer_the_plan_and_its_decisions() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = EngineConfig {
+        model: "test-model".into(),
+        // Small enough that the second prompt folds; the cheap rung is off so
+        // the fold is what actually happens.
+        context_window: 2_000,
+        keep_results_turns: 0,
+        ..EngineConfig::default()
+    };
+    let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("one"),
+        ScriptedProvider::text_reply("DIGEST"),
+        ScriptedProvider::text_reply("two"),
+    ]));
+    let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
+        provider: provider.clone(),
+        registry: Arc::new(Registry::builtin()),
+        rules: Arc::new(Rules::default()),
+        sandbox_enforced: false,
+        clock: Arc::new(SystemClock),
+        log,
+        system: "sys".into(),
+        cwd: dir.path().to_path_buf(),
+        hooks: None,
+        // A projection already past the window, so the very next prompt
+        // folds rather than needing a dozen turns to grow into one.
+        initial_items: vec![
+            hotl_types::Item::User {
+                text: "background ".repeat(4_000),
+                synthetic: None,
+                images: Vec::new(),
+            },
+            hotl_types::Item::Assistant {
+                blocks: vec![serde_json::json!({"type": "text", "text": "noted"})],
+            },
+        ],
+        initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
+        initial_goal: None,
+        config,
+    });
+    handle
+        .set_plan_nodes(
+            vec![todo("wire the gate", TodoStatus::InProgress)],
+            vec![decision("kept the ULID", "a hash loses ordering")],
+        )
+        .await;
+    await_todos(&mut handle).await;
+    handle.prompt("first".into()).await;
+    drain_turn(&mut handle).await;
+
+    let summarize = provider
+        .requests()
+        .into_iter()
+        .find(|r| {
+            r.system
+                .contains("You compress an agent-session transcript")
+        })
+        .expect("the fold ran a summarize call");
+    let text = match summarize.items[0].as_ref() {
+        hotl_types::Item::User { text, .. } => text.clone(),
+        other => panic!("the summarize prompt is a user item: {other:?}"),
+    };
+    assert!(text.contains("The session's plan:"), "{text}");
+    assert!(text.contains("wire the gate"), "{text}");
+    assert!(
+        text.contains("kept the ULID — a hash loses ordering"),
+        "the decisions log must reach the digest verbatim: {text}"
+    );
+}
+
+/// Drain to the next `TurnDone`, answering nothing.
+async fn drain_turn(handle: &mut SessionHandle) {
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
+        if let EngineEvent::TurnDone { .. } = ev {
+            return;
+        }
+    }
+}
