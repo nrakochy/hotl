@@ -118,27 +118,86 @@ fn preserved_prefix_len<I: std::borrow::Borrow<Item>>(items: &[I]) -> usize {
 }
 
 pub const SUMMARIZE_SYSTEM: &str = "\
-You compress an agent-session transcript into a working digest. Output only \
-the digest, structured exactly as:\n\
+You compress an agent-session transcript into a working digest that replaces \
+it. Two rules decide what happens to each thing you find.\n\
+\n\
+COPY VERBATIM — reproduce the original words, in quotes where they are the \
+user's:\n\
+- every correction or constraint the user stated, especially anything spelled \
+MUST, MUST NOT, never, always, or only\n\
+- every line of the plan's DECISIONS, if a plan is included below\n\
+- every validation result that is still open (a failing test, an unfixed \
+error, an unanswered question)\n\
+- every path that was created, modified or deleted\n\
+\n\
+SUMMARIZE — keep the finding, drop the bulk:\n\
+- tool output and file contents\n\
+- approaches that were tried and abandoned, and why\n\
+\n\
+Output only the digest, structured exactly as:\n\
 GOAL: what the user is trying to accomplish\n\
+CONSTRAINTS: the user's own words, quoted, one per line\n\
 STATE: what has been done and what is true now\n\
 DECISIONS: choices made and their reasons\n\
 FILES: files touched and how\n\
 NEXT: what remains\n\
-Be specific (paths, names, values). Omit pleasantries and tool mechanics.";
+Be specific (paths, names, values). Omit pleasantries and tool mechanics. \
+A section with nothing in it gets the word none, never an invention.";
 
-/// Render the folded items as a plain transcript for the summarize call.
+/// Bytes of a tool result the summarizer reads for the newest
+/// [`RECENT_RESULTS`] results — the ones whose detail is still load-bearing.
+pub const RESULT_CLIP_RECENT: usize = 2048;
+/// Bytes for every older result: enough for the gist, and no more.
+pub const RESULT_CLIP: usize = 600;
+/// How many trailing results count as recent.
+pub const RECENT_RESULTS: usize = 8;
+
+/// Render the folded items as a plain transcript for the summarize call,
+/// with the plan artifact (0056) appended when the session has one — its
+/// DECISIONS are on the COPY VERBATIM list, and the model cannot copy what
+/// it was not shown.
+///
 /// Tool results are clipped per-item — the digest needs their gist, and the
-/// summarize call must stay far smaller than the window being compacted.
-pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(folded: &[I]) -> String {
-    format!("Transcript to compress:\n\n{}", render_transcript(folded))
+/// summarize call must stay far smaller than the window being compacted —
+/// but the newest [`RECENT_RESULTS`] get [`RESULT_CLIP_RECENT`]: the fold
+/// happens *now*, so the work in flight is the work whose detail still
+/// matters.
+pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(
+    folded: &[I],
+    plan_md: Option<&str>,
+) -> String {
+    let mut out = format!(
+        "Transcript to compress:\n\n{}",
+        render_transcript_clipped(folded, RECENT_RESULTS)
+    );
+    if let Some(plan) = plan_md.map(str::trim).filter(|p| !p.is_empty()) {
+        out.push_str(&format!("\n\nThe session's plan:\n\n{plan}\n"));
+    }
+    out
 }
 
 /// The plain-text transcript both small-model calls read (the compaction
 /// summarizer and the goal evaluator): tool results clipped per-item, images
 /// text-only — the call must stay far smaller than the window it reads.
+///
+/// The goal evaluator judges one condition against recent history and never
+/// needs the roomier recent clip, so it takes the flat version.
 pub(crate) fn render_transcript<I: std::borrow::Borrow<Item>>(items: &[I]) -> String {
-    const RESULT_CLIP: usize = 600;
+    render_transcript_clipped(items, 0)
+}
+
+/// `recent` names how many *trailing* tool results get [`RESULT_CLIP_RECENT`]
+/// instead of [`RESULT_CLIP`]; `0` clips every result the same.
+fn render_transcript_clipped<I: std::borrow::Borrow<Item>>(items: &[I], recent: usize) -> String {
+    let total: usize = items
+        .iter()
+        .map(|i| match i.borrow() {
+            Item::ToolResults { results } => results.len(),
+            _ => 0,
+        })
+        .sum();
+    let recent_from = total.saturating_sub(recent);
+    let mut seen = 0usize;
     let mut out = String::new();
     for item in items {
         match item.borrow() {
@@ -164,7 +223,13 @@ pub(crate) fn render_transcript<I: std::borrow::Borrow<Item>>(items: &[I]) -> St
             }
             Item::ToolResults { results } => {
                 for r in results {
-                    let clipped = clip(&r.content, RESULT_CLIP);
+                    let max = if seen >= recent_from {
+                        RESULT_CLIP_RECENT
+                    } else {
+                        RESULT_CLIP
+                    };
+                    seen += 1;
+                    let clipped = clip(&r.content, max);
                     out.push_str(&format!("[tool result] {clipped}\n"));
                 }
             }
@@ -190,7 +255,8 @@ pub fn digest_item(summary: &str) -> Item {
         text: format!(
             "<compaction-summary>\n{summary}\n</compaction-summary>\n\
              Earlier conversation was compacted into the summary above; \
-             the messages that follow it are verbatim."
+             the messages that follow it are verbatim; the folded span is \
+             retrievable with recall (backend session-log)."
         ),
         synthetic: Some(SyntheticReason::CompactionSummary),
         images: Vec::new(),
@@ -239,7 +305,7 @@ mod tests {
                 data: "QkFTRTY0UEFZTE9BRA==".repeat(100).into(),
             }],
         }];
-        let prompt = summarize_prompt(&items);
+        let prompt = summarize_prompt(&items, None);
         assert!(prompt.contains("[user] look at [Image #1] please"));
         assert!(
             !prompt.contains("QkFTRTY0"),
@@ -421,9 +487,49 @@ mod tests {
 
     #[test]
     fn summarize_prompt_clips_results() {
-        let folded = vec![user("goal"), results(&"z".repeat(5000))];
-        let prompt = summarize_prompt(&folded);
-        assert!(prompt.len() < 2000);
+        // Ten results: the oldest are clipped hard, so the whole prompt stays
+        // far under what an unclipped pair of 5KB results would cost.
+        let mut folded = vec![user("goal")];
+        folded.extend((0..10).map(|_| results(&"z".repeat(5_000))));
+        let prompt = summarize_prompt(&folded, None);
+        assert!(prompt.len() < 20_000, "{}", prompt.len());
         assert!(prompt.contains("[user] goal"));
+    }
+
+    #[test]
+    fn summarize_prompt_clips_recent_results_at_2048_and_older_at_600() {
+        // Twelve results, each distinct and oversized: the last 8 keep 2048
+        // bytes, the first 4 keep 600.
+        let mut folded = vec![user("goal")];
+        for n in 0..12 {
+            folded.push(results(&format!("R{n}:{}", "z".repeat(5_000))));
+        }
+        let prompt = summarize_prompt(&folded, None);
+        let lines: Vec<&str> = prompt
+            .lines()
+            .filter(|l| l.starts_with("[tool result] "))
+            .collect();
+        assert_eq!(lines.len(), 12);
+        let body = |l: &str| l.trim_start_matches("[tool result] ").len();
+        for (n, line) in lines.iter().enumerate() {
+            let expected = if n < 4 {
+                RESULT_CLIP
+            } else {
+                RESULT_CLIP_RECENT
+            };
+            assert_eq!(body(line), expected, "result {n}: {}", &line[..40]);
+        }
+    }
+
+    #[test]
+    fn prompt_carries_the_plan_artifact() {
+        let folded = vec![user("goal")];
+        let plan = "# Plan\n\nDECISIONS\n- keep the ULID, not a hash\n";
+        let prompt = summarize_prompt(&folded, Some(plan));
+        assert!(prompt.contains("keep the ULID, not a hash"), "{prompt}");
+        assert!(prompt.contains("The session's plan:"), "{prompt}");
+        // No plan, and an empty one, both leave the prompt alone.
+        assert!(!summarize_prompt(&folded, None).contains("The session's plan"));
+        assert!(!summarize_prompt(&folded, Some("  \n")).contains("The session's plan"));
     }
 }

@@ -361,6 +361,13 @@ pub enum EntryPayload {
         /// reconstructs the same projection the live fold produced.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pinned: Vec<String>,
+        /// First and last **log entry id** of the span this digest was
+        /// computed from (0057 T4) — the coordinate `recall`'s session-log
+        /// backend reports hits in, so the digest's trailer can honestly say
+        /// the folded span is still retrievable. `None` on entries written
+        /// before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_range: Option<(String, String)>,
     },
     /// Re-point the projection to its first `keep_items` items — the
     /// `branch_move` of the commit-protocol vocabulary, expressed against

@@ -253,6 +253,14 @@ struct Head {
     todos: Arc<Vec<Todo>>,
     leaf: Option<String>,
     epoch: u64,
+    /// First entry id this head ever applied, and the id of the newest
+    /// `Compaction` entry — together they bound the log span a fold's digest
+    /// was computed from (`EntryPayload::Compaction::source_range`, 0057 T4).
+    /// Two ids rather than a per-item id vector: the projection carries no
+    /// entry ids, and putting one on every item would put a `String` clone on
+    /// the commit hot path 0033 exists to keep cheap.
+    first_entry: Option<String>,
+    last_fold: Option<String>,
 }
 
 impl Head {
@@ -273,6 +281,8 @@ impl Head {
             todos: Arc::new(todos),
             leaf: None,
             epoch: 0,
+            first_entry: None,
+            last_fold: None,
         };
         head.publish();
         head
@@ -308,8 +318,21 @@ impl Head {
 
     /// Record the durable leaf and epoch an acked unit advanced the head to.
     fn advance(&mut self, leaf: String, seq: u64) {
+        if self.first_entry.is_none() {
+            self.first_entry = Some(leaf.clone());
+        }
         self.leaf = Some(leaf);
         self.epoch = seq;
+    }
+
+    /// The log span a fold about to run covers: from the entry after the last
+    /// fold (or this head's first entry) to the newest entry applied.
+    fn fold_span(&self) -> Option<(String, String)> {
+        let start = self
+            .last_fold
+            .clone()
+            .or_else(|| self.first_entry.clone())?;
+        Some((start, self.leaf.clone()?))
     }
 
     fn set_todos(&mut self, todos: Vec<Todo>) {
@@ -2317,10 +2340,12 @@ async fn compact(
                     kept_from: spec.kept_from,
                     degraded: false,
                     pinned: pins.clone(),
+                    source_range: head.fold_span(),
                 };
                 if !shared.append(log, pipeline, head, payload).await {
                     return Err("session log is sealed".into());
                 }
+                head.last_fold = head.leaf.clone();
                 head.repoint(compaction::apply(head.items(), &plan, &digest, &pins));
                 post_compact(shared, &spec.text).await;
                 return Ok((false, spec_usage));
@@ -2362,10 +2387,12 @@ async fn compact(
         kept_from: plan.kept_from,
         degraded,
         pinned: pins.clone(),
+        source_range: head.fold_span(),
     };
     if !shared.append(log, pipeline, head, payload).await {
         return Err("session log is sealed".into());
     }
+    head.last_fold = head.leaf.clone();
     head.repoint(compaction::apply(head.items(), &plan, &digest, &pins));
     post_compact(shared, &text).await;
     Ok((degraded, fold_usage))
@@ -2449,7 +2476,9 @@ pub(crate) async fn summarize(
         max_tokens: SUMMARIZE_MAX_TOKENS,
         system: compaction::SUMMARIZE_SYSTEM.into(),
         items: Arc::new(vec![Arc::new(Item::User {
-            text: compaction::summarize_prompt(folded),
+            // `None`: the plan artifact (0056) does not exist yet. When it
+            // does, its DECISIONS are on the digest's COPY VERBATIM list.
+            text: compaction::summarize_prompt(folded, None),
             synthetic: None,
             images: Vec::new(),
         })]),

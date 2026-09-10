@@ -2046,6 +2046,7 @@ mod tests {
                 kept_from: 2,
                 degraded: false,
                 pinned: Vec::new(),
+                source_range: None,
             },
             3,
         )
@@ -3382,6 +3383,7 @@ mod tests {
                     kept_from: 3,
                     degraded: false,
                     pinned: Vec::new(),
+                    source_range: None,
                 },
                 11,
             )
