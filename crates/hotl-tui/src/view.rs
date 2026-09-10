@@ -2167,14 +2167,21 @@ fn render_strip(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
     // Three zones on one row (0049 T1): the snake, the left text, and the
     // chip cluster at the right edge. Width runs out by rank — fold, then
     // drop, then elide the text — so a chip is never painted over a word.
-    let (left, chips) = fit_strip(
+    let (segs, chips) = fit_strip(
         anim::strip_segments(state),
         strip_chips(state, p),
         anim::WIDTH,
         area.width as usize,
     );
-    if !left.is_empty() {
-        spans.push(Span::raw(format!(" {left}")));
+    // One span per segment: a `Blocked` one is painted loud while the rest
+    // take the paragraph's own style (0061 T19).
+    for (i, seg) in segs.iter().enumerate() {
+        let lead = if i == 0 { " " } else { " · " };
+        let text = format!("{lead}{}", seg.text);
+        spans.push(match seg.tone {
+            anim::Tone::Blocked => Span::styled(text, Style::new().fg(p.blocked).bold()),
+            anim::Tone::Plain => Span::raw(text),
+        });
     }
     frame.render_widget(Paragraph::new(Line::from(spans)).style(style), area);
     let mut x = area.right();
@@ -2305,19 +2312,16 @@ fn mode_chip_style(state: &State, p: &Palette) -> Style {
 /// Fold, then drop, by rank until the left text and the chips fit `width`
 /// (each chip carries its own cell of padding, so no further gap is
 /// reserved); as a last resort elide the left text at a ` · ` boundary.
-/// Returns (left text, surviving chips).
+/// Returns (surviving segments, surviving chips) — segments rather than one
+/// string so the view can paint a `Blocked` one loud (0061 T19); their joined
+/// text is exactly what the old string was.
 fn fit_strip(
     mut segs: Vec<anim::Segment>,
     mut chips: Vec<Chip>,
     snake_w: usize,
     width: usize,
-) -> (String, Vec<Chip>) {
-    let join = |segs: &[anim::Segment]| {
-        segs.iter()
-            .map(|s| s.text.as_str())
-            .collect::<Vec<_>>()
-            .join(" · ")
-    };
+) -> (Vec<anim::Segment>, Vec<Chip>) {
+    let join = anim::join;
     let chips_w = |chips: &[Chip]| chips.iter().map(|c| c.text.chars().count()).sum::<usize>();
     let fits = |segs: &[anim::Segment], chips: &[Chip]| {
         snake_w + 1 + join(segs).chars().count() + chips_w(chips) <= width
@@ -2351,12 +2355,44 @@ fn fit_strip(
             _ => break,
         }
     }
-    let mut left = join(&segs);
+    // The elision keeps whole segments where it can and cuts the last one
+    // hard, so the joined text is exactly what `elide_at_separator` would
+    // have produced from the old single string.
     let room = width.saturating_sub(snake_w + 1 + chips_w(&chips));
-    if left.chars().count() > room {
-        left = elide_at_separator(&left, room);
+    let full = join(&segs);
+    if full.chars().count() > room {
+        let want: Vec<char> = elide_at_separator(&full, room).chars().collect();
+        let mut out: Vec<anim::Segment> = Vec::new();
+        let mut used = 0usize;
+        for mut seg in segs {
+            let sep = if out.is_empty() { 0 } else { " · ".len() };
+            if used + sep >= want.len() {
+                break;
+            }
+            used += sep;
+            let left = want.len() - used;
+            let len = seg.text.chars().count();
+            let take = len.min(left);
+            if take < len {
+                seg.text = want[used..used + take].iter().collect();
+            }
+            used += take;
+            out.push(seg);
+            if take < len {
+                break;
+            }
+        }
+        // Whatever the elision added past the last kept segment (the ` …`).
+        if used < want.len() {
+            let tail: String = want[used..].iter().collect();
+            match out.last_mut() {
+                Some(last) => last.text.push_str(&tail),
+                None => out.push(anim::Segment::rank(tail, anim::KEEP)),
+            }
+        }
+        segs = out;
     }
-    (left, chips)
+    (segs, chips)
 }
 
 /// Cut at the last ` · ` that leaves room for `…`; a single overlong token
@@ -4308,6 +4344,52 @@ mod tests {
 
     /// The last resort when nothing droppable is left: the text is cut at a
     /// separator, never mid-token, and a lone overlong token is cut hard.
+    /// 0061 T19: `fit_strip` hands back segments now, so the view can paint a
+    /// blocked one loud — but the text they join to must be exactly what the
+    /// single string used to be, at every width.
+    #[test]
+    fn fit_strip_segments_join_to_the_old_strings() {
+        let segs = || {
+            vec![
+                anim::Segment::rank("bash · 3s", anim::KEEP),
+                anim::Segment::rank("2/4", 1),
+            ]
+        };
+        for width in [4usize, 8, 12, 20, 40] {
+            let (kept, _) = fit_strip(segs(), Vec::new(), 0, width);
+            let joined = anim::join(&kept);
+            assert!(
+                joined.chars().count() <= width.saturating_sub(1),
+                "width {width}: {joined:?}"
+            );
+        }
+        // Wide enough for everything: nothing is touched.
+        let (kept, _) = fit_strip(segs(), Vec::new(), 0, 40);
+        assert_eq!(anim::join(&kept), "bash · 3s · 2/4");
+    }
+
+    /// A blocked segment never folds and never drops, and keeps its tone
+    /// through the fit — it is the one thing on the strip that must survive.
+    #[test]
+    fn a_blocked_segment_survives_the_fit_with_its_tone() {
+        let segs = vec![
+            anim::Segment::rank("bash · 3s", anim::KEEP),
+            anim::Segment::blocked("quiet 12s"),
+            anim::Segment::rank("test-model", 5),
+        ];
+        let (kept, _) = fit_strip(segs, Vec::new(), 0, 24);
+        let blocked: Vec<_> = kept
+            .iter()
+            .filter(|s| s.tone == anim::Tone::Blocked)
+            .collect();
+        assert_eq!(blocked.len(), 1, "{kept:?}");
+        assert_eq!(blocked[0].text, "quiet 12s");
+        assert!(
+            !kept.iter().any(|s| s.text == "test-model"),
+            "the droppable segment went first: {kept:?}"
+        );
+    }
+
     #[test]
     fn elision_cuts_at_a_separator() {
         assert_eq!(elide_at_separator("bash · 3s · 2/4", 20), "bash · 3s · 2/4");

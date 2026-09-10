@@ -346,6 +346,15 @@ pub fn snake_ramp(phase: &Phase, p: &Palette) -> Vec<Color> {
     hotl_theme::ramp(a, b, WIDTH)
 }
 
+/// How a segment reads. `Blocked` is the loud one: nothing is moving, and
+/// the human should know (0061 T19). Everything else is the strip's own ink.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tone {
+    #[default]
+    Plain,
+    Blocked,
+}
+
 /// One strip segment and its drop rank: rank 0 goes first when width runs
 /// out, `KEEP` never goes. `short` is the fold form (`2/4 running the
 /// suite` → `2/4`), tried before the segment is dropped.
@@ -354,17 +363,22 @@ pub struct Segment {
     pub text: String,
     pub short: Option<String>,
     pub rank: u8,
+    pub tone: Tone,
 }
 
 /// The rank that never folds and never drops.
 pub const KEEP: u8 = u8::MAX;
 
-// Drop order, lowest first (0049 T1). Rank 2 is reserved for P1's output
-// line count; rank 4 is the view's session-name chip.
+// Drop order, lowest first (0049 T1). Rank 4 is the view's session-name chip.
 const RANK_TODO: u8 = 1;
+// Rank 2 is reserved for a running tool's output line count (0061 T25).
 const RANK_USAGE: u8 = 3;
 const RANK_MODEL: u8 = 5;
 const RANK_GOAL: u8 = 6;
+
+/// Ten seconds of nothing at all. Short enough to catch a stalled connect,
+/// long enough that a normal think never trips it.
+pub const QUIET_AFTER: u64 = 10 * TICK_HZ;
 
 impl Segment {
     fn keep(text: impl Into<String>) -> Self {
@@ -372,16 +386,44 @@ impl Segment {
             text: text.into(),
             short: None,
             rank: KEEP,
+            tone: Tone::Plain,
         }
     }
 
-    fn rank(text: impl Into<String>, rank: u8) -> Self {
+    /// A `KEEP` segment that reads as blocked: it never folds, never drops,
+    /// and is painted loud.
+    pub(crate) fn blocked(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            short: None,
+            rank: KEEP,
+            tone: Tone::Blocked,
+        }
+    }
+
+    pub(crate) fn rank(text: impl Into<String>, rank: u8) -> Self {
         Self {
             text: text.into(),
             short: None,
             rank,
+            tone: Tone::Plain,
         }
     }
+}
+
+/// Whole seconds of silence, once past [`QUIET_AFTER`]; `None` while the gap
+/// is still ordinary.
+pub fn quiet_secs(since_frame: u64) -> Option<u64> {
+    (since_frame >= QUIET_AFTER).then_some(since_frame / TICK_HZ)
+}
+
+/// The joined full forms of a segment list — one place, so the styled strip
+/// and every text consumer cannot disagree about separators.
+pub fn join(segs: &[Segment]) -> String {
+    segs.iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// The strip's left zone, in display order. `strip_text` joins the full
@@ -450,11 +492,24 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
         // the tool ask is the whole point of the prompt.
         Phase::WaitingEgress { .. } => segs.push(Segment::keep("waiting on you · network")),
     }
+    // Nothing has arrived for ten seconds (0061 T19). Its own segment rather
+    // than a suffix: it is a different claim from the phase's, and it must
+    // survive the fit. Suppressed where a later task explains the silence
+    // itself.
+    if matches!(
+        state.phase,
+        Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
+    ) {
+        if let Some(secs) = quiet_secs(state.since_frame) {
+            segs.push(Segment::blocked(format!("quiet {secs}s")));
+        }
+    }
     if let Some(count) = todos_count(&state.todos) {
         segs.push(Segment {
             text: format!("{count} {}", todos_label(&state.todos)),
             short: Some(count),
             rank: RANK_TODO,
+            tone: Tone::Plain,
         });
     }
     if let Some(mins) = goal_minutes(state) {
@@ -462,6 +517,7 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
             text: format!("◎ /goal active · {mins}m"),
             short: Some(format!("◎ {mins}m")),
             rank: RANK_GOAL,
+            tone: Tone::Plain,
         });
     }
     segs
@@ -470,11 +526,7 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
 /// Everything on the strip after the snake, every segment in full — the
 /// form tests pin and any non-styled consumer wants.
 pub fn strip_text(state: &State) -> String {
-    strip_segments(state)
-        .iter()
-        .map(|s| s.text.as_str())
-        .collect::<Vec<_>>()
-        .join(" · ")
+    join(&strip_segments(state))
 }
 
 /// Minutes on the goal's own tick clock, which advances only while a turn
@@ -804,6 +856,61 @@ mod tests {
         assert_eq!(strip_line(&s), resting("120 in · 45 out"));
     }
 
+    /// 0061 T19: the only honest thing a surface can say when nothing has
+    /// arrived. Ten seconds is short enough to catch a stalled connect and
+    /// long enough that an ordinary think never trips it.
+    #[test]
+    fn the_phase_text_says_quiet_after_ten_silent_seconds() {
+        let mut s = State::test_default();
+        s.since_frame = 12 * TICK_HZ;
+        s.phase = Phase::Sampling {
+            ticks: 12 * TICK_HZ,
+        };
+        assert_eq!(strip_text(&s), "thinking · 12s · quiet 12s");
+        s.phase = Phase::Streaming {
+            ticks: 12 * TICK_HZ,
+            chars: 200,
+        };
+        assert_eq!(strip_text(&s), "writing · ~50 tok · 12s · quiet 12s");
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 12 * TICK_HZ,
+        };
+        assert_eq!(strip_text(&s), "bash · 12s · quiet 12s");
+
+        // Nine seconds is not a stall.
+        s.since_frame = 9 * TICK_HZ;
+        assert_eq!(strip_text(&s), "bash · 12s");
+
+        // Waiting on you is not the engine being quiet.
+        s.since_frame = 12 * TICK_HZ;
+        s.phase = Phase::WaitingQuestion {
+            req_id: 1,
+            header: String::new(),
+            prompt: String::new(),
+            options: Vec::new(),
+            input: String::new(),
+            selected: 0,
+        };
+        assert_eq!(strip_text(&s), "waiting on you");
+    }
+
+    /// It is a claim about the engine, not a decoration on the phase — so it
+    /// keeps its own segment, never folds, and never drops.
+    #[test]
+    fn quiet_is_a_blocked_segment_that_never_drops() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.since_frame = QUIET_AFTER;
+        let seg = strip_segments(&s)
+            .into_iter()
+            .find(|g| g.text.starts_with("quiet"))
+            .expect("the quiet segment");
+        assert_eq!(seg.tone, Tone::Blocked);
+        assert_eq!(seg.rank, KEEP);
+        assert_eq!(seg.short, None);
+    }
+
     /// Ranks are the drop order the view folds and drops by: the todo label
     /// folds to its count first, usage detail goes before the model name,
     /// and the phase text never goes.
@@ -814,17 +921,17 @@ mod tests {
         s.todos = vec![todo("wire", TodoStatus::InProgress, Some("wiring"))];
         s.goal = Some("done".into());
         let segs = strip_segments(&s);
-        let ranks: Vec<(&str, Option<&str>, u8)> = segs
+        let ranks: Vec<(&str, Option<&str>, u8, Tone)> = segs
             .iter()
-            .map(|g| (g.text.as_str(), g.short.as_deref(), g.rank))
+            .map(|g| (g.text.as_str(), g.short.as_deref(), g.rank, g.tone))
             .collect();
         assert_eq!(
             ranks,
             vec![
-                ("test-model", None, RANK_MODEL),
-                ("1 in · 2 out", None, RANK_USAGE),
-                ("0/1 wiring", Some("0/1"), RANK_TODO),
-                ("◎ /goal active · 0m", Some("◎ 0m"), RANK_GOAL),
+                ("test-model", None, RANK_MODEL, Tone::Plain),
+                ("1 in · 2 out", None, RANK_USAGE, Tone::Plain),
+                ("0/1 wiring", Some("0/1"), RANK_TODO, Tone::Plain),
+                ("◎ /goal active · 0m", Some("◎ 0m"), RANK_GOAL, Tone::Plain),
             ]
         );
         s.phase = Phase::Tool {

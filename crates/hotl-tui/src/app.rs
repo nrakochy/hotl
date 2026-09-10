@@ -604,6 +604,11 @@ pub struct State {
     /// `Ctrl-O`: show every tool card instead of folding settled runs into
     /// one rollup line. The twin of `thinking_expanded` for work (0061 T6).
     pub tools_expanded: bool,
+    /// Ticks since the last frame the wire delivered (0061 T19). The core has
+    /// no clock, so this *is* the clock: it counts only while a turn runs,
+    /// and a `quiet Ns` past `anim::QUIET_AFTER` is the one honest thing a
+    /// surface can say when nothing has arrived.
+    pub since_frame: u64,
     /// Compacted pastes riding the current draft (`paste::Attachment`),
     /// keyed positionally to their `[Image #N]` / `[Pasted text #N …]`
     /// tokens. Lives here rather than in `Editor` so `$EDITOR` round-trips
@@ -684,6 +689,7 @@ impl State {
             dismissed: false,
             thinking_expanded: false,
             tools_expanded: false,
+            since_frame: 0,
             attachments: Vec::new(),
             selection: None,
             copy_notice: None,
@@ -910,7 +916,24 @@ fn title(state: &State, suffix: &str) -> String {
     }
 }
 
+/// Did this message come off the wire? Anything that did is proof the engine
+/// is alive, whatever it said (0061 T19).
+fn from_wire(msg: &Msg) -> bool {
+    matches!(
+        msg,
+        Msg::Update(_)
+            | Msg::PermissionRequest { .. }
+            | Msg::QuestionRequest { .. }
+            | Msg::EgressRequest { .. }
+            | Msg::PromptResult { .. }
+            | Msg::SteerRejected { .. }
+    )
+}
+
 pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
+    if from_wire(&msg) {
+        state.since_frame = 0;
+    }
     // A selection is a region of the *screen*, so any deliberate user action
     // retires it — but not the two message kinds that arrive on their own
     // schedule. Excluding `Update` is what lets a drag work mid-turn, and it
@@ -2402,6 +2425,9 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
             .push(TranscriptItem::User { text: text.into() });
         state.phase = Phase::Sampling { ticks: 0 };
         state.scroll = Scroll::Follow;
+        // The new turn's silence starts at the send, not at the last frame of
+        // the turn before it.
+        state.since_frame = 0;
         vec![
             Cmd::SendPrompt(payload),
             Cmd::SetTitle(title(state, " — working")),
@@ -3002,6 +3028,9 @@ fn on_tick(state: &mut State) {
         Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
     ) {
         state.work_ticks += 1;
+        // Silence only counts while a turn is running: waiting on you is not
+        // the engine being quiet.
+        state.since_frame += 1;
         // EVERY running card ticks (0037), not just the newest: a sibling's
         // tool_done keeps the phase in `Tool` on the oldest card's clock
         // (0049 T1b); running cards tick regardless. Bounded to this turn:
@@ -3740,6 +3769,95 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T19: anything off the wire is proof the engine is alive, whatever
+    /// it said — so every wire-borne message restarts the gap.
+    #[test]
+    fn every_wire_message_resets_the_quiet_gap() {
+        let msgs = || {
+            vec![
+                Msg::Update(json!({"type":"text_delta","text":"hi"})),
+                Msg::PermissionRequest {
+                    req_id: 1,
+                    summary: "bash: ls".into(),
+                    protected_why: None,
+                    diff: Vec::new(),
+                },
+                Msg::QuestionRequest {
+                    req_id: 2,
+                    question: Question {
+                        header: "which?".into(),
+                        prompt: "pick".into(),
+                        options: Vec::new(),
+                        multi: false,
+                    },
+                },
+                Msg::EgressRequest {
+                    req_id: 3,
+                    host: "example.com".into(),
+                },
+                Msg::PromptResult {
+                    outcome_kind: "done".into(),
+                    outcome_text: None,
+                    usage: json!({}),
+                    finished_at: None,
+                },
+                Msg::SteerRejected { why: "no".into() },
+            ]
+        };
+        for msg in msgs() {
+            let mut s = State::test_default();
+            s.since_frame = 5 * crate::anim::TICK_HZ;
+            update(&mut s, msg);
+            assert_eq!(s.since_frame, 0, "a wire frame left the gap running");
+        }
+        // A key press is not the engine speaking.
+        let mut s = State::test_default();
+        s.since_frame = 5 * crate::anim::TICK_HZ;
+        ctrl(&mut s, 'o');
+        assert_eq!(s.since_frame, 5 * crate::anim::TICK_HZ);
+    }
+
+    /// Waiting on you is not the engine being quiet, and neither is idle.
+    #[test]
+    fn the_quiet_gap_grows_only_while_a_turn_runs() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.since_frame, 1);
+        s.phase = Phase::Idle;
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.since_frame, 1, "idle ticks nothing");
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: "bash: ls".into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: Vec::new(),
+        };
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.since_frame, 1, "an ask ticks nothing");
+    }
+
+    /// A new turn's silence starts at the send, not at the last frame of the
+    /// turn before it.
+    #[test]
+    fn submit_restarts_the_quiet_gap() {
+        let mut s = State::test_default();
+        s.since_frame = 30 * crate::anim::TICK_HZ;
+        for c in "go".chars() {
+            update(
+                &mut s,
+                Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        update(
+            &mut s,
+            Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+        assert_eq!(s.since_frame, 0);
     }
 
     /// 0061 T7: the twin of Ctrl-T for work.
