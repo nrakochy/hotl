@@ -2067,6 +2067,7 @@ mod tests {
     /// Run a bash call with a progress sink in scope, returning the frames
     /// it emitted along with the outcome. The sink is a task-local, so it has
     /// to be scoped around the future — exactly as `turn.rs` does it.
+    #[cfg(unix)]
     fn run_with_progress(input: Value) -> (ToolOutcome, Vec<crate::Progress>) {
         let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink: crate::ProgressSink = {

@@ -68,6 +68,7 @@ async fn drain(s: &mut Session) -> Vec<EngineEvent> {
     }
 }
 
+#[cfg(unix)]
 fn log_lines(path: &std::path::Path) -> usize {
     std::fs::read_to_string(path)
         .expect("read log")
