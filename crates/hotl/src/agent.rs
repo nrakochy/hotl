@@ -5064,6 +5064,9 @@ mod tests {
     /// what the human is standing right there to authorize is the whole
     /// thing the envelope exists to prevent.
     #[test]
+    // Bypass cannot exist in that build, so there is no inheritance to refuse:
+    // `enforced_mode` coerces the parent to Ask before a child is ever derived.
+    #[cfg(not(feature = "security-enforced"))]
     fn child_never_inherits_bypass() {
         use hotl_tools::rules::PermissionMode;
         let parent = Arc::new(
