@@ -549,6 +549,35 @@ pub fn current_call_id() -> Option<String> {
     CURRENT_CALL_ID.try_with(Clone::clone).ok()
 }
 
+/// One liveness sample from a running tool: the newest output line and the
+/// counts behind it (0061 T12). Raw process output, deliberately not the
+/// capped `outcome.content` `tool_done` reports — a command that printed
+/// 60 KB and had it clipped really did print 60 KB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    pub tail: String,
+    pub lines: u64,
+    pub bytes: u64,
+}
+
+/// Where a tool's progress goes. A closure rather than a field on the tool:
+/// `Registry::builtin()` is a process-wide `OnceLock` prototype with no
+/// events sender to hand out, so the sink is scoped per call instead.
+pub type ProgressSink = std::sync::Arc<dyn Fn(Progress) + Send + Sync>;
+
+tokio::task_local! {
+    /// Scoped by `turn.rs` around the same `Tool::run` future as
+    /// [`CURRENT_CALL_ID`], so a frame is paired with its call by
+    /// construction rather than by lookup.
+    pub static PROGRESS_SINK: ProgressSink;
+}
+
+/// The sink for the call running on this task; `None` when nothing is
+/// listening (headless, a child, or any task outside a tool run).
+pub fn progress_sink() -> Option<ProgressSink> {
+    PROGRESS_SINK.try_with(Clone::clone).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -2,6 +2,7 @@
 //! model); truncation carries continuation hints.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::sandbox::{self, SandboxStatus};
@@ -1573,7 +1574,21 @@ async fn bash_impl(root: &Path, input: &Value, cancel: CancellationToken) -> Too
     // sees EOF. `Stdio::piped()` hides this because std keeps the parent end
     // on the `Child`; handing in our own fds makes it ours to release.
     drop(cmd);
-    let wait = collect_merged(child, pipe, BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK);
+    // The sink is read here, on the async task: task-locals are invisible on
+    // the `spawn_blocking` thread the drain runs on.
+    let sink = crate::progress_sink();
+    // The drain thread outlives a dropped `wait` on the timeout and cancel
+    // paths (a blocking read cannot be interrupted), so it must know when the
+    // call has already been reported settled — a frame after `tool_done`
+    // would re-open a finished card.
+    let settled = Arc::new(AtomicBool::new(false));
+    let _settle = SettleGuard(settled.clone());
+    let wait = collect_merged(
+        child,
+        pipe,
+        BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK,
+        sink.map(|s| (s, settled)),
+    );
     tokio::pin!(wait);
 
     tokio::select! {
@@ -1632,6 +1647,7 @@ async fn collect_merged(
     mut child: tokio::process::Child,
     pipe: std::io::PipeReader,
     cap: usize,
+    progress: Option<(crate::ProgressSink, Arc<AtomicBool>)>,
 ) -> std::io::Result<(std::process::ExitStatus, Vec<u8>)> {
     // `std::io::pipe` has no async reader, so the drain moves to a blocking
     // thread and `bash_impl`'s `select!` keeps the timeout and cancel arms
@@ -1643,7 +1659,7 @@ async fn collect_merged(
     // process group on the timeout and cancel paths, which is what closes them;
     // a descendant that escaped the group would strand one blocking-pool
     // thread. That is the same descendant that already escapes the reaper.
-    let bytes = tokio::task::spawn_blocking(move || drain_capped_blocking(pipe, cap))
+    let bytes = tokio::task::spawn_blocking(move || drain_capped_blocking(pipe, cap, progress))
         .await
         .unwrap_or_default();
     let status = child.wait().await?;
@@ -1651,9 +1667,16 @@ async fn collect_merged(
 }
 
 /// [`drain_capped`]'s blocking twin, for the one pipe that is not async.
-fn drain_capped_blocking<R: std::io::Read>(mut reader: R, cap: usize) -> Vec<u8> {
+/// Counts and samples every chunk it reads — including the ones past `cap`,
+/// which the model never sees but the human is still waiting on.
+fn drain_capped_blocking<R: std::io::Read>(
+    mut reader: R,
+    cap: usize,
+    progress: Option<(crate::ProgressSink, Arc<AtomicBool>)>,
+) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 8192];
+    let mut tailer = Tailer::default();
     loop {
         match reader.read(&mut chunk) {
             Ok(0) | Err(_) => break,
@@ -1662,10 +1685,167 @@ fn drain_capped_blocking<R: std::io::Read>(mut reader: R, cap: usize) -> Vec<u8>
                     let take = n.min(cap - buf.len());
                     buf.extend_from_slice(&chunk[..take]);
                 }
+                if let Some((sink, settled)) = &progress {
+                    tailer.feed(&chunk[..n]);
+                    if !settled.load(Ordering::Relaxed) {
+                        if let Some(p) = tailer.due() {
+                            sink(p);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // One last frame at EOF, past the rate limit: the counts the interval
+    // swallowed are the ones the card would otherwise sit on until
+    // `tool_done` corrects it. Suppressed when nothing changed, and when the
+    // call already settled (a killed group closes the pipe *after* the
+    // timeout arm returned).
+    if let Some((sink, settled)) = &progress {
+        if !settled.load(Ordering::Relaxed) {
+            if let Some(p) = tailer.flush() {
+                sink(p);
             }
         }
     }
     buf
+}
+
+/// At most one progress frame per call per this interval — enough for a build
+/// log to look alive without spending a frame per line.
+const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Bytes carried past a chunk boundary while looking for the next `\n`. A line
+/// longer than this is sampled from its tail, not buffered whole.
+const TAILER_CARRY_CAP: usize = 4 * 1024;
+
+/// Marks a bash call settled when `bash_impl` returns by any path, so the
+/// drain thread that outlives it emits nothing more.
+struct SettleGuard(Arc<AtomicBool>);
+
+impl Drop for SettleGuard {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Running counts plus the newest complete line, fed one read at a time.
+#[derive(Default)]
+struct Tailer {
+    /// Bytes since the last `\n`, capped at [`TAILER_CARRY_CAP`].
+    carry: Vec<u8>,
+    last_line: Option<String>,
+    lines: u64,
+    bytes: u64,
+    last_emit: Option<std::time::Instant>,
+    /// `(lines, bytes)` of the last frame actually sent, so the EOF flush can
+    /// tell "nothing new" from "the interval ate it".
+    last_sent: Option<(u64, u64)>,
+}
+
+impl Tailer {
+    fn feed(&mut self, chunk: &[u8]) {
+        self.bytes += chunk.len() as u64;
+        self.lines += chunk.iter().filter(|b| **b == b'\n').count() as u64;
+        for part in chunk.split_inclusive(|b| *b == b'\n') {
+            if part.last() == Some(&b'\n') {
+                self.carry.extend_from_slice(&part[..part.len() - 1]);
+                let line = String::from_utf8_lossy(&self.carry).into_owned();
+                if !line.trim().is_empty() {
+                    self.last_line = Some(line);
+                }
+                self.carry.clear();
+            } else {
+                let room = TAILER_CARRY_CAP.saturating_sub(self.carry.len());
+                self.carry.extend_from_slice(&part[..part.len().min(room)]);
+            }
+        }
+    }
+
+    /// A frame, if one is due. The unterminated carry counts too — a
+    /// progress bar redrawing with `\r` never sends a newline at all.
+    fn due(&mut self) -> Option<crate::Progress> {
+        let now = std::time::Instant::now();
+        if self.last_emit.is_some_and(|t| now - t < PROGRESS_INTERVAL) {
+            return None;
+        }
+        self.last_emit = Some(now);
+        Some(self.frame())
+    }
+
+    /// The final frame, ignoring the interval; `None` when the last one
+    /// already said this.
+    fn flush(&mut self) -> Option<crate::Progress> {
+        if self.bytes == 0 || self.last_sent == Some((self.lines, self.bytes)) {
+            return None;
+        }
+        Some(self.frame())
+    }
+
+    fn frame(&mut self) -> crate::Progress {
+        self.last_sent = Some((self.lines, self.bytes));
+        let raw = if self.carry.is_empty() {
+            self.last_line.clone().unwrap_or_default()
+        } else {
+            String::from_utf8_lossy(&self.carry).into_owned()
+        };
+        crate::Progress {
+            tail: progress_tail(&raw),
+            lines: self.lines,
+            bytes: self.bytes,
+        }
+    }
+}
+
+/// What a terminal would show of one output line: everything after the last
+/// carriage return (a progress bar's newest frame), ANSI stripped, trimmed,
+/// and clipped to 200 chars on a char boundary. No ellipsis — the row it
+/// lands on is already clipped by width.
+fn progress_tail(raw: &str) -> String {
+    let after_cr = raw.rsplit('\r').next().unwrap_or(raw);
+    let text = strip_ansi(after_cr);
+    let text = text.trim();
+    match text.char_indices().nth(200) {
+        Some((at, _)) => text[..at].to_string(),
+        None => text.to_string(),
+    }
+}
+
+/// Drop CSI (`ESC [ … 0x40..=0x7E`) and OSC (`ESC ] … BEL | ESC \`) sequences.
+/// Narrow on purpose: this is for reading a build log, not for emulating a
+/// terminal.
+fn strip_ansi(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if ('\x40'..='\x7e').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\x07' {
+                        break;
+                    }
+                    if c == '\x1b' && chars.peek() == Some(&'\\') {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            // A lone ESC, or a two-byte escape: drop the pair.
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Incrementally read the child's stdout/stderr (capped at `cap` bytes each)
@@ -1882,6 +2062,130 @@ mod tests {
             .build()
             .unwrap()
             .block_on(tool.run(input, CancellationToken::new()))
+    }
+
+    /// Run a bash call with a progress sink in scope, returning the frames
+    /// it emitted along with the outcome. The sink is a task-local, so it has
+    /// to be scoped around the future — exactly as `turn.rs` does it.
+    fn run_with_progress(input: Value) -> (ToolOutcome, Vec<crate::Progress>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: crate::ProgressSink = {
+            let seen = seen.clone();
+            Arc::new(move |p| seen.lock().unwrap().push(p))
+        };
+        let outcome = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(crate::PROGRESS_SINK.scope(
+                sink,
+                BashTool::default().run(input, CancellationToken::new()),
+            ));
+        let frames = seen.lock().unwrap().clone();
+        (outcome, frames)
+    }
+
+    #[test]
+    fn progress_tail_takes_the_text_after_the_last_cr_with_ansi_stripped() {
+        // A progress bar redraws in place; only the newest frame is true.
+        assert_eq!(progress_tail("10%\r50%\r100%"), "100%");
+        assert_eq!(
+            progress_tail("\x1b[32mCompiling\x1b[0m hotl-engine"),
+            "Compiling hotl-engine"
+        );
+        assert_eq!(progress_tail("  padded  "), "padded");
+    }
+
+    #[test]
+    fn progress_tail_clips_to_200_chars_on_a_char_boundary() {
+        let wide = "é".repeat(300);
+        let clipped = progress_tail(&wide);
+        assert_eq!(clipped.chars().count(), 200);
+        assert!(!clipped.ends_with('…'), "no ellipsis: the row clips itself");
+    }
+
+    #[test]
+    fn strip_ansi_removes_csi_and_osc_sequences() {
+        assert_eq!(strip_ansi("\x1b[1;31mred\x1b[0m"), "red");
+        assert_eq!(strip_ansi("\x1b]0;a title\x07after"), "after");
+        assert_eq!(strip_ansi("\x1b]0;a title\x1b\\after"), "after");
+        assert_eq!(strip_ansi("plain"), "plain");
+    }
+
+    /// 0061 T12: the rate limit is per call, so a burst is one frame — and
+    /// that frame still carries every byte the burst produced.
+    #[test]
+    #[cfg(unix)]
+    fn a_bash_burst_within_250ms_yields_one_progress_frame_with_full_counts() {
+        let (outcome, frames) = run_with_progress(json!({"command": "printf 'a\\nb\\nc\\n'"}));
+        assert!(!outcome.is_error, "{}", outcome.content);
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(
+            frames[0],
+            crate::Progress {
+                tail: "c".into(),
+                lines: 3,
+                bytes: 6
+            }
+        );
+    }
+
+    /// Two counters, deliberately (decision 2): `tool_done` reports what the
+    /// model received after the cap; progress reports what the process wrote.
+    #[test]
+    #[cfg(unix)]
+    fn bash_progress_counts_bytes_past_the_output_cap() {
+        let (outcome, frames) =
+            run_with_progress(json!({"command": "head -c 60000 /dev/zero | tr '\\0' x; echo"}));
+        assert!(!outcome.is_error, "{}", outcome.content);
+        let last = frames.last().expect("at least one frame");
+        assert_eq!(last.bytes, 60_001, "raw output, not the capped copy");
+        assert!(
+            outcome.content.len() <= BASH_MAX_OUTPUT + BASH_OUTPUT_SLACK + 200,
+            "the model's copy is still capped: {}",
+            outcome.content.len()
+        );
+    }
+
+    /// The drain thread outlives a timed-out call. A frame after the call
+    /// returns would re-open a card the surface already settled.
+    #[test]
+    #[cfg(unix)]
+    fn a_timed_out_bash_emits_no_progress_after_it_returns() {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink: crate::ProgressSink = {
+            let seen = seen.clone();
+            Arc::new(move |p| seen.lock().unwrap().push(p))
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = rt.block_on(crate::PROGRESS_SINK.scope(
+            sink,
+            BashTool::default().run(
+                json!({"command": "sleep 5", "timeout_ms": 100}),
+                CancellationToken::new(),
+            ),
+        ));
+        assert!(outcome.is_error, "{}", outcome.content);
+        let after = seen.lock().unwrap().len();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            after,
+            "the drain kept talking past the settle"
+        );
+    }
+
+    /// Nothing listening, nothing changed: the no-sink path is the one every
+    /// headless run and every child takes.
+    #[test]
+    fn bash_without_a_sink_in_scope_is_unchanged() {
+        let out = run(&BashTool::default(), json!({"command": "echo hi"}));
+        assert!(!out.is_error);
+        assert!(out.content.contains("hi"), "{}", out.content);
+        assert!(crate::progress_sink().is_none());
     }
 
     /// 0050 T5: the `[exit N]` trailer is the model's; this field is the
