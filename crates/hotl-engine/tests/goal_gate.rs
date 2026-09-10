@@ -32,7 +32,18 @@ fn session_with(
     dir: &std::path::Path,
     registry: Registry,
 ) -> (SessionHandle, std::path::PathBuf) {
-    let config = EngineConfig::default();
+    session_seeded(provider, dir, registry, EngineConfig::default(), Vec::new())
+}
+
+/// The same session with the window and the starting history chosen by the
+/// test — what the context-ladder cases need and no other case here does.
+fn session_seeded(
+    provider: Arc<dyn Provider>,
+    dir: &std::path::Path,
+    registry: Registry,
+    config: EngineConfig,
+    initial_items: Vec<Item>,
+) -> (SessionHandle, std::path::PathBuf) {
     let log = SessionLog::create(dir, &config.model, None, Masker::empty(), 0).expect("log");
     let log_path = log.path().to_path_buf();
     let handle = spawn_session(SessionDeps {
@@ -46,7 +57,7 @@ fn session_with(
         system: "sys".into(),
         cwd: dir.to_path_buf(),
         hooks: None,
-        initial_items: Vec::new(),
+        initial_items,
         initial_todos: Vec::new(),
         initial_decisions: Vec::new(),
         plan_files: None,
@@ -845,5 +856,331 @@ async fn a_true_machine_leaf_meets_the_goal_without_a_model() {
             .iter()
             .all(|r| !r.system.contains("You judge whether an agent session")),
         "a true machine leaf must meet the goal with no evaluator call"
+    );
+}
+
+/// Three lanes through one provider: the fold's summarize (`compress`), the
+/// evaluator (`VERDICT`) and the turn itself, each billed on its own so the
+/// goal's reported spend can be attributed to a spender.
+struct Lanes {
+    main: Arc<ScriptedProvider>,
+    summarize: Arc<ScriptedProvider>,
+    eval: Arc<ScriptedProvider>,
+}
+
+impl Provider for Lanes {
+    fn stream(
+        &self,
+        req: SamplingRequest,
+    ) -> futures_util::stream::BoxStream<'static, Result<StreamEvent, ProviderError>> {
+        if req.system.contains("compress") {
+            self.summarize.stream(req)
+        } else if req.system.contains("VERDICT") {
+            self.eval.stream(req)
+        } else {
+            self.main.stream(req)
+        }
+    }
+}
+
+/// A sample whose `Completed` reports the token counts the test chose.
+fn billed(
+    mut script: Vec<Result<StreamEvent, ProviderError>>,
+    input_tokens: u64,
+    output_tokens: u64,
+) -> Vec<Result<StreamEvent, ProviderError>> {
+    if let Some(Ok(StreamEvent::Completed { usage, .. })) = script.last_mut() {
+        usage.input_tokens = input_tokens;
+        usage.output_tokens = output_tokens;
+    }
+    script
+}
+
+fn call(id: &str) -> Item {
+    Item::Assistant {
+        blocks: vec![serde_json::json!({
+            "type": "tool_use", "id": id, "name": "bash", "input": {"command": "ls"}
+        })],
+    }
+}
+
+fn results(id: &str, content: &str) -> Item {
+    Item::ToolResults {
+        results: vec![hotl_types::ToolResultItem {
+            tool_use_id: id.into(),
+            content: content.into(),
+            is_error: false,
+        }],
+    }
+}
+
+/// A finished turn whose one result is already past 80% of the window below:
+/// the goal turn folds before it samples at all.
+fn oversized_history() -> Vec<Item> {
+    vec![
+        Item::User {
+            text: "first".into(),
+            synthetic: None,
+            images: Vec::new(),
+        },
+        call("t1"),
+        results("t1", &"y".repeat(2_600)),
+        Item::Assistant {
+            blocks: vec![serde_json::json!({"type": "text", "text": "listed"})],
+        },
+    ]
+}
+
+fn goal_usage(events: &[EngineEvent]) -> hotl_types::TokenUsage {
+    events
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            EngineEvent::GoalVerdict { usage, .. } => Some(*usage),
+            _ => None,
+        })
+        .expect("a verdict")
+}
+
+fn done_usage(events: &[EngineEvent]) -> hotl_types::TokenUsage {
+    match events.last() {
+        Some(EngineEvent::TurnDone { usage, .. }) => *usage,
+        other => panic!("the last event is the TurnDone: {other:?}"),
+    }
+}
+
+/// A window small enough to force one rung of the context ladder, with the
+/// cheap rung off (`keep_results_turns: 0`) so the fold is what fires.
+fn folding_config() -> EngineConfig {
+    EngineConfig {
+        model: "test-model".into(),
+        context_window: 1_000,
+        keep_results_turns: 0,
+        max_turns: 10,
+        ..Default::default()
+    }
+}
+
+/// 0051 T4, tracker 172: the goal reports what the goal cost, the fold
+/// included. `TurnEnd::Compact` parks the ending segment and the summarizer
+/// in `carry_usage` — the final `TurnDone` finds them there, but the gate
+/// used to see only the segment *after* the fold, so a goal loop that folded
+/// showed a progress line and a verdict lower than what was billed.
+#[tokio::test]
+async fn a_goal_turn_that_folds_counts_the_summarizer_in_its_spend() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let main = Arc::new(ScriptedProvider::new(vec![billed(
+        ScriptedProvider::text_reply("finished"),
+        10,
+        5,
+    )]));
+    let summarize = Arc::new(ScriptedProvider::new(vec![billed(
+        ScriptedProvider::text_reply("GOAL: keep going"),
+        700,
+        40,
+    )]));
+    let eval = Arc::new(ScriptedProvider::new(vec![billed(
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: the work is done"),
+        20,
+        7,
+    )]));
+    let provider = Arc::new(Lanes {
+        main: Arc::clone(&main),
+        summarize: Arc::clone(&summarize),
+        eval: Arc::clone(&eval),
+    });
+    let (mut handle, _) = session_seeded(
+        provider,
+        dir.path(),
+        Registry::builtin(),
+        folding_config(),
+        oversized_history(),
+    );
+
+    handle.set_goal(Some("finish the work".into())).await;
+    handle.prompt("go".into()).await;
+    let seen = events_until_turn_done(&mut handle).await;
+
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, EngineEvent::Compacted { .. })),
+        "the turn must fold for this test to mean anything"
+    );
+    // One of each: a second summarize (a speculative digest, say) would move
+    // the numbers below without moving the defect.
+    assert_eq!(summarize.request_count(), 1, "one fold to account for");
+    assert_eq!(main.request_count(), 1, "one segment after the fold");
+    assert_eq!(eval.request_count(), 1, "one evaluation");
+    assert_eq!(verdicts(&seen), vec![(GoalVerdictKind::Met, 1)]);
+
+    let goal = goal_usage(&seen);
+    assert_eq!(
+        goal.input_tokens,
+        10 + 700 + 20,
+        "segment + summarizer + evaluator: {goal:?}"
+    );
+    assert_eq!(goal.output_tokens, 5 + 40 + 7, "{goal:?}");
+    // The two are the same billing seen twice, so this catches the fix
+    // overshooting as loudly as it catches the miss: the goal was set for
+    // this one prompt, so its spend is exactly the prompt's.
+    assert_eq!(
+        goal,
+        done_usage(&seen),
+        "the goal reports what the turn does"
+    );
+}
+
+/// The clear rung's half of the same rule (0057): `TurnEnd::Clear` parks the
+/// segment that was running when the stubs were minted, and the goal must
+/// count it. The abandoned speculative digest rides the same line and is not
+/// asserted here — `abandon_speculation` deliberately does not wait, so what
+/// it reports is a race (tracker 171), not a number a test can pin.
+#[tokio::test]
+async fn a_goal_turn_that_clears_counts_the_segment_it_respawned() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let big = dir.path().join("big.txt");
+    // Sized so the read result tips the estimate over 60% (the clear) only
+    // after the first sample, and so the projection falls back under it once
+    // the seeded result is a stub — nothing speculates, nothing folds.
+    std::fs::write(&big, "y".repeat(1_050)).expect("fixture");
+    let path = big.to_str().expect("utf8 path").to_string();
+    let main = Arc::new(ScriptedProvider::new(vec![
+        billed(
+            ScriptedProvider::tool_call("t2", "read", serde_json::json!({ "path": path })),
+            300,
+            20,
+        ),
+        billed(ScriptedProvider::text_reply("finished"), 10, 5),
+    ]));
+    let summarize = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "GOAL: keep going",
+    )]));
+    let eval = Arc::new(ScriptedProvider::new(vec![billed(
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: the work is done"),
+        20,
+        7,
+    )]));
+    let provider = Arc::new(Lanes {
+        main: Arc::clone(&main),
+        summarize: Arc::clone(&summarize),
+        eval: Arc::clone(&eval),
+    });
+    let config = EngineConfig {
+        // One turn of results protected, so the seeded turn's is clearable.
+        keep_results_turns: 1,
+        ..folding_config()
+    };
+    let (mut handle, _) = session_seeded(
+        provider,
+        dir.path(),
+        Registry::builtin(),
+        config,
+        vec![
+            Item::User {
+                text: "first".into(),
+                synthetic: None,
+                images: Vec::new(),
+            },
+            call("t1"),
+            results("t1", &"y".repeat(1_350)),
+            Item::Assistant {
+                blocks: vec![serde_json::json!({"type": "text", "text": "listed"})],
+            },
+        ],
+    );
+
+    handle.set_goal(Some("finish the work".into())).await;
+    handle.prompt("go".into()).await;
+    let seen = events_until_turn_done(&mut handle).await;
+
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, EngineEvent::Cleared { .. })),
+        "the clear rung must fire for this test to mean anything"
+    );
+    assert_eq!(summarize.request_count(), 0, "the cheap rung, not the fold");
+    assert_eq!(
+        main.request_count(),
+        2,
+        "one segment each side of the clear"
+    );
+    assert_eq!(verdicts(&seen), vec![(GoalVerdictKind::Met, 1)]);
+
+    let goal = goal_usage(&seen);
+    assert_eq!(
+        goal.input_tokens,
+        300 + 10 + 20,
+        "the pre-clear segment counts too: {goal:?}"
+    );
+    assert_eq!(goal.output_tokens, 20 + 5 + 7, "{goal:?}");
+    assert_eq!(
+        goal,
+        done_usage(&seen),
+        "the goal reports what the turn does"
+    );
+}
+
+/// The other direction, and the reason the fold's tokens are billed to the
+/// goal where they land rather than read back off `carry_usage` at the gate:
+/// carry outlives a *not yet* turn (the branch that suppresses `TurnDone`
+/// folds the turn's own usage into it), so a gate that read carry would
+/// count the whole loop again on every later turn.
+#[tokio::test]
+async fn a_folded_goal_loop_counts_the_fold_once_across_turns() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let main = Arc::new(ScriptedProvider::new(vec![
+        billed(ScriptedProvider::text_reply("working"), 10, 5),
+        billed(ScriptedProvider::text_reply("finished"), 10, 5),
+    ]));
+    let summarize = Arc::new(ScriptedProvider::new(vec![billed(
+        ScriptedProvider::text_reply("GOAL: keep going"),
+        700,
+        40,
+    )]));
+    let eval = Arc::new(ScriptedProvider::new(vec![
+        billed(
+            ScriptedProvider::text_reply("VERDICT: not_yet\nREASON: nothing verified yet"),
+            20,
+            7,
+        ),
+        billed(
+            ScriptedProvider::text_reply("VERDICT: met\nREASON: the work is done"),
+            20,
+            7,
+        ),
+    ]));
+    let provider = Arc::new(Lanes {
+        main: Arc::clone(&main),
+        summarize: Arc::clone(&summarize),
+        eval: Arc::clone(&eval),
+    });
+    let (mut handle, _) = session_seeded(
+        provider,
+        dir.path(),
+        Registry::builtin(),
+        folding_config(),
+        oversized_history(),
+    );
+
+    handle.set_goal(Some("finish the work".into())).await;
+    handle.prompt("go".into()).await;
+    let seen = events_until_turn_done(&mut handle).await;
+
+    assert_eq!(summarize.request_count(), 1, "one fold in the whole loop");
+    assert_eq!(
+        verdicts(&seen),
+        vec![(GoalVerdictKind::NotYet, 1), (GoalVerdictKind::Met, 2)]
+    );
+    let goal = goal_usage(&seen);
+    assert_eq!(
+        goal.input_tokens,
+        700 + 2 * (10 + 20),
+        "the fold once, both turns and both evaluations: {goal:?}"
+    );
+    assert_eq!(goal.output_tokens, 40 + 2 * (5 + 7), "{goal:?}");
+    assert_eq!(
+        goal,
+        done_usage(&seen),
+        "the goal reports what the turn does"
     );
 }

@@ -1677,10 +1677,15 @@ async fn on_turn_finished(
     // Compaction's own dead end (the streak cap) is the third unrecoverable
     // class, and only `try_compact` knows it happened.
     let mut unrecoverable = unrecoverable;
+    // What a rung of the context ladder parks for the final `TurnDone`: the
+    // segment that ended, the summarizer, a clear's abandoned digest. Held
+    // apart from `carry_usage` only long enough to bill the goal too — the
+    // gate below sees `usage`, which the respawn resets (tracker 172).
+    let mut folded = TokenUsage::default();
     let outcome = match end {
         TurnEnd::Outcome(outcome) => Some(outcome),
         TurnEnd::Compact { spec, cont } => {
-            *ctx.carry_usage += usage;
+            folded += usage;
             usage = TokenUsage::default();
             // The continuation carries its own running count in
             // `TurnContinuation`, so folding it here too would double it.
@@ -1697,7 +1702,7 @@ async fn on_turn_finished(
                 ctx.events,
                 ctx.current_turn,
                 &mut unrecoverable,
-                ctx.carry_usage,
+                &mut folded,
             )
             .await
         }
@@ -1706,9 +1711,9 @@ async fn on_turn_finished(
             cont,
             spec_usage,
         } => {
-            *ctx.carry_usage += usage;
+            folded += usage;
             // A digest the clear abandoned was still billed (0051 decision 6).
-            *ctx.carry_usage += spec_usage;
+            folded += spec_usage;
             usage = TokenUsage::default();
             mispredictions = 0;
             try_clear(
@@ -1725,6 +1730,14 @@ async fn on_turn_finished(
             .await
         }
     };
+    *ctx.carry_usage += folded;
+    // The goal's own total, not just the last segment's: a `/goal` loop whose
+    // turns fold or clear was reporting a progress line and a verdict below
+    // what it was billed (tracker 172). Counted once — the arms above zeroed
+    // `usage`, which is all the gate adds.
+    if let Some(state) = ctx.goal.as_mut() {
+        state.spent += folded;
+    }
     if let Some(outcome) = outcome {
         *ctx.compact_streak = 0;
         // The owner has to act (0051 G6): tombstone, so resume never re-arms
@@ -2039,9 +2052,9 @@ async fn try_compact(
     // Set when the streak cap is what ended the turn: no retry, fallback or
     // further fold can make room, so the goal gate must tombstone (0051 G6).
     unrecoverable: &mut bool,
-    // The fold's own summarize is spend the turn pays for, so it rides the
-    // same carry the turn's samples do (0051 decision 6).
-    carry_usage: &mut TokenUsage,
+    // The fold's own summarize is spend the turn pays for, so it joins the
+    // ending segment's on the way to carry and to the goal (0051 decision 6).
+    folded: &mut TokenUsage,
 ) -> Option<Outcome> {
     // INVARIANT: the streak counts folds with no intervening completed sample
     // — a long, productive turn folds as often as it needs to, and only a
@@ -2072,7 +2085,7 @@ async fn try_compact(
     };
     match compacted {
         Ok((degraded, fold_usage)) => {
-            *carry_usage += fold_usage;
+            *folded += fold_usage;
             let _ = events.send(EngineEvent::Compacted { degraded }).await;
             if cancel.is_cancelled() {
                 return Some(Outcome::Cancelled);
