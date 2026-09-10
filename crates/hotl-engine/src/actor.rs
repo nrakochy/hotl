@@ -1851,6 +1851,12 @@ async fn on_turn_finished(
                     } else {
                         prose.join(" and ")
                     };
+                    // 0061 T18: a model-backed evaluation is a wait the human
+                    // sits through with the turn already over.
+                    let _ = ctx
+                        .events
+                        .send(EngineEvent::GoalEvaluating { turn: turns })
+                        .await;
                     tokio::select! {
                         biased;
                         _ = cancel.cancelled() => (None, TokenUsage::default()),

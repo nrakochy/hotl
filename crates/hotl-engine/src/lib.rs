@@ -426,6 +426,12 @@ pub enum EngineEvent {
         lines: u64,
         bytes: u64,
     },
+    /// A goal evaluation is about to reach the model (0061 T18). A verdict a
+    /// machine leaf settled needs no model and announces nothing — this
+    /// fires only for the branch that costs a call and a wait.
+    GoalEvaluating {
+        turn: u32,
+    },
     /// A call that is approved but waiting on the `subprocs` permit (0061
     /// T17). `ahead` is how many callers were already queued — process-wide,
     /// since children share the budget. Emitted before `ToolStart`, which
@@ -634,6 +640,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::ThinkingDelta(_) => write!(f, "ThinkingDelta"),
             Self::ToolStart { name, .. } => write!(f, "ToolStart({name})"),
             Self::ToolDone { name, ok, .. } => write!(f, "ToolDone({name},{ok})"),
+            Self::GoalEvaluating { turn } => write!(f, "GoalEvaluating({turn})"),
             Self::ToolQueued { name, ahead, .. } => write!(f, "ToolQueued({name},ahead={ahead})"),
             Self::Compacting { items } => write!(f, "Compacting({items})"),
             Self::ToolProgress { name, lines, .. } => write!(f, "ToolProgress({name},{lines})"),

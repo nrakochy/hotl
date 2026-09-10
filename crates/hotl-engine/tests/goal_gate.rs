@@ -801,6 +801,60 @@ async fn the_evaluator_prompt_carries_the_evidence_block() {
     );
 }
 
+/// 0061 T18: the evaluation runs with the turn already over, so nothing else
+/// is on screen while it waits. The announcement precedes its verdict and
+/// names the turn the verdict will report.
+#[tokio::test]
+async fn a_model_evaluation_is_announced_before_its_verdict() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("working"),
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: the work is done"),
+    ]));
+    let (mut handle, _) = session(provider, dir.path());
+    handle.set_goal(Some("finish the work".into())).await;
+    handle.prompt("go".into()).await;
+    let seen = events_until_turn_done(&mut handle).await;
+
+    let announced = seen
+        .iter()
+        .position(|e| matches!(e, EngineEvent::GoalEvaluating { .. }))
+        .expect("the evaluation must announce itself");
+    let settled = seen
+        .iter()
+        .position(|e| matches!(e, EngineEvent::GoalVerdict { .. }))
+        .expect("the verdict");
+    assert!(announced < settled, "announced after the fact");
+    let (Some(EngineEvent::GoalEvaluating { turn }), Some(EngineEvent::GoalVerdict { turns, .. })) =
+        (seen.get(announced), seen.get(settled))
+    else {
+        unreachable!()
+    };
+    assert_eq!(turn, turns, "the notice and the verdict name the same turn");
+}
+
+/// A machine leaf costs no call and no wait, so it announces nothing.
+#[tokio::test]
+async fn a_machine_settled_condition_announces_no_evaluation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("working"),
+        ScriptedProvider::text_reply("working still"),
+    ]));
+    let (mut handle, _) = session_with(provider, dir.path(), ran(0));
+    handle
+        .set_goal(Some("file_exists(\"never-written.json\")".into()))
+        .await;
+    handle.prompt("go".into()).await;
+    let seen = events_until_turn_done(&mut handle).await;
+    assert!(
+        !seen
+            .iter()
+            .any(|e| matches!(e, EngineEvent::GoalEvaluating { .. })),
+        "a free verdict announced a wait"
+    );
+}
+
 /// T5: a false machine leaf settles the goal with no evaluator call at all —
 /// the scripted provider records exactly one request, the turn's own.
 #[tokio::test]

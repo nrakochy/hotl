@@ -47,6 +47,7 @@ fn every_frame_is_tagged_and_versioned() {
             summary: "bash: cargo test".into(),
             ahead: 2,
         },
+        EngineEvent::GoalEvaluating { turn: 3 },
         EngineEvent::ToolDenied {
             id: "t2".into(),
             name: "write".into(),
@@ -431,6 +432,16 @@ fn tool_progress_is_a_tagged_frame_with_tail_and_counts() {
     assert_eq!(f["tail"], "Compiling hotl-engine");
     assert_eq!(f["lines"], 12);
     assert_eq!(f["bytes"], 480);
+}
+
+/// 0061 T18: a model-backed goal evaluation runs with the turn already over,
+/// so the surface has nothing else to show while it waits.
+#[test]
+fn goal_evaluating_carries_the_turn() {
+    let f = wire::update_frame(&EngineEvent::GoalEvaluating { turn: 3 })
+        .expect("goal_evaluating is a stream frame");
+    assert_eq!(f["type"], "goal_evaluating");
+    assert_eq!(f["turn"], 3);
 }
 
 /// 0061 T17: the `subprocs` permit was the one wait that emitted nothing at

@@ -57,6 +57,9 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         } => {
             json!({"type": "tool_done", "id": id, "name": name, "ok": ok, "lines": lines, "bytes": bytes})
         }
+        EngineEvent::GoalEvaluating { turn } => {
+            json!({"type": "goal_evaluating", "turn": turn})
+        }
         EngineEvent::ToolQueued {
             id,
             name,

@@ -294,6 +294,7 @@ fn update_line(update: &Value) -> Option<String> {
             // liveness. The console renders these on the card instead.
             "tool_progress" => return None,
             "compacting" => format!("(folding history — {} items)", n("items")),
+            "goal_evaluating" => format!("· evaluating goal (turn {})", n("turn")),
             "tool_queued" => format!("· queued: {} (behind {})", s("summary"), n("ahead")),
             // Mirrors `tool_done`'s success exemption: a child that worked
             // needs no line (0039).
@@ -440,6 +441,7 @@ mod tests {
                 summary: "bash: cargo test".into(),
                 ahead: 2,
             },
+            EngineEvent::GoalEvaluating { turn: 3 },
             EngineEvent::ToolDenied {
                 id: "t2".into(),
                 name: "write".into(),
