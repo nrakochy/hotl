@@ -1550,6 +1550,56 @@ mod tests {
         v.to_string().matches("\"prompt_cache_breakpoint\"").count()
     }
 
+    /// A16, on the chat wire: the twin of the Responses dialect's
+    /// `explicit_breakpoints_accumulate_rather_than_roll`, and for the same
+    /// reason — `prompt_cache_breakpoint` rides inside the content part, so a
+    /// rolling window of four would rewrite already-cached bytes and re-bill
+    /// the history every sample. Markers accumulate; they never move.
+    #[test]
+    fn explicit_breakpoints_accumulate_rather_than_roll() {
+        let durable: Vec<Item> = (0..60)
+            .flat_map(|i| {
+                vec![
+                    user(&format!("turn {i}")),
+                    tool_use(&format!("c{i}")),
+                    results(&[&format!("c{i}")]),
+                ]
+            })
+            .collect();
+        // Durable only: the tail and the MOIM ride after every marker.
+        let body_of = |n: usize| {
+            let mut req = static_req();
+            req.items = hotl_provider::arc_items(durable[..n].to_vec());
+            req.ephemeral_tail = std::sync::Arc::new(Vec::new());
+            req.turn_context = None;
+            OpenAiCompatProvider::body_for(&req, false, true)
+        };
+        let full = body_of(durable.len());
+        assert_eq!(markers_in(&full), 120, "one per durable user-role message");
+
+        let marked = |body: &Value| -> Vec<usize> {
+            body["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| markers_in(m) > 0)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let earlier = body_of(durable.len() - 3);
+        let later = body_of(durable.len());
+        assert!(
+            marked(&later).starts_with(&marked(&earlier)),
+            "a marker moved: {:?} then {:?}",
+            marked(&earlier),
+            marked(&later)
+        );
+        let a = earlier["messages"].as_array().unwrap();
+        let b = later["messages"].as_array().unwrap();
+        assert!(a.iter().zip(b).all(|(x, y)| x == y), "the prefix moved");
+    }
+
     /// D1/D2 on the chat wire: explicit-only mode, one marker on the last
     /// part of every durable user-role message, nothing on the system
     /// message, the tail or the MOIM.

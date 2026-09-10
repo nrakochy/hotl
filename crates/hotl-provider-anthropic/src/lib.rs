@@ -228,8 +228,18 @@ impl<'a> WireBody<'a> {
         }
     }
 
-    fn count_marker(&self) {
-        self.markers.set(self.markers.get() + 1);
+    /// Claim one of the request's `cache_control` slots, or refuse once the
+    /// budget is spent. A compare and a `Cell` store, no allocation — the
+    /// release-build twin of the `debug_assert` in `serialize`, which
+    /// [`cache_plan::Plan::bounded`] already makes unreachable. A dropped
+    /// marker costs one cached segment; a fifth marker costs a 400.
+    fn take_marker(&self) -> bool {
+        let n = self.markers.get();
+        if n >= cache_plan::MAX_BREAKPOINTS {
+            return false;
+        }
+        self.markers.set(n + 1);
+        true
     }
 }
 
@@ -306,9 +316,8 @@ impl serde::Serialize for SystemField<'_> {
         impl serde::Serialize for Block<'_> {
             fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
                 let mut map = s.serialize_map(None)?;
-                if self.0.mark {
+                if self.0.mark && self.0.take_marker() {
                     map.serialize_entry("cache_control", &ttl_marker(self.0.ttl))?;
-                    self.0.count_marker();
                 }
                 map.serialize_entry("text", self.0.req.system.as_ref())?;
                 map.serialize_entry("type", "text")?;
@@ -336,9 +345,8 @@ impl serde::Serialize for ToolsField<'_> {
         impl serde::Serialize for Entry<'_> {
             fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
                 let mut map = s.serialize_map(None)?;
-                if self.marked {
+                if self.marked && self.body.take_marker() {
                     map.serialize_entry("cache_control", &ttl_marker(self.body.ttl))?;
-                    self.body.count_marker();
                 }
                 map.serialize_entry("description", &self.tool.description)?;
                 map.serialize_entry("input_schema", &self.tool.input_schema)?;
@@ -517,9 +525,8 @@ impl serde::Serialize for TextBlock<'_> {
     fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         use serde::ser::SerializeMap;
         let mut map = s.serialize_map(None)?;
-        if let Some(cc) = &self.cc {
+        if let Some(cc) = self.cc.as_ref().filter(|_| self.body.take_marker()) {
             map.serialize_entry("cache_control", cc)?;
-            self.body.count_marker();
         }
         map.serialize_entry("text", self.text)?;
         map.serialize_entry("type", "text")?;
@@ -586,9 +593,8 @@ impl serde::Serialize for ResultsContent<'_> {
         impl serde::Serialize for Block<'_> {
             fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
                 let mut map = s.serialize_map(None)?;
-                if let Some(cc) = &self.cc {
+                if let Some(cc) = self.cc.as_ref().filter(|_| self.body.take_marker()) {
                     map.serialize_entry("cache_control", cc)?;
-                    self.body.count_marker();
                 }
                 map.serialize_entry("content", &self.r.content)?;
                 if self.r.is_error {
@@ -2404,6 +2410,40 @@ mod tests {
         let ttls = marker_ttls(&one_body);
         assert_eq!(ttls.iter().filter(|t| t.is_some()).count(), 2, "{ttls:?}");
         assert_eq!(ttls.last().unwrap(), &None, "latest stays plain: {ttls:?}");
+    }
+
+    /// The release-build backstop, stated on a plan the planner can no longer
+    /// produce: five markers are wanted, four reach the wire. Which one is
+    /// refused is deliberately unspecified beyond "the fifth in wire order" —
+    /// `Plan::bounded` is what decides *which* markers exist, and it makes
+    /// this path unreachable. The point is only that the body is valid.
+    ///
+    /// Profile-independent on purpose: it must hold under
+    /// `cargo test --release -p hotl-provider-anthropic`, where the
+    /// `debug_assert` that used to be the only guard is compiled out.
+    #[test]
+    fn release_body_never_carries_a_fifth_marker() {
+        let req = static_req("sys", vec![tool_results(60)]);
+        // Three anchors + latest + the system prefix marker = five wanted.
+        let over = cache_plan::Plan {
+            anchors: vec![
+                cache_plan::Mark { item: 0, block: 10 },
+                cache_plan::Mark { item: 0, block: 20 },
+                cache_plan::Mark { item: 0, block: 30 },
+            ],
+            latest: Some(cache_plan::Mark { item: 0, block: 59 }),
+        };
+        let body = WireBody {
+            plan: Some(over),
+            ..WireBody::new(&req)
+        };
+        let text = serde_json::to_string(&body).expect("serializes");
+        let value: Value = serde_json::from_str(&text).expect("valid JSON");
+        assert_eq!(
+            count_markers(&value),
+            cache_plan::MAX_BREAKPOINTS,
+            "{value:#}"
+        );
     }
 
     /// The budget assertion is a `debug_assert` in the body serializer; this is the

@@ -69,7 +69,12 @@ pub(crate) const MAX_BREAKPOINTS: usize = 4;
 
 /// What is left of the budget for rolling anchors once the prefix marker and
 /// the latest marker have taken theirs.
-const MAX_ANCHORS: usize = MAX_BREAKPOINTS - 2;
+pub(crate) const MAX_ANCHORS: usize = MAX_BREAKPOINTS - 2;
+
+/// The budget arithmetic, checked at compile time: 1 prefix + anchors + 1
+/// latest is the whole allowance, so [`Plan::bounded`] is what keeps a
+/// serialized body inside it.
+const _: () = assert!(1 + MAX_ANCHORS + 1 == MAX_BREAKPOINTS);
 
 /// Wire content-block cost of one item.
 ///
@@ -117,6 +122,17 @@ pub(crate) struct Plan {
 }
 
 impl Plan {
+    /// Drop all but the newest [`MAX_ANCHORS`] anchors. The deepest markers
+    /// are the ones a growing history still needs; the shallow ones are
+    /// already sealed behind them. Structural, so no body can ever want a
+    /// fifth marker — the serializer's live compare is only a backstop.
+    fn bounded(mut self) -> Self {
+        if self.anchors.len() > MAX_ANCHORS {
+            self.anchors.drain(..self.anchors.len() - MAX_ANCHORS);
+        }
+        self
+    }
+
     /// Does a `cache_control` marker belong on this rendered block at all —
     /// i.e. is it either the LATEST marker or a rolling ANCHOR? Anchors are
     /// deduped against `latest` when the plan is built, so the two can never
@@ -234,12 +250,7 @@ pub(crate) fn plan<I: std::borrow::Borrow<Item>>(items: &[I], send_images: bool)
             anchors.push(m);
         }
     }
-    // Keep the *last* MAX_ANCHORS: the deepest markers are the ones a growing
-    // history still needs. The shallow ones are already sealed behind them.
-    if anchors.len() > MAX_ANCHORS {
-        anchors.drain(..anchors.len() - MAX_ANCHORS);
-    }
-    Plan { anchors, latest }
+    Plan { anchors, latest }.bounded()
 }
 
 #[cfg(test)]
@@ -313,6 +324,50 @@ mod tests {
         for pair in positions.windows(2) {
             assert!(pair[1] - pair[0] <= 20, "lookback gap: {positions:?}");
         }
+    }
+
+    /// The budget is structural, not a debug assertion: no item list, however
+    /// wide, can plan a fifth marker. Pinned across widths so a planner change
+    /// that stopped truncating fails here rather than as a 400.
+    #[test]
+    fn plan_never_yields_more_anchors_than_max() {
+        for n in [0, 1, 14, 15, 16, 60, 200] {
+            let p = plan(&[results(n)], true);
+            assert!(
+                p.anchors.len() <= MAX_ANCHORS,
+                "{n} results planned {} anchors",
+                p.anchors.len()
+            );
+            // 1 prefix + anchors + at most 1 latest is the whole allowance.
+            assert!(1 + p.anchors.len() + usize::from(p.latest.is_some()) <= MAX_BREAKPOINTS);
+        }
+        // Non-vacuous: 200 candidates really do cross more strides than the
+        // budget holds, and the survivors are the deepest ones.
+        let items = vec![results(200)];
+        let all = crossings(&candidates(&items, true));
+        assert!(
+            all.len() > MAX_ANCHORS,
+            "fixture crossed only {}",
+            all.len()
+        );
+        let p = plan(&items, true);
+        assert_eq!(p.anchors, all[all.len() - MAX_ANCHORS..]);
+    }
+
+    /// `bounded` is what the planner leans on, so it is stated on its own —
+    /// a hand-built over-budget plan keeps the newest anchors, drops the
+    /// shallow ones, and leaves `latest` alone.
+    #[test]
+    fn bounded_keeps_the_newest_anchors() {
+        let over = Plan {
+            anchors: (0..5).map(|i| mark(0, i * 10)).collect(),
+            latest: Some(mark(0, 99)),
+        };
+        let p = over.bounded();
+        assert_eq!(p.anchors, vec![mark(0, 30), mark(0, 40)]);
+        assert_eq!(p.latest, Some(mark(0, 99)));
+        // Idempotent, and a plan already inside the budget is untouched.
+        assert_eq!(p.anchors.clone(), p.bounded().anchors);
     }
 
     /// The budget: many crossings exist, the last two win.

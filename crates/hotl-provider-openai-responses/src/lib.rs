@@ -1165,6 +1165,66 @@ mod tests {
         v.to_string().matches("\"prompt_cache_breakpoint\"").count()
     }
 
+    /// A16, answered on this dialect's own terms. The marker count is
+    /// **deliberately unbounded**: `prompt_cache_breakpoint` rides *inside*
+    /// the content part, so it is part of the bytes OpenAI hashes as the
+    /// prefix. Dropping a shallow marker to keep a rolling window of four
+    /// would change an already-cached item's bytes and re-bill the whole
+    /// history on every sample — the opposite of the fix. What has to hold
+    /// instead is that markers only ever accumulate, which this pins over a
+    /// 60-item projection.
+    #[test]
+    fn explicit_breakpoints_accumulate_rather_than_roll() {
+        let durable: Vec<Item> = (0..60)
+            .flat_map(|i| {
+                vec![
+                    user(&format!("turn {i}")),
+                    tool_use(&format!("c{i}")),
+                    results(&[&format!("c{i}")]),
+                ]
+            })
+            .collect();
+        // Two user-role items per round (the prompt and the batch), and every
+        // one of them carries a marker.
+        // Durable only: the tail and the MOIM ride after every marker, so
+        // leaving them on would compare a shorter body's tail against a
+        // longer body's durable items.
+        let body_of = |n: usize| {
+            let mut req = static_req();
+            req.items = hotl_provider::arc_items(durable[..n].to_vec());
+            req.ephemeral_tail = std::sync::Arc::new(Vec::new());
+            req.turn_context = None;
+            body_for(&req, true)
+        };
+        let full = body_of(durable.len());
+        assert_eq!(markers_in(&full), 120, "one per durable user-role item");
+
+        // …and every marked position of a shorter projection is still marked
+        // in a longer one, byte-identically. That is the property a bounded
+        // window would break.
+        let marked = |body: &Value| -> Vec<usize> {
+            body["input"]
+                .as_array()
+                .expect("input")
+                .iter()
+                .enumerate()
+                .filter(|(_, item)| markers_in(item) > 0)
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let earlier = body_of(durable.len() - 3);
+        let later = body_of(durable.len());
+        assert!(
+            marked(&later).starts_with(&marked(&earlier)),
+            "a marker moved: {:?} then {:?}",
+            marked(&earlier),
+            marked(&later)
+        );
+        let a = earlier["input"].as_array().unwrap();
+        let b = later["input"].as_array().unwrap();
+        assert!(a.iter().zip(b).all(|(x, y)| x == y), "the prefix moved");
+    }
+
     /// D1/D2: explicit-only mode, one marker on the last block of every
     /// durable user-role item, nothing on the tail or the MOIM.
     #[test]
