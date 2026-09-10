@@ -45,13 +45,32 @@ pub type QuestionSink =
 
 pub struct AskUserTool {
     sink: QuestionSink,
+    /// What a `NoHuman` answer reads as. A sub-agent gets different guidance
+    /// (0058 T9): "state your assumption and carry on" is right for an
+    /// unattended top-level run and wrong for a child, whose caller is a
+    /// model that can escalate.
+    no_human: Option<String>,
 }
 
 impl AskUserTool {
     pub fn new(sink: QuestionSink) -> Self {
-        Self { sink }
+        Self {
+            sink,
+            no_human: None,
+        }
+    }
+
+    /// Override the no-human guidance. Used for child sessions.
+    pub fn with_no_human(mut self, text: impl Into<String>) -> Self {
+        self.no_human = Some(text.into());
+        self
     }
 }
+
+/// What a sub-agent is told instead: nobody is reachable from down here, and
+/// its caller is a model that can act on a question.
+pub const CHILD_NO_HUMAN: &str = "No human is reachable from a sub-agent. Finish now with \
+     report_result {outcome: \"needs_input\", question: \"<the one thing a human must decide>\"}.";
 
 /// Validate + parse one question: a header, a prompt, and 2-4 options each
 /// with a non-empty label. 0/1 options should use the permission ask
@@ -133,14 +152,20 @@ pub fn parse_question(input: &Value) -> Result<Question, ToolOutcome> {
 /// options; `NoHuman` is the headless/no-human guidance — always resolves,
 /// never a dead end, so an unattended run proceeds instead of hanging.
 pub fn format_answer(answer: &QuestionAnswer) -> String {
+    format_answer_with(answer, None)
+}
+
+/// [`format_answer`] with a caller-supplied `NoHuman` rendering.
+pub fn format_answer_with(answer: &QuestionAnswer, no_human: Option<&str>) -> String {
     match answer {
         QuestionAnswer::Selected(labels) => labels.join(", "),
         QuestionAnswer::FreeText(text) => format!("The user answered: {text}"),
-        QuestionAnswer::NoHuman => {
-            "No human is available to answer; proceed with your best judgment and state the \
-             assumption you made."
-                .to_string()
-        }
+        QuestionAnswer::NoHuman => no_human
+            .unwrap_or(
+                "No human is available to answer; proceed with your best judgment and state the \
+                 assumption you made.",
+            )
+            .to_string(),
     }
 }
 
@@ -199,7 +224,7 @@ impl Tool for AskUserTool {
                 Err(e) => return e,
             };
             let answer = (self.sink)(question, cancel).await;
-            ToolOutcome::ok(format_answer(&answer))
+            ToolOutcome::ok(format_answer_with(&answer, self.no_human.as_deref()))
         })
     }
 }
@@ -252,6 +277,11 @@ mod tests {
             "The user answered: do it another way"
         );
         assert!(format_answer(&QuestionAnswer::NoHuman).contains("No human is available"));
+        // A child is told to escalate through its typed return instead.
+        assert!(
+            format_answer_with(&QuestionAnswer::NoHuman, Some(CHILD_NO_HUMAN))
+                .contains("report_result")
+        );
     }
 
     #[tokio::test]

@@ -1650,14 +1650,21 @@ fn spawn_session_inner(
         }),
         plan_artifact_path.clone(),
     )));
-    registry.register(Box::new(hotl_tools::AskUserTool::new(
-        hotl_engine::question_sink(
-            cmd_tx.downgrade(),
-            event_tx.downgrade(),
-            hooks.clone(),
-            notifications.clone(),
-        ),
-    )));
+    // A session with no `spawn` registration IS a child — depth-1 makes that
+    // structural, so it doubles as the marker for "nobody is reachable from
+    // here" (0058 T9). `ask_user` then tells the child to escalate through
+    // its typed return instead of inventing an assumption.
+    let question_sink = hotl_engine::question_sink(
+        cmd_tx.downgrade(),
+        event_tx.downgrade(),
+        hooks.clone(),
+        notifications.clone(),
+    );
+    let ask_user = hotl_tools::AskUserTool::new(question_sink.clone());
+    registry.register(Box::new(match spawn.is_some() {
+        true => ask_user,
+        false => ask_user.with_no_human(hotl_tools::ask::CHILD_NO_HUMAN),
+    }));
     // `recall`, always: the `session-log` backend needs no configuration, so
     // the tool is advertised for every session — one schema change at the
     // version boundary, never mid-session.
@@ -1717,6 +1724,10 @@ fn spawn_session_inner(
                 workflow_gate,
             )
             .with_prefix_stagger(prefix_stagger)
+            // A `human_input` phase asks through the same sink `ask_user`
+            // does, so a workflow pause parks and re-issues like any other
+            // question.
+            .with_ask(question_sink)
             .with_events(event_tx.downgrade()),
         ));
     }
@@ -4918,6 +4929,70 @@ mod tests {
         let reg = cb.child_registry(&general, &cb.cwd, None);
         assert!(reg.get("write").is_some() && reg.get("bash").is_some());
         assert!(reg.get("spawn").is_none(), "children never recurse");
+    }
+
+    /// 0058 T9: `ask_user` inside a child does not park and does not invent
+    /// an assumption — it tells the child to escalate through its typed
+    /// return, which its caller (a model) can act on.
+    #[tokio::test]
+    async fn ask_user_in_a_child_says_to_escalate_through_report_result() {
+        let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::tool_call(
+                "c1",
+                "ask_user",
+                serde_json::json!({
+                    "header": "Which?",
+                    "prompt": "pick one",
+                    "options": [{"label": "a"}, {"label": "b"}]
+                }),
+            ),
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        let (mut cb, _store) = test_child_builder();
+        cb.provider = provider.clone();
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let mut handle = cb
+            .spawn_child(&general, Vec::new(), None, None)
+            .expect("child spawns")
+            .handle;
+        handle.prompt("go".into()).await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                break;
+            }
+        }
+        // The second request carries the tool result the child actually saw.
+        let requests = provider.requests();
+        assert_eq!(
+            requests.len(),
+            2,
+            "it asked, was answered, and answered back"
+        );
+        let results: Vec<String> = requests[1]
+            .items
+            .iter()
+            .filter_map(|i| match &**i {
+                hotl_types::Item::ToolResults { results } => Some(
+                    results
+                        .iter()
+                        .map(|r| r.content.clone())
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let answer = results.join("\n");
+        assert!(answer.contains("report_result"), "{answer}");
+        assert!(answer.contains("needs_input"), "{answer}");
+        assert!(
+            !answer.contains("best judgment"),
+            "a child must not be told to assume: {answer}"
+        );
     }
 
     /// 0058 T4: a child never inherits bypass. The parent's allow and deny

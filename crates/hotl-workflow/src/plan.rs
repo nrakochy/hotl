@@ -49,6 +49,57 @@ pub struct Phase {
     pub stages: Option<Vec<AgentSpec>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until_quiet: Option<UntilQuiet>,
+    /// Stop and ask a human (0058 T9). The fourth shape: no agents run, the
+    /// run parks until someone answers, and the answer can route the rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_input: Option<HumanInput>,
+}
+
+/// A pause for a human. `actions` is what they may choose; a chosen action
+/// may route the run to another phase, which is how "reject → back to Fix"
+/// is expressed without a second control-flow concept.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanInput {
+    pub prompt: String,
+    /// Values to collect before the choice. Each is asked in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<HumanField>,
+    pub actions: Vec<HumanAction>,
+    /// How long to wait before routing to `on_timeout`. Without one the run
+    /// waits as long as the caller does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+    /// The phase a timeout routes to. Without one, a timeout ends the run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_timeout: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanField {
+    /// Also the key the answer lands under: `{{Approve.fields.reason}}`.
+    pub name: String,
+    pub kind: FieldKind,
+    /// Required for `choice`, meaningless for `text`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FieldKind {
+    Text,
+    Choice,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HumanAction {
+    pub label: String,
+    /// The phase to continue at. Omitted: fall through to the next phase.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -118,6 +169,7 @@ pub enum Shape<'a> {
         cfg: &'a UntilQuiet,
         agents: &'a [AgentSpec],
     },
+    Human(&'a HumanInput),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +193,72 @@ impl std::fmt::Display for PlanError {
     }
 }
 
+/// A `human_input` step's own rules: at least one action, every `next` and
+/// `on_timeout` naming a real phase, and a `choice` field carrying options.
+fn check_human_input(v: &mut Validator, at: &str, cfg: &HumanInput, titles: &[&str]) {
+    if cfg.prompt.trim().is_empty() {
+        v.error(
+            at,
+            "`human_input.prompt` is required — say what you are asking",
+        );
+    }
+    if cfg.actions.is_empty() {
+        v.error(
+            at,
+            "`human_input.actions` is empty: a person needs something to choose",
+        );
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for action in &cfg.actions {
+        if action.label.trim().is_empty() {
+            v.error(at, "an action needs a `label`");
+        }
+        if !seen.insert(&action.label) {
+            v.error(at, format!("duplicate action label `{}`", action.label));
+        }
+        if let Some(next) = &action.next {
+            if !titles.contains(&next.as_str()) {
+                v.error(
+                    at,
+                    format!(
+                        "action `{}` routes to `{next}`, which is not a phase in this plan",
+                        action.label
+                    ),
+                );
+            }
+        }
+    }
+    for field in &cfg.fields {
+        if !is_ident(&field.name) {
+            v.error(
+                at,
+                format!("field name `{}` must be a name like `reason`", field.name),
+            );
+        }
+        if field.kind == crate::plan::FieldKind::Choice && field.options.len() < 2 {
+            v.error(
+                at,
+                format!(
+                    "field `{}` is a `choice` and needs at least two `options`",
+                    field.name
+                ),
+            );
+        }
+    }
+    match (&cfg.on_timeout, cfg.timeout_secs) {
+        (Some(target), Some(_)) if !titles.contains(&target.as_str()) => v.error(
+            at,
+            format!("`on_timeout` routes to `{target}`, which is not a phase in this plan"),
+        ),
+        (Some(_), None) => v.error(at, "`on_timeout` needs a `timeout_secs` to trigger it"),
+        (None, Some(_)) => v.warn(
+            at,
+            "`timeout_secs` without `on_timeout`: a timeout will end the run",
+        ),
+        _ => {}
+    }
+}
+
 /// Reserved roots a phase title may not shadow.
 pub const RESERVED_ROOTS: [&str; 3] = ["args", "item", "prev"];
 
@@ -157,16 +275,24 @@ pub fn is_plan_name(s: &str) -> bool {
 impl Phase {
     /// Exactly one of: `agents`; `each` + `stages`; `until_quiet` + `agents`.
     pub fn shape(&self) -> Result<Shape<'_>, String> {
-        match (&self.agents, &self.each, &self.stages, &self.until_quiet) {
-            (Some(agents), None, None, None) => Ok(Shape::Parallel(agents)),
-            (None, Some(each), Some(stages), None) => Ok(Shape::Each {
+        match (
+            &self.agents,
+            &self.each,
+            &self.stages,
+            &self.until_quiet,
+            &self.human_input,
+        ) {
+            (Some(agents), None, None, None, None) => Ok(Shape::Parallel(agents)),
+            (None, Some(each), Some(stages), None, None) => Ok(Shape::Each {
                 selector: each,
                 stages,
             }),
-            (Some(agents), None, None, Some(cfg)) => Ok(Shape::UntilQuiet { cfg, agents }),
+            (Some(agents), None, None, Some(cfg), None) => Ok(Shape::UntilQuiet { cfg, agents }),
+            (None, None, None, None, Some(cfg)) => Ok(Shape::Human(cfg)),
             _ => Err(
                 "use exactly one shape: `agents` (parallel), `each` + `stages` \
-                      (per-item pipeline), or `until_quiet` + `agents` (repeat until quiet)"
+                      (per-item pipeline), `until_quiet` + `agents` (repeat until quiet), \
+                      or `human_input` (pause for a person)"
                     .into(),
             ),
         }
@@ -210,8 +336,12 @@ impl Plan {
         }
         let mut seen: HashSet<&str> = HashSet::new();
         let mut available: Vec<&str> = vec!["args"];
+        let titles: Vec<&str> = self.phases.iter().map(|p| p.title.as_str()).collect();
         for phase in &self.phases {
             let at = format!("phase `{}`", phase.title);
+            if let Some(cfg) = &phase.human_input {
+                check_human_input(&mut v, &at, cfg, &titles);
+            }
             if !is_ident(&phase.title) {
                 v.error(&at, "title must be a name like `Review` or `find_bugs` (it is also a selector root)");
             } else if RESERVED_ROOTS.contains(&phase.title.as_str()) {
@@ -269,6 +399,9 @@ impl Plan {
                     roots.push(&phase.title);
                     agents
                 }
+                // Checked below, against every title — which is only known
+                // once the whole list has been walked.
+                Shape::Human(_) => &[],
             };
             for (i, spec) in specs.iter().enumerate() {
                 let at = format!("{at} agent `{}`", spec.label);
@@ -522,6 +655,7 @@ pub(crate) mod tests {
             each: Some("args.x".into()),
             stages: Some(vec![]),
             until_quiet: None,
+            human_input: None,
         };
         assert!(both.shape().unwrap_err().contains("exactly one shape"));
         let none = Phase {
@@ -530,6 +664,7 @@ pub(crate) mod tests {
             each: None,
             stages: None,
             until_quiet: None,
+            human_input: None,
         };
         assert!(none.shape().is_err());
         let each_without_stages = Phase {

@@ -14,10 +14,11 @@ pub mod template;
 
 pub use discover::{discover, Found};
 pub use exec::{
-    run_plan, AgentReply, AgentRequest, AgentRunner, AgentStatus, Limits, Observer, Run, RunError,
-    RunOutcome, RunStatus, RunSummary, Silent,
+    run_plan, AgentReply, AgentRequest, AgentRunner, AgentStatus, HumanAnswer, HumanQuestion,
+    Limits, Observer, Run, RunError, RunOutcome, RunStatus, RunSummary, Silent,
 };
 pub use plan::{
-    json_schema, AgentSpec, Effort, Isolation, Phase, Plan, PlanError, Severity, Shape,
+    json_schema, AgentSpec, Effort, FieldKind, HumanAction, HumanField, HumanInput, Isolation,
+    Phase, Plan, PlanError, Severity, Shape,
 };
 pub use summary::Estimate;

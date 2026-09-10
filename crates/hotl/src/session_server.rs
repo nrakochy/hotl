@@ -57,6 +57,18 @@ struct Shared {
     /// Parked permission asks: id → (reply channel, the request frame to
     /// re-send, when it was parked). The instant is what `ask_expiry` reads.
     pending: Mutex<HashMap<u64, Parked<hotl_engine::AskReply>>>,
+    /// Parked `ask_user` questions (0058 T9), same shape as `pending`. These
+    /// used to fall through the catch-all and resolve `NoHuman` the moment
+    /// the sender dropped — a question asked while nobody was attached was
+    /// answered by nobody and never re-issued.
+    ///
+    /// **Deliberately not swept by `ask_expiry`** (0059 T5), which denies a
+    /// parked *permission* ask after an hour. A question authorizes nothing,
+    /// so leaving one parked risks nothing — and the case that would break is
+    /// exactly the one worth protecting: a `human_input` workflow step is a
+    /// recipe deliberately waiting for a person, with its own `timeout_secs`
+    /// chosen by whoever wrote it. A global hour would silently override that.
+    pending_question: Mutex<HashMap<u64, Parked<hotl_types::QuestionAnswer>>>,
     /// Parked egress asks (plan 0026), same shape as `pending`.
     ///
     /// A separate map, sharing `next_ask`: the two carry different reply types
@@ -303,6 +315,7 @@ pub async fn serve_on(
         handle,
         client: AsyncMutex::new(None),
         pending: Mutex::new(HashMap::new()),
+        pending_question: Mutex::new(HashMap::new()),
         pending_egress: Mutex::new(HashMap::new()),
         next_ask: AtomicU64::new(1),
         session_id,
@@ -498,6 +511,28 @@ async fn handle_frame(line: &str, shared: &Arc<Shared>) -> ClientAction {
                 }
             }
         }
+        "question_reply" => {
+            if let Some(id) = msg.get("id").and_then(Value::as_u64) {
+                if let Some((reply, ..)) = shared
+                    .pending_question
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(&id)
+                {
+                    // An option label, free text, or neither — a malformed
+                    // answer is `NoHuman`, never a made-up selection.
+                    let ans = match (
+                        msg.get("option").and_then(Value::as_str),
+                        msg.get("text").and_then(Value::as_str),
+                    ) {
+                        (Some(o), _) => hotl_types::QuestionAnswer::Selected(vec![o.to_string()]),
+                        (None, Some(t)) => hotl_types::QuestionAnswer::FreeText(t.to_string()),
+                        (None, None) => hotl_types::QuestionAnswer::NoHuman,
+                    };
+                    let _ = reply.send(ans);
+                }
+            }
+        }
         "egress_reply" => {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
                 if let Some((reply, _, _)) = shared
@@ -534,6 +569,11 @@ async fn resend_pending(shared: &Arc<Shared>) {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         pending.retain(|_, (tx, _, _)| !tx.is_closed());
+        let mut questions = shared
+            .pending_question
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        questions.retain(|_, (tx, _, _)| !tx.is_closed());
         let mut egress = shared
             .pending_egress
             .lock()
@@ -545,6 +585,7 @@ async fn resend_pending(shared: &Arc<Shared>) {
         pending
             .values()
             .map(|(_, f, _)| f.clone())
+            .chain(questions.values().map(|(_, f, _)| f.clone()))
             .chain(egress.values().map(|(_, f, _)| f.clone()))
             .collect()
     };
@@ -573,6 +614,28 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                 });
                 shared
                     .pending
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(id, (reply, frame.clone(), std::time::Instant::now()));
+                send(&shared, &frame).await; // no-op if detached; re-sent on attach
+            }
+            EngineEvent::Question {
+                id: qid,
+                question,
+                reply,
+            } => {
+                let id = shared.next_ask.fetch_add(1, Ordering::Relaxed);
+                let frame = json!({
+                    "t": "question",
+                    "id": id,
+                    "questionId": qid,
+                    "header": question.header,
+                    "prompt": question.prompt,
+                    "options": question.options,
+                    "multi": question.multi,
+                });
+                shared
+                    .pending_question
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(id, (reply, frame.clone(), std::time::Instant::now()));
@@ -767,6 +830,139 @@ mod tests {
         }
     }
 
+    /// 0058 T9: an `ask_user` question is parked like a permission ask,
+    /// re-issued on attach, and answered by id — before this it fell through
+    /// the catch-all and resolved `NoHuman` the moment the sender dropped,
+    /// which is how a `human_input` phase would have been answered by nobody.
+    #[tokio::test]
+    async fn question_frames_park_and_are_re_issued_on_attach() {
+        let (client_side, server_side) = connected_pair("question").await;
+        let (_cr, cw) = tokio::io::split(client_side);
+        let (sr, _sw) = tokio::io::split(server_side);
+        let mut lines = tokio::io::BufReader::new(sr).lines();
+        let shared = Arc::new(Shared {
+            handle: scripted_session(),
+            client: AsyncMutex::new(Some(cw)),
+            pending: Mutex::new(HashMap::new()),
+            pending_question: Mutex::new(HashMap::new()),
+            pending_egress: Mutex::new(HashMap::new()),
+            next_ask: AtomicU64::new(1),
+            session_id: "test".into(),
+            token: "tok".into(),
+            model: "m".into(),
+            ask_expiry: std::time::Duration::from_secs(3600),
+        });
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(drain_events(events_rx, shared.clone()));
+
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        events_tx
+            .send(EngineEvent::Question {
+                id: "q1".into(),
+                question: hotl_types::Question {
+                    header: "Approve".into(),
+                    prompt: "Ship it?".into(),
+                    options: vec![
+                        hotl_types::QuestionOption {
+                            label: "ship".into(),
+                            description: None,
+                        },
+                        hotl_types::QuestionOption {
+                            label: "redo".into(),
+                            description: None,
+                        },
+                    ],
+                    multi: false,
+                },
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let frame = loop {
+            let f = next(&mut lines).await;
+            if f["t"] == "question" {
+                break f;
+            }
+        };
+        assert_eq!(frame["header"], "Approve");
+        assert_eq!(frame["questionId"], "q1");
+        let id = frame["id"].as_u64().unwrap();
+        assert!(shared.pending_question.lock().unwrap().contains_key(&id));
+
+        // A reattach re-issues it: the whole point of parking.
+        resend_pending(&shared).await;
+        let re = loop {
+            let f = next(&mut lines).await;
+            if f["t"] == "question" {
+                break f;
+            }
+        };
+        assert_eq!(re["id"], json!(id), "the same question, same id");
+
+        handle_frame(
+            &json!({"t": "question_reply", "id": id, "option": "ship"}).to_string(),
+            &shared,
+        )
+        .await;
+        assert_eq!(
+            reply_rx.await.unwrap(),
+            hotl_types::QuestionAnswer::Selected(vec!["ship".into()])
+        );
+    }
+
+    /// A reply naming no option and no text is nobody's answer — never a
+    /// made-up selection.
+    #[tokio::test]
+    async fn a_malformed_question_reply_is_no_human() {
+        let (client_side, server_side) = connected_pair("question-bad").await;
+        let (_cr, cw) = tokio::io::split(client_side);
+        let (sr, _sw) = tokio::io::split(server_side);
+        let mut lines = tokio::io::BufReader::new(sr).lines();
+        let shared = Arc::new(Shared {
+            handle: scripted_session(),
+            client: AsyncMutex::new(Some(cw)),
+            pending: Mutex::new(HashMap::new()),
+            pending_question: Mutex::new(HashMap::new()),
+            pending_egress: Mutex::new(HashMap::new()),
+            next_ask: AtomicU64::new(1),
+            session_id: "test".into(),
+            token: "tok".into(),
+            model: "m".into(),
+            ask_expiry: std::time::Duration::from_secs(3600),
+        });
+        let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
+        tokio::spawn(drain_events(events_rx, shared.clone()));
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        events_tx
+            .send(EngineEvent::Question {
+                id: "q2".into(),
+                question: hotl_types::Question {
+                    header: "Approve".into(),
+                    prompt: "Ship it?".into(),
+                    options: vec![hotl_types::QuestionOption {
+                        label: "ship".into(),
+                        description: None,
+                    }],
+                    multi: false,
+                },
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        let id = loop {
+            let f = next(&mut lines).await;
+            if f["t"] == "question" {
+                break f["id"].as_u64().unwrap();
+            }
+        };
+        handle_frame(
+            &json!({"t": "question_reply", "id": id}).to_string(),
+            &shared,
+        )
+        .await;
+        assert_eq!(reply_rx.await.unwrap(), hotl_types::QuestionAnswer::NoHuman);
+    }
+
     /// Plan 0026's egress prompt through the whole server path: framed on the
     /// wire, parked for a detached client, answered by id, and swept when the
     /// turn ends. Driven by feeding the event channel directly — the real
@@ -782,6 +978,7 @@ mod tests {
             handle: scripted_session(),
             client: AsyncMutex::new(Some(cw)),
             pending: Mutex::new(HashMap::new()),
+            pending_question: Mutex::new(HashMap::new()),
             pending_egress: Mutex::new(HashMap::new()),
             next_ask: AtomicU64::new(1),
             session_id: "test".into(),
@@ -935,6 +1132,63 @@ mod tests {
         );
     }
 
+    /// 0058 T9 × 0059 T5: the ask expiry deliberately does **not** reach
+    /// parked questions. A question authorizes nothing, so leaving one parked
+    /// risks nothing — and a `human_input` workflow step is a recipe
+    /// deliberately waiting for a person, with its own `timeout_secs` chosen
+    /// by whoever wrote it. A global hour would silently override that and
+    /// route `on_timeout` behind the author's back.
+    #[tokio::test]
+    async fn the_ask_expiry_never_touches_a_parked_question() {
+        let shared = Arc::new(Shared {
+            handle: scripted_session(),
+            client: AsyncMutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            pending_question: Mutex::new(HashMap::new()),
+            pending_egress: Mutex::new(HashMap::new()),
+            next_ask: AtomicU64::new(1),
+            session_id: "test".into(),
+            token: "tok".into(),
+            model: "m".into(),
+            ask_expiry: std::time::Duration::from_secs(3600),
+        });
+        let (ask_tx, ask_rx) = tokio::sync::oneshot::channel();
+        let (q_tx, q_rx) = tokio::sync::oneshot::channel();
+        let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(7200);
+        shared
+            .pending
+            .lock()
+            .unwrap()
+            .insert(1, (ask_tx, json!({}), long_ago));
+        shared
+            .pending_question
+            .lock()
+            .unwrap()
+            .insert(2, (q_tx, json!({}), long_ago));
+
+        // Both are two hours old; only the permission ask expires.
+        assert_eq!(sweep_expired_asks(&shared), 1);
+        assert!(matches!(
+            ask_rx.await,
+            Ok(hotl_engine::AskReply::Deny { .. })
+        ));
+        assert_eq!(
+            shared.pending_question.lock().unwrap().len(),
+            1,
+            "a question outlives the ask expiry — its deadline is the recipe's"
+        );
+        // Still answerable, which is the whole point.
+        handle_frame(
+            &json!({"t": "question_reply", "id": 2, "option": "ship"}).to_string(),
+            &shared,
+        )
+        .await;
+        assert_eq!(
+            q_rx.await.unwrap(),
+            hotl_types::QuestionAnswer::Selected(vec!["ship".into()])
+        );
+    }
+
     /// The sweep's own contract, without a socket behind it: only asks past
     /// the deadline are denied, and the denial says why.
     #[tokio::test]
@@ -943,6 +1197,7 @@ mod tests {
             handle: scripted_session(),
             client: AsyncMutex::new(None),
             pending: Mutex::new(HashMap::new()),
+            pending_question: Mutex::new(HashMap::new()),
             pending_egress: Mutex::new(HashMap::new()),
             next_ask: AtomicU64::new(1),
             session_id: "test".into(),

@@ -98,6 +98,52 @@ A phase has a `title` and **exactly one shape**:
 | parallel | `agents` | An array of the agents' values, in listed order; `null` for an agent that failed. |
 | each | `each` (a selector) + `stages` | An array with one value per selected item — the item's last stage. Items pipeline independently (item B can be in stage 2 while item A is still in stage 1); a `null` stage ends that item's pipeline. An empty selection is a no-op phase. |
 | until_quiet | `until_quiet = { rounds, max_rounds, key }` + `agents` | The union of every round's elements, deduplicated by `key` (comma-separated field paths), first-seen order. Each round runs the agents in parallel; it stops after `rounds` consecutive rounds that add nothing, or at `max_rounds`. The phase's own title (`{{Find}}`) is the union so far. |
+| human_input | `human_input = { prompt, fields, actions, timeout_secs, on_timeout }` | `{ "action": "<label>", "fields": { … }, "timed_out": false }`. No agent runs: the run stops and asks you. |
+
+### Pausing for a person
+
+```toml
+[[phases]]
+title = "Approve"
+[phases.human_input]
+prompt = "Ship the release?"
+fields = [{ name = "reason", kind = "text" }]
+actions = [{ label = "ship" }, { label = "redo", next = "Fix" }]
+timeout_secs = 3600
+on_timeout = "Abandon"
+```
+
+Each `field` is asked first (one question each; a `kind = "choice"` field
+needs at least two `options`), then the choice. The chosen action's `next`
+routes the run to that phase — which is how "reject → go back to Fix" is
+expressed without a second control-flow concept; a `next` naming a phase the
+plan doesn't have fails validation, and a routing cycle stops after 32 jumps
+rather than spinning. Without `next`, the run falls through to the following
+phase.
+
+A timeout — or an answer naming an action this plan never offered — routes
+`on_timeout`. Without an `on_timeout`, nobody answering is a run error that
+says so, never a silent skip.
+
+**Answering from anywhere.** A backgrounded run parks its question until
+someone answers, and re-issues it whenever a client attaches. From a second
+terminal:
+
+```
+hotl approve <session>                      # what is it waiting on?
+hotl approve <session> --question 5 ship    # answer by id
+hotl approve <session> --ask 2 allow        # a permission ask, same way
+```
+
+`hotl approve` connects, answers, and detaches — it does not take over the
+session the way `hotl attach` does.
+
+A parked question is **not** subject to `[behavior] ask_expiry_secs`, which
+denies an unanswered *permission* ask after an hour. A question authorizes
+nothing, so leaving one parked risks nothing, and a `human_input` step's
+deadline is the `timeout_secs` the recipe itself names — a global hour would
+override that behind the author's back. Give a step that should not wait
+forever its own `timeout_secs` and `on_timeout`.
 
 Every agent (or stage) spec:
 

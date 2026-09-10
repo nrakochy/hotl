@@ -60,6 +60,8 @@ pub struct WorkflowTool {
     events: Option<tokio::sync::mpsc::WeakSender<EngineEvent>>,
     /// `[agents] prefix_stagger_ms`; zero disables the gate.
     prefix_stagger: std::time::Duration,
+    /// The `ask_user` sink a `human_input` phase asks through.
+    ask: Option<hotl_tools::ask::QuestionSink>,
 }
 
 impl WorkflowTool {
@@ -79,10 +81,18 @@ impl WorkflowTool {
             prefix_stagger: std::time::Duration::from_millis(
                 crate::spawn::DEFAULT_PREFIX_STAGGER_MS,
             ),
+            ask: None,
             limits,
             gate,
             events: None,
         }
+    }
+
+    /// Attach the question sink `human_input` phases ask through. Same
+    /// registration-time story as `with_events`.
+    pub fn with_ask(mut self, ask: hotl_tools::ask::QuestionSink) -> Self {
+        self.ask = Some(ask);
+        self
     }
 
     /// Override the prefix-stagger wait (`[agents] prefix_stagger_ms`).
@@ -211,6 +221,7 @@ impl WorkflowTool {
         let obs = Forwarder::new(self.events.clone().zip(parent_id));
         let runner = ChildRunner {
             prefix_stagger: self.prefix_stagger,
+            ask: self.ask.clone(),
             builder: self.builder.clone(),
             config_dir: self.config_dir.clone(),
             include_claude: self.include_claude,
@@ -435,6 +446,11 @@ struct ChildRunner {
     /// `.git` are the known-flaky concurrent pair, degrading silently to
     /// `isolation_unavailable` — so creation and removal serialise here.
     creation: tokio::sync::Mutex<()>,
+    /// The `human_input` seam (0058 T9): the same `ask_user` sink the tool
+    /// uses, so a workflow pause parks and re-issues exactly like every other
+    /// question. `None` in a context with no human surface — the runner's
+    /// default then answers nobody and the plan routes `on_timeout`.
+    ask: Option<hotl_tools::ask::QuestionSink>,
     /// The prefix-stagger wait (0058 T6). A phase's agents share a system
     /// prompt and tool roster by construction, so they are exactly the case
     /// the gate exists for.
@@ -444,6 +460,34 @@ struct ChildRunner {
 impl AgentRunner for ChildRunner {
     fn run(&self, req: AgentRequest, cancel: CancellationToken) -> BoxFuture<'_, AgentReply> {
         Box::pin(self.run_one(req, cancel))
+    }
+
+    fn ask_human(
+        &self,
+        q: hotl_workflow::HumanQuestion,
+    ) -> BoxFuture<'_, hotl_workflow::HumanAnswer> {
+        Box::pin(self.ask_human_impl(q))
+    }
+}
+
+/// One `Question` round-trip, or `NoHuman` when there is no surface to ask
+/// through. `timeout` is the plan's own, applied here rather than inside the
+/// sink so a host with no human still routes `on_timeout` promptly.
+async fn ask_one(
+    sink: &Option<hotl_tools::ask::QuestionSink>,
+    q: hotl_types::Question,
+    timeout: Option<std::time::Duration>,
+    cancel: &CancellationToken,
+) -> hotl_types::QuestionAnswer {
+    let Some(sink) = sink else {
+        return hotl_types::QuestionAnswer::NoHuman;
+    };
+    let call = sink(q, cancel.clone());
+    match timeout {
+        Some(d) => tokio::time::timeout(d, call)
+            .await
+            .unwrap_or(hotl_types::QuestionAnswer::NoHuman),
+        None => call.await,
     }
 }
 
@@ -469,6 +513,67 @@ fn settle(drained: crate::spawn::Drained) -> (Result<String, String>, TokenUsage
 }
 
 impl ChildRunner {
+    /// The declared fields first, one question each, then the choice. One
+    /// `Question` carries one answer, so a step with fields is that many
+    /// round-trips — each one parked and re-issued like any other.
+    async fn ask_human_impl(&self, q: hotl_workflow::HumanQuestion) -> hotl_workflow::HumanAnswer {
+        use hotl_types::{Question, QuestionAnswer, QuestionOption};
+        let cancel = CancellationToken::new();
+        let mut fields = serde_json::Map::new();
+        for field in &q.fields {
+            let options: Vec<QuestionOption> = field
+                .options
+                .iter()
+                .map(|label| QuestionOption {
+                    label: label.clone(),
+                    description: None,
+                })
+                .collect();
+            let asked = Question {
+                header: format!("{} · {}", q.phase, field.name),
+                prompt: q.prompt.clone(),
+                options,
+                multi: false,
+            };
+            let answer = ask_one(&self.ask, asked, q.timeout, &cancel).await;
+            match answer {
+                QuestionAnswer::Selected(v) => {
+                    fields.insert(field.name.clone(), json!(v.join(", ")));
+                }
+                QuestionAnswer::FreeText(t) => {
+                    fields.insert(field.name.clone(), json!(t));
+                }
+                // Nobody answered a field: nobody is going to answer the
+                // action either, so stop asking.
+                QuestionAnswer::NoHuman => {
+                    return hotl_workflow::HumanAnswer {
+                        action: None,
+                        fields,
+                    }
+                }
+            }
+        }
+        let asked = Question {
+            header: q.phase.clone(),
+            prompt: q.prompt.clone(),
+            options: q
+                .actions
+                .iter()
+                .map(|label| QuestionOption {
+                    label: label.clone(),
+                    description: None,
+                })
+                .collect(),
+            multi: false,
+        };
+        let action = match ask_one(&self.ask, asked, q.timeout, &cancel).await {
+            QuestionAnswer::Selected(v) => v.into_iter().next(),
+            QuestionAnswer::FreeText(t) => Some(t),
+            QuestionAnswer::NoHuman => None,
+        };
+        hotl_workflow::HumanAnswer { action, fields }
+    }
+
     fn def_for(&self, req: &AgentRequest) -> Result<AgentDef, String> {
         let agent = req.agent.as_deref().unwrap_or("general-purpose");
         let Some(mut def) =

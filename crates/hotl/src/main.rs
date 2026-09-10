@@ -10,6 +10,7 @@
 //!   acp           serve the ACP JSON-RPC protocol over stdio (M4)
 //!   bg            background a session as a detached socket server (attach later)
 //!   attach        connect to a backgrounded session (bare: list them)
+//!   approve       answer a parked ask or question without attaching
 //!   serve         (internal) host a session on a unix socket — used by `bg`
 //!   setup         write default config (safe defaults; never silent) (MD)
 //!   gc            prune old sessions/blobs per [retention] (retention)
@@ -18,6 +19,7 @@
 
 mod acp;
 mod agent;
+mod approve_cli;
 mod attach;
 mod bg;
 mod clipboard;
@@ -99,6 +101,7 @@ fn main() {
         Some("attach") => std::process::exit(block_on(attach::attach_main(
             args.get(1).map(String::as_str),
         ))),
+        Some("approve") => std::process::exit(block_on(approve_cli::approve_main(&args[1..]))),
         Some("serve") => {
             let (id, prompt, name) = parse_serve_args(&args);
             std::process::exit(block_on(agent::serve_main(id, prompt, name)));
@@ -159,6 +162,7 @@ fn print_help() {
          hotl --goal \"<cond>\"   headless goal loop with the condition as the prompt (no -p needed)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
+         hotl approve <id>    answer what a backgrounded session is waiting on\n  \
          hotl watch           tmux agent dashboard (watch)\n  \
          hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
          hotl doctor          check provider keys, sandbox, config, session store\n  \

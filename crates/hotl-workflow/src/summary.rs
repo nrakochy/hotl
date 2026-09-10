@@ -78,6 +78,9 @@ impl Plan {
                 Ok(Shape::UntilQuiet { cfg, agents: specs }) => {
                     agents += votes(specs) * cfg.max_rounds.max(1)
                 }
+                // A pause starts no agent; routing can revisit phases, so the
+                // estimate stays an upper bound only in the linear case.
+                Ok(Shape::Human(_)) => open_ended = true,
                 Err(_) => {}
             }
         }
@@ -116,6 +119,10 @@ impl Plan {
                 agents.len(),
                 votes_suffix(agents)
             ),
+            Ok(Shape::Human(cfg)) => format!("{} (asks you: {})", phase.title, {
+                let labels: Vec<&str> = cfg.actions.iter().map(|a| a.label.as_str()).collect();
+                labels.join("/")
+            }),
             Err(_) => format!("{} (?)", phase.title),
         }
     }

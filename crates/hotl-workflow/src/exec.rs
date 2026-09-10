@@ -14,7 +14,9 @@ use thiserror::Error;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::plan::{AgentSpec, Effort, Isolation, Phase, Plan, PlanError, Shape, UntilQuiet};
+use crate::plan::{
+    AgentSpec, Effort, HumanField, HumanInput, Isolation, Phase, Plan, PlanError, Shape, UntilQuiet,
+};
 use crate::select::{Lookup, SelectError, Selector};
 use crate::template::{Template, TemplateError};
 
@@ -46,8 +48,36 @@ pub struct AgentReply {
     pub unverifiable: bool,
 }
 
+/// One `human_input` step, as the host has to put it to a person.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HumanQuestion {
+    pub phase: String,
+    pub prompt: String,
+    pub fields: Vec<HumanField>,
+    /// The action labels, in plan order.
+    pub actions: Vec<String>,
+    pub timeout: Option<std::time::Duration>,
+}
+
+/// What came back. `action: None` means nobody answered in time (or at all),
+/// which routes `on_timeout`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct HumanAnswer {
+    pub action: Option<String>,
+    /// One entry per collected field, by name.
+    pub fields: serde_json::Map<String, Value>,
+}
+
 pub trait AgentRunner: Send + Sync {
     fn run(&self, req: AgentRequest, cancel: CancellationToken) -> BoxFuture<'_, AgentReply>;
+
+    /// Put a `human_input` step to a person (0058 T9). The default answers
+    /// nobody — a host with no human surface routes `on_timeout` rather than
+    /// parking forever, which is the same headless posture the permission
+    /// gate takes.
+    fn ask_human(&self, _q: HumanQuestion) -> BoxFuture<'_, HumanAnswer> {
+        Box::pin(std::future::ready(HumanAnswer::default()))
+    }
 }
 
 /// Progress sink. Sync and must not block — the host forwards with `try_send`
@@ -99,6 +129,10 @@ pub enum RunError {
         #[source]
         source: SelectError,
     },
+    #[error("phase `{phase}`: nobody answered, and no `on_timeout` phase was named")]
+    NoAnswer { phase: String },
+    #[error("the run routed between phases more than {max} times — check the `next` targets on your `human_input` actions for a cycle")]
+    RouteLoop { max: usize },
     #[error("phase `{phase}` agent `{label}`: {source}")]
     Template {
         phase: String,
@@ -349,6 +383,10 @@ struct Exec<'a> {
     summary: Arc<Mutex<RunSummary>>,
 }
 
+/// How many times a run may route between phases before it is called a
+/// cycle. Generous — a review loop legitimately goes round — but bounded.
+const MAX_ROUTE_JUMPS: usize = 32;
+
 pub async fn run_plan(run: Run<'_>, runner: &dyn AgentRunner, obs: &dyn Observer) -> RunOutcome {
     let Run {
         plan,
@@ -433,10 +471,16 @@ const CANCELLED: RunError = RunError::Cancelled {
 
 impl Exec<'_> {
     async fn drive(&self, scope: &mut Scope) -> Result<Value, RunError> {
-        for phase in &self.plan.phases {
+        // An index walk rather than an iterator: a `human_input` action can
+        // route the run to another phase, which is the whole point of asking.
+        let mut i = 0;
+        let mut jumps = 0;
+        while i < self.plan.phases.len() {
+            let phase = &self.plan.phases[i];
             if self.cancel.is_cancelled() {
                 return Err(CANCELLED);
             }
+            let mut goto: Option<&str> = None;
             let value = match phase.shape().expect("validated") {
                 Shape::Parallel(agents) => self.parallel(phase, agents, &*scope, "0").await?,
                 Shape::Each { selector, stages } => {
@@ -445,8 +489,33 @@ impl Exec<'_> {
                 Shape::UntilQuiet { cfg, agents } => {
                     self.until_quiet(phase, cfg, agents, scope).await?
                 }
+                Shape::Human(cfg) => {
+                    let (value, next) = self.human(phase, cfg).await?;
+                    goto = next;
+                    value
+                }
             };
+            // Last write wins, like every other phase result: a phase reached
+            // twice reports what it said the second time.
+            scope.phases.retain(|(t, _)| t != &phase.title);
             scope.phases.push((phase.title.clone(), value));
+            match goto {
+                Some(target) => {
+                    jumps += 1;
+                    if jumps > MAX_ROUTE_JUMPS {
+                        return Err(RunError::RouteLoop {
+                            max: MAX_ROUTE_JUMPS,
+                        });
+                    }
+                    i = self
+                        .plan
+                        .phases
+                        .iter()
+                        .position(|p| p.title == target)
+                        .expect("validated");
+                }
+                None => i += 1,
+            }
         }
         match &self.plan.output {
             Some(sel) => Selector::parse(sel)
@@ -460,6 +529,51 @@ impl Exec<'_> {
                 .last()
                 .map(|(_, v)| v.clone())
                 .unwrap_or(Value::Null)),
+        }
+    }
+
+    /// One `human_input` step: collect the declared fields, then the choice.
+    /// Returns the phase's value and where to go next.
+    async fn human<'p>(
+        &self,
+        phase: &'p Phase,
+        cfg: &'p HumanInput,
+    ) -> Result<(Value, Option<&'p str>), RunError> {
+        self.obs
+            .note(&format!("{}: waiting for a human", phase.title));
+        let answer = self
+            .runner
+            .ask_human(HumanQuestion {
+                phase: phase.title.clone(),
+                prompt: cfg.prompt.clone(),
+                fields: cfg.fields.clone(),
+                actions: cfg.actions.iter().map(|a| a.label.clone()).collect(),
+                timeout: cfg.timeout_secs.map(std::time::Duration::from_secs),
+            })
+            .await;
+        if self.cancel.is_cancelled() {
+            return Err(CANCELLED);
+        }
+        // An unrecognized label is nobody's answer: route the timeout rather
+        // than trusting a string this plan never offered.
+        let chosen = answer
+            .action
+            .as_deref()
+            .and_then(|label| cfg.actions.iter().find(|a| a.label == label));
+        match chosen {
+            Some(action) => Ok((
+                json!({"action": action.label, "fields": answer.fields, "timed_out": false}),
+                action.next.as_deref(),
+            )),
+            None => match &cfg.on_timeout {
+                Some(target) => Ok((
+                    json!({"action": Value::Null, "fields": answer.fields, "timed_out": true}),
+                    Some(target.as_str()),
+                )),
+                None => Err(RunError::NoAnswer {
+                    phase: phase.title.clone(),
+                }),
+            },
         }
     }
 
@@ -1380,6 +1494,183 @@ pub(crate) mod tests {
         assert_eq!(j["phases"][0]["agents"][0]["tokens"], 1200);
         assert_eq!(j["phases"][0]["agents"][0]["note"], "kept");
         assert!(j["phases"][0]["agents"][0]["elapsed_ms"].is_u64());
+    }
+
+    /// 0058 T9: a `human_input` phase parks, and the chosen action routes
+    /// the rest of the run. `deny_unknown_fields` stays intact.
+    #[tokio::test]
+    async fn human_input_validates_and_routes_by_the_chosen_action() {
+        struct Answers(&'static str);
+        impl AgentRunner for Answers {
+            fn run(&self, req: AgentRequest, _c: CancellationToken) -> BoxFuture<'_, AgentReply> {
+                Box::pin(std::future::ready(AgentReply {
+                    value: Ok(json!(req.phase)),
+                    tokens: None,
+                    note: None,
+                    unverifiable: false,
+                }))
+            }
+            fn ask_human(&self, q: HumanQuestion) -> BoxFuture<'_, HumanAnswer> {
+                assert_eq!(q.phase, "Approve");
+                assert_eq!(q.actions, vec!["ship".to_string(), "redo".to_string()]);
+                assert_eq!(q.fields[0].name, "reason");
+                Box::pin(std::future::ready(HumanAnswer {
+                    action: Some(self.0.to_string()),
+                    fields: json!({"reason": "looks fine"}).as_object().unwrap().clone(),
+                }))
+            }
+        }
+        let spec = json!({
+            "name": "hitl",
+            "phases": [
+                {"title": "Fix", "agents": [{"label": "f", "prompt": "p"}]},
+                {"title": "Approve", "human_input": {
+                    "prompt": "Ship it?",
+                    "fields": [{"name": "reason", "kind": "text"}],
+                    "actions": [{"label": "ship"}, {"label": "redo", "next": "Fix"}],
+                    "timeout_secs": 60,
+                    "on_timeout": "Done"
+                }},
+                {"title": "Done", "agents": [{"label": "d", "prompt": "p"}]}
+            ]
+        });
+        let plan = plan(spec.clone());
+        assert!(plan.errors().is_empty(), "{:?}", plan.errors());
+
+        // `ship` falls through to the next phase.
+        let (out, _) = Harness::default()
+            .run(&plan, &Answers("ship"), &Silent)
+            .await;
+        assert_eq!(out.result.unwrap(), json!(["Done"]));
+        let approve = out
+            .phases
+            .iter()
+            .find(|(t, _)| t == "Approve")
+            .expect("the pause is a phase like any other");
+        assert_eq!(approve.1["action"], "ship");
+        assert_eq!(approve.1["fields"]["reason"], "looks fine");
+        assert_eq!(approve.1["timed_out"], false);
+
+        // An unknown field is still refused.
+        let mut bad = spec.clone();
+        bad["phases"][1]["human_input"]["sneaky"] = json!(true);
+        assert!(
+            Plan::from_json(bad).is_err(),
+            "deny_unknown_fields must hold"
+        );
+    }
+
+    /// A timeout is nobody's answer: it routes `on_timeout`, and an action
+    /// this plan never offered is treated the same way.
+    #[tokio::test]
+    async fn a_human_timeout_routes_on_timeout_and_an_unknown_label_does_too() {
+        struct Silent2(Option<&'static str>);
+        impl AgentRunner for Silent2 {
+            fn run(&self, req: AgentRequest, _c: CancellationToken) -> BoxFuture<'_, AgentReply> {
+                Box::pin(std::future::ready(AgentReply {
+                    value: Ok(json!(req.phase)),
+                    tokens: None,
+                    note: None,
+                    unverifiable: false,
+                }))
+            }
+            fn ask_human(&self, _q: HumanQuestion) -> BoxFuture<'_, HumanAnswer> {
+                Box::pin(std::future::ready(HumanAnswer {
+                    action: self.0.map(str::to_string),
+                    fields: Default::default(),
+                }))
+            }
+        }
+        let plan = plan(json!({
+            "name": "hitl",
+            "phases": [
+                {"title": "Approve", "human_input": {
+                    "prompt": "Ship it?",
+                    "actions": [{"label": "ship", "next": "Ship"}],
+                    "timeout_secs": 1,
+                    "on_timeout": "Abandon"
+                }},
+                {"title": "Ship", "agents": [{"label": "s", "prompt": "p"}]},
+                {"title": "Abandon", "agents": [{"label": "a", "prompt": "p"}]}
+            ]
+        }));
+        for answer in [None, Some("something-else")] {
+            let (out, _) = Harness::default()
+                .run(&plan, &Silent2(answer), &Silent)
+                .await;
+            assert_eq!(out.result.unwrap(), json!(["Abandon"]), "answer={answer:?}");
+            assert!(!out.phases.iter().any(|(t, _)| t == "Ship"));
+            let approve = out.phases.iter().find(|(t, _)| t == "Approve").unwrap();
+            assert_eq!(approve.1["timed_out"], true);
+        }
+    }
+
+    /// Nobody answered and the plan named no `on_timeout`: the run fails
+    /// saying exactly that, rather than parking forever or silently going on.
+    #[tokio::test]
+    async fn no_answer_without_an_on_timeout_is_an_error_that_says_so() {
+        struct Nobody;
+        impl AgentRunner for Nobody {
+            fn run(&self, _r: AgentRequest, _c: CancellationToken) -> BoxFuture<'_, AgentReply> {
+                unreachable!("no agent phase in this plan")
+            }
+        }
+        let plan = plan(json!({
+            "name": "hitl",
+            "phases": [{"title": "Approve", "human_input": {
+                "prompt": "Ship it?",
+                "actions": [{"label": "ship"}]
+            }}]
+        }));
+        let (out, summary) = Harness::default().run(&plan, &Nobody, &Silent).await;
+        let err = out.result.unwrap_err().to_string();
+        assert!(err.contains("nobody answered"), "{err}");
+        assert!(err.contains("on_timeout"), "{err}");
+        assert_eq!(lock(&summary).status, RunStatus::Failed);
+    }
+
+    /// The validator refuses a route to a phase that does not exist, an
+    /// action list with nothing in it, and a choice field with no options.
+    #[test]
+    fn human_input_routes_and_fields_are_validated() {
+        let errs = |v: Value| {
+            Plan::from_json(v)
+                .unwrap()
+                .errors()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let e = errs(
+            json!({"name": "p", "phases": [{"title": "A", "human_input": {
+                "prompt": "?", "actions": [{"label": "x", "next": "Nowhere"}]
+            }}]}),
+        );
+        assert!(e.contains("`Nowhere`, which is not a phase"), "{e}");
+
+        let e = errs(
+            json!({"name": "p", "phases": [{"title": "A", "human_input": {
+                "prompt": "?", "actions": []
+            }}]}),
+        );
+        assert!(e.contains("needs something to choose"), "{e}");
+
+        let e = errs(
+            json!({"name": "p", "phases": [{"title": "A", "human_input": {
+                "prompt": "?",
+                "fields": [{"name": "size", "kind": "choice", "options": ["only-one"]}],
+                "actions": [{"label": "ok"}]
+            }}]}),
+        );
+        assert!(e.contains("at least two `options`"), "{e}");
+
+        let e = errs(
+            json!({"name": "p", "phases": [{"title": "A", "human_input": {
+                "prompt": "?", "actions": [{"label": "ok"}], "on_timeout": "A"
+            }}]}),
+        );
+        assert!(e.contains("needs a `timeout_secs`"), "{e}");
     }
 
     /// 0058 T8: a cancel drains rather than truncating. The agents already
