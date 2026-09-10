@@ -1856,7 +1856,14 @@ async fn on_turn_finished(
                         _ = cancel.cancelled() => (None, TokenUsage::default()),
                         v = tokio::time::timeout(
                             GOAL_EVAL_TIMEOUT,
-                            evaluate_goal(ctx.shared, &snapshot[..], &condition, progress, &evidence),
+                            evaluate_goal(
+                                ctx.shared,
+                                &snapshot[..],
+                                &condition,
+                                progress,
+                                &evidence,
+                                ctx.events,
+                            ),
                         ) => v.unwrap_or_default(),
                     }
                 };
@@ -2793,8 +2800,11 @@ async fn compact(
     let pins = pre_compact_pins(shared, head, &plan).await;
     // Timeout or two failed attempts: the floor digest keeps the session moving
     // rather than ending the turn on housekeeping.
-    let (summary, fold_usage) =
-        summarize_bounded(summarize(shared, folded), COMPACT_SUMMARIZE_TIMEOUT).await;
+    let (summary, fold_usage) = summarize_bounded(
+        summarize(shared, folded, Some(events)),
+        COMPACT_SUMMARIZE_TIMEOUT,
+    )
+    .await;
     // `text` is the digest body the `PostCompact` hook reads; the floor
     // digest has no summary to hand it, so it hands the empty string.
     let (digest, degraded, text) = match summary {
@@ -2885,6 +2895,9 @@ async fn summarize_bounded(
 pub(crate) async fn summarize(
     shared: &SharedDeps,
     folded: &[Arc<Item>],
+    // `None` for the speculative digest: background work, and a retry there is
+    // not a wait the human is sitting through (0061 T16).
+    events: Option<&mpsc::Sender<EngineEvent>>,
 ) -> (Option<String>, TokenUsage) {
     let model = shared.config.utility();
     let request = SamplingRequest {
@@ -2924,6 +2937,29 @@ pub(crate) async fn summarize(
                     spent += usage;
                     text = Some(assistant_text(&blocks));
                 }
+                // The utility model's ladder is a wait like any other, and
+                // used to be swallowed here (0061 T16).
+                Ok(StreamEvent::Retrying {
+                    attempt,
+                    max,
+                    reason,
+                    delay_ms,
+                    status,
+                }) => {
+                    if let Some(events) = events {
+                        let _ = events
+                            .send(EngineEvent::Retrying {
+                                attempt,
+                                max,
+                                reason,
+                                delay_ms,
+                                status,
+                                scope: crate::RetryScope::Summarize,
+                                discarded_partial: false,
+                            })
+                            .await;
+                    }
+                }
                 Ok(_) => {}
                 Err(_) => {
                     text = None;
@@ -2953,6 +2989,7 @@ async fn evaluate_goal(
     condition: &str,
     progress: hotl_context::goal::GoalProgress,
     evidence: &[hotl_context::goal::EvidenceLine],
+    events: &mpsc::Sender<EngineEvent>,
 ) -> (Option<(GoalVerdict, String)>, TokenUsage) {
     let model = shared.config.utility();
     let request = SamplingRequest {
@@ -2986,6 +3023,27 @@ async fn evaluate_goal(
                 Ok(StreamEvent::Completed { blocks, usage, .. }) => {
                     spent += usage;
                     text = Some(assistant_text(&blocks));
+                }
+                // Same as `summarize`: the human is waiting on this ladder
+                // too (0061 T16).
+                Ok(StreamEvent::Retrying {
+                    attempt,
+                    max,
+                    reason,
+                    delay_ms,
+                    status,
+                }) => {
+                    let _ = events
+                        .send(EngineEvent::Retrying {
+                            attempt,
+                            max,
+                            reason,
+                            delay_ms,
+                            status,
+                            scope: crate::RetryScope::GoalEval,
+                            discarded_partial: false,
+                        })
+                        .await;
                 }
                 Ok(_) => {}
                 Err(_) => {

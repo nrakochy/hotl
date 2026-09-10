@@ -267,6 +267,61 @@ async fn speculative_digest_overlaps_the_turn() {
     assert!(!degraded);
 }
 
+/// 0061 T16 / decision: the speculative digest is background work. A retry
+/// there is not a wait the human is sitting through, so it is deliberately
+/// not forwarded — only the inline fold's ladder is.
+#[tokio::test]
+async fn a_speculative_summarize_retry_is_not_forwarded() {
+    let main = Arc::new(ScriptedProvider::new(Vec::new()));
+    let mut digest = ScriptedProvider::text_reply("GOAL: SPEC DIGEST of the early work");
+    digest.insert(
+        0,
+        Ok(StreamEvent::Retrying {
+            attempt: 1,
+            max: 5,
+            reason: "HTTP 429: slow down".into(),
+            delay_ms: 0,
+            status: Some(429),
+        }),
+    );
+    let summarize = Arc::new(ScriptedProvider::new(vec![
+        digest,
+        ScriptedProvider::text_reply("LATE DIGEST"),
+    ]));
+    let concurrency = Arc::<Concurrency>::default();
+    let provider = Arc::new(Router {
+        main: Arc::clone(&main),
+        summarize,
+        delay_ms: 300,
+        concurrency,
+    });
+    let mut s = session(provider, cfg());
+    push_main_scripts(&main, s.dir.path());
+
+    s.handle.prompt("start the long task".into()).await;
+    let mut scopes = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(60), s.handle.events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
+        match ev {
+            EngineEvent::Ask { reply, .. } => {
+                let _ = reply.send(AskReply::Allow);
+            }
+            EngineEvent::Retrying { scope, .. } => scopes.push(scope),
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        !scopes.contains(&hotl_engine::RetryScope::Summarize),
+        "background work reported itself as a wait: {scopes:?}"
+    );
+    let (digest, _) = compaction_digest(&s.log_path).expect("compaction entry");
+    assert!(digest.contains("SPEC DIGEST"), "digest was: {digest}");
+}
+
 #[tokio::test]
 async fn failed_speculation_falls_back_to_inline_summarize() {
     let main = Arc::new(ScriptedProvider::new(Vec::new()));
