@@ -147,7 +147,10 @@ impl WorkflowTool {
         let cap = plan
             .max_agents
             .map_or(self.limits.max_agents, |m| m.min(self.limits.max_agents));
-        let estimate = plan.estimate();
+        // Against this run's own `args`: an `each` over an argument list is
+        // countable now, and a human approving a fan-out deserves the real
+        // number rather than `≈1+`.
+        let estimate = plan.estimate_with(&args);
         if estimate.agents > cap {
             return Err(format!(
                 "The plan could start {} agents, past the cap of {cap} (`max_agents`). \
@@ -671,7 +674,7 @@ impl Tool for WorkflowTool {
     }
     fn permission(&self, input: &Value) -> Permission {
         let summary = match self.resolve(input) {
-            Ok((plan, _)) => plan.summary_line(self.serialised(&plan)),
+            Ok((plan, args)) => plan.summary_line_with(self.serialised(&plan), &args),
             Err(_) => "workflow (invalid plan)".into(),
         };
         Permission::Ask { summary }

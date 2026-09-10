@@ -22,9 +22,25 @@
 //! sub-agent-spawn guard. `subproc()` is drawn per executed tool call by the
 //! engine's batch dispatch, so a 40-call batch never forks 40 children.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+/// How deep the queue in front of the `agents` permit may get, as a multiple
+/// of the width itself (0058 T7). Queueing is the *point* of a governor, so
+/// this is generous — but unbounded queueing turns a runaway fan-out into a
+/// silent hang, where the model waits on children that will not start for
+/// minutes and cannot tell that from work in progress. Past the cap the
+/// answer is a refusal the model can act on.
+pub const AGENT_QUEUE_FACTOR: usize = 4;
+
+/// The `agents` queue is full: `queued` waiting against `cap`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentQueueFull {
+    pub queued: usize,
+    pub cap: usize,
+}
 
 /// The three governed resources. Deliberately small and fixed — not
 /// `num_cpus` — because concurrent LLM calls and subprocesses cost money,
@@ -58,6 +74,12 @@ impl Default for ConcurrencyLimits {
 #[derive(Clone)]
 pub struct SessionConcurrency {
     agents: Arc<Semaphore>,
+    /// The configured `agents` width, kept because a `Semaphore` reports only
+    /// what is *available* — the queue cap is a multiple of the width.
+    agents_width: usize,
+    /// Children admitted and waiting for an `agents` permit. Shared with
+    /// every clone, like the semaphores beside it.
+    agents_queued: Arc<AtomicUsize>,
     requests: Arc<Semaphore>,
     subprocs: Arc<Semaphore>,
 }
@@ -78,9 +100,26 @@ impl SessionConcurrency {
         let mk = |n: usize| Arc::new(Semaphore::new(n.max(1)));
         Self {
             agents: mk(limits.agents),
+            agents_width: limits.agents.max(1),
+            agents_queued: Arc::new(AtomicUsize::new(0)),
             requests: mk(limits.requests),
             subprocs: mk(limits.subprocs),
         }
+    }
+
+    /// [`Self::agent`], but refusing rather than queueing without bound past
+    /// [`AGENT_QUEUE_FACTOR`] × the configured width. The error carries both
+    /// numbers so the refusal can name them.
+    pub async fn agent_queued(&self) -> Result<OwnedSemaphorePermit, AgentQueueFull> {
+        let cap = self.agents_width * AGENT_QUEUE_FACTOR;
+        let queued = self.agents_queued.fetch_add(1, Ordering::SeqCst) + 1;
+        if queued > cap {
+            self.agents_queued.fetch_sub(1, Ordering::SeqCst);
+            return Err(AgentQueueFull { queued, cap });
+        }
+        let permit = self.agent().await;
+        self.agents_queued.fetch_sub(1, Ordering::SeqCst);
+        Ok(permit)
     }
 
     /// Acquire one of the `agents` permits. `await` here *paces* (queues)
@@ -169,6 +208,39 @@ mod tests {
             "budget of 2 was exceeded: saw {}",
             max_seen.load(Ordering::SeqCst)
         );
+    }
+
+    /// 0058 T7: queueing is the point, but an unbounded queue turns a
+    /// runaway fan-out into a silent hang. Past `agents × 4` waiting, the
+    /// next arrival is refused with both numbers.
+    #[tokio::test]
+    async fn the_agent_queue_refuses_past_four_times_the_width() {
+        let sc = SessionConcurrency::new(ConcurrencyLimits {
+            agents: 1,
+            requests: 4,
+            subprocs: 8,
+        });
+        // The one runner, plus four that queue behind it.
+        let running = sc.agent_queued().await.expect("the first runs");
+        let mut waiting = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let sc = sc.clone();
+            waiting.spawn(async move { sc.agent_queued().await.map(drop) });
+        }
+        // Let all four register as queued before the fifth arrives.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let refused = sc.agent_queued().await;
+        assert_eq!(
+            refused.err(),
+            Some(AgentQueueFull { queued: 5, cap: 4 }),
+            "the fifth queued child must be refused, not queued"
+        );
+        drop(running);
+        while let Some(j) = waiting.join_next().await {
+            assert!(j.expect("task").is_ok(), "every queued child still runs");
+        }
+        // The queue drained, so the next arrival is admitted again.
+        assert!(sc.agent_queued().await.is_ok());
     }
 
     #[tokio::test]

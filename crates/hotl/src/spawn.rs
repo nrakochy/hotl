@@ -351,10 +351,23 @@ impl SpawnTool {
             ));
         };
 
-        // Layer B: paces (queues), never drops — a batch of many `spawn`
-        // calls is still *enqueued* concurrently (Layer A, uncapped) but only
-        // `agents` (default 4) hold a permit and run at once.
-        let _permit = self.concurrency.agent().await;
+        // Layer B: paces (queues) up to a bound — a batch of many `spawn`
+        // calls is still *enqueued* concurrently (Layer A, uncapped) and only
+        // `agents` (default 4) run at once, but past four times that width
+        // the queue refuses out loud rather than leaving the model waiting on
+        // children that will not start for minutes (0058 T7).
+        let _permit = match self.concurrency.agent_queued().await {
+            Ok(p) => p,
+            Err(full) => {
+                return ToolOutcome::err(format!(
+                    "spawn refused: {} children are queued against a cap of {} \
+                     ([concurrency] agents × {}). Wait for a result or reduce the fan-out.",
+                    full.queued,
+                    full.cap,
+                    hotl_tools::concurrency::AGENT_QUEUE_FACTOR
+                ))
+            }
+        };
 
         // Identical siblings queue behind the first one's first byte (0058
         // T6) so the provider writes this prefix once and the rest read it.
@@ -1426,6 +1439,77 @@ mod tests {
         // The warning is hotl's own word, outside the untrusted envelope.
         let after = out.content.split("</subagent-result>").nth(1).unwrap_or("");
         assert!(after.contains("`exit 3` failed"), "{}", out.content);
+    }
+
+    /// 0058 T7: the queue refuses out loud, naming both numbers and the
+    /// knob. A runaway fan-out that queued silently would leave the model
+    /// unable to tell a stalled child from a working one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_queue_past_the_cap_is_refused_with_the_numbers_named() {
+        use hotl_tools::concurrency::{ConcurrencyLimits, SessionConcurrency};
+        let concurrency = SessionConcurrency::new(ConcurrencyLimits {
+            agents: 1,
+            requests: 4,
+            subprocs: 8,
+        });
+        // Children that hold their permit for the whole test, so the queue
+        // behind them really fills. `ProbeChild` is defined below.
+        let running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool = Arc::new(
+            SpawnTool::new(
+                Arc::new(ProbeChild {
+                    running,
+                    max_seen,
+                    delay_ms: 3000,
+                    isolate_in: None,
+                    rendezvous: None,
+                }),
+                tempfile::tempdir().unwrap().keep(),
+                tempfile::tempdir().unwrap().keep(),
+                false,
+                concurrency,
+            )
+            // The queue cap is what is under test, not the prefix gate.
+            .with_prefix_stagger(std::time::Duration::ZERO),
+        );
+        let cancel = CancellationToken::new();
+        let mut set = tokio::task::JoinSet::new();
+        // One runner plus four queued fills the cap of `1 × 4`.
+        for _ in 0..5 {
+            let (tool, cancel) = (tool.clone(), cancel.clone());
+            set.spawn(async move {
+                tool.run(json!({"task": "t", "agent_type": "explore"}), cancel)
+                    .await
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let refused = tool
+            .run(
+                json!({"task": "one too many", "agent_type": "explore"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(refused.is_error, "{}", refused.content);
+        assert!(
+            refused
+                .content
+                .starts_with("spawn refused: 5 children are queued against a cap of 4"),
+            "{}",
+            refused.content
+        );
+        assert!(
+            refused.content.contains("[concurrency] agents × 4"),
+            "{}",
+            refused.content
+        );
+        assert!(
+            refused.content.contains("reduce the fan-out"),
+            "{}",
+            refused.content
+        );
+        cancel.cancel();
+        set.shutdown().await;
     }
 
     /// 0058 T6: three identical siblings do not all write the same prefix.

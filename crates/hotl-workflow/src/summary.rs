@@ -1,7 +1,10 @@
 //! The approval summary: what the human sees before a run starts, and the
 //! agent-count upper bound the `max_agents` cap is checked against.
 
+use serde_json::Value;
+
 use crate::plan::{Plan, Shape};
+use crate::select::{Lookup, Selector};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Estimate {
@@ -25,8 +28,38 @@ impl std::fmt::Display for Estimate {
 /// Phases shown in the summary before it elides to `… +N`.
 const SHOWN_PHASES: usize = 3;
 
+/// How many items an `each` selector yields against `args`, or `None` when it
+/// reads something no pre-flight can see.
+fn count_items(selector: &str, args: &Value) -> Option<usize> {
+    let items = Selector::parse(selector).ok()?.eval(&ArgsOnly(args)).ok()?;
+    match items {
+        Value::Array(v) => Some(v.len()),
+        Value::Null => None,
+        _ => Some(1),
+    }
+}
+
+/// `args` alone: what a pre-flight actually knows. An `each` selector that
+/// reads a phase's output resolves to nothing here and stays open-ended.
+struct ArgsOnly<'a>(&'a Value);
+
+impl Lookup for ArgsOnly<'_> {
+    fn get(&self, root: &str) -> Option<&Value> {
+        (root == "args").then_some(self.0)
+    }
+}
+
 impl Plan {
     pub fn estimate(&self) -> Estimate {
+        self.estimate_with(&Value::Null)
+    }
+
+    /// The pre-flight estimate against the `args` this run was given (0058
+    /// T7). An `each` phase whose selector reads only `args` is *countable*
+    /// before the run — resolve it and quote the real number instead of
+    /// `≈1+`, which understates a 40-item fan-out by 39 agents at the exact
+    /// moment a human is deciding whether to approve it.
+    pub fn estimate_with(&self, args: &Value) -> Estimate {
         let mut agents = 0;
         let mut open_ended = false;
         for phase in &self.phases {
@@ -35,10 +68,13 @@ impl Plan {
             };
             match phase.shape() {
                 Ok(Shape::Parallel(specs)) => agents += votes(specs),
-                Ok(Shape::Each { stages, .. }) => {
-                    open_ended = true;
-                    agents += votes(stages);
-                }
+                Ok(Shape::Each { selector, stages }) => match count_items(selector, args) {
+                    Some(n) => agents += votes(stages) * n,
+                    None => {
+                        open_ended = true;
+                        agents += votes(stages);
+                    }
+                },
                 Ok(Shape::UntilQuiet { cfg, agents: specs }) => {
                     agents += votes(specs) * cfg.max_rounds.max(1)
                 }
@@ -89,6 +125,12 @@ impl Plan {
     /// share the tree)` when `serialised > 0`. Kept to ~110 chars: phases past
     /// the third elide to `… +N`.
     pub fn summary_line(&self, serialised: usize) -> String {
+        self.summary_line_with(serialised, &Value::Null)
+    }
+
+    /// [`Self::summary_line`] against this run's `args`, so a countable
+    /// `each` shows its real width.
+    pub fn summary_line_with(&self, serialised: usize, args: &Value) -> String {
         let n = self.phases.len();
         let mut chain: Vec<String> = self
             .phases
@@ -103,7 +145,7 @@ impl Plan {
             "workflow `{}` — {n} phase{}, {} agents: {}",
             self.name,
             if n == 1 { "" } else { "s" },
-            self.estimate(),
+            self.estimate_with(args),
             chain.join(" → ")
         );
         if serialised > 0 {
@@ -135,6 +177,39 @@ mod tests {
         assert_eq!(e.to_string(), "≈15+");
         let closed = Plan::from_json(json!({"name": "x", "phases": [{"title": "A", "agents": [{"label": "a", "prompt": "p"}, {"label": "b", "prompt": "p"}]}]})).unwrap();
         assert_eq!(closed.estimate().to_string(), "≈2");
+    }
+
+    /// 0058 T7: an `each` over `args` is countable before the run, so the
+    /// pre-flight quotes the real width instead of understating it by N−1 at
+    /// the moment a human is deciding whether to approve the fan-out.
+    #[test]
+    fn an_each_over_args_estimates_the_real_item_count() {
+        let plan = Plan::from_json(json!({
+            "name": "p",
+            "phases": [{
+                "title": "Fix",
+                "each": "args.files",
+                "stages": [{"label": "a", "prompt": "{{item}}"}]
+            }]
+        }))
+        .unwrap();
+        let args = json!({"files": ["a.rs", "b.rs", "c.rs", "d.rs"]});
+        let e = plan.estimate_with(&args);
+        assert_eq!((e.agents, e.open_ended), (4, false));
+        assert_eq!(e.to_string(), "≈4", "no `+`: this one is known");
+        assert!(plan.summary_line_with(0, &args).contains("≈4 agents"));
+
+        // No args, or a selector over a phase's output: still open-ended.
+        assert_eq!(plan.estimate().to_string(), "≈1+");
+        let downstream = Plan::from_json(json!({
+            "name": "p",
+            "phases": [
+                {"title": "Find", "agents": [{"label": "f", "prompt": "p"}]},
+                {"title": "Fix", "each": "Find.hits", "stages": [{"label": "a", "prompt": "{{item}}"}]}
+            ]
+        }))
+        .unwrap();
+        assert!(downstream.estimate_with(&args).open_ended);
     }
 
     #[test]
