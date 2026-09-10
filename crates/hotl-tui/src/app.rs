@@ -510,6 +510,22 @@ pub struct State {
     pub goal_ticks: u64,
     /// Turns the evaluator has judged, from `goal_verdict`.
     pub goal_turns: u64,
+    /// The latest evaluator reason, shown by bare `/goal` so the human can
+    /// see what the loop thinks is still missing without scrolling.
+    pub goal_last_reason: Option<String>,
+    /// The loop's cumulative spend, read from `goal_verdict`'s `usage` —
+    /// never summed locally, because the evaluator's own calls are in it.
+    pub goal_usage: SessionUsage,
+    /// Set by a `stalled` verdict, cleared by the next one: the goal is armed
+    /// but resting, which the status line has to say out loud.
+    pub goal_stalled: bool,
+    /// The last goal that resolved this session: condition, outcome word,
+    /// turns. Bare `/goal` shows it when nothing is active.
+    pub goal_resolved: Option<(String, String, u64)>,
+    /// The condition an engine-initiated `goal_changed(None)` just cleared,
+    /// held until the verdict that explains it lands — the clear always
+    /// arrives first, and by then `goal` no longer knows what resolved.
+    pub goal_resolving: Option<String>,
     /// Every completable `/` command: the built-ins, plus one row per skill
     /// name the handshake advertised. Built once at startup.
     pub commands: Vec<complete::Command>,
@@ -590,6 +606,11 @@ impl State {
             goal: None,
             goal_ticks: 0,
             goal_turns: 0,
+            goal_last_reason: None,
+            goal_usage: SessionUsage::default(),
+            goal_stalled: false,
+            goal_resolved: None,
+            goal_resolving: None,
             commands: complete::builtins(),
             completion: None,
             dismissed: false,
@@ -1289,6 +1310,17 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             if goal != state.goal {
                 state.goal_ticks = 0;
                 state.goal_turns = 0;
+                state.goal_last_reason = None;
+                state.goal_usage = SessionUsage::default();
+                state.goal_stalled = false;
+                // An engine-initiated clear is a resolution whose verdict is
+                // still in flight: stash what it cleared, since `goal` is
+                // about to stop knowing. A local `/goal clear` already set
+                // `goal` to None, so this never fires for one.
+                state.goal_resolving = match (&goal, &state.goal) {
+                    (None, Some(c)) => Some(c.clone()),
+                    _ => None,
+                };
             }
             state.goal = goal;
         }
@@ -1300,9 +1332,30 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             let turns = v.get("turns").and_then(Value::as_u64).unwrap_or(0);
             state.goal_turns = turns;
             let reason = text_of("reason");
+            let verdict = text_of("verdict");
+            state.goal_last_reason = (!reason.is_empty()).then(|| reason.clone());
+            // Cumulative, evaluator included — replace, never accumulate.
+            if let Some(usage) = v.get("usage") {
+                state.goal_usage = SessionUsage::default();
+                state.goal_usage.add(usage);
+            }
+            state.goal_stalled = verdict == "stalled";
+            if let Some(word) = match verdict.as_str() {
+                "met" => Some("achieved"),
+                "impossible" => Some("impossible"),
+                "error" => Some("failed"),
+                _ => None,
+            } {
+                // The condition the clear took away, or — for a surface that
+                // never saw the clear — the one still on screen.
+                if let Some(condition) = state.goal_resolving.take().or_else(|| state.goal.clone())
+                {
+                    state.goal_resolved = Some((condition, word.into(), turns));
+                }
+            }
             notice(
                 state,
-                match text_of("verdict").as_str() {
+                match verdict.as_str() {
                     "not_yet" => format!("◎ goal check (turn {turns}): not yet — {reason}"),
                     "met" => format!("◎ goal achieved after {turns} turn(s) — {reason}"),
                     "impossible" => {
@@ -2217,24 +2270,46 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // `goal_changed` broadcast is the correction channel.
         "goal" => match arg.trim() {
             "" => {
-                let report = match &state.goal {
-                    Some(c) => format!(
-                        "◎ goal active · {}m · {} turn(s) — {c}",
+                let report = match (&state.goal, &state.goal_resolved) {
+                    // Armed and resting: a stall keeps the goal but stops
+                    // spending, and the line has to say which of the two it is.
+                    (Some(c), _) => format!(
+                        "◎ goal {} · {}m · {} turn(s) · {} in / {} out — {c}",
+                        if state.goal_stalled {
+                            "armed (paused after idle turns)"
+                        } else {
+                            "active"
+                        },
                         state.goal_ticks / (60 * crate::anim::TICK_HZ),
-                        state.goal_turns
+                        state.goal_turns,
+                        tok(state.goal_usage.input),
+                        tok(state.goal_usage.output),
                     ),
-                    None => "no goal set — /goal <condition> keeps the turn going until a \
-                             fast evaluator judges it met"
+                    (None, Some((c, word, turns))) => {
+                        format!("◎ last goal {word} after {turns} turn(s) — {c}")
+                    }
+                    (None, None) => "no goal set — /goal <condition> keeps the turn going \
+                                     until a fast evaluator judges it met"
                         .into(),
                 };
                 notice(state, report);
+                // The evaluator's own words, on their own line: what it says
+                // is missing is the most actionable thing on the screen.
+                if state.goal.is_some() {
+                    if let Some(reason) = state.goal_last_reason.clone() {
+                        notice(state, format!("last check: {reason}"));
+                    }
+                }
                 Vec::new()
             }
             "clear" | "stop" | "off" | "reset" | "none" | "cancel" => {
-                if state.goal.take().is_some() {
+                if let Some(condition) = state.goal.take() {
                     state.goal_ticks = 0;
                     state.goal_turns = 0;
-                    notice(state, "goal cleared".into());
+                    state.goal_last_reason = None;
+                    state.goal_usage = SessionUsage::default();
+                    state.goal_stalled = false;
+                    notice(state, format!("goal cleared: {condition}"));
                     vec![Cmd::SetGoal(None)]
                 } else {
                     notice(state, "no goal set".into());
@@ -2248,6 +2323,9 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     state.goal = Some(goal.clone());
                     state.goal_ticks = 0;
                     state.goal_turns = 0;
+                    state.goal_last_reason = None;
+                    state.goal_usage = SessionUsage::default();
+                    state.goal_stalled = false;
                     // Idle: the condition is the directive (0048), submitted
                     // behind the set — the engine's command channel is FIFO,
                     // so the goal is armed before the turn it gates is
@@ -5801,6 +5879,75 @@ mod tests {
         );
     }
 
+    /// 0051: clearing echoes what it ended — a goal set an hour ago is not
+    /// something the human still has on screen.
+    #[test]
+    fn slash_goal_clear_echoes_the_condition() {
+        let mut s = State::test_default();
+        type_and_submit(&mut s, "/goal ship it");
+        let cmds = type_and_submit(&mut s, "/goal clear");
+        assert_eq!(cmds, vec![Cmd::SetGoal(None)]);
+        assert!(
+            last_notice(&s).contains("goal cleared: ship it"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
+    /// Bare `/goal` is the status surface: spend from the event, the
+    /// evaluator's last words on their own line, the stall named, and — with
+    /// nothing active — the goal that resolved this session.
+    #[test]
+    fn slash_goal_bare_shows_spend_reason_and_the_resolved_summary() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "goal_changed", "goal": "tests pass"}),
+        );
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "not_yet", "reason": "no commit yet",
+                   "turns": 4, "usage": {"input_tokens": 41_214, "output_tokens": 3_100}}),
+        );
+        s.goal_ticks = 12 * 60 * crate::anim::TICK_HZ;
+        type_and_submit(&mut s, "/goal");
+        let lines = tail_notices(&s, 2);
+        assert!(
+            lines[0].contains("◎ goal active · 12m · 4 turn(s) · 41.2k in / 3.1k out — tests pass"),
+            "{lines:?}"
+        );
+        assert!(lines[1].contains("last check: no commit yet"), "{lines:?}");
+
+        // A stall keeps the goal, and the line says it is resting.
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "stalled",
+                   "reason": "no tool ran in the last 8 goal turns", "turns": 8,
+                   "usage": {"input_tokens": 80_000, "output_tokens": 6_000}}),
+        );
+        type_and_submit(&mut s, "/goal");
+        let lines = tail_notices(&s, 2);
+        assert!(
+            lines[0].contains("◎ goal armed (paused after idle turns) · 12m"),
+            "{lines:?}"
+        );
+
+        // Resolution: the clear lands first and takes the condition with it,
+        // so the verdict has to be told what it resolved.
+        upd(&mut s, json!({"type": "goal_changed", "goal": null}));
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "met", "reason": "green",
+                   "turns": 9, "usage": {"input_tokens": 90_000, "output_tokens": 7_000}}),
+        );
+        type_and_submit(&mut s, "/goal");
+        assert!(
+            last_notice(&s).contains("◎ last goal achieved after 9 turn(s) — tests pass"),
+            "{}",
+            last_notice(&s)
+        );
+    }
+
     #[test]
     fn slash_goal_bare_reports_and_overlong_shows_usage() {
         let mut s = State::test_default();
@@ -5818,7 +5965,7 @@ mod tests {
         type_and_submit(&mut s, "/goal");
         let text = last_notice(&s);
         assert!(
-            text.contains("◎ goal active · 2m · 3 turn(s) — ship it"),
+            text.contains("◎ goal active · 2m · 3 turn(s) · 0 in / 0 out — ship it"),
             "{text}"
         );
 
@@ -5992,6 +6139,23 @@ mod tests {
             Some(TranscriptItem::Notice { text }) => text.as_str().to_string(),
             other => panic!("expected a notice, got {other:?}"),
         }
+    }
+
+    /// The last `n` notices, oldest first — for the commands that answer on
+    /// more than one line.
+    fn tail_notices(s: &State, n: usize) -> Vec<String> {
+        let mut found: Vec<String> = s
+            .transcript
+            .iter()
+            .rev()
+            .filter_map(|i| match i {
+                TranscriptItem::Notice { text } => Some(text.as_str().to_string()),
+                _ => None,
+            })
+            .take(n)
+            .collect();
+        found.reverse();
+        found
     }
 
     /// 0044: `/<recipe>` desugars to a prompt naming the saved workflow; the
