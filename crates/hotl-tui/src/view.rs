@@ -873,6 +873,13 @@ fn item_block<'a>(
             let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
             let (marker, color) = status_glyph(status, *ticks, p);
             let (body, mut details) = split_summary(name, summary);
+            // The `cd` prefix is identical on every call in a session and eats
+            // the summary; the directory it lands in is the informative part.
+            let body = if name == "bash" {
+                bash_body(&body)
+            } else {
+                body
+            };
             if let ToolStatus::AutoAllowed { rule } = status {
                 details.push(format!("auto-allowed: {rule}"));
             }
@@ -1499,6 +1506,49 @@ fn split_summary(name: &str, summary: &str) -> (String, Vec<String>) {
         return (body.trim_start().to_string(), vec![tag.to_string()]);
     }
     (rest.to_string(), Vec::new())
+}
+
+/// `cd /Users/x/sources/hotl && cargo test` → `hotl ❯ cargo test`. Only `&&`
+/// is elided: a `;` chain runs the tail whether or not the `cd` worked, which
+/// is a different claim about what happened.
+fn bash_body(body: &str) -> String {
+    let Some((path, tail)) = body.strip_prefix("cd ").and_then(split_cd_path) else {
+        return body.to_string();
+    };
+    let Some(command) = tail.strip_prefix("&&") else {
+        return body.to_string();
+    };
+    let command = command.trim_start();
+    if command.is_empty() {
+        return body.to_string();
+    }
+    format!("{} ❯ {command}", dir_label(path))
+}
+
+/// The (possibly quoted) directory a `cd` names, and whatever follows it. An
+/// unterminated quote is not a path — the summary stays verbatim.
+fn split_cd_path(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim_start();
+    let first = rest.chars().next()?;
+    if first == '\'' || first == '"' {
+        let close = 1 + rest[1..].find(first)?;
+        return Some((&rest[1..close], rest[close + 1..].trim_start()));
+    }
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    Some((&rest[..end], rest[end..].trim_start()))
+}
+
+/// The last component of a path, with `/` and a bare `..` kept as themselves —
+/// a label, not a resolved directory.
+fn dir_label(path: &str) -> String {
+    let trimmed = path.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return "/".into();
+    }
+    match trimmed.rsplit('/').next() {
+        Some(last) if !last.is_empty() => last.to_string(),
+        _ => trimmed.to_string(),
+    }
 }
 
 /// Marker glyph + color for a tool status; running wears the wanderer frame
@@ -4484,6 +4534,54 @@ mod tests {
     /// 0061 T4: one table for every card verb. Known tools get past tense
     /// where they leave something behind; anything else is title-cased per
     /// `_` word rather than shouting its raw identifier.
+    /// 0061 T5: the repeated `cd` prefix is the least informative thing on a
+    /// bash card and the widest. Only `&&` elides; a `;` and a bare command
+    /// pass through untouched.
+    #[test]
+    fn bash_body_elides_a_leading_cd_to_its_basename() {
+        for (raw, want) in [
+            (
+                "cd /Users/x/sources/hotl && cargo test",
+                "hotl ❯ cargo test",
+            ),
+            ("cd 'my repo' && ls", "my repo ❯ ls"),
+            ("cd \"/tmp/a b\" && ls", "a b ❯ ls"),
+            ("cd ../sibling && make", "sibling ❯ make"),
+            ("cd .. && make", ".. ❯ make"),
+            ("cd / && ls", "/ ❯ ls"),
+            ("cd ~/src/hotl/ && ls", "hotl ❯ ls"),
+            // Untouched: a `;` runs the tail regardless, and a bare command
+            // has nothing to elide.
+            ("cd /tmp; ls", "cd /tmp; ls"),
+            ("cargo test", "cargo test"),
+            ("cd /tmp &&", "cd /tmp &&"),
+            ("cd 'unterminated && ls", "cd 'unterminated && ls"),
+        ] {
+            assert_eq!(bash_body(raw), want, "eliding {raw}");
+        }
+    }
+
+    /// The elision is a card affordance. The ask renders the summary the
+    /// engine wrote, verbatim — you approve what will run, not a shorthand.
+    #[test]
+    fn an_ask_keeps_the_verbatim_bash_summary() {
+        let mut s = State::new(true, "m".into());
+        let raw = "bash: cd /Users/x/sources/hotl && cargo test";
+        s.phase = Phase::WaitingAsk {
+            req_id: 1,
+            summary: raw.into(),
+            protected_why: None,
+            input: String::new(),
+            denying: false,
+            diff: Vec::new(),
+        };
+        let all = draw_raw(&s, 100, 24).join("\n");
+        assert!(
+            all.contains("cd /Users/x/sources/hotl && cargo test"),
+            "{all}"
+        );
+    }
+
     #[test]
     fn tool_verb_table() {
         for (name, want) in [
