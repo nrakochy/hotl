@@ -17,12 +17,20 @@ use hotl_engine::{
 use hotl_platform::SystemClock;
 use hotl_provider::{Provider, ProviderError, SamplingRequest, ScriptedProvider, StreamEvent};
 use hotl_store::{Masker, SessionLog};
-use hotl_tools::{rules::Rules, Registry};
+use hotl_tools::{rules::Rules, Permission, Registry, Tool, ToolOutcome};
 use hotl_types::{Item, SyntheticReason};
 
 fn session(
     provider: Arc<dyn Provider>,
     dir: &std::path::Path,
+) -> (SessionHandle, std::path::PathBuf) {
+    session_with(provider, dir, Registry::builtin())
+}
+
+fn session_with(
+    provider: Arc<dyn Provider>,
+    dir: &std::path::Path,
+    registry: Registry,
 ) -> (SessionHandle, std::path::PathBuf) {
     let config = EngineConfig::default();
     let log = SessionLog::create(dir, &config.model, None, Masker::empty(), 0).expect("log");
@@ -30,7 +38,7 @@ fn session(
     let handle = spawn_session(SessionDeps {
         concurrency: Default::default(),
         provider,
-        registry: Arc::new(Registry::builtin()),
+        registry: Arc::new(registry),
         rules: Arc::new(Rules::default()),
         sandbox_enforced: false,
         clock: Arc::new(SystemClock),
@@ -542,4 +550,79 @@ async fn a_stalled_goal_re_arms_on_the_next_prompt() {
     let resolved = events_until_turn_done(&mut handle).await;
     assert_eq!(verdicts(&resolved), vec![(GoalVerdictKind::Met, 9)]);
     assert_eq!(hotl_store::replay(&log_path).expect("replay").goal, None);
+}
+
+/// A tool that blocks on a nested session, as `spawn` and `workflow` do —
+/// so 0055 exempts it from the Layer-B subprocess permit entirely.
+struct NestingProbe;
+
+impl Tool for NestingProbe {
+    fn name(&self) -> &'static str {
+        "nest"
+    }
+    fn description(&self) -> &str {
+        "test nesting probe"
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object"})
+    }
+    fn permission(&self, _input: &serde_json::Value) -> Permission {
+        Permission::None
+    }
+    fn awaits_child_session(&self) -> bool {
+        true
+    }
+    fn run<'a>(
+        &'a self,
+        _input: serde_json::Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> futures_util::future::BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move { ToolOutcome::ok("spawned") })
+    }
+}
+
+/// A goal making progress through sub-agents must not read as idle. 0055
+/// gave `spawn`/`workflow` a subprocess-permit exemption, so a nesting call
+/// draws no permit at all; the stall brake counts what `finish_call` saw
+/// execute, which is downstream of the permit and independent of it. If the
+/// two were ever coupled, this call would count zero and the pause would
+/// land at turn 8 instead of turn 16.
+#[tokio::test]
+async fn a_permit_exempt_nesting_tool_still_counts_as_progress() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut script: Vec<_> = (0..7).flat_map(|_| idle_turn()).collect();
+    script.push(ScriptedProvider::tool_call(
+        "n1",
+        "nest",
+        serde_json::json!({}),
+    ));
+    script.push(ScriptedProvider::text_reply("the child did the work"));
+    script.push(ScriptedProvider::text_reply(
+        "VERDICT: not_yet\nREASON: the child reported back",
+    ));
+    script.extend((0..8).flat_map(|_| idle_turn()));
+    let provider = Arc::new(ScriptedProvider::new(script));
+    let mut registry = Registry::builtin();
+    registry.register(Box::new(NestingProbe));
+    let (mut handle, log_path) = session_with(provider.clone(), dir.path(), registry);
+
+    handle.set_goal(Some("the suite is green".into())).await;
+    handle.prompt("go".into()).await;
+
+    let seen = events_until_turn_done(&mut handle).await;
+    let mut expected: Vec<_> = (1..=16).map(|n| (GoalVerdictKind::NotYet, n)).collect();
+    expected.push((GoalVerdictKind::Stalled, 16));
+    assert_eq!(
+        verdicts(&seen),
+        expected,
+        "a permit-exempt tool that ran is still a tool that ran"
+    );
+    assert_eq!(
+        hotl_store::replay(&log_path)
+            .expect("replay")
+            .goal
+            .as_deref(),
+        Some("the suite is green")
+    );
+    assert_eq!(provider.request_count(), 33);
 }
