@@ -237,6 +237,10 @@ pub enum TranscriptItem {
         /// [`CHILD_TEXT_CAP`]. Drill-in only, so outside the fingerprint
         /// invariant for the same reason the tick stamps are.
         child_text: String,
+        /// The newest output line a running tool reported (0061 T25). `None`
+        /// is exactly today's card: a tool with no sink, a settled one, or an
+        /// older peer.
+        progress: Option<ToolProgress>,
     },
     /// Retrying / fallback / compacted / controlled stops.
     Notice {
@@ -360,6 +364,20 @@ pub enum ToolStatus {
     AutoAllowed {
         rule: String,
     },
+}
+
+/// A running tool's newest output line and the counts behind it (0061 T25).
+/// One `Option` rather than three loose fields, so "no progress" is one check
+/// and cannot half-exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolProgress {
+    pub tail: String,
+    pub lines: u64,
+    /// Not rendered; kept because the frame carries it and a later surface
+    /// (the inspector) will want it.
+    pub bytes: u64,
+    /// The card's own tick when this landed — what `quiet Ns` counts from.
+    pub at_ticks: u64,
 }
 
 /// A backoff the surface is counting down (0061 T22).
@@ -1287,6 +1305,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 }],
                 children: Vec::new(),
                 child_text: String::new(),
+                progress: None,
             });
             state.phase = Phase::Tool { name, ticks: 0 };
         }
@@ -1303,18 +1322,23 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             let bytes = v.get("bytes").and_then(Value::as_u64);
             let id = text_of("id");
             let mut found = false;
-            if let Some(TranscriptItem::Tool { status, calls, .. }) =
-                state.transcript.iter_mut().rev().find(|i| {
-                    matches!(i, TranscriptItem::Tool { calls, .. }
+            if let Some(TranscriptItem::Tool {
+                status,
+                calls,
+                progress,
+                ..
+            }) = state.transcript.iter_mut().rev().find(|i| {
+                matches!(i, TranscriptItem::Tool { calls, .. }
                         if calls.iter().any(|c| c.id == id && c.ok.is_none()))
-                })
-            {
+            }) {
                 found = true;
                 if let Some(call) = calls.iter_mut().find(|c| c.id == id && c.ok.is_none()) {
                     call.ok = Some(ok);
                     call.lines = lines;
                     call.bytes = bytes;
                 }
+                // The tail row gives way to the result row (0061 T25).
+                *progress = None;
                 if calls.iter().all(|c| c.ok.is_some()) {
                     *status = if calls.iter().any(|c| c.ok == Some(false)) {
                         ToolStatus::Failed
@@ -1348,9 +1372,40 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     }],
                     children: Vec::new(),
                     child_text: String::new(),
+                    progress: None,
                 });
             }
             settle_phase(state);
+        }
+        // A running tool's newest output line (0061 T25). Settles by id like
+        // `tool_done`; deliberately no phase change and no `enter_streaming`
+        // — it is not a `text_delta`, and the strip already follows the cards.
+        "tool_progress" => {
+            let id = text_of("id");
+            if let Some(TranscriptItem::Tool {
+                name,
+                status,
+                ticks,
+                progress,
+                ..
+            }) = state.transcript.iter_mut().rev().find(|i| {
+                matches!(i, TranscriptItem::Tool { calls, .. }
+                    if calls.iter().any(|c| c.id == id && c.ok.is_none()))
+            }) {
+                // An agent card's second row is its own account of itself,
+                // and a settled card is a late frame the drain raced (T12's
+                // guard covers the engine side; this is belt and braces).
+                if !is_agent_card(name)
+                    && matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. })
+                {
+                    *progress = Some(ToolProgress {
+                        tail: text_of("tail"),
+                        lines: v.get("lines").and_then(Value::as_u64).unwrap_or(0),
+                        bytes: v.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+                        at_ticks: *ticks,
+                    });
+                }
+            }
         }
         // Approved but waiting on the subprocess budget (0061 T24). Its own
         // card, parked without a clock, promoted in place by its `tool_start`.
@@ -1371,6 +1426,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 }],
                 children: Vec::new(),
                 child_text: String::new(),
+                progress: None,
             });
         }
         // Denied tools never get a `tool_start` (the engine returns before
@@ -1393,6 +1449,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 }],
                 children: Vec::new(),
                 child_text: String::new(),
+                progress: None,
             });
             settle_phase(state);
         }
@@ -3220,6 +3277,24 @@ pub fn running_cards(state: &State) -> Vec<(String, usize, u64)> {
     out
 }
 
+/// The newest running card's reported line count (0061 T25), for the strip's
+/// rank-2 slot. `None` when nothing running has spoken.
+pub fn running_lines(state: &State) -> Option<u64> {
+    state
+        .transcript
+        .iter()
+        .rev()
+        .take_while(|i| !matches!(i, TranscriptItem::User { .. }))
+        .find_map(|i| match i {
+            TranscriptItem::Tool {
+                status: ToolStatus::Running | ToolStatus::AutoAllowed { .. },
+                progress: Some(pr),
+                ..
+            } => Some(pr.lines),
+            _ => None,
+        })
+}
+
 /// After a tool settles: another card still running keeps the turn in the
 /// tool phase (on the oldest one's clock, so the strip's timer never resets
 /// while work continues); none left → the model is sampling its next step.
@@ -3555,6 +3630,7 @@ mod tests {
             }],
             children: Vec::new(),
             child_text: String::new(),
+            progress: None,
         }
     }
 
@@ -3889,6 +3965,90 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T25: liveness lands on the card and nowhere else — it is not a
+    /// `text_delta`, and the strip already follows the cards.
+    #[test]
+    fn tool_progress_lands_on_its_card_without_touching_the_phase() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: cargo build"}),
+        );
+        let phase = s.phase.clone();
+        upd(
+            &mut s,
+            json!({"type":"tool_progress","id":"p1","name":"bash","tail":"Compiling hotl","lines":12,"bytes":480}),
+        );
+        assert_eq!(s.phase, phase, "progress moved the phase");
+        let Some(TranscriptItem::Tool { progress, .. }) = s.transcript.last() else {
+            panic!("the card is the last item")
+        };
+        let pr = progress.clone().expect("the tail landed");
+        assert_eq!(pr.tail, "Compiling hotl");
+        assert_eq!((pr.lines, pr.bytes), (12, 480));
+    }
+
+    /// An agent card's second row is its own account of itself; a child's
+    /// bash tail has no place on it (0061 decision 3).
+    #[test]
+    fn tool_progress_on_an_agent_card_is_ignored() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"s1","name":"spawn","summary":"spawn survey"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_progress","id":"s1","name":"spawn","tail":"anything","lines":1,"bytes":1}),
+        );
+        let Some(TranscriptItem::Tool { progress, .. }) = s.transcript.last() else {
+            panic!("the card is the last item")
+        };
+        assert!(progress.is_none());
+    }
+
+    /// The tail row gives way to the result row when the tool settles.
+    #[test]
+    fn tool_done_clears_progress() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: cargo build"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_progress","id":"p1","name":"bash","tail":"Compiling","lines":1,"bytes":9}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"bash","ok":true,"lines":1,"bytes":9}),
+        );
+        let Some(TranscriptItem::Tool { progress, .. }) = s.transcript.last() else {
+            panic!("the card is the last item")
+        };
+        assert!(progress.is_none());
+    }
+
+    /// A tool that is printing is not a session that has gone quiet.
+    #[test]
+    fn a_tool_progress_frame_counts_as_activity() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: cargo build"}),
+        );
+        s.since_frame = 30 * crate::anim::TICK_HZ;
+        upd(
+            &mut s,
+            json!({"type":"tool_progress","id":"p1","name":"bash","tail":"Compiling","lines":1,"bytes":9}),
+        );
+        assert_eq!(s.since_frame, 0);
     }
 
     /// 0061 T24: a call waiting on the subprocess budget gets a parked card

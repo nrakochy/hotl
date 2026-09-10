@@ -255,6 +255,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             // Drill-in only, like the tick stamps beside it: hashing a
             // child's live prose would re-wrap the parent card per byte.
             child_text: _,
+            progress,
         } => {
             // Ticks are hashed at the two resolutions they are *rendered* at
             // — the marker's frame and the whole seconds of elapsed — not
@@ -290,6 +291,14 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             children.len().hash(&mut h);
             for c in children {
                 (&c.id, &c.name, &c.summary, c.ok).hash(&mut h);
+            }
+            // 0061 T25: `bytes` is carried, never rendered, so it is not
+            // hashed. `at_ticks` only moves on a frame that also moves
+            // `tail`/`lines`, and the card's `quiet Ns` is a function of it
+            // and the whole seconds already hashed above.
+            match progress {
+                None => 0u8.hash(&mut h),
+                Some(pr) => (1u8, &pr.tail, pr.lines, pr.at_ticks).hash(&mut h),
             }
         }
         TranscriptItem::Notice { text } => (5u8, text_key(text)).hash(&mut h),
@@ -1130,6 +1139,7 @@ fn item_block<'a>(
             calls,
             children,
             child_text: _,
+            progress,
         } => {
             let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
             let (marker, color) = status_glyph(status, *ticks, p);
@@ -1164,6 +1174,9 @@ fn item_block<'a>(
                 // running; a settled card moves it to the result row (T3).
                 if running {
                     details.push(format!("{}s", ticks / anim::TICK_HZ));
+                    if let Some(pr) = progress {
+                        details.push(format!("{} lines", group_digits(pr.lines)));
+                    }
                 }
             }
             // Name in the status color (so it stays identifiable now the
@@ -1184,7 +1197,32 @@ fn item_block<'a>(
                     Style::new().fg(p.muted),
                 ));
             }
+            // The one loud detail on a muted card (0061 T25): only `bash`
+            // has a sink, so only its silence means anything. Appended after
+            // the muted details so it can carry its own style.
+            if running && !agent && name == "bash" {
+                let since = match progress {
+                    Some(pr) => ticks.saturating_sub(pr.at_ticks),
+                    None => *ticks,
+                };
+                if since >= anim::QUIET_AFTER {
+                    spans.push(Span::styled(
+                        format!(" · quiet {}s", since / anim::TICK_HZ),
+                        Style::new().fg(p.blocked),
+                    ));
+                }
+            }
             let mut rows = vec![Line::from(spans)];
+            // The tail row (0061 T25) takes the same slot the result row will
+            // take once the tool settles, so the block's height never jumps.
+            // Clipped, never wrapped: a 200-char tail would otherwise flip
+            // between one and three rows per frame.
+            if running && !agent {
+                if let Some(pr) = progress.as_ref().filter(|pr| !pr.tail.is_empty()) {
+                    let clipped: String = pr.tail.chars().take(inner).collect();
+                    rows.push(Line::styled(clipped, Style::new().fg(p.faint)));
+                }
+            }
             if agent {
                 rows.push(Line::styled(
                     agent_row(children, *ticks, running, band_keys),
@@ -3280,6 +3318,7 @@ mod tests {
             }],
             children: Vec::new(),
             child_text: String::new(),
+            progress: None,
         }
     }
 
@@ -3888,6 +3927,183 @@ mod tests {
         assert!(rows[0].starts_with("   ⊘ Wrote"), "{:?}", rows[0]);
         // Same column as its neighbour: the verb starts at TEXT_COL on both.
         assert_eq!(rows[0].find("Wrote"), rows[1].find("Read"));
+    }
+
+    /// A running card with progress, for the T25 renders.
+    fn with_progress(ticks: u64, at_ticks: u64, tail: &str, lines: u64) -> TranscriptItem {
+        let mut item = tool_item(
+            "t1",
+            "bash",
+            "bash: cargo build",
+            ToolStatus::Running,
+            ticks,
+        );
+        if let TranscriptItem::Tool { progress, .. } = &mut item {
+            *progress = Some(crate::app::ToolProgress {
+                tail: tail.into(),
+                lines,
+                bytes: lines * 40,
+                at_ticks,
+            });
+        }
+        item
+    }
+
+    /// 0061 T25: the newest line the tool printed, on one faint row under the
+    /// header, with the running counts in the header itself.
+    #[test]
+    fn a_running_card_with_progress_shows_its_tail_on_one_faint_row() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(with_progress(
+            3 * anim::TICK_HZ,
+            3 * anim::TICK_HZ,
+            "Compiling hotl-engine",
+            1204,
+        ));
+        let rows = draw(&s);
+        assert!(
+            rows[0].contains("Bash  cargo build · 3s · 1,204 lines"),
+            "{:?}",
+            rows[0]
+        );
+        assert!(rows[1].contains("Compiling hotl-engine"), "{:?}", rows[1]);
+        let buf = draw_buffer(&s);
+        let col = rows[1].find("Compiling").unwrap() as u16;
+        assert_eq!(
+            buf.cell((col, 1)).unwrap().style().fg,
+            Some(Palette::default().faint)
+        );
+    }
+
+    /// A long tail must never wrap: three rows one frame and one the next
+    /// would make the whole transcript jump.
+    #[test]
+    fn the_tail_row_is_clipped_never_wrapped() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(with_progress(
+            anim::TICK_HZ,
+            anim::TICK_HZ,
+            &"x".repeat(200),
+            1,
+        ));
+        let rows = draw(&s);
+        assert!(rows[0].contains("Bash"), "{:?}", rows[0]);
+        assert!(rows[1].contains("xxx"), "{:?}", rows[1]);
+        assert!(!rows[2].contains('x'), "the tail wrapped: {:?}", rows[2]);
+    }
+
+    /// The tail row takes the slot the result row will take, so the block's
+    /// height does not jump at the moment the tool settles.
+    #[test]
+    fn a_settled_card_swaps_the_tail_row_for_the_result_row_at_the_same_height() {
+        let mut s = State::new(true, "m".into());
+        s.transcript
+            .push(with_progress(anim::TICK_HZ, anim::TICK_HZ, "Compiling", 12));
+        let running = draw(&s)[..STRIP]
+            .iter()
+            .filter(|r| !r.trim().is_empty())
+            .count();
+
+        let mut s = State::new(true, "m".into());
+        let mut item = tool_item(
+            "t1",
+            "bash",
+            "bash: cargo build",
+            ToolStatus::Done,
+            anim::TICK_HZ,
+        );
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            calls[0].lines = Some(12);
+            calls[0].bytes = Some(480);
+        }
+        s.transcript.push(item);
+        let settled = draw(&s)[..STRIP]
+            .iter()
+            .filter(|r| !r.trim().is_empty())
+            .count();
+        assert_eq!(running, settled, "the block changed height on settle");
+    }
+
+    /// Only `bash` has a sink, so only its silence means anything.
+    #[test]
+    fn a_silent_bash_card_says_quiet_after_ten_seconds() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(with_progress(
+            22 * anim::TICK_HZ,
+            10 * anim::TICK_HZ,
+            "Compiling",
+            12,
+        ));
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(all.contains("quiet 12s"), "{all}");
+
+        // Nine seconds of silence is not a stall.
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(with_progress(
+            19 * anim::TICK_HZ,
+            10 * anim::TICK_HZ,
+            "Compiling",
+            12,
+        ));
+        assert!(
+            !draw(&s)[..STRIP].join("\n").contains("quiet"),
+            "{:?}",
+            draw(&s)[0]
+        );
+    }
+
+    #[test]
+    fn a_silent_read_card_never_says_quiet() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(tool_item(
+            "t1",
+            "read",
+            "read app.rs",
+            ToolStatus::Running,
+            30 * anim::TICK_HZ,
+        ));
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(
+            !all.contains("quiet"),
+            "a tool with no sink said quiet: {all}"
+        );
+    }
+
+    /// Everything the tail row renders must invalidate the cached rows.
+    #[test]
+    fn progress_enters_the_fingerprint() {
+        let base = with_progress(anim::TICK_HZ, 0, "Compiling", 12);
+        let none = tool_item(
+            "t1",
+            "bash",
+            "bash: cargo build",
+            ToolStatus::Running,
+            anim::TICK_HZ,
+        );
+        assert_ne!(item_fingerprint(&base), item_fingerprint(&none));
+        for mutate in [
+            |pr: &mut crate::app::ToolProgress| pr.tail = "Linking".into(),
+            |pr: &mut crate::app::ToolProgress| pr.lines = 13,
+            |pr: &mut crate::app::ToolProgress| pr.at_ticks += 1,
+        ] {
+            let mut b = base.clone();
+            if let TranscriptItem::Tool {
+                progress: Some(pr), ..
+            } = &mut b
+            {
+                mutate(pr);
+            }
+            assert_ne!(item_fingerprint(&base), item_fingerprint(&b));
+        }
+        // `bytes` is carried, never rendered.
+        let mut b = base.clone();
+        if let TranscriptItem::Tool {
+            progress: Some(pr), ..
+        } = &mut b
+        {
+            pr.bytes += 1_000;
+        }
+        assert_eq!(item_fingerprint(&base), item_fingerprint(&b));
     }
 
     /// 0061 T24: parked, not working — a hollow glyph in the quietest role,
@@ -6466,7 +6682,9 @@ mod tests {
         let mut s = cacheable_state();
         let mut warm = TranscriptCache::default();
         for step in 0..40u64 {
-            bump_tool_ticks(&mut s, step * 7);
+            // 0061 T25: the multiplier crosses `QUIET_AFTER` before the walk
+            // ends, so the card's `quiet Ns` is exercised too.
+            bump_tool_ticks(&mut s, step * 12);
             if step % 5 == 0 {
                 if let Some(TranscriptItem::Assistant { text }) = s.transcript.get_mut(1) {
                     text.push_str(" delta");
@@ -6476,15 +6694,21 @@ mod tests {
                 s.scroll = Scroll::At(1);
             }
             // 0061 T24: a queue→promote step, so the walk covers the parked
-            // card and the promotion that replaces it.
+            // card and the promotion that replaces it. Inserted *before* the
+            // running card, which every mutation below still addresses as
+            // `last_mut`.
             if step == 5 {
-                s.transcript.push(tool_item(
-                    "q1",
-                    "bash",
-                    "bash: cargo test",
-                    ToolStatus::Queued { ahead: 1 },
-                    0,
-                ));
+                let at = s.transcript.len() - 1;
+                s.transcript.insert(
+                    at,
+                    tool_item(
+                        "q1",
+                        "bash",
+                        "bash: cargo test",
+                        ToolStatus::Queued { ahead: 1 },
+                        0,
+                    ),
+                );
             }
             if step == 7 {
                 if let Some(TranscriptItem::Tool { status, .. }) = s
@@ -6493,6 +6717,21 @@ mod tests {
                     .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if id == "q1"))
                 {
                     *status = ToolStatus::Running;
+                }
+            }
+            // 0061 T25: a tail lands once and then goes silent, so the walk
+            // crosses `quiet Ns` with the cache warm.
+            if step == 12 {
+                if let Some(TranscriptItem::Tool {
+                    ticks, progress, ..
+                }) = s.transcript.last_mut()
+                {
+                    *progress = Some(crate::app::ToolProgress {
+                        tail: "Compiling hotl-engine".into(),
+                        lines: 1204,
+                        bytes: 48_000,
+                        at_ticks: *ticks,
+                    });
                 }
             }
             if let Some(TranscriptItem::Tool {

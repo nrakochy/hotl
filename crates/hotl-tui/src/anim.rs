@@ -381,7 +381,8 @@ pub const KEEP: u8 = u8::MAX;
 
 // Drop order, lowest first (0049 T1). Rank 4 is the view's session-name chip.
 const RANK_TODO: u8 = 1;
-// Rank 2 is reserved for a running tool's output line count (0061 T25).
+/// A running tool's output line count — the slot 0049 T1 reserved (0061 T25).
+const RANK_LINES: u8 = 2;
 const RANK_USAGE: u8 = 3;
 const RANK_MODEL: u8 = 5;
 const RANK_GOAL: u8 = 6;
@@ -552,6 +553,11 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
                 (names.join(" · "), oldest)
             };
             segs.push(Segment::keep(format!("{list} · {}s", secs(secs_of))));
+            // The reserved rank-2 slot (0061 T25): drops after the todo label
+            // folds and before the usage detail goes.
+            if let Some(lines) = crate::app::running_lines(state) {
+                segs.push(Segment::rank(format!("{lines} lines"), RANK_LINES));
+            }
         }
         Phase::WaitingAsk { .. } | Phase::WaitingQuestion { .. } => {
             segs.push(Segment::keep("waiting on you"));
@@ -932,6 +938,52 @@ mod tests {
             delay_ticks: delay_ms.map(|ms| ms * TICK_HZ / 1000),
             ticks: 0,
         }
+    }
+
+    /// 0061 T25: the line count is the rank-2 segment 0049 T1 reserved — it
+    /// drops after the todo label folds and before the usage detail goes.
+    #[test]
+    fn the_line_count_is_the_rank_two_segment() {
+        let mut s = State::test_default();
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 3 * TICK_HZ,
+        };
+        let mut card = crate::app::TranscriptItem::Tool {
+            id: "t1".into(),
+            name: "bash".into(),
+            summary: "bash: cargo build".into(),
+            status: crate::app::ToolStatus::Running,
+            ticks: 3 * TICK_HZ,
+            calls: vec![crate::app::ToolCall {
+                id: "t1".into(),
+                ok: None,
+                lines: None,
+                bytes: None,
+            }],
+            children: Vec::new(),
+            child_text: String::new(),
+            progress: None,
+        };
+        s.transcript.push(card.clone());
+        assert_eq!(strip_text(&s), "bash · 3s", "no progress, no segment");
+
+        if let crate::app::TranscriptItem::Tool { progress, .. } = &mut card {
+            *progress = Some(crate::app::ToolProgress {
+                tail: "Compiling".into(),
+                lines: 1204,
+                bytes: 48_000,
+                at_ticks: 3 * TICK_HZ,
+            });
+        }
+        s.transcript = vec![card];
+        assert_eq!(strip_text(&s), "bash · 3s · 1204 lines");
+        let seg = strip_segments(&s)
+            .into_iter()
+            .find(|g| g.text.ends_with("lines"))
+            .expect("the line-count segment");
+        assert_eq!(seg.rank, RANK_LINES);
+        assert!(RANK_TODO < seg.rank && seg.rank < RANK_USAGE);
     }
 
     /// 0061 T23: the fold is the one thing worth saying while it runs — and
