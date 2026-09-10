@@ -35,6 +35,7 @@ fn session(provider: Arc<dyn Provider>, config: EngineConfig) -> Session {
         initial_items: Vec::new(),
         initial_todos: Vec::new(),
         initial_goal: None,
+        concurrency: Default::default(),
         config,
     });
     Session { handle, dir }

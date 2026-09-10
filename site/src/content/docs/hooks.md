@@ -29,6 +29,8 @@ hotl deliberately supports six events — not Claude's ~35 — each with a concr
 | `notification` | the agent blocks on you, goes idle, or finishes | fire-and-forget (ring a bell, `tmux display-message`, push a phone notification) |
 | `stop` | the model just finished replying with no tool calls | veto turn-end once, with a reason (bounded — see below) |
 | `session_end` | the session actor shuts down | fire-and-forget cleanup |
+| `pre_compact` | just before context compaction folds history | pin tool results that must survive verbatim |
+| `post_compact` | just after a fold | fire-and-forget; sees the digest the model will read |
 
 In `~/.config/hotl/config.toml`:
 
@@ -64,7 +66,7 @@ command = "/usr/local/bin/cleanup"
 
 Your command receives the event as JSON on **stdin** and returns a decision as JSON on **stdout**.
 
-Every stdin envelope carries the event **twice**: hotl's own lowercase `event` (unchanged, so an already-shipped `pre_tool`/`post_tool` hook keeps working), and `hookEventName`, Claude's own camelCase name for the same event (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Notification`, `Stop`, `SessionEnd`) — so a `~/.claude`-style hook script that keys on `hookEventName` (the only key it knows for the brand-new `user_prompt`/`notification`/`stop` events) can read hotl's envelope unmodified.
+Every stdin envelope carries the event **twice**: hotl's own lowercase `event` (unchanged, so an already-shipped `pre_tool`/`post_tool` hook keeps working), and `hookEventName`, Claude's own camelCase name for the same event (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Notification`, `Stop`, `SessionEnd`, `PreCompact`, `PostCompact`) — so a `~/.claude`-style hook script that keys on `hookEventName` (the only key it knows for the brand-new `user_prompt`/`notification`/`stop` events) can read hotl's envelope unmodified.
 
 **pre_tool** — stdin `{"event":"pre_tool","hookEventName":"PreToolUse","tool":"bash","input":{...}}`, respond with one of:
 ```json
@@ -91,6 +93,14 @@ A `deny` becomes an error tool result carrying your message. A `rewrite` swaps t
 or `{"decision":"allow"}` (the default for anything else). A `block` injects your `reason` as a reminder and lets the model keep going — **bounded**: `stop` shares one per-prompt budget of eight extensions (Claude Code's Stop-hook cap) with hotl's own todo-list nudge, so a hook that always blocks can never wedge a turn forever.
 
 **session_end** — stdin `{"event":"session_end","hookEventName":"SessionEnd"}`. Runs to completion at actor shutdown (bounded by its own timeout) rather than fire-and-forget — the process waits for it, so it's guaranteed to actually run before `hotl` exits.
+
+**pre_compact** — stdin `{"event":"pre_compact","hookEventName":"PreCompact","foldedIds":["t7","t8"],"keptFrom":12,"estimatePct":81}`, respond with:
+```json
+{"pin":["t7"]}
+```
+Each pinned `tool_use` id's result is re-appended verbatim right after the digest, so the detail a summary would have flattened survives the fold. `foldedIds` is every result about to be folded away, so a hook can decide by id without parsing anything. **A `pre_compact` hook can pin, never veto** — a fold the window needs is not a hook's to refuse, and a hung one folds with no pins. A pin survives one fold: keep it small, or the next sample folds it away again.
+
+**post_compact** — stdin `{"event":"post_compact","hookEventName":"PostCompact","digest":"GOAL: …"}`. Fire-and-forget (bounded like `session_end`): the digest is what the model will read from here on, so this is the seam for archiving it.
 
 ### Rules hooks live by
 

@@ -1638,13 +1638,19 @@ fn apply_log(
                 digest,
                 prefix_end,
                 kept_from,
+                pinned,
                 ..
             } => {
                 let prefix_end = prefix_end.min(items.len());
                 let kept_from = kept_from.clamp(prefix_end, items.len());
                 let tail = items.split_off(kept_from);
+                // Read the pins out of the folded span before it is dropped —
+                // the same walk `compaction::apply` does live, so replay and
+                // the live head cannot disagree (0057 T3).
+                let pinned = hotl_types::pinned_items(&items[prefix_end..], &pinned);
                 items.truncate(prefix_end);
                 items.extend(digest);
+                items.extend(pinned);
                 items.extend(tail);
             }
             // Rewrites result *content* in place, never the item count — so
@@ -2039,6 +2045,7 @@ mod tests {
                 prefix_end: 0,
                 kept_from: 2,
                 degraded: false,
+                pinned: Vec::new(),
             },
             3,
         )
@@ -3374,6 +3381,7 @@ mod tests {
                     prefix_end: 0,
                     kept_from: 3,
                     degraded: false,
+                    pinned: Vec::new(),
                 },
                 11,
             )

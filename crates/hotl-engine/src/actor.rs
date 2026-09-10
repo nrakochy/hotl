@@ -2305,21 +2305,24 @@ async fn compact(
         if let Some(spec) = spec {
             let spec_usage = spec.usage;
             if spec.prefix_end < spec.kept_from && spec.kept_from <= head.items().len() {
+                let plan = compaction::Plan {
+                    prefix_end: spec.prefix_end,
+                    kept_from: spec.kept_from,
+                };
+                let pins = pre_compact_pins(shared, head, &plan).await;
                 let digest = vec![compaction::digest_item(&spec.text)];
                 let payload = EntryPayload::Compaction {
                     digest: digest.clone(),
                     prefix_end: spec.prefix_end,
                     kept_from: spec.kept_from,
                     degraded: false,
+                    pinned: pins.clone(),
                 };
                 if !shared.append(log, pipeline, head, payload).await {
                     return Err("session log is sealed".into());
                 }
-                let plan = compaction::Plan {
-                    prefix_end: spec.prefix_end,
-                    kept_from: spec.kept_from,
-                };
-                head.repoint(compaction::apply(head.items(), &plan, &digest));
+                head.repoint(compaction::apply(head.items(), &plan, &digest, &pins));
+                post_compact(shared, &spec.text).await;
                 return Ok((false, spec_usage));
             }
         }
@@ -2342,25 +2345,78 @@ async fn compact(
     };
     let snapshot = Arc::clone(head.items());
     let folded = &snapshot[plan.prefix_end..plan.kept_from];
+    let pins = pre_compact_pins(shared, head, &plan).await;
     // Timeout or two failed attempts: the floor digest keeps the session moving
     // rather than ending the turn on housekeeping.
     let (summary, fold_usage) =
         summarize_bounded(summarize(shared, folded), COMPACT_SUMMARIZE_TIMEOUT).await;
-    let (digest, degraded) = match summary {
-        Some(text) => (vec![compaction::digest_item(&text)], false),
-        None => (vec![compaction::floor_digest()], true),
+    // `text` is the digest body the `PostCompact` hook reads; the floor
+    // digest has no summary to hand it, so it hands the empty string.
+    let (digest, degraded, text) = match summary {
+        Some(text) => (vec![compaction::digest_item(&text)], false, text),
+        None => (vec![compaction::floor_digest()], true, String::new()),
     };
     let payload = EntryPayload::Compaction {
         digest: digest.clone(),
         prefix_end: plan.prefix_end,
         kept_from: plan.kept_from,
         degraded,
+        pinned: pins.clone(),
     };
     if !shared.append(log, pipeline, head, payload).await {
         return Err("session log is sealed".into());
     }
-    head.repoint(compaction::apply(head.items(), &plan, &digest));
+    head.repoint(compaction::apply(head.items(), &plan, &digest, &pins));
+    post_compact(shared, &text).await;
     Ok((degraded, fold_usage))
+}
+
+/// Ask the `PreCompact` hooks what to keep. Bounded by
+/// [`crate::hooks::HOOK_CALL_TIMEOUT`], and never a veto: a hung or silent
+/// hook folds with no pins rather than wedging a fold the window needs.
+async fn pre_compact_pins(
+    shared: &SharedDeps,
+    head: &Head,
+    plan: &compaction::Plan,
+) -> Vec<String> {
+    crate::hooks::hook_gate!(
+        shared.hooks,
+        shared.hook_mask(),
+        crate::hooks::EventMask::PRE_COMPACT,
+        |hooks| {
+            let items = head.items();
+            let folded_ids: Vec<String> = items[plan.prefix_end..plan.kept_from]
+                .iter()
+                .filter_map(|i| match &**i {
+                    Item::ToolResults { results } => Some(results),
+                    _ => None,
+                })
+                .flatten()
+                .map(|r| r.tool_use_id.clone())
+                .collect();
+            let info = crate::hooks::CompactInfo {
+                folded_ids,
+                kept_from: plan.kept_from,
+                estimate_pct: ((head.estimated.saturating_mul(100)
+                    / shared.config.context_window.max(1))
+                .min(100)) as u8,
+            };
+            crate::hooks::call_pre_compact(hooks, &info).await.pins
+        },
+        else Vec::new()
+    )
+}
+
+/// Tell the `PostCompact` hooks what the model will read. Awaited under the
+/// hook timeout like `SessionEnd`: no turn is in flight during a fold.
+async fn post_compact(shared: &SharedDeps, digest: &str) {
+    crate::hooks::hook_gate!(
+        shared.hooks,
+        shared.hook_mask(),
+        crate::hooks::EventMask::POST_COMPACT,
+        |hooks| crate::hooks::call_post_compact(hooks, digest).await,
+        else ()
+    );
 }
 
 /// The inline fold's summarize under a wall-clock bound. `None` on either a

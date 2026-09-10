@@ -356,6 +356,11 @@ pub enum EntryPayload {
         kept_from: usize,
         /// True when the summarize call failed and the floor was applied.
         degraded: bool,
+        /// `tool_use` ids a `PreCompact` hook pinned (0057 T3): their results
+        /// are re-appended verbatim right after the digest, so replay
+        /// reconstructs the same projection the live fold produced.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pinned: Vec<String>,
     },
     /// Re-point the projection to its first `keep_items` items — the
     /// `branch_move` of the commit-protocol vocabulary, expressed against
@@ -475,6 +480,37 @@ pub fn cleared_stub(id: &str, bytes: usize, turn: usize) -> String {
 /// re-break the cache for nothing).
 pub fn is_cleared_stub(content: &str) -> bool {
     content.starts_with("<cleared tool_use_id=")
+}
+
+/// The pinned results found in a folded span, as verbatim user text — one
+/// item per pin, in pin order (0057 T3). Text rather than `ToolResults`
+/// because a `tool_result` block with no `tool_use` in front of it is a wire
+/// error; the content is byte-identical either way, which is what "verbatim"
+/// means here. Shared by `hotl_context::compaction::apply` and the store's
+/// replay so a resumed session sees the same projection the live fold built.
+pub fn pinned_items<I: std::borrow::Borrow<Item>>(folded: &[I], pins: &[String]) -> Vec<Item> {
+    if pins.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for pin in pins {
+        for item in folded {
+            let Item::ToolResults { results } = item.borrow() else {
+                continue;
+            };
+            for r in results.iter().filter(|r| &r.tool_use_id == pin) {
+                out.push(Item::User {
+                    text: format!(
+                        "<pinned tool_use_id=\"{}\">\n{}\n</pinned>",
+                        r.tool_use_id, r.content
+                    ),
+                    synthetic: Some(SyntheticReason::CompactionSummary),
+                    images: Vec::new(),
+                });
+            }
+        }
+    }
+    out
 }
 
 /// Replace every result named in `ids` with its stub, in place. Generic over

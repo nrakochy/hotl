@@ -56,8 +56,9 @@ use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
 use hotl_engine::hooks::{
-    cap_payload, join_additional_context, merge_pre_tool, merge_stop, EventMask, Hooks, Matcher,
-    NotificationKind, PreToolDecision, StopDecision,
+    cap_payload, join_additional_context, merge_pre_compact, merge_pre_tool, merge_stop,
+    CompactInfo, EventMask, Hooks, Matcher, NotificationKind, PreCompactDecision, PreToolDecision,
+    StopDecision,
 };
 use hotl_tools::concurrency::SessionConcurrency;
 use hotl_tools::{net, sandbox};
@@ -105,6 +106,8 @@ fn claude_event_name(event: &str) -> &'static str {
         "notification" => "Notification",
         "stop" => "Stop",
         "session_end" => "SessionEnd",
+        "pre_compact" => "PreCompact",
+        "post_compact" => "PostCompact",
         _ => "Unknown",
     }
 }
@@ -135,6 +138,8 @@ pub struct ShellHooks {
     notification: Vec<ShellHook>,
     stop: Vec<ShellHook>,
     session_end: Vec<ShellHook>,
+    pre_compact: Vec<ShellHook>,
+    post_compact: Vec<ShellHook>,
     /// The one shared Layer-B budget (`SessionConcurrency`) — every shell
     /// hook process draws a `subproc()` permit here, the same pool
     /// `bash`/`grep` draw from, so a turn firing a dozen matching hooks plus
@@ -166,6 +171,8 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
     let mut notification = Vec::new();
     let mut stop = Vec::new();
     let mut session_end = Vec::new();
+    let mut pre_compact = Vec::new();
+    let mut post_compact = Vec::new();
     for spec in parsed.hooks {
         let matcher = parse_matcher(spec.matcher.as_deref());
         let hook = ShellHook {
@@ -180,6 +187,8 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
             "notification" => notification.push(hook),
             "stop" => stop.push(hook),
             "session_end" => session_end.push(hook),
+            "pre_compact" => pre_compact.push(hook),
+            "post_compact" => post_compact.push(hook),
             _ => {} // unknown event: ignored (forward-compat)
         }
     }
@@ -189,6 +198,8 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
         && notification.is_empty()
         && stop.is_empty()
         && session_end.is_empty()
+        && pre_compact.is_empty()
+        && post_compact.is_empty()
     {
         return None;
     }
@@ -211,6 +222,12 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
     if !session_end.is_empty() {
         mask = mask.union(EventMask::SESSION_END);
     }
+    if !pre_compact.is_empty() {
+        mask = mask.union(EventMask::PRE_COMPACT);
+    }
+    if !post_compact.is_empty() {
+        mask = mask.union(EventMask::POST_COMPACT);
+    }
     Some(ShellHooks {
         pre,
         post,
@@ -218,6 +235,8 @@ pub fn load_str(raw: &str, concurrency: SessionConcurrency) -> Option<ShellHooks
         notification,
         stop,
         session_end,
+        pre_compact,
+        post_compact,
         concurrency,
         mask: Arc::new(AtomicU8::new(mask.bits())),
     })
@@ -509,6 +528,49 @@ impl Hooks for ShellHooks {
         })
     }
 
+    fn pre_compact<'a>(&'a self, info: &'a CompactInfo) -> BoxFuture<'a, PreCompactDecision> {
+        Box::pin(async move {
+            let payload = json!({
+                "event": "pre_compact",
+                "hookEventName": claude_event_name("pre_compact"),
+                "foldedIds": info.folded_ids,
+                "keptFrom": info.kept_from,
+                "estimatePct": info.estimate_pct
+            });
+            let futures = self.pre_compact.iter().map(|hook| {
+                let payload = payload.clone();
+                async move {
+                    match hook
+                        .invoke(&payload, "pre_compact", &self.concurrency)
+                        .await
+                    {
+                        Some(decision) => decode_pre_compact(&decision),
+                        None => PreCompactDecision::default(),
+                    }
+                }
+            });
+            let decision = merge_pre_compact(futures_util::future::join_all(futures).await);
+            self.refresh_mask_bit(EventMask::PRE_COMPACT, self.pre_compact.iter());
+            decision
+        })
+    }
+
+    fn post_compact<'a>(&'a self, digest: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let payload = json!({
+                "event": "post_compact",
+                "hookEventName": claude_event_name("post_compact"),
+                "digest": digest
+            });
+            let futures = self
+                .post_compact
+                .iter()
+                .map(|hook| hook.invoke(&payload, "post_compact", &self.concurrency));
+            futures_util::future::join_all(futures).await;
+            self.refresh_mask_bit(EventMask::POST_COMPACT, self.post_compact.iter());
+        })
+    }
+
     fn event_mask(&self) -> EventMask {
         hotl_engine::hooks::mask_of(&self.mask)
     }
@@ -519,6 +581,23 @@ impl Hooks for ShellHooks {
     /// next session, which a one-time `event_mask()` snapshot would mean.
     fn mask_handle(&self) -> Option<Arc<AtomicU8>> {
         Some(Arc::clone(&self.mask))
+    }
+}
+
+/// `{"pin": ["t1", "t2"]}` — anything else pins nothing. A hook cannot veto a
+/// fold, so there is no `decision` key to read here.
+fn decode_pre_compact(decision: &Value) -> PreCompactDecision {
+    PreCompactDecision {
+        pins: decision
+            .get("pin")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -595,6 +674,42 @@ mod tests {
         );
         // A config with no hooks loads as None.
         assert!(load_str("# no hooks here\n", concurrency()).is_none());
+    }
+
+    /// The envelope a real `~/.claude`-style script keys on, and the reply
+    /// shape it answers with (0057 T3).
+    #[tokio::test]
+    async fn a_shell_pre_compact_hook_pins_by_id() {
+        let hooks = load_str(
+            "[[hook]]\nevent = \"pre_compact\"\n\
+             command = \"grep -q '\\\"hookEventName\\\":\\\"PreCompact\\\"' && \
+             echo '{\\\"pin\\\":[\\\"t7\\\"]}'\"\n",
+            concurrency(),
+        )
+        .expect("hooks configured");
+        assert!(hooks.event_mask().contains(EventMask::PRE_COMPACT));
+        let info = CompactInfo {
+            folded_ids: vec!["t7".into(), "t8".into()],
+            kept_from: 12,
+            estimate_pct: 81,
+        };
+        assert_eq!(hooks.pre_compact(&info).await.pins, vec!["t7".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn a_shell_post_compact_hook_sees_the_digest() {
+        let out = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = out.path().to_str().expect("utf8").to_string();
+        let hooks = load_str(
+            &format!("[[hook]]\nevent = \"post_compact\"\ncommand = \"cat > {path}\"\n"),
+            concurrency(),
+        )
+        .expect("hooks configured");
+        assert!(hooks.event_mask().contains(EventMask::POST_COMPACT));
+        hooks.post_compact("GOAL: ship it").await;
+        let seen = std::fs::read_to_string(&path).expect("hook wrote its stdin");
+        assert!(seen.contains("\"hookEventName\":\"PostCompact\""), "{seen}");
+        assert!(seen.contains("GOAL: ship it"), "{seen}");
     }
 
     #[tokio::test]

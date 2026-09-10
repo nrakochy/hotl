@@ -3613,6 +3613,7 @@ mod fork_tests {
                     prefix_end: 0,
                     kept_from: 8,
                     degraded: false,
+                    pinned: Vec::new(),
                 },
                 11,
             )

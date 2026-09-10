@@ -58,17 +58,29 @@ pub fn plan<I: std::borrow::Borrow<Item>>(
     })
 }
 
-/// The new projection: preserved prefix + digest + verbatim tail. `Arc`
-/// elements in and out (0033 Task 5): the kept ranges move as pointer
-/// clones, only the digest items are newly allocated.
+/// The new projection: preserved prefix + digest + pinned results + verbatim
+/// tail. `Arc` elements in and out (0033 Task 5): the kept ranges move as
+/// pointer clones, only the digest items are newly allocated.
+///
+/// `pins` are `tool_use` ids a `PreCompact` hook asked to keep (0057 T3).
+/// Each pinned result is re-appended as a **standalone** `ToolResults` item
+/// right after the digest — never in place, which would strand it behind the
+/// assistant turn that called it. Pairing survives because the digest is a
+/// user item: the pinned block sits in the folded region's stead, with no
+/// `tool_use` in front of it, so it reads as evidence rather than as a reply.
 pub fn apply(
     items: &[std::sync::Arc<Item>],
     plan: &Plan,
     digest: &[Item],
+    pins: &[String],
 ) -> Vec<std::sync::Arc<Item>> {
-    let mut out = Vec::with_capacity(plan.prefix_end + digest.len() + items.len() - plan.kept_from);
+    let pinned = hotl_types::pinned_items(&items[plan.prefix_end..plan.kept_from], pins);
+    let mut out = Vec::with_capacity(
+        plan.prefix_end + digest.len() + pinned.len() + items.len() - plan.kept_from,
+    );
     out.extend_from_slice(&items[..plan.prefix_end]);
     out.extend(digest.iter().cloned().map(std::sync::Arc::new));
+    out.extend(pinned.into_iter().map(std::sync::Arc::new));
     out.extend_from_slice(&items[plan.kept_from..]);
     out
 }
@@ -319,7 +331,7 @@ mod tests {
         let digest = [digest_item("GOAL: test")];
         let with_history: Vec<std::sync::Arc<Item>> =
             with_history.into_iter().map(std::sync::Arc::new).collect();
-        let applied = apply(&with_history, &p, &digest);
+        let applied = apply(&with_history, &p, &digest, &[]);
         assert!(matches!(
             *applied[0],
             Item::User {

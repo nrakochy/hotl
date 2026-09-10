@@ -290,6 +290,8 @@ impl EventMask {
     pub const NOTIFICATION: EventMask = EventMask(1 << 3);
     pub const STOP: EventMask = EventMask(1 << 4);
     pub const SESSION_END: EventMask = EventMask(1 << 5);
+    pub const PRE_COMPACT: EventMask = EventMask(1 << 6);
+    pub const POST_COMPACT: EventMask = EventMask(1 << 7);
 
     /// No events registered — a zero-hook session's cached mask.
     pub const NONE: EventMask = EventMask(0);
@@ -301,7 +303,9 @@ impl EventMask {
             | Self::USER_PROMPT.0
             | Self::NOTIFICATION.0
             | Self::STOP.0
-            | Self::SESSION_END.0,
+            | Self::SESSION_END.0
+            | Self::PRE_COMPACT.0
+            | Self::POST_COMPACT.0,
     );
 
     pub const fn contains(self, bit: EventMask) -> bool {
@@ -318,7 +322,7 @@ impl EventMask {
     pub const fn bits(self) -> u8 {
         self.0
     }
-    /// Bits outside the six defined here are masked off — forward-compat
+    /// Bits outside the eight defined here are masked off — forward-compat
     /// against a stray byte rather than a panic.
     pub const fn from_bits(bits: u8) -> EventMask {
         EventMask(bits & Self::ALL.0)
@@ -363,6 +367,20 @@ pub trait Hooks: Send + Sync {
     /// `SessionEnd`: fire-and-forget, called once at actor shutdown. Default:
     /// no-op.
     fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// `PreCompact`: the fold is about to run. A hook may name tool_use ids
+    /// whose results must survive it verbatim; it can pin, never veto — a
+    /// fold the window needs is not a hook's to refuse. Default: no pins.
+    fn pre_compact<'a>(&'a self, _info: &'a CompactInfo) -> BoxFuture<'a, PreCompactDecision> {
+        Box::pin(std::future::ready(PreCompactDecision::default()))
+    }
+
+    /// `PostCompact`: the fold ran; `digest` is the summary the model will
+    /// read. Fire-and-forget — nothing downstream consumes a reply. Default:
+    /// no-op.
+    fn post_compact<'a>(&'a self, _digest: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
     }
 
@@ -448,6 +466,53 @@ pub enum StopDecision {
     Block { reason: String },
 }
 
+/// What a `PreCompact` hook is told about the fold about to happen.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactInfo {
+    /// `tool_use` ids of every result inside the folded span.
+    pub folded_ids: Vec<String>,
+    /// Projection index where the verbatim tail starts.
+    pub kept_from: usize,
+    /// How full the window was when the fold fired, as a percentage.
+    pub estimate_pct: u8,
+}
+
+/// A `PreCompact` hook's answer: ids whose results ride through the fold
+/// verbatim. Deliberately not a veto — see [`Hooks::pre_compact`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PreCompactDecision {
+    pub pins: Vec<String>,
+}
+
+/// Await [`Hooks::pre_compact`] under [`HOOK_CALL_TIMEOUT`]; a timeout folds
+/// with no pins — a hung hook can never wedge a fold the window needs.
+pub async fn call_pre_compact(hooks: &Arc<dyn Hooks>, info: &CompactInfo) -> PreCompactDecision {
+    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.pre_compact(info))
+        .await
+        .unwrap_or_default()
+}
+
+/// Await [`Hooks::post_compact`] under [`HOOK_CALL_TIMEOUT`]; a timeout is a
+/// no-op, exactly like [`call_session_end`]'s.
+pub async fn call_post_compact(hooks: &Arc<dyn Hooks>, digest: &str) {
+    let _ = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.post_compact(cap_payload(digest))).await;
+}
+
+/// Deterministic merge over `pre_compact` results: the union of every hook's
+/// pins, deduped, in registration order. Pinning is additive — one hook's
+/// silence never unpins another's item.
+pub fn merge_pre_compact(results: Vec<PreCompactDecision>) -> PreCompactDecision {
+    let mut pins: Vec<String> = Vec::new();
+    for r in results {
+        for pin in r.pins {
+            if !pins.contains(&pin) {
+                pins.push(pin);
+            }
+        }
+    }
+    PreCompactDecision { pins }
+}
+
 /// Clip a payload to the hook cap on a char boundary (never mid-UTF-8).
 pub fn cap_payload(s: &str) -> &str {
     if s.len() <= HOOK_PAYLOAD_CAP {
@@ -482,6 +547,10 @@ pub struct InProcessHooks {
     stop: Vec<Box<dyn Fn(&str) -> StopDecision + Send + Sync>>,
     #[allow(clippy::type_complexity)]
     session_end: Vec<Box<dyn Fn() + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    pre_compact: Vec<Box<dyn Fn(&CompactInfo) -> PreCompactDecision + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    post_compact: Vec<Box<dyn Fn(&str) + Send + Sync>>,
 }
 
 impl InProcessHooks {
@@ -540,6 +609,17 @@ impl InProcessHooks {
         self.session_end.push(Box::new(f));
         self
     }
+    pub fn on_pre_compact(
+        mut self,
+        f: impl Fn(&CompactInfo) -> PreCompactDecision + Send + Sync + 'static,
+    ) -> Self {
+        self.pre_compact.push(Box::new(f));
+        self
+    }
+    pub fn on_post_compact(mut self, f: impl Fn(&str) + Send + Sync + 'static) -> Self {
+        self.post_compact.push(Box::new(f));
+        self
+    }
     pub fn is_empty(&self) -> bool {
         self.pre.is_empty()
             && self.post.is_empty()
@@ -547,6 +627,8 @@ impl InProcessHooks {
             && self.notification.is_empty()
             && self.stop.is_empty()
             && self.session_end.is_empty()
+            && self.pre_compact.is_empty()
+            && self.post_compact.is_empty()
     }
 }
 
@@ -652,6 +734,18 @@ impl Hooks for InProcessHooks {
             }
         })
     }
+    fn pre_compact<'a>(&'a self, info: &'a CompactInfo) -> BoxFuture<'a, PreCompactDecision> {
+        Box::pin(async move {
+            merge_pre_compact(self.pre_compact.iter().map(|hook| hook(info)).collect())
+        })
+    }
+    fn post_compact<'a>(&'a self, digest: &'a str) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            for hook in &self.post_compact {
+                hook(digest);
+            }
+        })
+    }
 }
 
 /// One `additionalContext` item per commit point (Innovation #7): concatenate
@@ -704,6 +798,8 @@ mod tests {
         assert!(EventMask::ALL.contains(EventMask::NOTIFICATION));
         assert!(EventMask::ALL.contains(EventMask::STOP));
         assert!(EventMask::ALL.contains(EventMask::SESSION_END));
+        assert!(EventMask::ALL.contains(EventMask::PRE_COMPACT));
+        assert!(EventMask::ALL.contains(EventMask::POST_COMPACT));
         assert!(!EventMask::NONE.contains(EventMask::PRE_TOOL));
 
         let union = EventMask::PRE_TOOL.union(EventMask::STOP);
@@ -711,7 +807,7 @@ mod tests {
         assert!(union.contains(EventMask::STOP));
         assert!(!union.contains(EventMask::POST_TOOL));
 
-        // Six distinct bits, no overlap.
+        // Eight distinct bits, no overlap — the whole u8.
         let all_bits = [
             EventMask::PRE_TOOL,
             EventMask::POST_TOOL,
@@ -719,6 +815,8 @@ mod tests {
             EventMask::NOTIFICATION,
             EventMask::STOP,
             EventMask::SESSION_END,
+            EventMask::PRE_COMPACT,
+            EventMask::POST_COMPACT,
         ];
         for (i, a) in all_bits.iter().enumerate() {
             for (j, b) in all_bits.iter().enumerate() {
@@ -733,6 +831,68 @@ mod tests {
         let cleared = union.difference(EventMask::PRE_TOOL);
         assert!(!cleared.contains(EventMask::PRE_TOOL));
         assert!(cleared.contains(EventMask::STOP));
+
+        // The compaction bits round-trip through the wire form like the rest.
+        for bit in [EventMask::PRE_COMPACT, EventMask::POST_COMPACT] {
+            assert_eq!(EventMask::from_bits(bit.bits()), bit);
+        }
+    }
+
+    /// A hung `PreCompact` hook folds with no pins rather than wedging a fold
+    /// the window needs — the same posture `call_stop`'s timeout takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_hung_pre_compact_hook_times_out_into_no_pins() {
+        struct Hung;
+        impl Hooks for Hung {
+            fn pre_tool<'a>(
+                &'a self,
+                _n: &'a str,
+                _i: &'a Value,
+            ) -> BoxFuture<'a, PreToolDecision> {
+                Box::pin(std::future::ready(PreToolDecision::Continue))
+            }
+            fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+                Box::pin(std::future::ready(None))
+            }
+            fn pre_compact<'a>(
+                &'a self,
+                _info: &'a CompactInfo,
+            ) -> BoxFuture<'a, PreCompactDecision> {
+                Box::pin(async {
+                    tokio::time::sleep(HOOK_CALL_TIMEOUT * 4).await;
+                    PreCompactDecision {
+                        pins: vec!["t1".into()],
+                    }
+                })
+            }
+        }
+        let hooks: Arc<dyn Hooks> = Arc::new(Hung);
+        let info = CompactInfo {
+            folded_ids: vec!["t1".into()],
+            kept_from: 3,
+            estimate_pct: 82,
+        };
+        assert_eq!(
+            call_pre_compact(&hooks, &info).await,
+            PreCompactDecision::default()
+        );
+    }
+
+    /// A `PreCompact` hook pins, never vetoes, so the merge is a union — and
+    /// one hook's silence cannot unpin another's item.
+    #[test]
+    fn pre_compact_pins_are_a_deduped_union_in_registration_order() {
+        let merged = merge_pre_compact(vec![
+            PreCompactDecision {
+                pins: vec!["t1".into(), "t2".into()],
+            },
+            PreCompactDecision::default(),
+            PreCompactDecision {
+                pins: vec!["t2".into(), "t3".into()],
+            },
+        ]);
+        assert_eq!(merged.pins, vec!["t1", "t2", "t3"]);
+        assert_eq!(merge_pre_compact(Vec::new()), PreCompactDecision::default());
     }
 
     #[test]
