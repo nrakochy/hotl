@@ -11,6 +11,7 @@ use hotl_tools::ask::{Question, QuestionOption};
 use crate::app::{Cmd, DiffLine, DiffOp, Msg};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
+use std::io;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A server-sent skill roster as `(name, description)` pairs — the `skills`
@@ -92,15 +93,15 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
     }
 
     /// Send a request; returns the id used so the caller can match the reply.
-    pub async fn request(&mut self, method: &str, params: Value) -> u64 {
+    pub async fn request(&mut self, method: &str, params: Value) -> io::Result<u64> {
         self.next_id += 1;
         let id = self.next_id;
         let mut msg = json!({"jsonrpc": "2.0", "id": id, "method": method});
         if !params.is_null() {
             msg["params"] = params;
         }
-        self.send(&msg).await;
-        id
+        self.send(&msg).await?;
+        Ok(id)
     }
 
     pub async fn reply_permission(
@@ -109,7 +110,7 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         allow: bool,
         secret_reads: bool,
         message: Option<String>,
-    ) {
+    ) -> io::Result<()> {
         let mut result = json!({"allow": allow});
         // Plan 0022: only ever sent when set, so the ordinary allow stays
         // byte-identical to the pre-0022 result an ACP client already parses.
@@ -120,15 +121,15 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
             result["message"] = json!(m);
         }
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
-            .await;
+            .await
     }
 
     /// Answer a `session/request_egress` (plan 0026). Two answers, both
     /// scoped to this session; hotl never writes `config.toml`, so a
     /// permanent grant stays a deliberate edit.
-    pub async fn reply_egress(&mut self, req_id: u64, allow: bool) {
+    pub async fn reply_egress(&mut self, req_id: u64, allow: bool) -> io::Result<()> {
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": {"allow": allow}}))
-            .await;
+            .await
     }
 
     /// Answer a `session/request_question`: exactly one of `selected`
@@ -139,20 +140,23 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
         req_id: u64,
         selected: Vec<String>,
         free_text: Option<String>,
-    ) {
+    ) -> io::Result<()> {
         let result = match free_text {
             Some(text) => json!({"freeText": text}),
             None => json!({"selected": selected}),
         };
         self.send(&json!({"jsonrpc": "2.0", "id": req_id, "result": result}))
-            .await;
+            .await
     }
 
-    async fn send(&mut self, msg: &Value) {
+    /// A write failure on the duplex/stdio pipe means the server is gone and
+    /// the reader would EOF next: it *is* the hangup (0061 decision 13), so
+    /// it propagates rather than being swallowed.
+    async fn send(&mut self, msg: &Value) -> io::Result<()> {
         let mut line = msg.to_string();
         line.push('\n');
-        let _ = self.writer.write_all(line.as_bytes()).await;
-        let _ = self.writer.flush().await;
+        self.writer.write_all(line.as_bytes()).await?;
+        self.writer.flush().await
     }
 }
 
@@ -360,39 +364,39 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
     client: &mut AcpClient<W>,
     prompt_ids: &mut VecDeque<u64>,
     steer_ids: &mut VecDeque<u64>,
-) -> Option<Cmd> {
+) -> io::Result<Option<Cmd>> {
     match cmd {
         Cmd::SendPrompt(p) => {
-            prompt_ids.push_back(client.request("session/prompt", prompt_params(&p)).await);
+            prompt_ids.push_back(client.request("session/prompt", prompt_params(&p)).await?);
         }
         Cmd::SendSteer(p) => {
-            steer_ids.push_back(client.request("session/steer", prompt_params(&p)).await);
+            steer_ids.push_back(client.request("session/steer", prompt_params(&p)).await?);
         }
         Cmd::Cancel => {
-            client.request("session/cancel", Value::Null).await;
+            client.request("session/cancel", Value::Null).await?;
         }
         // Cancel/rename acks are noise: `translate` only surfaces prompt
         // replies and rejected steers.
         Cmd::Rename(name) => {
             client
                 .request("session/rename", json!({"name": name}))
-                .await;
+                .await?;
         }
         Cmd::SetMode(mode) => {
             client
                 .request("session/set_mode", json!({"mode": mode}))
-                .await;
+                .await?;
         }
         Cmd::SetPlan(plan) => {
             client
                 .request("session/set_plan", json!({"plan": plan}))
-                .await;
+                .await?;
         }
         Cmd::SetEffort(effort) => {
             let wire = effort.as_deref().unwrap_or("default");
             client
                 .request("session/set_effort", json!({"effort": wire}))
-                .await;
+                .await?;
         }
         // The ack is noise like set_mode: the engine's `goal_changed`
         // broadcast is what corrects the optimistic update. `None` rides as
@@ -400,21 +404,21 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         Cmd::SetGoal(goal) => {
             client
                 .request("session/set_goal", json!({"goal": goal}))
-                .await;
+                .await?;
         }
         // The ack is noise like rename/set_mode: the engine broadcasts
         // `config_reloaded` (or `config_reload_failed`), and that is what the
         // client acts on — no id-plumbing in the runtime's loop.
         Cmd::ReloadConfig => {
-            client.request("session/reload_config", Value::Null).await;
+            client.request("session/reload_config", Value::Null).await?;
         }
         // The id is discarded: the report comes back as a `context_report`
         // broadcast, so there is nothing to correlate it against.
         Cmd::RequestContext => {
-            client.request("session/context", json!({})).await;
+            client.request("session/context", json!({})).await?;
         }
         Cmd::RequestWorkflows => {
-            client.request("session/workflows", json!({})).await;
+            client.request("session/workflows", json!({})).await?;
         }
         Cmd::ReplyPermission {
             req_id,
@@ -424,18 +428,18 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
         } => {
             client
                 .reply_permission(req_id, allow, secret_reads, message)
-                .await
+                .await?
         }
-        Cmd::ReplyEgress { req_id, allow } => client.reply_egress(req_id, allow).await,
+        Cmd::ReplyEgress { req_id, allow } => client.reply_egress(req_id, allow).await?,
         Cmd::ReplyQuestion {
             req_id,
             selected,
             free_text,
-        } => client.reply_question(req_id, selected, free_text).await,
+        } => client.reply_question(req_id, selected, free_text).await?,
         // Not ours: the runtime owns the terminal and the history file.
-        other => return Some(other),
+        other => return Ok(Some(other)),
     }
-    None
+    Ok(None)
 }
 
 /// `session/prompt` / `session/steer` params. `images` carries only entries
@@ -542,15 +546,61 @@ mod tests {
         assert!(steer_ids.is_empty(), "the id is consumed either way");
     }
 
+    /// A writer that always fails, for the hangup path.
+    struct BrokenWriter;
+
+    impl AsyncWrite for BrokenWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+            _: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::Error::new(io::ErrorKind::BrokenPipe, "gone")))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// 0061 T27: a write failure on the pipe means the server is gone and the
+    /// reader would EOF next — it *is* the hangup, and swallowing it left the
+    /// loop waiting for an answer to a message that never left.
+    #[tokio::test]
+    async fn a_failed_write_surfaces_as_an_io_error() {
+        let mut client = AcpClient::new(BrokenWriter);
+        let err = client
+            .request("initialize", Value::Null)
+            .await
+            .expect_err("a broken pipe must not be swallowed");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+
+        let mut ids = VecDeque::new();
+        let mut steer_ids = VecDeque::new();
+        let err = exec_wire_cmd(Cmd::ReloadConfig, &mut client, &mut ids, &mut steer_ids)
+            .await
+            .expect_err("the failure propagates through the dispatcher");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
     #[tokio::test]
     async fn request_writes_jsonl_with_incrementing_ids() {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
-        assert_eq!(client.request("initialize", Value::Null).await, 1);
+        assert_eq!(client.request("initialize", Value::Null).await.unwrap(), 1);
         assert_eq!(
             client
                 .request("session/prompt", json!({"text": "go"}))
-                .await,
+                .await
+                .unwrap(),
             2
         );
         drop(client);
@@ -718,10 +768,14 @@ mod tests {
     async fn reply_question_shape_matches_server_contract() {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
-        client.reply_question(9, vec!["MVP".into()], None).await;
+        client
+            .reply_question(9, vec!["MVP".into()], None)
+            .await
+            .unwrap();
         client
             .reply_question(10, Vec::new(), Some("other".into()))
-            .await;
+            .await
+            .unwrap();
         drop(client);
         let mut out = String::new();
         read.read_to_string(&mut out).await.unwrap();
@@ -743,12 +797,13 @@ mod tests {
     async fn reply_permission_shape_matches_server_contract() {
         let (mut read, write) = tokio::io::duplex(4096);
         let mut client = AcpClient::new(write);
-        client.reply_permission(7, true, false, None).await;
+        client.reply_permission(7, true, false, None).await.unwrap();
         client
             .reply_permission(8, false, false, Some("wrong dir".into()))
-            .await;
+            .await
+            .unwrap();
         // Plan 0022: the grant rides the same result.
-        client.reply_permission(9, true, true, None).await;
+        client.reply_permission(9, true, true, None).await.unwrap();
         drop(client);
         let mut out = String::new();
         read.read_to_string(&mut out).await.unwrap();
@@ -875,6 +930,7 @@ mod tests {
         assert!(
             exec_wire_cmd(Cmd::ReloadConfig, &mut client, &mut ids, &mut steer_ids)
                 .await
+                .expect("the write succeeded")
                 .is_none(),
             "the wire half handles it; nothing returns to the runtime"
         );
@@ -900,7 +956,9 @@ mod tests {
         let mut ids = VecDeque::new();
         let mut steer_ids = VecDeque::new();
         assert_eq!(
-            exec_wire_cmd(Cmd::ReloadSettings, &mut client, &mut ids, &mut steer_ids).await,
+            exec_wire_cmd(Cmd::ReloadSettings, &mut client, &mut ids, &mut steer_ids)
+                .await
+                .expect("the write succeeded"),
             Some(Cmd::ReloadSettings)
         );
     }

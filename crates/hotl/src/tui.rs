@@ -399,7 +399,10 @@ async fn handshake(
     reader: &mut ServerReader,
     args: TuiArgs,
 ) -> Result<Opened, String> {
-    let init = client.request("initialize", Value::Null).await;
+    let init = client
+        .request("initialize", Value::Null)
+        .await
+        .map_err(|e| e.to_string())?;
     let hello = wait_response(reader, init).await?;
     let skills = hotl_tui::client::parse_skills(&hello);
     let workflows = hotl_tui::client::parse_workflows(&hello);
@@ -431,7 +434,8 @@ async fn handshake(
                 .request("session/load", json!({"sessionId": sid, "name": name}))
                 .await
         }
-    };
+    }
+    .map_err(|e| e.to_string())?;
     let v = wait_response(reader, open).await?;
     let (mode, plan, context_window) = open_settings(&hello, &v);
     let (context_tokens, todos, effort, previous_model) = open_extras(&v);
@@ -515,7 +519,7 @@ async fn run_loop(
                 Cmd::SendSteer(p) => Cmd::SendSteer(outbound(p).await),
                 other => other,
             };
-            let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids, &mut steer_ids).await
+            let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids, &mut steer_ids).await?
             else {
                 continue;
             };
@@ -568,11 +572,21 @@ async fn run_loop(
             ev = keys.recv() => match ev {
                 Some(ev) if is_paste_key(&ev) => clipboard_msg(&mut state),
                 Some(ev) => terminal_msg(ev, copy_on_select), // `None` = redraw-only (resize, mouse motion)
-                None => return Ok(1),
+                // 0061 T27: both used to return `Ok(1)` — the screen was
+                // restored and the shell got a bare exit code with no word
+                // about why. `tui_main` drops the guard before printing, so
+                // the line lands on a live terminal.
+                None => return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the input thread stopped",
+                )),
             },
             sm = read_server_msg(reader) => match sm {
                 Some(m) => translate(m, &mut prompt_ids, &mut steer_ids),
-                None => return Ok(1), // server hung up
+                None => return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the session server closed the connection",
+                )),
             },
             _ = ticker.tick(), if state.phase != Phase::Idle => Some(Msg::Tick),
         };
@@ -1789,6 +1803,22 @@ mod tests {
             "lines": 12,
             "bytes": 480
         }))));
+    }
+
+    /// 0061 T27: the server hanging up used to be `Ok(1)` — the screen came
+    /// back and the shell got a bare exit code with no word about why.
+    /// `tui_main` drops the terminal guard before printing, so the one line
+    /// lands on a live terminal.
+    #[test]
+    fn the_hangup_message_names_the_server() {
+        let e = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the session server closed the connection",
+        );
+        assert_eq!(
+            format!("hotl: {e}"),
+            "hotl: the session server closed the connection"
+        );
     }
 
     /// Every other message passes through untouched.

@@ -187,9 +187,15 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut client = AcpClient::new(cwrite);
     let mut reader = BufReader::new(cread);
-    let init = client.request("initialize", Value::Null).await;
+    let init = client
+        .request("initialize", Value::Null)
+        .await
+        .expect("write");
     wait_response(&mut reader, init).await.expect("initialize");
-    let open = client.request("session/new", Value::Null).await;
+    let open = client
+        .request("session/new", Value::Null)
+        .await
+        .expect("write");
     wait_response(&mut reader, open).await.expect("session/new");
     (client, reader)
 }
@@ -226,7 +232,9 @@ async fn exec(
     for cmd in cmds {
         // The terminal-bound remainder (title, editor, history, quit) has no
         // meaning in a headless test; the runtime handles those.
-        let _ = exec_wire_cmd(cmd, client, prompt_ids, steer_ids).await;
+        let _ = exec_wire_cmd(cmd, client, prompt_ids, steer_ids)
+            .await
+            .expect("the duplex write succeeded");
     }
 }
 
