@@ -258,6 +258,15 @@ pub enum TranscriptItem {
     /// rather than a `Notice`: it carries the two answers, and a plan the
     /// human is meant to act on must not read as muted chatter.
     Plan(PresentedPlan),
+    /// One line closing a turn (0061 T9): how long it took, how many tool
+    /// calls it made, and the wall time it finished at. The clock comes from
+    /// the runtime — the core has none — so `finished_at` is `None` under an
+    /// older peer and in tests.
+    TurnSummary {
+        secs: u64,
+        calls: usize,
+        finished_at: Option<String>,
+    },
 }
 
 /// What approving a plan sends. One sentence, and it says *how* to work the
@@ -771,6 +780,9 @@ pub enum Msg {
         outcome_kind: String,
         outcome_text: Option<String>,
         usage: Value,
+        /// Local `HH:MM`, stamped by the runtime (0061 T9). `None` off unix
+        /// and in tests, where the summary simply omits the clock.
+        finished_at: Option<String>,
     },
     /// The server refused a steer — image validation, most often. The
     /// transcript's pinned "queued" chip must not outlive this.
@@ -1012,7 +1024,8 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             outcome_kind,
             outcome_text,
             usage,
-        } => on_prompt_result(state, &outcome_kind, outcome_text, &usage),
+            finished_at,
+        } => on_prompt_result(state, &outcome_kind, outcome_text, &usage, finished_at),
         Msg::SteerRejected { why } => {
             clear_newest_queued_steer(state);
             notice(state, format!("steer rejected: {why}"));
@@ -1748,6 +1761,7 @@ fn on_prompt_result(
     kind: &str,
     text: Option<String>,
     usage: &Value,
+    finished_at: Option<String>,
 ) -> Vec<Cmd> {
     // A turn that streamed nothing still shows its outcome text.
     if turn_chars(&state.transcript) == 0 {
@@ -1780,6 +1794,13 @@ fn on_prompt_result(
             );
         }
     }
+    // The turn's own closing line, last so it reads as the full stop it is.
+    // `work_ticks` is still this turn's; it resets below.
+    state.transcript.push(TranscriptItem::TurnSummary {
+        secs: state.work_ticks / crate::anim::TICK_HZ,
+        calls: turn_tool_calls(&state.transcript),
+        finished_at,
+    });
     state.session_usage.add(usage);
     // What the *next* turn starts from: everything resident in this turn's
     // context. Computed here, not in `format_usage`, so the formatter stays a
@@ -1793,6 +1814,20 @@ fn on_prompt_result(
     state.work_ticks = 0;
     state.interrupt_sent = false;
     vec![Cmd::SetTitle(title(state, ""))]
+}
+
+/// Every tool call this turn made — merged cards count all their absorbed
+/// calls, since each one really ran.
+fn turn_tool_calls(transcript: &[TranscriptItem]) -> usize {
+    transcript
+        .iter()
+        .rev()
+        .take_while(|i| !matches!(i, TranscriptItem::User { .. }))
+        .filter_map(|i| match i {
+            TranscriptItem::Tool { calls, .. } => Some(calls.len()),
+            _ => None,
+        })
+        .sum()
 }
 
 /// Did any `skill` card name `requested` this turn (the trailing run since the
@@ -3321,6 +3356,7 @@ mod tests {
                 outcome_kind: kind.into(),
                 outcome_text: text,
                 usage: usage.clone(),
+                finished_at: None,
             },
         )
     }
@@ -3339,18 +3375,18 @@ mod tests {
         );
         assert!(
             matches!(
-                s.transcript.last(),
+                last_spoken(&s),
                 Some(TranscriptItem::Error { text }) if text.contains("HTTP 400")
             ),
             "an execution error must be an Error item: {:?}",
-            s.transcript.last()
+            last_spoken(&s)
         );
 
         // A controlled stop is still a muted notice, not an error.
         let mut s = State::test_default();
         on_result(&mut s, "turn_limit", None, &json!({}));
         assert!(matches!(
-            s.transcript.last(),
+            last_spoken(&s),
             Some(TranscriptItem::Notice { .. })
         ));
     }
@@ -3381,8 +3417,76 @@ mod tests {
         s.pending_skill = Some(name.into());
     }
 
+    /// The last item a turn produced, past the closing summary every
+    /// `PromptResult` now appends (0061 T9).
+    fn last_spoken(s: &State) -> Option<&TranscriptItem> {
+        s.transcript
+            .iter()
+            .rev()
+            .find(|i| !matches!(i, TranscriptItem::TurnSummary { .. }))
+    }
+
     fn warned_unloaded(s: &State) -> bool {
-        matches!(s.transcript.last(), Some(TranscriptItem::Notice { text }) if text.contains("not loaded"))
+        matches!(last_spoken(s), Some(TranscriptItem::Notice { text }) if text.contains("not loaded"))
+    }
+
+    /// 0061 T9: every turn closes with one line saying what it cost. It goes
+    /// last, after the outcome notice — a full stop, not a preamble.
+    #[test]
+    fn a_prompt_result_appends_a_turn_summary_after_the_outcome_notice() {
+        let mut s = State::test_default();
+        s.transcript
+            .push(TranscriptItem::User { text: "go".into() });
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: echo"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"bash","ok":true,"lines":1,"bytes":2}),
+        );
+        s.work_ticks = 134 * crate::anim::TICK_HZ;
+        on_result(&mut s, "turn_limit", None, &json!({}));
+        assert!(
+            matches!(
+                s.transcript.last(),
+                Some(TranscriptItem::TurnSummary {
+                    secs: 134,
+                    calls: 1,
+                    finished_at: None
+                })
+            ),
+            "{:?}",
+            s.transcript.last()
+        );
+        assert!(
+            matches!(last_spoken(&s), Some(TranscriptItem::Notice { .. })),
+            "the outcome notice comes first: {:?}",
+            s.transcript
+        );
+        // Merged cards count every call they absorbed.
+        let mut s = State::test_default();
+        s.transcript
+            .push(TranscriptItem::User { text: "go".into() });
+        for id in ["p1", "p2", "p3"] {
+            upd(
+                &mut s,
+                json!({"type":"tool_start","id":id,"name":"read","summary":"read app.rs"}),
+            );
+            upd(
+                &mut s,
+                json!({"type":"tool_done","id":id,"name":"read","ok":true,"lines":1,"bytes":2}),
+            );
+        }
+        on_result(&mut s, "done", None, &json!({}));
+        assert!(
+            matches!(
+                s.transcript.last(),
+                Some(TranscriptItem::TurnSummary { calls: 3, .. })
+            ),
+            "{:?}",
+            s.transcript.last()
+        );
     }
 
     #[test]
@@ -5553,6 +5657,7 @@ mod tests {
                 outcome_kind: "done".into(),
                 outcome_text: Some("fin".into()),
                 usage: json!({"input_tokens": 120, "output_tokens": 45}),
+                finished_at: None,
             },
         );
         assert_eq!(s.phase, Phase::Idle);
@@ -7014,6 +7119,7 @@ mod tests {
                     "cache_read_input_tokens": 40_000,
                     "cache_creation_input_tokens": 300,
                 }),
+                finished_at: None,
             },
         );
         assert_eq!(s.live_context, Some(41_300));

@@ -585,9 +585,53 @@ async fn run_loop(
         // covers the impossible-but-cheap case of a delta arriving with no
         // tick armed to flush it.
         let defer = defers_draw(&msg);
-        queue = update(&mut state, msg).into();
+        queue = update(&mut state, stamp_finished(msg)).into();
         needs_draw = !defer || state.phase == Phase::Idle;
     }
+}
+
+/// The Elm core has no clock, so a finished turn is stamped here — once, on
+/// the way in — with the local wall time its summary shows.
+fn stamp_finished(msg: Msg) -> Msg {
+    match msg {
+        Msg::PromptResult {
+            outcome_kind,
+            outcome_text,
+            usage,
+            finished_at: _,
+        } => Msg::PromptResult {
+            outcome_kind,
+            outcome_text,
+            usage,
+            finished_at: local_hhmm(),
+        },
+        other => other,
+    }
+}
+
+/// Local `HH:MM`. `localtime_r` is the only portable way to reach the
+/// platform's own zone rules without a date crate; Windows has no twin, so it
+/// gets no clock rather than a wrong one.
+#[cfg(unix)]
+fn local_hhmm() -> Option<String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs() as libc::time_t;
+    // SAFETY: `localtime_r` writes into our own zeroed `tm`; no shared state.
+    let tm = unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&now, &mut tm).is_null() {
+            return None;
+        }
+        tm
+    };
+    Some(format!("{:02}:{:02}", tm.tm_hour, tm.tm_min))
+}
+
+#[cfg(not(unix))]
+fn local_hhmm() -> Option<String> {
+    None
 }
 
 /// What actually leaves for the model: `@[path]` references expanded to file
@@ -1200,7 +1244,7 @@ fn age(t: SystemTime) -> String {
 mod tests {
     use super::{
         clipboard_paste, defers_draw, is_paste_key, parse_tui_args, parse_tui_flags, resolve_mouse,
-        resolve_session_arg, terminal_msg, ClipboardSource, WHEEL_LINES,
+        resolve_session_arg, stamp_finished, terminal_msg, ClipboardSource, WHEEL_LINES,
     };
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use hotl_tui::app::{update, Msg, State};
@@ -1696,5 +1740,46 @@ mod tests {
             resolve_session_arg("fix-auth", &s),
             Ok(named.session_id.clone())
         );
+    }
+
+    /// 0061 T9: the core has no clock, so the runtime stamps a finished turn
+    /// on the way in. Off unix there is no `localtime_r`, and no clock beats
+    /// a wrong one.
+    #[test]
+    fn the_runtime_stamps_prompt_results_with_a_local_clock() {
+        let stamped = stamp_finished(Msg::PromptResult {
+            outcome_kind: "done".into(),
+            outcome_text: None,
+            usage: json!({}),
+            finished_at: None,
+        });
+        let Msg::PromptResult { finished_at, .. } = stamped else {
+            panic!("stamping must not change the variant");
+        };
+        if cfg!(unix) {
+            let at = finished_at.expect("unix has localtime_r");
+            assert_eq!(at.len(), 5, "{at}");
+            let (h, m) = at.split_once(':').expect("HH:MM");
+            assert!(
+                h.len() == 2 && h.chars().all(|c| c.is_ascii_digit()),
+                "{at}"
+            );
+            assert!(
+                m.len() == 2 && m.chars().all(|c| c.is_ascii_digit()),
+                "{at}"
+            );
+            assert!(
+                h.parse::<u32>().unwrap() < 24 && m.parse::<u32>().unwrap() < 60,
+                "{at}"
+            );
+        } else {
+            assert!(finished_at.is_none());
+        }
+    }
+
+    /// Every other message passes through untouched.
+    #[test]
+    fn stamping_leaves_other_messages_alone() {
+        assert!(matches!(stamp_finished(Msg::Tick), Msg::Tick));
     }
 }

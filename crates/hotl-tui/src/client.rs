@@ -338,12 +338,15 @@ fn prompt_result_msg(result: Result<Value, String>) -> Msg {
                     .to_string(),
                 outcome_text: text,
                 usage: v.get("usage").cloned().unwrap_or(Value::Null),
+                // The runtime owns the clock (0061 T9).
+                finished_at: None,
             }
         }
         Err(e) => Msg::PromptResult {
             outcome_kind: "error".into(),
             outcome_text: Some(e),
             usage: Value::Null,
+            finished_at: None,
         },
     }
 }

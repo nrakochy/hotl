@@ -298,6 +298,11 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
         TranscriptItem::Error { text } => (7u8, text_key(text)).hash(&mut h),
         TranscriptItem::WorkflowsReport(runs) => (8u8, runs).hash(&mut h),
         TranscriptItem::Plan(plan) => (9u8, plan).hash(&mut h),
+        TranscriptItem::TurnSummary {
+            secs,
+            calls,
+            finished_at,
+        } => (10u8, secs, calls, finished_at).hash(&mut h),
     }
     h.finish()
 }
@@ -683,6 +688,7 @@ fn speaker(item: &TranscriptItem) -> Speaker {
         | TranscriptItem::Error { .. }
         | TranscriptItem::Report(_)
         | TranscriptItem::WorkflowsReport(_)
+        | TranscriptItem::TurnSummary { .. }
         | TranscriptItem::Plan(_) => Speaker::Harness,
     }
 }
@@ -1188,6 +1194,34 @@ fn item_block<'a>(
             },
             full(plan_lines(plan, p)),
         ),
+        // The turn's full stop (0061 T9): one faint line at the prose column
+        // saying what the turn cost. Harness voice, never the model's.
+        TranscriptItem::TurnSummary {
+            secs,
+            calls,
+            finished_at,
+        } => {
+            let mut parts = vec![fmt_elapsed(*secs)];
+            if *calls > 0 {
+                parts.push(call_count(*calls));
+            }
+            if let Some(at) = finished_at {
+                parts.push(format!("done {at}"));
+            }
+            (
+                Spine {
+                    indent: 0,
+                    marker: "✻",
+                    cont: " ",
+                    marker_style: Style::new().fg(p.faint),
+                    cont_style: Style::new(),
+                },
+                prose(vec![Line::styled(
+                    parts.join(" · "),
+                    Style::new().fg(p.faint),
+                )]),
+            )
+        }
         // Reasoning: dimmed italic behind a faint spine, collapsed by default.
         // The trailer names the toggle so it is discoverable without opening
         // the help overlay.
@@ -4733,6 +4767,54 @@ mod tests {
             }
         }
         item
+    }
+
+    /// 0061 T9: the closing line is Harness voice at the prose column, in the
+    /// quietest role — a full stop, not a result.
+    #[test]
+    fn the_turn_summary_is_one_faint_row_at_the_prose_column() {
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::Assistant {
+            text: "done".into(),
+        });
+        s.transcript.push(TranscriptItem::TurnSummary {
+            secs: 134,
+            calls: 6,
+            finished_at: Some("10:27".into()),
+        });
+        let rows = draw(&s);
+        let at = rows
+            .iter()
+            .position(|r| r.contains('✻'))
+            .expect("the summary row");
+        assert!(
+            rows[at].contains("✻ 2m 14s · 6 calls · done 10:27"),
+            "{:?}",
+            rows[at]
+        );
+        let prose = rows.iter().find_map(|r| r.find('●')).expect("prose marker");
+        assert_eq!(
+            rows[at].find('✻'),
+            Some(prose),
+            "the summary sits at the prose column, not the card's"
+        );
+        let buf = draw_buffer(&s);
+        assert_eq!(
+            buf.cell((prose as u16, at as u16)).unwrap().style().fg,
+            Some(Palette::default().faint)
+        );
+
+        // No clock (an older peer, or Windows) simply omits it.
+        let mut s = State::new(true, "m".into());
+        s.transcript.push(TranscriptItem::TurnSummary {
+            secs: 3,
+            calls: 0,
+            finished_at: None,
+        });
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(all.contains("✻ 3s"), "{all}");
+        assert!(!all.contains("done"), "{all}");
+        assert!(!all.contains("call"), "no calls, no count: {all}");
     }
 
     /// The bar is what makes the two rows read as one delegation rather than
