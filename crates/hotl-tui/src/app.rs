@@ -1992,6 +1992,11 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
         state.thinking_expanded = !state.thinking_expanded;
         return Vec::new();
     }
+    // Ctrl-O unfolds the tool rollups, the same way and for the same reason.
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('o') {
+        state.tools_expanded = !state.tools_expanded;
+        return Vec::new();
+    }
     if matches!(state.phase, Phase::WaitingAsk { .. }) {
         return on_ask_key(state, key);
     }
@@ -3631,6 +3636,33 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T7: the twin of Ctrl-T for work.
+    #[test]
+    fn ctrl_o_toggles_tool_expansion() {
+        let mut s = State::test_default();
+        assert!(!s.tools_expanded);
+        ctrl(&mut s, 'o');
+        assert!(s.tools_expanded);
+        ctrl(&mut s, 'o');
+        assert!(!s.tools_expanded);
+    }
+
+    /// `Editor::handle` swallows every Ctrl chord it does not itself bind, so
+    /// the toggle has to be caught above it — including mid-draft.
+    #[test]
+    fn ctrl_o_is_intercepted_above_the_editor_in_insert_mode() {
+        let mut s = State::test_default();
+        for c in "cargo".chars() {
+            update(
+                &mut s,
+                Msg::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)),
+            );
+        }
+        ctrl(&mut s, 'o');
+        assert!(s.tools_expanded, "the editor ate the chord");
+        assert_eq!(s.editor.text(), "cargo", "the draft survived");
     }
 
     #[test]

@@ -645,7 +645,10 @@ fn rollup_lines(
         cont_style: Style::new(),
     };
     let inner = width.saturating_sub(gutter + spine.indent + 2).max(1);
-    let content = Line::styled(rollup_text(run), Style::new().fg(p.muted));
+    let content = Line::from(vec![
+        Span::styled(rollup_text(run), Style::new().fg(p.muted)),
+        Span::styled(" · ctrl-o", Style::new().fg(p.faint)),
+    ]);
     let mut out = Vec::new();
     for wl in wrap::line(&content, inner) {
         let first = out.is_empty();
@@ -2721,10 +2724,8 @@ pub(crate) fn help_lines(state: &State) -> Vec<(&'static str, String)> {
             "commands",
             "/ opens completion · ↑↓ pick · tab complete · enter run",
         ),
-        row(
-            "transcript",
-            "pgup pgdn · ctrl-home/end · wheel · ctrl-t thinking",
-        ),
+        row("transcript", "pgup pgdn · ctrl-home/end · wheel"),
+        row("", "ctrl-t thinking · ctrl-o tool cards"),
         row(
             "",
             "drag to copy · shift-drag for the terminal's own select",
@@ -5672,6 +5673,40 @@ mod tests {
             rows[..STRIP].join("\n").contains("→ ran 40 shell commands"),
             "{rows:?}"
         );
+    }
+
+    /// The rollup names its own key, the way the collapsed Thinking block
+    /// does — discoverable without opening help.
+    #[test]
+    fn ctrl_o_unfolds_every_rollup_without_rewrapping() {
+        let mut s = State::new(true, "m".into());
+        s.transcript = vec![
+            settled("t1", "bash", "bash: echo a", 1),
+            settled("t2", "bash", "bash: echo b", 1),
+            TranscriptItem::Assistant { text: "ok".into() },
+        ];
+        let folded = draw(&s)[..STRIP].join("\n");
+        assert!(
+            folded.contains("· ctrl-o"),
+            "the key rides the line: {folded}"
+        );
+        s.tools_expanded = true;
+        let open = draw(&s)[..STRIP].join("\n");
+        assert!(open.contains("echo a") && open.contains("echo b"), "{open}");
+        assert!(!open.contains("→ ran"), "no header row survives: {open}");
+    }
+
+    /// P0's rule: no commit ships a false key hint, so the binding and its
+    /// help row land together.
+    #[test]
+    fn help_names_ctrl_o_for_tool_cards() {
+        let s = State::new(true, "m".into());
+        let all = help_lines(&s)
+            .iter()
+            .map(|(_, t)| t.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all.contains("ctrl-o tool cards"), "{all}");
     }
 
     /// Spacious puts a blank above every item. A hidden item is not an item.
