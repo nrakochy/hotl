@@ -1026,6 +1026,7 @@ version = "0.25.0"
 dependencies = [
  "hotl-types",
  "serde_json",
+ "tempfile",
 ]
 
 [[package]]

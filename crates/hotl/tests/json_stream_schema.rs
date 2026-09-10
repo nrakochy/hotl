@@ -90,6 +90,7 @@ fn every_frame_is_tagged_and_versioned() {
             reason: "no commit yet".into(),
             turns: 1,
             usage: TokenUsage::default(),
+            evidence: Vec::new(),
         },
         EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
@@ -226,6 +227,7 @@ fn goal_frames_carry_their_payloads() {
                 output_tokens: 20,
                 ..Default::default()
             },
+            evidence: vec!["n1 `cargo test`: green (seq 3)".into()],
         })
         .unwrap();
         assert_eq!(f["type"], "goal_verdict");
@@ -236,6 +238,8 @@ fn goal_frames_carry_their_payloads() {
         // verdict — the surface never sums it locally.
         assert_eq!(f["usage"]["input_tokens"], 40);
         assert_eq!(f["usage"]["output_tokens"], 20);
+        // 0056 T4: what the harness observed, so a client can show why.
+        assert_eq!(f["evidence"][0], "n1 `cargo test`: green (seq 3)");
     }
 }
 

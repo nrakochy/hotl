@@ -1565,10 +1565,12 @@ impl Turn {
             .flatten();
         // Read before `executed` moves into the failure budget.
         let chargeable = executed.chargeable;
+        let exit = executed.outcome.facts.exit;
         let (mut content, failed) = self.apply_failure_budget(tu, executed, budget_blown);
         if call_executed(failed, chargeable) {
             self.tools_ran += 1;
         }
+        self.record_evidence(tu, exit, failed, &content);
         if let Some(m) = found {
             content.push_str(&m.trailer());
             // A malformed prediction is the model's own mistake, not a
@@ -1584,6 +1586,32 @@ impl Turn {
             // A surprise is not an error: the call did exactly what it did,
             // and `is_error` is the tool's own report of whether it worked.
             is_error: failed,
+        }
+    }
+
+    /// What the harness saw this call do (0056 T4). A shell command's argv
+    /// and exit status, or the fact that an edit landed — the two facts the
+    /// goal gate needs and the transcript cannot be trusted for.
+    ///
+    /// `exit` comes from `OutcomeFacts` (0050 T5), never from parsing the
+    /// tool's content: the content is the model's to read, not the harness's.
+    fn record_evidence(&self, tu: &ToolUse, exit: Option<i32>, failed: bool, content: &str) {
+        let mut ledger = self
+            .shared
+            .command_ledger
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match tu.name.as_str() {
+            "bash" => {
+                let Some(cmd) = tu.input.get("command").and_then(serde_json::Value::as_str) else {
+                    return;
+                };
+                if let Some(argv) = hotl_tools::rules::argv(cmd) {
+                    ledger.record_run(argv, exit, content);
+                }
+            }
+            "edit" | "write" if !failed => ledger.record_edit(),
+            _ => {}
         }
     }
 

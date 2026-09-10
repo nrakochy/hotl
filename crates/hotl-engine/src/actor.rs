@@ -319,6 +319,14 @@ impl Head {
         &self.todos
     }
 
+    /// The plan as it stands, for the goal gate's evidence and machine leaves.
+    fn plan_state(&self) -> crate::plan_state::PlanState {
+        crate::plan_state::PlanState {
+            todos: (*self.todos).clone(),
+            decisions: (*self.decisions).clone(),
+        }
+    }
+
     fn decisions(&self) -> &Arc<Vec<hotl_types::Decision>> {
         &self.decisions
     }
@@ -667,6 +675,10 @@ pub(crate) struct SharedDeps {
     rules_epoch: std::sync::atomic::AtomicU32,
     /// Where this session files its plan artifact, if anywhere (0056 T2).
     plan_files: Option<crate::PlanFiles>,
+    /// What the harness observed commands do (0056 T4). Session-scoped, not
+    /// turn-scoped: a goal loop spans turns, and "has this run since the last
+    /// edit" is exactly the question a per-turn ledger could not answer.
+    pub(crate) command_ledger: std::sync::Mutex<hotl_context::goal::CommandLedger>,
     /// The read side of the published head (commit-protocol.md §Read
     /// invariant): a turn's sample-boundary refresh. Only a `Receiver` is
     /// shared — the `Sender` lives in [`run`]'s [`Head`], so the actor stays
@@ -767,6 +779,7 @@ impl SharedDeps {
             rules_epoch: std::sync::atomic::AtomicU32::new(0),
             head_rx,
             plan_files: deps.plan_files,
+            command_ledger: std::sync::Mutex::new(hotl_context::goal::CommandLedger::default()),
         };
         (shared, deps.log)
     }
@@ -1573,6 +1586,9 @@ async fn on_turn_finished(
                         reason: message.clone(),
                         turns: state.turns,
                         usage: state.spent,
+                        // An unrecoverable error is about the provider, not
+                        // about the work: no validation has anything to say.
+                        evidence: Vec::new(),
                     })
                     .await;
             }
@@ -1601,14 +1617,56 @@ async fn on_turn_finished(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 let snapshot = Arc::clone(ctx.head.items());
+                // What the harness itself observed (0056 T4/T5), read once:
+                // the evidence the evaluator reads, the machine leaves that
+                // may settle the condition outright, and the post-filter that
+                // refuses a `met` the validations refute.
+                let plan = ctx.head.plan_state();
+                let evidence = {
+                    let ledger = ctx
+                        .shared
+                        .command_ledger
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    hotl_context::goal::evidence_lines(
+                        &plan.todos,
+                        &ledger,
+                        &hotl_tools::rules::argv,
+                    )
+                };
                 let (verdict, eval_usage) = tokio::select! {
                     biased;
                     _ = cancel.cancelled() => (None, TokenUsage::default()),
                     v = tokio::time::timeout(
                         GOAL_EVAL_TIMEOUT,
-                        evaluate_goal(ctx.shared, &snapshot[..], &state.condition, progress),
+                        evaluate_goal(
+                            ctx.shared,
+                            &snapshot[..],
+                            &state.condition,
+                            progress,
+                            &evidence,
+                        ),
                     ) => v.unwrap_or_default(),
                 };
+                // The post-filter (0056 T4): a `met` the harness's own
+                // observations contradict is downgraded, naming the command.
+                // A rubric asks the model to be honest; this does not ask.
+                let verdict = match verdict {
+                    Some((GoalVerdict::Met, reason)) => {
+                        match evidence.iter().find(|e| !e.status.is_green()) {
+                            Some(e) => Some((
+                                GoalVerdict::NotYetMet,
+                                format!(
+                                    "`{}` has not run green this turn ({})",
+                                    e.command, e.status
+                                ),
+                            )),
+                            None => Some((GoalVerdict::Met, reason)),
+                        }
+                    }
+                    other => other,
+                };
+                let evidence: Vec<String> = evidence.iter().map(ToString::to_string).collect();
                 // Before every branch (0051 decision 6): met, impossible,
                 // failed and stalled all report the evaluator's spend in the
                 // final TurnDone, and not-yet accumulates it like a
@@ -1627,6 +1685,7 @@ async fn on_turn_finished(
                                 reason: reason.clone(),
                                 turns,
                                 usage: spent,
+                                evidence: evidence.clone(),
                             })
                             .await;
                         // A turn that only talked is idle (0051 decision 1);
@@ -1651,6 +1710,7 @@ async fn on_turn_finished(
                                     ),
                                     turns,
                                     usage: spent,
+                                    evidence: evidence.clone(),
                                 })
                                 .await;
                             // Falls through to `end_turn`: one TurnDone, as
@@ -1720,6 +1780,7 @@ async fn on_turn_finished(
                                 reason,
                                 turns,
                                 usage: spent,
+                                evidence: evidence.clone(),
                             })
                             .await;
                     }
@@ -1733,6 +1794,7 @@ async fn on_turn_finished(
                                 reason: "goal evaluation returned no verdict".into(),
                                 turns,
                                 usage: spent,
+                                evidence: evidence.clone(),
                             })
                             .await;
                     }
@@ -2668,6 +2730,7 @@ async fn evaluate_goal(
     items: &[Arc<Item>],
     condition: &str,
     progress: hotl_context::goal::GoalProgress,
+    evidence: &[hotl_context::goal::EvidenceLine],
 ) -> (Option<(GoalVerdict, String)>, TokenUsage) {
     let model = shared
         .config
@@ -2679,7 +2742,7 @@ async fn evaluate_goal(
         max_tokens: GOAL_EVAL_MAX_TOKENS,
         system: hotl_context::goal::GOAL_EVAL_SYSTEM.into(),
         items: Arc::new(vec![Arc::new(Item::User {
-            text: hotl_context::goal::eval_prompt(condition, progress, items),
+            text: hotl_context::goal::eval_prompt(condition, progress, evidence, items),
             synthetic: None,
             images: Vec::new(),
         })]),

@@ -138,13 +138,22 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             reason,
             turns,
             usage,
-        } => json!({
-            "type": "goal_verdict",
-            "verdict": goal_verdict_tag(*verdict),
-            "reason": reason,
-            "turns": turns,
-            "usage": usage,
-        }),
+            evidence,
+        } => {
+            let mut v = json!({
+                "type": "goal_verdict",
+                "verdict": goal_verdict_tag(*verdict),
+                "reason": reason,
+                "turns": turns,
+                "usage": usage,
+            });
+            // Omitted, not `[]`, when nothing was observed — the same
+            // additive rule the rest of this module follows.
+            if !evidence.is_empty() {
+                v["evidence"] = json!(evidence);
+            }
+            v
+        }
         // §S1 telemetry: a normal tagged frame (not a round-trip/result like
         // `Ask`/`Question`/`TurnDone`) — headline numbers plus the per-phase
         // deltas (9 small rows, the point of a wall-clock profiler). Only the

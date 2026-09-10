@@ -544,6 +544,9 @@ pub struct State {
     /// The latest evaluator reason, shown by bare `/goal` so the human can
     /// see what the loop thinks is still missing without scrolling.
     pub goal_last_reason: Option<String>,
+    /// What the harness observed each plan step's `validate_cmd` do, from the
+    /// newest `goal_verdict` (0056 T4). Rendered by bare `/goal`.
+    pub goal_evidence: Vec<String>,
     /// The loop's cumulative spend, read from `goal_verdict`'s `usage` —
     /// never summed locally, because the evaluator's own calls are in it.
     pub goal_usage: SessionUsage,
@@ -638,6 +641,7 @@ impl State {
             goal_ticks: 0,
             goal_turns: 0,
             goal_last_reason: None,
+            goal_evidence: Vec::new(),
             goal_usage: SessionUsage::default(),
             goal_stalled: false,
             goal_resolved: None,
@@ -1345,6 +1349,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 state.goal_ticks = 0;
                 state.goal_turns = 0;
                 state.goal_last_reason = None;
+                state.goal_evidence.clear();
                 state.goal_usage = SessionUsage::default();
                 state.goal_stalled = false;
                 // An engine-initiated clear is a resolution whose verdict is
@@ -1368,6 +1373,16 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             let reason = text_of("reason");
             let verdict = text_of("verdict");
             state.goal_last_reason = (!reason.is_empty()).then(|| reason.clone());
+            state.goal_evidence = v
+                .get("evidence")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             // Cumulative, evaluator included — replace, never accumulate.
             if let Some(usage) = v.get("usage") {
                 state.goal_usage = SessionUsage::default();
@@ -2390,6 +2405,11 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     if let Some(reason) = state.goal_last_reason.clone() {
                         notice(state, format!("last check: {reason}"));
                     }
+                    // What the harness itself saw each validate_cmd do —
+                    // the line that says why a `met` was refused.
+                    for line in state.goal_evidence.clone() {
+                        notice(state, format!("  {line}"));
+                    }
                 }
                 Vec::new()
             }
@@ -2398,6 +2418,7 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     state.goal_ticks = 0;
                     state.goal_turns = 0;
                     state.goal_last_reason = None;
+                    state.goal_evidence.clear();
                     state.goal_usage = SessionUsage::default();
                     state.goal_stalled = false;
                     notice(state, format!("goal cleared: {condition}"));
@@ -2415,6 +2436,7 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     state.goal_ticks = 0;
                     state.goal_turns = 0;
                     state.goal_last_reason = None;
+                    state.goal_evidence.clear();
                     state.goal_usage = SessionUsage::default();
                     state.goal_stalled = false;
                     // Idle: the condition is the directive (0048), submitted

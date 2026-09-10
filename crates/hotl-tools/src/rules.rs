@@ -1090,6 +1090,16 @@ pub(crate) fn shell_segments(cmd: &str) -> Vec<&str> {
 /// Quote-aware whitespace tokenizer. Returns tokens with one level of quoting
 /// removed, plus whether each token was quoted (a quoted argument to a wrapper
 /// is the nested command).
+/// One command string to its argv, quote-aware — the same tokenizer that
+/// decides what a deny-rule matches, so "the same command" means the same
+/// thing to the goal gate as it does to the sandbox (0056 T4).
+///
+/// `None` for a string that tokenizes to nothing.
+pub fn argv(cmd: &str) -> Option<Vec<String>> {
+    let out: Vec<String> = tokenize(cmd).into_iter().map(|(t, _)| t).collect();
+    (!out.is_empty()).then_some(out)
+}
+
 pub(crate) fn tokenize(seg: &str) -> Vec<(String, bool)> {
     let (mut out, mut cur, mut quote, mut quoted) = (Vec::new(), String::new(), None, false);
     for ch in seg.chars() {

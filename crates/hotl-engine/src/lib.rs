@@ -442,6 +442,10 @@ pub enum EngineEvent {
         reason: String,
         turns: u32,
         usage: TokenUsage,
+        /// What the harness observed each plan node's `validate_cmd` do
+        /// (0056 T4), one rendered line each. Additive and often empty — a
+        /// plan whose steps name no commands has nothing to report.
+        evidence: Vec<String>,
     },
     /// Loop-overhead instrument (§S1), flushed once when the turn task ends.
     /// UI/telemetry only — this NEVER becomes a session-log entry, so it

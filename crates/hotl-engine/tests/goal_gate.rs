@@ -628,3 +628,164 @@ async fn a_permit_exempt_nesting_tool_still_counts_as_progress() {
     );
     assert_eq!(provider.request_count(), 33);
 }
+
+// ── 0056 T4/T5: evidence, the rubric's post-filter, and machine leaves ─────
+
+/// A step the model has already marked `completed` — the case the whole
+/// post-filter exists for. It is also what keeps the TodoGate out of these
+/// tests: an open todo makes the turn re-sample, which is a different
+/// mechanism entirely.
+fn node(id: &str, cmd: &str) -> hotl_types::Todo {
+    hotl_types::Todo {
+        content: format!("step {id}"),
+        status: hotl_types::TodoStatus::Completed,
+        id: Some(id.into()),
+        validate_cmd: Some(cmd.into()),
+        ..Default::default()
+    }
+}
+
+/// A tool that reports an exit status the way `bash` does, without a shell.
+/// `bash` itself resolves against the process-global fsguard root and needs
+/// the sandbox floor, neither of which this test is about.
+struct FakeBash(i32);
+
+impl Tool for FakeBash {
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+    fn description(&self) -> &str {
+        "run a command"
+    }
+    fn schema(&self) -> serde_json::Value {
+        serde_json::json!({"type":"object","properties":{"command":{"type":"string"}},
+                           "required":["command"]})
+    }
+    fn permission(&self, _input: &serde_json::Value) -> Permission {
+        Permission::None
+    }
+    fn run<'a>(
+        &'a self,
+        _input: serde_json::Value,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> futures_util::future::BoxFuture<'a, ToolOutcome> {
+        Box::pin(async move {
+            ToolOutcome::ok("ran it, printed 180ms").with_facts(hotl_tools::OutcomeFacts {
+                exit: Some(self.0),
+                matched: None,
+            })
+        })
+    }
+}
+
+/// An empty roster plus the fake. Emptied rather than filtered by name:
+/// `Registry::builtin` ships a real `bash`, and `register` refuses a
+/// duplicate name.
+fn ran(exit: i32) -> Registry {
+    let mut out = Registry::builtin().filtered(|_| false);
+    out.register(Box::new(FakeBash(exit)));
+    out
+}
+
+/// The gate's whole point (0056 T4): a scripted `met` while a node's
+/// `validate_cmd` is red becomes `not_yet`, with the command named.
+#[tokio::test]
+async fn a_met_verdict_is_refused_while_a_validate_cmd_is_red() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "bash", serde_json::json!({"command": "cargo test"})),
+        ScriptedProvider::text_reply("all good, tests pass"),
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: the transcript says so"),
+    ]));
+    let (mut handle, _) = session_with(provider, dir.path(), ran(1));
+    handle
+        .set_plan_nodes(vec![node("n1", "cargo test")], Vec::new())
+        .await;
+    handle.set_goal(Some("the work is finished".into())).await;
+    handle.prompt("go".into()).await;
+
+    let seen = events_until_turn_done(&mut handle).await;
+    let v: Vec<_> = seen
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::GoalVerdict {
+                verdict,
+                reason,
+                evidence,
+                ..
+            } => Some((*verdict, reason.clone(), evidence.clone())),
+            _ => None,
+        })
+        .collect();
+    let (kind, reason, evidence) = v.last().expect("a verdict");
+    assert_eq!(
+        *kind,
+        GoalVerdictKind::NotYet,
+        "a red validation must refuse a met: {reason}"
+    );
+    assert!(reason.contains("cargo test"), "{reason}");
+    assert_eq!(evidence, &["n1 `cargo test`: red (exit 1)".to_string()]);
+}
+
+/// The control: the same script with the command green passes `met` through.
+#[tokio::test]
+async fn a_met_verdict_stands_when_every_validation_is_green() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::tool_call("t1", "bash", serde_json::json!({"command": "cargo test"})),
+        ScriptedProvider::text_reply("done"),
+        ScriptedProvider::text_reply("VERDICT: met\nREASON: cargo test exited 0"),
+    ]));
+    let (mut handle, _) = session_with(provider, dir.path(), ran(0));
+    handle
+        .set_plan_nodes(vec![node("n1", "cargo test")], Vec::new())
+        .await;
+    handle.set_goal(Some("the work is finished".into())).await;
+    handle.prompt("go".into()).await;
+
+    let seen = events_until_turn_done(&mut handle).await;
+    let (kind, evidence) = seen
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            EngineEvent::GoalVerdict {
+                verdict, evidence, ..
+            } => Some((*verdict, evidence.clone())),
+            _ => None,
+        })
+        .expect("a verdict");
+    assert_eq!(kind, GoalVerdictKind::Met);
+    assert_eq!(evidence.len(), 1);
+    assert!(evidence[0].contains("green"), "{evidence:?}");
+}
+
+/// The evaluator reads the harness's own observations, not just the
+/// transcript's account of them.
+#[tokio::test]
+async fn the_evaluator_prompt_carries_the_evidence_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("thinking"),
+        ScriptedProvider::text_reply("VERDICT: not_yet\nREASON: nothing ran"),
+    ]));
+    let (mut handle, _) = session_with(provider.clone(), dir.path(), ran(0));
+    handle
+        .set_plan_nodes(vec![node("n1", "cargo test -p fx")], Vec::new())
+        .await;
+    handle.set_goal(Some("the suite is green".into())).await;
+    handle.prompt("go".into()).await;
+    let _ = events_until_turn_done(&mut handle).await;
+
+    let eval = &provider.requests()[1];
+    let text = match eval.items[0].as_ref() {
+        Item::User { text, .. } => text.clone(),
+        other => panic!("the evaluator prompt is a user item: {other:?}"),
+    };
+    assert!(text.contains("EVIDENCE"), "{text}");
+    assert!(text.contains("n1 `cargo test -p fx`: not run"), "{text}");
+    assert!(
+        eval.system
+            .contains("A claim without a command result is not evidence"),
+        "the rubric must reach the evaluator"
+    );
+}

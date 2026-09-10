@@ -458,6 +458,7 @@ mod tests {
                 reason: "no commit yet".into(),
                 turns: 1,
                 usage: hotl_types::TokenUsage::default(),
+                evidence: Vec::new(),
             },
         ]
     }
