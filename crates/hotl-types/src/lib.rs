@@ -441,8 +441,9 @@ pub enum EntryPayload {
     /// Sets or resolves the session's goal (`/goal`, 0034). Log-only, last
     /// one wins, like `ModeSet`. `condition: None` is the tombstone: an
     /// achieved/cleared goal must never be restored by resume. `outcome`
-    /// (`"achieved" | "impossible" | "cleared"`) records why it ended;
-    /// absent on set.
+    /// (`"achieved" | "impossible" | "cleared" | "error"`) records why it
+    /// ended; absent on set. The set grows additively — a reader that does
+    /// not know a word still sees the tombstone.
     GoalSet {
         condition: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
