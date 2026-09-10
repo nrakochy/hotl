@@ -884,6 +884,25 @@ const PROTECTED_SUBPATHS: &[&str] = &[
     ".claude",
 ];
 
+/// Execute-later *files* under the cwd, denied the same way
+/// [`PROTECTED_SUBPATHS`] denies directories (0058 T5). `.git/config` is a
+/// command-execution surface in its own right — `core.fsmonitor`,
+/// `core.pager`, `core.sshCommand`, `alias.*`, and `core.hooksPath`, which
+/// would redirect hooks past the `.git/hooks` deny above it. The lock and
+/// worktree variants are named too, so `git config` fails on the write rather
+/// than on the rename.
+///
+/// An isolated child lives at `<cwd>/.git/hotl-worktrees/<id>` and commits
+/// through `<cwd>/.git/{objects,refs,worktrees}` — all still inside the cwd
+/// grant, which is what lets these three denials cost a child nothing it
+/// legitimately needs.
+///
+/// **macOS only**, for exactly the reason [`PROTECTED_SUBPATHS`] is: Landlock
+/// rights union across ancestors, so the Linux floor cannot carve a file back
+/// out of the cwd grant.
+#[cfg(target_os = "macos")]
+const PROTECTED_LITERALS: &[&str] = &[".git/config", ".git/config.lock", ".git/config.worktree"];
+
 #[cfg(target_os = "macos")]
 fn seatbelt_profile(
     confine_network: bool,
@@ -913,6 +932,11 @@ fn seatbelt_profile(
     profile.push_str("(deny file-write*");
     for i in 0..PROTECTED_SUBPATHS.len() {
         profile.push_str(&format!("\n  (subpath (param \"PROT_{i}\"))"));
+    }
+    // 0058 T5: the execute-later *files*, denied by literal — a subpath of a
+    // regular file would not cover its `.lock` sibling.
+    for i in 0..PROTECTED_LITERALS.len() {
+        profile.push_str(&format!("\n  (literal (param \"PROTLIT_{i}\"))"));
     }
     profile.push_str(")\n");
     // Plan 0022: the read-carve. `(allow default)` at the top is what grants
@@ -1019,6 +1043,11 @@ fn seatbelt_base_with(
     for (i, sub) in PROTECTED_SUBPATHS.iter().enumerate() {
         let mut d = std::ffi::OsString::from(format!("PROT_{i}="));
         d.push(cwd.join(sub).as_os_str());
+        cmd.arg("-D").arg(d);
+    }
+    for (i, file) in PROTECTED_LITERALS.iter().enumerate() {
+        let mut d = std::ffi::OsString::from(format!("PROTLIT_{i}="));
+        d.push(cwd.join(file).as_os_str());
         cmd.arg("-D").arg(d);
     }
     for (i, p) in extras.iter().enumerate() {
@@ -1685,6 +1714,116 @@ mod write_set_tests {
 mod tests {
     use super::*;
 
+    /// 0058 T5: an isolated child may commit in its own worktree — that is
+    /// what worktree isolation is for — and still cannot reach the two
+    /// execute-later surfaces under the same `.git`. `git commit` writes
+    /// objects, refs and the worktree's own index, all inside the cwd grant;
+    /// `.git/hooks` and `.git/config` are carved back out of it.
+    #[tokio::test]
+    async fn worktree_child_can_commit_but_not_touch_hooks_or_config() {
+        let Some((dir, wt)) = worktree_repo() else {
+            return; // no git on PATH
+        };
+        let cwd = canon(dir.path().to_path_buf());
+        let profile = seatbelt_profile(false, unix_socket_policy(), automation_policy(), 0, 0);
+        let run = |at: &std::path::Path, cmd: &str| {
+            let mut c = std::process::Command::new("/usr/bin/sandbox-exec");
+            c.current_dir(at);
+            // A stray GIT_DIR would take the child outside the tempdir — the
+            // repo's standing rule about tests that inherit one.
+            c.env_remove("GIT_DIR").env_remove("GIT_WORK_TREE");
+            c.arg("-p")
+                .arg(&profile)
+                .arg("-D")
+                .arg(format!("CWD={}", cwd.display()))
+                .arg("-D")
+                .arg(format!("TMP={}", canon(std::env::temp_dir()).display()));
+            for (i, sub) in PROTECTED_SUBPATHS.iter().enumerate() {
+                c.arg("-D")
+                    .arg(format!("PROT_{i}={}", cwd.join(sub).display()));
+            }
+            for (i, f) in PROTECTED_LITERALS.iter().enumerate() {
+                c.arg("-D")
+                    .arg(format!("PROTLIT_{i}={}", cwd.join(f).display()));
+            }
+            c.arg("sh").arg("-c").arg(cmd);
+            c.output().expect("spawn sandbox-exec")
+        };
+
+        let commit = run(
+            &wt,
+            "printf hello > made.txt && git add made.txt && \
+             git -c user.email=t@e -c user.name=t commit -q -m 'from the child'",
+        );
+        assert!(
+            commit.status.success(),
+            "an isolated child must be able to commit in its worktree: {}",
+            String::from_utf8_lossy(&commit.stderr)
+        );
+
+        let hook = run(&wt, "printf x > ../../hooks/pre-commit");
+        assert!(
+            !hook.status.success() && !cwd.join(".git/hooks/pre-commit").exists(),
+            "a child reached the git hooks: {}",
+            String::from_utf8_lossy(&hook.stderr)
+        );
+
+        let config = run(&wt, "git config --local core.pager 'sh -c evil'");
+        assert!(
+            !config.status.success(),
+            "a child rewrote .git/config: {}",
+            String::from_utf8_lossy(&config.stdout)
+        );
+        let text = std::fs::read_to_string(cwd.join(".git/config")).unwrap_or_default();
+        assert!(!text.contains("pager"), "{text}");
+    }
+
+    /// A tempdir repo with one commit plus a linked worktree under `.git/`,
+    /// exactly where `hotl_store::worktree` puts one. `None` without git.
+    fn worktree_repo() -> Option<(tempfile::TempDir, PathBuf)> {
+        let dir = tempfile::tempdir().ok()?;
+        let git = |args: &[&str], at: &std::path::Path| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(at)
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+        };
+        git(&["init", "-q"], dir.path())?;
+        std::fs::write(dir.path().join("seed.txt"), "seed").ok()?;
+        git(&["add", "."], dir.path())?;
+        git(
+            &[
+                "-c",
+                "user.email=t@e",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-q",
+                "-m",
+                "seed",
+            ],
+            dir.path(),
+        )?;
+        let wt = dir.path().join(".git/hotl-worktrees/w1");
+        git(
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                "-q",
+                &wt.to_string_lossy(),
+                "HEAD",
+            ],
+            dir.path(),
+        )?;
+        let wt = canon(wt);
+        Some((dir, wt))
+    }
+
     #[tokio::test]
     async fn seatbelt_denies_protected_subpaths_under_cwd() {
         // Vuln 4: a sandboxed bash cannot write the execute-later dirs even by
@@ -1709,6 +1848,10 @@ mod tests {
             for (i, sub) in PROTECTED_SUBPATHS.iter().enumerate() {
                 c.arg("-D")
                     .arg(format!("PROT_{i}={}", cwd.join(sub).display()));
+            }
+            for (i, f) in PROTECTED_LITERALS.iter().enumerate() {
+                c.arg("-D")
+                    .arg(format!("PROTLIT_{i}={}", cwd.join(f).display()));
             }
             c.arg("sh").arg("-c").arg(cmd);
             c.output().expect("spawn sandbox-exec")
