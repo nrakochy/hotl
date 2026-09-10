@@ -110,6 +110,11 @@ pub struct EngineConfig {
     /// Evict a successful tool result larger than this (estimated tokens) to a
     /// masked blob, leaving a head preview + read pointer (T4). `0` disables.
     pub evict_threshold_tokens: u64,
+    /// Per-tool spill thresholds that override [`Self::evict_threshold_tokens`]
+    /// (0057 T2). A `bash` or `grep` result is a haystack the model wanted one
+    /// needle out of, so it spills far earlier than a `read` — which is a
+    /// file the model asked for in full.
+    pub evict_overrides: Vec<(String, u64)>,
     /// How many of the newest user turns keep their tool results verbatim
     /// when the context ladder clears (0057). `0` disables clearing.
     pub keep_results_turns: usize,
@@ -146,6 +151,7 @@ impl Default for EngineConfig {
             compaction_reset: false,
             show_context_pct: false,
             evict_threshold_tokens: 20_000,
+            evict_overrides: vec![("bash".into(), 6_000), ("grep".into(), 6_000)],
             keep_results_turns: 4,
             ack_mode: AckMode::Pipelined,
         }

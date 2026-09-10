@@ -410,6 +410,10 @@ pub struct ContextCfg {
     /// How many of the newest user turns keep their tool results verbatim
     /// before the ladder clears the rest (0057). `0` disables clearing.
     pub keep_results: Option<usize>,
+    /// Per-tool spill thresholds (`{ bash = 6000 }`), merged over the
+    /// built-in `bash`/`grep` defaults; a named tool's entry wins.
+    #[serde(default)]
+    pub evict_tokens_per_tool: std::collections::BTreeMap<String, u64>,
 }
 
 impl ContextCfg {

@@ -2884,6 +2884,13 @@ fn engine_config(
     if let Some(k) = cfg.context.keep_results {
         config.keep_results_turns = k;
     }
+    // Merged, not replaced: an owner naming `bash` keeps the `grep` default.
+    for (tool, threshold) in &cfg.context.evict_tokens_per_tool {
+        match config.evict_overrides.iter_mut().find(|(n, _)| n == tool) {
+            Some(entry) => entry.1 = *threshold,
+            None => config.evict_overrides.push((tool.clone(), *threshold)),
+        }
+    }
     config.compaction_reset = match secrets.get("HOTL_COMPACTION_RESET").as_deref() {
         Some(v) => v == "1",
         None => cfg.context.compaction_reset.unwrap_or(false),
@@ -5049,6 +5056,19 @@ mod tests {
             0,
             "0 turns off the clearing rung entirely"
         );
+    }
+
+    #[test]
+    fn per_tool_spill_thresholds_merge_over_the_defaults() {
+        let cfg =
+            config_from_toml("[context]\nevict_tokens_per_tool = { bash = 1000, mcp = 2000 }\n");
+        let overrides = engine_config("m", &MapSecrets::default(), &cfg)
+            .0
+            .evict_overrides;
+        let of = |t: &str| overrides.iter().find(|(n, _)| n == t).map(|(_, v)| *v);
+        assert_eq!(of("bash"), Some(1_000), "a named tool is replaced");
+        assert_eq!(of("grep"), Some(6_000), "an unnamed default survives");
+        assert_eq!(of("mcp"), Some(2_000), "a new tool is added");
     }
 
     #[test]

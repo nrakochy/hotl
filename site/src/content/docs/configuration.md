@@ -52,6 +52,7 @@ cache_breakpoints = true                    # OpenAI dialects only: explicit GPT
 [context]
 window = 200000            # usually unnecessary — looked up per model; see below
 evict_tokens = 20000       # offload tool results larger than this (0 disables)
+evict_tokens_per_tool = { bash = 6000, grep = 6000 }   # per-tool override
 keep_results = 4           # user turns whose tool results are never cleared
 compaction_reset = false   # fresh-slate compaction instead of in-place
 show_used_pct = false      # opt in to showing the model context-fullness each
@@ -527,7 +528,7 @@ hotl reclaims context cheapest-first, and only climbs to the next rung when the 
 
 | At | Rung | What it costs |
 |----|------|---------------|
-| any size | **spill** — a single oversized tool result goes to a file, leaving a preview and a `read` pointer (`evict_tokens`) | nothing; the file is still on disk |
+| any size | **spill** — a single oversized tool result goes to a file, leaving a head+tail preview and a `read` pointer (`evict_tokens`, `evict_tokens_per_tool`) | nothing; the file is still on disk |
 | 60% | **clear** — tool results older than the last `keep_results` user turns become one-line `<cleared …/>` stubs | nothing; the session log still holds every byte, and `recall` fetches one back by id |
 | 80% | **fold** — earlier history is replaced by a typed summary (compaction) | a summarize call, and the detail the summary didn't keep |
 
@@ -539,6 +540,13 @@ keep_results = 8   # a workflow that re-reads old tool output; costs context
 ```
 
 Both the clear and the fold rewrite the start of the prompt, so each one costs exactly one prompt-cache miss — which is why clearing is batched into a single pass rather than one per result.
+
+`bash` and `grep` spill at **6,000** tokens rather than the session-wide `evict_tokens`: their output is a haystack the model wanted one needle out of, unlike a `read`, which is a file it asked for in full. `evict_tokens_per_tool` merges over those two defaults — naming `bash` leaves `grep` alone — and a spilled result keeps its first 1,536 and last 512 characters, so a build log's verdict and a stack trace's cause survive alongside the command that produced them.
+
+```toml
+[context]
+evict_tokens_per_tool = { bash = 12000 }   # you page through long build logs
+```
 
 ### Reasoning effort (`[provider] effort`)
 

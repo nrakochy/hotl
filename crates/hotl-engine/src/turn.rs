@@ -2309,12 +2309,12 @@ impl Turn {
     }
 
     /// Evict an oversized *successful* tool result to a masked blob (T4),
-    /// replacing it in-context with a head preview + a read-it pointer. The
-    /// deliberate 3-chars/token overcount (M2) evicts a bit early. A failed
-    /// blob write leaves the full content in place — eviction is an
+    /// replacing it in-context with a head+tail preview + a read-it pointer.
+    /// The deliberate 3-chars/token overcount (M2) evicts a bit early. A
+    /// failed blob write leaves the full content in place — eviction is an
     /// optimization, never a data-loss path.
     async fn maybe_evict(&self, tu: &ToolUse, outcome: &mut ToolOutcome) {
-        let threshold = self.shared.config.evict_threshold_tokens;
+        let threshold = evict_threshold(&self.shared.config, &tu.name);
         if threshold == 0 || outcome.is_error {
             return;
         }
@@ -2324,8 +2324,8 @@ impl Turn {
         // Cut the preview before the content moves; on any failure the
         // content comes back — eviction is never a data-loss path.
         let content = std::mem::take(&mut outcome.content);
+        let (preview, tail_line) = spill_preview(&content);
         let total = content.len();
-        let head = clip(&content, 2048).to_string();
         let (tx, rx) = oneshot::channel();
         let cmd = SessionCmd::WriteBlob {
             tool_use_id: tu.id.clone(),
@@ -2341,14 +2341,15 @@ impl Turn {
         match rx.await {
             Ok(Ok(path)) => {
                 outcome.content = format!(
-                    "{head}\n<evicted total_bytes={total} file=\"{path}\">Full output saved. \
-                     Read it with the read tool ({path}); use offset to page.</evicted>"
+                    "{preview}\n<evicted total_bytes={total} file=\"{path}\">Full output saved. \
+                     Read it with the read tool (path above); use offset/limit to page — the \
+                     tail is at offset {tail_line}.</evicted>"
                 );
             }
             // Blob write failed: the actor handed the content back.
             Ok(Err(content)) => outcome.content = content,
             // Actor gone mid-write (session closing): keep the preview.
-            Err(_) => outcome.content = head,
+            Err(_) => outcome.content = preview,
         }
     }
 
@@ -2776,6 +2777,49 @@ fn anchored_estimate<I: std::borrow::Borrow<Item>>(
     }
 }
 
+/// Leading characters kept in a spill preview: enough to see what the command
+/// was doing.
+const EVICT_HEAD_CHARS: usize = 1536;
+/// Trailing characters kept in a spill preview. A build log's verdict, a test
+/// runner's summary and a stack trace's cause all live at the *end*, which the
+/// old head-only preview threw away.
+const EVICT_TAIL_CHARS: usize = 512;
+
+/// The spill threshold for one tool: its own override if it has one, else the
+/// session-wide [`EngineConfig::evict_threshold_tokens`].
+fn evict_threshold(config: &crate::EngineConfig, tool: &str) -> u64 {
+    config
+        .evict_overrides
+        .iter()
+        .find(|(name, _)| name == tool)
+        .map(|(_, t)| *t)
+        .unwrap_or(config.evict_threshold_tokens)
+}
+
+/// A spilled result's in-context preview, plus the 1-based line the tail
+/// starts on so the model can `read` straight to it. Head and tail are cut on
+/// char boundaries; a body too small to split comes back whole (with line 1),
+/// which keeps this total rather than conditional at the call site.
+fn spill_preview(content: &str) -> (String, usize) {
+    if content.len() <= EVICT_HEAD_CHARS + EVICT_TAIL_CHARS {
+        return (content.to_string(), 1);
+    }
+    let head = clip(content, EVICT_HEAD_CHARS);
+    let mut start = content.len() - EVICT_TAIL_CHARS;
+    while !content.is_char_boundary(start) {
+        start += 1;
+    }
+    let omitted = start - head.len();
+    let tail_line = content[..start].matches('\n').count() + 1;
+    (
+        format!(
+            "{head}\n… <{omitted} bytes omitted> …\n{}",
+            &content[start..]
+        ),
+        tail_line,
+    )
+}
+
 /// A head slice on a char boundary (never mid-UTF-8) — the eviction preview.
 fn clip(s: &str, max: usize) -> &str {
     if s.len() <= max {
@@ -3068,6 +3112,51 @@ mod tests {
             name: name.into(),
             input,
         })
+    }
+
+    /// A haystack tool spills at its own, much lower threshold; a `read` —
+    /// a file the model asked for in full — keeps the session-wide one.
+    #[test]
+    fn bash_and_grep_spill_at_their_own_threshold() {
+        let config = crate::EngineConfig::default();
+        assert_eq!(evict_threshold(&config, "bash"), 6_000);
+        assert_eq!(evict_threshold(&config, "grep"), 6_000);
+        assert_eq!(evict_threshold(&config, "read"), 20_000);
+        // A ~7k-token body: over bash's threshold, under read's.
+        let seven_k = hotl_context::tokens::estimate_text(&"x".repeat(21_000));
+        assert!(seven_k > evict_threshold(&config, "bash"));
+        assert!(seven_k <= evict_threshold(&config, "read"));
+        // An override the owner set wins for the tool it names, and only it.
+        let config = crate::EngineConfig {
+            evict_overrides: vec![("bash".into(), 100)],
+            ..Default::default()
+        };
+        assert_eq!(evict_threshold(&config, "bash"), 100);
+        assert_eq!(evict_threshold(&config, "grep"), 20_000);
+    }
+
+    #[test]
+    fn spill_preview_keeps_head_and_tail() {
+        let body = format!(
+            "{}{}{}",
+            "H".repeat(EVICT_HEAD_CHARS),
+            "M\n".repeat(4_000),
+            "T".repeat(EVICT_TAIL_CHARS)
+        );
+        let (preview, tail_line) = spill_preview(&body);
+        assert!(preview.starts_with(&"H".repeat(EVICT_HEAD_CHARS)));
+        assert!(preview.ends_with(&"T".repeat(EVICT_TAIL_CHARS)));
+        assert!(
+            preview.contains("bytes omitted"),
+            "the gap is named: {preview:.200}"
+        );
+        assert!(
+            preview.len() < EVICT_HEAD_CHARS + EVICT_TAIL_CHARS + 64,
+            "the preview is the two ends and a marker, nothing else"
+        );
+        assert_eq!(tail_line, 4_001, "the tail's 1-based line, for read offset");
+        // Anything that already fits comes back whole rather than mangled.
+        assert_eq!(spill_preview("short"), ("short".into(), 1));
     }
 
     #[test]
