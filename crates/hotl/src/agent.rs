@@ -1025,6 +1025,7 @@ async fn scaffold(
         initial_helper_key.clone(),
         cfg.agents.isolation(),
         sessions_dir(),
+        concurrency.clone(),
     );
     // `spawn`'s own registration (agent.rs::spawn_session_with_todos) needs a
     // *clone* of this same instance (shared Arc semaphores) — cloned before
@@ -1151,6 +1152,7 @@ impl Scaffold {
             initial_todos,
             initial_goal,
             config,
+            concurrency: self.concurrency.clone(),
         }
     }
 }
@@ -1725,6 +1727,9 @@ struct HotlChildBuilder {
     /// dir), never re-resolved from KNOWN_PATHS here, so tests can point it
     /// at a tempdir instead of littering the real store (0032 Task 7).
     sessions_dir: PathBuf,
+    /// The parent's Layer-B budget, cloned: parent and every child draw
+    /// subprocess permits from the one shared pool.
+    concurrency: hotl_tools::concurrency::SessionConcurrency,
 }
 
 impl HotlChildBuilder {
@@ -1925,6 +1930,7 @@ impl HotlChildBuilder {
                 initial_todos: Vec::new(),
                 initial_goal: None,
                 config,
+                concurrency: self.concurrency.clone(),
             },
         );
         Ok(crate::spawn::Child {
@@ -2029,6 +2035,7 @@ fn child_builder(
     initial_helper_key: Option<String>,
     default_isolation: hotl_tools::agents::Isolation,
     sessions_dir: PathBuf,
+    concurrency: hotl_tools::concurrency::SessionConcurrency,
 ) -> Arc<dyn crate::spawn::ChildBuilder> {
     Arc::new(HotlChildBuilder {
         provider,
@@ -2044,6 +2051,7 @@ fn child_builder(
         initial_helper_key,
         default_isolation,
         sessions_dir,
+        concurrency,
     })
 }
 
@@ -4140,6 +4148,7 @@ mod tests {
             initial_helper_key: None,
             default_isolation: hotl_tools::agents::Isolation::None,
             sessions_dir: store.path().to_path_buf(),
+            concurrency: Default::default(),
         };
         (cb, store)
     }
@@ -4594,6 +4603,7 @@ mod tests {
         ]));
         let mut handle =
             spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -4646,6 +4656,7 @@ mod tests {
         ]));
         let handle =
             spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -4752,6 +4763,7 @@ mod tests {
         // function itself ends).
         let SessionHandle { mut events, .. } =
             spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -4807,6 +4819,7 @@ mod tests {
         ]));
         let mut handle =
             spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -4863,6 +4876,7 @@ mod tests {
         ]));
         let SessionHandle { mut events, .. } =
             spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry,
                 rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -5821,6 +5835,7 @@ mod tests {
                 None,
                 Some(hooks.clone()),
                 move |registry| SessionDeps {
+                    concurrency: Default::default(),
                     provider,
                     registry,
                     rules: Arc::new(hotl_tools::rules::Rules::default()),

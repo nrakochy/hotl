@@ -66,6 +66,7 @@ fn session() -> Session {
         .expect("session log");
     let log_path = log.path().to_path_buf();
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: Arc::new(SlowFinish),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

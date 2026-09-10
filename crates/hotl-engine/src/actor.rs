@@ -560,6 +560,9 @@ pub(crate) struct SharedDeps {
     pub system_estimate: u64,
     pub cwd: PathBuf,
     pub config: EngineConfig,
+    /// The Layer-B budget every tool call in this session's batches draws a
+    /// `subproc()` permit from — see `SessionDeps::concurrency`.
+    pub concurrency: hotl_tools::concurrency::SessionConcurrency,
     pub hooks: Option<Arc<dyn crate::hooks::Hooks>>,
     /// §S1 HookRouter gate (Task 5): the union of event kinds `hooks`
     /// actually wants dispatched, read by every `hook_gate!` call site as
@@ -684,6 +687,7 @@ impl SharedDeps {
             system_estimate,
             cwd: deps.cwd,
             config: deps.config,
+            concurrency: deps.concurrency,
             hooks: deps.hooks,
             hook_mask,
             notifications,
@@ -3019,6 +3023,7 @@ mod tests {
 
     fn test_deps(dir: &std::path::Path, log: hotl_store::SessionLog) -> crate::SessionDeps {
         crate::SessionDeps {
+            concurrency: Default::default(),
             provider: Arc::new(hotl_provider::ScriptedProvider::new(vec![])),
             registry: Arc::new(hotl_tools::Registry::builtin()),
             rules: Arc::new(hotl_tools::rules::Rules::default()),

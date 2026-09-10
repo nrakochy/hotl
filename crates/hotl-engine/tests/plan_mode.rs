@@ -72,6 +72,7 @@ async fn run_one(
         ScriptedProvider::text_reply("done"),
     ]));
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(registry),
         rules: Arc::new(Rules::default().with_mode(mode).with_plan(plan)),
@@ -335,6 +336,7 @@ async fn run_visible(start_in_plan: bool, toggles: [Option<bool>; 2]) -> Visible
         ScriptedProvider::text_reply("two"),
     ]));
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: provider.clone(),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(

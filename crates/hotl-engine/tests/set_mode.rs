@@ -22,6 +22,7 @@ async fn set_mode_appends_a_durable_entry() {
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
     let log_path = log.path().to_path_buf();
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
             "ok",
         )])),
@@ -73,6 +74,7 @@ async fn set_plan_appends_its_own_durable_entry() {
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
     let log_path = log.path().to_path_buf();
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
             "ok",
         )])),
@@ -134,6 +136,7 @@ async fn set_plan_takes_effect_on_the_running_session() {
         ScriptedProvider::text_reply("done"),
     ]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         // Starts in Bypass with plan OFF: without the flip below this write
@@ -221,6 +224,7 @@ async fn set_mode_auto_stays_auto_on_a_normal_build() {
         ScriptedProvider::text_reply("done"),
     ]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()), // starts in Ask, never Auto

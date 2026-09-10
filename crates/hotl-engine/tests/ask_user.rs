@@ -35,6 +35,7 @@ fn spawn_with_ask_user(
     ))));
     hotl_engine::spawn_session_with_channels(
         SessionDeps {
+            concurrency: Default::default(),
             provider,
             registry: Arc::new(registry),
             rules: Arc::new(Rules::default()),

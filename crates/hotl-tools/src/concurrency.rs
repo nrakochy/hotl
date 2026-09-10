@@ -19,8 +19,8 @@
 //! somewhere real to acquire a `request()` permit. `agent()` is now consumed
 //! by `spawn` (`hotl::spawn::SpawnTool`, held for a child's whole lifetime,
 //! acquired right before `ChildBuilder::build`/`build_fork`) — the runaway
-//! sub-agent-spawn guard. `subproc()` is still unused, waiting for a
-//! subprocess-fan-out plan to draw on it.
+//! sub-agent-spawn guard. `subproc()` is drawn per executed tool call by the
+//! engine's batch dispatch, so a 40-call batch never forks 40 children.
 
 use std::sync::Arc;
 
@@ -36,7 +36,9 @@ pub struct ConcurrencyLimits {
     pub agents: usize,
     /// Concurrent `web_fetch`/`web_search` HTTP requests.
     pub requests: usize,
-    /// Concurrent `bash`/`grep`/hook child processes.
+    /// Concurrent `bash`/`grep`/hook child processes. Drawn per executed
+    /// tool call; a tool that awaits a nested session takes none, or a small
+    /// budget would deadlock the child inside its parent's permit.
     pub subprocs: usize,
 }
 
@@ -58,6 +60,15 @@ pub struct SessionConcurrency {
     agents: Arc<Semaphore>,
     requests: Arc<Semaphore>,
     subprocs: Arc<Semaphore>,
+}
+
+/// A fresh, independent budget at the default limits. Production builds
+/// exactly one `SessionConcurrency` in `agent.rs` and clones it — this is for
+/// tests and standalone embedders that have no scaffold to clone from.
+impl Default for SessionConcurrency {
+    fn default() -> Self {
+        Self::new(ConcurrencyLimits::default())
+    }
 }
 
 impl SessionConcurrency {

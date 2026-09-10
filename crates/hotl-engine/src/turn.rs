@@ -1359,7 +1359,10 @@ impl Turn {
                 results.push(pair(only, "Not executed (turn stopped).", true));
             } else {
                 let gate = self.gate(only).await;
-                let executed = self.execute(only, gate).await;
+                let executed = {
+                    let _permit = self.subproc_permit(&only.name).await;
+                    self.execute(only, gate).await
+                };
                 results.push(
                     self.finish_call(only, executed, &mut budget_blown, 1, &mut miss)
                         .await,
@@ -1389,13 +1392,20 @@ impl Turn {
                 // A chunk is one serial call or a run of parallel-safe calls
                 // that overlap; join_all returns outcomes in source order
                 // either way.
-                let outcomes = futures_util::future::join_all(
-                    chunk
-                        .iter()
-                        .zip(gates)
-                        .map(|(tu, gate)| self.execute(tu, gate)),
-                )
-                .await;
+                // `&*self` (a `Copy` shared borrow) so each future can hold
+                // its own handle; `&mut self` could only move into one.
+                let this: &Turn = self;
+                let outcomes =
+                    futures_util::future::join_all(chunk.iter().zip(gates).map(|(tu, gate)| {
+                        // Inside the future, not the closure: gating stays
+                        // serial, dispatch order and join order are unchanged,
+                        // and only the execution itself queues on the budget.
+                        async move {
+                            let _permit = this.subproc_permit(&tu.name).await;
+                            this.execute(tu, gate).await
+                        }
+                    }))
+                    .await;
                 for (tu, executed) in chunk.iter().zip(outcomes) {
                     call_index += 1;
                     results.push(
@@ -1733,6 +1743,22 @@ impl Turn {
             secret_reads,
             shown,
         }
+    }
+
+    /// A Layer-B subprocess permit for one call, awaited immediately before
+    /// the call runs. `None` for a tool that blocks on a nested session
+    /// (`spawn`, `workflow`): a parent holding a leaf permit across its
+    /// child's own tool calls deadlocks a small `subprocs` budget.
+    async fn subproc_permit(&self, name: &str) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        if self
+            .shared
+            .registry
+            .get(name)
+            .is_some_and(hotl_tools::Tool::awaits_child_session)
+        {
+            return None;
+        }
+        Some(self.shared.concurrency.subproc().await)
     }
 
     /// Execute an approved call: ToolStart → run → PostToolUse hook →

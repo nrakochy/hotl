@@ -39,6 +39,7 @@ async fn notification_hook_sees_blocked_then_done_then_idle_in_order() {
         let _ = tx.send((kind, detail.to_string()));
     });
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -128,6 +129,7 @@ async fn a_slow_notification_hook_never_stalls_turn_done() {
         }
     });
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -207,6 +209,7 @@ async fn ask_user_question_fires_a_blocked_notification() {
     ))));
     let mut handle = hotl_engine::spawn_session_with_channels(
         SessionDeps {
+            concurrency: Default::default(),
             provider,
             registry: Arc::new(registry),
             rules: Arc::new(Rules::default()),

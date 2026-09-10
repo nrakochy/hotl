@@ -163,6 +163,7 @@ mod tests {
             ScriptedProvider::text_reply(r#"{"name":"ok"}"#),
         ]));
         let handle = spawn_session(SessionDeps {
+            concurrency: Default::default(),
             provider: provider.clone(),
             registry: Arc::new(Registry::builtin()),
             rules: Arc::new(Rules::default()),

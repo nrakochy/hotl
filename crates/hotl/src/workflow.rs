@@ -636,6 +636,11 @@ impl Tool for WorkflowTool {
     fn parallel_safe(&self) -> bool {
         false
     }
+    /// A recipe is many child sessions running their own tool batches — same
+    /// reason `spawn` draws no subprocess permit.
+    fn awaits_child_session(&self) -> bool {
+        true
+    }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome> {
         Box::pin(self.run_impl(input, cancel))
     }
@@ -697,6 +702,7 @@ mod tests {
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
         std::mem::forget(dir);
         spawn_session(SessionDeps {
+            concurrency: Default::default(),
             provider,
             registry: Arc::new(registry),
             rules: Arc::new(Rules::default().with_mode(hotl_tools::rules::PermissionMode::Bypass)),

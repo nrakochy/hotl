@@ -27,6 +27,7 @@ fn session(
     let log = SessionLog::create(dir, &config.model, None, Masker::empty(), 0).expect("log");
     let log_path = log.path().to_path_buf();
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

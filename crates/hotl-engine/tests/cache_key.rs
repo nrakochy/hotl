@@ -26,6 +26,7 @@ async fn every_sample_in_a_turn_carries_the_session_id_as_cache_key() {
         ScriptedProvider::text_reply("done"),
     ]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: provider.clone(),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

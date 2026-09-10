@@ -38,6 +38,7 @@ fn session_of(provider: Arc<dyn Provider>, rules: Rules, registry: Registry) -> 
         .expect("session log");
     let log_path = log.path().to_path_buf();
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(registry),
         rules: Arc::new(rules),

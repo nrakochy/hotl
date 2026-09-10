@@ -40,6 +40,7 @@ fn session_with_recall(provider: Arc<dyn Provider>) -> Session {
         error: None,
     })])));
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(registry),
         rules: Arc::new(Rules::default()),

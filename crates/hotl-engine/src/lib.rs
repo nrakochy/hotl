@@ -771,6 +771,10 @@ pub struct SessionDeps {
     /// at zero (in-memory by design).
     pub initial_goal: Option<String>,
     pub config: EngineConfig,
+    /// The process-wide Layer-B budget, cloned — never a fresh
+    /// `SessionConcurrency::default()` outside tests, which would hand this
+    /// session a second, independent set of semaphores.
+    pub concurrency: hotl_tools::concurrency::SessionConcurrency,
 }
 
 /// See [`SessionHandle::turn_cancel`]. Reads the cell, never writes it — only

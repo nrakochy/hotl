@@ -59,6 +59,7 @@ async fn a_stop_hook_can_block_once_then_allow() {
         }
     });
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -128,6 +129,7 @@ async fn an_always_block_stop_hook_composed_with_the_todo_gate_never_exceeds_the
         reason: "owner policy: always keep going".into(),
     });
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: provider.clone(),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -194,6 +196,7 @@ async fn no_hooks_means_stop_never_fires_and_todo_gate_is_unaffected() {
         "done",
     )]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

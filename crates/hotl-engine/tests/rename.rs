@@ -19,6 +19,7 @@ async fn rename_appends_a_durable_entry() {
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
     let log_path = log.path().to_path_buf();
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
             "ok",
         )])),

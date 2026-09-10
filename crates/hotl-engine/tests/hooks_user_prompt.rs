@@ -27,6 +27,7 @@ async fn user_prompt_hook_injects_additional_context_after_the_prompt() {
         Some("remember: use pnpm".to_string())
     });
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -96,6 +97,7 @@ async fn multiple_user_prompt_hooks_concatenate_into_one_item() {
         .on_user_prompt(|_p| Some("first".to_string()))
         .on_user_prompt(|_p| Some("second".to_string()));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -158,6 +160,7 @@ async fn no_hooks_means_no_injected_reminder() {
         "done",
     )]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

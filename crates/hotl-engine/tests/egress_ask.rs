@@ -109,6 +109,7 @@ fn session(cmd: &str, host: &str, rules: Rules) -> (Session, Arc<AtomicBool>) {
         ScriptedProvider::text_reply("done"),
     ]));
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(registry),
         rules: Arc::new(rules),

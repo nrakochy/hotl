@@ -39,6 +39,7 @@ async fn set_todos_appends_a_durable_entry_and_emits_todos_changed() {
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0).expect("log");
     let log_path = log.path().to_path_buf();
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
             "ok",
         )])),
@@ -101,6 +102,7 @@ async fn the_todo_reminder_rides_the_snapshot_but_never_the_durable_projection()
         "ok",
     )]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: provider.clone(),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -205,6 +207,7 @@ async fn a_resumed_actor_seeds_its_live_todos_from_the_replayed_log() {
         "ok",
     )]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: provider.clone(),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

@@ -41,6 +41,7 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
         .expect("session log");
     let provider = Arc::new(ScriptedProvider::new(scripts));
     let mut handle: SessionHandle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: provider.clone(),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
@@ -280,6 +281,7 @@ async fn cancel_during_the_backoff_ends_the_turn() {
         ScriptedProvider::text_reply("never reached"),
     ]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

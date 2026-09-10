@@ -53,6 +53,7 @@ async fn run_one(mode: PermissionMode, tool: &str, input: Value, answer: AskRepl
         ScriptedProvider::text_reply("done"),
     ]));
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default().with_mode(mode)),
@@ -237,6 +238,7 @@ async fn run_flag_batches(batches: Vec<Vec<(String, &str, Value)>>) -> Vec<(Stri
     }
     let provider = Arc::new(ScriptedProvider::new(scripts));
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default().with_mode(PermissionMode::Bypass)),

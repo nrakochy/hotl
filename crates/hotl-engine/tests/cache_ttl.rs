@@ -20,6 +20,7 @@ async fn run_one_turn_and_capture(config: EngineConfig) -> hotl_provider::Sampli
         "ok",
     )]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider: provider.clone(),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

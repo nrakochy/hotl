@@ -11,6 +11,7 @@ use hotl_tools::{rules::Rules, Registry};
 
 fn deps(dir: &std::path::Path, log: SessionLog, config: EngineConfig) -> SessionDeps {
     SessionDeps {
+        concurrency: Default::default(),
         provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
             "ok",
         )])),

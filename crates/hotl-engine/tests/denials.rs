@@ -30,6 +30,7 @@ fn session_with_rules(provider: Arc<dyn Provider>, config: EngineConfig, rules: 
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
         .expect("session log");
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(rules),

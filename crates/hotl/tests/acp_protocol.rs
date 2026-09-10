@@ -97,6 +97,7 @@ fn scripted_factory_recording(
         std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry: Arc::new(Registry::builtin()),
                 rules: Arc::new(Rules::default()),
@@ -153,6 +154,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
         std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
                     ScriptedProvider::text_reply("FIRST"),
                     ScriptedProvider::text_reply("SECOND"),
@@ -351,6 +353,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
         }];
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
                     "ok",
                 )])),
@@ -916,6 +919,7 @@ async fn overlapping_prompts_resolve_in_order() {
         ]));
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry: Arc::new(Registry::builtin()),
                 rules: Arc::new(Rules::default()),
@@ -1130,6 +1134,7 @@ async fn prompt_images_are_validated_at_the_wire() {
         std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
                     ScriptedProvider::text_reply("saw it"),
                     ScriptedProvider::text_reply("saw that too"),
@@ -1324,6 +1329,7 @@ async fn ask_user_round_trip_via_session_request_question() {
         Ok(acp::SessionOpen {
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {
+                    concurrency: Default::default(),
                     provider,
                     registry: Arc::new(registry),
                     rules: Arc::new(Rules::default()),
@@ -1822,6 +1828,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
         std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![])),
                 registry: Arc::new(Registry::builtin()),
                 rules: Arc::new(Rules::default()),

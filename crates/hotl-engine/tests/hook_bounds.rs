@@ -34,6 +34,7 @@ fn session(provider: Arc<dyn Provider>, hooks: Arc<dyn Hooks>, config: EngineCon
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
         .expect("session log");
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

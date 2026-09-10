@@ -374,6 +374,7 @@ impl Harness {
             None => provider.clone(),
         };
         let deps = SessionDeps {
+            concurrency: Default::default(),
             provider: engine_provider,
             registry: Arc::new(registry),
             rules: Arc::new(rules),

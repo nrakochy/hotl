@@ -605,6 +605,7 @@ mod tests {
             ScriptedProvider::text_reply("done in the background"),
         ]));
         spawn_session(SessionDeps {
+            concurrency: Default::default(),
             provider,
             registry: Arc::new(Registry::builtin()),
             rules: Arc::new(Rules::default()),

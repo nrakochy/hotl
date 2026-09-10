@@ -50,6 +50,7 @@ fn session(provider: Arc<dyn Provider>, config: EngineConfig) -> Session {
         .expect("session log");
     let log_path = log.path().to_path_buf();
     let handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

@@ -174,6 +174,12 @@ pub trait Tool: Send + Sync {
     fn edits_files(&self) -> bool {
         false
     }
+    /// Does this tool block on a nested hotl session (`spawn`, `workflow`)?
+    /// Such a call draws no subprocess permit: holding a leaf permit while
+    /// the child runs its own tools deadlocks a small `subprocs` budget.
+    fn awaits_child_session(&self) -> bool {
+        false
+    }
     fn run<'a>(&'a self, input: Value, cancel: CancellationToken) -> BoxFuture<'a, ToolOutcome>;
 }
 

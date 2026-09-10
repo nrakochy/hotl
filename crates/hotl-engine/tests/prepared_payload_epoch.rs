@@ -21,6 +21,7 @@ use tokio::sync::oneshot;
 
 fn deps(dir: &std::path::Path, log: SessionLog, config: EngineConfig) -> SessionDeps {
     SessionDeps {
+        concurrency: Default::default(),
         provider: Arc::new(NeverAnswers),
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),

@@ -53,6 +53,7 @@ fn scripted_factory() -> acp::SessionFactory {
         std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
                 provider,
                 registry: Arc::new(Registry::builtin()),
                 rules: Arc::new(Rules::default()),
@@ -117,6 +118,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
         Ok(acp::SessionOpen {
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {
+                    concurrency: Default::default(),
                     provider,
                     registry: Arc::new(registry),
                     rules: Arc::new(Rules::default()),

@@ -28,6 +28,7 @@ async fn the_gate_fires_at_most_twice_then_lets_the_turn_end() {
         ScriptedProvider::text_reply("done"),
     ]));
     let mut handle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
         provider,
         registry: Arc::new(Registry::builtin()),
         rules: Arc::new(Rules::default()),
