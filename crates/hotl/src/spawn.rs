@@ -223,7 +223,12 @@ impl SpawnTool {
         // The brief goes to disk and inline both (0058 T1): recall of a long
         // brief improves when the model has a file it can re-read, and the
         // inline copy is what makes the first turn actionable without one.
-        let scratch = self.spawn_dir.join(hotl_types::new_ulid());
+        let validate_cmd = input
+            .get("validate_cmd")
+            .and_then(Value::as_str)
+            .filter(|c| !c.trim().is_empty());
+        let child_ulid = hotl_types::new_ulid();
+        let scratch = self.spawn_dir.join(&child_ulid);
         let brief = match write_task_md(&scratch, task) {
             Ok(path) => format!(
                 "Your brief is in {}. Read it before doing anything else; end by calling \
@@ -289,15 +294,41 @@ impl SpawnTool {
         // `usage` is summed but unused here: the spawn card keeps `tokens:
         // None` (0044 leaves that to the workflow tool).
         let forward = self.events.clone().zip(parent_id);
-        let Drained { outcome, usage: _ } = drain_child(&mut child, &cancel, forward.clone()).await;
+        let Drained { outcome, mut usage } =
+            drain_child(&mut child, &cancel, forward.clone()).await;
         // The typed return (0058 T1). Only for a child that was actually given
         // `report_result`: re-prompting one that never had the tool would just
         // burn turns asking for the impossible.
         let typed = match (&outcome, &report_path) {
             (Outcome::Done { text }, Some(path)) => {
-                Some(collect_report(&mut child, &cancel, &forward, path, text).await)
+                Some(collect_report(&mut child, &cancel, &forward, path, text, &mut usage).await)
             }
             _ => None,
+        };
+        // One `agent` frame per child, carrying its whole token bill — the
+        // same shape the workflow tool's per-agent frames use (0044), so the
+        // spawn card can total a child without a second wire vocabulary.
+        forward_child_agent(
+            &forward,
+            &child_ulid,
+            format!("{agent_type} · {}", short_task(task)),
+            matches!(outcome, Outcome::Done { .. }),
+            usage.input_tokens
+                + usage.output_tokens
+                + usage.cache_read_input_tokens
+                + usage.cache_creation_input_tokens,
+        )
+        .await;
+        // The caller's own check on a `completed` claim (0058 T2). It runs
+        // only because the human already approved this spawn with the command
+        // named in the ask — `SpawnTool::permission` puts it there.
+        let false_completion = match (validate_cmd, typed.as_ref()) {
+            (Some(cmd), Some(v))
+                if v.get("outcome").and_then(Value::as_str) == Some("completed") =>
+            {
+                run_validate(cmd).await
+            }
+            _ => false,
         };
         let outcome = match (outcome, &typed) {
             (Outcome::Done { .. }, Some(v)) => Outcome::Done {
@@ -351,15 +382,45 @@ impl SpawnTool {
             wt.remove();
         }
 
+        // hotl's own word about the check, outside the envelope — the same
+        // rule the merge-back line follows.
+        let checked = false_completion.then(|| {
+            format!(
+                "\nThe sub-agent reported `completed`, but `{}` failed. Treat the result as \
+                 unverified and check it yourself before building on it.",
+                validate_cmd.unwrap_or_default()
+            )
+        });
+        let facts = hotl_tools::OutcomeFacts {
+            delegation: Some(hotl_tools::DelegationFacts {
+                files_touched: typed
+                    .as_ref()
+                    .and_then(|v| v.get("files_touched"))
+                    .and_then(Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                false_completion,
+            }),
+            ..Default::default()
+        };
+        let dress = |text: String| {
+            let text = match note {
+                Some(n) => format!("{n}\n{text}"),
+                None => text,
+            };
+            match &checked {
+                Some(c) => format!("{text}{c}"),
+                None => text,
+            }
+        };
         match result {
-            Ok(text) => ToolOutcome::ok(match note {
-                Some(n) => format!("{n}\n{text}"),
-                None => text,
-            }),
-            Err(text) => ToolOutcome::err(match note {
-                Some(n) => format!("{n}\n{text}"),
-                None => text,
-            }),
+            Ok(text) => ToolOutcome::ok(dress(text)).with_facts(facts),
+            Err(text) => ToolOutcome::err(dress(text)).with_facts(facts),
         }
     }
 }
@@ -401,6 +462,7 @@ async fn collect_report(
     forward: &Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
     path: &Path,
     final_text: &str,
+    usage: &mut hotl_types::TokenUsage,
 ) -> Value {
     let mut last = final_text.to_string();
     for _ in 0..MAX_REPORT_RETRIES {
@@ -414,6 +476,7 @@ async fn collect_report(
             .prompt(hotl_tools::report_tool::REPROMPT.to_string())
             .await;
         let drained = drain_child(child, cancel, forward.clone()).await;
+        *usage += drained.usage;
         if let Outcome::Done { text } = &drained.outcome {
             last = text.clone();
         } else {
@@ -468,6 +531,9 @@ pub(crate) async fn drain_child(
                     // but only by accident (0026 Step 4.5, watch-out 9).
                     eprintln!("sub-agent egress denied: {host}");
                     let _ = reply.send(hotl_tools::net::EgressDecision::NoAnswer);
+                }
+                Some(EngineEvent::TextDelta(text)) | Some(EngineEvent::ThinkingDelta(text)) => {
+                    forward_child_text(&forward, text).await;
                 }
                 Some(EngineEvent::ToolStart { id, name, summary }) => {
                     forward_child_tool(&forward, id, name, summary, None).await;
@@ -557,6 +623,63 @@ async fn forward_child_tool(
         .await;
 }
 
+/// The first line of a brief, for a card label.
+fn short_task(task: &str) -> String {
+    task.lines().next().unwrap_or("").chars().take(60).collect()
+}
+
+/// Run the caller's `validate_cmd` and report whether it disagreed with the
+/// child's `completed`. A command that cannot run at all is not a false
+/// completion — it is no evidence either way.
+async fn run_validate(cmd: &str) -> bool {
+    let out = hotl_tools::BashTool::default()
+        .run(json!({"command": cmd}), CancellationToken::new())
+        .await;
+    out.facts.exit.is_some_and(|code| code != 0)
+}
+
+/// One `agent` frame per finished child, carrying its token total.
+async fn forward_child_agent(
+    forward: &Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
+    id: &str,
+    summary: String,
+    ok: bool,
+    tokens: u64,
+) {
+    let Some((events, parent_id)) = forward else {
+        return;
+    };
+    let Some(tx) = events.upgrade() else { return };
+    let _ = tx
+        .send(EngineEvent::ChildTool {
+            parent_id: parent_id.clone(),
+            id: id.to_string(),
+            name: "agent".into(),
+            summary,
+            ok: Some(ok),
+            tokens: Some(tokens),
+        })
+        .await;
+}
+
+/// Re-emit one chunk of a child's own prose on the parent stream (0058 T2).
+/// Never a parent log entry: the child logs its own words in its own session.
+async fn forward_child_text(
+    forward: &Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
+    text: String,
+) {
+    let Some((events, parent_id)) = forward else {
+        return;
+    };
+    let Some(tx) = events.upgrade() else { return };
+    let _ = tx
+        .send(EngineEvent::ChildText {
+            parent_id: parent_id.clone(),
+            text,
+        })
+        .await;
+}
+
 /// The untrusted-content envelope for a sub-agent's result (SECURITY.md §M4).
 pub(crate) fn envelope(text: &str) -> String {
     envelope_tagged("subagent-result", "", text)
@@ -605,6 +728,13 @@ impl Tool for SpawnTool {
                     "type": "boolean",
                     "description": "Seed the child with your own current context instead of a \
                         fresh one (a history-inheriting continuation). Default false."
+                },
+                "validate_cmd": {
+                    "type": "string",
+                    "description": "A shell command that checks the sub-agent's claim (a test \
+                        command, a build). Run once, after it returns `completed`; a non-zero \
+                        exit marks the result unverified. The human approving this spawn sees \
+                        the command."
                 }
             },
             "required": ["task"]
@@ -617,8 +747,14 @@ impl Tool for SpawnTool {
             .unwrap_or("general-purpose");
         let task = input.get("task").and_then(Value::as_str).unwrap_or("?");
         let short: String = task.chars().take(80).collect();
+        // The validate command is named here or it never runs: this ask is
+        // the only place a human sees it.
+        let check = match input.get("validate_cmd").and_then(Value::as_str) {
+            Some(cmd) if !cmd.trim().is_empty() => format!(", then check with `{cmd}`"),
+            _ => String::new(),
+        };
         Permission::Ask {
-            summary: format!("spawn {agent_type} sub-agent: {short}"),
+            summary: format!("spawn {agent_type} sub-agent: {short}{check}"),
         }
     }
     /// Children are isolated engines with their own logs; several may run
@@ -1043,6 +1179,107 @@ mod tests {
         );
     }
 
+    /// The child's whole token bill reaches the parent on one `agent` frame,
+    /// and its own prose arrives as `ChildText` — never as a parent log entry
+    /// (the child logs its words in its own session).
+    #[tokio::test]
+    async fn child_usage_and_text_reach_the_parent_stream() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let (event_tx, mut event_rx) = hotl_engine::event_channel();
+        let builder = Arc::new(TypedChild::new(vec![
+            ScriptedProvider::text_reply("I am looking"),
+            reports("completed", "done"),
+            ScriptedProvider::text_reply("stopping"),
+        ]));
+        let tool =
+            typed_tool(builder, spawn_dir.path().to_path_buf()).with_events(event_tx.downgrade());
+        let out = hotl_tools::CURRENT_CALL_ID
+            .scope(
+                "spawn_1".into(),
+                tool.run(json!({"task": "survey"}), CancellationToken::new()),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        drop(event_tx);
+
+        let mut text = String::new();
+        let mut agent_tokens: Option<u64> = None;
+        while let Some(e) = event_rx.recv().await {
+            match e {
+                EngineEvent::ChildText { parent_id, text: t } => {
+                    assert_eq!(parent_id, "spawn_1");
+                    text.push_str(&t);
+                }
+                EngineEvent::ChildTool {
+                    name, tokens, ok, ..
+                } if name == "agent" => {
+                    assert_eq!(ok, Some(true));
+                    agent_tokens = tokens;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            text.contains("I am looking"),
+            "child prose forwarded: {text:?}"
+        );
+        // `text_reply` bills 10 in / 5 out and `tool_call` 10/8, over three
+        // samples: the total is the child's, not one turn's.
+        assert_eq!(agent_tokens, Some(48), "the whole child bill on one frame");
+
+        // The delegation facts ride the outcome for the turn to fold.
+        let d = out
+            .facts
+            .delegation
+            .expect("spawn reports delegation facts");
+        assert!(!d.false_completion);
+    }
+
+    /// A `validate_cmd` that fails turns a `completed` claim into a marked
+    /// false completion, and the parent is told so outside the envelope.
+    #[tokio::test]
+    async fn a_failing_validate_cmd_marks_a_completed_claim_unverified() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            reports("completed", "all green"),
+            ScriptedProvider::text_reply("stopping"),
+        ]));
+        let tool = typed_tool(builder, spawn_dir.path().to_path_buf());
+        let out = tool
+            .run(
+                json!({"task": "fix it", "validate_cmd": "exit 3"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            out.facts.delegation.as_ref().unwrap().false_completion,
+            "a red check contradicts the claim: {}",
+            out.content
+        );
+        assert!(out.content.contains("`exit 3` failed"), "{}", out.content);
+        // The warning is hotl's own word, outside the untrusted envelope.
+        let after = out.content.split("</subagent-result>").nth(1).unwrap_or("");
+        assert!(after.contains("`exit 3` failed"), "{}", out.content);
+    }
+
+    /// The command is in the ask or it never runs — this is the only place a
+    /// human sees it.
+    #[test]
+    fn the_validate_command_is_named_in_the_permission_ask() {
+        let tool = tool(Arc::new(ScriptedChild::new()));
+        let Permission::Ask { summary } =
+            tool.permission(&json!({"task": "t", "validate_cmd": "cargo test"}))
+        else {
+            panic!("spawn always asks")
+        };
+        assert!(summary.contains("cargo test"), "{summary}");
+        let Permission::Ask { summary } = tool.permission(&json!({"task": "t"})) else {
+            panic!()
+        };
+        assert!(!summary.contains("check with"), "{summary}");
+    }
+
     #[tokio::test]
     async fn subagent_runs_and_returns_enveloped_result() {
         let tool = tool(Arc::new(ScriptedChild::new()));
@@ -1173,6 +1410,14 @@ mod tests {
                 frames.push((parent_id, id, name, ok));
             }
         }
+        // The child's own `agent` frame (0058 T2) rides the same stream; the
+        // forwarded tool calls are the `read` ones.
+        assert_eq!(
+            frames.iter().filter(|(.., n, _)| n == "agent").count(),
+            1,
+            "one agent frame per child: {frames:?}"
+        );
+        frames.retain(|(.., name, _)| name == "read");
         assert_eq!(frames.len(), 4, "2 starts + 2 dones: {frames:?}");
         for (parent_id, _, name, _) in &frames {
             assert_eq!(parent_id, "spawn_1");

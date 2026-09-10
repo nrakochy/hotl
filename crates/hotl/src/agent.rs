@@ -2623,6 +2623,22 @@ impl Surface {
                 Some(false) => eprintln!("  ↳ (sub-agent tool error)"),
                 Some(true) => {}
             },
+            // A child's words are already visible through its own card's
+            // summary line here; the headless surface stays quiet rather
+            // than interleaving two streams of prose.
+            EngineEvent::ChildText { .. } => {}
+            EngineEvent::Delegation {
+                subagent_runs,
+                duplicate_work_paths,
+                false_completions,
+            } => {
+                if duplicate_work_paths > 0 || false_completions > 0 {
+                    eprintln!(
+                        "· {subagent_runs} sub-agent(s): {duplicate_work_paths} duplicated \
+                         path(s), {false_completions} false completion(s)"
+                    );
+                }
+            }
             EngineEvent::Retrying {
                 attempt, reason, ..
             } => {

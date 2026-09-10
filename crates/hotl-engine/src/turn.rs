@@ -115,6 +115,39 @@ const MAX_TOKENS_CONTINUE_MAX: u32 = 3;
 /// than as a turn that quietly re-bills itself five times.
 pub const STREAM_RETRY_MAX: u32 = 2;
 
+/// One turn's delegation record: every sub-agent's touched paths, so the
+/// duplicates can be counted at the end rather than guessed at per call.
+#[derive(Default)]
+struct DelegationTally {
+    runs: u32,
+    /// One entry per child, in call order.
+    files: Vec<Vec<String>>,
+    false_completions: u32,
+}
+
+impl DelegationTally {
+    fn fold(&mut self, facts: &hotl_tools::DelegationFacts) {
+        self.runs += 1;
+        self.files.push(facts.files_touched.clone());
+        self.false_completions += u32::from(facts.false_completion);
+    }
+
+    /// Paths more than one child touched. Counted per distinct path, not per
+    /// collision: two siblings on one file is one duplicated path.
+    fn duplicate_paths(&self) -> u32 {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut dup: HashSet<&str> = HashSet::new();
+        for child in &self.files {
+            for path in child.iter().collect::<HashSet<_>>() {
+                if !seen.insert(path) {
+                    dup.insert(path);
+                }
+            }
+        }
+        dup.len() as u32
+    }
+}
+
 pub(crate) async fn run(
     shared: Arc<SharedDeps>,
     cmd_tx: mpsc::Sender<SessionCmd>,
@@ -141,6 +174,17 @@ pub(crate) async fn run(
     // canon log — before telling the actor the turn is over.
     let report = turn.ledger.summary(crate::ledger::max_rss_bytes());
     let _ = turn.events.send(EngineEvent::LedgerReport(report)).await;
+    // Silent for a turn that delegated nothing: a row of zeros is not news.
+    if turn.delegation.runs > 0 {
+        let _ = turn
+            .events
+            .send(EngineEvent::Delegation {
+                subagent_runs: turn.delegation.runs,
+                duplicate_work_paths: turn.delegation.duplicate_paths(),
+                false_completions: turn.delegation.false_completions,
+            })
+            .await;
+    }
     let _ = cmd_tx
         .send(SessionCmd::TurnFinished {
             end,
@@ -784,6 +828,10 @@ struct Turn {
     /// what the number measures is the model's calibration over one piece of
     /// work, and a compaction is not the end of that work.
     mispredictions: u32,
+    /// What this turn delegated (0058 T2). Not carried across a compaction
+    /// respawn: each `Turn` task emits its own frame when it ends, exactly
+    /// like the ledger beside it.
+    delegation: DelegationTally,
     /// Truncation-recovery continues spent ([`MAX_TOKENS_CONTINUE_MAX`]);
     /// crosses folds like `turn_extensions`.
     max_tokens_continues: u32,
@@ -906,6 +954,7 @@ impl Turn {
             // `Turn` task flushes its own report when it ends (see `run`).
             ledger: crate::ledger::LoopLedger::new(),
             pipeline: TicketPipeline::default(),
+            delegation: DelegationTally::default(),
             head,
             speculative: None,
             projected_tail: Vec::new(),
@@ -1641,6 +1690,9 @@ impl Turn {
         miss: &mut Option<(usize, crate::expect::Miss)>,
     ) -> ToolResultItem {
         self.maybe_evict(tu, &mut executed.outcome).await;
+        if let Some(d) = &executed.outcome.facts.delegation {
+            self.delegation.fold(d);
+        }
         // The expectation check (0050 T5), before the outcome moves into the
         // failure budget. Only the *first* miss in a batch is recorded: the
         // calls after it did not run, so nothing later can surprise anyone.
@@ -4251,5 +4303,30 @@ mod tests {
             window,
             0
         ));
+    }
+
+    /// Duplicated work is counted per distinct path, not per collision: two
+    /// siblings on one file is one duplicated path, and a child listing the
+    /// same path twice is not a duplicate at all.
+    #[test]
+    fn the_delegation_tally_counts_distinct_paths_touched_by_more_than_one_child() {
+        let child = |files: &[&str], false_completion: bool| hotl_tools::DelegationFacts {
+            files_touched: files.iter().map(|s| s.to_string()).collect(),
+            false_completion,
+        };
+        let mut t = DelegationTally::default();
+        assert_eq!(
+            (t.runs, t.duplicate_paths(), t.false_completions),
+            (0, 0, 0)
+        );
+
+        t.fold(&child(&["a.rs", "a.rs", "b.rs"], false));
+        assert_eq!(t.duplicate_paths(), 0, "one child cannot duplicate itself");
+
+        t.fold(&child(&["b.rs", "c.rs"], true));
+        t.fold(&child(&["c.rs"], false));
+        assert_eq!(t.runs, 3);
+        assert_eq!(t.duplicate_paths(), 2, "b.rs and c.rs, each once");
+        assert_eq!(t.false_completions, 1);
     }
 }

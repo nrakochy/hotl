@@ -457,6 +457,24 @@ pub enum EngineEvent {
         /// cache_creation); `None` on start and for forwarded tool calls.
         tokens: Option<u64>,
     },
+    /// A sub-agent's own text and thinking, forwarded live on the parent
+    /// stream (0058 T2). Never a parent log entry — the child logs its own
+    /// words in its own session; this exists so a human can watch a child
+    /// work instead of staring at a stalled card.
+    ChildText {
+        parent_id: String,
+        text: String,
+    },
+    /// One turn's delegation summary (0058 T2), emitted at turn end when the
+    /// turn spawned anything at all.
+    Delegation {
+        subagent_runs: u32,
+        /// Paths more than one sibling touched — duplicated work.
+        duplicate_work_paths: u32,
+        /// Children that reported `completed` while the caller's own
+        /// `validate_cmd` said otherwise.
+        false_completions: u32,
+    },
     Retrying {
         attempt: u32,
         reason: String,
@@ -582,6 +600,8 @@ impl std::fmt::Debug for EngineEvent {
                 let phase = if ok.is_some() { "done" } else { "start" };
                 write!(f, "ChildTool({name},{phase})")
             }
+            Self::ChildText { text, .. } => write!(f, "ChildText(n={})", text.len()),
+            Self::Delegation { subagent_runs, .. } => write!(f, "Delegation({subagent_runs})"),
             Self::Retrying { attempt, .. } => write!(f, "Retrying({attempt})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),

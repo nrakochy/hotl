@@ -233,6 +233,10 @@ pub enum TranscriptItem {
         /// A spawn card's forwarded child calls (0039), rendered inside this
         /// item's block — item-indexed scroll never sees them.
         children: Vec<ChildCall>,
+        /// The child's own words (0058 T2), tail-capped at
+        /// [`CHILD_TEXT_CAP`]. Drill-in only, so outside the fingerprint
+        /// invariant for the same reason the tick stamps are.
+        child_text: String,
     },
     /// Retrying / fallback / compacted / controlled stops.
     Notice {
@@ -302,6 +306,10 @@ pub struct WorkflowPhase {
     pub started: usize,
     pub failed: usize,
 }
+
+/// How much of a child's own prose a spawn card keeps. The tail, not the
+/// head: what a child is saying now is what a human watching it wants.
+pub const CHILD_TEXT_CAP: usize = 4000;
 
 /// The two tool cards that own a row of the agent band (0039/0044): a
 /// running `spawn` or `workflow` call, whose forwarded children the drill-in
@@ -1174,6 +1182,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 ticks: 0,
                 calls: vec![ToolCall { id, ok: None }],
                 children: Vec::new(),
+                child_text: String::new(),
             });
             state.phase = Phase::Tool { name, ticks: 0 };
         }
@@ -1226,6 +1235,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                         ok: Some(ok),
                     }],
                     children: Vec::new(),
+                    child_text: String::new(),
                 });
             }
             settle_phase(state);
@@ -1247,6 +1257,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     ok: Some(false),
                 }],
                 children: Vec::new(),
+                child_text: String::new(),
             });
             settle_phase(state);
         }
@@ -1300,6 +1311,25 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                             });
                         }
                     }
+                }
+            }
+        }
+        // A child's own words (0058 T2): appended to its spawn card's tail
+        // for the drill-in. Like `child_tool`, no `enter_streaming` — child
+        // prose must not perturb the parent's phase — and no parent card
+        // means drop.
+        "child_text" => {
+            let parent_id = text_of("parent_id");
+            if let Some(TranscriptItem::Tool { child_text, .. }) = state
+                .transcript
+                .iter_mut()
+                .rev()
+                .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if *id == parent_id))
+            {
+                child_text.push_str(&text_of("text"));
+                if child_text.chars().count() > CHILD_TEXT_CAP {
+                    let keep = child_text.chars().count() - CHILD_TEXT_CAP;
+                    *child_text = child_text.chars().skip(keep).collect();
                 }
             }
         }
@@ -3304,6 +3334,7 @@ mod tests {
                 ok: None,
             }],
             children: Vec::new(),
+            child_text: String::new(),
         }
     }
 
@@ -4370,6 +4401,59 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// 0058 T2: a child's prose accumulates on its OWN spawn card, is
+    /// tail-capped, and never touches the parent's streaming phase.
+    #[test]
+    fn child_text_lands_on_its_own_card_tail_capped() {
+        let mut s = State::new(false, "m".into());
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"s1","name":"spawn","summary":"spawn explore"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"s2","name":"spawn","summary":"spawn plan"}),
+        );
+        let phase_before = s.phase.clone();
+        upd(
+            &mut s,
+            json!({"type":"child_text","parent_id":"s1","text":"reading "}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"child_text","parent_id":"s1","text":"the parser"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"child_text","parent_id":"nope","text":"dropped"}),
+        );
+        assert_eq!(
+            s.phase, phase_before,
+            "child prose must not move the parent's phase"
+        );
+        let text_of_card = |s: &State, want: &str| -> String {
+            s.transcript
+                .iter()
+                .find_map(|i| match i {
+                    TranscriptItem::Tool { id, child_text, .. } if id == want => {
+                        Some(child_text.clone())
+                    }
+                    _ => None,
+                })
+                .unwrap()
+        };
+        assert_eq!(text_of_card(&s, "s1"), "reading the parser");
+        assert_eq!(text_of_card(&s, "s2"), "", "siblings never bleed");
+
+        upd(
+            &mut s,
+            json!({"type":"child_text","parent_id":"s1","text":"x".repeat(CHILD_TEXT_CAP)}),
+        );
+        let kept = text_of_card(&s, "s1");
+        assert_eq!(kept.chars().count(), CHILD_TEXT_CAP);
+        assert!(kept.ends_with('x'), "the tail is what a watcher wants");
     }
 
     /// 0044: a running `workflow` card is a band row like a spawn, and two

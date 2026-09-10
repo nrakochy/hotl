@@ -63,6 +63,15 @@ fn every_frame_is_tagged_and_versioned() {
             ok: Some(true),
             tokens: Some(12),
         },
+        EngineEvent::ChildText {
+            parent_id: "t5".into(),
+            text: "still looking".into(),
+        },
+        EngineEvent::Delegation {
+            subagent_runs: 3,
+            duplicate_work_paths: 1,
+            false_completions: 0,
+        },
         EngineEvent::Retrying {
             attempt: 1,
             reason: "429".into(),
@@ -398,6 +407,31 @@ fn child_tool_frames_carry_parent_id_phase_and_ok_only_on_done() {
     })
     .expect("child_tool is a stream frame");
     assert_eq!(counted["tokens"], json!(1234));
+}
+
+/// 0058 T2: a child's own prose and the per-turn delegation summary are both
+/// ordinary tagged frames, additive to the schema.
+#[test]
+fn child_text_and_delegation_are_tagged_additive_frames() {
+    let t = wire::update_frame(&EngineEvent::ChildText {
+        parent_id: "toolu_spawn".into(),
+        text: "reading the parser".into(),
+    })
+    .expect("child_text is a stream frame");
+    assert_eq!(t["type"], "child_text");
+    assert_eq!(t["parent_id"], "toolu_spawn");
+    assert_eq!(t["text"], "reading the parser");
+
+    let d = wire::update_frame(&EngineEvent::Delegation {
+        subagent_runs: 4,
+        duplicate_work_paths: 2,
+        false_completions: 1,
+    })
+    .expect("delegation is a stream frame");
+    assert_eq!(d["type"], "delegation");
+    assert_eq!(d["subagent_runs"], json!(4));
+    assert_eq!(d["duplicate_work_paths"], json!(2));
+    assert_eq!(d["false_completions"], json!(1));
 }
 
 #[test]

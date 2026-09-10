@@ -108,6 +108,20 @@ pub struct OutcomeFacts {
     pub exit: Option<i32>,
     /// Whether a search found anything.
     pub matched: Option<bool>,
+    /// What one delegated sub-agent run reported (0058 T2). `Some` only for
+    /// `spawn`; the turn folds these into its per-turn `delegation` frame.
+    pub delegation: Option<DelegationFacts>,
+}
+
+/// One `spawn` call's contribution to the turn's delegation summary.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DelegationFacts {
+    /// Paths the child said it touched. Two siblings naming the same path is
+    /// duplicated work, which is the number worth watching.
+    pub files_touched: Vec<String>,
+    /// The child claimed `completed` and the caller's own `validate_cmd`
+    /// disagreed.
+    pub false_completion: bool,
 }
 
 #[derive(Debug, Clone)]

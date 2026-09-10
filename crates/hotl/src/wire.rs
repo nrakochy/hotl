@@ -92,6 +92,21 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             }
             v
         }
+        // A child's own words on the parent stream (0058 T2). Additive, so
+        // `JSON_STREAM_SCHEMA_VERSION` stands (the 0037 ruling).
+        EngineEvent::ChildText { parent_id, text } => {
+            json!({"type": "child_text", "parent_id": parent_id, "text": text})
+        }
+        EngineEvent::Delegation {
+            subagent_runs,
+            duplicate_work_paths,
+            false_completions,
+        } => json!({
+            "type": "delegation",
+            "subagent_runs": subagent_runs,
+            "duplicate_work_paths": duplicate_work_paths,
+            "false_completions": false_completions,
+        }),
         EngineEvent::Retrying {
             attempt,
             reason,

@@ -672,7 +672,7 @@ impl Tool for FakeBash {
         Box::pin(async move {
             ToolOutcome::ok("ran it, printed 180ms").with_facts(hotl_tools::OutcomeFacts {
                 exit: Some(self.0),
-                matched: None,
+                ..Default::default()
             })
         })
     }

@@ -245,6 +245,9 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             ticks,
             calls,
             children,
+            // Drill-in only, like the tick stamps beside it: hashing a
+            // child's live prose would re-wrap the parent card per byte.
+            child_text: _,
         } => {
             // Ticks are hashed at the two resolutions they are *rendered* at
             // — the marker's frame and the whole seconds of elapsed — not
@@ -833,6 +836,7 @@ fn item_block<'a>(
             ticks,
             calls,
             children,
+            child_text: _,
         } => {
             let running = matches!(status, ToolStatus::Running | ToolStatus::AutoAllowed { .. });
             let (marker, color) = match status {
@@ -1531,6 +1535,7 @@ fn render_agent_stream(
         status,
         ticks,
         children,
+        child_text,
         ..
     } = item
     else {
@@ -1580,6 +1585,14 @@ fn render_agent_stream(
             ));
         }
         content.push(Line::from(spans));
+    }
+    // The child's own words (0058 T2), after its calls — this is the whole
+    // reason to drill in on a running child.
+    if !child_text.is_empty() {
+        content.push(Line::raw(""));
+        for line in child_text.lines() {
+            content.push(Line::styled(line.to_string(), Style::new().fg(p.muted)));
+        }
     }
     let gutter = state.density.gutter();
     let inner = (area.width as usize).saturating_sub(gutter + 2).max(1);
@@ -2688,6 +2701,7 @@ mod tests {
             ticks,
             calls: vec![crate::app::ToolCall { id: id.into(), ok }],
             children: Vec::new(),
+            child_text: String::new(),
         }
     }
 
