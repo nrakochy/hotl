@@ -37,6 +37,24 @@ semver promise of their own.
 
 ### Fixed
 
+- **A parallel tool batch no longer forks a child per call** (plan 0055). The
+  concurrency budget's `subprocs` limit existed but nothing drew on it: a
+  12-call batch of parallel-safe calls forked 12 children at once, and four
+  sub-agents doing the same forked 48. Every executed call now takes one
+  permit from the session's share of the one process-wide budget, so a wide
+  batch queues instead of stampeding — parent and children draw from the same
+  pool. Parallelism is unchanged up to the budget (`[concurrency] subprocs`,
+  default 8); gating stays serial and results still pair in source order.
+  Tools that block on a nested session (`spawn`, `workflow`) take no permit:
+  holding one across a child's own tool calls would deadlock a small budget.
+
+- **The prompt-cache marker budget is enforced in release builds** (plan
+  0055). The Anthropic four-breakpoint cap was a debug assertion, so a release
+  build that planned a fifth `cache_control` shipped it and the API answered
+  400. The bound is structural now (the anchor plan is truncated to the
+  newest two) with a runtime check behind it, and CI runs the provider's tests
+  under `--release` — the only build that exercises it.
+
 - **1M-window models were compacting at 160K** (plan 0050). The model
   catalog knew every model's context window and nothing ever asked it: a
   session with no explicit `[context] window` got a hardcoded 200,000
@@ -72,6 +90,11 @@ semver promise of their own.
   unescape would have eaten their backslashes. Drive-letter paths
   (`C:\…`, bare or quoted, backslashes kept as separators) now compact like
   any other drop; drive-relative and UNC forms still insert literally.
+
+### Changed
+
+- CI's harness job now runs `hotl-provider-openai-responses` and
+  `hotl-retrieval`, neither of which had ever been in the PR gate.
 
 ## [0.25.0] - 2026-09-03
 
