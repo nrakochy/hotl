@@ -14,6 +14,7 @@ use serde_json::json;
 
 struct Session {
     handle: SessionHandle,
+    #[cfg_attr(not(unix), allow(dead_code))]
     log_path: std::path::PathBuf,
     #[allow(dead_code)]
     dir: tempfile::TempDir,
