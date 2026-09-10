@@ -921,7 +921,7 @@ pub(crate) async fn drain_child(
                     first_byte!();
                     forward_child_tool(&forward, id, name, summary, None).await;
                 }
-                Some(EngineEvent::ToolDone { id, name, ok }) => {
+                Some(EngineEvent::ToolDone { id, name, ok, .. }) => {
                     if ok && name == "report_result" {
                         reported = true;
                     }

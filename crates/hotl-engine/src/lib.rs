@@ -416,10 +416,15 @@ pub enum EngineEvent {
         name: String,
         summary: String,
     },
+    /// 0061 T1: `lines`/`bytes` count `outcome.content` — the result the model
+    /// receives, after the output cap and any PostToolUse rewrite — so a
+    /// surface can show `N lines` without capturing the body.
     ToolDone {
         id: String,
         name: String,
         ok: bool,
+        lines: u64,
+        bytes: u64,
     },
     ToolDenied {
         id: String,

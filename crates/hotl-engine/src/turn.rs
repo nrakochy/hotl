@@ -44,6 +44,18 @@ const CLEAR_TRIGGER: f64 = 0.6;
 /// `interrupt_lands_during_the_speculative_summarize` (the cancel race).
 const SPECULATION_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// What `tool_done` reports: lines and bytes of the result the model receives,
+/// after the output cap and any PostToolUse rewrite. Not the raw process
+/// output — `tool_progress` counts that (0061 decision 2).
+fn result_counts(content: &str) -> (u64, u64) {
+    let lines = if content.is_empty() {
+        0
+    } else {
+        content.lines().count() as u64
+    };
+    (lines, content.len() as u64)
+}
+
 /// Whether a projection must fold before it can be sampled. Two independent
 /// pressures: tokens, and the image bytes the token estimate deliberately
 /// under-charges at a flat 1600 each. Pure so both are testable without a
@@ -1927,10 +1939,13 @@ impl Turn {
                 AskReply::AllowEdited { input: edited } => input = edited, // §2b
                 AskReply::Respond { content } => {
                     // §2b: the human answered as the tool — skip execution.
+                    let (lines, bytes) = result_counts(&content);
                     self.emit(EngineEvent::ToolDone {
                         id: tu.id.clone(),
                         name: tu.name.clone(),
                         ok: true,
+                        lines,
+                        bytes,
                     })
                     .await;
                     return Gate::Resolved {
@@ -2072,10 +2087,13 @@ impl Turn {
                 else {}
             );
         }
+        let (lines, bytes) = result_counts(&outcome.content);
         self.emit(EngineEvent::ToolDone {
             id: tu.id.clone(),
             name: tu.name.clone(),
             ok: !outcome.is_error,
+            lines,
+            bytes,
         })
         .await;
         // A tool that actually ran and failed is exactly what the budget is for.

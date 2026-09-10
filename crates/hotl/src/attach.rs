@@ -398,6 +398,8 @@ mod tests {
                 id: "t1".into(),
                 name: "read".into(),
                 ok: true,
+                lines: 3,
+                bytes: 5,
             },
             EngineEvent::ToolDenied {
                 id: "t2".into(),
@@ -491,6 +493,8 @@ mod tests {
             id: "t1".into(),
             name: "read".into(),
             ok: false,
+            lines: 1,
+            bytes: 4,
         })
         .unwrap();
         assert!(update_line(&failed).is_some(), "a tool error must be shown");

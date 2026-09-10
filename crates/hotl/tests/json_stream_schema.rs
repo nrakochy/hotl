@@ -30,6 +30,8 @@ fn every_frame_is_tagged_and_versioned() {
             id: "t1".into(),
             name: "read".into(),
             ok: true,
+            lines: 3,
+            bytes: 5,
         },
         EngineEvent::ToolDenied {
             id: "t2".into(),
@@ -332,6 +334,8 @@ fn tool_frames_carry_the_call_id() {
             id: "toolu_1".into(),
             name: "read".into(),
             ok: true,
+            lines: 3,
+            bytes: 5,
         },
         EngineEvent::ToolDenied {
             id: "toolu_1".into(),
@@ -354,6 +358,37 @@ fn tool_frames_carry_the_call_id() {
         let f = wire::update_frame(&e).expect("tool events are stream frames");
         assert_eq!(f["id"], "toolu_1", "missing call id on {}", f["type"]);
     }
+}
+
+/// 0061 T1: `tool_done` reports how much result the model got, so a card can
+/// say `N lines` without the stream carrying the body. Both fields are always
+/// present — a client that sees neither is talking to an older peer.
+#[test]
+fn tool_done_carries_result_line_and_byte_counts() {
+    let f = wire::update_frame(&EngineEvent::ToolDone {
+        id: "t1".into(),
+        name: "bash".into(),
+        ok: true,
+        lines: 1204,
+        bytes: 51_233,
+    })
+    .expect("tool_done is a stream frame");
+    assert_eq!(f["type"], "tool_done");
+    assert_eq!(f["lines"], 1204);
+    assert_eq!(f["bytes"], 51_233);
+
+    // Zero is a count, not an absence: `(no output)` must not read as "older
+    // peer" on the client.
+    let empty = wire::update_frame(&EngineEvent::ToolDone {
+        id: "t2".into(),
+        name: "bash".into(),
+        ok: true,
+        lines: 0,
+        bytes: 0,
+    })
+    .expect("tool_done is a stream frame");
+    assert_eq!(empty["lines"], 0);
+    assert_eq!(empty["bytes"], 0);
 }
 
 /// 0039 D1: `child_tool` frames route by `parent_id`, carry an explicit

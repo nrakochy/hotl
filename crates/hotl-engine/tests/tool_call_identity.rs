@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hotl_engine::{spawn_session, EngineConfig, EngineEvent, SessionDeps, SessionHandle};
+use hotl_engine::{spawn_session, AskReply, EngineConfig, EngineEvent, SessionDeps, SessionHandle};
 use hotl_platform::SystemClock;
 use hotl_provider::{Provider, ScriptedProvider, StreamEvent};
 use hotl_store::{Masker, SessionLog};
@@ -345,4 +345,73 @@ async fn an_identical_mutating_duplicate_still_runs_twice() {
     let results = committed_results(&s.log_path);
     let ids: Vec<&str> = results.iter().map(|r| r.tool_use_id.as_str()).collect();
     assert_eq!(ids, ["m1", "m2"]);
+}
+
+/// 0061 T1: `tool_done`'s counts describe the result the *model* receives —
+/// `outcome.content` after the cap and any PostToolUse rewrite — not the raw
+/// process output. A human who answers as the tool (§2b `Respond`) never runs
+/// a process at all, and the counts still describe what was handed over.
+#[tokio::test]
+async fn tool_done_counts_the_result_the_model_receives() {
+    let answered = "answered\nby hand";
+    let mut scripts = Vec::new();
+    // `printf` is a POSIX shell builtin; the Windows shell has no twin, so the
+    // executed half is unix-only while the `Respond` half runs everywhere.
+    if cfg!(unix) {
+        scripts.push(ScriptedProvider::tool_call(
+            "t_run",
+            "bash",
+            json!({"command": "printf 'a\\nb\\nc'"}),
+        ));
+    }
+    scripts.push(ScriptedProvider::tool_call(
+        "t_said",
+        "bash",
+        json!({"command": "echo never runs"}),
+    ));
+    scripts.push(ScriptedProvider::text_reply("done"));
+
+    let provider = Arc::new(ScriptedProvider::new(scripts));
+    let mut s = session(provider);
+    s.handle.prompt("go".into()).await;
+
+    let mut counts: HashMap<String, (u64, u64)> = HashMap::new();
+    let mut answered_once = false;
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::Ask { reply, .. } => {
+                // The last ask is the one the human answers as the tool.
+                let last = cfg!(not(unix)) || counts.contains_key("t_run");
+                let _ = reply.send(if last {
+                    answered_once = true;
+                    AskReply::Respond {
+                        content: answered.into(),
+                    }
+                } else {
+                    AskReply::Allow
+                });
+            }
+            EngineEvent::ToolDone {
+                id, lines, bytes, ..
+            } => {
+                counts.insert(id, (lines, bytes));
+            }
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+
+    assert!(answered_once, "the human never got the second ask");
+    assert_eq!(
+        counts.get("t_said"),
+        Some(&(2, answered.len() as u64)),
+        "the human's own text is what the model received: {counts:?}"
+    );
+    if cfg!(unix) {
+        assert_eq!(
+            counts.get("t_run"),
+            Some(&(3, 5)),
+            "`a\\nb\\nc` is three lines and five bytes: {counts:?}"
+        );
+    }
 }

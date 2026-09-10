@@ -46,8 +46,16 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         EngineEvent::ToolStart { id, name, summary } => {
             json!({"type": "tool_start", "id": id, "name": name, "summary": summary})
         }
-        EngineEvent::ToolDone { id, name, ok } => {
-            json!({"type": "tool_done", "id": id, "name": name, "ok": ok})
+        // 0061 T1: `lines`/`bytes` count the result the model receives.
+        // Always present — a surface reads "no counts" as an older peer.
+        EngineEvent::ToolDone {
+            id,
+            name,
+            ok,
+            lines,
+            bytes,
+        } => {
+            json!({"type": "tool_done", "id": id, "name": name, "ok": ok, "lines": lines, "bytes": bytes})
         }
         EngineEvent::ToolDenied { id, name } => {
             json!({"type": "tool_denied", "id": id, "name": name})
