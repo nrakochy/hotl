@@ -22,6 +22,33 @@ semver promise of their own.
 
 ### Added
 
+- **Sub-agents return a typed result** (plan 0058). Every child gets
+  `report_result` and answers through it, not through prose: an outcome, a
+  bounded summary, the files it touched, commits, and `path:line` citations.
+  Its brief now arrives twice — inline and as a `TASK.md` it is told to read
+  first — carrying the parent's decisions whole plus only the plan steps the
+  brief names, so a child knows what was already settled without being invited
+  to overstep. A child that stops without reporting is nudged twice, then its
+  last words become `{"outcome": "unverifiable"}`. The parent always gets a
+  shape.
+- **A running sub-agent is watchable** (plan 0058). A child's own prose
+  streams to the parent (`child_text`), and one `agent` frame carries its whole
+  token bill, instead of a stalled card.
+- **A per-turn `delegation` frame** (plan 0058): how many sub-agents ran, how
+  many paths more than one of them touched, and how many claimed `completed`
+  while the caller's own optional `validate_cmd` disagreed. That command is
+  named in the spawn approval, so nothing runs you did not see.
+- **Workflows can stop and ask you** (plan 0058). A `human_input` phase
+  collects its fields, puts its actions to a person, and routes the run by what
+  they choose — including back to an earlier phase. `hotl approve <session>`
+  answers what a backgrounded session is waiting on, from a second terminal,
+  without taking the session over.
+- **`workflow {resume: "<run_id>"}`** (plan 0058) replays the agent calls whose
+  content is unchanged and re-runs from the first that differs. A run that died
+  on its fourth phase no longer re-runs three.
+- `[agents] prefix_stagger_ms`, `child_idle_secs`, `completion_grace_secs`
+  (plan 0058).
+
 - **`[provider] effort` also takes a per-phase table** (plan 0059) — `effort =
   { plan = "xhigh", implement = "high", verify = "xhigh" }` — applied once at
   turn start, so every sample in a turn is billed at one depth. `plan` when
@@ -130,6 +157,16 @@ semver promise of their own.
 
 ### Fixed
 
+- **A sub-agent could hang forever** (plan 0058). Two clocks bound one now, and
+  neither discards an answer: a silent child ends `unverifiable`; a child that
+  reported and then hung is reaped and its result kept. A child out of turns
+  gets one wrap-up prompt whose only tools are reads and `report_result`.
+- **`ask_user` questions raised while nothing was attached were answered by
+  nobody and never re-issued** (plan 0058). They now park and re-issue on
+  attach exactly like permission asks. Inside a sub-agent, `ask_user` no longer
+  says "proceed with your best judgment" — nobody is reachable from there, so
+  it says to finish with `report_result {outcome: "needs_input"}`.
+
 - **A model with a denser tokenizer was budgeted as if it were ASCII** (plan
   0057, tech-debt #63). The per-model chars-per-token ratio from the model
   catalog now drives every estimate hotl makes — the compaction trigger, the
@@ -194,6 +231,30 @@ semver promise of their own.
   any other drop; drive-relative and UNC forms still insert literally.
 
 ### Changed
+
+- **A sub-agent no longer inherits `bypass`** (plan 0058). Your allow and deny
+  rules still apply inside children; the mode is forced to `dontask`, so a
+  mutating call in a child runs only if one of your own rules already covered
+  it. A def's `tools:` now intersects with what the spawning session could do
+  rather than replacing it. A child's tool-call and cost budgets are its own,
+  so a wide fan-out cannot end the parent's turn.
+- **Your hooks run inside sub-agents** (plan 0058). Every hook envelope carries
+  `actor`: `"main"` or `"child:<id>"` — including `pre_compact` and
+  `post_compact`, so a hook can tell whose context is folding. A policy that
+  stopped applying the moment work was delegated was not one.
+- **Identical sub-agents fanned out together stagger** (plan 0058): the first
+  goes, the rest wait for its first response byte, so their shared prefix is
+  cached once instead of N times.
+- **On macOS the sandbox now denies writes to `.git/config`** as well as
+  `.git/hooks` (plan 0058). An isolated child can still commit in its worktree;
+  it cannot install a hook or set `core.pager` to run something later. On Linux
+  neither is denied — Landlock cannot carve a path back out of the
+  working-directory grant, and `permissions-and-sandbox.md` says so.
+- **`spawn` refuses past `agents × 4` queued children**, naming both numbers,
+  instead of queueing silently (plan 0058). A workflow's `each` phase over
+  `args` now reports its real width before you approve it. Cancelling a
+  workflow drains: agents in flight settle, agents never admitted are recorded
+  `skipped`, and the summary accounts for all of them.
 
 - **The model sees its step budget once it is nearly spent** (plan 0059). The
   ephemeral turn-context block carries `turn_budget="80/100"` and `elapsed_s`,
