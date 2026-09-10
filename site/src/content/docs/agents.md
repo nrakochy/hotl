@@ -109,6 +109,40 @@ cache anyway, so `fork` instead wraps your history into an explicit,
 labeled background block the child receives as context, not as its own
 prior turns.
 
+## The return contract
+
+A sub-agent gets its brief twice — inline in its first message, and as a file
+at `<data dir>/spawn/<id>/TASK.md` it is told to read first. The file is
+there because a long brief is recalled better when the child can go back and
+re-read it; the inline copy is what makes the first turn actionable without
+one.
+
+It answers through a tool, not through prose. Every child carries
+`report_result`, registered past whatever `tools:` its def names — it is how
+the child speaks at all, so a narrow tool list cannot remove it:
+
+| Field | |
+| --- | --- |
+| `outcome` | `completed`, `blocked`, `needs_input` or `unverifiable` — required |
+| `summary` | what it found or did, at most 6000 characters (≈1,500 tokens); a longer one is **refused**, not truncated |
+| `files_touched` | every path it created, edited or deleted |
+| `commits` | commit shas it made |
+| `citations` | `path:line` for each claim worth checking |
+| `question` | required with `needs_input`: the one thing a human must decide |
+
+The parent sees that object, pretty-printed, inside the usual untrusted
+envelope — tagged `typed="true"` so a client can tell a shape from prose.
+
+A child that stops without reporting is asked twice more ("Call report_result
+now with what you have"). If it still doesn't, the parent writes the result
+itself: `{"outcome": "unverifiable", "summary": <the child's last words>}`.
+The parent always gets a shape — what it never gets is a claim of success
+nobody made.
+
+`workflow` agents are the exception: they answer against their phase's own
+JSON schema, so they are not given `report_result`. Two return contracts in
+one roster is just a way to lose the reply.
+
 ## Depth, isolation, and trust
 
 - **Depth is capped at one level, structurally.** A child's registry is

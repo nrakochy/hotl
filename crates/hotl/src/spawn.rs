@@ -14,7 +14,7 @@
 //! `hotl_tools::agents::filter_registry`. `teammate` (a peer topology) stays
 //! reserved.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
@@ -37,20 +37,36 @@ pub struct Child {
     /// a git worktree, `worktree add` failed). The child still ran, sharing the
     /// parent's tree — the caller says so rather than letting it look isolated.
     pub isolation_unavailable: bool,
+    /// Where this child's `report_result` writes, when the builder wired that
+    /// tool (0058 T1). `None` means the child was never given the tool, so the
+    /// caller must not re-prompt it for a report it cannot make.
+    pub report_path: Option<PathBuf>,
 }
 
 /// Builds a fresh child session from a resolved [`AgentDef`], seeded with a
 /// task brief. The real binary wires engine deps here; tests inject a
 /// scripted-provider child.
+///
+/// `report` is the child's own scratch dir (`<data_dir>/spawn/<ulid>/`), where
+/// its `TASK.md` already sits and its `RESPONSE.json` will land. `None` — the
+/// workflow runner — leaves `report_result` out of the registry: those agents
+/// answer against a per-phase JSON schema instead, and two competing return
+/// contracts in one roster would just be a way to lose the reply.
 pub trait ChildBuilder: Send + Sync {
-    fn build(&self, def: &AgentDef, brief: &str) -> Result<Child, String>;
+    fn build(&self, def: &AgentDef, brief: &str, report: Option<&Path>) -> Result<Child, String>;
     /// `fork`: seed the child with the parent's own history instead of a
     /// fresh context. `seed` is the parent's projection at the moment of the
     /// call plus the lineage that projection came from (see
     /// `SpawnTool::snapshot`); the returned session ends on an unanswered turn
     /// (the brief is already the last item), so the caller drives it with
     /// `continue_turn()`, not `prompt()`.
-    fn build_fork(&self, def: &AgentDef, brief: &str, seed: ForkSeed) -> Result<Child, String>;
+    fn build_fork(
+        &self,
+        def: &AgentDef,
+        brief: &str,
+        report: Option<&Path>,
+        seed: ForkSeed,
+    ) -> Result<Child, String>;
 }
 
 /// What a `fork: true` spawn inherits: the parent's durable projection, and
@@ -111,6 +127,11 @@ pub(crate) fn parent_tree_lock() -> &'static tokio::sync::Mutex<()> {
 pub struct SpawnTool {
     builder: Arc<dyn ChildBuilder>,
     config_dir: PathBuf,
+    /// `<data_dir>/spawn`: one scratch dir per child, holding its `TASK.md`
+    /// and the `RESPONSE.json` it reports back through. Injected, never
+    /// re-resolved from KNOWN_PATHS, for the same reason the child sessions
+    /// dir is (0032 Task 7).
+    spawn_dir: PathBuf,
     include_claude: bool,
     /// The ONE process-wide budget (shared `Arc` semaphores, not a fresh
     /// pool) — every concurrent child, wherever it's dispatched from, draws
@@ -130,12 +151,14 @@ impl SpawnTool {
     pub fn new(
         builder: Arc<dyn ChildBuilder>,
         config_dir: PathBuf,
+        spawn_dir: PathBuf,
         include_claude: bool,
         concurrency: SessionConcurrency,
     ) -> Self {
         Self {
             builder,
             config_dir,
+            spawn_dir,
             include_claude,
             concurrency,
             snapshot: None,
@@ -197,6 +220,24 @@ impl SpawnTool {
         // `agents` (default 4) hold a permit and run at once.
         let _permit = self.concurrency.agent().await;
 
+        // The brief goes to disk and inline both (0058 T1): recall of a long
+        // brief improves when the model has a file it can re-read, and the
+        // inline copy is what makes the first turn actionable without one.
+        let scratch = self.spawn_dir.join(hotl_types::new_ulid());
+        let brief = match write_task_md(&scratch, task) {
+            Ok(path) => format!(
+                "Your brief is in {}. Read it before doing anything else; end by calling \
+                 report_result.\n\n{task}",
+                path.display()
+            ),
+            // A scratch dir we cannot write is not worth failing a subtask
+            // over — the child still gets the brief, just not the file.
+            Err(e) => {
+                eprintln!("hotl: could not write the sub-agent brief file: {e}");
+                task.to_string()
+            }
+        };
+
         let build_result = if fork {
             let Some(snapshot) = &self.snapshot else {
                 return ToolOutcome::err(
@@ -205,7 +246,7 @@ impl SpawnTool {
                 );
             };
             match (snapshot)().await {
-                Some(seed) => self.builder.build_fork(&def, task, seed),
+                Some(seed) => self.builder.build_fork(&def, &brief, Some(&scratch), seed),
                 None => {
                     return ToolOutcome::err(
                         "Could not read the parent session's context to fork from — \
@@ -214,12 +255,13 @@ impl SpawnTool {
                 }
             }
         } else {
-            self.builder.build(&def, task)
+            self.builder.build(&def, &brief, Some(&scratch))
         };
         let Child {
             handle: mut child,
             worktree,
             isolation_unavailable,
+            report_path,
         } = match build_result {
             Ok(c) => c,
             Err(e) => return ToolOutcome::err(format!("Could not start sub-agent: {e}")),
@@ -242,18 +284,38 @@ impl SpawnTool {
         if fork {
             child.continue_turn().await;
         } else {
-            child.prompt(task.to_string()).await;
+            child.prompt(brief).await;
         }
         // `usage` is summed but unused here: the spawn card keeps `tokens:
         // None` (0044 leaves that to the workflow tool).
-        let Drained { outcome, usage: _ } =
-            drain_child(&mut child, &cancel, self.events.clone().zip(parent_id)).await;
+        let forward = self.events.clone().zip(parent_id);
+        let Drained { outcome, usage: _ } = drain_child(&mut child, &cancel, forward.clone()).await;
+        // The typed return (0058 T1). Only for a child that was actually given
+        // `report_result`: re-prompting one that never had the tool would just
+        // burn turns asking for the impossible.
+        let typed = match (&outcome, &report_path) {
+            (Outcome::Done { text }, Some(path)) => {
+                Some(collect_report(&mut child, &cancel, &forward, path, text).await)
+            }
+            _ => None,
+        };
+        let outcome = match (outcome, &typed) {
+            (Outcome::Done { .. }, Some(v)) => Outcome::Done {
+                text: serde_json::to_string_pretty(v).unwrap_or_default(),
+            },
+            (other, _) => other,
+        };
         let note = isolation_unavailable.then_some(
             "Note: this agent def asked for worktree isolation, which is unavailable here \
              (no git, or the workspace is not a git worktree). The sub-agent ran in your \
              working directory.",
         );
 
+        // `typed="true"` says the body is a `report_result` object, not prose.
+        let env = |text: &str| match typed.is_some() {
+            true => envelope_tagged("subagent-result", " typed=\"true\"", text),
+            false => envelope(text),
+        };
         let (result, worktree) = match (outcome, worktree) {
             (Outcome::Done { text }, Some(wt)) => match merge_back(wt).await {
                 // The merge-back line goes *outside* `<subagent-result>`:
@@ -264,7 +326,7 @@ impl SpawnTool {
                     Ok(format!(
                         "{}\nApplied the sub-agent's changes to the working tree \
                          ({n} file(s)).",
-                        envelope(&text)
+                        env(&text)
                     )),
                     wt,
                 ),
@@ -272,13 +334,13 @@ impl SpawnTool {
                     Ok(format!(
                         "{}\nNot applied — {msg}. Resolve manually; the sub-agent's \
                          worktree is at {}.\n\nIts diff:\n{diff}",
-                        envelope(&text),
+                        env(&text),
                         path.display()
                     )),
                     wt,
                 ),
             },
-            (Outcome::Done { text }, None) => (Ok(envelope(&text)), None),
+            (Outcome::Done { text }, None) => (Ok(env(&text)), None),
             // Cancelled/refused/failed: the diff is discarded and the worktree
             // goes with it. A cancelled child must not leave one behind.
             (Outcome::Cancelled, wt) => (Err("The sub-agent was cancelled.".to_string()), wt),
@@ -300,6 +362,66 @@ impl SpawnTool {
             }),
         }
     }
+}
+
+/// How many times a child that finished without reporting is asked again
+/// (the workflow runner's schema-retry budget, same number for the same
+/// reason: two nudges, then take what there is).
+const MAX_REPORT_RETRIES: usize = 2;
+
+/// Write the child's brief to `<scratch>/TASK.md` and return its path.
+///
+/// `## Plan steps` / `## Decisions` are not written: the parent-side
+/// `PlanState` they would be read from is 0056's and is not in this tree
+/// (see the plan's decision log, 2026-09-09).
+fn write_task_md(scratch: &Path, brief: &str) -> std::io::Result<PathBuf> {
+    use hotl_platform::PrivateFs;
+    use std::io::Write;
+    hotl_platform::PRIVATE_FS.create_dir_all(scratch)?;
+    let path = scratch.join(hotl_tools::report_tool::TASK_FILE);
+    let mut f = hotl_platform::PRIVATE_FS.create_file_truncate(&path)?;
+    write!(
+        f,
+        "# Brief\n\n{brief}\n\n## Return\n\nEnd by calling `report_result` exactly once with \
+         `outcome` (completed | blocked | needs_input | unverifiable), a `summary` of at most \
+         {} characters, `files_touched`, `commits` and `citations` (`path:line`). Prose after \
+         that call is not read.\n",
+        hotl_tools::report_tool::MAX_SUMMARY_CHARS
+    )?;
+    Ok(path)
+}
+
+/// Read the child's typed result, nudging it up to [`MAX_REPORT_RETRIES`]
+/// times if it stopped without one, and inventing an `unverifiable` result
+/// from its last words if it never does. Always returns a value: the parent
+/// model gets a shape whatever the child did.
+async fn collect_report(
+    child: &mut SessionHandle,
+    cancel: &CancellationToken,
+    forward: &Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
+    path: &Path,
+    final_text: &str,
+) -> Value {
+    let mut last = final_text.to_string();
+    for _ in 0..MAX_REPORT_RETRIES {
+        if let Some(v) = hotl_tools::report_tool::read_response(path) {
+            return v;
+        }
+        if cancel.is_cancelled() {
+            break;
+        }
+        child
+            .prompt(hotl_tools::report_tool::REPROMPT.to_string())
+            .await;
+        let drained = drain_child(child, cancel, forward.clone()).await;
+        if let Outcome::Done { text } = &drained.outcome {
+            last = text.clone();
+        } else {
+            break;
+        }
+    }
+    hotl_tools::report_tool::read_response(path)
+        .unwrap_or_else(|| hotl_tools::report_tool::unverifiable(&last))
 }
 
 /// What [`drain_child`] saw: the terminal outcome plus every `TurnDone`'s
@@ -548,7 +670,12 @@ mod tests {
     }
 
     impl ChildBuilder for ScriptedChild {
-        fn build(&self, def: &AgentDef, _brief: &str) -> Result<Child, String> {
+        fn build(
+            &self,
+            def: &AgentDef,
+            _brief: &str,
+            _report: Option<&Path>,
+        ) -> Result<Child, String> {
             self.seen.lock().unwrap().push(def.clone());
             let dir = tempfile::tempdir().unwrap();
             let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
@@ -579,7 +706,13 @@ mod tests {
             })))
         }
 
-        fn build_fork(&self, def: &AgentDef, brief: &str, seed: ForkSeed) -> Result<Child, String> {
+        fn build_fork(
+            &self,
+            def: &AgentDef,
+            brief: &str,
+            _report: Option<&Path>,
+            seed: ForkSeed,
+        ) -> Result<Child, String> {
             self.seen.lock().unwrap().push(def.clone());
             self.fork_history.lock().unwrap().push(seed.history);
             let dir = tempfile::tempdir().unwrap();
@@ -627,6 +760,7 @@ mod tests {
             handle,
             worktree: None,
             isolation_unavailable: false,
+            report_path: None,
         }
     }
 
@@ -638,9 +772,275 @@ mod tests {
         SpawnTool::new(
             builder,
             tempfile::tempdir().unwrap().keep(),
+            tempfile::tempdir().unwrap().keep(),
             false,
             test_concurrency(),
         )
+    }
+
+    /// A child that really carries `report_result`, wired at the scratch dir
+    /// the spawn tool chose — the only shape that exercises the typed return.
+    /// `replies` is its whole script; `Vec::new()` means it never reports.
+    type Script = Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>>;
+
+    struct TypedChild {
+        replies: Mutex<Vec<Vec<Script>>>,
+        provider: Mutex<Option<Arc<ScriptedProvider>>>,
+        briefs: Mutex<Vec<String>>,
+    }
+
+    impl TypedChild {
+        fn new(scripts: Vec<Script>) -> Self {
+            Self {
+                replies: Mutex::new(vec![scripts]),
+                provider: Mutex::new(None),
+                briefs: Mutex::new(Vec::new()),
+            }
+        }
+        fn last_brief(&self) -> String {
+            self.briefs.lock().unwrap().last().cloned().unwrap()
+        }
+        fn requests(&self) -> usize {
+            self.provider
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(0, |p| p.request_count())
+        }
+        fn spawn(
+            &self,
+            brief: &str,
+            report: Option<&Path>,
+            initial_items: Vec<Item>,
+        ) -> Result<Child, String> {
+            self.briefs.lock().unwrap().push(brief.to_string());
+            let dir = tempfile::tempdir().unwrap();
+            let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
+            std::mem::forget(dir);
+            let scripts = self.replies.lock().unwrap().pop().unwrap_or_default();
+            let provider = Arc::new(ScriptedProvider::new(scripts));
+            *self.provider.lock().unwrap() = Some(provider.clone());
+            let mut registry = Registry::builtin();
+            if let Some(d) = report {
+                registry.register(Box::new(hotl_tools::ReportResultTool::new(
+                    d.join(hotl_tools::report_tool::RESPONSE_FILE),
+                )));
+            }
+            Ok(Child {
+                handle: spawn_session(SessionDeps {
+                    concurrency: Default::default(),
+                    provider,
+                    registry: Arc::new(registry),
+                    rules: Arc::new(Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "child".into(),
+                    cwd: std::env::temp_dir(),
+                    hooks: None,
+                    initial_items,
+                    initial_todos: Vec::new(),
+                    initial_decisions: Vec::new(),
+                    plan_files: None,
+                    initial_goal: None,
+                    config: EngineConfig {
+                        max_turns: 8,
+                        ..Default::default()
+                    },
+                }),
+                worktree: None,
+                isolation_unavailable: false,
+                report_path: report.map(|d| d.join(hotl_tools::report_tool::RESPONSE_FILE)),
+            })
+        }
+    }
+
+    impl ChildBuilder for TypedChild {
+        fn build(
+            &self,
+            _def: &AgentDef,
+            brief: &str,
+            report: Option<&Path>,
+        ) -> Result<Child, String> {
+            self.spawn(brief, report, Vec::new())
+        }
+        /// Ends on an unanswered user turn, like the real `build_fork`, so
+        /// the caller's `continue_turn()` samples.
+        fn build_fork(
+            &self,
+            _def: &AgentDef,
+            brief: &str,
+            report: Option<&Path>,
+            _seed: ForkSeed,
+        ) -> Result<Child, String> {
+            self.spawn(
+                brief,
+                report,
+                vec![Item::User {
+                    text: brief.to_string(),
+                    synthetic: None,
+                    images: Vec::new(),
+                }],
+            )
+        }
+    }
+
+    fn typed_tool(builder: Arc<TypedChild>, spawn_dir: PathBuf) -> SpawnTool {
+        SpawnTool::new(
+            builder,
+            tempfile::tempdir().unwrap().keep(),
+            spawn_dir,
+            false,
+            test_concurrency(),
+        )
+    }
+
+    fn reports(outcome: &str, summary: &str) -> Script {
+        ScriptedProvider::tool_call(
+            "r1",
+            "report_result",
+            json!({"outcome": outcome, "summary": summary, "citations": ["a.rs:1"]}),
+        )
+    }
+
+    /// The brief goes to disk *and* inline, and the child is told where the
+    /// file is before anything else.
+    #[tokio::test]
+    async fn spawn_writes_task_md_and_the_child_is_pointed_at_it() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            reports("completed", "found it"),
+            ScriptedProvider::text_reply("stopping"),
+        ]));
+        let tool = typed_tool(builder.clone(), spawn_dir.path().to_path_buf());
+        let out = tool
+            .run(
+                json!({"task": "survey the parser"}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+
+        let scratch: Vec<_> = std::fs::read_dir(spawn_dir.path())
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(scratch.len(), 1, "one scratch dir per child");
+        let task_md = scratch[0].path().join("TASK.md");
+        let body = std::fs::read_to_string(&task_md).expect("TASK.md written");
+        assert!(body.starts_with("# Brief\n"), "{body}");
+        assert!(body.contains("survey the parser"));
+        assert!(
+            body.contains("## Return") && body.contains("report_result"),
+            "{body}"
+        );
+
+        let brief = builder.last_brief();
+        assert!(
+            brief.starts_with(&format!("Your brief is in {}.", task_md.display())),
+            "the child is pointed at the file first: {brief}"
+        );
+        assert!(
+            brief.contains("survey the parser"),
+            "and still carries the brief inline: {brief}"
+        );
+    }
+
+    /// A child that calls `report_result` answers with the file, not its prose.
+    #[tokio::test]
+    async fn child_returns_a_typed_response() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            reports("completed", "the parser is fine"),
+            ScriptedProvider::text_reply("anything after the report is ignored"),
+        ]));
+        let tool = typed_tool(builder, spawn_dir.path().to_path_buf());
+        let out = tool
+            .run(json!({"task": "survey"}), CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("typed=\"true\""), "{}", out.content);
+        assert!(
+            out.content.contains("\"outcome\": \"completed\""),
+            "{}",
+            out.content
+        );
+        assert!(out.content.contains("the parser is fine"));
+        assert!(
+            out.content.contains("a.rs:1"),
+            "citations survive: {}",
+            out.content
+        );
+
+        let scratch: Vec<_> = std::fs::read_dir(spawn_dir.path())
+            .unwrap()
+            .flatten()
+            .collect();
+        let response = scratch[0].path().join("RESPONSE.json");
+        assert!(response.exists(), "RESPONSE.json is the durable copy");
+    }
+
+    /// Two nudges, then the child's last words become an `unverifiable`
+    /// summary — the parent always gets a shape.
+    #[tokio::test]
+    async fn child_without_report_result_is_reprompted_twice_then_unverifiable() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            ScriptedProvider::text_reply("I looked around"),
+            ScriptedProvider::text_reply("still looking"),
+            ScriptedProvider::text_reply("my final word"),
+        ]));
+        let tool = typed_tool(builder.clone(), spawn_dir.path().to_path_buf());
+        let out = tool
+            .run(json!({"task": "survey"}), CancellationToken::new())
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            builder.requests(),
+            3,
+            "the first turn plus exactly two nudges"
+        );
+        assert!(
+            out.content.contains("\"outcome\": \"unverifiable\""),
+            "{}",
+            out.content
+        );
+        assert!(
+            out.content.contains("my final word"),
+            "the last text becomes the summary: {}",
+            out.content
+        );
+    }
+
+    /// `fork` seeds differently but returns the same shape.
+    #[tokio::test]
+    async fn fork_true_still_returns_the_typed_shape() {
+        let spawn_dir = tempfile::tempdir().unwrap();
+        let builder = Arc::new(TypedChild::new(vec![
+            reports("blocked", "needs a key"),
+            ScriptedProvider::text_reply("stopping"),
+        ]));
+        let tool =
+            typed_tool(builder, spawn_dir.path().to_path_buf()).with_snapshot(Arc::new(|| {
+                Box::pin(std::future::ready(Some(ForkSeed {
+                    history: Vec::new(),
+                    parent_session_id: "p".into(),
+                    parent_tip_entry_id: None,
+                })))
+            }));
+        let out = tool
+            .run(
+                json!({"task": "survey", "fork": true}),
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("typed=\"true\""), "{}", out.content);
+        assert!(
+            out.content.contains("\"outcome\": \"blocked\""),
+            "{}",
+            out.content
+        );
     }
 
     #[tokio::test]
@@ -662,7 +1062,7 @@ mod tests {
     #[tokio::test]
     async fn drain_child_reports_usage() {
         let def = hotl_tools::agents::builtin("general-purpose").unwrap();
-        let mut child = ScriptedChild::new().build(&def, "go").unwrap().handle;
+        let mut child = ScriptedChild::new().build(&def, "go", None).unwrap().handle;
         child.prompt("go".into()).await;
         let drained = drain_child(&mut child, &CancellationToken::new(), None).await;
         assert!(matches!(drained.outcome, Outcome::Done { .. }));
@@ -676,7 +1076,12 @@ mod tests {
     struct ToolRunningChild;
 
     impl ChildBuilder for ToolRunningChild {
-        fn build(&self, _def: &AgentDef, _brief: &str) -> Result<Child, String> {
+        fn build(
+            &self,
+            _def: &AgentDef,
+            _brief: &str,
+            _report: Option<&Path>,
+        ) -> Result<Child, String> {
             let dir = tempfile::tempdir().unwrap();
             let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
             std::mem::forget(dir);
@@ -725,6 +1130,7 @@ mod tests {
             &self,
             _def: &AgentDef,
             _brief: &str,
+            _report: Option<&Path>,
             _seed: ForkSeed,
         ) -> Result<Child, String> {
             Err("unused in this test".into())
@@ -739,6 +1145,7 @@ mod tests {
         let (event_tx, mut event_rx) = hotl_engine::event_channel();
         let tool = SpawnTool::new(
             Arc::new(ToolRunningChild),
+            tempfile::tempdir().unwrap().keep(),
             tempfile::tempdir().unwrap().keep(),
             false,
             test_concurrency(),
@@ -791,6 +1198,7 @@ mod tests {
     async fn no_event_sink_means_no_forwarding_and_no_panic() {
         let tool = SpawnTool::new(
             Arc::new(ToolRunningChild),
+            tempfile::tempdir().unwrap().keep(),
             tempfile::tempdir().unwrap().keep(),
             false,
             test_concurrency(),
@@ -1012,7 +1420,12 @@ mod tests {
     }
 
     impl ChildBuilder for ProbeChild {
-        fn build(&self, _def: &AgentDef, _brief: &str) -> Result<Child, String> {
+        fn build(
+            &self,
+            _def: &AgentDef,
+            _brief: &str,
+            _report: Option<&Path>,
+        ) -> Result<Child, String> {
             let dir = tempfile::tempdir().unwrap();
             let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
             std::mem::forget(dir);
@@ -1058,6 +1471,7 @@ mod tests {
                 handle,
                 worktree,
                 isolation_unavailable: false,
+                report_path: None,
             })
         }
 
@@ -1065,9 +1479,10 @@ mod tests {
             &self,
             def: &AgentDef,
             brief: &str,
+            report: Option<&Path>,
             _seed: ForkSeed,
         ) -> Result<Child, String> {
-            self.build(def, brief)
+            self.build(def, brief, report)
         }
     }
 
@@ -1123,7 +1538,12 @@ mod tests {
     }
 
     impl ChildBuilder for WorktreeChild {
-        fn build(&self, _def: &AgentDef, _brief: &str) -> Result<Child, String> {
+        fn build(
+            &self,
+            _def: &AgentDef,
+            _brief: &str,
+            _report: Option<&Path>,
+        ) -> Result<Child, String> {
             let worktree =
                 hotl_store::worktree::Worktree::create(&self.workspace, &hotl_types::new_ulid())
                     .ok_or("no worktree")?;
@@ -1162,6 +1582,7 @@ mod tests {
                 handle,
                 worktree: Some(worktree),
                 isolation_unavailable: false,
+                report_path: None,
             })
         }
 
@@ -1169,15 +1590,17 @@ mod tests {
             &self,
             def: &AgentDef,
             brief: &str,
+            report: Option<&Path>,
             _seed: ForkSeed,
         ) -> Result<Child, String> {
-            self.build(def, brief)
+            self.build(def, brief, report)
         }
     }
 
     fn worktree_tool(builder: WorktreeChild) -> SpawnTool {
         SpawnTool::new(
             Arc::new(builder),
+            tempfile::tempdir().unwrap().keep(),
             tempfile::tempdir().unwrap().keep(),
             false,
             test_concurrency(),
@@ -1275,6 +1698,7 @@ mod tests {
                 rendezvous: Some(2),
             }),
             tempfile::tempdir().unwrap().keep(),
+            tempfile::tempdir().unwrap().keep(),
             false,
             test_concurrency(),
         ));
@@ -1317,6 +1741,7 @@ mod tests {
                 rendezvous: None,
             }),
             tempfile::tempdir().unwrap().keep(),
+            tempfile::tempdir().unwrap().keep(),
             false,
             test_concurrency(),
         ));
@@ -1350,6 +1775,7 @@ mod tests {
                 isolate_in: Some(repo.path().to_path_buf()),
                 rendezvous: None,
             }),
+            tempfile::tempdir().unwrap().keep(),
             tempfile::tempdir().unwrap().keep(),
             false,
             test_concurrency(),
@@ -1396,6 +1822,7 @@ mod tests {
         });
         let tool = Arc::new(SpawnTool::new(
             builder,
+            tempfile::tempdir().unwrap().keep(),
             tempfile::tempdir().unwrap().keep(),
             false,
             concurrency,
@@ -1447,6 +1874,7 @@ mod tests {
         let tool = Arc::new(SpawnTool::new(
             builder,
             tempfile::tempdir().unwrap().keep(),
+            tempfile::tempdir().unwrap().keep(),
             false,
             concurrency,
         ));
@@ -1494,6 +1922,7 @@ mod tests {
         });
         let tool = Arc::new(SpawnTool::new(
             builder,
+            tempfile::tempdir().unwrap().keep(),
             tempfile::tempdir().unwrap().keep(),
             false,
             concurrency,

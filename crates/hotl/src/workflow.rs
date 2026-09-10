@@ -433,6 +433,7 @@ fn fail(message: impl Into<String>) -> AgentReply {
         value: Err(message.into()),
         tokens: None,
         note: None,
+        unverifiable: false,
     }
 }
 
@@ -503,12 +504,13 @@ impl ChildRunner {
         };
         let built = {
             let _creating = self.creation.lock().await;
-            self.builder.build(&def, &brief)
+            self.builder.build(&def, &brief, None)
         };
         let Child {
             handle: mut child,
             worktree,
             isolation_unavailable,
+            report_path: _,
         } = match built {
             Ok(c) => c,
             Err(e) => return fail(format!("could not start the agent: {e}")),
@@ -525,9 +527,12 @@ impl ChildRunner {
         // still count. Owned captures: a borrowed one makes the closure's
         // future non-`Send` (higher-ranked lifetime).
         let used = Arc::new(Mutex::new(TokenUsage::default()));
+        // Set the moment the child answers at all: an answer that then fails
+        // every schema retry is unverifiable, not failed (0058 T1).
+        let answered = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let value: Result<Value, String> = match &req.schema {
             Some(schema) => {
-                let (cancel, used) = (cancel.clone(), used.clone());
+                let (cancel, used, answered) = (cancel.clone(), used.clone(), answered.clone());
                 crate::structured::structured_loop(
                     &mut child,
                     schema,
@@ -535,6 +540,9 @@ impl ChildRunner {
                     async move |h: &mut hotl_engine::SessionHandle| {
                         let (text, usage) = settle(drain_child(h, &cancel, None).await);
                         *lock(&used) += usage;
+                        if text.is_ok() {
+                            answered.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
                         text.map(|t| (t, usage))
                     },
                 )
@@ -580,6 +588,9 @@ impl ChildRunner {
                 }
             }
         }
+        let unverifiable = value.is_err()
+            && answered.load(std::sync::atomic::Ordering::SeqCst)
+            && !cancel.is_cancelled();
         AgentReply {
             value,
             tokens: Some(
@@ -589,6 +600,7 @@ impl ChildRunner {
                     + used.cache_creation_input_tokens,
             ),
             note: (!notes.is_empty()).then(|| notes.join("; ")),
+            unverifiable,
         }
     }
 }
@@ -725,7 +737,12 @@ mod tests {
     }
 
     impl ChildBuilder for ScriptedBuilder {
-        fn build(&self, def: &AgentDef, brief: &str) -> Result<Child, String> {
+        fn build(
+            &self,
+            def: &AgentDef,
+            brief: &str,
+            _report: Option<&std::path::Path>,
+        ) -> Result<Child, String> {
             self.seen
                 .lock()
                 .unwrap()
@@ -765,9 +782,16 @@ mod tests {
                 handle: session(Arc::new(ScriptedProvider::new(replies)), registry, cwd),
                 worktree,
                 isolation_unavailable: false,
+                report_path: None,
             })
         }
-        fn build_fork(&self, _: &AgentDef, _: &str, _: ForkSeed) -> Result<Child, String> {
+        fn build_fork(
+            &self,
+            _: &AgentDef,
+            _: &str,
+            _report: Option<&std::path::Path>,
+            _: ForkSeed,
+        ) -> Result<Child, String> {
             Err("unused".into())
         }
     }

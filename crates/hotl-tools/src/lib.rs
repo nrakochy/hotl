@@ -17,6 +17,7 @@ pub(crate) mod minified;
 pub mod net;
 pub mod path;
 pub mod plugins;
+pub mod report_tool;
 pub mod rules;
 pub mod sandbox;
 pub mod shell;
@@ -30,6 +31,7 @@ pub mod winfloor;
 pub use ask::AskUserTool;
 pub use builtins::{BashTool, EditTool, GlobTool, GrepTool, ReadTool, WriteTool};
 pub use minified::MinifyConfig;
+pub use report_tool::ReportResultTool;
 pub use todo::{PresentPlanTool, TodoWriteTool};
 pub use web::{WebFetchTool, WebSearchTool};
 

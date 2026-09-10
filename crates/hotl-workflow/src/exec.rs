@@ -40,6 +40,10 @@ pub struct AgentReply {
     pub tokens: Option<u64>,
     /// hotl-authored remark about the agent (a kept worktree path, say).
     pub note: Option<String>,
+    /// The agent answered, but its answer never validated (0058 T1). It did
+    /// work; the shape could not be verified — which is not the same failure
+    /// as never having run.
+    pub unverifiable: bool,
 }
 
 pub trait AgentRunner: Send + Sync {
@@ -118,6 +122,8 @@ pub enum AgentStatus {
     Done,
     Failed,
     Cancelled,
+    /// Ran and answered; the answer never validated.
+    Unverifiable,
 }
 
 impl RunStatus {
@@ -138,6 +144,7 @@ impl AgentStatus {
             AgentStatus::Done => "done",
             AgentStatus::Failed => "failed",
             AgentStatus::Cancelled => "cancelled",
+            AgentStatus::Unverifiable => "unverifiable",
         }
     }
 }
@@ -210,11 +217,18 @@ impl RunSummary {
         let started = self.records().count();
         let finished = self
             .records()
-            .filter(|r| matches!(r.status, AgentStatus::Done | AgentStatus::Failed))
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    AgentStatus::Done | AgentStatus::Failed | AgentStatus::Unverifiable
+                )
+            })
             .count();
+        // Unverifiable counts as failed here: it settled without a value the
+        // next phase can read, which is what this number is for.
         let failed = self
             .records()
-            .filter(|r| r.status == AgentStatus::Failed)
+            .filter(|r| matches!(r.status, AgentStatus::Failed | AgentStatus::Unverifiable))
             .count();
         (started, finished, failed)
     }
@@ -671,10 +685,11 @@ impl Exec<'_> {
         );
         self.obs.started(&id, &phase.title, &label);
         let reply = self.runner.run(req, self.cancel.child_token()).await;
-        let status = match (&reply.value, self.cancel.is_cancelled()) {
-            (Ok(_), _) => AgentStatus::Done,
-            (Err(_), true) => AgentStatus::Cancelled,
-            (Err(_), false) => AgentStatus::Failed,
+        let status = match (&reply.value, self.cancel.is_cancelled(), reply.unverifiable) {
+            (Ok(_), ..) => AgentStatus::Done,
+            (Err(_), true, _) => AgentStatus::Cancelled,
+            (Err(_), false, true) => AgentStatus::Unverifiable,
+            (Err(_), false, false) => AgentStatus::Failed,
         };
         lock(&self.summary).settle(&id, status, &reply);
         self.obs.finished(&id, reply.value.is_ok(), reply.tokens);
@@ -784,6 +799,7 @@ pub(crate) mod tests {
                     value,
                     tokens: Some(100),
                     note: None,
+                    unverifiable: false,
                 }
             })
         }
@@ -1109,6 +1125,7 @@ pub(crate) mod tests {
                         value: Ok(json!(req.label)),
                         tokens: None,
                         note: None,
+                        unverifiable: false,
                     }
                 })
             }
@@ -1322,6 +1339,7 @@ pub(crate) mod tests {
                 value: Ok(json!(1)),
                 tokens: Some(1200),
                 note: Some("kept".into()),
+                unverifiable: false,
             },
         );
         let j = s.to_json();
@@ -1335,5 +1353,37 @@ pub(crate) mod tests {
         assert_eq!(j["phases"][0]["agents"][0]["tokens"], 1200);
         assert_eq!(j["phases"][0]["agents"][0]["note"], "kept");
         assert!(j["phases"][0]["agents"][0]["elapsed_ms"].is_u64());
+    }
+
+    /// An agent that answered but never validated is its own status: it ran,
+    /// so it is settled and it counts against the run, but "failed" would say
+    /// it never got anywhere.
+    #[tokio::test]
+    async fn an_answer_that_never_validates_settles_unverifiable() {
+        struct Unvalidated;
+        impl AgentRunner for Unvalidated {
+            fn run(&self, _req: AgentRequest, _c: CancellationToken) -> BoxFuture<'_, AgentReply> {
+                Box::pin(std::future::ready(AgentReply {
+                    value: Err("output did not validate after 2 retries".into()),
+                    tokens: Some(7),
+                    note: None,
+                    unverifiable: true,
+                }))
+            }
+        }
+        let plan = plan(
+            json!({"name": "p", "phases": [{"title": "A", "agents": [{"label": "a", "prompt": "p"}]}]}),
+        );
+        let (_out, summary) = Harness::default().run(&plan, &Unvalidated, &Silent).await;
+        let s = lock(&summary);
+        assert_eq!(
+            s.to_json()["phases"][0]["agents"][0]["status"],
+            "unverifiable"
+        );
+        assert_eq!(
+            s.counts(),
+            (1, 1, 1),
+            "settled, and counted against the run"
+        );
     }
 }

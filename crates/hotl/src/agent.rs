@@ -1676,6 +1676,7 @@ fn spawn_session_inner(
             crate::spawn::SpawnTool::new(
                 builder.clone(),
                 config_dir.clone(),
+                data_dir.join("spawn"),
                 include_claude,
                 concurrency,
             )
@@ -2016,6 +2017,7 @@ impl HotlChildBuilder {
         &self,
         def: &hotl_tools::agents::AgentDef,
         root: &std::path::Path,
+        report: Option<&std::path::Path>,
     ) -> Registry {
         let diagnostics = self
             .hooks_toml
@@ -2023,7 +2025,16 @@ impl HotlChildBuilder {
             .map(hotl_tools::diagnostics::Diagnostics::from_toml)
             .unwrap_or_default();
         let full = Registry::builtin_with_root(diagnostics, self.minify.clone(), root.into());
-        hotl_tools::agents::filter_registry(def, &full)
+        let mut registry = hotl_tools::agents::filter_registry(def, &full);
+        // Registered *after* the def's filter, not through it: `report_result`
+        // is how this child answers at all, so a `tools:` list must not be
+        // able to leave it out (0058 T1).
+        if let Some(dir) = report {
+            registry.register(Box::new(hotl_tools::ReportResultTool::new(
+                dir.join(hotl_tools::report_tool::RESPONSE_FILE),
+            )));
+        }
+        registry
     }
 
     /// Whether this def's child gets a worktree: frontmatter first, then the
@@ -2101,6 +2112,7 @@ impl HotlChildBuilder {
         def: &hotl_tools::agents::AgentDef,
         initial_items: Vec<hotl_types::Item>,
         lineage: Option<(hotl_store::ParentRef, usize)>,
+        report: Option<&std::path::Path>,
     ) -> Result<crate::spawn::Child, String> {
         let inherited = lineage.as_ref().map(|(_, n)| *n);
         let mut log = SessionLog::create(
@@ -2131,7 +2143,7 @@ impl HotlChildBuilder {
             .map_or(self.cwd.as_path(), hotl_store::worktree::Worktree::path)
             .to_path_buf();
 
-        let registry = self.child_registry(def, &root);
+        let registry = self.child_registry(def, &root, report);
         let system = def
             .system_prompt
             .clone()
@@ -2168,6 +2180,7 @@ impl HotlChildBuilder {
             handle,
             worktree,
             isolation_unavailable,
+            report_path: report.map(|d| d.join(hotl_tools::report_tool::RESPONSE_FILE)),
         })
     }
 }
@@ -2177,14 +2190,16 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
         &self,
         def: &hotl_tools::agents::AgentDef,
         _brief: &str,
+        report: Option<&std::path::Path>,
     ) -> Result<crate::spawn::Child, String> {
-        self.spawn_child(def, Vec::new(), None)
+        self.spawn_child(def, Vec::new(), None, report)
     }
 
     fn build_fork(
         &self,
         def: &hotl_tools::agents::AgentDef,
         brief: &str,
+        report: Option<&std::path::Path>,
         seed: crate::spawn::ForkSeed,
     ) -> Result<crate::spawn::Child, String> {
         let crate::spawn::ForkSeed {
@@ -2203,6 +2218,7 @@ impl crate::spawn::ChildBuilder for HotlChildBuilder {
                 },
                 inherited,
             )),
+            report,
         )
     }
 }
@@ -4146,6 +4162,7 @@ mod fork_tests {
             &cb,
             &def,
             "write the handoff summary",
+            None,
             crate::spawn::ForkSeed {
                 history: seed.clone(),
                 parent_session_id: parent_id.clone(),
@@ -4184,7 +4201,7 @@ mod fork_tests {
         // A plain (non-fork) subagent shares no transcript, so it stays
         // lineage-free: giving it one would make GC over-retain a history it
         // never had.
-        let plain = crate::spawn::ChildBuilder::build(&cb, &def, "unrelated subtask")
+        let plain = crate::spawn::ChildBuilder::build(&cb, &def, "unrelated subtask", None)
             .expect("child spawns");
         assert!(
             child_of(&dir, &parent_id)
@@ -4597,7 +4614,7 @@ mod tests {
 
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
         let child = cb
-            .spawn_child(&general, Vec::new(), None)
+            .spawn_child(&general, Vec::new(), None, None)
             .expect("child spawns");
         let worktree = child.worktree.expect("the child was isolated");
         // Canonicalized: `Worktree::create` re-resolves the workspace through
@@ -4620,7 +4637,7 @@ mod tests {
 
         // The child's tools resolve relative paths inside the worktree.
         let out = cb
-            .child_registry(&general, worktree.path())
+            .child_registry(&general, worktree.path(), None)
             .get("write")
             .unwrap()
             .run(
@@ -4650,7 +4667,7 @@ mod tests {
         ]));
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
         let mut handle = cb
-            .spawn_child(&general, Vec::new(), None)
+            .spawn_child(&general, Vec::new(), None, None)
             .expect("child spawns")
             .handle;
         handle.prompt("go".into()).await;
@@ -4693,7 +4710,7 @@ mod tests {
 
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
         let mut handle = cb
-            .spawn_child(&general, Vec::new(), None)
+            .spawn_child(&general, Vec::new(), None, None)
             .expect("child spawns")
             .handle;
         handle.prompt("go".into()).await;
@@ -4730,7 +4747,7 @@ mod tests {
         cb.provider = provider.clone();
         cb.config.effort = parent_effort;
         let mut handle = cb
-            .spawn_child(def, Vec::new(), None)
+            .spawn_child(def, Vec::new(), None, None)
             .expect("child spawns")
             .handle;
         handle.prompt("go".into()).await;
@@ -4814,16 +4831,46 @@ mod tests {
     fn child_registry_applies_the_defs_tool_scope() {
         let (cb, _store) = test_child_builder();
         let explore = hotl_tools::agents::builtin("explore").unwrap();
-        let reg = cb.child_registry(&explore, &cb.cwd);
+        let reg = cb.child_registry(&explore, &cb.cwd, None);
         assert!(reg.get("read").is_some());
         assert!(reg.get("write").is_none());
         assert!(reg.get("bash").is_none());
         assert!(reg.get("spawn").is_none());
 
         let general = hotl_tools::agents::builtin("general-purpose").unwrap();
-        let reg = cb.child_registry(&general, &cb.cwd);
+        let reg = cb.child_registry(&general, &cb.cwd, None);
         assert!(reg.get("write").is_some() && reg.get("bash").is_some());
         assert!(reg.get("spawn").is_none(), "children never recurse");
+    }
+
+    /// `report_result` is registered past the def's tool filter — a `tools:`
+    /// list that omitted it would leave the child no way to answer — and only
+    /// when a report dir was asked for (the workflow runner asks for none).
+    #[test]
+    fn report_result_survives_every_tool_scope_and_only_exists_when_asked_for() {
+        let (cb, _store) = test_child_builder();
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["explore", "general-purpose"] {
+            let def = hotl_tools::agents::builtin(name).unwrap();
+            assert!(
+                cb.child_registry(&def, &cb.cwd, Some(dir.path()))
+                    .get("report_result")
+                    .is_some(),
+                "{name} must be able to report"
+            );
+            assert!(cb
+                .child_registry(&def, &cb.cwd, None)
+                .get("report_result")
+                .is_none());
+        }
+        let only_read = hotl_tools::agents::parse_def(
+            "---\nname: narrow\ntools: read\n---\nbody",
+            hotl_tools::agents::AgentSource::User,
+        )
+        .unwrap();
+        let reg = cb.child_registry(&only_read, &cb.cwd, Some(dir.path()));
+        assert!(reg.get("write").is_none());
+        assert!(reg.get("report_result").is_some());
     }
 
     /// The byte-identical fork path (index E3): a def with no system-prompt/
