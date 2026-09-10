@@ -60,6 +60,13 @@ Top to bottom:
    | **the loop halted with a gap** · "waiting on you" | a permission ask — the gap is you; nothing moves until you answer |
    | the loop coiling up · "folding history…" | context compaction |
 
+   With `[behavior] max_cost_usd` set, the strip carries a spend meter
+   (`$3.20/$5`) from the first threshold crossed — muted below 80% of the
+   budget, amber at or past it. No cap, or nothing near it, and the meter is
+   not drawn: the strip has one line, and a budget nobody is close to is not
+   news. Each threshold (50%, 80%, 100%) also gets one transcript notice, once
+   per session.
+
    When the model has an active `todo_write` checklist, the strip also
    carries a compact `done/total` count — and, while one item is
    `in_progress`, that item's own label (e.g. `2/5 wiring the gate`) — so you

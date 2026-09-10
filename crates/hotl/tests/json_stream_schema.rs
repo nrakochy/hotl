@@ -180,6 +180,23 @@ fn every_outcome_variant_is_tagged_and_carries_its_payload() {
             Some(("tool", "bash")),
         ),
         (
+            Outcome::DenialSpiral {
+                consecutive: 3,
+                total: 7,
+            },
+            "denial_spiral",
+            None,
+        ),
+        (
+            Outcome::Budget {
+                kind: "tool_calls".into(),
+                used: 5.0,
+                cap: 5.0,
+            },
+            "budget",
+            Some(("budget", "tool_calls")),
+        ),
+        (
             Outcome::Error {
                 message: "m".into(),
             },
@@ -194,6 +211,53 @@ fn every_outcome_variant_is_tagged_and_carries_its_payload() {
             assert_eq!(f[key], value, "{kind} must carry `{key}`");
         }
     }
+}
+
+/// 0059 T5: both new outcomes carry their numbers AND a sentence naming the
+/// knob — a consumer that renders only the text still tells the human what to
+/// do next.
+#[test]
+fn the_budget_outcomes_carry_numbers_and_a_next_action() {
+    let f = wire::outcome_frame(&Outcome::DenialSpiral {
+        consecutive: 3,
+        total: 7,
+    });
+    assert_eq!(f["kind"], "denial_spiral");
+    assert_eq!(f["consecutive"], 3);
+    assert_eq!(f["total"], 7);
+    assert!(
+        f["message"].as_str().unwrap().contains("denied in a row"),
+        "{f}"
+    );
+
+    let f = wire::outcome_frame(&Outcome::Budget {
+        kind: "cost_usd".into(),
+        used: 3.2,
+        cap: 5.0,
+    });
+    assert_eq!(f["kind"], "budget");
+    assert_eq!(f["budget"], "cost_usd");
+    assert_eq!(f["used"], 3.2);
+    assert_eq!(f["cap"], 5.0);
+    let message = f["message"].as_str().unwrap();
+    assert!(message.contains("$3.20 of $5.00"), "{message}");
+    assert!(message.contains("max_cost_usd"), "{message}");
+}
+
+/// The spend meter's own frame (0059 T5) — additive, so
+/// `JSON_STREAM_SCHEMA_VERSION` stands.
+#[test]
+fn budget_notice_is_tagged_and_carries_its_numbers() {
+    let f = wire::update_frame(&EngineEvent::BudgetNotice {
+        pct: 80,
+        used_usd: 4.0,
+        cap_usd: 5.0,
+    })
+    .expect("budget_notice is an update frame");
+    assert_eq!(f["type"], "budget_notice");
+    assert_eq!(f["pct"], 80);
+    assert_eq!(f["used_usd"], 4.0);
+    assert_eq!(f["cap_usd"], 5.0);
 }
 
 /// 0034: the goal frames are additive (`JSON_STREAM_SCHEMA_VERSION` stands).

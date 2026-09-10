@@ -117,6 +117,15 @@ pub struct EngineConfig {
     pub fallback_models: Vec<String>,
     /// Consecutive failures of one tool before the turn stops.
     pub tool_failure_budget: u32,
+    /// Tool calls this **session** may run before a batch is refused
+    /// (`[behavior] max_tool_calls`). `0` = no cap. Checked once per batch, so
+    /// one wide batch may cross it by its own width — a runaway backstop, not
+    /// an accounting ledger.
+    pub max_tool_calls: u64,
+    /// USD this **session** may spend before a sample is refused pre-flight
+    /// (`[behavior] max_cost_usd`). `0.0` = no cap, and an uncatalogued model
+    /// has no price, so no cap applies there either (warned once at startup).
+    pub max_cost_usd: f64,
     /// Model context window in tokens; compaction triggers at 80% (M2).
     pub context_window: u64,
     /// Housekeeping model (compaction summarize); defaults to `model`.
@@ -194,6 +203,8 @@ impl Default for EngineConfig {
             cache_ttl: CacheTtl::FiveMinutes,
             fallback_models: Vec::new(),
             tool_failure_budget: 5,
+            max_tool_calls: 0,
+            max_cost_usd: 0.0,
             context_window: 200_000,
             fast_model: None,
             utility_model: None,
@@ -283,6 +294,10 @@ pub struct TurnContinuation {
     /// Calls that executed this logical turn (0051 G1) — carried, because a
     /// fold does not undo the work already done.
     pub(crate) tools_ran: u32,
+    /// Denials in a row, and in total, this logical turn (0059 T5). Carried:
+    /// a fold does not un-deny anything.
+    pub(crate) denials_consecutive: u32,
+    pub(crate) denials_total: u32,
 }
 
 /// A compaction digest computed speculatively *during* the turn, overlapping
@@ -326,13 +341,66 @@ pub enum AskReply {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Outcome {
-    Done { text: String },
+    Done {
+        text: String,
+    },
     Cancelled,
     TurnLimit,
     Refused,
-    DoomLoop { pattern: String },
-    ToolFailureBudget { tool: String },
-    Error { message: String },
+    DoomLoop {
+        pattern: String,
+    },
+    ToolFailureBudget {
+        tool: String,
+    },
+    /// Denials piling up (0059 T5): three in a row, or twenty in one turn.
+    /// A denial is a human saying no; a spiral is the agent not hearing it,
+    /// and burning samples asking again is what this ends.
+    DenialSpiral {
+        consecutive: u32,
+        total: u32,
+    },
+    /// A session-level budget stopped the turn before it spent more.
+    /// `kind` is `"tool_calls"` or `"cost_usd"`; `used`/`cap` are in that
+    /// kind's own unit.
+    Budget {
+        kind: String,
+        used: f64,
+        cap: f64,
+    },
+    Error {
+        message: String,
+    },
+}
+
+/// Denials in a row before the turn ends. Three: two is a human changing
+/// their mind about one call, three is a pattern nothing downstream fixes.
+pub const DENIAL_SPIRAL_CONSECUTIVE: u32 = 3;
+/// Denials in one turn, however scattered, before the turn ends.
+pub const DENIAL_SPIRAL_TOTAL: u32 = 20;
+
+/// The `[behavior]` key that raises a budget of this kind.
+pub fn budget_key(kind: &str) -> &'static str {
+    match kind {
+        "cost_usd" => "max_cost_usd",
+        _ => "max_tool_calls",
+    }
+}
+
+/// The one refusal sentence every budget shares: the invariant, the target,
+/// and the next action (core belief 9).
+pub fn budget_refusal(kind: &str, used: f64, cap: f64) -> String {
+    let n = |v: f64| match kind {
+        "cost_usd" => format!("${v:.2}"),
+        _ => format!("{v:.0}"),
+    };
+    format!(
+        "Session budget reached: {} of {} ({kind}). Raise [behavior] {} or \
+         start a new session.",
+        n(used),
+        n(cap),
+        budget_key(kind),
+    )
 }
 
 /// Everything the surface renders. `Ask` carries the reply channel — the
@@ -401,6 +469,13 @@ pub enum EngineEvent {
         model: String,
     },
     PromptQueued,
+    /// A session spend budget crossed one of its thresholds (0059 T5).
+    /// Fires once per threshold per session; `pct` is 50, 80 or 100.
+    BudgetNotice {
+        pct: u8,
+        used_usd: f64,
+        cap_usd: f64,
+    },
     /// Context was compacted (digest + verbatim tail); `degraded` means the
     /// summarize call failed and the floor placeholder was used.
     Compacted {
@@ -510,6 +585,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::Retrying { attempt, .. } => write!(f, "Retrying({attempt})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),
+            Self::BudgetNotice { pct, .. } => write!(f, "BudgetNotice({pct}%)"),
             Self::Compacted { degraded } => write!(f, "Compacted({degraded})"),
             Self::Cleared { count } => write!(f, "Cleared({count})"),
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),

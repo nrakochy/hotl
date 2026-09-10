@@ -70,9 +70,10 @@ async fn run_answering(s: &mut Session, answer: impl Fn() -> AskReply) -> Outcom
     }
 }
 
-/// T3-1: six consecutive user denials must not end the turn with
+/// T3-1: consecutive user denials must not end the turn with
 /// `ToolFailureBudget` (default budget 5). A denial is a decision, not a tool
-/// malfunction, and it is not retryable.
+/// malfunction, and it is not retryable. Since 0059 T5 a run of them ends the
+/// turn as a *spiral* instead — a different outcome, for a different reason.
 #[tokio::test]
 async fn user_denials_are_not_charged_to_the_tool_failure_budget() {
     let scripts: Vec<_> = (0..6)
@@ -100,8 +101,130 @@ async fn user_denials_are_not_charged_to_the_tool_failure_budget() {
     let outcome = run_answering(&mut s, || AskReply::Deny { message: None }).await;
     assert_eq!(
         outcome,
+        Outcome::DenialSpiral {
+            consecutive: 3,
+            total: 3
+        },
+        "never the tool-failure budget: a denial is not a malfunction"
+    );
+}
+
+/// 0059 T5: three denials in a row end the turn. Asking again after a human
+/// has said no three times spends samples on an answer that is not going to
+/// change.
+#[tokio::test]
+async fn three_consecutive_denials_end_the_turn() {
+    let scripts: Vec<_> = (0..5)
+        .map(|i| {
+            ScriptedProvider::tool_call(
+                &format!("t{i}"),
+                "bash",
+                json!({"command": format!("echo {i}")}),
+            )
+        })
+        .chain(std::iter::once(ScriptedProvider::text_reply("unreachable")))
+        .collect();
+    let provider = Arc::new(ScriptedProvider::new(scripts));
+    let mut s = session(
+        provider,
+        EngineConfig {
+            max_turns: 20,
+            ..Default::default()
+        },
+    );
+    s.handle.prompt("go".into()).await;
+    assert_eq!(
+        run_answering(&mut s, || AskReply::Deny { message: None }).await,
+        Outcome::DenialSpiral {
+            consecutive: 3,
+            total: 3
+        }
+    );
+}
+
+/// …and twenty scattered denials do too, even though no three ever land in a
+/// row. A session that keeps being told no is not making progress.
+#[tokio::test]
+async fn twenty_scattered_denials_end_the_turn() {
+    let scripts: Vec<_> = (0..40)
+        .map(|i| {
+            ScriptedProvider::tool_call(
+                &format!("t{i}"),
+                "bash",
+                json!({"command": format!("echo {i}")}),
+            )
+        })
+        .chain(std::iter::once(ScriptedProvider::text_reply("unreachable")))
+        .collect();
+    let provider = Arc::new(ScriptedProvider::new(scripts));
+    let mut s = session(
+        provider,
+        EngineConfig {
+            max_turns: 60,
+            // Wide enough that the tool-failure budget never fires first.
+            tool_failure_budget: 100,
+            ..Default::default()
+        },
+    );
+    s.handle.prompt("go".into()).await;
+    // Deny twice, allow once, forever: the consecutive count never reaches
+    // three, so only the running total can end this turn.
+    let seen = std::sync::atomic::AtomicU32::new(0);
+    let outcome = run_answering(&mut s, || {
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 3 == 2 {
+            AskReply::Allow
+        } else {
+            AskReply::Deny { message: None }
+        }
+    })
+    .await;
+    assert_eq!(
+        outcome,
+        Outcome::DenialSpiral {
+            consecutive: 2,
+            total: 20
+        }
+    );
+}
+
+/// An allowed call clears the run: a human who says no twice and then yes has
+/// not spiralled.
+#[tokio::test]
+async fn an_allowed_call_clears_the_consecutive_run() {
+    let scripts: Vec<_> = (0..6)
+        .map(|i| {
+            ScriptedProvider::tool_call(
+                &format!("t{i}"),
+                "bash",
+                json!({"command": format!("echo {i}")}),
+            )
+        })
+        .chain(std::iter::once(ScriptedProvider::text_reply("done")))
+        .collect();
+    let provider = Arc::new(ScriptedProvider::new(scripts));
+    let mut s = session(
+        provider,
+        EngineConfig {
+            max_turns: 20,
+            ..Default::default()
+        },
+    );
+    s.handle.prompt("go".into()).await;
+    let seen = std::sync::atomic::AtomicU32::new(0);
+    let outcome = run_answering(&mut s, || {
+        let n = seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n % 3 == 2 {
+            AskReply::Allow
+        } else {
+            AskReply::Deny { message: None }
+        }
+    })
+    .await;
+    assert_eq!(
+        outcome,
         Outcome::Done {
-            text: "gave up on bash".into()
+            text: "done".into()
         }
     );
 }

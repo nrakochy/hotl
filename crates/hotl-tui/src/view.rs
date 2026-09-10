@@ -1714,6 +1714,20 @@ fn strip_chips(state: &State, p: &Palette) -> Vec<Chip> {
             rank: anim::KEEP,
         });
     }
+    // The spend meter (0059 T5): only once a threshold has been crossed —
+    // a budget nobody is near is not news, and the strip has one line.
+    if let Some((used, cap)) = state.budget.filter(|(_, cap)| *cap > 0.0) {
+        // Amber past 80%: the same "you are close" signal the notice carries.
+        let hot = used >= 0.8 * cap;
+        chips.push(Chip {
+            text: format!(" ${used:.2}/${cap:.0} "),
+            style: match hot {
+                true => Style::new().fg(p.band).bg(p.accent).bold(),
+                false => Style::new().fg(p.muted).bg(p.band),
+            },
+            rank: anim::KEEP,
+        });
+    }
     // Flag chip (0036): how many calls ran (or were refused) on a ⚑ notice
     // instead of an ask. A running count, never cleared mid-session, so an
     // unattended run's flags survive scrollback.

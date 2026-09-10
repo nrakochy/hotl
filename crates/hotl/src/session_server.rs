@@ -54,23 +54,16 @@ pub fn paste_hint(host: &str) -> String {
 struct Shared {
     handle: SessionHandle,
     client: ClientWriter,
-    /// Parked permission asks: id → (reply channel, the request frame to re-send).
-    pending: Mutex<HashMap<u64, (tokio::sync::oneshot::Sender<hotl_engine::AskReply>, Value)>>,
+    /// Parked permission asks: id → (reply channel, the request frame to
+    /// re-send, when it was parked). The instant is what `ask_expiry` reads.
+    pending: Mutex<HashMap<u64, Parked<hotl_engine::AskReply>>>,
     /// Parked egress asks (plan 0026), same shape as `pending`.
     ///
     /// A separate map, sharing `next_ask`: the two carry different reply types
     /// (`AskReply` vs `EgressDecision`), so one map could not hold both, and
     /// the shared counter is what keeps an id from ever meaning two different
     /// things — the same arrangement `acp.rs`'s `PendingQuestions` documents.
-    pending_egress: Mutex<
-        HashMap<
-            u64,
-            (
-                tokio::sync::oneshot::Sender<hotl_tools::net::EgressDecision>,
-                Value,
-            ),
-        >,
-    >,
+    pending_egress: Mutex<HashMap<u64, Parked<hotl_tools::net::EgressDecision>>>,
     next_ask: AtomicU64,
     session_id: String,
     /// Per-session secret a client must present before it can drive the session
@@ -80,6 +73,80 @@ struct Shared {
     /// (Task 5). See `wire::usage_frame` for the fallback-model imprecision
     /// this accepts.
     model: String,
+    /// How long a parked ask waits for a human before it is denied (0059 T5).
+    /// `Duration::ZERO` disables expiry.
+    ask_expiry: std::time::Duration,
+}
+
+/// One parked ask: its reply channel, the frame to re-send on attach, and
+/// when it was parked.
+type Parked<T> = (tokio::sync::oneshot::Sender<T>, Value, std::time::Instant);
+
+/// The coarsest the expiry sweep ever runs. An hour-scale deadline does not
+/// need a fine-grained sweep, and the loop must stay cheap while a session
+/// sits idle — but a deadline shorter than this gets a sweep to match, so an
+/// expiry is never rounded up to five seconds.
+const ASK_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The tick for `ask_expiry`, never longer than the deadline itself and never
+/// zero (a zero-period interval would spin).
+fn sweep_period(ask_expiry: std::time::Duration) -> std::time::Duration {
+    if ask_expiry.is_zero() {
+        return ASK_SWEEP_INTERVAL;
+    }
+    ask_expiry
+        .min(ASK_SWEEP_INTERVAL)
+        .max(std::time::Duration::from_millis(50))
+}
+
+/// Deny every parked ask older than `shared.ask_expiry`. Denying is what
+/// closes the loop: the engine's `ask` is still awaiting this channel, so the
+/// turn resumes and commits its own `AskResolved`. Returns how many expired,
+/// for the test and for the notice.
+fn sweep_expired_asks(shared: &Shared) -> usize {
+    if shared.ask_expiry.is_zero() {
+        return 0;
+    }
+    let secs = shared.ask_expiry.as_secs();
+    let message = format!("expired after {secs} s with no human");
+    let now = std::time::Instant::now();
+    let expired = |at: &std::time::Instant| now.duration_since(*at) >= shared.ask_expiry;
+    let mut n = 0;
+    {
+        let mut pending = shared
+            .pending
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let ids: Vec<u64> = pending
+            .iter()
+            .filter(|(_, (_, _, at))| expired(at))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            if let Some((tx, _, _)) = pending.remove(&id) {
+                let _ = tx.send(hotl_engine::AskReply::Deny {
+                    message: Some(message.clone()),
+                });
+                n += 1;
+            }
+        }
+    }
+    let mut egress = shared
+        .pending_egress
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let ids: Vec<u64> = egress
+        .iter()
+        .filter(|(_, (_, _, at))| expired(at))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        if let Some((tx, _, _)) = egress.remove(&id) {
+            let _ = tx.send(hotl_tools::net::EgressDecision::Deny);
+            n += 1;
+        }
+    }
+    n
 }
 
 /// Directory holding one `<id>.sock` per live backgrounded session.
@@ -166,6 +233,7 @@ pub async fn serve(
     model: String,
     handle: SessionHandle,
     prompt: Option<String>,
+    ask_expiry: std::time::Duration,
 ) -> i32 {
     // A *live* endpoint means this id collides with a running session (pid
     // reuse, a repeated --id) — refuse rather than silently steal it. A dead
@@ -190,7 +258,10 @@ pub async fn serve(
     };
     let _guard = EndpointGuard::new(&session_id);
     let _token_guard = TokenGuard(token_path(&session_id));
-    serve_on(listener, session_id, model, handle, prompt, token).await;
+    serve_on(
+        listener, session_id, model, handle, prompt, token, ask_expiry,
+    )
+    .await;
     0
 }
 
@@ -225,6 +296,7 @@ pub async fn serve_on(
     mut handle: SessionHandle,
     prompt: Option<String>,
     token: String,
+    ask_expiry: std::time::Duration,
 ) {
     let events = std::mem::replace(&mut handle.events, tokio::sync::mpsc::channel(1).1);
     let shared = Arc::new(Shared {
@@ -236,6 +308,7 @@ pub async fn serve_on(
         session_id,
         token,
         model,
+        ask_expiry,
     });
     tokio::spawn(drain_events(events, shared.clone()));
     if let Some(p) = prompt {
@@ -289,8 +362,26 @@ enum ClientAction {
 /// unread in the listener backlog.
 async fn accept_loop(mut listener: Listener, shared: Arc<Shared>) {
     let mut reader: Option<tokio::io::Lines<BufReader<ReadHalf>>> = None;
+    let mut sweep = tokio::time::interval(sweep_period(shared.ask_expiry));
+    sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
+            // A parked ask nobody ever answers holds a turn open forever
+            // (0059 T5). Denying it is the fail-closed answer, and the engine
+            // commits the `AskResolved` when its await returns.
+            _ = sweep.tick() => {
+                let n = sweep_expired_asks(&shared);
+                if n > 0 {
+                    send(
+                        &shared,
+                        &json!({"t": "error", "message": format!(
+                            "{n} parked ask(s) expired after {} s with no human and were denied",
+                            shared.ask_expiry.as_secs()
+                        )}),
+                    )
+                    .await;
+                }
+            }
             accepted = listener.accept() => {
                 let Ok(stream) = accepted else {
                     // A persistent accept failure (fd exhaustion) must not
@@ -390,7 +481,7 @@ async fn handle_frame(line: &str, shared: &Arc<Shared>) -> ClientAction {
         "cancel" => shared.handle.interrupt(),
         "ask_reply" => {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some((reply, _)) = shared
+                if let Some((reply, _, _)) = shared
                     .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -409,7 +500,7 @@ async fn handle_frame(line: &str, shared: &Arc<Shared>) -> ClientAction {
         }
         "egress_reply" => {
             if let Some(id) = msg.get("id").and_then(Value::as_u64) {
-                if let Some((reply, _)) = shared
+                if let Some((reply, _, _)) = shared
                     .pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -442,19 +533,19 @@ async fn resend_pending(shared: &Arc<Shared>) {
             .pending
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        pending.retain(|_, (tx, _)| !tx.is_closed());
+        pending.retain(|_, (tx, _, _)| !tx.is_closed());
         let mut egress = shared
             .pending_egress
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        egress.retain(|_, (tx, _)| !tx.is_closed());
+        egress.retain(|_, (tx, _, _)| !tx.is_closed());
         // An egress ask raised while the TUI was detached must still be
         // answerable on reattach, or the blocked connection just waits out the
         // proxy's deadline.
         pending
             .values()
-            .map(|(_, f)| f.clone())
-            .chain(egress.values().map(|(_, f)| f.clone()))
+            .map(|(_, f, _)| f.clone())
+            .chain(egress.values().map(|(_, f, _)| f.clone()))
             .collect()
     };
     // Tell the client the current session id first (a lightweight hello).
@@ -484,7 +575,7 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                     .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id, (reply, frame.clone()));
+                    .insert(id, (reply, frame.clone(), std::time::Instant::now()));
                 send(&shared, &frame).await; // no-op if detached; re-sent on attach
             }
             EngineEvent::EgressAsk { host, reply } => {
@@ -494,7 +585,7 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                     .pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(id, (reply, frame.clone()));
+                    .insert(id, (reply, frame.clone(), std::time::Instant::now()));
                 send(&shared, &frame).await; // no-op if detached; re-sent on attach
             }
             EngineEvent::TurnDone {
@@ -508,12 +599,12 @@ async fn drain_events(mut events: tokio::sync::mpsc::Receiver<EngineEvent>, shar
                     .pending
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|_, (tx, _)| !tx.is_closed());
+                    .retain(|_, (tx, _, _)| !tx.is_closed());
                 shared
                     .pending_egress
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain(|_, (tx, _)| !tx.is_closed());
+                    .retain(|_, (tx, _, _)| !tx.is_closed());
                 let mut done = json!({
                     "t": "turn_done",
                     "schemaVersion": UPDATE_SCHEMA_VERSION,
@@ -597,14 +688,21 @@ mod tests {
     }
 
     fn scripted_session() -> SessionHandle {
+        scripted_session_logged().0
+    }
+
+    /// The same session, plus the path of the log it writes — the expiry test
+    /// asserts on the `AskResolved` the engine commits when its ask is denied.
+    fn scripted_session_logged() -> (SessionHandle, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).unwrap();
+        let log_path = log.path().to_path_buf();
         std::mem::forget(dir);
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
             ScriptedProvider::text_reply("done in the background"),
         ]));
-        spawn_session(SessionDeps {
+        let handle = spawn_session(SessionDeps {
             concurrency: Default::default(),
             provider,
             registry: Arc::new(Registry::builtin()),
@@ -624,7 +722,8 @@ mod tests {
                 max_turns: 6,
                 ..Default::default()
             },
-        })
+        });
+        (handle, log_path)
     }
 
     async fn next(
@@ -688,6 +787,7 @@ mod tests {
             session_id: "test".into(),
             token: "tok".into(),
             model: "m".into(),
+            ask_expiry: std::time::Duration::ZERO,
         });
         let (events_tx, events_rx) = tokio::sync::mpsc::channel(8);
         tokio::spawn(drain_events(events_rx, shared.clone()));
@@ -780,6 +880,100 @@ mod tests {
         );
     }
 
+    /// 0059 T5: a parked ask nobody answers is denied once `ask_expiry` is up,
+    /// and the engine records the resolution — the turn resumes instead of
+    /// holding the session open forever.
+    #[tokio::test]
+    async fn a_parked_ask_expires_and_is_denied() {
+        let id = endpoint_id("expiry");
+        let listener = hotl_platform::IPC.bind_private(&id).unwrap();
+        let (handle, log_path) = scripted_session_logged();
+        tokio::spawn(serve_on(
+            listener,
+            "test".into(),
+            "m".into(),
+            handle,
+            None,
+            "tok".into(),
+            std::time::Duration::from_millis(200),
+        ));
+
+        let (r, mut w) = tokio::io::split(hotl_platform::IPC.connect(&id).await.unwrap());
+        let mut lines = tokio::io::BufReader::new(r).lines();
+        send(&mut w, json!({"t":"auth","token":"tok"})).await;
+        send(&mut w, json!({"t":"prompt","text":"go"})).await;
+
+        // Never answer the ask. The sweep denies it, the turn runs on, and the
+        // client is told why.
+        let (mut expired, mut done) = (false, None);
+        while done.is_none() {
+            let f = next(&mut lines).await;
+            match f["t"].as_str().unwrap_or("") {
+                "error" if f["message"].as_str().unwrap_or("").contains("expired") => {
+                    expired = true
+                }
+                "turn_done" => done = Some(f),
+                _ => {}
+            }
+        }
+        assert!(expired, "the client is told the ask expired");
+        assert_eq!(done.unwrap()["outcome"]["kind"], "done");
+
+        let resolutions: Vec<bool> = std::fs::read_to_string(&log_path)
+            .expect("read log")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
+            .filter_map(|e| match e.payload {
+                hotl_types::EntryPayload::AskResolved { allowed, .. } => Some(allowed),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resolutions,
+            vec![false],
+            "the expiry is recorded as a denial"
+        );
+    }
+
+    /// The sweep's own contract, without a socket behind it: only asks past
+    /// the deadline are denied, and the denial says why.
+    #[tokio::test]
+    async fn the_sweep_denies_only_what_is_past_the_deadline() {
+        let shared = Arc::new(Shared {
+            handle: scripted_session(),
+            client: AsyncMutex::new(None),
+            pending: Mutex::new(HashMap::new()),
+            pending_egress: Mutex::new(HashMap::new()),
+            next_ask: AtomicU64::new(1),
+            session_id: "test".into(),
+            token: "tok".into(),
+            model: "m".into(),
+            ask_expiry: std::time::Duration::from_secs(3600),
+        });
+        let (old_tx, old_rx) = tokio::sync::oneshot::channel();
+        let (fresh_tx, fresh_rx) = tokio::sync::oneshot::channel();
+        {
+            let mut pending = shared.pending.lock().unwrap();
+            let long_ago = std::time::Instant::now() - std::time::Duration::from_secs(7200);
+            pending.insert(1, (old_tx, json!({}), long_ago));
+            pending.insert(2, (fresh_tx, json!({}), std::time::Instant::now()));
+        }
+        assert_eq!(sweep_expired_asks(&shared), 1);
+        match old_rx.await.expect("the expired ask was answered") {
+            hotl_engine::AskReply::Deny { message } => assert_eq!(
+                message.as_deref(),
+                Some("expired after 3600 s with no human")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            shared.pending.lock().unwrap().len(),
+            1,
+            "the fresh ask stays"
+        );
+        drop(fresh_rx);
+    }
+
     #[tokio::test]
     async fn detach_while_asking_then_reattach_reissues_the_ask() {
         let id = endpoint_id("serve");
@@ -791,6 +985,7 @@ mod tests {
             scripted_session(),
             None,
             "tok".into(),
+            std::time::Duration::ZERO,
         ));
 
         // Attach (authenticate first), prompt; the scripted bash call is gated.
@@ -850,6 +1045,7 @@ mod tests {
             scripted_session(),
             None,
             "tok".into(),
+            std::time::Duration::ZERO,
         ));
 
         // Authenticated client A drives to a parked ask.

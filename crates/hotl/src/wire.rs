@@ -109,6 +109,14 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             json!({"type": "fallback_model", "model": model})
         }
         EngineEvent::PromptQueued => json!({"type": "prompt_queued"}),
+        // Additive (0037 ruling): `JSON_STREAM_SCHEMA_VERSION` stands.
+        EngineEvent::BudgetNotice {
+            pct,
+            used_usd,
+            cap_usd,
+        } => {
+            json!({"type": "budget_notice", "pct": pct, "used_usd": used_usd, "cap_usd": cap_usd})
+        }
         EngineEvent::Compacted { degraded } => {
             json!({"type": "compacted", "degraded": degraded})
         }
@@ -201,6 +209,20 @@ pub fn outcome_frame(outcome: &Outcome) -> Value {
         Outcome::ToolFailureBudget { tool } => {
             json!({"kind": "tool_failure_budget", "tool": tool})
         }
+        // Both carry a `message` as well as their numbers: every client that
+        // reads an outcome's text (the TUI's `prompt_result_msg`) then shows
+        // the refusal that names the knob, not a bare kind word.
+        Outcome::DenialSpiral { consecutive, total } => json!({
+            "kind": "denial_spiral", "consecutive": consecutive, "total": total,
+            "message": format!(
+                "{consecutive} calls denied in a row ({total} this turn) — change what \
+                 you are asking for, or relax the rule that is denying it"
+            ),
+        }),
+        Outcome::Budget { kind, used, cap } => json!({
+            "kind": "budget", "budget": kind, "used": used, "cap": cap,
+            "message": hotl_engine::budget_refusal(kind, *used, *cap),
+        }),
         Outcome::Error { message } => json!({"kind": "error", "message": message}),
     }
 }

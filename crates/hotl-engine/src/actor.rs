@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt;
@@ -633,6 +633,17 @@ pub(crate) struct SharedDeps {
     /// phase schedule stops writing over it — a deliberate pin outranks
     /// config (0059 T1).
     effort_pinned: AtomicBool,
+    /// Tool calls this session has run, against `config.max_tool_calls`.
+    /// Session-scoped, not per-turn: the cap exists so an unattended session
+    /// cannot run forever, and a fresh turn is not a fresh budget.
+    tool_calls: AtomicU64,
+    /// Session spend in micro-dollars, against `config.max_cost_usd`.
+    /// Integer so the running total is an atomic; the price of one turn is
+    /// far above a millionth of a dollar, so nothing meaningful rounds away.
+    spend_micros: AtomicU64,
+    /// Which budget thresholds have already been announced (bit 0 = 50%,
+    /// 1 = 80%, 2 = 100%), so each fires once per session.
+    budget_notices: AtomicU8,
     /// Did the most recent tool batch run a verify-class command and no edit?
     /// Written by the turn task, read at the next turn's start to pick the
     /// schedule's phase. An atomic rather than a `TurnContinuation` field:
@@ -748,6 +759,9 @@ impl SharedDeps {
         let plan = AtomicBool::new(deps.rules.plan());
         let effort = AtomicU8::new(effort_to_u8(deps.config.effort));
         let effort_pinned = AtomicBool::new(false);
+        let tool_calls = AtomicU64::new(0);
+        let spend_micros = AtomicU64::new(0);
+        let budget_notices = AtomicU8::new(0);
         let last_batch_verified = AtomicBool::new(false);
         let hook_mask = deps
             .hooks
@@ -776,6 +790,9 @@ impl SharedDeps {
             plan,
             effort,
             effort_pinned,
+            tool_calls,
+            spend_micros,
+            budget_notices,
             last_batch_verified,
             sandbox_enforced: deps.sandbox_enforced,
             clock: deps.clock,
@@ -892,6 +909,55 @@ impl SharedDeps {
         // A hand-set rung is a decision, and the schedule is configuration:
         // the decision wins for the rest of the session.
         self.effort_pinned.store(true, Ordering::Relaxed);
+    }
+
+    /// Would this batch cross `max_tool_calls`? Checked once per batch, so a
+    /// wide batch may cross by its own width — the cap is a runaway backstop.
+    /// `Some((used, cap))` refuses.
+    pub(crate) fn tool_call_budget(&self) -> Option<(f64, f64)> {
+        let cap = self.config.max_tool_calls;
+        if cap == 0 {
+            return None;
+        }
+        let used = self.tool_calls.load(Ordering::Relaxed);
+        (used >= cap).then_some((used as f64, cap as f64))
+    }
+
+    /// Count `n` calls against the session's tool-call budget.
+    pub(crate) fn count_tool_calls(&self, n: u64) {
+        self.tool_calls.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Session spend so far, in USD.
+    pub(crate) fn spent_usd(&self) -> f64 {
+        self.spend_micros.load(Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    /// Fold one sample's cost into the session total and report any spend
+    /// threshold it just crossed. Each threshold is announced once.
+    pub(crate) fn add_spend(&self, usd: f64) -> Option<u8> {
+        if usd > 0.0 {
+            self.spend_micros
+                .fetch_add((usd * 1_000_000.0) as u64, Ordering::Relaxed);
+        }
+        let cap = self.config.max_cost_usd;
+        if cap <= 0.0 {
+            return None;
+        }
+        let pct = (self.spent_usd() / cap * 100.0) as u32;
+        // Highest crossed threshold first: a jump straight past 80 to 100
+        // should say 100, not 50.
+        for (bit, threshold) in [(2u8, 100u32), (1, 80), (0, 50)] {
+            if pct >= threshold {
+                let mask = 1u8 << bit;
+                let before = self.budget_notices.fetch_or(mask, Ordering::Relaxed);
+                if before & mask == 0 {
+                    return Some(threshold as u8);
+                }
+                return None;
+            }
+        }
+        None
     }
 
     /// What the last tool batch was: a verify-class command with no edit
@@ -2568,6 +2634,10 @@ async fn annotate(
         Outcome::TurnLimit => Some(format!("max_turns ({}) reached", shared.config.max_turns)),
         Outcome::DoomLoop { pattern } => Some(format!("doom loop: {pattern}")),
         Outcome::ToolFailureBudget { tool } => Some(format!("tool failure budget: {tool}")),
+        Outcome::DenialSpiral { consecutive, total } => Some(format!(
+            "denial spiral: {consecutive} in a row, {total} total"
+        )),
+        Outcome::Budget { kind, used, cap } => Some(crate::budget_refusal(kind, *used, *cap)),
         Outcome::Error { message } => Some(format!("error: {message}")),
         Outcome::Done { .. } | Outcome::Refused => None,
     };

@@ -565,6 +565,16 @@ pub struct BehaviorCfg {
     /// Extra command prefixes that count as verification when the effort
     /// schedule picks a phase, on top of the built-in runner table.
     pub verify_commands: Option<Vec<String>>,
+    /// Tool calls one session may run before a batch is refused. Absent or
+    /// `0` = no cap.
+    pub max_tool_calls: Option<u64>,
+    /// USD one session may spend before a sample is refused pre-flight.
+    /// Absent or `0` = no cap; an uncatalogued model has no price and so no
+    /// cap either (warned once at startup).
+    pub max_cost_usd: Option<f64>,
+    /// Seconds a parked permission ask waits for a human before it is denied.
+    /// Resolve via [`BehaviorCfg::ask_expiry`] — absent means one hour.
+    pub ask_expiry_secs: Option<u64>,
 }
 
 impl BehaviorCfg {
@@ -593,6 +603,14 @@ impl BehaviorCfg {
     /// Turning it off returns the console to wheel-scroll only.
     pub fn copy_on_select(&self) -> bool {
         self.copy_on_select.unwrap_or(true)
+    }
+
+    /// Default **one hour**: a parked ask holds a turn open, and a detached
+    /// session that nobody ever returns to should fail closed rather than
+    /// wait forever. `0` disables expiry — the pre-0059 behavior, for anyone
+    /// who really does come back the next day.
+    pub fn ask_expiry(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.ask_expiry_secs.unwrap_or(3600))
     }
 }
 

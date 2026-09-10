@@ -75,6 +75,11 @@ max_turns = 100            # model steps one prompt may spend (a tool round-trip
                            # done, the context fills, or you interrupt.
 verify_commands = []       # extra command prefixes that count as verification
                            # when [provider] effort is a per-phase table
+max_tool_calls = 0         # tool calls one SESSION may run; 0 = no cap
+max_cost_usd = 0.0         # USD one SESSION may spend; 0 = no cap. Needs a
+                           # catalogued model — hotl never guesses a price
+ask_expiry_secs = 3600     # a parked permission ask nobody answers is denied
+                           # after this many seconds; 0 = wait forever
 
 [permissions]
 mode = "bypass"   # "bypass" | "ask" | "dontask"  ("auto" = the old name for bypass)
@@ -278,6 +283,8 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_WEB_ALLOW_METADATA` | — | `1` permits `web_fetch` to reach cloud instance-metadata addresses (`169.254.169.254`, `169.254.170.2`, `fd00:ec2::254`), which are otherwise refused on every redirect hop including the first. Nothing legitimate needs this. |
 | `HOTL_PROXY_AUTH` | — | `off` drops the `Proxy-Authorization` requirement on the local egress proxy, for a client that honors `HTTP_PROXY` but discards its credentials. Without it, any local process could spend your allowlist. |
 | `HOTL_MAX_TURNS` | `[behavior].max_turns` | Model steps per prompt (default 100); `-1` = unlimited. |
+| `HOTL_MAX_TOOL_CALLS` | `[behavior].max_tool_calls` | Tool calls one **session** may run before a batch is refused. Absent or `0` = no cap. |
+| `HOTL_MAX_COST_USD` | `[behavior].max_cost_usd` | USD one **session** may spend before a sample is refused pre-flight. Absent or `0` = no cap; an uncatalogued model has no price and so no cap (warned at startup). |
 | `HOTL_MAX_TOKENS` | `[provider].max_tokens` | Per-sample output-token cap, thinking included (default 64000); always clamped to the model's catalogued maximum. |
 | `HOTL_CONCURRENCY_REQUESTS` | `[concurrency].requests` | Concurrent `web_fetch`/`web_search` HTTP requests (default 4). |
 | `HOTL_CONCURRENCY_AGENTS` | `[concurrency].agents` | Concurrent sub-agent (`spawn`) sessions (default 4) — global across the parent and every child. |
@@ -603,6 +610,30 @@ The phase is derived once, **at turn start**, so every sample inside one turn is
 - **`implement`** — everything else.
 
 A phase you leave out inherits the session's effort, and so does a rung that names no level (it warns at startup rather than failing the file). The schedule is configuration, not a decision: it writes no durable entry, `hotl resume` re-derives it, and `HOTL_EFFORT` stays a scalar. The moment you run `/effort <rung>` the session is **pinned** and the schedule stops — a rung you set by hand outranks a rung a table chose. A bare `/effort` names the schedule while it still governs.
+
+### Session budgets (`[behavior] max_tool_calls`, `max_cost_usd`)
+
+Two caps that bound a whole **session**, not a turn — a fresh prompt does not refill them:
+
+```toml
+[behavior]
+max_tool_calls = 500
+max_cost_usd = 5.0
+```
+
+`max_tool_calls` is checked once per tool batch, before any call in it runs. A single wide batch may therefore cross the cap by its own width: this is a runaway backstop, the same posture `max_turns` takes, not an accounting ledger.
+
+`max_cost_usd` is checked **before** each sample goes out, priced at the worst case that sample could bill — the whole prompt at input rates plus a full `max_tokens` of output. The cap needs a price, and hotl allowlists no model names, so an **uncatalogued model is never refused**: the whole OpenAI-compatible family and every gateway alias run uncapped, and hotl warns once at startup rather than guessing a rate. Cap those sessions with `max_tool_calls`, which needs no price. Compaction digests and `/goal` evaluations are billed but do not yet move this meter.
+
+Crossing 50%, 80% or 100% of the spend budget raises one notice each — a transcript line and the console's strip meter. Either cap ending a turn produces a typed outcome (`budget` on the JSON stream) whose message names the knob to raise.
+
+### Ask expiry (`[behavior] ask_expiry_secs`)
+
+A permission ask raised while no client is attached (`hotl bg`, `hotl serve`) is **parked**: its reply channel is held and the ask is re-issued the moment you attach. Without a deadline, a session nobody returns to holds that turn open forever. After `ask_expiry_secs` — one hour by default — a parked ask is **denied**, the denial is recorded in the session log like any other, and the turn carries on. `0` restores the old wait-forever behavior. Headless (`dontask`) sessions are unaffected: they already deny immediately.
+
+### Denial spirals
+
+Three denied calls in a row, or twenty in one turn, end the turn with a `denial_spiral` outcome. A denial is a human (or a rule) saying no; asking again is spending samples on an answer that is not going to change. The message names both counts, and the fix is either to change what the agent is being asked to do or to relax the rule doing the denying. This is separate from the per-tool failure budget: a denial is a decision, never a malfunction, and it has never drawn that budget down.
 
 ### Concurrency (`[concurrency]`)
 

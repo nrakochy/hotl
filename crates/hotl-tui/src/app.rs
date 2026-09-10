@@ -487,6 +487,9 @@ pub struct State {
     /// set reports this instead of the lie "default". Never sent anywhere —
     /// the engine already holds the same resolved value.
     pub default_effort: Option<String>,
+    /// Session spend against `[behavior] max_cost_usd` (0059 T5), from the
+    /// last `budget_notice`. `None` = no cap, or none crossed yet.
+    pub budget: Option<(f64, f64)>,
     /// The per-phase effort schedule (0059 T1), pre-rendered by the server.
     /// Reported by `/effort` and `/status` so a rung that moves between turns
     /// reads as configuration, not drift.
@@ -629,6 +632,7 @@ impl State {
             plan: false,
             effort: None,
             default_effort: None,
+            budget: None,
             effort_schedule: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
             live_context: None,
@@ -1542,6 +1546,21 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             }));
         }
         "prompt_queued" => clear_newest_queued_steer(state),
+        // The spend meter (0059 T5): the strip shows it from here on, and the
+        // threshold itself is worth a line in the transcript.
+        "budget_notice" => {
+            let num = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+            let (used, cap) = (num("used_usd"), num("cap_usd"));
+            state.budget = Some((used, cap));
+            let pct = v.get("pct").and_then(Value::as_u64).unwrap_or(0);
+            notice(
+                state,
+                format!(
+                    "session spend {pct}% of budget (${used:.2} of ${cap:.2}) — \
+                     raise [behavior] max_cost_usd or start a new session"
+                ),
+            );
+        }
         "compacted" => {
             let degraded = v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
             notice(
@@ -1757,6 +1776,11 @@ fn outcome_notice(kind: &str, text: Option<&str>) -> Option<String> {
         // fix ([behavior] max_turns, or -1 for no cap) is not guessable.
         "turn_limit" => "turn limit reached — raise [behavior] max_turns (-1 = no cap)".into(),
         "refused" => "provider refused the request".into(),
+        // Both carry their own sentence on the wire (`wire::outcome_frame`),
+        // which already names the knob and the next action.
+        "denial_spiral" | "budget" => text
+            .unwrap_or("the session budget stopped the turn")
+            .to_string(),
         other => format!("{other}: {}", text.unwrap_or(""))
             .trim_end_matches([':', ' '])
             .to_string(),

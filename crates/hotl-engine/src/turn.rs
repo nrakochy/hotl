@@ -729,6 +729,12 @@ enum SampleEnd {
         discarded_partial: bool,
     },
     Fatal(String),
+    /// A session budget refused this sample before it was sent (0059 T5).
+    BudgetExhausted {
+        kind: String,
+        used: f64,
+        cap: f64,
+    },
 }
 
 struct Turn {
@@ -798,6 +804,12 @@ struct Turn {
     /// excluded (0051 G1). Crosses a fold: the goal gate reads it to tell a
     /// turn that did something from one that only talked.
     tools_ran: u32,
+    /// Denials in a row, and in total, this logical turn (0059 T5).
+    denials_consecutive: u32,
+    denials_total: u32,
+    /// A spiral this batch tripped, read once the batch's results are
+    /// committed — the same shape as `budget_blown`.
+    denial_spiral: Option<(u32, u32)>,
     /// The turn's error, if it has one, is the owner's to fix (0051 G6).
     /// Set where the `ProviderError` is still typed; never carried across a
     /// fold, because a continuation has not failed yet.
@@ -886,6 +898,9 @@ impl Turn {
             // would let one productive stretch excuse every later fold.
             samples_since_compact: 0,
             tools_ran: cont.tools_ran,
+            denials_consecutive: cont.denials_consecutive,
+            denials_total: cont.denials_total,
+            denial_spiral: None,
             unrecoverable: false,
             // Deliberately NOT carried across a compaction respawn: each
             // `Turn` task flushes its own report when it ends (see `run`).
@@ -913,6 +928,8 @@ impl Turn {
             cleared: self.cleared,
             samples_since_compact: self.samples_since_compact,
             tools_ran: self.tools_ran,
+            denials_consecutive: self.denials_consecutive,
+            denials_total: self.denials_total,
         }
     }
 
@@ -962,6 +979,10 @@ impl Turn {
                 SampleEnd::Unavailable(m) | SampleEnd::Fatal(m) => {
                     self.ledger.stamp(Phase::BoundaryEnd);
                     return TurnEnd::Outcome(Outcome::Error { message: m });
+                }
+                SampleEnd::BudgetExhausted { kind, used, cap } => {
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    return TurnEnd::Outcome(Outcome::Budget { kind, used, cap });
                 }
                 // `sample()` owns the whole re-sample loop; an `Interrupted`
                 // reaching here would mean it returned one it should have
@@ -1245,6 +1266,17 @@ impl Turn {
             prune_unsigned_trailing_thinking(&mut blocks);
         }
         self.usage += usage;
+        // Session spend, and the one-per-threshold notice it may cross
+        // (0059 T5). Priced at the model this sample actually used.
+        let cost = hotl_provider::catalog::cost_usd(&self.models[self.model_idx], &usage);
+        if let Some(pct) = self.shared.add_spend(cost.unwrap_or(0.0)) {
+            self.emit(EngineEvent::BudgetNotice {
+                pct,
+                used_usd: self.shared.spent_usd(),
+                cap_usd: self.shared.config.max_cost_usd,
+            })
+            .await;
+        }
         // A completed sample is the "intervening progress" the compaction
         // streak is defined against (T2-3).
         self.samples_since_compact += 1;
@@ -1378,6 +1410,20 @@ impl Turn {
             &self.shared.registry,
             &self.shared.config.verify_commands,
         ));
+        if let Some((used, cap)) = self.shared.tool_call_budget() {
+            let commit = self
+                .abort_batch(uses, &crate::budget_refusal("tool_calls", used, cap))
+                .await;
+            if !commit.ok() {
+                return Some(commit.outcome());
+            }
+            return Some(Outcome::Budget {
+                kind: "tool_calls".into(),
+                used,
+                cap,
+            });
+        }
+        self.shared.count_tool_calls(uses.len() as u64);
         if let Some(pattern) = self.fold_doom_window(uses) {
             if let Some(outcome) = self.handle_doom_loop(uses, pattern).await {
                 return Some(outcome);
@@ -1562,7 +1608,13 @@ impl Turn {
         if cancelled {
             return Some(Outcome::Cancelled);
         }
-        let outcome = budget_blown.map(|tool| Outcome::ToolFailureBudget { tool });
+        let outcome = budget_blown
+            .map(|tool| Outcome::ToolFailureBudget { tool })
+            .or_else(|| {
+                self.denial_spiral
+                    .take()
+                    .map(|(consecutive, total)| Outcome::DenialSpiral { consecutive, total })
+            });
         if outcome.is_none() {
             // This is the sample boundary §Causal groups (b) names: the
             // group carrying the blocks and results is forwarded, its id is
@@ -1602,6 +1654,18 @@ impl Turn {
         let (mut content, failed) = self.apply_failure_budget(tu, executed, budget_blown);
         if call_executed(failed, chargeable) {
             self.tools_ran += 1;
+            self.denials_consecutive = 0;
+        } else {
+            // The not-a-malfunction-and-not-retryable branch: a human said no,
+            // a hook blocked it, or the turn was interrupted (0059 T5).
+            self.denials_consecutive += 1;
+            self.denials_total += 1;
+            if (self.denials_consecutive >= crate::DENIAL_SPIRAL_CONSECUTIVE
+                || self.denials_total >= crate::DENIAL_SPIRAL_TOTAL)
+                && self.denial_spiral.is_none()
+            {
+                self.denial_spiral = Some((self.denials_consecutive, self.denials_total));
+            }
         }
         self.record_evidence(tu, exit, failed, &content);
         if let Some(m) = found {
@@ -2101,6 +2165,13 @@ impl Turn {
         if must_compact(estimate, window, image_bytes) {
             return Err(SampleEnd::ContextFull);
         }
+        if let Some((used, cap)) = self.cost_preflight(estimate) {
+            return Err(SampleEnd::BudgetExhausted {
+                kind: "cost_usd".into(),
+                used,
+                cap,
+            });
+        }
         self.maybe_speculate_digest(snapshot, estimate, image_bytes);
         Ok(self.compose_request(snapshot, estimate, self.samples))
     }
@@ -2120,6 +2191,24 @@ impl Turn {
         }
         let ids = crate::clearing::candidates(&snapshot.durable, keep);
         (!ids.is_empty()).then_some(ids)
+    }
+
+    /// Would this sample cross `max_cost_usd`? Prices the request the way it
+    /// will actually be billed at worst — the whole prompt at input rates plus
+    /// a full `max_tokens` of output. An uncatalogued model has no price and
+    /// therefore no cap (the startup warning says so): guessing a price to
+    /// refuse someone's work would be worse than not capping it.
+    fn cost_preflight(&self, estimate: u64) -> Option<(f64, f64)> {
+        let cap = self.shared.config.max_cost_usd;
+        if cap <= 0.0 {
+            return None;
+        }
+        let info = hotl_provider::catalog::lookup(&self.models[self.model_idx])?;
+        let projected = self.shared.spent_usd()
+            + (estimate as f64 * info.input_usd_per_mtok
+                + self.shared.config.max_tokens as f64 * info.output_usd_per_mtok)
+                / 1_000_000.0;
+        (projected > cap).then(|| (self.shared.spent_usd(), cap))
     }
 
     /// Fire the speculative compaction digest once the estimate crosses
@@ -2162,6 +2251,12 @@ impl Turn {
     fn speculative_request(&self, snapshot: &crate::actor::Snapshot) -> Option<SamplingRequest> {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
+        // A speculative sample spends real money: the cost cap applies to it
+        // exactly as to the sequential build. Declining to speculate is all
+        // that is needed — `build_request` refuses the turn on its own path.
+        if self.cost_preflight(estimate).is_some() {
+            return None;
+        }
         if must_compact(
             estimate,
             window,

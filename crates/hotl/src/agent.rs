@@ -868,6 +868,9 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
             return 1;
         }
     };
+    // Read before `cfg` moves into the scaffold: a parked ask nobody answers
+    // must not hold a detached session open forever (0059 T5).
+    let ask_expiry = cfg.behavior.ask_expiry();
     let mut scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(msg) => {
@@ -922,7 +925,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
             deps
         },
     );
-    crate::session_server::serve(id, scaffold.model.clone(), handle, prompt).await
+    crate::session_server::serve(id, scaffold.model.clone(), handle, prompt, ask_expiry).await
 }
 
 /// The deps every session shares (provider, registry-with-spawn, rules, hooks,
@@ -2611,6 +2614,11 @@ impl Surface {
             }
             EngineEvent::FallbackModel { model } => eprintln!("· falling back to {model}"),
             EngineEvent::PromptQueued => eprintln!("(queued — runs after the current turn)"),
+            EngineEvent::BudgetNotice {
+                pct,
+                used_usd,
+                cap_usd,
+            } => eprintln!("· session spend {pct}% of budget (${used_usd:.2} of ${cap_usd:.2})"),
             EngineEvent::Compacted { degraded } => {
                 if degraded {
                     eprintln!("(context compacted — summary failed, earlier history dropped)");
@@ -2733,6 +2741,13 @@ impl Surface {
             }
             Outcome::ToolFailureBudget { tool } => {
                 eprintln!("\nhotl: stopped — `{tool}` failed too many times in a row.")
+            }
+            Outcome::DenialSpiral { consecutive, total } => eprintln!(
+                "\nhotl: stopped — {consecutive} calls denied in a row ({total} this turn). \
+                 Change what you are asking it to do, or relax the rule that is denying it."
+            ),
+            Outcome::Budget { kind, used, cap } => {
+                eprintln!("\nhotl: {}", hotl_engine::budget_refusal(kind, *used, *cap))
             }
             Outcome::Error { message } => eprintln!("\nhotl: {message}"),
         }
@@ -3210,6 +3225,25 @@ fn engine_config(
     warnings.extend(schedule_warnings);
     config.effort_schedule = (!schedule.is_empty()).then_some(schedule);
     config.verify_commands = cfg.behavior.verify_commands.clone().unwrap_or_default();
+    // Session spend caps (0059 T5). Env beats config, like every scalar here.
+    config.max_tool_calls = secrets
+        .get("HOTL_MAX_TOOL_CALLS")
+        .and_then(|v| v.parse().ok())
+        .or(cfg.behavior.max_tool_calls)
+        .unwrap_or(0);
+    config.max_cost_usd = secrets
+        .get("HOTL_MAX_COST_USD")
+        .and_then(|v| v.parse().ok())
+        .or(cfg.behavior.max_cost_usd)
+        .unwrap_or(0.0);
+    // The cost cap needs a price, and hotl allowlists no model names: an
+    // uncatalogued model simply is not capped. Say so once rather than let
+    // someone believe a cap is guarding a session it cannot see.
+    if config.max_cost_usd > 0.0 && hotl_provider::catalog::lookup(model).is_none() {
+        warnings.push(format!(
+            "hotl: `{model}` is not in the model catalog, so hotl cannot price it —              [behavior] max_cost_usd will not apply this session. [behavior]              max_tool_calls caps a session that has no price."
+        ));
+    }
     // Env beats config, like every other scalar here. A typo warns and is
     // ignored rather than refusing to start — same posture as `parse_isolation`.
     config.effort = secrets.get("HOTL_EFFORT").or(cfg_effort).and_then(|raw| {
