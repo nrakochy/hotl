@@ -4697,21 +4697,23 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
-                concurrency: Default::default(),
-                provider,
-                registry,
-                rules: Arc::new(hotl_tools::rules::Rules::default()),
-                sandbox_enforced: false,
-                clock: Arc::new(SystemClock),
-                log,
-                system: "sys".into(),
-                cwd: dir.path().to_path_buf(),
-                hooks: None,
-                initial_items: Vec::new(),
-                initial_todos: Vec::new(),
-                initial_goal: None,
-                config,
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+                SessionDeps {
+                    concurrency: Default::default(),
+                    provider,
+                    registry,
+                    rules: Arc::new(hotl_tools::rules::Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: dir.path().to_path_buf(),
+                    hooks: None,
+                    initial_items: Vec::new(),
+                    initial_todos: Vec::new(),
+                    initial_goal: None,
+                    config,
+                }
             });
         handle.prompt("go".into()).await;
 
@@ -4749,8 +4751,8 @@ mod tests {
         let provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
-        let handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
+        let handle = spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+            SessionDeps {
                 concurrency: Default::default(),
                 provider,
                 registry,
@@ -4773,7 +4775,8 @@ mod tests {
                 }],
                 initial_goal: None,
                 config,
-            });
+            }
+        });
 
         // The actor publishes its seeded head at startup; wait for that rather
         // than racing it.
@@ -4857,21 +4860,23 @@ mod tests {
         // *before* the assertion below, not merely by the time the test
         // function itself ends).
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
-                concurrency: Default::default(),
-                provider,
-                registry,
-                rules: Arc::new(hotl_tools::rules::Rules::default()),
-                sandbox_enforced: false,
-                clock: Arc::new(SystemClock),
-                log,
-                system: "sys".into(),
-                cwd: dir.path().to_path_buf(),
-                hooks: None,
-                initial_items: Vec::new(),
-                initial_todos: Vec::new(),
-                initial_goal: None,
-                config,
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+                SessionDeps {
+                    concurrency: Default::default(),
+                    provider,
+                    registry,
+                    rules: Arc::new(hotl_tools::rules::Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: dir.path().to_path_buf(),
+                    hooks: None,
+                    initial_items: Vec::new(),
+                    initial_todos: Vec::new(),
+                    initial_goal: None,
+                    config,
+                }
             });
 
         // With no turn ever started, the only strong `SessionCmd` sender was
@@ -4913,21 +4918,23 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
-                concurrency: Default::default(),
-                provider,
-                registry,
-                rules: Arc::new(hotl_tools::rules::Rules::default()),
-                sandbox_enforced: false,
-                clock: Arc::new(SystemClock),
-                log,
-                system: "sys".into(),
-                cwd: dir.path().to_path_buf(),
-                hooks: None,
-                initial_items: Vec::new(),
-                initial_todos: Vec::new(),
-                initial_goal: None,
-                config,
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+                SessionDeps {
+                    concurrency: Default::default(),
+                    provider,
+                    registry,
+                    rules: Arc::new(hotl_tools::rules::Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: dir.path().to_path_buf(),
+                    hooks: None,
+                    initial_items: Vec::new(),
+                    initial_todos: Vec::new(),
+                    initial_goal: None,
+                    config,
+                }
             });
         handle.prompt("go".into()).await;
 
@@ -4970,21 +4977,23 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
-                concurrency: Default::default(),
-                provider,
-                registry,
-                rules: Arc::new(hotl_tools::rules::Rules::default()),
-                sandbox_enforced: false,
-                clock: Arc::new(SystemClock),
-                log,
-                system: "sys".into(),
-                cwd: dir.path().to_path_buf(),
-                hooks: None,
-                initial_items: Vec::new(),
-                initial_todos: Vec::new(),
-                initial_goal: None,
-                config,
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| {
+                SessionDeps {
+                    concurrency: Default::default(),
+                    provider,
+                    registry,
+                    rules: Arc::new(hotl_tools::rules::Rules::default()),
+                    sandbox_enforced: false,
+                    clock: Arc::new(SystemClock),
+                    log,
+                    system: "sys".into(),
+                    cwd: dir.path().to_path_buf(),
+                    hooks: None,
+                    initial_items: Vec::new(),
+                    initial_todos: Vec::new(),
+                    initial_goal: None,
+                    config,
+                }
             });
 
         let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {

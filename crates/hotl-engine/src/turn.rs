@@ -934,6 +934,7 @@ impl Turn {
                     self.cleared = true;
                     return TurnEnd::Clear {
                         ids,
+                        spec_usage: self.abandon_speculation().await,
                         cont: Box::new(self.continuation()),
                     };
                 }
@@ -2364,6 +2365,30 @@ impl Turn {
     async fn take_speculation(&mut self) -> Option<crate::SpecDigest> {
         let handle = self.speculation.take()?;
         await_speculation(handle, &self.cancel, SPECULATION_WAIT).await
+    }
+
+    /// Give up a speculative digest and report only what it cost (0051
+    /// decision 6). The clearing rung, unlike a fold, has no use for the
+    /// digest — reclaiming results drops the estimate back below
+    /// [`SPECULATE_TRIGGER`], so the fold it was computed for is not going to
+    /// happen. Deliberately does NOT wait: a digest still in flight is
+    /// abandoned with its spend unknown, exactly as `SPECULATION_WAIT`
+    /// already abandons a stalled one on the fold path. One that has already
+    /// landed is free to read, and its tokens are real.
+    async fn abandon_speculation(&mut self) -> TokenUsage {
+        let Some(handle) = self.speculation.take() else {
+            return TokenUsage::default();
+        };
+        if !handle.is_finished() {
+            handle.abort();
+            return TokenUsage::default();
+        }
+        handle
+            .await
+            .ok()
+            .flatten()
+            .map(|digest| digest.usage)
+            .unwrap_or_default()
     }
 
     /// The sample boundary: barrier (b)'s ticket drain, then the refresh —

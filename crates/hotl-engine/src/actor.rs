@@ -1400,8 +1400,14 @@ async fn on_turn_finished(
             )
             .await
         }
-        TurnEnd::Clear { ids, cont } => {
+        TurnEnd::Clear {
+            ids,
+            cont,
+            spec_usage,
+        } => {
             *ctx.carry_usage += usage;
+            // A digest the clear abandoned was still billed (0051 decision 6).
+            *ctx.carry_usage += spec_usage;
             usage = TokenUsage::default();
             mispredictions = 0;
             try_clear(

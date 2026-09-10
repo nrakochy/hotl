@@ -185,6 +185,11 @@ pub enum TurnEnd {
     Clear {
         ids: Vec<String>,
         cont: Box<TurnContinuation>,
+        /// What a speculative digest this clear abandons already cost (0051
+        /// decision 6). Clearing drops below the speculate threshold, so the
+        /// digest will never be folded — but it was billed, and an unreported
+        /// spend is the one direction this codebase treats as unacceptable.
+        spec_usage: TokenUsage,
     },
 }
 

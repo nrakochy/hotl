@@ -50,6 +50,16 @@ async fn next_event(s: &mut Session) -> EngineEvent {
 
 /// Drive one prompt to its outcome, reporting whether the ladder fired.
 async fn run(s: &mut Session, prompt: &str) -> (Outcome, usize, bool) {
+    let (outcome, cleared, compacted, _) = run_reporting_usage(s, prompt).await;
+    (outcome, cleared, compacted)
+}
+
+/// The same, plus the prompt's total reported spend — `turn_done.usage` is
+/// cumulative over the whole prompt, respawns included.
+async fn run_reporting_usage(
+    s: &mut Session,
+    prompt: &str,
+) -> (Outcome, usize, bool, hotl_types::TokenUsage) {
     s.handle.prompt(prompt.into()).await;
     let mut cleared = 0;
     let mut compacted = false;
@@ -60,7 +70,9 @@ async fn run(s: &mut Session, prompt: &str) -> (Outcome, usize, bool) {
             EngineEvent::Ask { reply, .. } => {
                 let _ = reply.send(hotl_engine::AskReply::Allow);
             }
-            EngineEvent::TurnDone { outcome, .. } => return (outcome, cleared, compacted),
+            EngineEvent::TurnDone { outcome, usage, .. } => {
+                return (outcome, cleared, compacted, usage)
+            }
             _ => {}
         }
     }
@@ -236,4 +248,43 @@ async fn clearing_is_once_and_idempotent() {
     assert_eq!(run(&mut s, "two").await.1, 1);
     provider.push_script(ScriptedProvider::text_reply("three"));
     assert_eq!(run(&mut s, "three").await.1, 0, "nothing left to clear");
+}
+
+/// A clear ends the turn and respawns it, exactly as a fold does — so the
+/// prompt's reported spend must cover the samples on *both* sides of it
+/// (0051 decision 6 composed with this rung). A `carry_usage` that reset at
+/// the respawn would under-report every cleared prompt.
+#[tokio::test]
+async fn a_clear_carries_the_turn_spend_across_the_respawn() {
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    let mut s = session(Arc::clone(&provider) as Arc<dyn Provider>, config());
+    let file = s.dir.path().join("big.txt");
+    std::fs::write(&file, "y".repeat(2_100)).expect("fixture");
+    let path = file.to_str().expect("utf8 path").to_string();
+    provider.push_script(billed(
+        ScriptedProvider::tool_call("t1", "read", json!({ "path": path })),
+        700,
+    ));
+    provider.push_script(billed(ScriptedProvider::text_reply("read it"), 800));
+    let (_, _, _, first) = run_reporting_usage(&mut s, "read the big file").await;
+    assert_eq!(first.input_tokens, 1_500, "both samples counted");
+
+    provider.push_script(billed(ScriptedProvider::text_reply("second"), 900));
+    let (_, cleared, _, second) = run_reporting_usage(&mut s, "now something else").await;
+    assert_eq!(cleared, 1, "the clear fired");
+    assert_eq!(
+        second.input_tokens, 900,
+        "the sample after the clear is billed to this prompt, and nothing is double-counted"
+    );
+}
+
+/// A sample whose `Completed` reports a chosen `input_tokens`.
+fn billed(
+    mut script: Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>>,
+    input_tokens: u64,
+) -> Vec<Result<hotl_provider::StreamEvent, hotl_provider::ProviderError>> {
+    if let Some(Ok(hotl_provider::StreamEvent::Completed { usage, .. })) = script.last_mut() {
+        usage.input_tokens = input_tokens;
+    }
+    script
 }

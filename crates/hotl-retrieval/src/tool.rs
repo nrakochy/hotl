@@ -289,6 +289,19 @@ mod tests {
         assert_eq!(out.content.matches("</tool-result>").count(), 1, "defanged");
     }
 
+    /// 0055: every executed call draws a subprocess permit unless it blocks
+    /// on a nested hotl session. `recall` does not — its shipped MCP backend
+    /// *spawns* a program, which is exactly what the budget bounds — so it
+    /// must keep the trait default and stay inside the budget.
+    #[test]
+    fn recall_draws_a_subprocess_permit_like_any_other_leaf_tool() {
+        let tool = RecallTool::new(vec![notes(one_hit())]);
+        assert!(
+            !tool.awaits_child_session(),
+            "0055: exempting recall would let an MCP backend fork outside the subprocs budget"
+        );
+    }
+
     #[test]
     fn recall_is_not_read_only_because_a_backend_may_spawn_a_program() {
         let tool = RecallTool::new(vec![notes(one_hit())]);
