@@ -272,20 +272,76 @@ pub fn nested_instructions(cwd: &Path, touched: &Path) -> Option<(String, Item)>
     None
 }
 
+/// This turn's step budget, as the MOIM reports it (0059 T3). Rides the
+/// ephemeral tag rather than joining `goal::GoalProgress`: the budget applies
+/// whether or not a goal is set, and a per-sample number in a durable item
+/// would break the prefix cache every sample.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TurnBudget {
+    /// Steps spent so far, this sample included.
+    pub spent: i64,
+    /// The cap. Non-positive is the opt-in "no cap" posture, and then there
+    /// is no fraction to render and no sentence to earn.
+    pub max: i64,
+    /// Wall-clock seconds since this turn started.
+    pub elapsed_s: u64,
+    /// A goal's or workflow's own deadline, already rendered. `None` when the
+    /// step budget is the only thing bounding the work.
+    pub remaining: Option<String>,
+}
+
+/// The share of the budget past which the model is told about it. Below this
+/// the number is noise; the context-anxiety finding that keeps `context_used`
+/// off by default (tech-debt #9) applies to a step count just as well.
+const BUDGET_DISCLOSE_AT: f64 = 0.8;
+
+/// The one sentence that accompanies a nearly-spent budget. Verbatim: it
+/// exists to keep a low budget from reading as permission to wrap up early.
+pub const BUDGET_SENTENCE: &str = "Do not finish early because the budget is low; \
+finish because the work is verified. If the budget will not suffice, say so and stop cleanly.";
+
+impl TurnBudget {
+    /// Is the budget spent enough to be worth naming?
+    fn nearly_spent(&self) -> bool {
+        self.max > 0 && self.spent as f64 >= BUDGET_DISCLOSE_AT * self.max as f64
+    }
+}
+
 /// The MOIM ephemeral turn-context block (M2): attached to the
 /// request only — never persisted, never cached (it rides after the cache
 /// marker by construction).
 /// `context_used_pct` is optional (tech-debt #9): broadcasting how full the
 /// window is every sample can induce "context anxiety" (premature wrap-up —
 /// Anthropic long-horizon finding), so a caller may omit it.
-pub fn turn_context(now_ms: u64, cwd: &Path, context_used_pct: Option<u8>, sample: u32) -> String {
+pub fn turn_context(
+    now_ms: u64,
+    cwd: &Path,
+    context_used_pct: Option<u8>,
+    sample: u32,
+    budget: &TurnBudget,
+) -> String {
     let used = match context_used_pct {
         Some(pct) => format!(" context_used=\"{pct}%\""),
         None => String::new(),
     };
+    // An uncapped turn has no fraction to report; the clock still runs.
+    let turn_budget = match budget.max > 0 {
+        true => format!(" turn_budget=\"{}/{}\"", budget.spent, budget.max),
+        false => String::new(),
+    };
+    let remaining = match &budget.remaining {
+        Some(r) => format!(" remaining=\"{r}\""),
+        None => String::new(),
+    };
+    let sentence = match budget.nearly_spent() {
+        true => format!("\n{BUDGET_SENTENCE}"),
+        false => String::new(),
+    };
     format!(
-        "<turn-context now_unix_ms=\"{now_ms}\" cwd=\"{}\"{used} sample=\"{sample}\"/>",
-        cwd.display()
+        "<turn-context now_unix_ms=\"{now_ms}\" cwd=\"{}\"{used} sample=\"{sample}\"\
+         {turn_budget} elapsed_s=\"{}\"{remaining}/>{sentence}",
+        cwd.display(),
+        budget.elapsed_s,
     )
 }
 
@@ -315,6 +371,102 @@ pub fn defang(content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn turn_context_carries_the_step_budget_and_the_sentence() {
+        let cwd = std::path::Path::new("/w");
+        // Well inside the budget: the numbers ride, the sentence does not.
+        let tc = turn_context(
+            1,
+            cwd,
+            None,
+            7,
+            &TurnBudget {
+                spent: 7,
+                max: 100,
+                elapsed_s: 41,
+                remaining: None,
+            },
+        );
+        assert!(tc.contains("turn_budget=\"7/100\""), "{tc}");
+        assert!(tc.contains("elapsed_s=\"41\""), "{tc}");
+        assert!(!tc.contains("remaining="), "{tc}");
+        assert!(
+            !tc.contains(BUDGET_SENTENCE),
+            "no number until it matters: {tc}"
+        );
+
+        // A deadline the caller knows about rides beside the budget.
+        let tc = turn_context(
+            1,
+            cwd,
+            None,
+            7,
+            &TurnBudget {
+                spent: 7,
+                max: 100,
+                elapsed_s: 41,
+                remaining: Some("4m".into()),
+            },
+        );
+        assert!(tc.contains("remaining=\"4m\""), "{tc}");
+
+        // At 80% the sentence follows the tag, on its own line.
+        let tc = turn_context(
+            1,
+            cwd,
+            None,
+            80,
+            &TurnBudget {
+                spent: 80,
+                max: 100,
+                elapsed_s: 900,
+                remaining: None,
+            },
+        );
+        assert!(tc.contains("turn_budget=\"80/100\""), "{tc}");
+        assert_eq!(
+            tc.lines().count(),
+            2,
+            "the sentence follows the tag, not inside it: {tc}"
+        );
+        assert!(tc.ends_with(BUDGET_SENTENCE), "{tc}");
+        // One below the threshold is still silent.
+        let quiet = turn_context(
+            1,
+            cwd,
+            None,
+            79,
+            &TurnBudget {
+                spent: 79,
+                max: 100,
+                elapsed_s: 900,
+                remaining: None,
+            },
+        );
+        assert!(!quiet.contains(BUDGET_SENTENCE), "{quiet}");
+
+        // An uncapped turn has no fraction and never earns the sentence,
+        // however long it runs.
+        let tc = turn_context(
+            1,
+            cwd,
+            None,
+            9000,
+            &TurnBudget {
+                spent: 9000,
+                max: -1,
+                elapsed_s: 60,
+                remaining: None,
+            },
+        );
+        assert!(!tc.contains("turn_budget="), "{tc}");
+        assert!(!tc.contains(BUDGET_SENTENCE), "{tc}");
+        assert!(
+            tc.contains("elapsed_s=\"60\""),
+            "the clock still runs: {tc}"
+        );
+    }
 
     #[test]
     fn environment_reports_git_state_and_carries_no_envelope() {

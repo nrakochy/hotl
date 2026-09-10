@@ -784,6 +784,10 @@ struct Turn {
     /// Steps spent against `EngineConfig::max_turns`. A `Turn` field rather
     /// than a `drive()` local precisely so it can cross a fold (T2-2).
     spent: i64,
+    /// When this turn started, for the MOIM's `elapsed_s` (0059 T3). Crosses a
+    /// fold like `spent`: a compaction respawn is the same turn, and a clock
+    /// that restarted there would understate every long turn.
+    started_ms: u64,
     /// Completed samples since the last fold — the "intervening progress" the
     /// compaction streak is defined against (T2-3).
     samples_since_compact: u32,
@@ -843,6 +847,7 @@ impl Turn {
         let mut models = vec![shared.config.model.clone()];
         models.extend(shared.config.fallback_models.iter().cloned());
         let head = shared.head();
+        let started_ms = shared.clock.now_ms();
         Self {
             tool_defs_all: shared.registry.without_plan_tools().defs().into(),
             tool_defs_plan: shared.registry.without_edit_tools().defs().into(),
@@ -871,6 +876,7 @@ impl Turn {
             max_tokens_continues: cont.max_tokens_continues,
             cleared: cont.cleared,
             spent: cont.spent,
+            started_ms: cont.started_ms.unwrap_or(started_ms),
             // A continuation starts a fresh progress count: the value it
             // inherited was already read by `try_compact`, and re-carrying it
             // would let one productive stretch excuse every later fold.
@@ -891,6 +897,7 @@ impl Turn {
     fn continuation(&mut self) -> crate::TurnContinuation {
         crate::TurnContinuation {
             spent: self.spent,
+            started_ms: Some(self.started_ms),
             model_idx: self.model_idx,
             call_sigs: std::mem::take(&mut self.call_sigs),
             flagged: std::mem::take(&mut self.flagged),
@@ -2172,11 +2179,25 @@ impl Turn {
             .config
             .show_context_pct
             .then(|| (estimate.saturating_mul(100) / window).min(100) as u8);
+        let now_ms = self.shared.clock.now_ms();
         let turn_context = hotl_context::turn_context(
-            self.shared.clock.now_ms(),
+            now_ms,
             &self.shared.cwd,
             used_pct,
             sample_no,
+            &hotl_context::TurnBudget {
+                // `spent` crosses a fold and `sample_no` does not, but a
+                // speculative build runs one step ahead of `spent` (admission
+                // dispatches before `drive` counts). The larger is the step
+                // this request actually is.
+                spent: self.spent.max(sample_no as i64),
+                max: self.shared.config.max_turns,
+                elapsed_s: now_ms.saturating_sub(self.started_ms) / 1000,
+                // No producer yet: the goal loop is deliberately uncapped
+                // (0048 OD1) and a workflow's deadline never reaches the
+                // engine. The seam is here for the first one that does.
+                remaining: None,
+            },
         );
         SamplingRequest {
             model: self.models[self.model_idx].clone(),

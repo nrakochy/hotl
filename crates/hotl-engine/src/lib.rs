@@ -246,6 +246,10 @@ pub enum TurnEnd {
 pub struct TurnContinuation {
     /// Steps already spent against [`EngineConfig::max_turns`].
     pub(crate) spent: i64,
+    /// When the logical turn started (0059 T3). `None` on a fresh turn — the
+    /// respawn reads the clock itself — `Some` across a fold, so the MOIM's
+    /// `elapsed_s` keeps counting through a compaction.
+    pub(crate) started_ms: Option<u64>,
     /// Fallback-model position: a continuation does not silently revert to the
     /// primary model that just failed.
     pub(crate) model_idx: usize,

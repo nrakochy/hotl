@@ -2943,6 +2943,44 @@ mod tests {
         assert!(degraded, "the compaction entry records the floor");
     }
 
+    /// 0059 T3: the step budget and its sentence ride the MOIM, which sits
+    /// after every cache marker. Two sessions differing only in how much of
+    /// the budget is left must therefore serialize to the same durable body —
+    /// the number moves, the cached prefix does not.
+    #[tokio::test]
+    async fn the_step_budget_rides_the_moim_and_never_the_durable_body() {
+        let run = |max_turns: i64| async move {
+            let mut h = Harness::new(
+                vec![ScriptedProvider::text_reply("hi")],
+                EngineConfig { max_turns, ..cfg() },
+            );
+            h.prompt_and_wait("hello").await;
+            h.provider.requests()
+        };
+        // `max_turns: 1` puts sample 1 at 100% of the budget; `100` leaves it
+        // at 1%. Same prompt, same tools, same everything else.
+        let tight = run(1).await;
+        let roomy = run(100).await;
+        let tc = tight[0].turn_context.as_deref().expect("MOIM attached");
+        assert!(tc.contains("turn_budget=\"1/1\""), "{tc}");
+        assert!(tc.contains(hotl_context::BUDGET_SENTENCE), "{tc}");
+        let tc = roomy[0].turn_context.as_deref().expect("MOIM attached");
+        assert!(tc.contains("turn_budget=\"1/100\""), "{tc}");
+        assert!(
+            !tc.contains(hotl_context::BUDGET_SENTENCE),
+            "no sentence until it matters: {tc}"
+        );
+        assert_eq!(
+            hotl_provider_anthropic::wire_body(&without_moim(&tight[0])),
+            hotl_provider_anthropic::wire_body(&without_moim(&roomy[0])),
+            "the budget must not reach the durable body"
+        );
+        assert!(
+            !tight[0].turn_context.as_deref().unwrap().is_empty(),
+            "and it must actually be somewhere"
+        );
+    }
+
     #[tokio::test]
     async fn moim_rides_the_request_but_never_the_log() {
         let mut h = Harness::new(vec![ScriptedProvider::text_reply("hi")], cfg());
