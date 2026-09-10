@@ -52,6 +52,7 @@ cache_breakpoints = true                    # OpenAI dialects only: explicit GPT
 [context]
 window = 200000            # usually unnecessary — looked up per model; see below
 evict_tokens = 20000       # offload tool results larger than this (0 disables)
+keep_results = 4           # user turns whose tool results are never cleared
 compaction_reset = false   # fresh-slate compaction instead of in-place
 show_used_pct = false      # opt in to showing the model context-fullness each
                            # turn (default hidden: it induces premature wrap-up)
@@ -519,6 +520,25 @@ window = 8192   # only needed for a model hotl doesn't recognize, or a
 ```
 
 Setting this too high overflows the model mid-turn; too low burns a summarize call and discards context you were still paying to keep.
+
+### The context ladder (`[context] keep_results`)
+
+hotl reclaims context cheapest-first, and only climbs to the next rung when the one below it has run out of room:
+
+| At | Rung | What it costs |
+|----|------|---------------|
+| any size | **spill** — a single oversized tool result goes to a file, leaving a preview and a `read` pointer (`evict_tokens`) | nothing; the file is still on disk |
+| 60% | **clear** — tool results older than the last `keep_results` user turns become one-line `<cleared …/>` stubs | nothing; the session log still holds every byte, and `recall` fetches one back by id |
+| 80% | **fold** — earlier history is replaced by a typed summary (compaction) | a summarize call, and the detail the summary didn't keep |
+
+Clearing happens at most once per prompt and never touches the last `keep_results` turns, the turn in flight, or a `skill` result — those are the history the model is still working from. Set `keep_results = 0` to turn the rung off entirely and go straight from spilling to folding.
+
+```toml
+[context]
+keep_results = 8   # a workflow that re-reads old tool output; costs context
+```
+
+Both the clear and the fold rewrite the start of the prompt, so each one costs exactly one prompt-cache miss — which is why clearing is batched into a single pass rather than one per result.
 
 ### Reasoning effort (`[provider] effort`)
 

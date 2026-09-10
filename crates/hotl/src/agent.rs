@@ -2347,6 +2347,9 @@ impl Surface {
                     eprintln!("(context compacted — earlier history summarized)");
                 }
             }
+            EngineEvent::Cleared { count } => {
+                eprintln!("(cleared {count} old tool results — recall fetches any of them back)")
+            }
             EngineEvent::Ask { summary, reply, .. } => {
                 // Headless asks default-deny; the record goes to stderr.
                 eprintln!("hotl: denied (headless): {summary}");
@@ -2877,6 +2880,9 @@ fn engine_config(
         .or(cfg.context.evict_tokens)
     {
         config.evict_threshold_tokens = t;
+    }
+    if let Some(k) = cfg.context.keep_results {
+        config.keep_results_turns = k;
     }
     config.compaction_reset = match secrets.get("HOTL_COMPACTION_RESET").as_deref() {
         Some(v) => v == "1",
@@ -5025,6 +5031,24 @@ mod tests {
         );
         assert_eq!(config.context_window, 1_000_000);
         assert!(warnings.is_empty(), "warnings: {warnings:?}");
+    }
+
+    #[test]
+    fn keep_results_is_four_turns_unless_configured() {
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &config_from_toml(""))
+                .0
+                .keep_results_turns,
+            4
+        );
+        let cfg = config_from_toml("[context]\nkeep_results = 0\n");
+        assert_eq!(
+            engine_config("m", &MapSecrets::default(), &cfg)
+                .0
+                .keep_results_turns,
+            0,
+            "0 turns off the clearing rung entirely"
+        );
     }
 
     #[test]

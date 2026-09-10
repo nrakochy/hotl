@@ -8,6 +8,7 @@
 //! asks are events carrying a oneshot reply.
 
 mod actor;
+pub mod clearing;
 mod expect;
 pub mod hooks;
 mod ledger;
@@ -109,6 +110,9 @@ pub struct EngineConfig {
     /// Evict a successful tool result larger than this (estimated tokens) to a
     /// masked blob, leaving a head preview + read pointer (T4). `0` disables.
     pub evict_threshold_tokens: u64,
+    /// How many of the newest user turns keep their tool results verbatim
+    /// when the context ladder clears (0057). `0` disables clearing.
+    pub keep_results_turns: usize,
     /// Which [`AckMode`] turn-originated proposals use where the protocol
     /// allows pipelining (commit-protocol.md §Pipelined commits). Production
     /// is `Pipelined`; `Sync` exists so a golden scenario can drive the same
@@ -142,6 +146,7 @@ impl Default for EngineConfig {
             compaction_reset: false,
             show_context_pct: false,
             evict_threshold_tokens: 20_000,
+            keep_results_turns: 4,
             ack_mode: AckMode::Pipelined,
         }
     }
@@ -159,6 +164,13 @@ pub enum TurnEnd {
     /// variant stays small).
     Compact {
         spec: Option<SpecDigest>,
+        cont: Box<TurnContinuation>,
+    },
+    /// The ladder's cheap rung below `Compact` (0057): clear these old tool
+    /// results to stubs, then respawn the same logical turn. Same
+    /// terminate → re-point → respawn shape as a fold, and the same `cont`.
+    Clear {
+        ids: Vec<String>,
         cont: Box<TurnContinuation>,
     },
 }
@@ -189,6 +201,11 @@ pub struct TurnContinuation {
     pub(crate) turn_extensions: u32,
     /// Tool results that missed a stated `expect` so far this prompt (0050 T5).
     pub(crate) mispredictions: u32,
+    /// Whether this prompt already spent its one clearing pass (0057). Once
+    /// per prompt is the whole budget: `clearing::candidates` counts back
+    /// from the newest *user* turns, and a prompt adds none, so a second pass
+    /// could only ever return the same (now stubbed) set.
+    pub(crate) cleared: bool,
     /// Truncation-recovery continues already spent (MAX_TOKENS_CONTINUE_MAX).
     pub(crate) max_tokens_continues: u32,
     /// Completed samples since the last fold — the compaction streak's
@@ -321,6 +338,11 @@ pub enum EngineEvent {
     Compacted {
         degraded: bool,
     },
+    /// Old tool results were cleared to stubs (0057) — the rung below
+    /// `Compacted`, and the one a long exploration should hit first.
+    Cleared {
+        count: usize,
+    },
     Ask {
         summary: String,
         protected_why: Option<String>,
@@ -408,6 +430,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),
             Self::Compacted { degraded } => write!(f, "Compacted({degraded})"),
+            Self::Cleared { count } => write!(f, "Cleared({count})"),
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),
             Self::Question { question, .. } => write!(f, "Question({})", question.header),
             Self::EgressAsk { host, .. } => write!(f, "EgressAsk({host})"),

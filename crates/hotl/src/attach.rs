@@ -315,6 +315,7 @@ fn update_line(update: &Value) -> Option<String> {
                     "(context compacted)".to_string()
                 }
             }
+            "cleared" => format!("(cleared {} old tool results)", n("count")),
             "todos_changed" => {
                 let n = update
                     .get("items")

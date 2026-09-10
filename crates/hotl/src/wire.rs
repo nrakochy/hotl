@@ -112,6 +112,7 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         EngineEvent::Compacted { degraded } => {
             json!({"type": "compacted", "degraded": degraded})
         }
+        EngineEvent::Cleared { count } => json!({"type": "cleared", "count": count}),
         EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
         EngineEvent::GoalChanged { condition } => {
             json!({"type": "goal_changed", "goal": condition})

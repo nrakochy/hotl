@@ -449,8 +449,82 @@ pub enum EntryPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         outcome: Option<String>,
     },
+    /// The cheapest rung of the context ladder (0057): the named tool results
+    /// are replaced in the *projection* by `<cleared/>` stubs. Like
+    /// `Compaction` this re-points what the model sees and leaves the log
+    /// bytes untouched — `recall` can still fetch the original.
+    Cleared {
+        ids: Vec<String>,
+    },
     #[serde(other)]
     Unknown,
+}
+
+/// What a cleared tool result reads as in the projection. Names the id so
+/// `recall` has something to fetch, and the size so the model can judge
+/// whether fetching it is worth the tokens.
+pub fn cleared_stub(id: &str, bytes: usize, turn: usize) -> String {
+    format!(
+        "<cleared tool_use_id=\"{id}\" bytes={bytes} turn={turn}/>Result cleared to save \
+         context; recall {id} to fetch it."
+    )
+}
+
+/// Whether a result's content is already a [`cleared_stub`] — clearing is
+/// idempotent, and a stub must never be re-cleared (it would count twice and
+/// re-break the cache for nothing).
+pub fn is_cleared_stub(content: &str) -> bool {
+    content.starts_with("<cleared tool_use_id=")
+}
+
+/// Replace every result named in `ids` with its stub, in place. Generic over
+/// the element type so the store's `Vec<Item>` replay and the engine's
+/// `Vec<Arc<Item>>` projection share one implementation — a second copy is
+/// how replay and the live head would drift.
+///
+/// `turn` in the stub is the count of real (non-synthetic) user items before
+/// the result, which is the same coordinate `hotl_engine::clearing` counts
+/// back from.
+pub fn clear_results<I>(items: &mut [I], ids: &[String]) -> usize
+where
+    I: std::borrow::Borrow<Item> + From<Item>,
+{
+    if ids.is_empty() {
+        return 0;
+    }
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut turn = 0usize;
+    let mut cleared = 0usize;
+    for slot in items.iter_mut() {
+        match slot.borrow() {
+            Item::User {
+                synthetic: None, ..
+            } => turn += 1,
+            Item::ToolResults { results }
+                if results.iter().any(|r| {
+                    wanted.contains(r.tool_use_id.as_str()) && !is_cleared_stub(&r.content)
+                }) =>
+            {
+                let results = results
+                    .iter()
+                    .map(|r| {
+                        if !wanted.contains(r.tool_use_id.as_str()) || is_cleared_stub(&r.content) {
+                            return r.clone();
+                        }
+                        cleared += 1;
+                        ToolResultItem {
+                            tool_use_id: r.tool_use_id.clone(),
+                            content: cleared_stub(&r.tool_use_id, r.content.len(), turn),
+                            is_error: r.is_error,
+                        }
+                    })
+                    .collect();
+                *slot = I::from(Item::ToolResults { results });
+            }
+            _ => {}
+        }
+    }
+    cleared
 }
 
 /// One selectable choice in a structured [`Question`] (`ask_user`, tier-1

@@ -29,6 +29,11 @@ const COMPACT_TRIGGER: f64 = 0.8;
 /// background so it is (usually) already done when [`COMPACT_TRIGGER`] hits,
 /// and the fold needs no blocking model call.
 const SPECULATE_TRIGGER: f64 = 0.6;
+/// The context ladder's cheapest rung (0057): at this share of the window,
+/// old tool results are cleared to stubs *before* a digest is paid for. Same
+/// number as [`SPECULATE_TRIGGER`] on purpose — clearing is checked first, so
+/// a session that can reclaim room for free never fires the summarize at all.
+const CLEAR_TRIGGER: f64 = 0.6;
 /// Wall-clock bound on waiting for a speculative digest at the fold. The task
 /// has had whole samples to run in, so a digest that still isn't ready is a
 /// stalled provider call, not a slow one — the inline summarize is then the
@@ -153,8 +158,9 @@ pub(crate) async fn run(
 /// [`Turn::handle_doom_loop`] already applies inline ("a `DoomLoop` outcome
 /// would name a batch the log will never carry"). Two ends survive: one that
 /// is already an error — keep the first cause — and a cancellation, because
-/// Cancelled ≠ Failed. A `Compact` end needs no override: the fold runs
-/// against the sealed log next and fails there, with its own message.
+/// Cancelled ≠ Failed. A `Compact`/`Clear` end needs no override: the fold or
+/// the clear runs against the sealed log next and fails there, with its own
+/// message.
 fn seal_end(end: TurnEnd, commit: Commit) -> TurnEnd {
     if commit.ok() {
         return end;
@@ -165,7 +171,7 @@ fn seal_end(end: TurnEnd, commit: Commit) -> TurnEnd {
             TurnEnd::Outcome(Outcome::Error { message })
         }
         TurnEnd::Outcome(_) => TurnEnd::Outcome(commit.outcome()),
-        compact @ TurnEnd::Compact { .. } => compact,
+        ladder @ (TurnEnd::Compact { .. } | TurnEnd::Clear { .. }) => ladder,
     }
 }
 
@@ -707,6 +713,12 @@ enum SampleEnd {
     /// The next request won't fit (threshold or provider overflow): the turn
     /// ends and the actor compacts, then respawns a continuation.
     ContextFull,
+    /// Old tool results can be cleared to stubs: the turn ends, the actor
+    /// re-points the projection and respawns the continuation — the same
+    /// shape as `ContextFull`, one rung cheaper.
+    Clear {
+        ids: Vec<String>,
+    },
     /// The stream died after producing bytes but before sealing anything
     /// irreversible. Handled entirely inside [`Turn::sample`] — `drive` never
     /// sees it.
@@ -766,6 +778,9 @@ struct Turn {
     /// Truncation-recovery continues spent ([`MAX_TOKENS_CONTINUE_MAX`]);
     /// crosses folds like `turn_extensions`.
     max_tokens_continues: u32,
+    /// This prompt already spent its clearing pass (0057); crosses a fold
+    /// like the other per-prompt budgets.
+    cleared: bool,
     /// Steps spent against `EngineConfig::max_turns`. A `Turn` field rather
     /// than a `drive()` local precisely so it can cross a fold (T2-2).
     spent: i64,
@@ -854,6 +869,7 @@ impl Turn {
             turn_extensions: cont.turn_extensions,
             mispredictions: cont.mispredictions,
             max_tokens_continues: cont.max_tokens_continues,
+            cleared: cont.cleared,
             spent: cont.spent,
             // A continuation starts a fresh progress count: the value it
             // inherited was already read by `try_compact`, and re-carrying it
@@ -882,6 +898,7 @@ impl Turn {
             turn_extensions: self.turn_extensions,
             mispredictions: self.mispredictions,
             max_tokens_continues: self.max_tokens_continues,
+            cleared: self.cleared,
             samples_since_compact: self.samples_since_compact,
             tools_ran: self.tools_ran,
         }
@@ -909,6 +926,14 @@ impl Turn {
                     self.ledger.stamp(Phase::BoundaryEnd);
                     return TurnEnd::Compact {
                         spec: self.take_speculation().await,
+                        cont: Box::new(self.continuation()),
+                    };
+                }
+                SampleEnd::Clear { ids } => {
+                    self.ledger.stamp(Phase::BoundaryEnd);
+                    self.cleared = true;
+                    return TurnEnd::Clear {
+                        ids,
                         cont: Box::new(self.continuation()),
                     };
                 }
@@ -2004,11 +2029,34 @@ impl Turn {
         let window = self.shared.config.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
         let image_bytes = hotl_context::tokens::image_b64_bytes(&snapshot.durable);
+        // The ladder, cheapest first: clearing costs no model call and no
+        // history, so it is checked ahead of both the fold and the digest —
+        // including on the pass where the fold would also have fired.
+        if let Some(ids) = self.clear_candidates(snapshot, estimate, window) {
+            return Err(SampleEnd::Clear { ids });
+        }
         if must_compact(estimate, window, image_bytes) {
             return Err(SampleEnd::ContextFull);
         }
         self.maybe_speculate_digest(snapshot, estimate, image_bytes);
         Ok(self.compose_request(snapshot, estimate, self.samples))
+    }
+
+    /// Results this turn may clear, or `None` when the rung does not apply.
+    /// The empty-set case is `None` too: an entry naming nothing would break
+    /// the cache prefix for no reclaimed tokens.
+    fn clear_candidates(
+        &self,
+        snapshot: &crate::actor::Snapshot,
+        estimate: u64,
+        window: u64,
+    ) -> Option<Vec<String>> {
+        let keep = self.shared.config.keep_results_turns;
+        if self.cleared || keep == 0 || estimate < (window as f64 * CLEAR_TRIGGER) as u64 {
+            return None;
+        }
+        let ids = crate::clearing::candidates(&snapshot.durable, keep);
+        (!ids.is_empty()).then_some(ids)
     }
 
     /// Fire the speculative compaction digest once the estimate crosses
@@ -2038,10 +2086,13 @@ impl Turn {
     /// The speculative twin of [`Turn::build_request`]: the same compose,
     /// against the *predicted* snapshot and the sample number that snapshot
     /// will belong to. `None` when the predicted request would cross the
-    /// compaction trigger — the next sample is going to fold rather than
-    /// sample, and a speculative call there would be pure waste (and, being
-    /// a real billed call, waste of the kind §The side-effect ruling makes
-    /// us account for).
+    /// compaction trigger, or when the ladder's cheap rung is due — the next
+    /// sample is going to reclaim rather than sample, and a speculative call
+    /// there would be pure waste (and, being a real billed call, waste of the
+    /// kind §The side-effect ruling makes us account for). Skipping it is
+    /// also what makes the clear reachable at all: an adopted stream never
+    /// re-enters `build_request`, so a dispatched speculation would carry the
+    /// unreclaimed history straight past the trigger.
     ///
     /// Deliberately does NOT fire the speculative *compaction* digest: that
     /// is `build_request`'s, once, on the sequential path.
@@ -2052,7 +2103,8 @@ impl Turn {
             estimate,
             window,
             hotl_context::tokens::image_b64_bytes(&snapshot.durable),
-        ) {
+        ) || self.clear_candidates(snapshot, estimate, window).is_some()
+        {
             return None;
         }
         Some(self.compose_request(snapshot, estimate, self.samples + 1))
@@ -3702,7 +3754,7 @@ mod tests {
     fn a_failed_barrier_c_replaces_every_end_reason_it_invalidates() {
         let sealed = |outcome| match seal_end(TurnEnd::Outcome(outcome), Commit::Sealed) {
             TurnEnd::Outcome(o) => o,
-            TurnEnd::Compact { .. } => unreachable!(),
+            TurnEnd::Compact { .. } | TurnEnd::Clear { .. } => unreachable!(),
         };
         for outcome in [
             Outcome::Done { text: "hi".into() },

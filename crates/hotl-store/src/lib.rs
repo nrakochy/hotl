@@ -144,6 +144,7 @@ pub enum EntryKind {
     QuestionResolved,
     Todos,
     GoalSet,
+    Cleared,
     Unknown,
 }
 
@@ -167,6 +168,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::QuestionResolved { .. } => EntryKind::QuestionResolved,
             EntryPayload::Todos { .. } => EntryKind::Todos,
             EntryPayload::GoalSet { .. } => EntryKind::GoalSet,
+            EntryPayload::Cleared { .. } => EntryKind::Cleared,
             EntryPayload::Unknown => EntryKind::Unknown,
         }
     }
@@ -1645,6 +1647,12 @@ fn apply_log(
                 items.extend(digest);
                 items.extend(tail);
             }
+            // Rewrites result *content* in place, never the item count — so
+            // every index a later `Compaction`/`BranchMove` carries still
+            // names the same item.
+            EntryPayload::Cleared { ids } => {
+                hotl_types::clear_results(items, &ids);
+            }
             EntryPayload::BranchMove { keep_items } => items.truncate(keep_items),
             EntryPayload::Supersede { digest } => items.extend(digest),
             EntryPayload::PendingAsk { id, summary, .. } => {
@@ -1937,6 +1945,78 @@ mod tests {
         assert!(!content.contains("w0rd"), "secret body leaked in any form");
         assert!(content.contains("«masked:HOTL_TEST_TOKEN»"));
         std::env::remove_var("HOTL_TEST_TOKEN");
+    }
+
+    /// The whole point of the cheap rung: the projection shrinks, the log
+    /// does not. `recall` reads the log, so the bytes have to still be there.
+    #[test]
+    fn cleared_entry_replaces_result_content_in_the_projection_and_keeps_the_log_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append(
+            &EntryPayload::Item {
+                item: Item::User {
+                    text: "find it".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+        log.append(
+            &EntryPayload::Item {
+                item: Item::ToolResults {
+                    results: vec![
+                        ToolResultItem {
+                            tool_use_id: "t1".into(),
+                            content: "SEVEN-THOUSAND-LINE-HAYSTACK".into(),
+                            is_error: false,
+                        },
+                        ToolResultItem {
+                            tool_use_id: "t2".into(),
+                            content: "kept verbatim".into(),
+                            is_error: false,
+                        },
+                    ],
+                },
+            },
+            3,
+        )
+        .unwrap();
+        log.append(
+            &EntryPayload::Cleared {
+                ids: vec!["t1".into()],
+            },
+            4,
+        )
+        .unwrap();
+
+        let replayed = replay(log.path()).expect("replay");
+        let Item::ToolResults { results } = &replayed.items[1] else {
+            panic!("expected the results item, got {:?}", replayed.items[1]);
+        };
+        assert!(
+            results[0]
+                .content
+                .starts_with("<cleared tool_use_id=\"t1\""),
+            "t1 is a stub: {}",
+            results[0].content
+        );
+        assert!(results[0].content.contains("bytes=28"), "size is named");
+        assert!(results[0].content.contains("turn=1"), "turn is named");
+        assert!(
+            !results[0].content.contains("HAYSTACK"),
+            "the projection no longer carries the body"
+        );
+        assert_eq!(results[1].content, "kept verbatim", "t2 is untouched");
+        assert!(replayed.warnings.is_empty());
+
+        let on_disk = std::fs::read_to_string(log.path()).unwrap();
+        assert!(
+            on_disk.contains("SEVEN-THOUSAND-LINE-HAYSTACK"),
+            "the log keeps everything — that is what recall reads"
+        );
     }
 
     #[test]

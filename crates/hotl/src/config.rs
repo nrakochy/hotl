@@ -407,6 +407,9 @@ pub struct ContextCfg {
     pub compaction_reset: Option<bool>,
     pub show_used_pct: Option<bool>,
     pub evict_tokens: Option<u64>,
+    /// How many of the newest user turns keep their tool results verbatim
+    /// before the ladder clears the rest (0057). `0` disables clearing.
+    pub keep_results: Option<usize>,
 }
 
 impl ContextCfg {

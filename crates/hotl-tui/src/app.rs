@@ -1475,6 +1475,12 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 },
             );
         }
+        // The rung below `compacted`: no history was lost, so the notice says
+        // so rather than sounding like a fold.
+        "cleared" => {
+            let count = v.get("count").and_then(Value::as_u64).unwrap_or(0);
+            notice(state, format!("cleared {count} results"));
+        }
         // `turn_done` rides in the prompt result; thinking stays in Sampling.
         _ => {}
     }

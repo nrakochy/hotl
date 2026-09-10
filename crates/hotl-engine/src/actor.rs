@@ -1368,6 +1368,23 @@ async fn on_turn_finished(
             )
             .await
         }
+        TurnEnd::Clear { ids, cont } => {
+            *ctx.carry_usage += usage;
+            usage = TokenUsage::default();
+            mispredictions = 0;
+            try_clear(
+                ctx.shared,
+                ctx.log,
+                ctx.head,
+                ctx.pipeline,
+                ids,
+                cont,
+                ctx.cmd_tx,
+                ctx.events,
+                ctx.current_turn,
+            )
+            .await
+        }
     };
     if let Some(outcome) = outcome {
         *ctx.compact_streak = 0;
@@ -1648,6 +1665,54 @@ async fn try_compact(
         }
         Err(message) => Some(Outcome::Error { message }),
     }
+}
+
+/// The ladder's cheap rung (0057): commit one `Cleared` entry, re-point the
+/// projection to the stubs, and respawn the continuation. No streak cap —
+/// unlike a fold this spends no model call and, being once per prompt
+/// (`TurnContinuation::cleared`), it cannot spiral.
+#[allow(clippy::too_many_arguments)]
+async fn try_clear(
+    shared: &Arc<SharedDeps>,
+    log: &mut SessionLog,
+    head: &mut Head,
+    pipeline: &mut Pipeline,
+    ids: Vec<String>,
+    cont: Box<crate::TurnContinuation>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
+    events: &mpsc::Sender<EngineEvent>,
+    current_turn: &Arc<Mutex<CancellationToken>>,
+) -> Option<Outcome> {
+    let cancel = current_turn
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    // Drain before reading `items`, exactly as `compact` does: a rewrite
+    // planned against the pre-drain projection would miss entries the drain
+    // landed.
+    pipeline.drain(head, Resolution::Abort).await;
+    if !shared
+        .append(
+            log,
+            pipeline,
+            head,
+            EntryPayload::Cleared { ids: ids.clone() },
+        )
+        .await
+    {
+        return Some(Outcome::Error {
+            message: "session log is sealed".into(),
+        });
+    }
+    let mut items = head.items().as_ref().clone();
+    let count = hotl_types::clear_results(&mut items, &ids);
+    head.repoint(items);
+    let _ = events.send(EngineEvent::Cleared { count }).await;
+    if cancel.is_cancelled() {
+        return Some(Outcome::Cancelled);
+    }
+    respawn_turn(shared, cmd_tx, events, cancel, *cont, None);
+    None // still running: same logical turn continues
 }
 
 /// Annotate + report a finished turn, then promote the next queued prompt.
