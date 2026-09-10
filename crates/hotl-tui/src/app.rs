@@ -627,6 +627,10 @@ pub struct State {
     /// one, so the countdown *is* the liveness; cleared by the first frame
     /// that proves the re-send landed.
     pub retry: Option<Retry>,
+    /// A model-backed fold is running (0061 T23, tracker #35). The actor is
+    /// blocked for a hook and a model call — up to two minutes with nothing
+    /// else on screen.
+    pub compacting: bool,
     /// Compacted pastes riding the current draft (`paste::Attachment`),
     /// keyed positionally to their `[Image #N]` / `[Pasted text #N …]`
     /// tokens. Lives here rather than in `Editor` so `$EDITOR` round-trips
@@ -709,6 +713,7 @@ impl State {
             tools_expanded: false,
             since_frame: 0,
             retry: None,
+            compacting: false,
             attachments: Vec::new(),
             selection: None,
             copy_notice: None,
@@ -1701,7 +1706,9 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 ),
             );
         }
+        "compacting" => state.compacting = true,
         "compacted" => {
+            state.compacting = false;
             let degraded = v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
             notice(
                 state,
@@ -1715,6 +1722,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // The rung below `compacted`: no history was lost, so the notice says
         // so rather than sounding like a fold.
         "cleared" => {
+            state.compacting = false;
             let count = v.get("count").and_then(Value::as_u64).unwrap_or(0);
             notice(state, format!("cleared {count} results"));
         }
@@ -1883,6 +1891,7 @@ fn on_prompt_result(
     state.work_ticks = 0;
     state.interrupt_sent = false;
     state.retry = None;
+    state.compacting = false;
     vec![Cmd::SetTitle(title(state, ""))]
 }
 
@@ -2445,6 +2454,7 @@ fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
     state.detached_turns += 1;
     state.phase = Phase::Idle;
     state.retry = None;
+    state.compacting = false;
     band_tidy(state);
     state.work_ticks = 0;
     state.interrupt_sent = false;
@@ -3834,6 +3844,30 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T23 (tracker #35): the fold blocks the actor for a hook and a
+    /// model call, and until now emitted nothing until it was over.
+    #[test]
+    fn a_compacting_frame_sets_the_fold_flag_and_compacted_clears_it() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"compacting","items":42}));
+        assert!(s.compacting);
+        upd(&mut s, json!({"type":"compacted","degraded":false}));
+        assert!(!s.compacting);
+    }
+
+    #[test]
+    fn cleared_and_the_prompt_result_also_clear_the_fold_flag() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"compacting","items":4}));
+        upd(&mut s, json!({"type":"cleared","count":2}));
+        assert!(!s.compacting);
+
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"compacting","items":4}));
+        on_result(&mut s, "done", None, &json!({}));
+        assert!(!s.compacting);
     }
 
     /// 0061 T22: a backoff parks a countdown, and the first frame that proves
@@ -5979,22 +6013,11 @@ mod tests {
         assert!(matches!(&cmds[..], [Cmd::SetTitle(t)] if t == "hotl"));
     }
 
-    /// Dead animation state: the compacting phase was defined, ticked,
-    /// exited, and animated, but never assigned outside tests (evaluation §7)
-    /// — the engine emits only `Compacted { degraded }`, a *completion*
-    /// signal. It is gone until the engine emits a compaction-*start* event
-    /// (this plan's RQ-3); the frames are preserved in the plan's Task 12 so
-    /// restoring it is a copy-paste.
-    #[test]
-    fn no_unreachable_phase_variants() {
-        let src = include_str!("app.rs");
-        // Split so this assertion is not its own counter-example.
-        let needle = concat!("Compact", "ing");
-        assert!(
-            !src.contains(needle),
-            "a phase nothing assigns must not ship — see RQ-3"
-        );
-    }
+    // `no_unreachable_phase_variants` retired here (0061 T23, decision 14):
+    // the engine now emits a compaction-*start* event, and the fold renders as
+    // a strip segment rather than a `Phase` variant — so a source grep for the
+    // word `Compacting` no longer says anything about reachability, and it was
+    // never a reachability check to begin with.
 
     #[test]
     fn compacted_and_retrying_become_notices() {

@@ -449,6 +449,13 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
     // it, so the strip kept saying `bash · 41s` while the engine tore down.
     // Replaces the phase segment on the phase's own clock; the card list goes
     // with it (the cards still show what is running).
+    // 0061 T23 (tracker #35): the actor is blocked for a hook and a model
+    // call. Progress, not a block, so the wave keeps moving on the phase's
+    // own ramp — but there is nothing else true to say meanwhile.
+    if state.compacting {
+        segs.push(Segment::keep("folding history…"));
+        return segs;
+    }
     // 0061 T22: a backoff is dead air — the phase used to keep animating its
     // old text through it. The countdown is the liveness.
     if let Some(retry) = &state.retry {
@@ -925,6 +932,24 @@ mod tests {
             delay_ticks: delay_ms.map(|ms| ms * TICK_HZ / 1000),
             ticks: 0,
         }
+    }
+
+    /// 0061 T23: the fold is the one thing worth saying while it runs — and
+    /// it is progress, not a block, so it takes the plain tone.
+    #[test]
+    fn the_strip_reads_folding_history_while_compacting() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.compacting = true;
+        assert_eq!(strip_text(&s), "folding history…");
+        let seg = &strip_segments(&s)[0];
+        assert_eq!(seg.tone, Tone::Plain);
+        assert_eq!(seg.rank, KEEP);
+        // A silence the fold explains must not also read as unexplained.
+        s.since_frame = 30 * TICK_HZ;
+        assert_eq!(strip_text(&s), "folding history…");
+        s.compacting = false;
+        assert_eq!(strip_text(&s), "thinking · 0s · quiet 30s");
     }
 
     /// 0061 T22: nothing is computing during a backoff, so the countdown is
