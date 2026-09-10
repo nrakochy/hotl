@@ -510,6 +510,16 @@ async fn run_loop(
     // is armed exactly when deltas can arrive; everything else draws now.
     let mut needs_draw = true;
     loop {
+        // 0061 T28: paint before the queue drains, not after. `SendPrompt`
+        // goes through `outbound`, which reads and base64-encodes every
+        // dropped image — seconds for a 4MB PNG — and until now the echo of
+        // what you typed waited behind all of it.
+        if needs_draw {
+            guard
+                .terminal
+                .draw(|f| view(&state, &palette, &mut cache, f))?;
+            needs_draw = false;
+        }
         while let Some(cmd) = queue.pop_front() {
             // The wire-bound half is shared with the e2e harness; what comes
             // back is the terminal-bound remainder this loop owns.
@@ -528,13 +538,17 @@ async fn run_loop(
                     let _ = execute!(io::stdout(), SetTitle(&title));
                 }
                 Cmd::AppendHistory(text) => history.append(&text),
+                // The three arms that feed `update` back: whatever they
+                // changed has to reach the screen before the next `select!`.
                 Cmd::CopySelection(sel) => {
                     let lines = copy_region(guard, &state, &palette, &mut cache, &sel)?;
                     queue.extend(update(&mut state, Msg::Copied { lines }));
+                    needs_draw = true;
                 }
                 Cmd::OpenEditor(text) => {
                     let content = suspended_editor(guard, suspended, &text);
                     queue.extend(update(&mut state, Msg::EditorDone(content)));
+                    needs_draw = true;
                 }
                 // The client-side half of `/reload`. The engine half is a wire
                 // request `exec_wire_cmd` already sent; these are the settings
@@ -555,14 +569,17 @@ async fn run_loop(
                             warnings: s.warnings,
                         },
                     ));
+                    needs_draw = true;
                 }
                 Cmd::Quit => return Ok(0),
                 // `exec_wire_cmd` handled every other variant.
                 handled => debug_assert!(false, "unhandled cmd: {handled:?}"),
             }
         }
-        // No `needs_draw = false` here: every path below reassigns it before
-        // this line runs again (redraw-only `continue`, or the loop bottom).
+        // Once more before parking: the drain's own `update` calls may have
+        // changed the screen since the paint at the top of the iteration.
+        // Every path out of `select!` reassigns `needs_draw`, so it is not
+        // cleared here.
         if needs_draw {
             guard
                 .terminal
