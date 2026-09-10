@@ -435,6 +435,31 @@ pub fn join(segs: &[Segment]) -> String {
 pub fn strip_segments(state: &State) -> Vec<Segment> {
     let secs = |ticks: u64| ticks / TICK_HZ;
     let mut segs = Vec::new();
+    // 0061 T20: Esc was invisible — `interrupt_sent` was set and nothing read
+    // it, so the strip kept saying `bash · 41s` while the engine tore down.
+    // Replaces the phase segment on the phase's own clock; the card list goes
+    // with it (the cards still show what is running).
+    if state.interrupt_sent && state.phase != Phase::Idle {
+        let ticks = match &state.phase {
+            Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => *ticks,
+            Phase::Tool { ticks, .. } => crate::app::running_cards(state)
+                .iter()
+                .map(|(_, _, t)| *t)
+                .max()
+                .unwrap_or(*ticks),
+            _ => 0,
+        };
+        segs.push(Segment::blocked(format!("interrupting · {}s", secs(ticks))));
+        if let Some(mins) = goal_minutes(state) {
+            segs.push(Segment {
+                text: format!("◎ /goal active · {mins}m"),
+                short: Some(format!("◎ {mins}m")),
+                rank: RANK_GOAL,
+                tone: Tone::Plain,
+            });
+        }
+        return segs;
+    }
     match &state.phase {
         // Idle is the only phase with room to spare, and the only one where
         // "which model is this?" is still an open question — every other arm
@@ -854,6 +879,43 @@ mod tests {
 
         s.usage_line = Some("120 in · 45 out".into());
         assert_eq!(strip_line(&s), resting("120 in · 45 out"));
+    }
+
+    /// 0061 T20: Esc used to be invisible — `interrupt_sent` was set and
+    /// nothing read it, so the strip kept reporting the work being torn down.
+    #[test]
+    fn an_interrupt_in_flight_reads_interrupting_on_the_phase_clock() {
+        let mut s = State::test_default();
+        s.interrupt_sent = true;
+        s.phase = Phase::Streaming {
+            ticks: 3 * TICK_HZ,
+            chars: 400,
+        };
+        assert_eq!(strip_text(&s), "interrupting · 3s");
+        s.phase = Phase::Sampling { ticks: 3 * TICK_HZ };
+        assert_eq!(strip_text(&s), "interrupting · 3s");
+        s.phase = Phase::Tool {
+            name: "bash".into(),
+            ticks: 3 * TICK_HZ,
+        };
+        assert_eq!(strip_text(&s), "interrupting · 3s", "the card list goes");
+
+        // Idle is not an interrupt in flight.
+        s.phase = Phase::Idle;
+        assert_eq!(strip_text(&s), "test-model");
+    }
+
+    /// The wave keeps moving: `Cmd::Cancel` is fire-and-forget and the engine
+    /// really is tearing down. A frozen wave under `interrupting` would read
+    /// as hung, which is the opposite of the truth.
+    #[test]
+    fn the_wave_keeps_moving_while_an_interrupt_is_in_flight() {
+        let mut s = State::test_default();
+        s.interrupt_sent = true;
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        let a = snake(&s.phase, 0);
+        let b = snake(&s.phase, TICK_HZ / 2);
+        assert_ne!(a, b, "the wave froze under an interrupt");
     }
 
     /// 0061 T19: the only honest thing a surface can say when nothing has

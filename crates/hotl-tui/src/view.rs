@@ -2544,6 +2544,9 @@ fn render_hint(state: &State, p: &Palette, frame: &mut Frame, area: Rect) {
         }
         _ if state.band_cursor.is_some() => "↑↓ move · enter open · esc back",
         _ if selected_spawn(state).is_some() => "↑↓ agents · esc back to main · pgup/pgdn scroll",
+        // 0061 T20: the first Esc is spent; say what the second one does.
+        // Below the modal hints, whose handlers own the keyboard outright.
+        _ if state.interrupt_sent => "esc again takes control back · ctrl-c quits",
         // Phase-aware (0049 T8): `esc interrupt` only while something runs.
         (Phase::Idle, true, Mode::Normal) => "i insert · j/k scroll · ? help · ctrl-g editor",
         (_, true, Mode::Normal) => "esc interrupt · i insert · ? help",
@@ -4344,6 +4347,24 @@ mod tests {
 
     /// The last resort when nothing droppable is left: the text is cut at a
     /// separator, never mid-token, and a lone overlong token is cut hard.
+    /// 0061 T20: the first Esc is spent, so the row says what the second one
+    /// does — in both editor modes.
+    #[test]
+    fn the_hint_names_the_second_esc_while_an_interrupt_is_in_flight() {
+        for vim in [false, true] {
+            let mut s = State::new(true, "m".into());
+            s.vim_mode = vim;
+            s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+            s.interrupt_sent = true;
+            let rows = draw(&s);
+            assert!(
+                rows[HINT].contains("esc again takes control back · ctrl-c quits"),
+                "vim={vim}: {}",
+                rows[HINT]
+            );
+        }
+    }
+
     /// 0061 T19: `fit_strip` hands back segments now, so the view can paint a
     /// blocked one loud — but the text they join to must be exactly what the
     /// single string used to be, at every width.

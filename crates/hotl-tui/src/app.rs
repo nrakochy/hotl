@@ -2027,7 +2027,8 @@ fn on_key(state: &mut State, key: KeyEvent) -> Vec<Cmd> {
             return vec![Cmd::Quit];
         }
         state.interrupt_sent = true;
-        notice(state, "interrupting — ctrl-c again quits".into());
+        // No notice (0061 T20): the strip says `interrupting` and the hint
+        // names the second press — a transcript item said it a third time.
         return vec![Cmd::Cancel];
     }
     // The help table scrolls on the arrow and page keys (0049 T7); every
@@ -2392,7 +2393,6 @@ fn scroll_route(state: &mut State, intent: crate::scroll::Intent) {
 fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
     if !state.interrupt_sent {
         state.interrupt_sent = true;
-        notice(state, "interrupting — esc again takes control back".into());
         return vec![Cmd::Cancel];
     }
     state.detached_turns += 1;
@@ -3769,6 +3769,37 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T20: the strip and the hint both say it now, so a transcript item
+    /// saying it a third time is noise the answer has to scroll past.
+    #[test]
+    fn an_interrupt_pushes_no_notice() {
+        for key in [KeyCode::Esc, KeyCode::Char('c')] {
+            let mut s = State::test_default();
+            s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+            let before = s.transcript.len();
+            if key == KeyCode::Esc {
+                press(&mut s, KeyCode::Esc); // Insert → Normal (0042 D2)
+                press(&mut s, KeyCode::Esc);
+            } else {
+                ctrl(&mut s, 'c');
+            }
+            assert!(s.interrupt_sent, "{key:?}");
+            assert_eq!(s.transcript.len(), before, "{key:?} pushed a notice");
+        }
+        // The detach notice stays: control changing hands is a fact about the
+        // session, not a repeat of the strip.
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Esc);
+        press(&mut s, KeyCode::Esc);
+        assert!(
+            matches!(s.transcript.last(), Some(TranscriptItem::Notice { .. })),
+            "{:?}",
+            s.transcript.last()
+        );
     }
 
     /// 0061 T19: anything off the wire is proof the engine is alive, whatever
@@ -5564,10 +5595,6 @@ mod tests {
         let cmds = press(&mut s, KeyCode::Esc);
         assert!(matches!(cmds[..], [Cmd::Cancel]));
         assert!(s.interrupt_sent);
-        assert!(
-            matches!(s.transcript.last(), Some(TranscriptItem::Notice { .. })),
-            "state notes the interrupt"
-        );
         let cmds = press(&mut s, KeyCode::Esc);
         assert_eq!(s.phase, Phase::Idle, "the second esc hands the prompt back");
         assert!(!s.interrupt_sent);
