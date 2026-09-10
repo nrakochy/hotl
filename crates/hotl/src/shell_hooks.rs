@@ -682,11 +682,13 @@ mod tests {
     async fn the_envelope_names_the_actor_main_or_the_child() {
         let seen = tempfile::tempdir().unwrap();
         let out = seen.path().join("actor.txt");
+        // A Windows backslash is an escape inside a TOML basic string; forward
+        // slashes parse and still resolve.
+        let out_toml = out.display().to_string().replace('\\', "/");
         let hooks = load_str(
             &format!(
                 "[[hook]]\nevent = \"pre_tool\"\n\
-                 command = \"jq -r .actor >> {}\"\n",
-                out.display()
+                 command = \"jq -r .actor >> {out_toml}\"\n",
             ),
             concurrency(),
         )
@@ -725,14 +727,15 @@ mod tests {
     async fn the_compact_events_name_the_actor_as_well() {
         let seen = tempfile::tempdir().unwrap();
         let out = seen.path().join("actor.txt");
+        // A Windows backslash is an escape inside a TOML basic string; forward
+        // slashes parse and still resolve.
+        let out_toml = out.display().to_string().replace('\\', "/");
         let hooks = load_str(
             &format!(
                 "[[hook]]\nevent = \"pre_compact\"\n\
-                 command = \"jq -r .actor >> {}\"\n\
+                 command = \"jq -r .actor >> {out_toml}\"\n\
                  [[hook]]\nevent = \"post_compact\"\n\
-                 command = \"jq -r .actor >> {}\"\n",
-                out.display(),
-                out.display()
+                 command = \"jq -r .actor >> {out_toml}\"\n",
             ),
             concurrency(),
         )
@@ -849,8 +852,11 @@ mod tests {
     async fn a_shell_post_compact_hook_sees_the_digest() {
         let out = tempfile::NamedTempFile::new().expect("tempfile");
         let path = out.path().to_str().expect("utf8").to_string();
+        // A Windows backslash is an escape inside a TOML basic string; forward
+        // slashes parse and still resolve.
+        let path_toml = path.replace('\\', "/");
         let hooks = load_str(
-            &format!("[[hook]]\nevent = \"post_compact\"\ncommand = \"cat > {path}\"\n"),
+            &format!("[[hook]]\nevent = \"post_compact\"\ncommand = \"cat > {path_toml}\"\n"),
             concurrency(),
         )
         .expect("hooks configured");
