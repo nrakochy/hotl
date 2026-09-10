@@ -14,7 +14,7 @@ homepage.workspace = true
 # chain and needs no `[features]` of its own. `hotl-provider` is featureless
 # and pure, pulled in for `Effort` alone.
 [dependencies]
-hotl-provider = { path = "../hotl-provider", version = "0.26.0" }
+hotl-provider = { path = "../hotl-provider", version = "0.27.0" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }

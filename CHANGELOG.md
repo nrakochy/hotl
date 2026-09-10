@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.27.0] - 2026-09-10
+
 ### Changed
 
 - **The transcript is quieter, and work reads as a second voice** (plan 0061).
