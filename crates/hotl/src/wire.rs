@@ -116,15 +116,21 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         EngineEvent::GoalChanged { condition } => {
             json!({"type": "goal_changed", "goal": condition})
         }
+        // `usage` is the goal loop's cumulative spend, the evaluator's own
+        // calls included — the raw `TokenUsage` shape, not `usage_frame`'s:
+        // `update_frame` has no session model to price it with, and the
+        // surfaces that render this line show tokens, not dollars.
         EngineEvent::GoalVerdict {
             verdict,
             reason,
             turns,
+            usage,
         } => json!({
             "type": "goal_verdict",
             "verdict": goal_verdict_tag(*verdict),
             "reason": reason,
             "turns": turns,
+            "usage": usage,
         }),
         // §S1 telemetry: a normal tagged frame (not a round-trip/result like
         // `Ask`/`Question`/`TurnDone`) — headline numbers plus the per-phase

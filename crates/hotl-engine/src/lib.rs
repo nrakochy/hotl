@@ -209,6 +209,9 @@ pub struct SpecDigest {
     pub prefix_end: usize,
     pub kept_from: usize,
     pub text: String,
+    /// What the speculative summarize cost. Carried so an adopted digest is
+    /// as honest about its spend as the inline fold (0051 decision 6).
+    pub usage: TokenUsage,
 }
 
 /// A human's answer to a permission ask. Widened from a
@@ -368,10 +371,14 @@ pub enum EngineEvent {
     },
     /// The goal evaluator's per-turn judgment (0034). `turns` counts
     /// evaluated turns since the goal was set (in-memory; resets on resume).
+    /// `usage` is the loop's cumulative spend since then, the evaluator's own
+    /// calls included — the surface reads spend from here, never from local
+    /// sums (0051 G4).
     GoalVerdict {
         verdict: GoalVerdictKind,
         reason: String,
         turns: u32,
+        usage: TokenUsage,
     },
     /// Loop-overhead instrument (§S1), flushed once when the turn task ends.
     /// UI/telemetry only — this NEVER becomes a session-log entry, so it

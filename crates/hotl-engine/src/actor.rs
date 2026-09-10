@@ -885,7 +885,11 @@ pub(crate) async fn run(
     let mut running = false;
     // The active goal (0034). In-memory beyond the seed, so the turn counter
     // resets on resume by design; the condition itself is durable (`GoalSet`).
-    let mut goal: Option<GoalState> = deps.initial_goal.take().map(GoalState::new);
+    let goal_started_ms = deps.clock.now_ms();
+    let mut goal: Option<GoalState> = deps
+        .initial_goal
+        .take()
+        .map(|c| GoalState::new(c, goal_started_ms));
     let mut queue: VecDeque<QueuedPrompt> = VecDeque::new();
     // Steers that arrived while a turn was live (or a tool batch open),
     // waiting for a boundary before they can be appended.
@@ -1111,7 +1115,9 @@ pub(crate) async fn run(
                 // active is a silent no-op — no tombstone, no event.
                 let clearing_nothing = condition.is_none() && goal.is_none();
                 if !clearing_nothing {
-                    goal = condition.clone().map(GoalState::new);
+                    // Resume/replace restarts the counters with the rest of it.
+                    let now_ms = shared.clock.now_ms();
+                    goal = condition.clone().map(|c| GoalState::new(c, now_ms));
                     let outcome = condition.is_none().then(|| "cleared".to_string());
                     let _ = shared
                         .append(
@@ -1295,14 +1301,32 @@ struct GoalState {
     /// turn that ran one, and by the stall itself — the pause is a rest, not
     /// a tombstone, so the next prompt starts from a full budget again.
     idle_turns: u32,
+    /// When the goal was set (or restored), for the progress line's elapsed.
+    started_ms: u64,
+    /// Tokens spent since then, the evaluator's own calls included (0051 G4)
+    /// — what the loop actually cost, not what the last turn cost.
+    spent: TokenUsage,
 }
 
 impl GoalState {
-    fn new(condition: String) -> Self {
+    fn new(condition: String, now_ms: u64) -> Self {
         Self {
             condition,
             turns: 0,
             idle_turns: 0,
+            started_ms: now_ms,
+            spent: TokenUsage::default(),
+        }
+    }
+
+    fn progress(&self, now_ms: u64) -> hotl_context::goal::GoalProgress {
+        hotl_context::goal::GoalProgress {
+            turns: self.turns,
+            elapsed_secs: now_ms.saturating_sub(self.started_ms) / 1_000,
+            input_tokens: self.spent.input_tokens
+                + self.spent.cache_read_input_tokens
+                + self.spent.cache_creation_input_tokens,
+            output_tokens: self.spent.output_tokens,
         }
     }
 }
@@ -1340,6 +1364,7 @@ async fn on_turn_finished(
                 ctx.events,
                 ctx.current_turn,
                 &mut unrecoverable,
+                ctx.carry_usage,
             )
             .await
         }
@@ -1374,6 +1399,7 @@ async fn on_turn_finished(
                         verdict: GoalVerdictKind::Errored,
                         reason: message.clone(),
                         turns: state.turns,
+                        usage: state.spent,
                     })
                     .await;
             }
@@ -1387,6 +1413,12 @@ async fn on_turn_finished(
             if let Some(state) = ctx.goal.as_mut() {
                 state.turns += 1;
                 let turns = state.turns;
+                // The turn's own tokens join the goal's running total before
+                // the evaluator reads the progress line, so the number the
+                // evaluator judges a token bound against is current.
+                state.spent += usage;
+                let now_ms = ctx.shared.clock.now_ms();
+                let progress = state.progress(now_ms);
                 // Esc during the evaluation returns control immediately: the
                 // eval races the turn's cancel token (`try_compact`'s
                 // pattern); cancel and timeout both fail open.
@@ -1396,14 +1428,23 @@ async fn on_turn_finished(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone();
                 let snapshot = Arc::clone(ctx.head.items());
-                let verdict = tokio::select! {
+                let (verdict, eval_usage) = tokio::select! {
                     biased;
-                    _ = cancel.cancelled() => None,
+                    _ = cancel.cancelled() => (None, TokenUsage::default()),
                     v = tokio::time::timeout(
                         GOAL_EVAL_TIMEOUT,
-                        evaluate_goal(ctx.shared, &snapshot[..], &state.condition),
-                    ) => v.ok().flatten(),
+                        evaluate_goal(ctx.shared, &snapshot[..], &state.condition, progress),
+                    ) => v.unwrap_or_default(),
                 };
+                // Before every branch (0051 decision 6): met, impossible,
+                // failed and stalled all report the evaluator's spend in the
+                // final TurnDone, and not-yet accumulates it like a
+                // compaction respawn.
+                state.spent += eval_usage;
+                *ctx.carry_usage += eval_usage;
+                // Captured now: the met/impossible arm tombstones the goal
+                // before it can report what the goal cost.
+                let spent = state.spent;
                 match verdict {
                     Some((GoalVerdict::NotYetMet, reason)) => {
                         let _ = ctx
@@ -1412,6 +1453,7 @@ async fn on_turn_finished(
                                 verdict: GoalVerdictKind::NotYet,
                                 reason: reason.clone(),
                                 turns,
+                                usage: spent,
                             })
                             .await;
                         // A turn that only talked is idle (0051 decision 1);
@@ -1435,6 +1477,7 @@ async fn on_turn_finished(
                                         "no tool ran in the last {GOAL_STALL_TURNS} goal turns"
                                     ),
                                     turns,
+                                    usage: spent,
                                 })
                                 .await;
                             // Falls through to `end_turn`: one TurnDone, as
@@ -1449,7 +1492,11 @@ async fn on_turn_finished(
                             // spend.
                             *ctx.carry_usage += usage;
                             *ctx.carry_mispredictions += mispredictions;
-                            let guidance = goal_guidance_text(&reason, &state.condition);
+                            let guidance = hotl_context::goal::guidance_text(
+                                &reason,
+                                &state.condition,
+                                state.progress(now_ms),
+                            );
                             *ctx.running = start_turn(
                                 ctx.shared,
                                 ctx.log,
@@ -1499,6 +1546,7 @@ async fn on_turn_finished(
                                 verdict: kind,
                                 reason,
                                 turns,
+                                usage: spent,
                             })
                             .await;
                     }
@@ -1511,6 +1559,7 @@ async fn on_turn_finished(
                                 verdict: GoalVerdictKind::EvalFailed,
                                 reason: "goal evaluation returned no verdict".into(),
                                 turns,
+                                usage: spent,
                             })
                             .await;
                     }
@@ -1556,6 +1605,9 @@ async fn try_compact(
     // Set when the streak cap is what ended the turn: no retry, fallback or
     // further fold can make room, so the goal gate must tombstone (0051 G6).
     unrecoverable: &mut bool,
+    // The fold's own summarize is spend the turn pays for, so it rides the
+    // same carry the turn's samples do (0051 decision 6).
+    carry_usage: &mut TokenUsage,
 ) -> Option<Outcome> {
     // INVARIANT: the streak counts folds with no intervening completed sample
     // — a long, productive turn folds as often as it needs to, and only a
@@ -1585,7 +1637,8 @@ async fn try_compact(
         }
     };
     match compacted {
-        Ok(degraded) => {
+        Ok((degraded, fold_usage)) => {
+            *carry_usage += fold_usage;
             let _ = events.send(EngineEvent::Compacted { degraded }).await;
             if cancel.is_cancelled() {
                 return Some(Outcome::Cancelled);
@@ -2167,7 +2220,7 @@ async fn compact(
     head: &mut Head,
     pipeline: &mut Pipeline,
     spec: Option<crate::SpecDigest>,
-) -> Result<bool, String> {
+) -> Result<(bool, TokenUsage), String> {
     // Drain-before-BUILD-and-mint (commit-protocol.md §conflict table, the
     // Abort arm's steps 3→5). Both halves are load-bearing and fail
     // differently: minting after the drain keeps the fold chained onto the
@@ -2185,6 +2238,7 @@ async fn compact(
     // so it never uses one; the turn doesn't speculate in reset mode.
     if !shared.config.compaction_reset {
         if let Some(spec) = spec {
+            let spec_usage = spec.usage;
             if spec.prefix_end < spec.kept_from && spec.kept_from <= head.items().len() {
                 let digest = vec![compaction::digest_item(&spec.text)];
                 let payload = EntryPayload::Compaction {
@@ -2201,7 +2255,7 @@ async fn compact(
                     kept_from: spec.kept_from,
                 };
                 head.repoint(compaction::apply(head.items(), &plan, &digest));
-                return Ok(false);
+                return Ok((false, spec_usage));
             }
         }
     }
@@ -2225,11 +2279,12 @@ async fn compact(
     let folded = &snapshot[plan.prefix_end..plan.kept_from];
     // Timeout or two failed attempts: the floor digest keeps the session moving
     // rather than ending the turn on housekeeping.
-    let (digest, degraded) =
-        match summarize_bounded(summarize(shared, folded), COMPACT_SUMMARIZE_TIMEOUT).await {
-            Some(text) => (vec![compaction::digest_item(&text)], false),
-            None => (vec![compaction::floor_digest()], true),
-        };
+    let (summary, fold_usage) =
+        summarize_bounded(summarize(shared, folded), COMPACT_SUMMARIZE_TIMEOUT).await;
+    let (digest, degraded) = match summary {
+        Some(text) => (vec![compaction::digest_item(&text)], false),
+        None => (vec![compaction::floor_digest()], true),
+    };
     let payload = EntryPayload::Compaction {
         digest: digest.clone(),
         prefix_end: plan.prefix_end,
@@ -2240,21 +2295,29 @@ async fn compact(
         return Err("session log is sealed".into());
     }
     head.repoint(compaction::apply(head.items(), &plan, &digest));
-    Ok(degraded)
+    Ok((degraded, fold_usage))
 }
 
 /// The inline fold's summarize under a wall-clock bound. `None` on either a
 /// failed summarize or an exceeded bound — both degrade to the floor digest,
 /// which is why one return type covers them. Split out from [`compact`] so the
-/// bound is testable without a session behind it.
+/// bound is testable without a session behind it. A summarize the bound cut
+/// off reports no spend: the future was dropped, so nothing came back to
+/// count.
 async fn summarize_bounded(
-    fut: impl std::future::Future<Output = Option<String>>,
+    fut: impl std::future::Future<Output = (Option<String>, TokenUsage)>,
     bound: std::time::Duration,
-) -> Option<String> {
-    tokio::time::timeout(bound, fut).await.ok().flatten()
+) -> (Option<String>, TokenUsage) {
+    tokio::time::timeout(bound, fut).await.unwrap_or_default()
 }
 
-pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Arc<Item>]) -> Option<String> {
+/// Returns the digest text and what producing it cost: housekeeping the
+/// session pays for is housekeeping the session's totals must show (0051
+/// decision 6).
+pub(crate) async fn summarize(
+    shared: &SharedDeps,
+    folded: &[Arc<Item>],
+) -> (Option<String>, TokenUsage) {
     let model = shared
         .config
         .fast_model
@@ -2284,12 +2347,16 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Arc<Item>]) -> Opti
         // the session key's ~15 req/min routing budget.
         cache_key: None,
     };
+    let mut spent = TokenUsage::default();
     for _ in 0..SUMMARIZE_ATTEMPTS {
         let mut stream = shared.provider.stream(request.clone());
         let mut text: Option<String> = None;
         while let Some(event) = stream.next().await {
             match event {
-                Ok(StreamEvent::Completed { blocks, .. }) => text = Some(assistant_text(&blocks)),
+                Ok(StreamEvent::Completed { blocks, usage, .. }) => {
+                    spent += usage;
+                    text = Some(assistant_text(&blocks));
+                }
                 Ok(_) => {}
                 Err(_) => {
                     text = None;
@@ -2304,10 +2371,10 @@ pub(crate) async fn summarize(shared: &SharedDeps, folded: &[Arc<Item>]) -> Opti
             }
         }
         if let Some(t) = text.filter(|t| !t.trim().is_empty()) {
-            return Some(t);
+            return (Some(t), spent);
         }
     }
-    None
+    (None, spent)
 }
 
 /// One goal evaluation against the durable projection (0034): `summarize`'s
@@ -2317,7 +2384,8 @@ async fn evaluate_goal(
     shared: &SharedDeps,
     items: &[Arc<Item>],
     condition: &str,
-) -> Option<(GoalVerdict, String)> {
+    progress: hotl_context::goal::GoalProgress,
+) -> (Option<(GoalVerdict, String)>, TokenUsage) {
     let model = shared
         .config
         .fast_model
@@ -2328,7 +2396,7 @@ async fn evaluate_goal(
         max_tokens: GOAL_EVAL_MAX_TOKENS,
         system: hotl_context::goal::GOAL_EVAL_SYSTEM.into(),
         items: Arc::new(vec![Arc::new(Item::User {
-            text: hotl_context::goal::eval_prompt(condition, items),
+            text: hotl_context::goal::eval_prompt(condition, progress, items),
             synthetic: None,
             images: Vec::new(),
         })]),
@@ -2343,12 +2411,18 @@ async fn evaluate_goal(
         // Keyless (0045 D2), as `summarize`.
         cache_key: None,
     };
+    // The evaluator is not free: its tokens are the goal loop's, and every
+    // attempt counts even when the reply is unparseable (0051 decision 6).
+    let mut spent = TokenUsage::default();
     for _ in 0..GOAL_EVAL_ATTEMPTS {
         let mut stream = shared.provider.stream(request.clone());
         let mut text: Option<String> = None;
         while let Some(event) = stream.next().await {
             match event {
-                Ok(StreamEvent::Completed { blocks, .. }) => text = Some(assistant_text(&blocks)),
+                Ok(StreamEvent::Completed { blocks, usage, .. }) => {
+                    spent += usage;
+                    text = Some(assistant_text(&blocks));
+                }
                 Ok(_) => {}
                 Err(_) => {
                     text = None;
@@ -2360,19 +2434,10 @@ async fn evaluate_goal(
             }
         }
         if let Some(v) = text.as_deref().and_then(hotl_context::goal::parse_verdict) {
-            return Some(v);
+            return (Some(v), spent);
         }
     }
-    None
-}
-
-/// The continuation's opening user item. The wrap happens here —
-/// `start_turn` commits synthetic prompts verbatim, it never wraps.
-fn goal_guidance_text(reason: &str, condition: &str) -> String {
-    format!(
-        "<system-reminder>Goal check — not yet met: {reason}\n\
-         Keep working toward the goal: {condition}</system-reminder>"
-    )
+    (None, spent)
 }
 
 /// A prompt waiting its turn (one-at-a-time promotion), with everything the
@@ -2828,13 +2893,22 @@ mod tests {
     /// this function, so the bound under test is the shipped one.
     #[tokio::test(start_paused = true)]
     async fn a_hung_inline_summarize_degrades_instead_of_wedging() {
-        let hung = summarize_bounded(std::future::pending(), COMPACT_SUMMARIZE_TIMEOUT).await;
+        let (hung, spent) =
+            summarize_bounded(std::future::pending(), COMPACT_SUMMARIZE_TIMEOUT).await;
         assert!(
             hung.is_none(),
             "a hung summarize must degrade to the floor digest, not stall the command loop"
         );
-        let answered = summarize_bounded(
-            std::future::ready(Some("DIGEST".to_string())),
+        assert_eq!(
+            spent,
+            hotl_types::TokenUsage::default(),
+            "a dropped future reports no spend"
+        );
+        let (answered, _) = summarize_bounded(
+            std::future::ready((
+                Some("DIGEST".to_string()),
+                hotl_types::TokenUsage::default(),
+            )),
             COMPACT_SUMMARIZE_TIMEOUT,
         )
         .await;
@@ -3447,8 +3521,9 @@ mod tests {
             prefix_end: 0,
             kept_from: 2,
             text: "folded".into(),
+            usage: hotl_types::TokenUsage::default(),
         };
-        let degraded = compact(&shared, &mut log, &mut head, &mut pipeline, Some(spec))
+        let (degraded, _) = compact(&shared, &mut log, &mut head, &mut pipeline, Some(spec))
             .await
             .expect("the fold must see the drained projection");
         assert!(!degraded);

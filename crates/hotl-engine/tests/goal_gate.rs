@@ -103,19 +103,20 @@ async fn not_yet_then_met_runs_two_turns_under_one_turn_done() {
 
     let seen = events_until_turn_done(&mut handle).await;
     // The one suppression the whole design rests on: the not-yet turn ended
-    // with NO TurnDone — the single final one carries the cumulative spend
-    // of both turns (two text_reply samples at 10 in / 5 out each).
+    // with NO TurnDone — the single final one carries the cumulative spend of
+    // both turns AND both evaluations (four samples at 10 in / 5 out each).
+    // The evaluator is not free, so it is not invisible (0051 decision 6).
     let Some(EngineEvent::TurnDone { outcome, usage, .. }) = seen.last() else {
         unreachable!()
     };
     assert!(matches!(outcome, Outcome::Done { .. }), "{outcome:?}");
     assert_eq!(
-        usage.input_tokens, 20,
-        "cumulative, not last-leg: {usage:?}"
+        usage.input_tokens, 40,
+        "cumulative, evaluator included: {usage:?}"
     );
     assert_eq!(
-        usage.output_tokens, 10,
-        "cumulative, not last-leg: {usage:?}"
+        usage.output_tokens, 20,
+        "cumulative, evaluator included: {usage:?}"
     );
     assert_eq!(
         verdicts(&seen),
@@ -133,6 +134,14 @@ async fn not_yet_then_met_runs_two_turns_under_one_turn_done() {
     // no tools, no thinking.
     let eval_req = &provider.requests()[1];
     assert!(eval_req.system.contains("VERDICT"), "{}", eval_req.system);
+    let hotl_types::Item::User { text, .. } = &*eval_req.items[0] else {
+        unreachable!()
+    };
+    assert!(
+        text.contains("<goal-condition>finish the work</goal-condition>"),
+        "{text}"
+    );
+    assert!(text.contains("Progress: turn 1 · "), "{text}");
     assert!(eval_req.tools.is_empty());
     assert!(!eval_req.thinking);
 
@@ -158,7 +167,12 @@ async fn not_yet_then_met_runs_two_turns_under_one_turn_done() {
     };
     assert!(text.contains("<system-reminder>"), "{text}");
     assert!(text.contains("nothing verified yet"), "{text}");
-    assert!(text.contains("finish the work"), "{text}");
+    // The condition is data, and the worker is told where it stands (0051 T4).
+    assert!(
+        text.contains("<goal-condition>finish the work</goal-condition>"),
+        "{text}"
+    );
+    assert!(text.contains("Progress: turn 1 · "), "{text}");
     // The tombstone: an achieved goal must never be restored by resume.
     assert_eq!(replayed.goal, None);
 }

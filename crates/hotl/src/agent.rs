@@ -2390,6 +2390,7 @@ impl Surface {
                 verdict,
                 reason,
                 turns,
+                ..
             } => match verdict {
                 hotl_engine::GoalVerdictKind::NotYet => {
                     eprintln!("· goal check (turn {turns}): not yet — {reason}")

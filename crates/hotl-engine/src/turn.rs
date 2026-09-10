@@ -504,15 +504,16 @@ fn spawn_speculation(
     Some(tokio::spawn(async move {
         let folded = &snapshot[plan.prefix_end..plan.kept_from];
         // A cancelled turn stops paying for a digest nobody will fold.
-        let text = tokio::select! {
+        let (text, usage) = tokio::select! {
             biased;
-            _ = cancel.cancelled() => None,
-            text = crate::actor::summarize(&shared, folded) => text,
-        }?;
+            _ = cancel.cancelled() => (None, hotl_types::TokenUsage::default()),
+            summarized = crate::actor::summarize(&shared, folded) => summarized,
+        };
         Some(crate::SpecDigest {
             prefix_end: plan.prefix_end,
             kept_from: plan.kept_from,
-            text,
+            text: text?,
+            usage,
         })
     }))
 }
@@ -3228,6 +3229,7 @@ mod tests {
                 prefix_end: 1,
                 kept_from: 4,
                 text: "DIGEST".into(),
+                usage: hotl_types::TokenUsage::default(),
             })
         });
         // Let the task complete before the race, so the assertion is about the

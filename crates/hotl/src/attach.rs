@@ -327,12 +327,24 @@ fn update_line(update: &Value) -> Option<String> {
                 Some(goal) => format!("· goal set: {goal}"),
                 None => "· goal cleared".to_string(),
             },
-            "goal_verdict" => format!(
-                "· goal check (turn {}): {} — {}",
-                n("turns"),
-                s("verdict"),
-                s("reason")
-            ),
+            "goal_verdict" => {
+                let mut line = format!(
+                    "· goal check (turn {}): {} — {}",
+                    n("turns"),
+                    s("verdict"),
+                    s("reason")
+                );
+                // Present since 0051; an older server omits it.
+                if let Some(usage) = update.get("usage") {
+                    let t = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+                    line.push_str(&format!(
+                        " · {} in / {} out",
+                        t("input_tokens"),
+                        t("output_tokens")
+                    ));
+                }
+                line
+            }
             "mode_changed" => format!("· permission mode → {}", s("mode")),
             _ => return None,
         },
@@ -444,6 +456,7 @@ mod tests {
                 verdict: hotl_engine::GoalVerdictKind::NotYet,
                 reason: "no commit yet".into(),
                 turns: 1,
+                usage: hotl_types::TokenUsage::default(),
             },
         ]
     }

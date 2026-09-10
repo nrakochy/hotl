@@ -84,6 +84,7 @@ fn every_frame_is_tagged_and_versioned() {
             verdict: hotl_engine::GoalVerdictKind::NotYet,
             reason: "no commit yet".into(),
             turns: 1,
+            usage: TokenUsage::default(),
         },
         EngineEvent::TurnDone {
             outcome: Outcome::Done { text: "ok".into() },
@@ -189,12 +190,21 @@ fn goal_frames_carry_their_payloads() {
             verdict: kind,
             reason: "because".into(),
             turns: 3,
+            usage: TokenUsage {
+                input_tokens: 40,
+                output_tokens: 20,
+                ..Default::default()
+            },
         })
         .unwrap();
         assert_eq!(f["type"], "goal_verdict");
         assert_eq!(f["verdict"], tag);
         assert_eq!(f["reason"], "because");
         assert_eq!(f["turns"], 3);
+        // 0051: the loop's cumulative spend, evaluator included, rides the
+        // verdict — the surface never sums it locally.
+        assert_eq!(f["usage"]["input_tokens"], 40);
+        assert_eq!(f["usage"]["output_tokens"], 20);
     }
 }
 
