@@ -273,10 +273,12 @@ async fn plan_mode_opens_the_turn_at_the_plan_rung() {
 #[tokio::test]
 async fn a_verify_only_batch_puts_the_next_turn_at_the_verify_rung() {
     let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    // The rung is read off the command *string*; the subprocess is incidental,
+    // so it is bounded — an unbounded `cargo test` here really does run one.
     provider.push_script(ScriptedProvider::tool_call(
         "t1",
         "bash",
-        json!({"command": "cargo test --workspace"}),
+        json!({"command": "cargo test --workspace", "timeout_ms": 2000}),
     ));
     provider.push_script(ScriptedProvider::text_reply("checked"));
     provider.push_script(ScriptedProvider::text_reply("next"));
@@ -300,8 +302,13 @@ async fn a_batch_that_edits_stays_at_the_implement_rung() {
     let file = dir.path().join("f.txt");
     std::fs::write(&file, "body").expect("fixture");
     let path = file.to_str().expect("utf8").to_string();
-    let mut batch =
-        ScriptedProvider::tool_call("t1", "bash", json!({"command": "cargo nextest run"}));
+    // Bounded like its siblings: green here only because the runner has no
+    // nextest, which is not something to depend on.
+    let mut batch = ScriptedProvider::tool_call(
+        "t1",
+        "bash",
+        json!({"command": "cargo nextest run", "timeout_ms": 2000}),
+    );
     if let Some(Ok(StreamEvent::Completed { blocks, .. })) = batch.last_mut() {
         blocks.push(json!({
             "type": "tool_use", "id": "t2", "name": "write",
@@ -327,15 +334,16 @@ async fn a_batch_that_edits_stays_at_the_implement_rung() {
 #[tokio::test]
 async fn the_rung_changes_only_at_turn_start() {
     let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    // Bounded for the same reason as above: the string is what is under test.
     provider.push_script(ScriptedProvider::tool_call(
         "t1",
         "bash",
-        json!({"command": "cargo test"}),
+        json!({"command": "cargo test", "timeout_ms": 2000}),
     ));
     provider.push_script(ScriptedProvider::tool_call(
         "t2",
         "bash",
-        json!({"command": "cargo test"}),
+        json!({"command": "cargo test", "timeout_ms": 2000}),
     ));
     provider.push_script(ScriptedProvider::text_reply("done"));
     let (mut handle, _dir) = session(provider.clone(), scheduled_config());
