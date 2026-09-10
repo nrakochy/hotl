@@ -186,6 +186,16 @@ pub enum TodoStatus {
     Unknown,
 }
 
+/// The `/goal` condition leaves the harness decides itself, as the help text
+/// lists them (0056 T5). Lives here rather than beside the parser
+/// (`hotl_context::goal`) because the TUI is a pure ACP client and must be
+/// able to print them without reaching into the engine's crates — the same
+/// reason [`normalize_goal`] lives here.
+pub const CONDITION_LEAVES: &str = "\
+tests_green(\"<command>\") · file_exists(\"<path>\") · \
+output_matches(\"<command>\", \"<glob>\") · no_edits_since_verify · turns <= N \
+· and / or / parentheses. Anything else is judged by a model.";
+
 /// A plan node. Everything past `active_form` is 0056 T1 — all defaulted and
 /// skipped when empty, so a v0.25 `Todos` entry still deserializes and a list
 /// that uses none of it serializes to the same bytes it always did.

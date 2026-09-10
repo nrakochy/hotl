@@ -2394,9 +2394,12 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                     (None, Some((c, word, turns))) => {
                         format!("◎ last goal {word} after {turns} turn(s) — {c}")
                     }
-                    (None, None) => "no goal set — /goal <condition> keeps the turn going \
-                                     until a fast evaluator judges it met"
-                        .into(),
+                    (None, None) => format!(
+                        "no goal set — /goal <condition> keeps the turn going until the \
+                         condition is satisfied. Checks the harness decides itself, no \
+                         model involved: {}",
+                        hotl_types::CONDITION_LEAVES
+                    ),
                 };
                 notice(state, report);
                 // The evaluator's own words, on their own line: what it says

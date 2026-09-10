@@ -789,3 +789,61 @@ async fn the_evaluator_prompt_carries_the_evidence_block() {
         "the rubric must reach the evaluator"
     );
 }
+
+/// T5: a false machine leaf settles the goal with no evaluator call at all —
+/// the scripted provider records exactly one request, the turn's own.
+#[tokio::test]
+async fn a_false_machine_leaf_calls_no_model() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        ScriptedProvider::text_reply("working"),
+        ScriptedProvider::text_reply("working still"),
+    ]));
+    let (mut handle, _) = session_with(provider.clone(), dir.path(), ran(0));
+    handle
+        .set_goal(Some("file_exists(\"never-written.json\")".into()))
+        .await;
+    handle.prompt("go".into()).await;
+    let seen = events_until_turn_done(&mut handle).await;
+
+    assert_eq!(
+        verdicts(&seen).first().map(|(k, _)| *k),
+        Some(GoalVerdictKind::NotYet)
+    );
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .all(|r| !r.system.contains("You judge whether an agent session")),
+        "a false machine leaf must settle the goal with no evaluator call"
+    );
+}
+
+/// …and a machine leaf that is true, with no prose left, says met without a
+/// model either.
+#[tokio::test]
+async fn a_true_machine_leaf_meets_the_goal_without_a_model() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("out.json"), "{}").expect("write");
+    let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "wrote it",
+    )]));
+    let (mut handle, _) = session_with(provider.clone(), dir.path(), ran(0));
+    handle
+        .set_goal(Some("file_exists(\"out.json\")".into()))
+        .await;
+    handle.prompt("go".into()).await;
+    let seen = events_until_turn_done(&mut handle).await;
+
+    assert_eq!(
+        verdicts(&seen).first().map(|(k, _)| *k),
+        Some(GoalVerdictKind::Met)
+    );
+    assert!(
+        provider
+            .requests()
+            .iter()
+            .all(|r| !r.system.contains("You judge whether an agent session")),
+        "a true machine leaf must meet the goal with no evaluator call"
+    );
+}

@@ -1622,31 +1622,60 @@ async fn on_turn_finished(
                 // may settle the condition outright, and the post-filter that
                 // refuses a `met` the validations refute.
                 let plan = ctx.head.plan_state();
-                let evidence = {
+                let (evidence, machine, prose) = {
                     let ledger = ctx
                         .shared
                         .command_ledger
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    hotl_context::goal::evidence_lines(
+                    let evidence = hotl_context::goal::evidence_lines(
                         &plan.todos,
                         &ledger,
                         &hotl_tools::rules::argv,
-                    )
+                    );
+                    let oracle = hotl_context::goal::Oracle {
+                        ledger: &ledger,
+                        cwd: &ctx.shared.cwd,
+                        turns,
+                        argv: &hotl_tools::rules::argv,
+                    };
+                    let partial = hotl_context::goal::evaluate_machine(
+                        &hotl_context::goal::parse(&state.condition),
+                        &oracle,
+                    );
+                    (evidence, partial.decided, partial.prose)
                 };
-                let (verdict, eval_usage) = tokio::select! {
-                    biased;
-                    _ = cancel.cancelled() => (None, TokenUsage::default()),
-                    v = tokio::time::timeout(
-                        GOAL_EVAL_TIMEOUT,
-                        evaluate_goal(
-                            ctx.shared,
-                            &snapshot[..],
-                            &state.condition,
-                            progress,
-                            &evidence,
-                        ),
-                    ) => v.unwrap_or_default(),
+                // A machine leaf that settled it needs no model at all — the
+                // cheapest verdict there is, and the one a transcript cannot
+                // argue with.
+                let settled = match (machine, prose.is_empty()) {
+                    (Some(false), _) => Some((
+                        GoalVerdict::NotYetMet,
+                        "a check in the condition is not satisfied".to_string(),
+                    )),
+                    (Some(true), true) => Some((
+                        GoalVerdict::Met,
+                        "every check in the condition is satisfied".to_string(),
+                    )),
+                    _ => None,
+                };
+                let (verdict, eval_usage) = if let Some(v) = settled {
+                    (Some(v), TokenUsage::default())
+                } else {
+                    // Only the prose remainder reaches the model.
+                    let condition = if prose.is_empty() {
+                        state.condition.clone()
+                    } else {
+                        prose.join(" and ")
+                    };
+                    tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => (None, TokenUsage::default()),
+                        v = tokio::time::timeout(
+                            GOAL_EVAL_TIMEOUT,
+                            evaluate_goal(ctx.shared, &snapshot[..], &condition, progress, &evidence),
+                        ) => v.unwrap_or_default(),
+                    }
                 };
                 // The post-filter (0056 T4): a `met` the harness's own
                 // observations contradict is downgraded, naming the command.
