@@ -392,6 +392,10 @@ pub struct ProviderCfg {
     pub auth: Option<String>,
     /// Cheap model for compaction summaries.
     pub fast_model: Option<String>,
+    /// Model for one-off housekeeping calls the session pays for but never
+    /// shows: compaction digests and goal evaluations. Absent = `fast_model`,
+    /// then the session model.
+    pub utility_model: Option<String>,
     /// Reasoning depth: either one rung (`low | medium | high | xhigh | max`)
     /// or a per-phase table (`{ plan = "xhigh", implement = "high" }`).
     /// Absent = the provider's default. Text, not a typed enum: an

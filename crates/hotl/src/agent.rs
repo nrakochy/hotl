@@ -3163,6 +3163,12 @@ fn engine_config(
     {
         config.fast_model = Some(DEFAULT_FAST_MODEL.into());
     }
+    // The one-off-call role (0059 T2). Left unset when nothing named it, so
+    // `EngineConfig::utility` can fall back through `fast_model` and `/cost`
+    // can still tell a configured role from an inherited one.
+    config.utility_model = secrets
+        .get("HOTL_UTILITY_MODEL")
+        .or_else(|| cfg.provider.utility_model.clone());
     if let Some(t) = secrets
         .get("HOTL_EVICT_TOKENS")
         .and_then(|v| v.parse().ok())
@@ -5804,6 +5810,31 @@ mod tests {
             .as_deref(),
             Some(DEFAULT_FAST_MODEL)
         );
+    }
+
+    #[test]
+    fn utility_model_defaults_to_fast_model() {
+        // Nothing named a utility model: the role falls through to the
+        // compaction fast model.
+        let (config, _) = engine_config(
+            "claude-opus-4-8",
+            &MapSecrets::default(),
+            &config_from_toml(""),
+        );
+        assert_eq!(config.utility_model, None);
+        assert_eq!(config.utility(), DEFAULT_FAST_MODEL);
+
+        // Neither named: the session model pays.
+        let (config, _) = engine_config("m", &MapSecrets::default(), &config_from_toml(""));
+        assert_eq!(config.utility(), "m");
+
+        // Named in config, and env beats it.
+        let cfg = config_from_toml("[provider]\nutility_model = \"cheap-1\"\n");
+        let (config, _) = engine_config("claude-opus-4-8", &MapSecrets::default(), &cfg);
+        assert_eq!(config.utility(), "cheap-1");
+        let secrets = MapSecrets::from([("HOTL_UTILITY_MODEL", "cheap-2")]);
+        let (config, _) = engine_config("claude-opus-4-8", &secrets, &cfg);
+        assert_eq!(config.utility(), "cheap-2");
     }
 
     #[test]

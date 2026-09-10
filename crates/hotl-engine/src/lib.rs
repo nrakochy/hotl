@@ -120,6 +120,11 @@ pub struct EngineConfig {
     pub context_window: u64,
     /// Housekeeping model (compaction summarize); defaults to `model`.
     pub fast_model: Option<String>,
+    /// The one-off-call role (0059 T2): compaction digests and goal
+    /// evaluations. Resolved by [`EngineConfig::utility`] — this field is the
+    /// explicit setting only, so `/cost` can still tell a configured role from
+    /// an inherited fallback.
+    pub utility_model: Option<String>,
     /// Reset-mode compaction (M4/#9): the continuation gets the preserved
     /// prefix + digest only, no verbatim tail — a fresh slate rather than a
     /// summarized-then-refilling window. Default false = M2 in-place behavior.
@@ -157,6 +162,18 @@ pub struct EngineConfig {
     pub ack_mode: AckMode,
 }
 
+impl EngineConfig {
+    /// The model a one-off call takes: `utility_model` → `fast_model` → the
+    /// session model. One resolver, so compaction and goal evaluation can
+    /// never drift onto different models.
+    pub fn utility(&self) -> String {
+        self.utility_model
+            .clone()
+            .or_else(|| self.fast_model.clone())
+            .unwrap_or_else(|| self.model.clone())
+    }
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -178,6 +195,7 @@ impl Default for EngineConfig {
             tool_failure_budget: 5,
             context_window: 200_000,
             fast_model: None,
+            utility_model: None,
             compaction_reset: false,
             show_context_pct: false,
             evict_threshold_tokens: 20_000,

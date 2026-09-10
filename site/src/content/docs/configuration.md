@@ -43,6 +43,8 @@ model = "openai/gpt-5"                      # provider/model; openai/ covers any
 base_url = "http://localhost:11434/v1"      # endpoint for the active provider
 auth = "api_key"                            # or "subscription": hotl holds no credential (requires base_url)
 fast_model = "..."                          # cheap model for compaction summaries; absent = claude-haiku-4-5 on catalogued Anthropic models, else the session model
+utility_model = "..."                       # model for one-off calls the session pays for but never shows
+                                            # (compaction digests, goal checks); absent = fast_model, then the session model
 effort = "high"                             # low | medium | high | xhigh | max; absent = xhigh on catalogued Anthropic models, else the provider's default
                                             # or a per-phase table, applied at turn start:
                                             # effort = { plan = "xhigh", implement = "high", verify = "xhigh" }
@@ -262,6 +264,7 @@ A refusal is a prompt: it names the offending component and tells the model to r
 | `HOTL_API_KEY_HELPER_TTL_SECS` | `[provider].api_key_helper_ttl_secs` | Overrides the config.toml key of the same name. |
 | `HOTL_CONTEXT_WINDOW` | `[context].window` | Context size in tokens; compaction fires at ~80%. From ~60% the summary is precomputed in the background, so the fold itself doesn't pause the session. Leave unset to get the [per-model window](#context-window-context-window). |
 | `HOTL_FAST_MODEL` | `[provider].fast_model` | Cheap model for compaction summaries. Absent everywhere: catalogued Anthropic sessions digest on `claude-haiku-4-5`; anything else keeps the session model. |
+| `HOTL_UTILITY_MODEL` | `[provider].utility_model` | Model for one-off housekeeping calls — compaction digests and `/goal` evaluations. Resolved `utility_model` → `fast_model` → the session model, so setting neither changes nothing. |
 | `HOTL_EFFORT` | `[provider].effort` | Reasoning depth: `low` \| `medium` \| `high` \| `xhigh` \| `max`. Unset defaults to `xhigh` on catalogued Anthropic models with effort support; other models get no depth field. An unrecognized value warns and is ignored. The env var is always a scalar; the config key also takes a per-phase table. |
 | `HOTL_EVICT_TOKENS` | `[context].evict_tokens` | Tool-result eviction threshold (`0` disables). |
 | `HOTL_PERMISSIONS` | `[permissions].mode` | `bypass` (default: no per-action asks) \| `ask` \| `dontask`; `auto` still parses as `bypass`, and a typo fails closed to `ask`. |
@@ -570,6 +573,17 @@ effort = "high"
 A model that accepts fewer rungs clamps to its nearest one rather than erroring, and ties clamp **downward**, toward the cheaper rung: guessing upward spends your money on an inference hotl cannot justify. The OpenAI-compatible dialect accepts only `low | medium | high` on the wire, so `xhigh`/`max` clamp to `high` there. A model with no effort support at all (today: `claude-haiku-4-5`) simply gets no field. A model hotl does not recognize is never *refused* an effort — hotl allowlists no model names, so the field goes out and the provider's own answer is what you see.
 
 `effort` and `thinking` stay two knobs. `HOTL_THINKING=0` turns extended thinking off; on an OpenAI-compatible endpoint that is spelled `reasoning_effort: "none"` and wins over any rung you set.
+
+### The utility model (`[provider] utility_model`)
+
+Some calls a session makes are not the conversation: the digest that compaction folds your history into, and the verdict `/goal` asks for after each turn. You pay for both and see neither, so they take their own model:
+
+```toml
+[provider]
+utility_model = "claude-haiku-4-5"
+```
+
+Resolution is `utility_model` → `fast_model` → the session model, in that order, and one resolver serves both call sites — compaction and goal evaluation can never end up on different models. Neither call inherits the session's reasoning effort or extended thinking, for the same reason: housekeeping at `max` rates is a cost nobody opts into.
 
 `/effort` in the console changes the rung mid-session and is recorded durably, so `hotl resume` keeps it. Sub-agents take their own rung from an `effort:` line in the agent def — see [agents.md](../agents/). Compaction never inherits the session's rung: folding your own history at `max` rates is a cost nobody opts into.
 

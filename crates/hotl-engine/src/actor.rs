@@ -2749,11 +2749,7 @@ pub(crate) async fn summarize(
     shared: &SharedDeps,
     folded: &[Arc<Item>],
 ) -> (Option<String>, TokenUsage) {
-    let model = shared
-        .config
-        .fast_model
-        .clone()
-        .unwrap_or_else(|| shared.config.model.clone());
+    let model = shared.config.utility();
     let request = SamplingRequest {
         model,
         max_tokens: SUMMARIZE_MAX_TOKENS,
@@ -2821,11 +2817,7 @@ async fn evaluate_goal(
     progress: hotl_context::goal::GoalProgress,
     evidence: &[hotl_context::goal::EvidenceLine],
 ) -> (Option<(GoalVerdict, String)>, TokenUsage) {
-    let model = shared
-        .config
-        .fast_model
-        .clone()
-        .unwrap_or_else(|| shared.config.model.clone());
+    let model = shared.config.utility();
     let request = SamplingRequest {
         model,
         max_tokens: GOAL_EVAL_MAX_TOKENS,
