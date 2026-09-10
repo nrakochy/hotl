@@ -296,6 +296,9 @@ fn update_line(update: &Value) -> Option<String> {
             "compacting" => format!("(folding history — {} items)", n("items")),
             "goal_evaluating" => format!("· evaluating goal (turn {})", n("turn")),
             // 0061 T26: the same text the console shows.
+            // 0061 T26: `-p --json` only today — the session server turns an
+            // `Ask` into its own `ask` frame — but the text is the console's,
+            // so a future broadcast reads the same on both surfaces.
             "ask_denied" => format!(
                 "· ask skipped — no human was attached to answer: {}",
                 s("summary")
@@ -451,6 +454,7 @@ mod tests {
                 ahead: 2,
             },
             EngineEvent::GoalEvaluating { turn: 3 },
+            EngineEvent::Compacting { items: 42 },
             EngineEvent::ToolDenied {
                 id: "t2".into(),
                 name: "write".into(),
