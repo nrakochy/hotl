@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.26.0] - 2026-09-10
+
 ### Removed
 
 - **`hotl undo` and the shadow-git snapshot store** (plan 0054). Session
