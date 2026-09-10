@@ -276,7 +276,7 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             // reason. Running-child glyphs ride the parent ticks hashed above.
             calls.len().hash(&mut h);
             for c in calls {
-                (&c.id, c.ok).hash(&mut h);
+                (&c.id, c.ok, c.lines, c.bytes).hash(&mut h);
             }
             children.len().hash(&mut h);
             for c in children {
@@ -2699,7 +2699,12 @@ mod tests {
             summary: summary.into(),
             status,
             ticks,
-            calls: vec![crate::app::ToolCall { id: id.into(), ok }],
+            calls: vec![crate::app::ToolCall {
+                id: id.into(),
+                ok,
+                lines: None,
+                bytes: None,
+            }],
             children: Vec::new(),
             child_text: String::new(),
         }
@@ -4129,6 +4134,8 @@ mod tests {
                 calls.push(crate::app::ToolCall {
                     id: (*id).into(),
                     ok: Some(true),
+                    lines: None,
+                    bytes: None,
                 });
             }
         }
@@ -4836,6 +4843,23 @@ mod tests {
         *ticks = to;
     }
 
+    /// 0061 T2: unlike a child's tokens, a call's line count IS rendered —
+    /// it must invalidate the cached rows when it lands.
+    #[test]
+    fn a_calls_line_count_enters_the_fingerprint() {
+        let a = tool_item("t1", "bash", "cargo build", ToolStatus::Done, 0);
+        let mut b = a.clone();
+        if let TranscriptItem::Tool { calls, .. } = &mut b {
+            calls[0].lines = Some(1204);
+        }
+        assert_ne!(item_fingerprint(&a), item_fingerprint(&b));
+        let mut c = b.clone();
+        if let TranscriptItem::Tool { calls, .. } = &mut c {
+            calls[0].bytes = Some(51_233);
+        }
+        assert_ne!(item_fingerprint(&b), item_fingerprint(&c));
+    }
+
     /// 0044: a child's token total is drill-in data, like its tick stamps —
     /// it must not re-wrap the spawn card when the done frame lands.
     #[test]
@@ -4999,8 +5023,15 @@ mod tests {
                     10 => calls.push(crate::app::ToolCall {
                         id: "t2".into(),
                         ok: None,
+                        lines: None,
+                        bytes: None,
                     }),
-                    15 => calls.last_mut().unwrap().ok = Some(true),
+                    15 => {
+                        let c = calls.last_mut().unwrap();
+                        c.ok = Some(true);
+                        c.lines = Some(1204);
+                        c.bytes = Some(51_233);
+                    }
                     25 => children.push(crate::app::ChildCall {
                         id: "c1".into(),
                         name: "read".into(),

@@ -351,6 +351,10 @@ pub enum ToolStatus {
 pub struct ToolCall {
     pub id: String,
     pub ok: Option<bool>,
+    /// What the model received (0061 T1). `None` = an older peer that sends
+    /// no counts, which renders as no result row rather than `0 lines`.
+    pub lines: Option<u64>,
+    pub bytes: Option<u64>,
 }
 
 /// A sub-agent's tool call, nested on its spawn card (0039).
@@ -1167,7 +1171,12 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     && merge_key(prev_summary) == key
                     && !matches!(prev_status, ToolStatus::Failed | ToolStatus::Denied)
                 {
-                    calls.push(ToolCall { id, ok: None });
+                    calls.push(ToolCall {
+                        id,
+                        ok: None,
+                        lines: None,
+                        bytes: None,
+                    });
                     *prev_summary = key.to_string();
                     *prev_status = status;
                     state.phase = Phase::Tool { name, ticks: 0 };
@@ -1180,7 +1189,12 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 summary,
                 status,
                 ticks: 0,
-                calls: vec![ToolCall { id, ok: None }],
+                calls: vec![ToolCall {
+                    id,
+                    ok: None,
+                    lines: None,
+                    bytes: None,
+                }],
                 children: Vec::new(),
                 child_text: String::new(),
             });
@@ -1193,6 +1207,10 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // settles only when every absorbed call has (D4: any failed → Failed).
         "tool_done" => {
             let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+            // Absent from an older peer, and absent is not zero: no counts
+            // means no result row at all (0061 T1).
+            let lines = v.get("lines").and_then(Value::as_u64);
+            let bytes = v.get("bytes").and_then(Value::as_u64);
             let id = text_of("id");
             let mut found = false;
             if let Some(TranscriptItem::Tool { status, calls, .. }) =
@@ -1204,6 +1222,8 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 found = true;
                 if let Some(call) = calls.iter_mut().find(|c| c.id == id && c.ok.is_none()) {
                     call.ok = Some(ok);
+                    call.lines = lines;
+                    call.bytes = bytes;
                 }
                 if calls.iter().all(|c| c.ok.is_some()) {
                     *status = if calls.iter().any(|c| c.ok == Some(false)) {
@@ -1233,6 +1253,8 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     calls: vec![ToolCall {
                         id: id2,
                         ok: Some(ok),
+                        lines,
+                        bytes,
                     }],
                     children: Vec::new(),
                     child_text: String::new(),
@@ -1255,6 +1277,8 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 calls: vec![ToolCall {
                     id,
                     ok: Some(false),
+                    lines: None,
+                    bytes: None,
                 }],
                 children: Vec::new(),
                 child_text: String::new(),
@@ -3332,6 +3356,8 @@ mod tests {
             calls: vec![ToolCall {
                 id: "t1".into(),
                 ok: None,
+                lines: None,
+                bytes: None,
             }],
             children: Vec::new(),
             child_text: String::new(),
@@ -4227,6 +4253,59 @@ mod tests {
             panic!("the merged card is the last item");
         };
         assert_eq!(*ticks, 2, "the clock resumed instead of resetting");
+    }
+
+    /// 0061 T2: the counts on `tool_done` land on the call that settled, so
+    /// the card can render `N lines` without the stream carrying the body.
+    #[test]
+    fn tool_done_records_line_and_byte_counts_on_its_call() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"cargo build"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"bash","ok":true,"lines":1204,"bytes":51233}),
+        );
+        let Some(TranscriptItem::Tool { calls, .. }) = s.transcript.last() else {
+            panic!("the card is the last item");
+        };
+        assert_eq!(calls[0].lines, Some(1204));
+        assert_eq!(calls[0].bytes, Some(51_233));
+    }
+
+    /// An older peer sends no counts. `None` is not `0`: the card must render
+    /// no result row at all rather than claiming the tool printed nothing.
+    #[test]
+    fn tool_done_without_counts_leaves_them_none() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"cargo build"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"p1","name":"bash","ok":true}),
+        );
+        let Some(TranscriptItem::Tool { calls, .. }) = s.transcript.last() else {
+            panic!("the card is the last item");
+        };
+        assert_eq!(calls[0].lines, None);
+        assert_eq!(calls[0].bytes, None);
+
+        // The no-card fallback (§2b Respond) carries them too.
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type":"tool_done","id":"r1","name":"read","ok":true,"lines":3,"bytes":5}),
+        );
+        let Some(TranscriptItem::Tool { calls, .. }) = s.transcript.last() else {
+            panic!("the fallback card is the last item");
+        };
+        assert_eq!((calls[0].lines, calls[0].bytes), (Some(3), Some(5)));
     }
 
     /// 0039 D3: failures are never laundered — a retry after a failed call
