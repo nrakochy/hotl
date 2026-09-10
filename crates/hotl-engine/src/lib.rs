@@ -423,6 +423,14 @@ pub enum GoalVerdictKind {
     Met,
     Impossible,
     EvalFailed,
+    /// The loop paused: `GOAL_STALL_TURNS` consecutive not-yet verdicts with
+    /// no tool executed. The goal STAYS SET — the next user prompt re-arms it
+    /// with a fresh idle budget (0051 G1).
+    Stalled,
+    /// The goal is tombstoned: the turn ended in an error only the owner can
+    /// clear (auth, 401/402/403/404, context exhausted). Resume must never
+    /// re-arm the loop against a dead credential (0051 G6).
+    Errored,
 }
 
 /// One entry a turn task proposes to the actor, already serialized and

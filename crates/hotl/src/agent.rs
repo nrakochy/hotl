@@ -2403,6 +2403,18 @@ impl Surface {
                 hotl_engine::GoalVerdictKind::EvalFailed => {
                     eprintln!("· goal check failed — no verdict; the goal stays active")
                 }
+                hotl_engine::GoalVerdictKind::Stalled => {
+                    eprintln!(
+                        "· goal paused after {turns} turn(s) without a tool call — it stays \
+                         set; the next prompt re-arms it"
+                    )
+                }
+                hotl_engine::GoalVerdictKind::Errored => {
+                    eprintln!(
+                        "· goal cleared after an unrecoverable error — {reason}; run --goal \
+                         again to continue"
+                    )
+                }
             },
             // §S1 telemetry, not a human-facing update — the headless
             // terminal renderer has nothing to show for it.

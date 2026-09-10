@@ -155,6 +155,8 @@ fn goal_verdict_tag(verdict: hotl_engine::GoalVerdictKind) -> &'static str {
         hotl_engine::GoalVerdictKind::Met => "met",
         hotl_engine::GoalVerdictKind::Impossible => "impossible",
         hotl_engine::GoalVerdictKind::EvalFailed => "eval_failed",
+        hotl_engine::GoalVerdictKind::Stalled => "stalled",
+        hotl_engine::GoalVerdictKind::Errored => "error",
     }
 }
 

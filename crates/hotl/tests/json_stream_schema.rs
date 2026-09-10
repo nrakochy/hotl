@@ -182,6 +182,8 @@ fn goal_frames_carry_their_payloads() {
         (hotl_engine::GoalVerdictKind::Met, "met"),
         (hotl_engine::GoalVerdictKind::Impossible, "impossible"),
         (hotl_engine::GoalVerdictKind::EvalFailed, "eval_failed"),
+        (hotl_engine::GoalVerdictKind::Stalled, "stalled"),
+        (hotl_engine::GoalVerdictKind::Errored, "error"),
     ] {
         let f = wire::update_frame(&EngineEvent::GoalVerdict {
             verdict: kind,

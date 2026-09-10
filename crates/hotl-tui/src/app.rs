@@ -1308,6 +1308,15 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                     "impossible" => {
                         format!("◎ goal impossible after {turns} turn(s) — {reason}")
                     }
+                    // The goal stays set here: only `goal_changed` clears it.
+                    "stalled" => format!(
+                        "◎ goal paused after {turns} turn(s) without a tool call — it stays \
+                         set; your next prompt re-arms it"
+                    ),
+                    "error" => format!(
+                        "◎ goal cleared after an unrecoverable error — {reason}; run /goal \
+                         again to continue"
+                    ),
                     _ => "◎ goal check failed — no verdict; the goal stays active".into(),
                 },
             );
@@ -5879,6 +5888,47 @@ mod tests {
             "{}",
             last_notice(&s)
         );
+    }
+
+    /// A `stalled` verdict names what to do next and leaves the goal alone:
+    /// the clear, when it comes, arrives as `goal_changed` — never inferred
+    /// from a verdict tag (0051 T1).
+    #[test]
+    fn goal_verdict_stalled_and_error_notices_name_the_next_step() {
+        let mut s = State::test_default();
+        upd(
+            &mut s,
+            json!({"type": "goal_changed", "goal": "tests pass"}),
+        );
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "stalled",
+                   "reason": "no tool ran in the last 8 goal turns", "turns": 8}),
+        );
+        let text = last_notice(&s);
+        assert!(
+            text.contains("◎ goal paused after 8 turn(s) without a tool call"),
+            "{text}"
+        );
+        assert!(text.contains("your next prompt re-arms it"), "{text}");
+        assert_eq!(
+            s.goal.as_deref(),
+            Some("tests pass"),
+            "a stall must not clear the goal locally"
+        );
+
+        upd(
+            &mut s,
+            json!({"type": "goal_verdict", "verdict": "error",
+                   "reason": "authentication failed: revoked", "turns": 2}),
+        );
+        let text = last_notice(&s);
+        assert!(
+            text.contains("◎ goal cleared after an unrecoverable error"),
+            "{text}"
+        );
+        assert!(text.contains("authentication failed: revoked"), "{text}");
+        assert!(text.contains("run /goal again to continue"), "{text}");
     }
 
     /// Durable session state, like `mode_changed`: a detached turn's goal
