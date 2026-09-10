@@ -355,6 +355,20 @@ pub enum ToolStatus {
     AutoAllowed { rule: String },
 }
 
+/// A backoff the surface is counting down (0061 T22).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Retry {
+    pub attempt: u64,
+    /// The ladder's ceiling; `None` from a peer that does not send one.
+    pub max: Option<u64>,
+    /// `HTTP 429`, or the first words of the reason when there was no status.
+    pub status: String,
+    /// The sleep the provider said it would take; `None` from an older peer,
+    /// which simply gets no countdown.
+    pub delay_ticks: Option<u64>,
+    pub ticks: u64,
+}
+
 /// One call absorbed into a tool card (0039 D5). `ok: None` = outstanding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
@@ -609,6 +623,10 @@ pub struct State {
     /// and a `quiet Ns` past `anim::QUIET_AFTER` is the one honest thing a
     /// surface can say when nothing has arrived.
     pub since_frame: u64,
+    /// A provider backoff in flight (0061 T22). Nothing is computing during
+    /// one, so the countdown *is* the liveness; cleared by the first frame
+    /// that proves the re-send landed.
+    pub retry: Option<Retry>,
     /// Compacted pastes riding the current draft (`paste::Attachment`),
     /// keyed positionally to their `[Image #N]` / `[Pasted text #N …]`
     /// tokens. Lives here rather than in `Editor` so `$EDITOR` round-trips
@@ -690,6 +708,7 @@ impl State {
             thinking_expanded: false,
             tools_expanded: false,
             since_frame: 0,
+            retry: None,
             attachments: Vec::new(),
             selection: None,
             copy_notice: None,
@@ -1177,9 +1196,11 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
     match kind {
         "text_delta" => {
             append_assistant(state, &text_of("text"));
+            state.retry = None;
             enter_streaming(state);
         }
         "tool_start" => {
+            state.retry = None;
             let id = text_of("id");
             let status = match state.pending_auto_rules.remove(&id) {
                 Some(rule) => ToolStatus::AutoAllowed { rule },
@@ -1414,6 +1435,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 // pass, since `Streaming.chars` counts Assistant text only.
                 // A `Tool` phase with running cards keeps the strip on the
                 // cards (0049 T1b), so only `Streaming` is corrected.
+                state.retry = None;
                 if matches!(state.phase, Phase::Streaming { .. }) {
                     state.phase = Phase::Sampling { ticks: 0 };
                 }
@@ -1544,6 +1566,23 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 state,
                 format!("retrying (attempt {attempt}) — {}", text_of("reason")),
             );
+            // The countdown the strip runs (0061 T22): the phase kept
+            // animating its old text through the whole backoff, which read as
+            // work in progress when nothing at all was computing.
+            let reason = text_of("reason");
+            state.retry = Some(Retry {
+                attempt,
+                max: v.get("max").and_then(Value::as_u64),
+                status: match v.get("status").and_then(Value::as_u64) {
+                    Some(code) => format!("HTTP {code}"),
+                    None => reason.chars().take(24).collect(),
+                },
+                delay_ticks: v
+                    .get("delay_ms")
+                    .and_then(Value::as_u64)
+                    .map(|ms| ms * crate::anim::TICK_HZ / 1000),
+                ticks: 0,
+            });
         }
         "fallback_model" => {
             state.model = text_of("model");
@@ -1843,6 +1882,7 @@ fn on_prompt_result(
     band_tidy(state);
     state.work_ticks = 0;
     state.interrupt_sent = false;
+    state.retry = None;
     vec![Cmd::SetTitle(title(state, ""))]
 }
 
@@ -2404,6 +2444,7 @@ fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
     }
     state.detached_turns += 1;
     state.phase = Phase::Idle;
+    state.retry = None;
     band_tidy(state);
     state.work_ticks = 0;
     state.interrupt_sent = false;
@@ -3038,6 +3079,9 @@ fn on_tick(state: &mut State) {
         // Silence only counts while a turn is running: waiting on you is not
         // the engine being quiet.
         state.since_frame += 1;
+        if let Some(retry) = &mut state.retry {
+            retry.ticks += 1;
+        }
         // EVERY running card ticks (0037), not just the newest: a sibling's
         // tool_done keeps the phase in `Tool` on the oldest card's clock
         // (0049 T1b); running cards tick regardless. Bounded to this turn:
@@ -3790,6 +3834,72 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T22: a backoff parks a countdown, and the first frame that proves
+    /// the re-send landed clears it.
+    #[test]
+    fn a_retrying_frame_parks_a_countdown_that_the_next_delta_clears() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":2,"max":5,"reason":"HTTP 429: slow","delay_ms":4000,"status":429}),
+        );
+        let retry = s.retry.clone().expect("the backoff parked");
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(retry.max, Some(5));
+        assert_eq!(retry.status, "HTTP 429");
+        assert_eq!(retry.delay_ticks, Some(4 * crate::anim::TICK_HZ));
+        upd(&mut s, json!({"type":"text_delta","text":"back"}));
+        assert!(s.retry.is_none(), "the delta proved the re-send landed");
+
+        // A thinking delta counts too.
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"stream idle for 300s"}),
+        );
+        let retry = s.retry.clone().expect("the backoff parked");
+        assert_eq!(retry.max, None);
+        assert_eq!(
+            retry.status, "stream idle for 300s",
+            "no status, the reason"
+        );
+        assert_eq!(retry.delay_ticks, None, "an older peer sends no delay");
+        upd(&mut s, json!({"type":"thinking_delta","text":"mm"}));
+        assert!(s.retry.is_none());
+    }
+
+    #[test]
+    fn a_tool_start_clears_the_retry() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"boom"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: ls"}),
+        );
+        assert!(s.retry.is_none());
+    }
+
+    /// The countdown rides the same clock everything else does: it advances
+    /// only while a turn runs.
+    #[test]
+    fn retry_ticks_advance_only_while_running() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"boom"}),
+        );
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.retry.as_ref().unwrap().ticks, 1);
+        s.phase = Phase::Idle;
+        update(&mut s, Msg::Tick);
+        assert_eq!(s.retry.as_ref().unwrap().ticks, 1, "idle ticks nothing");
     }
 
     /// 0061 T21: thinking is not writing. `enter_streaming` on a thinking

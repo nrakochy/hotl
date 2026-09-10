@@ -339,6 +339,16 @@ pub fn ramp_ends(phase: &Phase, p: &Palette) -> (Color, Color) {
     }
 }
 
+/// The wave the strip actually shows. At rest during a backoff (0061 T22):
+/// nothing is computing, and a moving wave would claim otherwise. An
+/// interrupt keeps moving — the engine really is tearing down.
+pub fn snake_for(state: &State) -> String {
+    if state.retry.is_some() {
+        return at_rest();
+    }
+    snake(&state.phase, state.work_ticks)
+}
+
 /// The strip's colors, cell by cell: the phase gradient sampled across
 /// `WIDTH`.
 pub fn snake_ramp(phase: &Phase, p: &Palette) -> Vec<Color> {
@@ -439,6 +449,25 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
     // it, so the strip kept saying `bash · 41s` while the engine tore down.
     // Replaces the phase segment on the phase's own clock; the card list goes
     // with it (the cards still show what is running).
+    // 0061 T22: a backoff is dead air — the phase used to keep animating its
+    // old text through it. The countdown is the liveness.
+    if let Some(retry) = &state.retry {
+        let of = match retry.max {
+            Some(max) => format!("{}/{max}", retry.attempt),
+            None => format!("#{}", retry.attempt),
+        };
+        let mut text = format!("retrying {of} · {}", retry.status);
+        if let Some(delay) = retry.delay_ticks {
+            let left = delay.saturating_sub(retry.ticks);
+            text.push_str(&if left == 0 {
+                " · now".to_string()
+            } else {
+                format!(" · {}s left", left.div_ceil(TICK_HZ))
+            });
+        }
+        segs.push(Segment::blocked(text));
+        return segs;
+    }
     if state.interrupt_sent && state.phase != Phase::Idle {
         let ticks = match &state.phase {
             Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => *ticks,
@@ -574,7 +603,7 @@ fn goal_minutes(state: &State) -> Option<u64> {
 /// The view renders the two parts separately (only the snake is gradient-lit);
 /// this is the form tests pin and the form any non-styled consumer wants.
 pub fn strip_line(state: &State) -> String {
-    let snake = snake(&state.phase, state.work_ticks);
+    let snake = snake_for(state);
     match strip_text(state) {
         t if t.is_empty() => snake,
         t => format!("{snake} {t}"),
@@ -886,6 +915,61 @@ mod tests {
 
         s.usage_line = Some("120 in · 45 out".into());
         assert_eq!(strip_line(&s), resting("120 in · 45 out"));
+    }
+
+    fn parked(attempt: u64, max: Option<u64>, delay_ms: Option<u64>) -> crate::app::Retry {
+        crate::app::Retry {
+            attempt,
+            max,
+            status: "HTTP 429".into(),
+            delay_ticks: delay_ms.map(|ms| ms * TICK_HZ / 1000),
+            ticks: 0,
+        }
+    }
+
+    /// 0061 T22: nothing is computing during a backoff, so the countdown is
+    /// the only liveness there is — and it is in whole seconds, rounded up,
+    /// so it never shows `0s left` while still waiting.
+    #[test]
+    fn the_retry_readout_counts_down_in_whole_seconds() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.retry = Some(parked(2, Some(5), Some(4000)));
+        assert_eq!(strip_text(&s), "retrying 2/5 · HTTP 429 · 4s left");
+        s.retry.as_mut().unwrap().ticks = TICK_HZ;
+        assert_eq!(strip_text(&s), "retrying 2/5 · HTTP 429 · 3s left");
+        s.retry.as_mut().unwrap().ticks = 4 * TICK_HZ;
+        assert_eq!(strip_text(&s), "retrying 2/5 · HTTP 429 · now");
+    }
+
+    #[test]
+    fn a_retry_without_a_max_reads_as_a_hash_attempt() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.retry = Some(parked(2, None, Some(1000)));
+        assert_eq!(strip_text(&s), "retrying #2 · HTTP 429 · 1s left");
+    }
+
+    /// An older peer sends no `delay_ms`: no countdown rather than a made-up
+    /// one.
+    #[test]
+    fn a_retry_from_an_older_peer_has_no_countdown() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.retry = Some(parked(2, Some(5), None));
+        assert_eq!(strip_text(&s), "retrying 2/5 · HTTP 429");
+    }
+
+    /// The wave rests: motion means something is computing, and during a
+    /// backoff nothing is.
+    #[test]
+    fn the_wave_rests_during_a_backoff() {
+        let mut s = State::test_default();
+        s.phase = Phase::Streaming { ticks: 0, chars: 0 };
+        s.work_ticks = 7;
+        assert_ne!(snake_for(&s), at_rest(), "a running turn animates");
+        s.retry = Some(parked(1, Some(5), Some(1000)));
+        assert_eq!(snake_for(&s), at_rest());
     }
 
     /// 0061 T21: the readout counts what was *thought*. `writing · ~N tok`
