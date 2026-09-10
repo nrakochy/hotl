@@ -9,6 +9,7 @@
 
 pub mod config;
 pub mod mcp;
+pub mod session_log;
 pub mod testing;
 mod tool;
 
@@ -38,8 +39,19 @@ pub const DEFAULT_K: usize = 8;
 /// sees names its source, so claims can be verified with `read`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceRef {
-    File { path: String, line: Option<u64> },
-    Server { name: String },
+    File {
+        path: String,
+        line: Option<u64>,
+    },
+    Server {
+        name: String,
+    },
+    /// A log entry in this session or one of its ancestors (0057 T5) — the
+    /// coordinate `EntryPayload::Compaction::source_range` names too.
+    Session {
+        session: String,
+        entry: String,
+    },
 }
 
 impl std::fmt::Display for SourceRef {
@@ -51,6 +63,7 @@ impl std::fmt::Display for SourceRef {
             } => write!(f, "{path}:{line}"),
             SourceRef::File { path, line: None } => write!(f, "{path}"),
             SourceRef::Server { name } => write!(f, "server:{name}"),
+            SourceRef::Session { session, entry } => write!(f, "session:{session}#{entry}"),
         }
     }
 }
@@ -79,6 +92,12 @@ pub trait Retriever: Send + Sync {
     fn permission(&self, query: &str) -> Permission {
         let _ = query;
         Permission::None
+    }
+    /// A clause appended once to this backend's results — what the model must
+    /// know about their provenance beyond the shared untrusted envelope.
+    /// Default: none, so a backend that has nothing extra to say says nothing.
+    fn clause(&self) -> Option<&str> {
+        None
     }
     fn search<'a>(
         &'a self,

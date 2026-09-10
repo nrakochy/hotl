@@ -136,6 +136,7 @@ fn session() -> Session {
         initial_items: seeded(),
         initial_todos: Vec::new(),
         initial_goal: None,
+        concurrency: Default::default(),
         config,
     });
     Session {

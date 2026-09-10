@@ -1495,7 +1495,8 @@ impl Turn {
                         "<system-reminder>Call {at} (`{name}`) did not match your \
                          expectation: {}; observed {}. The remaining {not_run} call(s) in \
                          this batch were not run. Revise your understanding of why before \
-                         continuing.</system-reminder>",
+                         continuing — `recall` (backend session-log) can show you every \
+                         earlier result for this command.</system-reminder>",
                         m.what(),
                         m.got(),
                     ),

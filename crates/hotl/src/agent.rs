@@ -499,7 +499,8 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     let session_id = log.session_id.clone();
     let mut handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
-        Some(scaffold.spawn_registration(session_id)),
+        Some(scaffold.spawn_registration(session_id.clone())),
+        Some(scaffold.recall_registration(session_id)),
         scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(log, items, Inherited::default(), Vec::new(), None);
@@ -773,6 +774,7 @@ pub(crate) async fn build_acp() -> Result<
         let handle = spawn_interactive_session(
             (*scaffold.registry).clone(),
             Some(scaffold.spawn_registration(session_id.clone())),
+            Some(scaffold.recall_registration(session_id.clone())),
             scaffold.hooks.clone(),
             |registry| {
                 let mut deps = scaffold.deps(
@@ -884,6 +886,7 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
     let handle = spawn_interactive_session(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration(session_id.clone())),
+        Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
         |registry| {
             let mut deps =
@@ -933,6 +936,10 @@ struct Scaffold {
     /// built once here like `concurrency`, and the limits a plan may lower.
     workflow_gate: Arc<tokio::sync::Semaphore>,
     workflow_limits: hotl_workflow::Limits,
+    /// The parsed `[[retrieval]]` entries (0057 T5). Held rather than built:
+    /// `recall` is per-session, because its built-in `session-log` backend
+    /// indexes the session's own log.
+    retrieval: Vec<hotl_retrieval::config::BackendConfig>,
     /// Startup warnings, collected rather than printed: `/reload` rebuilds a
     /// scaffold with the alternate screen up, where a stray `eprintln!` would
     /// corrupt the display. Startup callers print these verbatim; the reload
@@ -1032,7 +1039,7 @@ async fn scaffold(
     // `build_registry` consumes the original for the web tools, so the
     // `agents` cap and the `requests` cap draw from one shared budget, not
     // two independently-built ones.
-    let (registry, skills, discovery_warnings) =
+    let (registry, skills, discovery_warnings, retrieval) =
         build_registry(&cfg, &config_dir, concurrency.clone());
     warnings.extend(discovery_warnings);
     let registry = Arc::new(registry);
@@ -1063,6 +1070,7 @@ async fn scaffold(
         agents_include_claude,
         workflow_gate,
         workflow_limits,
+        retrieval,
         warnings,
     })
 }
@@ -1097,6 +1105,18 @@ impl Scaffold {
             workflow_gate: self.workflow_gate.clone(),
             workflow_limits: self.workflow_limits,
             data_dir: data_dir(),
+        }
+    }
+
+    /// What a session needs to register its own `recall` (0057 T5). Every
+    /// session gets one — the `session-log` backend needs no configuration,
+    /// so the tool is always advertised.
+    fn recall_registration(&self, session_id: String) -> RecallRegistration {
+        RecallRegistration {
+            sessions_dir: sessions_dir(),
+            session_id,
+            config_dir: self.config_dir.clone(),
+            backends: self.retrieval.clone(),
         }
     }
 
@@ -1284,6 +1304,7 @@ async fn run_session(
     let handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
         Some(scaffold.spawn_registration(session_id.clone())),
+        Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
         |registry| {
             let mut deps = scaffold.deps(
@@ -1376,6 +1397,19 @@ struct SpawnRegistration {
     data_dir: PathBuf,
 }
 
+/// What a session's `recall` tool needs (0057 T5), threaded in per-session
+/// for the same reason `spawn` is: the built-in `session-log` backend indexes
+/// *this* session's own log, which does not exist at scaffold time.
+struct RecallRegistration {
+    sessions_dir: PathBuf,
+    session_id: String,
+    config_dir: PathBuf,
+    /// The parsed `[[retrieval]]` entries, rebuilt per session — an
+    /// `McpRetriever` holds a trust store and a connection, neither shareable
+    /// across sessions.
+    backends: Vec<hotl_retrieval::config::BackendConfig>,
+}
+
 /// A session on a surface that can put a question in front of a human, so it
 /// also installs the plan-0026 egress ask sink.
 ///
@@ -1386,26 +1420,29 @@ struct SpawnRegistration {
 fn spawn_interactive_session(
     registry: Registry,
     spawn: Option<SpawnRegistration>,
+    recall: Option<RecallRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
-    spawn_session_inner(registry, spawn, hooks, true, build_deps)
+    spawn_session_inner(registry, spawn, recall, hooks, true, build_deps)
 }
 
 #[allow(clippy::type_complexity)]
 fn spawn_session_with_todos(
     registry: Registry,
     spawn: Option<SpawnRegistration>,
+    recall: Option<RecallRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
 ) -> SessionHandle {
-    spawn_session_inner(registry, spawn, hooks, false, build_deps)
+    spawn_session_inner(registry, spawn, recall, hooks, false, build_deps)
 }
 
 #[allow(clippy::type_complexity)]
 fn spawn_session_inner(
     mut registry: Registry,
     spawn: Option<SpawnRegistration>,
+    recall: Option<RecallRegistration>,
     hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     egress_ask: bool,
     build_deps: impl FnOnce(Arc<Registry>) -> SessionDeps,
@@ -1437,6 +1474,24 @@ fn spawn_session_inner(
             notifications.clone(),
         ),
     )));
+    // `recall`, always: the `session-log` backend needs no configuration, so
+    // the tool is advertised for every session — one schema change at the
+    // version boundary, never mid-session.
+    if let Some(RecallRegistration {
+        sessions_dir,
+        session_id,
+        config_dir,
+        backends,
+    }) = recall
+    {
+        let mut retrievers: Vec<Box<dyn hotl_retrieval::Retriever>> = vec![Box::new(
+            hotl_retrieval::session_log::SessionLogRetriever::new(sessions_dir, session_id),
+        )];
+        // Warnings were already surfaced at scaffold time; a bad entry is
+        // skipped here for the same reason it was skipped there.
+        retrievers.extend(hotl_retrieval::config::build(backends, &config_dir).0);
+        registry.register(Box::new(hotl_retrieval::RecallTool::new(retrievers)));
+    }
     if let Some(SpawnRegistration {
         builder,
         concurrency,
@@ -1590,11 +1645,17 @@ fn minify_config(cfg: &crate::config::Config) -> (hotl_tools::MinifyConfig, Opti
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn build_registry(
     cfg: &crate::config::Config,
     config_dir: &std::path::Path,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
-) -> (Registry, Vec<(String, String)>, Vec<String>) {
+) -> (
+    Registry,
+    Vec<(String, String)>,
+    Vec<String>,
+    Vec<hotl_retrieval::config::BackendConfig>,
+) {
     let mut discovery_warnings: Vec<String> = Vec::new();
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
     let diagnostics = cfg
@@ -1641,19 +1702,17 @@ fn build_registry(
             .collect();
         registry.register(Box::new(skills));
     }
-    // Retrieval backends (`[[retrieval]]`) → the `recall` tool. Absent when
-    // nothing is configured: no ambient context cost when unused.
+    // `recall` is registered per session (`RecallRegistration`), not here: its
+    // built-in `session-log` backend indexes *this* session's own log, and no
+    // session exists yet. Configured `[[retrieval]]` entries are parsed once,
+    // here, so a bad entry warns at startup rather than at first search.
     let retrieval = cfg
         .retrieval_toml()
         .and_then(|t| toml::from_str::<hotl_retrieval::config::RetrievalConfig>(&t).ok())
         .map(|c| c.backends)
         .unwrap_or_default();
     if !retrieval.is_empty() {
-        let (backends, warnings) = hotl_retrieval::config::build(retrieval, config_dir);
-        discovery_warnings.extend(warnings);
-        if !backends.is_empty() {
-            registry.register(Box::new(hotl_retrieval::RecallTool::new(backends)));
-        }
+        discovery_warnings.extend(hotl_retrieval::config::build(retrieval.clone(), config_dir).1);
     }
     // `web_fetch` needs no backend — always registered, gated by the human
     // (Permission::Ask) and by the process-wide [network] egress policy.
@@ -1697,7 +1756,7 @@ fn build_registry(
             hotl_tools::filter_for_shell(registry, false)
         }
     };
-    (registry, skills_catalog, discovery_warnings)
+    (registry, skills_catalog, discovery_warnings, retrieval)
 }
 
 /// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
@@ -1915,6 +1974,9 @@ impl HotlChildBuilder {
         let handle = spawn_session_with_todos(
             registry,
             None, // children never get their own `spawn` tool — depth-1 is structural
+            // Nor `recall`: a child's own log is one turn deep, and reaching
+            // the parent's would leak history the parent chose not to pass.
+            None,
             None, // children never get hooks either — see `hooks: None` below
             |registry| SessionDeps {
                 provider: self.provider.clone(),
@@ -4088,7 +4150,8 @@ mod tests {
         // developer's machine and would leak into this assertion.
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (_registry, catalog, _warnings) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (_registry, catalog, _warnings, _retrieval) =
+            build_registry(&cfg, dir.path(), test_concurrency());
         assert_eq!(
             catalog,
             vec![("deploy".to_string(), "Deploy checklist".to_string())],
@@ -4097,7 +4160,7 @@ mod tests {
 
         // No skills configured → no names, and no tool registered.
         let empty = tempfile::tempdir().unwrap();
-        let (_registry, catalog, _warnings) =
+        let (_registry, catalog, _warnings, _retrieval) =
             build_registry(&cfg, empty.path(), test_concurrency());
         assert!(catalog.is_empty(), "{catalog:?}");
     }
@@ -4600,14 +4663,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = crate::config::Config::default();
         cfg.skills.claude = Some(false);
-        let (registry, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (registry, _, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_none());
 
         let cfg = config_from_toml(
             "[web]\n[web.search]\nurl = \"https://s.example/api\"\napi_key_env = \"SEARCH_KEY\"\n",
         );
-        let (registry, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
+        let (registry, _, _, _) = build_registry(&cfg, dir.path(), test_concurrency());
         assert!(registry.get("web_fetch").is_some());
         assert!(registry.get("web_search").is_some());
     }
@@ -4630,7 +4693,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
                 concurrency: Default::default(),
                 provider,
                 registry,
@@ -4683,7 +4746,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
                 concurrency: Default::default(),
                 provider,
                 registry,
@@ -4790,7 +4853,7 @@ mod tests {
         // *before* the assertion below, not merely by the time the test
         // function itself ends).
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
                 concurrency: Default::default(),
                 provider,
                 registry,
@@ -4846,7 +4909,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let mut handle =
-            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
                 concurrency: Default::default(),
                 provider,
                 registry,
@@ -4903,7 +4966,7 @@ mod tests {
             hotl_provider::ScriptedProvider::text_reply("ok"),
         ]));
         let SessionHandle { mut events, .. } =
-            spawn_session_with_todos(Registry::builtin(), None, None, |registry| SessionDeps {
+            spawn_session_with_todos(Registry::builtin(), None, None, None, |registry| SessionDeps {
                 concurrency: Default::default(),
                 provider,
                 registry,
@@ -5891,6 +5954,7 @@ mod tests {
             let hooks_for_deps = hooks.clone();
             let handle = spawn_session_with_todos(
                 Registry::builtin(),
+                None,
                 None,
                 Some(hooks.clone()),
                 move |registry| SessionDeps {

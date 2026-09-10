@@ -114,7 +114,13 @@ impl RecallTool {
                  identifiers.",
                 backend.name()
             )),
-            Ok(hits) => ToolOutcome::ok(self.envelope(backend.name(), &format_hits(&hits))),
+            Ok(hits) => {
+                let mut body = format_hits(&hits);
+                if let Some(clause) = backend.clause() {
+                    body.push_str(&format!("\n\nThese results are {clause}."));
+                }
+                ToolOutcome::ok(self.envelope(backend.name(), &body))
+            }
         }
     }
 }

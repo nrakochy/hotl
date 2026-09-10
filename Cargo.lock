@@ -1151,7 +1151,9 @@ version = "0.25.0"
 dependencies = [
  "futures-util",
  "hotl-mcp",
+ "hotl-store",
  "hotl-tools",
+ "hotl-types",
  "serde",
  "serde_json",
  "tempfile",

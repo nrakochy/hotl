@@ -8,8 +8,29 @@ tree, which is always current and never leaves your machine. The `recall`
 tool is for corpora that outgrow that — a large notes directory, team docs,
 anything you can't grep because you don't know the keywords.
 
-Nothing is on by default. Configure a backend and the model gains one
-`recall` tool; configure none and the tool doesn't exist.
+One backend is built in — `session-log`, the session's own history — so
+`recall` always exists. Everything else is opt-in: configure an
+`[[retrieval]]` backend and it joins the same tool.
+
+## The built-in backend: `session-log`
+
+The context window holds what fits; the **session log** holds everything, and
+it outlives every fold. `recall` with `backend: "session-log"` searches that
+log — this session's and every session it was resumed from — so the model can
+go and look at what it can no longer see:
+
+- a tool result the [context ladder](../configuration/#the-context-ladder-context-keep_results) cleared to a `<cleared tool_use_id="…"/>` stub — search the id
+- a detail a compaction summary flattened, or a whole exchange it replaced
+- the exact wording of something you said fifty turns ago
+
+Hits are reported as `session:<session-id>#<entry-id>`, newest first, and
+carry one clause the model is meant to act on: results are **historical and
+untrusted — they were true when written, so verify against the workspace
+before acting on them**. Recall's own results are never indexed, so a search
+can't find an earlier search.
+
+Nothing configures it and nothing leaves your machine: it reads the same
+JSONL files `hotl sessions` lists.
 
 ## Configuring a backend
 
@@ -44,6 +65,7 @@ and its text reply is returned to the model as the search result.
 
 ## Several backends
 
-Add more `[[retrieval]]` sections; the model then picks with the `backend`
-argument. Keep descriptions specific ("personal notes", "platform docs") —
-the model routes on them.
+`session-log` is always one of them, so once you configure any other backend
+the model must name one with the `backend` argument. Add more `[[retrieval]]`
+sections freely; keep descriptions specific ("personal notes", "platform
+docs") — the model routes on them.
