@@ -171,6 +171,8 @@
                 "sandbox::tests::seatbelt_denies_protected_subpaths_under_cwd"
                 "sandbox::tests::seatbelt_denies_reading_a_carved_path"
                 "sandbox::tests::seatbelt_egress_off_confines_to_loopback"
+                # nested sandbox-exec: sandbox_apply is refused inside the builder
+                "sandbox::tests::worktree_child_can_commit_but_not_touch_hooks_or_config"
                 # hotl-tools tests/sandbox_extras.rs, tests/sandbox_read_carve.rs
                 # and tests/sandbox_rules_carve.rs — never reached in the nix
                 # macos log (fail-fast stopped at the lib target); caught by the
