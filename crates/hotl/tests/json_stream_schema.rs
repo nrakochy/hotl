@@ -40,6 +40,7 @@ fn every_frame_is_tagged_and_versioned() {
             lines: 12,
             bytes: 480,
         },
+        EngineEvent::Compacting { items: 42 },
         EngineEvent::ToolDenied {
             id: "t2".into(),
             name: "write".into(),
@@ -416,6 +417,16 @@ fn tool_progress_is_a_tagged_frame_with_tail_and_counts() {
     assert_eq!(f["tail"], "Compiling hotl-engine");
     assert_eq!(f["lines"], 12);
     assert_eq!(f["bytes"], 480);
+}
+
+/// 0061 T14: a fold blocks the actor for a hook and a model call. The size
+/// is what a surface shows while it waits.
+#[test]
+fn compacting_carries_the_fold_size() {
+    let f = wire::update_frame(&EngineEvent::Compacting { items: 42 })
+        .expect("compacting is a stream frame");
+    assert_eq!(f["type"], "compacting");
+    assert_eq!(f["items"], 42);
 }
 
 /// 0039 D1: `child_tool` frames route by `parent_id`, carry an explicit

@@ -2080,7 +2080,7 @@ async fn try_compact(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Some(Outcome::Cancelled),
-            compacted = compact(shared, log, head, pipeline, spec) => compacted,
+            compacted = compact(shared, log, head, pipeline, spec, events) => compacted,
         }
     };
     match compacted {
@@ -2719,6 +2719,7 @@ async fn compact(
     head: &mut Head,
     pipeline: &mut Pipeline,
     spec: Option<crate::SpecDigest>,
+    events: &mpsc::Sender<EngineEvent>,
 ) -> Result<(bool, TokenUsage), String> {
     // Drain-before-BUILD-and-mint (commit-protocol.md §conflict table, the
     // Abort arm's steps 3→5). Both halves are load-bearing and fail
@@ -2779,6 +2780,14 @@ async fn compact(
     } else {
         plan
     };
+    // The window opens here (0061 T14, tracker #35): the `PreCompact` hook is
+    // allowed 15 s of its own and the summarize is a model call, so both
+    // belong inside the announced silence rather than before it.
+    let _ = events
+        .send(EngineEvent::Compacting {
+            items: plan.kept_from - plan.prefix_end,
+        })
+        .await;
     let snapshot = Arc::clone(head.items());
     let folded = &snapshot[plan.prefix_end..plan.kept_from];
     let pins = pre_compact_pins(shared, head, &plan).await;
@@ -4095,9 +4104,17 @@ mod tests {
             text: "folded".into(),
             usage: hotl_types::TokenUsage::default(),
         };
-        let (degraded, _) = compact(&shared, &mut log, &mut head, &mut pipeline, Some(spec))
-            .await
-            .expect("the fold must see the drained projection");
+        let (events, _rx) = tokio::sync::mpsc::channel(8);
+        let (degraded, _) = compact(
+            &shared,
+            &mut log,
+            &mut head,
+            &mut pipeline,
+            Some(spec),
+            &events,
+        )
+        .await
+        .expect("the fold must see the drained projection");
         assert!(!degraded);
 
         for ticket in tickets {

@@ -155,6 +155,10 @@ async fn run(s: &mut Session, prompt: &str) -> (Outcome, bool) {
             .expect("event timeout")
             .expect("event channel closed");
         match ev {
+            // 0061 T14: the announcement must precede the fold it announces.
+            EngineEvent::Compacting { .. } => {
+                assert!(!compacted, "the fold was announced after it finished")
+            }
             EngineEvent::Compacted { .. } => compacted = true,
             EngineEvent::TurnDone { outcome, .. } => return (outcome, compacted),
             _ => {}
@@ -262,4 +266,57 @@ async fn post_compact_receives_the_digest() {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     assert_eq!(seen, vec!["GOAL: keep going".to_string()]);
+}
+
+/// 0061 T14 (tracker #35): the actor blocks for the `PreCompact` hook and a
+/// model-backed summarize, up to two minutes with nothing on screen. The
+/// announcement has to open that window — before the hook, not after it.
+///
+/// The hook itself is the assertion: it refuses to return until the test has
+/// already received `Compacting`. Announced late, this deadlocks, and the
+/// bound turns that into a failure rather than a hang. Multi-thread because
+/// the hook is synchronous and would otherwise stall the receive loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fold_announces_compacting_before_compacted_and_before_the_pre_compact_hook() {
+    let (announced_tx, announced_rx) = std::sync::mpsc::channel::<()>();
+    let announced_rx = Mutex::new(announced_rx);
+    let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let hook_ran = Arc::clone(&ran);
+    let hooks = InProcessHooks::new().on_pre_compact(move |_info| {
+        if !hook_ran.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            announced_rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the fold reached its hook before announcing itself");
+        }
+        PreCompactDecision { pins: Vec::new() }
+    });
+    let mut s = session(Arc::new(hooks));
+    s.handle.prompt("go".into()).await;
+    let mut items = 0usize;
+    let mut order: Vec<&'static str> = Vec::new();
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(30), s.handle.events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
+        match ev {
+            EngineEvent::Compacting { items: n } => {
+                items = n;
+                order.push("compacting");
+                let _ = announced_tx.send(());
+            }
+            EngineEvent::Compacted { .. } => order.push("compacted"),
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    assert!(
+        ran.load(std::sync::atomic::Ordering::SeqCst),
+        "the fixture must actually fold"
+    );
+    assert_eq!(order, vec!["compacting", "compacted"]);
+    assert!(items > 0, "the fold size is what the surface shows");
+    drop(s.dir);
 }

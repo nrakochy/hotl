@@ -431,6 +431,13 @@ pub enum EngineEvent {
     /// flight, and `ToolDone` is the record. Lossy by design — sent with
     /// `try_send`, so a full channel drops a frame rather than parking the
     /// turn.
+    /// A model-backed fold is about to run (0061 T14): the surface's cue to
+    /// say `folding history…` for the seconds the actor is blocked. Emitted
+    /// before the `PreCompact` hook and the summarize, never for a
+    /// speculative hit (which is instant) and never for a clear.
+    Compacting {
+        items: usize,
+    },
     ToolProgress {
         id: String,
         name: String,
@@ -606,6 +613,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::ThinkingDelta(_) => write!(f, "ThinkingDelta"),
             Self::ToolStart { name, .. } => write!(f, "ToolStart({name})"),
             Self::ToolDone { name, ok, .. } => write!(f, "ToolDone({name},{ok})"),
+            Self::Compacting { items } => write!(f, "Compacting({items})"),
             Self::ToolProgress { name, lines, .. } => write!(f, "ToolProgress({name},{lines})"),
             Self::ToolDenied { name, .. } => write!(f, "ToolDenied({name})"),
             Self::ToolAutoAllowed { name, rule, .. } => {

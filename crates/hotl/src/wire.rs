@@ -57,6 +57,9 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         } => {
             json!({"type": "tool_done", "id": id, "name": name, "ok": ok, "lines": lines, "bytes": bytes})
         }
+        EngineEvent::Compacting { items } => {
+            json!({"type": "compacting", "items": items})
+        }
         // Liveness only (0061 T13): never persisted, additive — the
         // `child_tool` ruling, for the same reason.
         EngineEvent::ToolProgress {

@@ -293,6 +293,7 @@ fn update_line(update: &Value) -> Option<String> {
             // every 250 ms would be one line per output line — spam, not
             // liveness. The console renders these on the card instead.
             "tool_progress" => return None,
+            "compacting" => format!("(folding history — {} items)", n("items")),
             // Mirrors `tool_done`'s success exemption: a child that worked
             // needs no line (0039).
             "child_tool" => match update.get("ok").and_then(Value::as_bool) {

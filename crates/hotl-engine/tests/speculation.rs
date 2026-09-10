@@ -133,6 +133,12 @@ fn session(provider: Arc<dyn Provider>, config: EngineConfig) -> Session {
 }
 
 async fn wait_done(s: &mut Session) -> Outcome {
+    wait_counting_announcements(s).await.0
+}
+
+/// The outcome plus how many folds announced themselves (0061 T14).
+async fn wait_counting_announcements(s: &mut Session) -> (Outcome, usize) {
+    let mut announced = 0;
     loop {
         let ev = tokio::time::timeout(Duration::from_secs(60), s.handle.events.recv())
             .await
@@ -142,7 +148,8 @@ async fn wait_done(s: &mut Session) -> Outcome {
             EngineEvent::Ask { reply, .. } => {
                 let _ = reply.send(AskReply::Allow);
             }
-            EngineEvent::TurnDone { outcome, .. } => return outcome,
+            EngineEvent::Compacting { .. } => announced += 1,
+            EngineEvent::TurnDone { outcome, .. } => return (outcome, announced),
             _ => {}
         }
     }
@@ -236,13 +243,16 @@ async fn speculative_digest_overlaps_the_turn() {
     push_main_scripts(&main, s.dir.path());
 
     s.handle.prompt("start the long task".into()).await;
-    let outcome = wait_done(&mut s).await;
+    let (outcome, announced) = wait_counting_announcements(&mut s).await;
     assert_eq!(
         outcome,
         Outcome::Done {
             text: "done after compaction".into()
         }
     );
+    // 0061 T14: the digest was already computed, so the fold is instant —
+    // `folding history…` flashing on screen would be a lie about the wait.
+    assert_eq!(announced, 0, "a speculative hit announced a fold");
 
     // The summarize must ride alongside a sample rather than following it: a
     // serial summarize never puts two streams in flight at once.

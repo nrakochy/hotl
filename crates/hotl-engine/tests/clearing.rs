@@ -56,6 +56,42 @@ async fn run(s: &mut Session, prompt: &str) -> (Outcome, usize, bool) {
     (outcome, cleared, compacted)
 }
 
+/// 0061 T14: clearing is the free rung — no model call, no blocked actor, so
+/// nothing to announce. Only a fold opens the `folding history…` window.
+#[tokio::test]
+async fn a_clear_announces_no_compacting() {
+    let provider = Arc::new(ScriptedProvider::new(Vec::new()));
+    let mut s = session(Arc::clone(&provider) as Arc<dyn Provider>, config());
+    let file = s.dir.path().join("big.txt");
+    std::fs::write(&file, "y".repeat(2_100)).expect("fixture");
+    let path = file.to_str().expect("utf8 path").to_string();
+    provider.push_script(ScriptedProvider::tool_call(
+        "t1",
+        "read",
+        json!({ "path": path }),
+    ));
+    provider.push_script(ScriptedProvider::text_reply("read it"));
+    run(&mut s, "read the big file").await;
+
+    provider.push_script(ScriptedProvider::text_reply("second"));
+    s.handle.prompt("now something else".into()).await;
+    let mut cleared = 0usize;
+    let mut announced = 0usize;
+    loop {
+        match next_event(&mut s).await {
+            EngineEvent::Cleared { count } => cleared += count,
+            EngineEvent::Compacting { .. } => announced += 1,
+            EngineEvent::Ask { reply, .. } => {
+                let _ = reply.send(hotl_engine::AskReply::Allow);
+            }
+            EngineEvent::TurnDone { .. } => break,
+            _ => {}
+        }
+    }
+    assert_eq!(cleared, 1, "the fixture must actually clear");
+    assert_eq!(announced, 0, "a clear announced a fold");
+}
+
 /// The same, plus the prompt's total reported spend — `turn_done.usage` is
 /// cumulative over the whole prompt, respawns included.
 async fn run_reporting_usage(
