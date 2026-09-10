@@ -218,6 +218,9 @@ struct Geometry {
     palette: Palette,
     /// The prose measure (0049 T5) — a `/reload` that changes it re-wraps.
     measure: usize,
+    /// Whether an agent block advertises the band keys (0061 T8). Not a
+    /// per-item property, so it belongs here rather than in the fingerprint.
+    band_keys: bool,
 }
 
 /// A hash of everything about one item that reaches the screen.
@@ -351,7 +354,9 @@ fn render_transcript(
         thinking_expanded: state.thinking_expanded,
         palette: *p,
         measure: state.measure,
+        band_keys: state.selected_agent.is_none(),
     };
+    let band_keys = geometry.band_keys;
     if cache.geometry.as_ref() != Some(&geometry) {
         cache.items.clear();
         cache.geometry = Some(geometry);
@@ -414,6 +419,7 @@ fn render_transcript(
                     gutter,
                     state.thinking_expanded,
                     state.measure,
+                    band_keys,
                 ),
                 incremental: None,
             }
@@ -748,12 +754,13 @@ fn item_visual_lines<'a>(
     gutter: usize,
     thinking_expanded: bool,
     measure: usize,
+    band_keys: bool,
 ) -> Vec<Line<'a>> {
     // `gutter + 2` = the pad plus the one-column glyph and its trailing space;
     // a card's own indent narrows it further, so `inner` is known before the
     // block is built and `item_block` can clip to the width it will get.
     let inner = width.saturating_sub(gutter + item_indent(item) + 2).max(1);
-    let (spine, content) = item_block(item, p, thinking_expanded, inner);
+    let (spine, content) = item_block(item, p, thinking_expanded, inner, band_keys);
     let mut out = Vec::new();
     for (cl, full) in &content {
         for wl in wrap::line(cl, if *full { inner } else { inner.min(measure) }) {
@@ -979,6 +986,7 @@ fn item_block<'a>(
     p: &Palette,
     thinking_expanded: bool,
     inner: usize,
+    band_keys: bool,
 ) -> (Spine, Tagged<'a>) {
     match item {
         TranscriptItem::User { text } => (
@@ -1061,26 +1069,16 @@ fn item_block<'a>(
             if calls.len() > 1 {
                 details.push(format!("×{}", calls.len()));
             }
-            // A spawn's children collapse to a count, running or settled
-            // (0042 D3) — the full list lives in the drill-in.
-            if !children.is_empty() {
-                details.push(call_count(children.len()));
-            }
-            // Elapsed rides the header only while the tool is still running;
-            // a settled card moves it to the result row (0061 T3).
-            if running {
-                details.push(format!("{}s", ticks / anim::TICK_HZ));
-            }
-            // Running only: the newest outstanding (else last) child call as
-            // a final muted detail, so the card stays one calm line.
-            if running {
-                if let Some(c) = children
-                    .iter()
-                    .rev()
-                    .find(|c| c.ok.is_none())
-                    .or_else(|| children.last())
-                {
-                    details.push(format!("{} {}", c.name, c.summary));
+            // An agent card is a two-row block (0061 T8): the brief keeps the
+            // title row, and everything about the delegation drops to a
+            // second row under a bar. Every other card stays one line plus
+            // its result row.
+            let agent = crate::app::is_agent_card(name);
+            if !agent {
+                // Elapsed rides the header only while the tool is still
+                // running; a settled card moves it to the result row (T3).
+                if running {
+                    details.push(format!("{}s", ticks / anim::TICK_HZ));
                 }
             }
             // Name in the status color (so it stays identifiable now the
@@ -1088,7 +1086,12 @@ fn item_block<'a>(
             // whole card reads as a second voice under the prose (0061 T3).
             let mut spans = vec![Span::styled(tool_verb(name).label, Style::new().fg(color))];
             if !body.is_empty() {
-                spans.push(Span::styled(format!("  {body}"), Style::new().fg(p.muted)));
+                let style = if agent {
+                    Style::new().fg(p.ink)
+                } else {
+                    Style::new().fg(p.muted)
+                };
+                spans.push(Span::styled(format!("  {body}"), style));
             }
             if !details.is_empty() {
                 spans.push(Span::styled(
@@ -1097,18 +1100,27 @@ fn item_block<'a>(
                 ));
             }
             let mut rows = vec![Line::from(spans)];
-            // The result row (0061 T3): what the model got, and how long it
-            // took. Settled cards only — a running one still owns its clock.
-            if let Some(text) = result_row(status, calls, *ticks) {
+            if agent {
+                rows.push(Line::styled(
+                    agent_row(children, *ticks, running, band_keys),
+                    Style::new().fg(p.muted),
+                ));
+            } else if let Some(text) = result_row(status, calls, *ticks) {
+                // The result row (0061 T3): what the model got, and how long
+                // it took. Settled cards only — a running one owns its clock.
                 rows.push(Line::styled(text, Style::new().fg(p.faint)));
             }
             (
                 Spine {
                     indent: 1,
                     marker,
-                    cont: " ",
+                    cont: if agent { "│" } else { " " },
                     marker_style: Style::new().fg(color),
-                    cont_style: Style::new(),
+                    cont_style: if agent {
+                        Style::new().fg(p.faint)
+                    } else {
+                        Style::new()
+                    },
                 },
                 full(rows),
             )
@@ -1232,6 +1244,43 @@ fn result_row(status: &ToolStatus, calls: &[crate::app::ToolCall], ticks: u64) -
         format!("{} lines", group_digits(lines))
     };
     Some(format!("└ {what} · {}s", ticks / anim::TICK_HZ))
+}
+
+/// The second row of an agent block: how much work it has done, how long it
+/// has been at it, what it is doing now, and — while it runs and nothing is
+/// drilled into — the keys that open it.
+fn agent_row(
+    children: &[crate::app::ChildCall],
+    ticks: u64,
+    running: bool,
+    band_keys: bool,
+) -> String {
+    let mut parts = Vec::new();
+    if !children.is_empty() {
+        parts.push(call_count(children.len()));
+    }
+    parts.push(fmt_elapsed(ticks / anim::TICK_HZ));
+    if running {
+        // The newest outstanding child, else the last one to have run.
+        if let Some(c) = children
+            .iter()
+            .rev()
+            .find(|c| c.ok.is_none())
+            .or_else(|| children.last())
+        {
+            let (body, _) = split_summary(&c.name, &c.summary);
+            let what = if body.is_empty() {
+                c.summary.clone()
+            } else {
+                body
+            };
+            parts.push(format!("{} {what}", tool_verb(&c.name).label));
+        }
+        if band_keys {
+            parts.push("↑↓ agents".into());
+        }
+    }
+    parts.join(" · ")
 }
 
 /// `1 call` / `N calls` — a spawn's child count on its card and band row.
@@ -3826,7 +3875,7 @@ mod tests {
             spawn_with_children(ToolStatus::Running, 1),
         ];
         for item in items {
-            let (spine, _) = item_block(&item, &p, false, 40);
+            let (spine, _) = item_block(&item, &p, false, 40, true);
             assert_eq!(
                 spine.indent,
                 item_indent(&item),
@@ -3840,8 +3889,8 @@ mod tests {
         let mut s = State::new(true, "m".into());
         s.transcript
             .push(spawn_with_children(ToolStatus::Running, 1));
-        let all = draw(&s).join("\n");
-        assert!(all.contains("· 1 call ·"), "{all}");
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(all.contains("│ 1 call ·"), "{all}");
         assert!(!all.contains("1 calls"), "{all}");
     }
 
@@ -4686,19 +4735,76 @@ mod tests {
         item
     }
 
-    /// 0042 D3: a running spawn is ONE calm line — call count, duration and
-    /// the newest outstanding child call ride the muted details; no child
-    /// rows, no `… +N earlier` churn.
+    /// The bar is what makes the two rows read as one delegation rather than
+    /// two unrelated cards.
     #[test]
-    fn a_running_spawn_card_is_one_line_with_call_count_and_latest_child() {
+    fn an_agent_card_is_a_two_row_block_with_a_bar() {
+        let p = Palette::default();
+        let item = spawn_with_children(ToolStatus::Running, 2);
+        let (spine, rows) = item_block(&item, &p, false, 76, true);
+        assert_eq!(spine.cont, "│");
+        assert_eq!(spine.cont_style.fg, Some(p.faint));
+        assert_eq!(spine.indent, 1);
+        assert_eq!(rows.len(), 2, "title row plus the delegation row");
+    }
+
+    /// While it runs and nothing is drilled into, the block says how to open
+    /// it. Drilled in, the keys belong to the stream, not the card.
+    #[test]
+    fn a_running_agent_card_names_the_band_keys() {
+        let p = Palette::default();
+        let running = spawn_with_children(ToolStatus::Running, 2);
+        let text = |item: &TranscriptItem, band_keys| {
+            item_block(item, &p, false, 76, band_keys).1[1]
+                .0
+                .spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        assert!(text(&running, true).contains("↑↓ agents"));
+        assert!(
+            !text(&running, false).contains("↑↓ agents"),
+            "a drill-in owns those keys"
+        );
+        let settled = spawn_with_children(ToolStatus::Done, 2);
+        assert!(
+            !text(&settled, true).contains("↑↓ agents"),
+            "a finished agent is not somewhere to go"
+        );
+    }
+
+    /// A spawn's `tool_done` carries counts like any other tool, but a line
+    /// count of the child's report says nothing about the delegation — the
+    /// second row is the block's own account of itself.
+    #[test]
+    fn an_agent_card_never_shows_a_line_count_row() {
+        let mut s = State::new(true, "m".into());
+        let mut item = spawn_with_children(ToolStatus::Done, 2);
+        if let TranscriptItem::Tool { calls, .. } = &mut item {
+            calls[0].lines = Some(1204);
+            calls[0].bytes = Some(51_233);
+        }
+        s.transcript.push(item);
+        let all = draw(&s)[..STRIP].join("\n");
+        assert!(!all.contains("1,204 lines"), "{all}");
+        assert!(!all.contains('└'), "{all}");
+    }
+
+    /// 0061 T8 supersedes 0042 D3 for agent cards alone: the brief keeps the
+    /// title row and the delegation drops to a second row under a bar. Still
+    /// no child rows and no `… +N earlier` churn.
+    #[test]
+    fn a_running_agent_card_puts_its_work_on_a_second_row() {
         let mut s = State::new(true, "m".into());
         s.transcript
             .push(spawn_with_children(ToolStatus::Running, 5));
         let rows = draw(&s);
-        let all = rows.join("\n");
+        let all = rows[..STRIP].join("\n");
+        assert!(all.contains("Agent  survey"), "title row: {all}");
         assert!(
-            all.contains("Agent  survey · 5 calls · 0s · read read c5.rs"),
-            "one line, count then latest call: {all}"
+            all.contains("│ 5 calls · 0s · Read c5.rs"),
+            "count, elapsed then the newest call: {all}"
         );
         assert!(!all.contains("earlier"), "no tail block: {all}");
         assert!(
@@ -4715,10 +4821,7 @@ mod tests {
         s.transcript.push(spawn_with_children(ToolStatus::Done, 5));
         let rows = draw(&s);
         let all = rows.join("\n");
-        assert!(
-            all.contains("Agent  survey · 5 calls"),
-            "collapsed count: {all}"
-        );
+        assert!(all.contains("│ 5 calls · 0s"), "collapsed count: {all}");
         assert!(!all.contains("read c5.rs"), "no child rows: {all}");
     }
 
@@ -5968,7 +6071,7 @@ mod tests {
                 text.push_str(&corpus[fed..end]);
                 fed = end;
                 assistant_append(&mut rows, &mut inc, text.as_str(), &p, 40, 2, 30);
-                let cold = item_visual_lines(&item, &p, 40, 2, false, 30);
+                let cold = item_visual_lines(&item, &p, 40, 2, false, 30, true);
                 assert_eq!(rows, cold, "diverged at chunk={chunk} fed={fed}");
             }
         }
@@ -6049,6 +6152,7 @@ mod tests {
             &p,
             false,
             76,
+            true,
         );
         assert_eq!(spine.marker, "✗");
         assert_eq!(spine.marker_style.fg, Some(p.blocked));
@@ -6092,6 +6196,7 @@ mod tests {
             &Palette::default(),
             false,
             inner,
+            true,
         )
         .1
         .into_iter()
