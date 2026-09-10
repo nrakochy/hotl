@@ -479,7 +479,14 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
             }
         }
         Phase::Sampling { ticks } => {
-            segs.push(Segment::keep(format!("thinking · {}s", secs(*ticks))));
+            // The reasoning tokens, when there are any (0061 T21): `writing`
+            // counts what was written, and this counts what was thought.
+            let tok = crate::app::thinking_chars(&state.transcript) / 4;
+            segs.push(Segment::keep(if tok > 0 {
+                format!("thinking · ~{tok} tok · {}s", secs(*ticks))
+            } else {
+                format!("thinking · {}s", secs(*ticks))
+            }));
         }
         Phase::Streaming { ticks, chars } => segs.push(Segment::keep(format!(
             "writing · ~{} tok · {}s",
@@ -879,6 +886,24 @@ mod tests {
 
         s.usage_line = Some("120 in · 45 out".into());
         assert_eq!(strip_line(&s), resting("120 in · 45 out"));
+    }
+
+    /// 0061 T21: the readout counts what was *thought*. `writing · ~N tok`
+    /// counts what was written, and one must never stand in for the other.
+    #[test]
+    fn the_thinking_readout_counts_thinking_tokens_not_written_ones() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: TICK_HZ };
+        assert_eq!(strip_text(&s), "thinking · 1s", "no reasoning yet");
+        s.transcript.push(crate::app::TranscriptItem::Thinking {
+            text: "x".repeat(400).into(),
+        });
+        assert_eq!(strip_text(&s), "thinking · ~100 tok · 1s");
+        // Written text is the other counter's business.
+        s.transcript.push(crate::app::TranscriptItem::Assistant {
+            text: "y".repeat(400).into(),
+        });
+        assert_eq!(strip_text(&s), "thinking · ~100 tok · 1s");
     }
 
     /// 0061 T20: Esc used to be invisible — `interrupt_sent` was set and

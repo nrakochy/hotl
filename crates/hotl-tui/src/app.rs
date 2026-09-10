@@ -1409,7 +1409,14 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                         .transcript
                         .push(TranscriptItem::Thinking { text: delta.into() }),
                 }
-                enter_streaming(state);
+                // 0061 T21: thinking is not writing. `enter_streaming` here
+                // put the strip on `writing · ~0 tok` for the whole reasoning
+                // pass, since `Streaming.chars` counts Assistant text only.
+                // A `Tool` phase with running cards keeps the strip on the
+                // cards (0049 T1b), so only `Streaming` is corrected.
+                if matches!(state.phase, Phase::Streaming { .. }) {
+                    state.phase = Phase::Sampling { ticks: 0 };
+                }
             }
         }
         "tool_auto_allowed" => {
@@ -3144,6 +3151,20 @@ fn enter_streaming(state: &mut State) {
     };
 }
 
+/// Reasoning characters since the last prompt (0061 T21) — the counterpart of
+/// [`turn_chars`], which counts only what was written.
+pub(crate) fn thinking_chars(transcript: &[TranscriptItem]) -> u64 {
+    transcript
+        .iter()
+        .rev()
+        .take_while(|i| !matches!(i, TranscriptItem::User { .. }))
+        .map(|i| match i {
+            TranscriptItem::Thinking { text } => text.len() as u64,
+            _ => 0,
+        })
+        .sum()
+}
+
 fn turn_chars(transcript: &[TranscriptItem]) -> u64 {
     transcript
         .iter()
@@ -3769,6 +3790,41 @@ mod tests {
         assert!(s.thinking_expanded);
         ctrl(&mut s, 't');
         assert!(!s.thinking_expanded);
+    }
+
+    /// 0061 T21: thinking is not writing. `enter_streaming` on a thinking
+    /// delta put the strip on `writing · ~0 tok` for the whole reasoning pass,
+    /// because `Streaming.chars` counts Assistant text only.
+    #[test]
+    fn thinking_deltas_keep_the_sampling_phase() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 5 };
+        upd(&mut s, json!({"type":"thinking_delta","text":"mulling"}));
+        assert_eq!(
+            s.phase,
+            Phase::Sampling { ticks: 5 },
+            "the clock kept running"
+        );
+    }
+
+    /// A model that thinks again after writing goes back to thinking.
+    #[test]
+    fn thinking_after_writing_returns_to_sampling() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(&mut s, json!({"type":"text_delta","text":"half an answer"}));
+        assert!(matches!(s.phase, Phase::Streaming { .. }));
+        upd(&mut s, json!({"type":"thinking_delta","text":"wait"}));
+        assert!(matches!(s.phase, Phase::Sampling { .. }), "{:?}", s.phase);
+        // A tool phase with a running card is not disturbed (0049 T1b).
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"tool_start","id":"p1","name":"bash","summary":"bash: ls"}),
+        );
+        upd(&mut s, json!({"type":"thinking_delta","text":"wait"}));
+        assert!(matches!(s.phase, Phase::Tool { .. }), "{:?}", s.phase);
     }
 
     /// 0061 T20: the strip and the hint both say it now, so a transcript item
