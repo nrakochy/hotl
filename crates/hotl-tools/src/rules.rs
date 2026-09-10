@@ -2928,6 +2928,89 @@ path_prefix = "/Volumes/other"
         assert_eq!(first, projected(toml, None, existing));
     }
 
+    /// Precedence, not specificity: `deny` runs before every allow tier, so a
+    /// broad deny beats a narrower allow that names the exact command. The
+    /// twin of `deny_is_never_weaker_than_allow`, which pins the *matcher*;
+    /// this pins the order the tiers run in, in every mode and both plan
+    /// states — a rules engine that scored specificity instead would silently
+    /// re-open `git push` to anyone who allow-listed `git status`.
+    #[test]
+    fn deny_beats_a_more_specific_allow() {
+        let r = Rules::from_toml(
+            r#"
+[[deny]]
+tool = "bash"
+prefix = "git "
+
+[[allow]]
+tool = "bash"
+prefix = "git status"
+"#,
+        )
+        .unwrap();
+        let input = json!({"command": "git status --short"});
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::DontAsk,
+            PermissionMode::Bypass,
+        ] {
+            for plan in [false, true] {
+                assert!(
+                    matches!(
+                        r.evaluate(mode, plan, "bash", &input, facts(true, false, false)),
+                        Verdict::Deny { .. }
+                    ),
+                    "{mode:?} plan={plan}: a narrower allow beat the deny"
+                );
+            }
+        }
+        // Non-vacuous: without the deny the same allow really would auto it.
+        let allow_only =
+            Rules::from_toml("[[allow]]\ntool = \"bash\"\nprefix = \"git status\"\n").unwrap();
+        assert!(matches!(
+            allow_only.evaluate(
+                PermissionMode::Ask,
+                false,
+                "bash",
+                &input,
+                facts(true, false, false)
+            ),
+            Verdict::Auto { .. }
+        ));
+    }
+
+    /// The floor sits above every allow tier, in every mode *and* both plan
+    /// states. `protected_paths_never_auto` walks the classes; this walks the
+    /// full `(mode, plan)` product for the worst case — a kernel-denied path
+    /// under the widest grant a config can express, `path_prefix = "/"`. No
+    /// combination may reach an auto verdict, flagged or not.
+    #[test]
+    fn no_verdict_raises_a_kernel_denied_path() {
+        let r = Rules::from_toml("[[allow]]\ntool = \"write\"\npath_prefix = \"/\"\n").unwrap();
+        let input = json!({"path": "/anything"});
+        for mode in [
+            PermissionMode::Ask,
+            PermissionMode::DontAsk,
+            PermissionMode::Bypass,
+        ] {
+            for plan in [false, true] {
+                for edits_files in [false, true] {
+                    let facts = CallFacts {
+                        sandbox_enforced: true,
+                        protected: Some(crate::ProtectedClass::HotlOwn),
+                        read_only: false,
+                        edits_files,
+                    };
+                    let v = r.evaluate(mode, plan, "write", &input, facts);
+                    assert!(
+                        matches!(v, Verdict::Ask | Verdict::DenyFlagged { .. }),
+                        "{mode:?} plan={plan} edits_files={edits_files}: {v:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     #[cfg(not(feature = "security-enforced"))]
     fn deny_is_never_weaker_than_allow() {
