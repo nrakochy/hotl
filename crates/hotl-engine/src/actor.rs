@@ -1579,7 +1579,7 @@ pub(crate) async fn run(
         shared.hook_mask(),
         crate::hooks::EventMask::SESSION_END,
         |hooks| {
-            crate::hooks::call_session_end(hooks).await;
+            crate::hooks::call_session_end(hooks, crate::hooks::ACTOR_MAIN).await;
         },
         else {}
     );
@@ -2808,7 +2808,7 @@ async fn pre_compact_pins(
                     / shared.config.context_window.max(1))
                 .min(100)) as u8,
             };
-            crate::hooks::call_pre_compact(hooks, &info).await.pins
+            crate::hooks::call_pre_compact(hooks, crate::hooks::ACTOR_MAIN, &info).await.pins
         },
         else Vec::new()
     )
@@ -2821,7 +2821,7 @@ async fn post_compact(shared: &SharedDeps, digest: &str) {
         shared.hooks,
         shared.hook_mask(),
         crate::hooks::EventMask::POST_COMPACT,
-        |hooks| crate::hooks::call_post_compact(hooks, digest).await,
+        |hooks| crate::hooks::call_post_compact(hooks, crate::hooks::ACTOR_MAIN, digest).await,
         else ()
     );
 }
@@ -3166,7 +3166,7 @@ async fn start_turn(
         shared.hook_mask(),
         crate::hooks::EventMask::USER_PROMPT,
         |hooks| {
-            if let Some(context) = crate::hooks::call_user_prompt(hooks, &prompt_for_hooks).await {
+            if let Some(context) = crate::hooks::call_user_prompt(hooks, crate::hooks::ACTOR_MAIN, &prompt_for_hooks).await {
                 let reminder = EntryPayload::Item {
                     item: Item::User {
                         text: format!("<system-reminder>{context}</system-reminder>"),

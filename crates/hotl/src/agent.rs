@@ -1051,8 +1051,12 @@ async fn scaffold(
     }
     let concurrency =
         hotl_tools::concurrency::SessionConcurrency::new(concurrency_limits(secrets, &cfg));
+    // Loaded before the child builder, not after: a child now runs the
+    // parent's hooks (0058 T3), so the builder has to be handed them.
+    let hooks = load_hooks(&cfg, concurrency.clone());
     let spawn_builder = child_builder(
         provider.clone(),
+        hooks.clone(),
         rules.clone(),
         clock.clone(),
         config.clone(),
@@ -1076,7 +1080,6 @@ async fn scaffold(
         build_registry(&cfg, &config_dir, concurrency.clone());
     warnings.extend(discovery_warnings);
     let registry = Arc::new(registry);
-    let hooks = load_hooks(&cfg, concurrency.clone());
     let agents_include_claude = cfg.agents.claude.unwrap_or(true);
     let (wf_concurrency, wf_max_agents) = cfg.workflows.limits();
     let workflow_limits = hotl_workflow::Limits {
@@ -1931,6 +1934,10 @@ fn build_registry(
 /// a clean, non-recursive child). M4.
 struct HotlChildBuilder {
     provider: Arc<dyn hotl_provider::Provider>,
+    /// The parent's hooks, run inside every child under a `child:<ulid>`
+    /// actor (0058 T3). A hook is the operator's policy, and a policy that
+    /// stops applying the moment work is delegated is not one.
+    hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     rules: Arc<Rules>,
     clock: Arc<dyn Clock>,
     config: EngineConfig,
@@ -2149,13 +2156,21 @@ impl HotlChildBuilder {
             .clone()
             .unwrap_or_else(|| self.system.clone());
         let config = self.child_config(def);
+        // The parent's hooks under this child's own actor marker: a hook can
+        // tell parent from child, and can still only deny — never grant.
+        let hooks = self
+            .hooks
+            .clone()
+            .map(|h| -> Arc<dyn hotl_engine::hooks::Hooks> {
+                Arc::new(hotl_engine::hooks::ChildHooks::new(h, &log.session_id))
+            });
         let handle = spawn_session_with_todos(
             registry,
             None, // children never get their own `spawn` tool — depth-1 is structural
             // Nor `recall`: a child's own log is one turn deep, and reaching
             // the parent's would leak history the parent chose not to pass.
             None,
-            None, // children never get hooks either — see `hooks: None` below
+            hooks.clone(),
             None, // …and no plan artifact: a child's plan is its parent's business
             |registry| SessionDeps {
                 provider: self.provider.clone(),
@@ -2166,7 +2181,7 @@ impl HotlChildBuilder {
                 log,
                 system,
                 cwd: root.clone(),
-                hooks: None,
+                hooks,
                 initial_items,
                 initial_todos: Vec::new(),
                 initial_decisions: Vec::new(),
@@ -2270,6 +2285,7 @@ fn wrap_background_context(history: &[hotl_types::Item]) -> String {
 #[allow(clippy::too_many_arguments)]
 fn child_builder(
     provider: Arc<dyn hotl_provider::Provider>,
+    hooks: Option<Arc<dyn hotl_engine::hooks::Hooks>>,
     rules: Arc<Rules>,
     clock: Arc<dyn Clock>,
     config: EngineConfig,
@@ -2286,6 +2302,7 @@ fn child_builder(
 ) -> Arc<dyn crate::spawn::ChildBuilder> {
     Arc::new(HotlChildBuilder {
         provider,
+        hooks,
         rules,
         clock,
         config,
@@ -4537,6 +4554,7 @@ mod tests {
     pub(super) fn test_child_builder() -> (HotlChildBuilder, tempfile::TempDir) {
         let store = tempfile::tempdir().unwrap();
         let cb = HotlChildBuilder {
+            hooks: None,
             minify: hotl_tools::MinifyConfig::default(),
             provider: Arc::new(hotl_provider::ScriptedProvider::new(vec![])),
             rules: Arc::new(hotl_tools::rules::Rules::default()),
@@ -4857,6 +4875,61 @@ mod tests {
         let reg = cb.child_registry(&general, &cb.cwd, None);
         assert!(reg.get("write").is_some() && reg.get("bash").is_some());
         assert!(reg.get("spawn").is_none(), "children never recurse");
+    }
+
+    /// 0058 T3: the parent's hooks run inside a child. A hook is the
+    /// operator's policy, and a policy that stops applying the moment work is
+    /// delegated is not one — before this, `spawn_child` passed `hooks: None`.
+    #[tokio::test]
+    async fn child_pre_tool_hook_can_deny() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let saw = Arc::new(AtomicUsize::new(0));
+        let counted = saw.clone();
+        let hooks: Arc<dyn hotl_engine::hooks::Hooks> = Arc::new(
+            hotl_engine::hooks::InProcessHooks::new().on_pre_tool(move |name, _input| {
+                if name != "bash" {
+                    return hotl_engine::hooks::PreToolDecision::Continue;
+                }
+                counted.fetch_add(1, Ordering::SeqCst);
+                hotl_engine::hooks::PreToolDecision::Deny {
+                    message: "no shell in children".into(),
+                }
+            }),
+        );
+        let (mut cb, _store) = test_child_builder();
+        cb.hooks = Some(hooks);
+        cb.provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::tool_call(
+                "c1",
+                "bash",
+                serde_json::json!({"command": "ls"}),
+            ),
+            hotl_provider::ScriptedProvider::text_reply("ok"),
+        ]));
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let mut handle = cb
+            .spawn_child(&general, Vec::new(), None, None)
+            .expect("child spawns")
+            .handle;
+        handle.prompt("go".into()).await;
+        let mut denied = false;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            match ev {
+                EngineEvent::ToolDenied { name, .. } if name == "bash" => denied = true,
+                EngineEvent::TurnDone { .. } => break,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            saw.load(Ordering::SeqCst),
+            1,
+            "the hook ran inside the child"
+        );
+        assert!(denied, "and its denial actually stopped the call");
     }
 
     /// `report_result` is registered past the def's tool filter — a `tools:`

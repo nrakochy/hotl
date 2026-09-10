@@ -64,10 +64,20 @@ async fn next_event(s: &mut Session) -> EngineEvent {
 struct HangingPreTool;
 
 impl Hooks for HangingPreTool {
-    fn pre_tool<'a>(&'a self, _n: &'a str, _i: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+    fn pre_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        _n: &'a str,
+        _i: &'a Value,
+    ) -> BoxFuture<'a, PreToolDecision> {
         Box::pin(std::future::pending())
     }
-    fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn post_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        _n: &'a str,
+        _r: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(std::future::ready(None))
     }
 }

@@ -68,7 +68,13 @@ Your command receives the event as JSON on **stdin** and returns a decision as J
 
 Every stdin envelope carries the event **twice**: hotl's own lowercase `event` (unchanged, so an already-shipped `pre_tool`/`post_tool` hook keeps working), and `hookEventName`, Claude's own camelCase name for the same event (`PreToolUse`, `PostToolUse`, `UserPromptSubmit`, `Notification`, `Stop`, `SessionEnd`, `PreCompact`, `PostCompact`) — so a `~/.claude`-style hook script that keys on `hookEventName` (the only key it knows for the brand-new `user_prompt`/`notification`/`stop` events) can read hotl's envelope unmodified.
 
-**pre_tool** — stdin `{"event":"pre_tool","hookEventName":"PreToolUse","tool":"bash","input":{...}}`, respond with one of:
+Every envelope also carries **`actor`**: `"main"` for the session you are
+talking to, `"child:<id>"` for a sub-agent hotl spawned. Your hooks run inside
+children too — a policy that stopped applying the moment work was delegated
+would not be one — so key on `actor` if you mean to police only your own
+session.
+
+**pre_tool** — stdin `{"event":"pre_tool","hookEventName":"PreToolUse","actor":"main","tool":"bash","input":{...}}`, respond with one of:
 ```json
 {"decision":"continue"}
 {"decision":"deny","message":"why the model should not do this"}
@@ -76,15 +82,15 @@ Every stdin envelope carries the event **twice**: hotl's own lowercase `event` (
 ```
 A `deny` becomes an error tool result carrying your message. A `rewrite` swaps the arguments and **re-enters the normal permission gate** — a hook cannot push a call past the y/N ask. With several matching hooks, `deny` beats `rewrite` beats `continue`.
 
-**post_tool** — stdin `{"event":"post_tool","hookEventName":"PostToolUse","tool":"read","result":"<up to 2KB>"}`, respond with `{"result":"replacement"}` to change what the model sees, or anything else to leave it.
+**post_tool** — stdin `{"event":"post_tool","hookEventName":"PostToolUse","actor":"main","tool":"read","result":"<up to 2KB>"}`, respond with `{"result":"replacement"}` to change what the model sees, or anything else to leave it.
 
-**user_prompt** — stdin `{"event":"user_prompt","hookEventName":"UserPromptSubmit","prompt":"..."}`, respond with:
+**user_prompt** — stdin `{"event":"user_prompt","hookEventName":"UserPromptSubmit","actor":"main","prompt":"..."}`, respond with:
 ```json
 {"hookSpecificOutput":{"additionalContext":"remember: use pnpm, not npm"}}
 ```
 (the same nested shape Claude Code uses, so an existing `additionalContext` hook script ports unmodified). The text becomes one reminder committed right after the prompt it answers — never a system-prompt edit, so the prefix cache stays stable. Several matching hooks' context is concatenated into that one reminder, in the order they're listed.
 
-**notification** — stdin `{"event":"notification","hookEventName":"Notification","kind":"blocked"|"idle"|"done","detail":"..."}`. Fire-and-forget: your command's stdout is ignored, and a slow or hung notifier is spawned detached with its own timeout — it can never stall the agent. This is the seam behind `hotl watch`/desktop notifiers. `blocked` also fires from the structured `ask_user` question surface, not just the permission ask.
+**notification** — stdin `{"event":"notification","hookEventName":"Notification","actor":"main","kind":"blocked"|"idle"|"done","detail":"..."}`. Fire-and-forget: your command's stdout is ignored, and a slow or hung notifier is spawned detached with its own timeout — it can never stall the agent. This is the seam behind `hotl watch`/desktop notifiers. `blocked` also fires from the structured `ask_user` question surface, not just the permission ask.
 
 **stop** — stdin `{"event":"stop","hookEventName":"Stop","outcome":"the model's final reply text"}`, respond with:
 ```json
@@ -92,15 +98,15 @@ A `deny` becomes an error tool result carrying your message. A `rewrite` swaps t
 ```
 or `{"decision":"allow"}` (the default for anything else). A `block` injects your `reason` as a reminder and lets the model keep going — **bounded**: `stop` shares one per-prompt budget of eight extensions (Claude Code's Stop-hook cap) with hotl's own todo-list nudge, so a hook that always blocks can never wedge a turn forever.
 
-**session_end** — stdin `{"event":"session_end","hookEventName":"SessionEnd"}`. Runs to completion at actor shutdown (bounded by its own timeout) rather than fire-and-forget — the process waits for it, so it's guaranteed to actually run before `hotl` exits.
+**session_end** — stdin `{"event":"session_end","hookEventName":"SessionEnd","actor":"main"}`. Runs to completion at actor shutdown (bounded by its own timeout) rather than fire-and-forget — the process waits for it, so it's guaranteed to actually run before `hotl` exits.
 
-**pre_compact** — stdin `{"event":"pre_compact","hookEventName":"PreCompact","foldedIds":["t7","t8"],"keptFrom":12,"estimatePct":81}`, respond with:
+**pre_compact** — stdin `{"event":"pre_compact","hookEventName":"PreCompact","actor":"main","foldedIds":["t7","t8"],"keptFrom":12,"estimatePct":81}`, respond with:
 ```json
 {"pin":["t7"]}
 ```
 Each pinned `tool_use` id's result is re-appended verbatim right after the digest, so the detail a summary would have flattened survives the fold. `foldedIds` is every result about to be folded away, so a hook can decide by id without parsing anything. **A `pre_compact` hook can pin, never veto** — a fold the window needs is not a hook's to refuse, and a hung one folds with no pins. A pin survives one fold: keep it small, or the next sample folds it away again.
 
-**post_compact** — stdin `{"event":"post_compact","hookEventName":"PostCompact","digest":"GOAL: …"}`. Fire-and-forget (bounded like `session_end`): the digest is what the model will read from here on, so this is the seam for archiving it.
+**post_compact** — stdin `{"event":"post_compact","hookEventName":"PostCompact","actor":"main","digest":"GOAL: …"}`. Fire-and-forget (bounded like `session_end`): the digest is what the model will read from here on, so this is the seam for archiving it.
 
 ### Rules hooks live by
 

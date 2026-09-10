@@ -151,6 +151,7 @@ async fn a_user_prompt_hook_keeps_the_awaited_path() {
     impl hotl_engine::hooks::Hooks for PromptHook {
         fn pre_tool<'a>(
             &'a self,
+            _actor: &'a str,
             _name: &'a str,
             _input: &'a serde_json::Value,
         ) -> futures_util::future::BoxFuture<'a, hotl_engine::hooks::PreToolDecision> {
@@ -160,6 +161,7 @@ async fn a_user_prompt_hook_keeps_the_awaited_path() {
         }
         fn post_tool<'a>(
             &'a self,
+            _actor: &'a str,
             _name: &'a str,
             _result: &'a str,
         ) -> futures_util::future::BoxFuture<'a, Option<String>> {

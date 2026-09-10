@@ -45,6 +45,7 @@ pub const HOOK_CALL_TIMEOUT: Duration = Duration::from_secs(15);
 /// permission gate (deny rules, protected paths, the human).
 pub async fn call_pre_tool(
     hooks: &Arc<dyn Hooks>,
+    actor: &str,
     name: &str,
     input: &Value,
     cancel: &CancellationToken,
@@ -52,7 +53,7 @@ pub async fn call_pre_tool(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => PreToolDecision::Continue,
-        decision = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.pre_tool(name, input)) => {
+        decision = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.pre_tool(actor, name, input)) => {
             decision.unwrap_or(PreToolDecision::Continue)
         }
     }
@@ -64,6 +65,7 @@ pub async fn call_pre_tool(
 /// never a half-applied proposal.
 pub async fn call_post_tool(
     hooks: &Arc<dyn Hooks>,
+    actor: &str,
     name: &str,
     result: &str,
     cancel: &CancellationToken,
@@ -72,7 +74,7 @@ pub async fn call_post_tool(
     tokio::select! {
         biased;
         _ = cancel.cancelled() => None,
-        replacement = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.post_tool(name, capped)) => {
+        replacement = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.post_tool(actor, name, capped)) => {
             replacement.ok().flatten()
         }
     }
@@ -127,8 +129,8 @@ pub fn restore_capped(original: &Value, mut rewritten: Value) -> Value {
 
 /// Await [`Hooks::on_user_prompt`] under [`HOOK_CALL_TIMEOUT`]; a timeout
 /// behaves exactly like `None` — no context, never a crash.
-pub async fn call_user_prompt(hooks: &Arc<dyn Hooks>, prompt: &str) -> Option<String> {
-    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.on_user_prompt(prompt))
+pub async fn call_user_prompt(hooks: &Arc<dyn Hooks>, actor: &str, prompt: &str) -> Option<String> {
+    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.on_user_prompt(actor, prompt))
         .await
         .ok()
         .flatten()
@@ -205,8 +207,11 @@ pub fn notify(
     let hooks = Arc::clone(hooks);
     let detail = detail.into();
     let handle = tokio::spawn(async move {
-        let _ =
-            tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_notification(kind, &detail)).await;
+        let _ = tokio::time::timeout(
+            NOTIFICATION_TIMEOUT,
+            hooks.on_notification(ACTOR_MAIN, kind, &detail),
+        )
+        .await;
     });
     drain.track(handle);
 }
@@ -214,8 +219,8 @@ pub fn notify(
 /// Await [`Hooks::on_stop`] under [`HOOK_CALL_TIMEOUT`]; a timeout behaves
 /// exactly like `Allow` — a hung hook can never wedge a turn (it's a no-op,
 /// not a block).
-pub async fn call_stop(hooks: &Arc<dyn Hooks>, outcome: &str) -> StopDecision {
-    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.on_stop(outcome))
+pub async fn call_stop(hooks: &Arc<dyn Hooks>, actor: &str, outcome: &str) -> StopDecision {
+    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.on_stop(actor, outcome))
         .await
         .unwrap_or(StopDecision::Allow)
 }
@@ -229,8 +234,8 @@ pub async fn call_stop(hooks: &Arc<dyn Hooks>, outcome: &str) -> StopDecision {
 /// (`actor::run`) is itself a spawned task the CLI now awaits to completion
 /// before returning (`SessionHandle::finish`), so awaiting here — rather
 /// than spawning — is what makes that wait actually cover the hook call.
-pub async fn call_session_end(hooks: &Arc<dyn Hooks>) {
-    let _ = tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_session_end()).await;
+pub async fn call_session_end(hooks: &Arc<dyn Hooks>, actor: &str) {
+    let _ = tokio::time::timeout(NOTIFICATION_TIMEOUT, hooks.on_session_end(actor)).await;
 }
 
 /// A `PreToolUse` decision (wrap-style intercept). A `Rewrite` re-enters the
@@ -329,19 +334,39 @@ impl EventMask {
     }
 }
 
+/// Who a hook call is about (0058 T3): `"main"` for the session a human is
+/// talking to, `"child:<ulid>"` for a sub-agent. One `Hooks` instance now
+/// serves a parent and every child it spawns, so a hook that only wants to
+/// police the human's own session needs this to tell them apart.
+pub const ACTOR_MAIN: &str = "main";
+
 pub trait Hooks: Send + Sync {
     /// Before a tool runs. The hook sees the tool name and full input.
-    fn pre_tool<'a>(&'a self, name: &'a str, input: &'a Value) -> BoxFuture<'a, PreToolDecision>;
+    fn pre_tool<'a>(
+        &'a self,
+        actor: &'a str,
+        name: &'a str,
+        input: &'a Value,
+    ) -> BoxFuture<'a, PreToolDecision>;
     /// After a tool succeeds. `result` is byte-capped to `HOOK_PAYLOAD_CAP`.
     /// `Some(replacement)` swaps the result the model sees; `None` leaves it.
-    fn post_tool<'a>(&'a self, name: &'a str, result: &'a str) -> BoxFuture<'a, Option<String>>;
+    fn post_tool<'a>(
+        &'a self,
+        actor: &'a str,
+        name: &'a str,
+        result: &'a str,
+    ) -> BoxFuture<'a, Option<String>>;
 
     /// `UserPromptSubmit`: runs when a prompt is admitted, before the turn it
     /// starts samples. `Some(context)` becomes one `SyntheticReason::SystemReminder`
     /// user item committed right after the prompt — a tagged user item, never
     /// a system-prompt edit (prefix-cache stability). Default: no-op (`None`),
     /// so a lane that hasn't wired this event compiles and behaves inertly.
-    fn on_user_prompt<'a>(&'a self, _prompt: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn on_user_prompt<'a>(
+        &'a self,
+        _actor: &'a str,
+        _prompt: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(std::future::ready(None))
     }
 
@@ -351,6 +376,7 @@ pub trait Hooks: Send + Sync {
     /// `spawn_notification`); the default is a no-op.
     fn on_notification<'a>(
         &'a self,
+        _actor: &'a str,
         _kind: NotificationKind,
         _detail: &'a str,
     ) -> BoxFuture<'a, ()> {
@@ -360,27 +386,31 @@ pub trait Hooks: Send + Sync {
     /// `Stop`: a bounded veto at the turn's Done branch (tech-debt #10,
     /// node-style: it returns a decision, it doesn't wrap the branch).
     /// Default: `Allow` — a hook-less build never delays turn-end.
-    fn on_stop<'a>(&'a self, _outcome: &'a str) -> BoxFuture<'a, StopDecision> {
+    fn on_stop<'a>(&'a self, _actor: &'a str, _outcome: &'a str) -> BoxFuture<'a, StopDecision> {
         Box::pin(std::future::ready(StopDecision::Allow))
     }
 
     /// `SessionEnd`: fire-and-forget, called once at actor shutdown. Default:
     /// no-op.
-    fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
+    fn on_session_end<'a>(&'a self, _actor: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
     }
 
     /// `PreCompact`: the fold is about to run. A hook may name tool_use ids
     /// whose results must survive it verbatim; it can pin, never veto — a
     /// fold the window needs is not a hook's to refuse. Default: no pins.
-    fn pre_compact<'a>(&'a self, _info: &'a CompactInfo) -> BoxFuture<'a, PreCompactDecision> {
+    fn pre_compact<'a>(
+        &'a self,
+        _actor: &'a str,
+        _info: &'a CompactInfo,
+    ) -> BoxFuture<'a, PreCompactDecision> {
         Box::pin(std::future::ready(PreCompactDecision::default()))
     }
 
     /// `PostCompact`: the fold ran; `digest` is the summary the model will
     /// read. Fire-and-forget — nothing downstream consumes a reply. Default:
     /// no-op.
-    fn post_compact<'a>(&'a self, _digest: &'a str) -> BoxFuture<'a, ()> {
+    fn post_compact<'a>(&'a self, _actor: &'a str, _digest: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(std::future::ready(()))
     }
 
@@ -486,16 +516,24 @@ pub struct PreCompactDecision {
 
 /// Await [`Hooks::pre_compact`] under [`HOOK_CALL_TIMEOUT`]; a timeout folds
 /// with no pins — a hung hook can never wedge a fold the window needs.
-pub async fn call_pre_compact(hooks: &Arc<dyn Hooks>, info: &CompactInfo) -> PreCompactDecision {
-    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.pre_compact(info))
+pub async fn call_pre_compact(
+    hooks: &Arc<dyn Hooks>,
+    actor: &str,
+    info: &CompactInfo,
+) -> PreCompactDecision {
+    tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.pre_compact(actor, info))
         .await
         .unwrap_or_default()
 }
 
 /// Await [`Hooks::post_compact`] under [`HOOK_CALL_TIMEOUT`]; a timeout is a
 /// no-op, exactly like [`call_session_end`]'s.
-pub async fn call_post_compact(hooks: &Arc<dyn Hooks>, digest: &str) {
-    let _ = tokio::time::timeout(HOOK_CALL_TIMEOUT, hooks.post_compact(cap_payload(digest))).await;
+pub async fn call_post_compact(hooks: &Arc<dyn Hooks>, actor: &str, digest: &str) {
+    let _ = tokio::time::timeout(
+        HOOK_CALL_TIMEOUT,
+        hooks.post_compact(actor, cap_payload(digest)),
+    )
+    .await;
 }
 
 /// Deterministic merge over `pre_compact` results: the union of every hook's
@@ -671,7 +709,12 @@ pub fn merge_stop(results: Vec<StopDecision>) -> StopDecision {
 }
 
 impl Hooks for InProcessHooks {
-    fn pre_tool<'a>(&'a self, name: &'a str, input: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+    fn pre_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        name: &'a str,
+        input: &'a Value,
+    ) -> BoxFuture<'a, PreToolDecision> {
         // These handlers are synchronous `Fn`s: `join_all` over futures that are
         // ready on first poll bought concurrency-shaped syntax and no
         // concurrency (T3-10). Registration order is the tiebreak
@@ -688,7 +731,12 @@ impl Hooks for InProcessHooks {
             merge_pre_tool(results)
         })
     }
-    fn post_tool<'a>(&'a self, name: &'a str, result: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn post_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        name: &'a str,
+        result: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
             let capped = cap_payload(result);
             let mut current: Option<String> = None;
@@ -708,43 +756,134 @@ impl Hooks for InProcessHooks {
             current
         })
     }
-    fn on_user_prompt<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn on_user_prompt<'a>(
+        &'a self,
+        _actor: &'a str,
+        prompt: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
             let results: Vec<_> = self.prompt.iter().filter_map(|hook| hook(prompt)).collect();
             join_additional_context(results.into_iter())
         })
     }
-    fn on_notification<'a>(&'a self, kind: NotificationKind, detail: &'a str) -> BoxFuture<'a, ()> {
+    fn on_notification<'a>(
+        &'a self,
+        _actor: &'a str,
+        kind: NotificationKind,
+        detail: &'a str,
+    ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             for hook in &self.notification {
                 hook(kind, detail);
             }
         })
     }
-    fn on_stop<'a>(&'a self, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
+    fn on_stop<'a>(&'a self, _actor: &'a str, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
         Box::pin(async move {
             let results: Vec<_> = self.stop.iter().map(|hook| hook(outcome)).collect();
             merge_stop(results)
         })
     }
-    fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
+    fn on_session_end<'a>(&'a self, _actor: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             for hook in &self.session_end {
                 hook();
             }
         })
     }
-    fn pre_compact<'a>(&'a self, info: &'a CompactInfo) -> BoxFuture<'a, PreCompactDecision> {
+    fn pre_compact<'a>(
+        &'a self,
+        _actor: &'a str,
+        info: &'a CompactInfo,
+    ) -> BoxFuture<'a, PreCompactDecision> {
         Box::pin(async move {
             merge_pre_compact(self.pre_compact.iter().map(|hook| hook(info)).collect())
         })
     }
-    fn post_compact<'a>(&'a self, digest: &'a str) -> BoxFuture<'a, ()> {
+    fn post_compact<'a>(&'a self, _actor: &'a str, digest: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             for hook in &self.post_compact {
                 hook(digest);
             }
         })
+    }
+}
+
+/// The parent's hooks, seen from inside a child session (0058 T3): every
+/// call forwards unchanged except the actor, which becomes this child's.
+///
+/// A wrapper rather than a per-session field because one `Hooks` instance
+/// serves the parent and every child it spawns — the actor is a property of
+/// the *caller*, not of the hook set, and threading it through `SessionDeps`
+/// would have meant a required field on 85 construction sites for a value
+/// only this one path ever varies.
+pub struct ChildHooks {
+    inner: Arc<dyn Hooks>,
+    actor: String,
+}
+
+impl ChildHooks {
+    pub fn new(inner: Arc<dyn Hooks>, child_session_id: &str) -> Self {
+        Self {
+            inner,
+            actor: format!("child:{child_session_id}"),
+        }
+    }
+}
+
+impl Hooks for ChildHooks {
+    fn pre_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        name: &'a str,
+        input: &'a Value,
+    ) -> BoxFuture<'a, PreToolDecision> {
+        self.inner.pre_tool(&self.actor, name, input)
+    }
+    fn post_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        name: &'a str,
+        result: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
+        self.inner.post_tool(&self.actor, name, result)
+    }
+    fn on_user_prompt<'a>(
+        &'a self,
+        _actor: &'a str,
+        prompt: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
+        self.inner.on_user_prompt(&self.actor, prompt)
+    }
+    fn on_notification<'a>(
+        &'a self,
+        _actor: &'a str,
+        kind: NotificationKind,
+        detail: &'a str,
+    ) -> BoxFuture<'a, ()> {
+        self.inner.on_notification(&self.actor, kind, detail)
+    }
+    fn on_stop<'a>(&'a self, _actor: &'a str, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
+        self.inner.on_stop(&self.actor, outcome)
+    }
+    fn on_session_end<'a>(&'a self, _actor: &'a str) -> BoxFuture<'a, ()> {
+        self.inner.on_session_end(&self.actor)
+    }
+    fn pre_compact<'a>(
+        &'a self,
+        _actor: &'a str,
+        info: &'a CompactInfo,
+    ) -> BoxFuture<'a, PreCompactDecision> {
+        self.inner.pre_compact(&self.actor, info)
+    }
+    fn post_compact<'a>(&'a self, _actor: &'a str, digest: &'a str) -> BoxFuture<'a, ()> {
+        self.inner.post_compact(&self.actor, digest)
+    }
+    fn event_mask(&self) -> EventMask {
+        self.inner.event_mask()
+    }
+    fn mask_handle(&self) -> Option<Arc<AtomicU8>> {
+        self.inner.mask_handle()
     }
 }
 
@@ -846,16 +985,23 @@ mod tests {
         impl Hooks for Hung {
             fn pre_tool<'a>(
                 &'a self,
+                _actor: &'a str,
                 _n: &'a str,
                 _i: &'a Value,
             ) -> BoxFuture<'a, PreToolDecision> {
                 Box::pin(std::future::ready(PreToolDecision::Continue))
             }
-            fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+            fn post_tool<'a>(
+                &'a self,
+                _actor: &'a str,
+                _n: &'a str,
+                _r: &'a str,
+            ) -> BoxFuture<'a, Option<String>> {
                 Box::pin(std::future::ready(None))
             }
             fn pre_compact<'a>(
                 &'a self,
+                _actor: &'a str,
                 _info: &'a CompactInfo,
             ) -> BoxFuture<'a, PreCompactDecision> {
                 Box::pin(async {
@@ -873,7 +1019,7 @@ mod tests {
             estimate_pct: 82,
         };
         assert_eq!(
-            call_pre_compact(&hooks, &info).await,
+            call_pre_compact(&hooks, ACTOR_MAIN, &info).await,
             PreCompactDecision::default()
         );
     }
@@ -901,12 +1047,18 @@ mod tests {
         impl Hooks for DefaultMaskHooks {
             fn pre_tool<'a>(
                 &'a self,
+                _actor: &'a str,
                 _n: &'a str,
                 _i: &'a Value,
             ) -> BoxFuture<'a, PreToolDecision> {
                 Box::pin(std::future::ready(PreToolDecision::Continue))
             }
-            fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+            fn post_tool<'a>(
+                &'a self,
+                _actor: &'a str,
+                _n: &'a str,
+                _r: &'a str,
+            ) -> BoxFuture<'a, Option<String>> {
                 Box::pin(std::future::ready(None))
             }
         }
@@ -919,10 +1071,20 @@ mod tests {
     struct HangingHooks;
 
     impl Hooks for HangingHooks {
-        fn pre_tool<'a>(&'a self, _n: &'a str, _i: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+        fn pre_tool<'a>(
+            &'a self,
+            _actor: &'a str,
+            _n: &'a str,
+            _i: &'a Value,
+        ) -> BoxFuture<'a, PreToolDecision> {
             Box::pin(std::future::pending())
         }
-        fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+        fn post_tool<'a>(
+            &'a self,
+            _actor: &'a str,
+            _n: &'a str,
+            _r: &'a str,
+        ) -> BoxFuture<'a, Option<String>> {
             Box::pin(std::future::pending())
         }
     }
@@ -935,12 +1097,12 @@ mod tests {
         let hooks: Arc<dyn Hooks> = Arc::new(HangingHooks);
         let cancel = CancellationToken::new();
         assert_eq!(
-            call_pre_tool(&hooks, "bash", &json!({}), &cancel).await,
+            call_pre_tool(&hooks, ACTOR_MAIN, "bash", &json!({}), &cancel).await,
             PreToolDecision::Continue,
             "a hung pre_tool degrades to a no-op — never a grant, never a block"
         );
         assert_eq!(
-            call_post_tool(&hooks, "bash", "the real output", &cancel).await,
+            call_post_tool(&hooks, ACTOR_MAIN, "bash", "the real output", &cancel).await,
             None,
             "a hung post_tool leaves the tool's real output in place"
         );
@@ -953,10 +1115,13 @@ mod tests {
         cancel.cancel();
         let start = tokio::time::Instant::now();
         assert_eq!(
-            call_pre_tool(&hooks, "bash", &json!({}), &cancel).await,
+            call_pre_tool(&hooks, ACTOR_MAIN, "bash", &json!({}), &cancel).await,
             PreToolDecision::Continue
         );
-        assert_eq!(call_post_tool(&hooks, "bash", "out", &cancel).await, None);
+        assert_eq!(
+            call_post_tool(&hooks, ACTOR_MAIN, "bash", "out", &cancel).await,
+            None
+        );
         assert_eq!(
             start.elapsed(),
             Duration::ZERO,
@@ -1034,7 +1199,7 @@ mod tests {
         });
         assert_eq!(
             hooks
-                .pre_tool("bash", &json!({"command": "rm -rf /"}))
+                .pre_tool(ACTOR_MAIN, "bash", &json!({"command": "rm -rf /"}))
                 .await,
             PreToolDecision::Deny {
                 message: "no destructive commands".into()
@@ -1042,12 +1207,12 @@ mod tests {
         );
         assert!(matches!(
             hooks
-                .pre_tool("write", &json!({"path": "x", "content": "y"}))
+                .pre_tool(ACTOR_MAIN, "write", &json!({"path": "x", "content": "y"}))
                 .await,
             PreToolDecision::Rewrite { .. }
         ));
         assert_eq!(
-            hooks.pre_tool("read", &json!({})).await,
+            hooks.pre_tool(ACTOR_MAIN, "read", &json!({})).await,
             PreToolDecision::Continue
         );
     }
@@ -1057,7 +1222,7 @@ mod tests {
         let hooks = InProcessHooks::new()
             .on_post_tool(|_n, result| Some(format!("[annotated] {} chars", result.len())));
         let big = "z".repeat(HOOK_PAYLOAD_CAP * 2);
-        let out = hooks.post_tool("read", &big).await.unwrap();
+        let out = hooks.post_tool(ACTOR_MAIN, "read", &big).await.unwrap();
         // The hook only ever saw the capped payload.
         assert!(out.contains(&format!("{} chars", HOOK_PAYLOAD_CAP)));
     }
@@ -1072,12 +1237,12 @@ mod tests {
         );
         // fires on bash
         assert!(matches!(
-            hooks.pre_tool("bash", &json!({})).await,
+            hooks.pre_tool(ACTOR_MAIN, "bash", &json!({})).await,
             PreToolDecision::Deny { .. }
         ));
         // does not fire on read
         assert_eq!(
-            hooks.pre_tool("read", &json!({})).await,
+            hooks.pre_tool(ACTOR_MAIN, "read", &json!({})).await,
             PreToolDecision::Continue
         );
     }
@@ -1102,7 +1267,10 @@ mod tests {
             .on_stop(push(&order, "b"))
             .on_stop(push(&order, "c"));
         // Disambiguated: the builder's `on_stop` shadows the trait's.
-        assert_eq!(Hooks::on_stop(&hooks, "done").await, StopDecision::Allow);
+        assert_eq!(
+            Hooks::on_stop(&hooks, ACTOR_MAIN, "done").await,
+            StopDecision::Allow
+        );
         assert_eq!(*order.lock().expect("lock"), vec!["a", "b", "c"]);
     }
 
@@ -1127,7 +1295,7 @@ mod tests {
                 message: "blocked".into(),
             });
         assert_eq!(
-            hooks.pre_tool("bash", &json!({})).await,
+            hooks.pre_tool(ACTOR_MAIN, "bash", &json!({})).await,
             PreToolDecision::Deny {
                 message: "blocked".into()
             }
@@ -1147,7 +1315,7 @@ mod tests {
                 message: "second".into(),
             });
         assert_eq!(
-            hooks.pre_tool("bash", &json!({})).await,
+            hooks.pre_tool(ACTOR_MAIN, "bash", &json!({})).await,
             PreToolDecision::Deny {
                 message: "first".into()
             }
@@ -1166,7 +1334,7 @@ mod tests {
         // `bash` only matches the `All` hook (Continue) — the `write`-only
         // Deny must not leak into an unrelated tool's decision.
         assert_eq!(
-            hooks.pre_tool("bash", &json!({})).await,
+            hooks.pre_tool(ACTOR_MAIN, "bash", &json!({})).await,
             PreToolDecision::Continue
         );
     }

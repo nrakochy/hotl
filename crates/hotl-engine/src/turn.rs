@@ -1161,7 +1161,7 @@ impl Turn {
             self.shared.hook_mask(),
             crate::hooks::EventMask::STOP,
             |hooks| {
-                match crate::hooks::call_stop(hooks, outcome_text).await {
+                match crate::hooks::call_stop(hooks, crate::hooks::ACTOR_MAIN, outcome_text).await {
                     crate::hooks::StopDecision::Block { reason } => Some(reason),
                     crate::hooks::StopDecision::Allow => None,
                 }
@@ -1836,7 +1836,7 @@ impl Turn {
             crate::hooks::EventMask::PRE_TOOL,
             |hooks| {
                 let view = crate::hooks::cap_tool_input(&input);
-                match crate::hooks::call_pre_tool(hooks, &tu.name, &view, &self.cancel).await {
+                match crate::hooks::call_pre_tool(hooks, crate::hooks::ACTOR_MAIN, &tu.name, &view, &self.cancel).await {
                     crate::hooks::PreToolDecision::Continue => {}
                     crate::hooks::PreToolDecision::Deny { message } => {
                         self.emit(EngineEvent::ToolDenied {
@@ -2049,6 +2049,7 @@ impl Turn {
                 |hooks| {
                     if let Some(replacement) = crate::hooks::call_post_tool(
                         hooks,
+                        crate::hooks::ACTOR_MAIN,
                         &tu.name,
                         &outcome.content,
                         &self.cancel,

@@ -375,11 +375,17 @@ impl ShellHooks {
 }
 
 impl Hooks for ShellHooks {
-    fn pre_tool<'a>(&'a self, name: &'a str, input: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+    fn pre_tool<'a>(
+        &'a self,
+        actor: &'a str,
+        name: &'a str,
+        input: &'a Value,
+    ) -> BoxFuture<'a, PreToolDecision> {
         Box::pin(async move {
             let payload = json!({
                 "event": "pre_tool",
                 "hookEventName": claude_event_name("pre_tool"),
+                "actor": actor,
                 "tool": name,
                 "input": input
             });
@@ -407,7 +413,12 @@ impl Hooks for ShellHooks {
         })
     }
 
-    fn post_tool<'a>(&'a self, name: &'a str, result: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn post_tool<'a>(
+        &'a self,
+        actor: &'a str,
+        name: &'a str,
+        result: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
             let capped = cap_payload(result);
             let mut current: Option<String> = None;
@@ -421,6 +432,7 @@ impl Hooks for ShellHooks {
                 let payload = json!({
                     "event": "post_tool",
                     "hookEventName": claude_event_name("post_tool"),
+                    "actor": actor,
                     "tool": name,
                     "result": view
                 });
@@ -438,11 +450,16 @@ impl Hooks for ShellHooks {
         })
     }
 
-    fn on_user_prompt<'a>(&'a self, prompt: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn on_user_prompt<'a>(
+        &'a self,
+        actor: &'a str,
+        prompt: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(async move {
             let payload = json!({
                 "event": "user_prompt",
                 "hookEventName": claude_event_name("user_prompt"),
+                "actor": actor,
                 "prompt": prompt
             });
             let futures = self.prompt.iter().map(|hook| {
@@ -464,7 +481,12 @@ impl Hooks for ShellHooks {
         })
     }
 
-    fn on_notification<'a>(&'a self, kind: NotificationKind, detail: &'a str) -> BoxFuture<'a, ()> {
+    fn on_notification<'a>(
+        &'a self,
+        actor: &'a str,
+        kind: NotificationKind,
+        detail: &'a str,
+    ) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let kind_str = match kind {
                 NotificationKind::Blocked => "blocked",
@@ -474,6 +496,7 @@ impl Hooks for ShellHooks {
             let payload = json!({
                 "event": "notification",
                 "hookEventName": claude_event_name("notification"),
+                "actor": actor,
                 "kind": kind_str,
                 "detail": detail
             });
@@ -491,11 +514,12 @@ impl Hooks for ShellHooks {
         })
     }
 
-    fn on_stop<'a>(&'a self, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
+    fn on_stop<'a>(&'a self, actor: &'a str, outcome: &'a str) -> BoxFuture<'a, StopDecision> {
         Box::pin(async move {
             let payload = json!({
                 "event": "stop",
                 "hookEventName": claude_event_name("stop"),
+                "actor": actor,
                 "outcome": outcome
             });
             let futures = self.stop.iter().map(|hook| {
@@ -513,11 +537,12 @@ impl Hooks for ShellHooks {
         })
     }
 
-    fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
+    fn on_session_end<'a>(&'a self, actor: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let payload = json!({
                 "event": "session_end",
-                "hookEventName": claude_event_name("session_end")
+                "hookEventName": claude_event_name("session_end"),
+                "actor": actor
             });
             let futures = self
                 .session_end
@@ -528,11 +553,16 @@ impl Hooks for ShellHooks {
         })
     }
 
-    fn pre_compact<'a>(&'a self, info: &'a CompactInfo) -> BoxFuture<'a, PreCompactDecision> {
+    fn pre_compact<'a>(
+        &'a self,
+        actor: &'a str,
+        info: &'a CompactInfo,
+    ) -> BoxFuture<'a, PreCompactDecision> {
         Box::pin(async move {
             let payload = json!({
                 "event": "pre_compact",
                 "hookEventName": claude_event_name("pre_compact"),
+                "actor": actor,
                 "foldedIds": info.folded_ids,
                 "keptFrom": info.kept_from,
                 "estimatePct": info.estimate_pct
@@ -555,11 +585,12 @@ impl Hooks for ShellHooks {
         })
     }
 
-    fn post_compact<'a>(&'a self, digest: &'a str) -> BoxFuture<'a, ()> {
+    fn post_compact<'a>(&'a self, actor: &'a str, digest: &'a str) -> BoxFuture<'a, ()> {
         Box::pin(async move {
             let payload = json!({
                 "event": "post_compact",
                 "hookEventName": claude_event_name("post_compact"),
+                "actor": actor,
                 "digest": digest
             });
             let futures = self
@@ -643,6 +674,109 @@ mod tests {
         SessionConcurrency::new(hotl_tools::concurrency::ConcurrencyLimits::default())
     }
 
+    /// 0058 T3: the envelope says who the call is about, so a hook that
+    /// only wants to police the human's own session can. `main` for the
+    /// parent; `child:<ulid>` for a sub-agent, which the `ChildHooks`
+    /// wrapper substitutes.
+    #[tokio::test]
+    async fn the_envelope_names_the_actor_main_or_the_child() {
+        let seen = tempfile::tempdir().unwrap();
+        let out = seen.path().join("actor.txt");
+        let hooks = load_str(
+            &format!(
+                "[[hook]]\nevent = \"pre_tool\"\n\
+                 command = \"jq -r .actor >> {}\"\n",
+                out.display()
+            ),
+            concurrency(),
+        )
+        .expect("hooks configured");
+        if which_jq().is_none() {
+            return;
+        }
+        hooks
+            .pre_tool(
+                hotl_engine::hooks::ACTOR_MAIN,
+                "bash",
+                &json!({"command": "ls"}),
+            )
+            .await;
+        let child: Arc<dyn Hooks> = Arc::new(hotl_engine::hooks::ChildHooks::new(
+            Arc::new(hooks) as Arc<dyn Hooks>,
+            "01ABC",
+        ));
+        // The wrapper substitutes its own actor whatever the caller passes.
+        child
+            .pre_tool(
+                hotl_engine::hooks::ACTOR_MAIN,
+                "bash",
+                &json!({"command": "ls"}),
+            )
+            .await;
+        let lines = std::fs::read_to_string(&out).unwrap_or_default();
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(lines, vec!["main", "child:01ABC"], "{lines:?}");
+    }
+
+    /// 0057's two compact events carry the actor too (0058 T3): a child folds
+    /// its own context, and a hook that cannot tell whose context is folding
+    /// cannot police either one.
+    #[tokio::test]
+    async fn the_compact_events_name_the_actor_as_well() {
+        let seen = tempfile::tempdir().unwrap();
+        let out = seen.path().join("actor.txt");
+        let hooks = load_str(
+            &format!(
+                "[[hook]]\nevent = \"pre_compact\"\n\
+                 command = \"jq -r .actor >> {}\"\n\
+                 [[hook]]\nevent = \"post_compact\"\n\
+                 command = \"jq -r .actor >> {}\"\n",
+                out.display(),
+                out.display()
+            ),
+            concurrency(),
+        )
+        .expect("hooks configured");
+        if which_jq().is_none() {
+            return;
+        }
+        let info = CompactInfo {
+            folded_ids: vec!["t1".into()],
+            kept_from: 3,
+            estimate_pct: 82,
+        };
+        hooks
+            .pre_compact(hotl_engine::hooks::ACTOR_MAIN, &info)
+            .await;
+        let child: Arc<dyn Hooks> = Arc::new(hotl_engine::hooks::ChildHooks::new(
+            Arc::new(hooks) as Arc<dyn Hooks>,
+            "01ABC",
+        ));
+        child
+            .pre_compact(hotl_engine::hooks::ACTOR_MAIN, &info)
+            .await;
+        child
+            .post_compact(hotl_engine::hooks::ACTOR_MAIN, "GOAL: ship it")
+            .await;
+        let lines = std::fs::read_to_string(&out).unwrap_or_default();
+        let lines: Vec<&str> = lines.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["main", "child:01ABC", "child:01ABC"],
+            "{lines:?}"
+        );
+    }
+
+    /// The actor test needs `jq`; skipped rather than failed where it is
+    /// missing, like every other tool-dependent test here.
+    fn which_jq() -> Option<std::path::PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join("jq"))
+                .find(|p| p.is_file())
+        })
+    }
+
     #[tokio::test]
     async fn pre_hook_denies_over_stdio() {
         // A hook that reads the event on stdin and denies bash calls.
@@ -651,7 +785,13 @@ mod tests {
              command = \"cat >/dev/null; echo '{\\\"decision\\\":\\\"deny\\\",\\\"message\\\":\\\"shell says no\\\"}'\"\n",
             concurrency(),
         ).expect("hooks configured");
-        let decision = hooks.pre_tool("bash", &json!({"command": "ls"})).await;
+        let decision = hooks
+            .pre_tool(
+                hotl_engine::hooks::ACTOR_MAIN,
+                "bash",
+                &json!({"command": "ls"}),
+            )
+            .await;
         assert_eq!(
             decision,
             PreToolDecision::Deny {
@@ -669,7 +809,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            hooks.post_tool("read", "raw output").await.as_deref(),
+            hooks
+                .post_tool(hotl_engine::hooks::ACTOR_MAIN, "read", "raw output")
+                .await
+                .as_deref(),
             Some("cleaned")
         );
         // A config with no hooks loads as None.
@@ -693,7 +836,13 @@ mod tests {
             kept_from: 12,
             estimate_pct: 81,
         };
-        assert_eq!(hooks.pre_compact(&info).await.pins, vec!["t7".to_string()]);
+        assert_eq!(
+            hooks
+                .pre_compact(hotl_engine::hooks::ACTOR_MAIN, &info)
+                .await
+                .pins,
+            vec!["t7".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -706,7 +855,9 @@ mod tests {
         )
         .expect("hooks configured");
         assert!(hooks.event_mask().contains(EventMask::POST_COMPACT));
-        hooks.post_compact("GOAL: ship it").await;
+        hooks
+            .post_compact(hotl_engine::hooks::ACTOR_MAIN, "GOAL: ship it")
+            .await;
         let seen = std::fs::read_to_string(&path).expect("hook wrote its stdin");
         assert!(seen.contains("\"hookEventName\":\"PostCompact\""), "{seen}");
         assert!(seen.contains("GOAL: ship it"), "{seen}");
@@ -723,7 +874,9 @@ mod tests {
         // (still continue — a hook can block but never grant).
         for _ in 0..5 {
             assert_eq!(
-                hooks.pre_tool("bash", &json!({})).await,
+                hooks
+                    .pre_tool(hotl_engine::hooks::ACTOR_MAIN, "bash", &json!({}))
+                    .await,
                 PreToolDecision::Continue
             );
         }
@@ -739,14 +892,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            hooks.pre_tool("bash", &json!({})).await,
+            hooks
+                .pre_tool(hotl_engine::hooks::ACTOR_MAIN, "bash", &json!({}))
+                .await,
             PreToolDecision::Deny {
                 message: "no".into()
             }
         );
         // `read` doesn't match the `bash`-only matcher — no-op.
         assert_eq!(
-            hooks.pre_tool("read", &json!({})).await,
+            hooks
+                .pre_tool(hotl_engine::hooks::ACTOR_MAIN, "read", &json!({}))
+                .await,
             PreToolDecision::Continue
         );
     }
@@ -759,7 +916,13 @@ mod tests {
             concurrency(),
         )
         .unwrap();
-        assert_eq!(hooks.on_user_prompt("hello").await.as_deref(), Some("X"));
+        assert_eq!(
+            hooks
+                .on_user_prompt(hotl_engine::hooks::ACTOR_MAIN, "hello")
+                .await
+                .as_deref(),
+            Some("X")
+        );
     }
 
     #[tokio::test]
@@ -771,7 +934,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            hooks.on_stop("done").await,
+            hooks.on_stop(hotl_engine::hooks::ACTOR_MAIN, "done").await,
             StopDecision::Block {
                 reason: "not yet".into()
             }
@@ -842,7 +1005,9 @@ mod tests {
             "the freshly loaded hook is live"
         );
         for _ in 0..MAX_STRIKES {
-            hooks.pre_tool("bash", &json!({})).await;
+            hooks
+                .pre_tool(hotl_engine::hooks::ACTOR_MAIN, "bash", &json!({}))
+                .await;
         }
         assert!(
             !hooks.event_mask().contains(EventMask::PRE_TOOL),
@@ -862,7 +1027,7 @@ command = "printf '{\"decision\":\"block\",\"reason\":\"%s\"}' \"$HOTL_HOOK_EVEN
 env = { HOTL_HOOK_EVENT = "spoofed-should-not-win" }
 "#;
         let hooks = load_str(toml, concurrency()).unwrap();
-        let decision = hooks.on_stop("done").await;
+        let decision = hooks.on_stop(hotl_engine::hooks::ACTOR_MAIN, "done").await;
         assert_eq!(
             decision,
             StopDecision::Block {
@@ -881,9 +1046,13 @@ env = { HOTL_HOOK_EVENT = "spoofed-should-not-win" }
         )
         .unwrap();
         hooks
-            .on_notification(NotificationKind::Blocked, "waiting")
+            .on_notification(
+                hotl_engine::hooks::ACTOR_MAIN,
+                NotificationKind::Blocked,
+                "waiting",
+            )
             .await;
-        hooks.on_session_end().await;
+        hooks.on_session_end(hotl_engine::hooks::ACTOR_MAIN).await;
     }
 
     /// Finding 3: `user_prompt`/`notification`/`stop` are brand-new events
@@ -908,9 +1077,13 @@ env = { HOTL_HOOK_EVENT = "spoofed-should-not-win" }
         );
         let hooks = load_str(&toml, concurrency()).unwrap();
         hooks
-            .on_notification(NotificationKind::Blocked, "waiting on a human")
+            .on_notification(
+                hotl_engine::hooks::ACTOR_MAIN,
+                NotificationKind::Blocked,
+                "waiting on a human",
+            )
             .await;
-        hooks.on_stop("done").await;
+        hooks.on_stop(hotl_engine::hooks::ACTOR_MAIN, "done").await;
 
         let notif: Value =
             serde_json::from_str(&std::fs::read_to_string(&notif_capture).unwrap()).unwrap();

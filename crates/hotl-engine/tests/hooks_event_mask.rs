@@ -41,31 +41,46 @@ impl RecordingHooks {
 }
 
 impl Hooks for RecordingHooks {
-    fn pre_tool<'a>(&'a self, _n: &'a str, _i: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+    fn pre_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        _n: &'a str,
+        _i: &'a Value,
+    ) -> BoxFuture<'a, PreToolDecision> {
         self.pre_tool.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(PreToolDecision::Continue))
     }
-    fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn post_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        _n: &'a str,
+        _r: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         self.post_tool.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(None))
     }
-    fn on_user_prompt<'a>(&'a self, _prompt: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn on_user_prompt<'a>(
+        &'a self,
+        _actor: &'a str,
+        _prompt: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         self.user_prompt.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(None))
     }
     fn on_notification<'a>(
         &'a self,
+        _actor: &'a str,
         _kind: NotificationKind,
         _detail: &'a str,
     ) -> BoxFuture<'a, ()> {
         self.notification.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(()))
     }
-    fn on_stop<'a>(&'a self, _outcome: &'a str) -> BoxFuture<'a, StopDecision> {
+    fn on_stop<'a>(&'a self, _actor: &'a str, _outcome: &'a str) -> BoxFuture<'a, StopDecision> {
         self.stop.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(StopDecision::Allow))
     }
-    fn on_session_end<'a>(&'a self) -> BoxFuture<'a, ()> {
+    fn on_session_end<'a>(&'a self, _actor: &'a str) -> BoxFuture<'a, ()> {
         self.session_end.fetch_add(1, Ordering::SeqCst);
         Box::pin(std::future::ready(()))
     }
@@ -196,7 +211,12 @@ impl SelfEvictingHooks {
 }
 
 impl Hooks for SelfEvictingHooks {
-    fn pre_tool<'a>(&'a self, _n: &'a str, _i: &'a Value) -> BoxFuture<'a, PreToolDecision> {
+    fn pre_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        _n: &'a str,
+        _i: &'a Value,
+    ) -> BoxFuture<'a, PreToolDecision> {
         let n = self.pre_tool_calls.fetch_add(1, Ordering::SeqCst) + 1;
         if n == 3 {
             self.mask
@@ -204,7 +224,12 @@ impl Hooks for SelfEvictingHooks {
         }
         Box::pin(std::future::ready(PreToolDecision::Continue))
     }
-    fn post_tool<'a>(&'a self, _n: &'a str, _r: &'a str) -> BoxFuture<'a, Option<String>> {
+    fn post_tool<'a>(
+        &'a self,
+        _actor: &'a str,
+        _n: &'a str,
+        _r: &'a str,
+    ) -> BoxFuture<'a, Option<String>> {
         Box::pin(std::future::ready(None))
     }
     fn mask_handle(&self) -> Option<Arc<AtomicU8>> {
