@@ -1063,6 +1063,7 @@ async fn drain_events(
         // Fold a burst that is already sitting in the queue into one frame —
         // one JSON line, one flush, one client parse. Cross-kind or control
         // events end the fold and are handled next iteration, in order.
+        // Child prose folds per parent (0062 T1).
         let event = match event {
             EngineEvent::TextDelta(mut t) => {
                 while t.len() < DELTA_COALESCE_MAX {
@@ -1089,6 +1090,25 @@ async fn drain_events(
                     }
                 }
                 EngineEvent::ThinkingDelta(t)
+            }
+            EngineEvent::ChildText {
+                parent_id,
+                text: mut t,
+            } => {
+                while t.len() < DELTA_COALESCE_MAX {
+                    match events.try_recv() {
+                        Ok(EngineEvent::ChildText {
+                            parent_id: p,
+                            text: next,
+                        }) if p == parent_id => t.push_str(&next),
+                        Ok(other) => {
+                            held = Some(other);
+                            break;
+                        }
+                        Err(_) => break,
+                    }
+                }
+                EngineEvent::ChildText { parent_id, text: t }
             }
             other => other,
         };
@@ -1314,6 +1334,38 @@ mod drain_tests {
         let updates: Vec<_> = lines.iter().filter(|l| l.contains("text_delta")).collect();
         assert_eq!(updates.len(), 1, "burst must fold: {lines:?}");
         assert!(updates[0].contains("\"text\":\"abc\""), "{updates:?}");
+    }
+
+    /// 0062 T1: a queued burst of one child's prose is one frame; a chunk
+    /// from a different child ends the fold, in order.
+    #[tokio::test]
+    async fn queued_child_text_coalesces_per_parent() {
+        let (tx, rx) = mpsc::channel(64);
+        for (p, t) in [("s1", "a"), ("s1", "b"), ("s2", "c"), ("s1", "d")] {
+            tx.send(EngineEvent::ChildText {
+                parent_id: p.into(),
+                text: t.into(),
+            })
+            .await
+            .unwrap();
+        }
+        tx.send(turn_done()).await.unwrap();
+        drop(tx);
+        let lines = run_drain_events_capturing_writer(rx).await;
+        let frames: Vec<_> = lines.iter().filter(|l| l.contains("child_text")).collect();
+        assert_eq!(frames.len(), 3, "s1 burst folds, s2 splits it: {lines:?}");
+        assert!(
+            frames[0].contains("\"parent_id\":\"s1\"") && frames[0].contains("\"text\":\"ab\""),
+            "{frames:?}"
+        );
+        assert!(
+            frames[1].contains("\"parent_id\":\"s2\"") && frames[1].contains("\"text\":\"c\""),
+            "{frames:?}"
+        );
+        assert!(
+            frames[2].contains("\"parent_id\":\"s1\"") && frames[2].contains("\"text\":\"d\""),
+            "{frames:?}"
+        );
     }
 
     /// Only *adjacent same-kind* deltas merge — a cross-kind event ends the

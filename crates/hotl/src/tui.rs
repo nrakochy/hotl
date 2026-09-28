@@ -478,10 +478,11 @@ async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, St
 /// keys, tool events, TurnDone, Tick itself — draws now. `child_tool` rides
 /// the tick too (0039 D9): children arrive at up to 4× the parent's tool
 /// rate, and the 30 Hz repaint caps the deferral at ≤ 33 ms.
+/// `child_text` rides the tick too (0062 T1), for the same reason.
 fn defers_draw(msg: &Msg) -> bool {
     matches!(msg, Msg::Update(v)
         if matches!(v.get("type").and_then(Value::as_str),
-            Some("text_delta" | "thinking_delta" | "child_tool" | "tool_progress")))
+            Some("text_delta" | "thinking_delta" | "child_tool" | "child_text" | "tool_progress")))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1419,6 +1420,11 @@ mod tests {
         // 0039 D9: children arrive at up to 4× the parent's tool rate.
         assert!(defers_draw(&Msg::Update(
             json!({"type": "child_tool", "parent_id": "p", "id": "c", "name": "read", "summary": "read ./x", "phase": "start"})
+        )));
+        // 0062 T1: sub-agent prose arrives at N children × their delta rate;
+        // a full frame per chunk is what made three streaming agents lag.
+        assert!(defers_draw(&Msg::Update(
+            json!({"type": "child_text", "parent_id": "p", "text": "x"})
         )));
         assert!(!defers_draw(&Msg::Update(
             json!({"type": "tool_start", "name": "bash", "summary": ""})

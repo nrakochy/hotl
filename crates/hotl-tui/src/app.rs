@@ -1524,9 +1524,15 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 .find(|i| matches!(i, TranscriptItem::Tool { id, .. } if *id == parent_id))
             {
                 child_text.push_str(&text_of("text"));
-                if child_text.chars().count() > CHILD_TEXT_CAP {
-                    let keep = child_text.chars().count() - CHILD_TEXT_CAP;
-                    *child_text = child_text.chars().skip(keep).collect();
+                // One count and an in-place drain, not two counts and a rebuild.
+                let over = child_text.chars().count().saturating_sub(CHILD_TEXT_CAP);
+                if over > 0 {
+                    let cut = child_text
+                        .char_indices()
+                        .nth(over)
+                        .map(|(i, _)| i)
+                        .unwrap_or(child_text.len());
+                    child_text.drain(..cut);
                 }
             }
         }
