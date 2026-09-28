@@ -292,7 +292,7 @@ fn update_line(update: &Value) -> Option<String> {
             // 0061 decision 15: plain `attach` is a line printer, so a frame
             // every 250 ms would be one line per output line — spam, not
             // liveness. The console renders these on the card instead.
-            "tool_progress" => return None,
+            "tool_progress" | "tool_input_progress" => return None,
             "compacting" => format!("(folding history — {} items)", n("items")),
             "goal_evaluating" => format!("· evaluating goal (turn {})", n("turn")),
             // 0061 T26: the same text the console shows.
@@ -447,6 +447,10 @@ mod tests {
                 lines: 12,
                 bytes: 480,
             },
+            EngineEvent::ToolInputProgress {
+                calls: 1,
+                bytes: 4096,
+            },
             EngineEvent::ToolQueued {
                 id: "t1".into(),
                 name: "bash".into(),
@@ -533,8 +537,14 @@ mod tests {
         // is the answer itself (streamed to stdout unadorned), and a tool that
         // *succeeded* needs no line — its output already spoke.
         // `tool_progress` is exempt by decision 15: a tail row is a console
-        // affordance, and a line printer cannot show one without spamming.
-        let exempt = ["text_delta", "tool_done", "tool_progress"];
+        // affordance, and a line printer cannot show one without spamming;
+        // `tool_input_progress` (0062 T3) likewise is a moving byte count.
+        let exempt = [
+            "text_delta",
+            "tool_done",
+            "tool_progress",
+            "tool_input_progress",
+        ];
         for e in every_streamable_event() {
             let Some(frame) = crate::wire::update_frame(&e) else {
                 continue;

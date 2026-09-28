@@ -127,6 +127,9 @@ const MAX_TOKENS_CONTINUE_MAX: u32 = 3;
 /// than as a turn that quietly re-bills itself five times.
 pub const STREAM_RETRY_MAX: u32 = 2;
 
+/// Floor between two `ToolInputProgress` frames of one call (0062 T3).
+const TOOL_INPUT_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// One turn's delegation record: every sub-agent's touched paths, so the
 /// duplicates can be counted at the end rather than guessed at per call.
 #[derive(Default)]
@@ -2484,6 +2487,11 @@ impl Turn {
         let mut sealed_tool_use = false;
         let mut open_tool_use: Option<usize> = None;
         let mut forwarded_text = false;
+        // 0062 T3: writing-a-tool-call liveness, cumulative per sample; a new
+        // call reports at once, then at most every 250 ms, and once more sealed.
+        let mut input_calls: u32 = 0;
+        let mut input_bytes: u64 = 0;
+        let mut input_last_frame: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 biased;
@@ -2495,6 +2503,11 @@ impl Turn {
                         match &event {
                             StreamEvent::BlockStart { index, kind } if kind == "tool_use" => {
                                 open_tool_use = Some(*index);
+                                input_calls += 1;
+                                input_last_frame = None;
+                            }
+                            StreamEvent::ToolInputDelta { json, .. } => {
+                                input_bytes += json.len() as u64;
                             }
                             StreamEvent::BlockEnd { index } if open_tool_use == Some(*index) => {
                                 sealed_tool_use = true;
@@ -2503,6 +2516,25 @@ impl Turn {
                                 forwarded_text = true;
                             }
                             _ => {}
+                        }
+                        // A sealed block flushes its final count past the throttle.
+                        let sealed_now = matches!(&event, StreamEvent::BlockEnd { index } if open_tool_use == Some(*index));
+                        if sealed_now
+                            || matches!(&event, StreamEvent::BlockStart { kind, .. } if kind == "tool_use")
+                            || matches!(&event, StreamEvent::ToolInputDelta { .. })
+                        {
+                            let now = tokio::time::Instant::now();
+                            if sealed_now
+                                || input_last_frame
+                                    .is_none_or(|t| now - t >= TOOL_INPUT_PROGRESS_INTERVAL)
+                            {
+                                input_last_frame = Some(now);
+                                // Lossy on purpose: `ToolStart` is the truth.
+                                let _ = self.events.try_send(EngineEvent::ToolInputProgress {
+                                    calls: input_calls,
+                                    bytes: input_bytes,
+                                });
+                            }
                         }
                         if let StreamEvent::Completed { stop, usage, blocks } = event {
                             self.ledger.stamp(Phase::LastBlockEnd);

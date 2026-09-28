@@ -166,3 +166,74 @@ async fn tool_progress_is_never_a_log_entry() {
         "progress leaked into the session log"
     );
 }
+
+/// 0062 T3: while the model streams a tool call's arguments the screen used
+/// to get nothing until `ToolStart`. Now it gets a byte count, and the count
+/// precedes the start.
+#[tokio::test]
+async fn tool_input_progress_precedes_tool_start_and_counts_bytes() {
+    use hotl_provider::StreamEvent;
+    use hotl_types::{StopReason, TokenUsage};
+    let (head, tail) = (r#"{"path": "Cargo.toml","#, r#" "limit": 5}"#);
+    let block = json!({"type": "tool_use", "id": "t1", "name": "read",
+                       "input": {"path": "Cargo.toml", "limit": 5}});
+    let script = vec![
+        Ok(StreamEvent::Started),
+        Ok(StreamEvent::BlockStart {
+            index: 0,
+            kind: "tool_use".into(),
+        }),
+        Ok(StreamEvent::ToolInputDelta {
+            index: 0,
+            json: head.into(),
+        }),
+        Ok(StreamEvent::ToolInputDelta {
+            index: 0,
+            json: tail.into(),
+        }),
+        Ok(StreamEvent::BlockEnd { index: 0 }),
+        Ok(StreamEvent::Completed {
+            stop: StopReason::ToolUse,
+            usage: TokenUsage {
+                input_tokens: 10,
+                output_tokens: 8,
+                ..Default::default()
+            },
+            blocks: vec![block],
+        }),
+    ];
+    let provider = Arc::new(ScriptedProvider::new(vec![
+        script,
+        ScriptedProvider::text_reply("done"),
+    ]));
+    let mut s = session(provider);
+    s.handle.prompt("go".into()).await;
+    let seen = drain(&mut s).await;
+
+    let first_progress = seen
+        .iter()
+        .position(|e| matches!(e, EngineEvent::ToolInputProgress { .. }))
+        .expect("a progress frame while the input streamed");
+    let start = seen
+        .iter()
+        .position(|e| matches!(e, EngineEvent::ToolStart { .. }))
+        .expect("the call started");
+    assert!(
+        first_progress < start,
+        "progress must land before the tool runs: {seen:?}"
+    );
+    let frames: Vec<(u32, u64)> = seen
+        .iter()
+        .filter_map(|e| match e {
+            EngineEvent::ToolInputProgress { calls, bytes } => Some((*calls, *bytes)),
+            _ => None,
+        })
+        .collect();
+    // Immediate at the block's start, throttled between, exact at its seal.
+    assert_eq!(frames.first(), Some(&(1, 0)), "{seen:?}");
+    assert_eq!(
+        frames.last(),
+        Some(&(1, (head.len() + tail.len()) as u64)),
+        "{seen:?}"
+    );
+}

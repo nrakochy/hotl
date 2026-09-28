@@ -40,6 +40,10 @@ fn every_frame_is_tagged_and_versioned() {
             lines: 12,
             bytes: 480,
         },
+        EngineEvent::ToolInputProgress {
+            calls: 1,
+            bytes: 4096,
+        },
         EngineEvent::Compacting { items: 42 },
         EngineEvent::ToolQueued {
             id: "t1".into(),

@@ -2688,6 +2688,7 @@ impl Surface {
             }
             // Liveness for an attached surface only; `-p` stays byte-identical.
             EngineEvent::ToolProgress { .. }
+            | EngineEvent::ToolInputProgress { .. }
             | EngineEvent::Compacting { .. }
             | EngineEvent::ToolQueued { .. }
             | EngineEvent::GoalEvaluating { .. } => {}

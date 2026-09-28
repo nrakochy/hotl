@@ -511,14 +511,28 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
             }
         }
         Phase::Sampling { ticks } => {
-            // The reasoning tokens, when there are any (0061 T21): `writing`
-            // counts what was written, and this counts what was thought.
-            let tok = crate::app::thinking_chars(&state.transcript) / 4;
-            segs.push(Segment::keep(if tok > 0 {
-                format!("thinking · ~{tok} tok · {}s", secs(*ticks))
+            // 0062 T3: writing a tool call is neither thinking nor quiet.
+            if let Some(ti) = state.tool_input {
+                let calls = if ti.calls == 1 {
+                    "1 call".to_string()
+                } else {
+                    format!("{} calls", ti.calls)
+                };
+                segs.push(Segment::keep(format!(
+                    "preparing {calls} · {} · {}s",
+                    human_bytes(ti.bytes),
+                    secs(*ticks)
+                )));
             } else {
-                format!("thinking · {}s", secs(*ticks))
-            }));
+                // The reasoning tokens, when there are any (0061 T21): `writing`
+                // counts what was written, and this counts what was thought.
+                let tok = crate::app::thinking_chars(&state.transcript) / 4;
+                segs.push(Segment::keep(if tok > 0 {
+                    format!("thinking · ~{tok} tok · {}s", secs(*ticks))
+                } else {
+                    format!("thinking · {}s", secs(*ticks))
+                }));
+            }
         }
         Phase::Streaming { ticks, chars } => segs.push(Segment::keep(format!(
             "writing · ~{} tok · {}s",
@@ -660,6 +674,17 @@ fn todos_label(todos: &[hotl_tools::todo::Todo]) -> String {
         .find(|t| t.status == hotl_tools::todo::TodoStatus::InProgress)
         .map(|t| t.active_form.as_deref().unwrap_or(&t.content).to_string())
         .unwrap_or_else(|| "todos".to_string())
+}
+
+/// `512 B`, `4.2 KB`, `1.3 MB` — one decimal above a kilobyte.
+fn human_bytes(n: u64) -> String {
+    if n < 1024 {
+        format!("{n} B")
+    } else if n < 1024 * 1024 {
+        format!("{:.1} KB", n as f64 / 1024.0)
+    } else {
+        format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
+    }
 }
 
 #[cfg(test)]
@@ -1116,6 +1141,23 @@ mod tests {
     /// 0061 T19: the only honest thing a surface can say when nothing has
     /// arrived. Ten seconds is short enough to catch a stalled connect and
     /// long enough that an ordinary think never trips it.
+    /// 0062 T3: a streaming tool call is not thinking, and it is not quiet.
+    #[test]
+    fn the_phase_text_says_preparing_while_a_tool_call_streams() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 3 * TICK_HZ };
+        s.tool_input = Some(crate::app::ToolInputProgress {
+            calls: 1,
+            bytes: 4_300,
+        });
+        assert_eq!(strip_text(&s), "preparing 1 call · 4.2 KB · 3s");
+        s.tool_input = Some(crate::app::ToolInputProgress {
+            calls: 2,
+            bytes: 512,
+        });
+        assert_eq!(strip_text(&s), "preparing 2 calls · 512 B · 3s");
+    }
+
     #[test]
     fn the_phase_text_says_quiet_after_ten_silent_seconds() {
         let mut s = State::test_default();

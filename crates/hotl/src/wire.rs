@@ -82,6 +82,10 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         } => {
             json!({"type": "tool_progress", "id": id, "name": name, "tail": tail, "lines": lines, "bytes": bytes})
         }
+        // 0062 T3. Additive — `JSON_STREAM_SCHEMA_VERSION` stands (0037 ruling).
+        EngineEvent::ToolInputProgress { calls, bytes } => {
+            json!({"type": "tool_input_progress", "calls": calls, "bytes": bytes})
+        }
         EngineEvent::ToolDenied { id, name } => {
             json!({"type": "tool_denied", "id": id, "name": name})
         }

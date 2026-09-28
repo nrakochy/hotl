@@ -380,6 +380,14 @@ pub struct ToolProgress {
     pub at_ticks: u64,
 }
 
+/// The model is writing a tool call (0062 T3): a sample-wide count, not a
+/// card — no card exists until `tool_start`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolInputProgress {
+    pub calls: u32,
+    pub bytes: u64,
+}
+
 /// A backoff the surface is counting down (0061 T22).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Retry {
@@ -652,6 +660,8 @@ pub struct State {
     /// and a `quiet Ns` past `anim::QUIET_AFTER` is the one honest thing a
     /// surface can say when nothing has arrived.
     pub since_frame: u64,
+    /// Set while a tool call's input streams; the strip reads it (0062 T3).
+    pub tool_input: Option<ToolInputProgress>,
     /// A provider backoff in flight (0061 T22). Nothing is computing during
     /// one, so the countdown *is* the liveness; cleared by the first frame
     /// that proves the re-send landed.
@@ -742,6 +752,7 @@ impl State {
             thinking_expanded: false,
             tools_expanded: false,
             since_frame: 0,
+            tool_input: None,
             retry: None,
             compacting: false,
             attachments: Vec::new(),
@@ -1230,11 +1241,13 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
     }
     match kind {
         "text_delta" => {
+            state.tool_input = None;
             append_assistant(state, &text_of("text"));
             state.retry = None;
             enter_streaming(state);
         }
         "tool_start" => {
+            state.tool_input = None;
             state.retry = None;
             let id = text_of("id");
             let status = match state.pending_auto_rules.remove(&id) {
@@ -1382,6 +1395,14 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             }
             settle_phase(state);
         }
+        // The model is writing a tool call (0062 T3); like `tool_progress`,
+        // no phase change.
+        "tool_input_progress" => {
+            state.tool_input = Some(ToolInputProgress {
+                calls: v.get("calls").and_then(Value::as_u64).unwrap_or(0) as u32,
+                bytes: v.get("bytes").and_then(Value::as_u64).unwrap_or(0),
+            });
+        }
         // A running tool's newest output line (0061 T25). Settles by id like
         // `tool_done`; deliberately no phase change and no `enter_streaming`
         // — it is not a `text_delta`, and the strip already follows the cards.
@@ -1415,6 +1436,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // Approved but waiting on the subprocess budget (0061 T24). Its own
         // card, parked without a clock, promoted in place by its `tool_start`.
         "tool_queued" => {
+            state.tool_input = None;
             let id = text_of("id");
             let ahead = v.get("ahead").and_then(Value::as_u64).unwrap_or(0) as usize;
             state.transcript.push(TranscriptItem::Tool {
@@ -1976,6 +1998,7 @@ fn on_prompt_result(
     usage: &Value,
     finished_at: Option<String>,
 ) -> Vec<Cmd> {
+    state.tool_input = None;
     // A turn that streamed nothing still shows its outcome text.
     if turn_chars(&state.transcript) == 0 {
         if let Some(t) = text.as_deref().filter(|t| kind == "done" && !t.is_empty()) {
@@ -2623,6 +2646,7 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
         // The new turn's silence starts at the send, not at the last frame of
         // the turn before it.
         state.since_frame = 0;
+        state.tool_input = None;
         vec![
             Cmd::SendPrompt(payload),
             Cmd::SetTitle(title(state, " — working")),
@@ -4068,6 +4092,51 @@ mod tests {
         upd(&mut s, json!({"type":"goal_evaluating","turn":1}));
         on_result(&mut s, "done", None, &json!({}));
         assert!(!s.goal_evaluating);
+    }
+
+    /// 0062 T3: the frame lands in state, resets the quiet clock, and clears
+    /// the moment the call starts or prose arrives.
+    #[test]
+    fn tool_input_progress_is_held_until_the_call_starts() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.since_frame = 5 * crate::anim::TICK_HZ;
+        update(
+            &mut s,
+            Msg::Update(json!({"type": "tool_input_progress", "calls": 1, "bytes": 10})),
+        );
+        assert_eq!(
+            s.tool_input,
+            Some(ToolInputProgress {
+                calls: 1,
+                bytes: 10
+            })
+        );
+        assert_eq!(s.since_frame, 0, "a wire frame resets the quiet clock");
+        assert!(
+            matches!(s.phase, Phase::Sampling { .. }),
+            "liveness never moves the phase"
+        );
+        update(
+            &mut s,
+            Msg::Update(
+                json!({"type": "tool_start", "id": "t1", "name": "read", "summary": "read x"}),
+            ),
+        );
+        assert_eq!(s.tool_input, None);
+
+        update(
+            &mut s,
+            Msg::Update(json!({"type": "tool_input_progress", "calls": 1, "bytes": 10})),
+        );
+        update(
+            &mut s,
+            Msg::Update(json!({"type": "text_delta", "text": "hi"})),
+        );
+        assert_eq!(
+            s.tool_input, None,
+            "prose after a call means the input finished"
+        );
     }
 
     /// 0061 T25: liveness lands on the card and nowhere else — it is not a

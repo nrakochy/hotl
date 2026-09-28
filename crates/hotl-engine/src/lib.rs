@@ -461,6 +461,12 @@ pub enum EngineEvent {
         lines: u64,
         bytes: u64,
     },
+    /// The model is still writing a tool call (0062 T3): `tool_use` blocks
+    /// opened this sample and input bytes streamed. Lossy, never persisted.
+    ToolInputProgress {
+        calls: u32,
+        bytes: u64,
+    },
     ToolDenied {
         id: String,
         name: String,
@@ -644,6 +650,9 @@ impl std::fmt::Debug for EngineEvent {
             Self::ToolQueued { name, ahead, .. } => write!(f, "ToolQueued({name},ahead={ahead})"),
             Self::Compacting { items } => write!(f, "Compacting({items})"),
             Self::ToolProgress { name, lines, .. } => write!(f, "ToolProgress({name},{lines})"),
+            Self::ToolInputProgress { calls, bytes } => {
+                write!(f, "ToolInputProgress({calls},{bytes})")
+            }
             Self::ToolDenied { name, .. } => write!(f, "ToolDenied({name})"),
             Self::ToolAutoAllowed { name, rule, .. } => {
                 write!(f, "ToolAutoAllowed({name},{rule})")
