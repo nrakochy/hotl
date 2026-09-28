@@ -6,7 +6,22 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **The strip shows a tool call being written.** While the model streams a
+  `write` or `edit` argument the strip reads `preparing 1 call · 4.2 KB · 3s`
+  instead of `thinking`, and the quiet alarm no longer fires on a busy turn.
+  A new `tool_input_progress` frame on `--json`; `-p` output is unchanged.
+
 ### Fixed
+
+- **Sub-agent prose no longer repaints the screen per chunk.** It rides the
+  same 30 Hz tick as everything else and folds per agent before it is sent.
+- **A busy screen no longer drops half a message.** The console's line reader
+  keeps a partly read line when the screen redraws in the middle of it, so a
+  finished-tool message under heavy output cannot vanish.
+- **Ctrl-t and agent drill-in re-wrap only what changed**, not the whole
+  transcript, and a streaming answer keeps its place.
 
 - **Entry ids minted in one process now strictly increase**, even within a
   single millisecond. A plain ULID orders same-millisecond ids by its random
