@@ -6,6 +6,8 @@ semver promise of their own.
 
 ## [Unreleased]
 
+## [0.28.0] - 2026-09-28
+
 ### Added
 
 - **The strip shows a tool call being written.** While the model streams a
