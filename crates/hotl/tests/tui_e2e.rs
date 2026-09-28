@@ -13,12 +13,14 @@ use hotl_store::{Masker, SessionLog};
 use hotl_theme::Palette;
 use hotl_tools::{rules::Rules, Registry};
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
-use hotl_tui::client::{exec_wire_cmd, read_server_msg, translate, AcpClient, ServerMsg};
+use hotl_tui::client::{
+    exec_wire_cmd, read_server_msg, translate, AcpClient, FrameReader, ServerMsg,
+};
 use hotl_tui::view::{view, TranscriptCache};
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 use serde_json::{json, Value};
-use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
+use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 
 // The server module lives in the binary crate; pull it in directly.
 #[path = "../src/images.rs"]
@@ -35,7 +37,7 @@ mod acp;
 #[allow(dead_code)]
 mod wire;
 
-type Reader = BufReader<ReadHalf<DuplexStream>>;
+type Reader = FrameReader<ReadHalf<DuplexStream>>;
 type Client = AcpClient<WriteHalf<DuplexStream>>;
 
 /// A session whose scripted model calls bash (a gated tool → a permission
@@ -186,7 +188,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
     ));
     let (cread, cwrite) = tokio::io::split(client_io);
     let mut client = AcpClient::new(cwrite);
-    let mut reader = BufReader::new(cread);
+    let mut reader = FrameReader::new(cread);
     let init = client
         .request("initialize", Value::Null)
         .await

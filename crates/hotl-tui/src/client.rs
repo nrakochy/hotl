@@ -1,8 +1,9 @@
 //! ACP client codec: JSONL requests out, decoded server messages in. Pure
 //! framing — the runtime owns the sockets and the select loop.
 //!
-//! `read_line` framing is safe here: the server emits `serde_json::to_string`
-//! output, which escapes all control characters including newlines. (The Pi
+//! Line framing is safe and cancel-safe here: the server emits
+//! `serde_json::to_string` output, which escapes all control characters
+//! including newlines, and `FrameReader` keeps a partial line across drops. (The Pi
 //! U+2028 caveat applies to Node's readline splitting on Unicode line
 //! separators, not to byte-linewise framing of serde output.)
 
@@ -12,7 +13,7 @@ use crate::app::{Cmd, DiffLine, DiffOp, Msg};
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::io;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// A server-sent skill roster as `(name, description)` pairs — the `skills`
 /// array of an `initialize` result or of a `config_reloaded` update.
@@ -160,14 +161,61 @@ impl<W: AsyncWrite + Unpin> AcpClient<W> {
     }
 }
 
+/// Line framing that survives being dropped mid-line. `read_line` keeps its
+/// partial bytes in the future; the run loop's `select!` drops that future
+/// on every tick, so under backlog a frame's head vanished and its tail was
+/// skipped as malformed. Here the partial lives in the struct.
+pub struct FrameReader<R> {
+    inner: tokio::io::BufReader<R>,
+    partial: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(inner: R) -> Self {
+        FrameReader {
+            inner: tokio::io::BufReader::new(inner),
+            partial: Vec::new(),
+        }
+    }
+
+    /// One whole line without its `\n`, or `None` at EOF. Cancel-safe: bytes
+    /// move from the buffer into `partial` only after `fill_buf` returned
+    /// them, and `partial` outlives any one call.
+    async fn next_line(&mut self) -> Option<String> {
+        loop {
+            let buf = self.inner.fill_buf().await.ok()?;
+            if buf.is_empty() {
+                // `read_line` parity: an unterminated last line still counts.
+                if self.partial.is_empty() {
+                    return None;
+                }
+                let line = std::mem::take(&mut self.partial);
+                return Some(String::from_utf8_lossy(&line).into_owned());
+            }
+            match buf.iter().position(|&b| b == b'\n') {
+                Some(pos) => {
+                    self.partial.extend_from_slice(&buf[..pos]);
+                    self.inner.consume(pos + 1);
+                    let line = std::mem::take(&mut self.partial);
+                    return Some(String::from_utf8_lossy(&line).into_owned());
+                }
+                None => {
+                    let n = buf.len();
+                    self.partial.extend_from_slice(buf);
+                    self.inner.consume(n);
+                }
+            }
+        }
+    }
+}
+
 /// Next decodable server message; malformed or unknown lines are skipped, not
 /// fatal. `None` = EOF (the server hung up).
-pub async fn read_server_msg<R: AsyncBufRead + Unpin>(r: &mut R) -> Option<ServerMsg> {
+pub async fn read_server_msg<R: tokio::io::AsyncRead + Unpin>(
+    r: &mut FrameReader<R>,
+) -> Option<ServerMsg> {
     loop {
-        let mut line = String::new();
-        if r.read_line(&mut line).await.ok()? == 0 {
-            return None;
-        }
+        let line = r.next_line().await?;
         let Ok(msg) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -470,7 +518,7 @@ fn prompt_params(p: &crate::paste::PromptPayload) -> Value {
 mod tests {
     use super::*;
     use std::collections::VecDeque;
-    use tokio::io::{AsyncReadExt, BufReader};
+    use tokio::io::AsyncReadExt;
 
     /// The e2e harness used to keep a hand-copy of this mapping, and the copy
     /// had already drifted: it read only `/outcome/text`, so `doom_loop` and
@@ -620,6 +668,37 @@ mod tests {
         );
     }
 
+    /// The run loop drops this future whenever a tick or a key wins its
+    /// `select!`. A half-read line must survive the drop — before 0062 T2 it
+    /// was lost with the future and the tail parsed as garbage.
+    #[tokio::test]
+    async fn a_dropped_read_keeps_the_partial_line() {
+        let (client, mut server) = tokio::io::duplex(4096);
+        let mut r = FrameReader::new(client);
+        let line = r#"{"jsonrpc":"2.0","method":"session/update","params":{"schemaVersion":1,"sessionId":"s","update":{"type":"text_delta","text":"hi"}}}"#;
+        let (head, tail) = line.split_at(40);
+        tokio::io::AsyncWriteExt::write_all(&mut server, head.as_bytes())
+            .await
+            .unwrap();
+        // Poll the read once (it takes the head), then let the other branch
+        // win and drop it — what the run loop does thirty times a second.
+        tokio::select! {
+            biased;
+            _ = read_server_msg(&mut r) => panic!("no whole line has arrived"),
+            _ = tokio::task::yield_now() => {}
+        }
+        tokio::io::AsyncWriteExt::write_all(&mut server, format!("{tail}\n").as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(
+            read_server_msg(&mut r).await,
+            Some(ServerMsg::Update(
+                json!({"type": "text_delta", "text": "hi"})
+            )),
+            "the head was lost with the dropped future"
+        );
+    }
+
     #[tokio::test]
     async fn read_decodes_update_permission_and_response() {
         let (client, mut server) = tokio::io::duplex(4096);
@@ -636,7 +715,7 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-        let mut r = BufReader::new(client);
+        let mut r = FrameReader::new(client);
         assert_eq!(
             read_server_msg(&mut r).await,
             Some(ServerMsg::Update(
@@ -719,7 +798,7 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-        let mut r = BufReader::new(client);
+        let mut r = FrameReader::new(client);
         assert_eq!(
             read_server_msg(&mut r).await,
             Some(ServerMsg::EgressRequest {
@@ -740,7 +819,7 @@ mod tests {
             .await
             .unwrap();
         drop(server);
-        let mut r = BufReader::new(client);
+        let mut r = FrameReader::new(client);
         assert_eq!(
             read_server_msg(&mut r).await,
             Some(ServerMsg::QuestionRequest {

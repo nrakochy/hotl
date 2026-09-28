@@ -16,15 +16,17 @@ use crossterm::terminal::SetTitle;
 use hotl_platform::KnownPaths as _;
 use hotl_theme::Palette;
 use hotl_tui::app::{update, Cmd, Msg, Phase, State};
-use hotl_tui::client::{exec_wire_cmd, read_server_msg, translate, AcpClient, ServerMsg};
+use hotl_tui::client::{
+    exec_wire_cmd, read_server_msg, translate, AcpClient, FrameReader, ServerMsg,
+};
 use hotl_tui::view::{view, TranscriptCache};
 
 use crate::term::TerminalGuard;
 use serde_json::{json, Value};
-use tokio::io::{BufReader, DuplexStream, ReadHalf, WriteHalf};
+use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 
-type ServerReader = BufReader<ReadHalf<DuplexStream>>;
+type ServerReader = FrameReader<ReadHalf<DuplexStream>>;
 type Client = AcpClient<WriteHalf<DuplexStream>>;
 
 pub async fn tui_main(args: Vec<String>) -> i32 {
@@ -242,7 +244,7 @@ async fn open_session(
         Some(crate::agent::reload_hook()),
     ));
     let (cread, cwrite) = tokio::io::split(client_io);
-    let mut reader = BufReader::new(cread);
+    let mut reader = FrameReader::new(cread);
     let mut client = AcpClient::new(cwrite);
     let opened = handshake(&mut client, &mut reader, tui_args)
         .await
