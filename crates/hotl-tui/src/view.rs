@@ -214,13 +214,10 @@ impl Incremental {
 struct Geometry {
     width: u16,
     density: Density,
-    thinking_expanded: bool,
     palette: Palette,
     /// The prose measure (0049 T5) — a `/reload` that changes it re-wraps.
     measure: usize,
-    /// Whether an agent block advertises the band keys (0061 T8). Not a
-    /// per-item property, so it belongs here rather than in the fingerprint.
-    band_keys: bool,
+    // ctrl-t and the band keys are hashed by the items that read them (0062 T4).
 }
 
 /// A hash of everything about one item that reaches the screen.
@@ -236,14 +233,17 @@ struct Geometry {
 /// resolution it is rendered. Enforced by
 /// `cached_rows_are_identical_to_a_fresh_render`, which walks a turn's worth
 /// of mutations comparing a warm cache against a cold one.
-fn item_fingerprint(item: &TranscriptItem) -> u64 {
+///
+/// The two render flags are hashed only where they are read, so a toggle
+/// re-wraps just those items and the streaming answer keeps its place.
+fn item_fingerprint(item: &TranscriptItem, thinking_expanded: bool, band_keys: bool) -> u64 {
     let text_key = |t: &crate::app::Streamed| (t.seed(), t.rev(), t.len() as u64);
     let mut h = DefaultHasher::new();
     match item {
         TranscriptItem::User { text } => (0u8, text_key(text)).hash(&mut h),
         TranscriptItem::Steer { text, queued } => (1u8, text_key(text), queued).hash(&mut h),
         TranscriptItem::Assistant { text } => (2u8, text_key(text)).hash(&mut h),
-        TranscriptItem::Thinking { text } => (3u8, text_key(text)).hash(&mut h),
+        TranscriptItem::Thinking { text } => (3u8, text_key(text), thinking_expanded).hash(&mut h),
         TranscriptItem::Tool {
             id,
             name,
@@ -299,6 +299,10 @@ fn item_fingerprint(item: &TranscriptItem) -> u64 {
             match progress {
                 None => 0u8.hash(&mut h),
                 Some(pr) => (1u8, &pr.tail, pr.lines, pr.at_ticks).hash(&mut h),
+            }
+            // 0062 T4: only an agent card's second row reads the band keys.
+            if crate::app::is_agent_card(name) {
+                band_keys.hash(&mut h);
             }
         }
         TranscriptItem::Notice { text } => (5u8, text_key(text)).hash(&mut h),
@@ -367,12 +371,10 @@ fn render_transcript(
     let geometry = Geometry {
         width: area.width,
         density: state.density,
-        thinking_expanded: state.thinking_expanded,
         palette: *p,
         measure: state.measure,
-        band_keys: state.selected_agent.is_none(),
     };
-    let band_keys = geometry.band_keys;
+    let band_keys = state.selected_agent.is_none();
     if cache.geometry.as_ref() != Some(&geometry) {
         cache.items.clear();
         cache.geometry = Some(geometry);
@@ -394,7 +396,7 @@ fn render_transcript(
     // rows, and any whose content changed is caught by its fingerprint below.
     cache.items.truncate(state.transcript.len());
     for (i, item) in state.transcript.iter().enumerate() {
-        let fingerprint = item_fingerprint(item);
+        let fingerprint = item_fingerprint(item, state.thinking_expanded, band_keys);
         if cache
             .items
             .get(i)
@@ -4078,7 +4080,10 @@ mod tests {
             ToolStatus::Running,
             anim::TICK_HZ,
         );
-        assert_ne!(item_fingerprint(&base), item_fingerprint(&none));
+        assert_ne!(
+            item_fingerprint(&base, false, true),
+            item_fingerprint(&none, false, true)
+        );
         for mutate in [
             |pr: &mut crate::app::ToolProgress| pr.tail = "Linking".into(),
             |pr: &mut crate::app::ToolProgress| pr.lines = 13,
@@ -4091,7 +4096,10 @@ mod tests {
             {
                 mutate(pr);
             }
-            assert_ne!(item_fingerprint(&base), item_fingerprint(&b));
+            assert_ne!(
+                item_fingerprint(&base, false, true),
+                item_fingerprint(&b, false, true)
+            );
         }
         // `bytes` is carried, never rendered.
         let mut b = base.clone();
@@ -4101,7 +4109,10 @@ mod tests {
         {
             pr.bytes += 1_000;
         }
-        assert_eq!(item_fingerprint(&base), item_fingerprint(&b));
+        assert_eq!(
+            item_fingerprint(&base, false, true),
+            item_fingerprint(&b, false, true)
+        );
     }
 
     /// 0061 T24: parked, not working — a hollow glyph in the quietest role,
@@ -4178,7 +4189,10 @@ mod tests {
             ToolStatus::Queued { ahead: 2 },
             0,
         );
-        assert_ne!(item_fingerprint(&a), item_fingerprint(&b));
+        assert_ne!(
+            item_fingerprint(&a, false, true),
+            item_fingerprint(&b, false, true)
+        );
     }
 
     /// 0061 T3: a settled card's clock moves to a faint `└` row that also
@@ -6547,12 +6561,18 @@ mod tests {
         if let TranscriptItem::Tool { calls, .. } = &mut b {
             calls[0].lines = Some(1204);
         }
-        assert_ne!(item_fingerprint(&a), item_fingerprint(&b));
+        assert_ne!(
+            item_fingerprint(&a, false, true),
+            item_fingerprint(&b, false, true)
+        );
         let mut c = b.clone();
         if let TranscriptItem::Tool { calls, .. } = &mut c {
             calls[0].bytes = Some(51_233);
         }
-        assert_ne!(item_fingerprint(&b), item_fingerprint(&c));
+        assert_ne!(
+            item_fingerprint(&b, false, true),
+            item_fingerprint(&c, false, true)
+        );
     }
 
     /// 0044: a child's token total is drill-in data, like its tick stamps —
@@ -6565,7 +6585,10 @@ mod tests {
             children[0].tokens = Some(4321);
         }
         assert_ne!(a, b, "the fixture differs only in tokens");
-        assert_eq!(item_fingerprint(&a), item_fingerprint(&b));
+        assert_eq!(
+            item_fingerprint(&a, false, true),
+            item_fingerprint(&b, false, true)
+        );
     }
 
     #[test]
@@ -6682,13 +6705,90 @@ mod tests {
         at(&s, 60, &mut cache);
         assert_eq!(cache.rewraps(), 6, "a resize must re-wrap all three");
 
-        // So are the two other things every item's rows are a function of.
+        // 0062 T4: the flag is hashed only by the items that read it. None
+        // of these three does, so ctrl-t re-wraps nothing.
         s.thinking_expanded = !s.thinking_expanded;
         at(&s, 60, &mut cache);
-        assert_eq!(cache.rewraps(), 9, "ctrl-t must re-wrap all three");
+        assert_eq!(
+            cache.rewraps(),
+            6,
+            "ctrl-t must not touch prose or plain cards"
+        );
         s.density = hotl_theme::Density::Compact;
         at(&s, 60, &mut cache);
-        assert_eq!(cache.rewraps(), 12, "density must re-wrap all three");
+        assert_eq!(cache.rewraps(), 9, "density must re-wrap all three");
+    }
+
+    /// 0062 T4: ctrl-t re-wraps the thinking block and only it.
+    #[test]
+    fn ctrl_t_rewraps_only_thinking_items() {
+        let mut s = cacheable_state();
+        s.transcript.insert(
+            1,
+            TranscriptItem::Thinking {
+                text: (1..=6)
+                    .map(|i| format!("t{i}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    .into(),
+            },
+        );
+        // Tall enough that the thinking block is on screen above the answer.
+        let mut cache = TranscriptCache::default();
+        draw_cached_at(&s, &mut cache, 80, 80);
+        let settled = cache.rewraps();
+        s.thinking_expanded = true;
+        let out = draw_cached_at(&s, &mut cache, 80, 80).join("\n");
+        assert!(out.contains("t6"), "{out}");
+        assert_eq!(
+            cache.rewraps(),
+            settled + 1,
+            "only the thinking item re-wraps"
+        );
+        // A delta after ctrl-t re-renders the streaming item alone.
+        if let Some(TranscriptItem::Assistant { text }) = s.transcript.get_mut(2) {
+            text.push_str("more ");
+        }
+        draw_cached_at(&s, &mut cache, 80, 80);
+        assert_eq!(
+            cache.rewraps(),
+            settled + 2,
+            "only the grown answer re-wraps"
+        );
+    }
+
+    /// 0062 T4: entering and leaving an agent's stream re-wraps agent cards
+    /// (their second row names the band keys) and nothing else.
+    #[test]
+    fn drill_in_rewraps_only_agent_cards() {
+        let mut s = cacheable_state();
+        s.phase = Phase::Sampling { ticks: 0 };
+        s.transcript.push(tool_item(
+            "s1",
+            "spawn",
+            "review bugs",
+            ToolStatus::Running,
+            0,
+        ));
+        let mut cache = TranscriptCache::default();
+        draw_cached(&s, &mut cache);
+        let settled = cache.rewraps();
+        // Drill in: the agent stream renders outside the cache, so the memo
+        // is untouched; drill out: nothing on the main transcript changed.
+        s.selected_agent = Some("s1".into());
+        draw_cached(&s, &mut cache);
+        s.selected_agent = None;
+        draw_cached(&s, &mut cache);
+        assert_eq!(
+            cache.rewraps(),
+            settled,
+            "a round trip through the drill-in re-wrapped"
+        );
+        // A dangling id falls back to the main transcript with the band keys
+        // hidden — the one case where an agent card's row really changes.
+        s.selected_agent = Some("other".into());
+        draw_cached(&s, &mut cache);
+        assert_eq!(cache.rewraps(), settled + 1, "only the agent card re-wraps");
     }
 
     #[test]
@@ -6728,6 +6828,28 @@ mod tests {
                         0,
                     ),
                 );
+            }
+            // 0062 T4: a thinking block and a running agent card, then the two
+            // render flags they alone read, toggled with the cache warm (before
+            // step 20 scrolls them off screen).
+            if step == 3 {
+                let at = s.transcript.len() - 1;
+                s.transcript.insert(
+                    at,
+                    TranscriptItem::Thinking {
+                        text: "one\ntwo\nthree\nfour\nfive\nsix".into(),
+                    },
+                );
+                s.transcript.insert(
+                    at + 1,
+                    tool_item("s1", "spawn", "review bugs", ToolStatus::Running, 0),
+                );
+            }
+            match step {
+                8 | 14 => s.thinking_expanded = !s.thinking_expanded,
+                9 => s.selected_agent = Some("nonexistent".into()),
+                11 => s.selected_agent = None,
+                _ => {}
             }
             if step == 7 {
                 if let Some(TranscriptItem::Tool { status, .. }) = s
