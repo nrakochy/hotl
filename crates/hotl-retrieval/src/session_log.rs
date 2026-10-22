@@ -89,7 +89,7 @@ fn parent_of(path: &Path) -> Option<String> {
 fn searchable(item: &Item) -> Option<String> {
     match item {
         Item::User { text, .. } => Some(format!("[user] {text}")),
-        Item::Assistant { blocks } => {
+        Item::Assistant { blocks, .. } => {
             let text = assistant_text(blocks);
             (!text.is_empty()).then(|| format!("[assistant] {text}"))
         }

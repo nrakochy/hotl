@@ -1776,7 +1776,7 @@ fn title_material(items: &[Arc<Item>]) -> Option<String> {
                 synthetic: None,
                 ..
             } if prompt.is_none() => prompt = Some(text),
-            Item::Assistant { blocks } if prompt.is_some() => {
+            Item::Assistant { blocks, .. } if prompt.is_some() => {
                 let answer = assistant_text(blocks);
                 if answer.trim().is_empty() {
                     continue;
@@ -2694,7 +2694,7 @@ fn fold_images(
 fn awaiting_tool_results<I: std::borrow::Borrow<Item>>(items: &[I]) -> bool {
     matches!(
         items.last().map(std::borrow::Borrow::borrow),
-        Some(Item::Assistant { blocks }) if !hotl_types::assistant_tool_uses(blocks).is_empty()
+        Some(Item::Assistant { blocks, .. }) if !hotl_types::assistant_tool_uses(blocks).is_empty()
     )
 }
 
@@ -2858,7 +2858,7 @@ async fn close_open_batch(
     head: &mut Head,
     pipeline: &mut Pipeline,
 ) {
-    let Some(Item::Assistant { blocks }) = head.items().last().map(Arc::as_ref) else {
+    let Some(Item::Assistant { blocks, .. }) = head.items().last().map(Arc::as_ref) else {
         return;
     };
     let results = unanswered_results(blocks);
@@ -2911,7 +2911,7 @@ pub(crate) fn close_dangling_batches(items: Vec<Item>) -> Vec<Item> {
     let mut out: Vec<Item> = Vec::with_capacity(items.len() + 1);
     let mut it = items.into_iter().peekable();
     while let Some(item) = it.next() {
-        if let Item::Assistant { blocks } = &item {
+        if let Item::Assistant { blocks, .. } = &item {
             let results = unanswered_results(blocks);
             if !results.is_empty() && !matches!(it.peek(), Some(Item::ToolResults { .. })) {
                 out.push(item);
@@ -3910,6 +3910,7 @@ mod tests {
                     serde_json::json!({"type": "text", "text": "reply"}),
                     serde_json::json!({"type": "tool_use", "id": "t1", "name": "read", "input": {}}),
                 ],
+                model: None,
             },
             hotl_types::Item::ToolResults {
                 results: vec![hotl_types::ToolResultItem {
@@ -3983,7 +3984,10 @@ mod tests {
             Vec::new(),
             hotl_context::TokenProfile::CONSERVATIVE,
         );
-        head.apply(Item::Assistant { blocks: Vec::new() });
+        head.apply(Item::Assistant {
+            blocks: Vec::new(),
+            model: None,
+        });
         let Item::User { images, .. } = &*head.items()[0] else {
             panic!("user item")
         };
@@ -4035,12 +4039,14 @@ mod tests {
     fn calls(id: &str) -> Item {
         Item::Assistant {
             blocks: vec![json!({"type": "tool_use", "id": id, "name": "read", "input": {}})],
+            model: None,
         }
     }
 
     fn says(text: &str) -> Item {
         Item::Assistant {
             blocks: vec![json!({"type": "text", "text": text})],
+            model: None,
         }
     }
 

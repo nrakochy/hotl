@@ -443,7 +443,7 @@ impl serde::Serialize for Msg<'_> {
             // is the Responses dialect's `reasoning` items (a session can
             // cross dialects via /reload) — dropped by the narrow
             // [`is_foreign_reasoning`].
-            Item::Assistant { blocks } => {
+            Item::Assistant { blocks, .. } => {
                 map.serialize_entry("content", &AssistantContent(blocks))?;
                 map.serialize_entry("role", "assistant")?;
             }
@@ -778,7 +778,7 @@ fn build_messages<I: std::borrow::Borrow<Item>>(
             // [`is_foreign_reasoning`], never by the broader
             // `strip_foreign_reasoning`, which would also strip this
             // dialect's own signed thinking.
-            Item::Assistant { blocks } => {
+            Item::Assistant { blocks, .. } => {
                 let content: Vec<&Value> =
                     blocks.iter().filter(|b| !is_foreign_reasoning(b)).collect();
                 out.push(json!({"role": "assistant", "content": content}));
@@ -1264,12 +1264,14 @@ mod tests {
                     json!({"type": "text", "text": "calling tools"}),
                     json!({"type": "tool_use", "id": "tu-0", "name": "read", "input": {"path": "x"}}),
                 ],
+                model: None,
             },
             corpus_results(20, true),
             Item::Unknown,
             corpus_user("follow-up", 0),
             Item::Assistant {
                 blocks: vec![json!({"type": "text", "text": "more"})],
+                model: None,
             },
             corpus_results(18, false),
             corpus_user("latest question", 0),
@@ -1942,6 +1944,7 @@ mod tests {
                 },
                 Item::Assistant {
                     blocks: vec![serde_json::json!({"type":"text","text":"ok"})],
+                    model: None,
                 },
                 Item::ToolResults {
                     results: vec![ToolResultItem {
@@ -2090,6 +2093,7 @@ mod tests {
                 },
                 Item::Assistant {
                     blocks: vec![serde_json::json!({"type":"text","text":"ok"})],
+                    model: None,
                 },
                 Item::ToolResults {
                     results: vec![ToolResultItem {
@@ -2170,6 +2174,7 @@ mod tests {
             blocks: (0..blocks)
                 .map(|i| serde_json::json!({"type": "text", "text": format!("b{i}")}))
                 .collect(),
+            model: None,
         }
     }
 
@@ -2189,6 +2194,7 @@ mod tests {
                     thinking.clone(),
                     serde_json::json!({"type": "text", "text": "ok"}),
                 ],
+                model: None,
             }]),
             ..sampling_req()
         };

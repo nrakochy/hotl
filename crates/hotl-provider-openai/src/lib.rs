@@ -347,7 +347,7 @@ fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool, mark: bool
             parts.push(text_part);
             out.push(json!({"role": "user", "content": parts}));
         }
-        Item::Assistant { blocks } => {
+        Item::Assistant { blocks, .. } => {
             // Named canonicalization stage: provider-bound reasoning from a
             // foreign dialect never crosses (hotl_provider::transform).
             let blocks = hotl_provider::transform::strip_foreign_reasoning(blocks);
@@ -933,6 +933,7 @@ mod tests {
                         json!({"type": "text", "text": "I'll check."}),
                         json!({"type": "tool_use", "id": "toolu_1", "name": "read", "input": {"path": "a"}}),
                     ],
+                    model: None,
                 },
                 Item::ToolResults {
                     results: vec![
@@ -1576,6 +1577,7 @@ mod tests {
     fn tool_use(id: &str) -> Item {
         Item::Assistant {
             blocks: vec![json!({"type": "tool_use", "id": id, "name": "read", "input": {}})],
+            model: None,
         }
     }
 
@@ -1608,6 +1610,7 @@ mod tests {
             results(&["a1", "a2"]),
             Item::Assistant {
                 blocks: vec![json!({"type": "text", "text": "done"})],
+                model: None,
             },
             user("more"),
         ]);

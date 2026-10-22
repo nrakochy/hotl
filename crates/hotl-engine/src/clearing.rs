@@ -52,7 +52,7 @@ pub fn candidates<I: Borrow<Item>>(items: &[I], keep_turns: usize) -> Vec<String
             // Read straight off the blocks rather than through
             // `assistant_tool_uses`: that borrows the ids into owned Strings,
             // and only the name is wanted here.
-            Item::Assistant { blocks } => {
+            Item::Assistant { blocks, .. } => {
                 for b in blocks {
                     if let (Some(id), Some(name)) = (
                         b.get("id").and_then(serde_json::Value::as_str),
@@ -97,6 +97,7 @@ mod tests {
     fn call(id: &str, name: &str) -> Item {
         Item::Assistant {
             blocks: vec![json!({"type": "tool_use", "id": id, "name": name, "input": {}})],
+            model: None,
         }
     }
 

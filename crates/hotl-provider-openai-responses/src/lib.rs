@@ -185,7 +185,7 @@ fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool, mark: bool
         // Blocks replay in original order, so a `reasoning` item stays
         // directly before the `function_call` it justified — the stateless
         // tool loop 400s if the pair is separated or the reasoning dropped.
-        Item::Assistant { blocks } => {
+        Item::Assistant { blocks, .. } => {
             for b in blocks {
                 match b.get("type").and_then(Value::as_str) {
                     // This dialect's own reasoning items: replayed verbatim
@@ -1161,6 +1161,7 @@ mod tests {
     fn tool_use(id: &str) -> Item {
         Item::Assistant {
             blocks: vec![json!({"type": "tool_use", "id": id, "name": "read", "input": {}})],
+            model: None,
         }
     }
 
@@ -1191,6 +1192,7 @@ mod tests {
             results(&["a1", "a2"]),
             Item::Assistant {
                 blocks: vec![json!({"type": "text", "text": "done"})],
+                model: None,
             },
             user("more"),
         ]);
@@ -1435,6 +1437,7 @@ mod tests {
                 json!({"type": "tool_use", "id": "call_1", "name": "read", "input": {"path": "a.rs"}}),
                 json!({"type": "text", "text": "done"}),
             ],
+            model: None,
         }]);
         let body = body_for(&req, false);
         let input = body["input"].as_array().unwrap();
@@ -1461,6 +1464,7 @@ mod tests {
                 json!({"type": "redacted_thinking", "data": "d"}),
                 json!({"type": "text", "text": "ok"}),
             ],
+            model: None,
         }]);
         let body = body_for(&req, false);
         assert!(!body.to_string().contains("secret chain"));

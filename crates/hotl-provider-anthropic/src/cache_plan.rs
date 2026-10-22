@@ -92,7 +92,7 @@ fn item_blocks(item: &Item, send_images: bool) -> usize {
         Item::User { images, .. } => 1 + if send_images { images.len() } else { 0 },
         // Foreign `reasoning` items are dropped at render
         // (`build_messages`), so they must not be counted here either.
-        Item::Assistant { blocks } => blocks
+        Item::Assistant { blocks, .. } => blocks
             .iter()
             .filter(|b| !crate::is_foreign_reasoning(b))
             .count(),
@@ -272,6 +272,7 @@ mod tests {
             blocks: (0..blocks)
                 .map(|i| json!({"type": "text", "text": format!("b{i}")}))
                 .collect(),
+            model: None,
         }
     }
 

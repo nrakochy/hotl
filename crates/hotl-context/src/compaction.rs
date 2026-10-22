@@ -226,7 +226,7 @@ fn render_transcript_clipped<I: std::borrow::Borrow<Item>>(items: &[I], recent: 
                 };
                 out.push_str(&format!("[{label}] {text}\n"));
             }
-            Item::Assistant { blocks } => {
+            Item::Assistant { blocks, .. } => {
                 let text = hotl_types::assistant_text(blocks);
                 if !text.is_empty() {
                     out.push_str(&format!("[assistant] {text}\n"));
@@ -329,6 +329,7 @@ mod tests {
     fn assistant(text: &str) -> Item {
         Item::Assistant {
             blocks: vec![json!({"type":"text","text":text})],
+            model: None,
         }
     }
     fn results(content: &str) -> Item {

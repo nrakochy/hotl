@@ -188,6 +188,7 @@ mod tests {
             },
             Item::Assistant {
                 blocks: vec![serde_json::json!({"type":"text","text":"sure"})],
+                model: None,
             },
             Item::ToolResults {
                 results: vec![ToolResultItem {

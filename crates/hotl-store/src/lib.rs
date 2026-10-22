@@ -142,6 +142,7 @@ pub enum EntryKind {
     ModeSet,
     PlanSet,
     EffortSet,
+    ModelSet,
     PendingQuestion,
     QuestionResolved,
     Todos,
@@ -167,6 +168,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::ModeSet { .. } => EntryKind::ModeSet,
             EntryPayload::PlanSet { .. } => EntryKind::PlanSet,
             EntryPayload::EffortSet { .. } => EntryKind::EffortSet,
+            EntryPayload::ModelSet { .. } => EntryKind::ModelSet,
             EntryPayload::PendingQuestion { .. } => EntryKind::PendingQuestion,
             EntryPayload::QuestionResolved { .. } => EntryKind::QuestionResolved,
             EntryPayload::Todos { .. } => EntryKind::Todos,
@@ -1362,6 +1364,9 @@ pub struct Replayed {
     /// Plan mode (last `PlanSet` in the chain, child wins) — the axis
     /// orthogonal to `mode`. `None` = never set (use the process default).
     pub plan: Option<bool>,
+    /// The session model (last `ModelSet` in the chain, child wins; 0067) —
+    /// a `provider/model` spec. `None` = never switched: the header's model.
+    pub model: Option<String>,
     /// Reasoning depth (last `EffortSet` in the chain, child wins) — a raw
     /// string, forward-compat, like `mode`. **Doubly optional on purpose:**
     /// the outer `None` is "never set", the inner `None` is "explicitly
@@ -1398,6 +1403,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut mode = None;
     let mut plan = None;
     let mut effort = None;
+    let mut model = None;
     let mut todos = Vec::new();
     let mut decisions = Vec::new();
     let mut goal = None;
@@ -1410,6 +1416,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut mode,
         &mut plan,
         &mut effort,
+        &mut model,
         &mut todos,
         &mut decisions,
         &mut goal,
@@ -1423,6 +1430,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         mode,
         plan,
         effort,
+        model,
         todos,
         decisions,
         goal,
@@ -1539,6 +1547,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     let mut mode = None;
     let mut plan = None;
     let mut effort = None;
+    let mut model = None;
     let mut todos = Vec::new();
     let mut decisions = Vec::new();
     let mut goal = None;
@@ -1558,6 +1567,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut mode,
             &mut plan,
             &mut effort,
+            &mut model,
             &mut todos,
             &mut decisions,
             &mut goal,
@@ -1575,6 +1585,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         mode,
         plan,
         effort,
+        model,
         todos,
         decisions,
         goal,
@@ -1616,6 +1627,7 @@ fn apply_log(
     mode: &mut Option<String>,
     plan: &mut Option<bool>,
     effort: &mut Option<Option<String>>,
+    model: &mut Option<String>,
     todos: &mut Vec<hotl_types::Todo>,
     decisions: &mut Vec<hotl_types::Decision>,
     goal: &mut Option<String>,
@@ -1741,6 +1753,8 @@ fn apply_log(
             // Same log-only last-one-wins shape; see `Replayed::effort` for
             // why the "cleared" case is its own value rather than an absence.
             EntryPayload::EffortSet { effort: e } => *effort = Some(e),
+            // Same log-only last-one-wins shape (0067).
+            EntryPayload::ModelSet { model: m } => *model = Some(m),
             // Log-only durable snapshot of the todo checklist (tier-1 gap
             // #3), exactly like `Rename`/`ModeSet`: never rides the
             // projection, last one wins. The resumed actor's *starting* list
@@ -3683,6 +3697,47 @@ mod tests {
         let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":1,"session_id":"01SELF2","parent_session_id":"01SELF2","model":"m","created_at_ms":0}}}"#;
         std::fs::write(&path, format!("{header}\n")).unwrap();
         assert!(ancestor_ids(dir.path(), "01SELF2").is_empty());
+    }
+
+    /// 0067: `ModelSet` is log-only, last wins; a stamped assistant item
+    /// keeps its model through replay.
+    #[test]
+    fn model_set_replays_last_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        for m in ["openai/gpt-5", "anthropic/claude-opus-5"] {
+            log.append(&EntryPayload::ModelSet { model: m.into() }, 2)
+                .unwrap();
+        }
+        let r = replay(log.path()).unwrap();
+        assert_eq!(r.model.as_deref(), Some("anthropic/claude-opus-5"));
+        assert!(r.items.is_empty(), "a switch is not a projection item");
+        assert_eq!(
+            EntryKind::from(&EntryPayload::ModelSet { model: "x".into() }),
+            EntryKind::ModelSet
+        );
+        let fresh = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        assert_eq!(replay(fresh.path()).unwrap().model, None);
+    }
+
+    #[test]
+    fn an_assistant_items_model_survives_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append(
+            &EntryPayload::Item {
+                item: Item::Assistant {
+                    blocks: vec![serde_json::json!({"type": "text", "text": "hi"})],
+                    model: Some("backup-model".into()),
+                },
+            },
+            2,
+        )
+        .unwrap();
+        let r = replay(log.path()).unwrap();
+        assert!(
+            matches!(&r.items[0], Item::Assistant { model: Some(m), .. } if m == "backup-model")
+        );
     }
 
     /// 0071 T4: a `Title` is log-only like `Rename`, the last one wins, and

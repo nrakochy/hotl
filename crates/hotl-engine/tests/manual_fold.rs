@@ -81,6 +81,7 @@ fn call(id: &str) -> Item {
         blocks: vec![serde_json::json!({
             "type": "tool_use", "id": id, "name": "bash", "input": {"command": "ls"}
         })],
+        model: None,
     }
 }
 
@@ -105,10 +106,12 @@ fn seeded() -> Vec<Item> {
         result("t2", &"y".repeat(2_600)),
         Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "listed"})],
+            model: None,
         },
         user("second"),
         Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "noted"})],
+            model: None,
         },
     ]
 }

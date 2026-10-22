@@ -126,7 +126,7 @@ fn assistant_items(log: &str) -> Vec<String> {
     for line in log.lines() {
         let entry: hotl_types::Entry = serde_json::from_str(line).expect("entry");
         if let EntryPayload::Item {
-            item: Item::Assistant { blocks },
+            item: Item::Assistant { blocks, .. },
         } = entry.payload
         {
             out.push(

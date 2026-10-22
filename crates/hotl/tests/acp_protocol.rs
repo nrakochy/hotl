@@ -2167,6 +2167,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
                 hooks: None,
                 initial_items: vec![hotl_types::Item::Assistant {
                     blocks: vec![json!({"type":"text","text":"done"})],
+                    model: None,
                 }],
                 initial_todos: Vec::new(),
                 initial_decisions: Vec::new(),

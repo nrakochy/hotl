@@ -956,6 +956,7 @@ fn call(id: &str) -> Item {
         blocks: vec![serde_json::json!({
             "type": "tool_use", "id": id, "name": "bash", "input": {"command": "ls"}
         })],
+        model: None,
     }
 }
 
@@ -982,6 +983,7 @@ fn oversized_history() -> Vec<Item> {
         results("t1", &"y".repeat(2_600)),
         Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "listed"})],
+            model: None,
         },
     ]
 }
@@ -1140,6 +1142,7 @@ async fn a_goal_turn_that_clears_counts_the_segment_it_respawned() {
             results("t1", &"y".repeat(1_350)),
             Item::Assistant {
                 blocks: vec![serde_json::json!({"type": "text", "text": "listed"})],
+                model: None,
             },
         ],
     );

@@ -69,6 +69,7 @@ fn stranded_results<I: std::borrow::Borrow<Item>>(items: &[I]) -> Option<usize> 
 fn assistant(id: &str) -> Item {
     Item::Assistant {
         blocks: vec![json!({"type": "tool_use", "id": id, "name": "read", "input": {}})],
+        model: None,
     }
 }
 
@@ -183,7 +184,7 @@ async fn resumed_history_repairs_results_stranded_by_an_older_build() {
 /// followed by their results — the dangling call both APIs reject.
 fn dangling_call<I: std::borrow::Borrow<Item>>(items: &[I]) -> Option<usize> {
     items.iter().enumerate().position(|(i, item)| {
-        matches!(item.borrow(), Item::Assistant { blocks } if !assistant_tool_uses(blocks).is_empty())
+        matches!(item.borrow(), Item::Assistant { blocks, .. } if !assistant_tool_uses(blocks).is_empty())
             && !matches!(
                 items.get(i + 1).map(std::borrow::Borrow::borrow),
                 Some(Item::ToolResults { .. })
@@ -263,7 +264,7 @@ async fn every_call_is_answered_once() {
         let Item::ToolResults { results } = &**item else {
             continue;
         };
-        let Some(Item::Assistant { blocks }) =
+        let Some(Item::Assistant { blocks, .. }) =
             i.checked_sub(1).and_then(|p| items.get(p)).map(|a| &**a)
         else {
             panic!("results at {i} have no assistant turn: {items:#?}");

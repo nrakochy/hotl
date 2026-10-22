@@ -109,7 +109,7 @@ fn sections(r: &Replayed) -> Vec<(String, Vec<Block>)> {
                 };
                 out.push((heading, vec![Block::Text(text.clone())]));
             }
-            Item::Assistant { blocks } => {
+            Item::Assistant { blocks, .. } => {
                 let mut body = Vec::new();
                 for b in blocks {
                     match b.get("type").and_then(|t| t.as_str()) {
@@ -306,6 +306,7 @@ mod tests {
                     serde_json::json!({"type":"text","text":"hi"}),
                     serde_json::json!({"type":"tool_use","id":"t1","name":"read","input":{"path":"a"}}),
                 ],
+                model: None,
             },
         );
         push(

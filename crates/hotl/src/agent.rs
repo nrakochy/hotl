@@ -2485,7 +2485,7 @@ fn wrap_background_context(history: &[hotl_types::Item]) -> String {
                 rendered.push_str(text);
                 rendered.push('\n');
             }
-            hotl_types::Item::Assistant { blocks } => {
+            hotl_types::Item::Assistant { blocks, .. } => {
                 let text = hotl_types::assistant_text(blocks);
                 if !text.is_empty() {
                     rendered.push_str("Assistant: ");
@@ -4254,6 +4254,7 @@ mod fork_tests {
                 &mut log,
                 Item::Assistant {
                     blocks: vec![serde_json::json!({"type":"text","text":format!("answer {n}")})],
+                    model: None,
                 },
             );
         }
@@ -5778,6 +5779,7 @@ mod tests {
             },
             hotl_types::Item::Assistant {
                 blocks: vec![serde_json::json!({"type": "text", "text": "earlier answer"})],
+                model: None,
             },
         ];
         let (items, inherited) =

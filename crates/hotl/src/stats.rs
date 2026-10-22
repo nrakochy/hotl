@@ -81,7 +81,7 @@ fn fold_log(path: &std::path::Path, skipped: &mut u64) -> Option<(String, String
                 Item::User {
                     synthetic: None, ..
                 } => row.turns += 1,
-                Item::Assistant { blocks } => {
+                Item::Assistant { blocks, .. } => {
                     row.tool_calls += blocks
                         .iter()
                         .filter(|b| b.get("type").and_then(|t| t.as_str()) == Some("tool_use"))
@@ -276,6 +276,7 @@ mod tests {
                             serde_json::json!({"type":"tool_use","id":"a","name":"read","input":{}}),
                             serde_json::json!({"type":"text","text":"ok"}),
                         ],
+                        model: None,
                     },
                 },
             );

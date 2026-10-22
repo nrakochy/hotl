@@ -38,6 +38,7 @@ fn seeded() -> Vec<Item> {
             blocks: vec![serde_json::json!({
                 "type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "ls"}
             })],
+            model: None,
         },
         Item::ToolResults {
             results: vec![ToolResultItem {
@@ -48,10 +49,12 @@ fn seeded() -> Vec<Item> {
         },
         Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "listed"})],
+            model: None,
         },
         user("second"),
         Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "noted"})],
+            model: None,
         },
     ]
 }

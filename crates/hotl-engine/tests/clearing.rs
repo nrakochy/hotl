@@ -202,7 +202,7 @@ async fn old_results_are_cleared_to_stubs_before_any_fold() {
     let assistant: Vec<String> = items
         .iter()
         .filter_map(|i| match &**i {
-            Item::Assistant { blocks } => Some(assistant_text(blocks)),
+            Item::Assistant { blocks, .. } => Some(assistant_text(blocks)),
             _ => None,
         })
         .collect();

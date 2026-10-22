@@ -56,6 +56,7 @@ fn assistant_payload() -> EntryPayload {
     EntryPayload::Item {
         item: Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "hi"})],
+            model: None,
         },
     }
 }
@@ -108,6 +109,7 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
         stale,
         Some(Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "hi"})],
+            model: None,
         }),
     );
     let (tx, rx) = oneshot::channel();
@@ -143,6 +145,7 @@ async fn a_stale_epoch_reject_holds_the_steer_until_the_retried_commit_lands() {
         fresh,
         Some(Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": "hi"})],
+            model: None,
         }),
     );
     let (tx, rx) = oneshot::channel();

@@ -287,6 +287,7 @@ async fn a_fold_shows_the_summarizer_the_plan_and_its_decisions() {
             },
             hotl_types::Item::Assistant {
                 blocks: vec![serde_json::json!({"type": "text", "text": "noted"})],
+                model: None,
             },
         ],
         initial_todos: Vec::new(),

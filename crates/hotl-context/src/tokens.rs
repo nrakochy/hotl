@@ -130,7 +130,7 @@ pub fn estimate_item_with(item: &Item, profile: &TokenProfile) -> u64 {
         Item::User { text, images, .. } => {
             estimate_text_with(text, profile) + images.len() as u64 * IMAGE_TOKENS_ESTIMATE
         }
-        Item::Assistant { blocks } => blocks
+        Item::Assistant { blocks, .. } => blocks
             .iter()
             .map(|b| BLOCK_OVERHEAD + estimate_block(b, profile))
             .sum(),
@@ -196,6 +196,7 @@ mod tests {
             },
             Item::Assistant {
                 blocks: vec![serde_json::json!({"type":"text","text":text})],
+                model: None,
             },
         ];
         assert!(estimate_items(&items) > 2 * actual_ish);
@@ -292,7 +293,10 @@ mod tests {
     fn assistant_blocks_do_not_bill_their_json_framing() {
         let body = "x".repeat(3000);
         let blocks = vec![serde_json::json!({"type": "text", "text": body})];
-        let est = estimate_item(&Item::Assistant { blocks });
+        let est = estimate_item(&Item::Assistant {
+            blocks,
+            model: None,
+        });
         // Still an overcount of the payload (the invariant)…
         assert!(est > 3000 / 4, "{est}");
         // …but not inflated by `{"type":"text","text":…}` framing: the old

@@ -438,7 +438,7 @@ fn item_size_estimate(item: &Item) -> usize {
     match item {
         Item::User { text, .. } | Item::System { text } => text.len(),
         Item::ToolResults { results } => results.iter().map(|r| r.content.len()).sum(),
-        Item::Assistant { blocks } => blocks.iter().map(value_size_estimate).sum(),
+        Item::Assistant { blocks, .. } => blocks.iter().map(value_size_estimate).sum(),
         Item::Unknown => 0,
     }
 }
@@ -1382,6 +1382,7 @@ impl Turn {
         self.anchor = Some((reported, snapshot.durable.len() + 1));
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
+            model: None,
         };
         self.projected_tail.push(Arc::new(assistant.clone()));
         self.ledger.stamp(Phase::BatchProposed);
@@ -3977,6 +3978,7 @@ mod tests {
             prompt,
             Item::Assistant {
                 blocks: vec![json!({"type": "text", "text": "ok"})],
+                model: None,
             },
             tool_results(&big),
         ];

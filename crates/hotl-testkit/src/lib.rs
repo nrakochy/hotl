@@ -539,7 +539,7 @@ impl Harness {
         self.items()
             .iter()
             .filter_map(|i| match i {
-                Item::Assistant { blocks } => Some(hotl_types::assistant_tool_uses(blocks)),
+                Item::Assistant { blocks, .. } => Some(hotl_types::assistant_tool_uses(blocks)),
                 _ => None,
             })
             .flatten()
@@ -2496,6 +2496,7 @@ mod tests {
                     },
                     Item::Assistant {
                         blocks: vec![json!({"type": "text", "text": format!("earlier reply {i}")})],
+                        model: None,
                     },
                 ]
             })
@@ -3098,6 +3099,7 @@ mod tests {
             },
             Item::Assistant {
                 blocks: vec![json!({"type":"text","text":"a"})],
+                model: None,
             },
         ];
         assert!(!hotl_engine::needs_continuation(&done));

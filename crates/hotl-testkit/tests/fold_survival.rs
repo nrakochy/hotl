@@ -80,6 +80,7 @@ fn seeded() -> Vec<Item> {
             blocks: vec![serde_json::json!({
                 "type": "tool_use", "id": "t1", "name": "bash", "input": {"command": "cargo test"}
             })],
+            model: None,
         },
         Item::ToolResults {
             results: vec![ToolResultItem {
@@ -90,6 +91,7 @@ fn seeded() -> Vec<Item> {
         },
         Item::Assistant {
             blocks: vec![serde_json::json!({"type": "text", "text": DECISION})],
+            model: None,
         },
     ]
 }

@@ -70,6 +70,11 @@ pub enum Item {
     /// Verbatim provider content blocks (text / tool_use / thinking / ...).
     Assistant {
         blocks: Vec<Value>,
+        /// The model that produced these blocks — the session model, or a
+        /// fallback the turn walked to (0067). `None` on logs written before
+        /// the field existed; a session that never switches writes no key.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     /// All results for one assistant turn's tool calls, in source order
     /// (the API requires them in a single user message).
@@ -498,6 +503,13 @@ pub enum EntryPayload {
     EffortSet {
         effort: Option<String>,
     },
+    /// Switches the session model (`/model`, `session/set_model`; 0067).
+    /// Log-only, last one wins, like `ModeSet`. Written when the switch is
+    /// *applied* (a turn boundary), so its position in the log is where the
+    /// next request changed model.
+    ModelSet {
+        model: String,
+    },
     /// A structured question (`ask_user`, tier-1 gap #4) committed durably
     /// **before** it surfaces — mirrors `PendingAsk`/`AskResolved` exactly:
     /// if the process dies before a matching `question_resolved`, replay
@@ -788,6 +800,7 @@ mod tests {
                     serde_json::json!({"type":"text","text":"hello"}),
                     serde_json::json!({"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a.rs"}}),
                 ],
+                model: None,
             },
             Item::ToolResults {
                 results: vec![ToolResultItem {
@@ -805,6 +818,42 @@ mod tests {
     /// The wire/log shape of an imageless user item is pinned to the exact
     /// pre-`images` bytes: this struct is persisted in session logs and
     /// serialized into provider requests, so an empty vec must stay invisible.
+    /// 0067: the switch entry round-trips; an assistant item with no model
+    /// writes the bytes it always did (old logs, the testkit's byte compare).
+    #[test]
+    fn model_set_round_trips() {
+        let e = EntryPayload::ModelSet {
+            model: "openai-responses/gpt-5.6".into(),
+        };
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(
+            json,
+            r#"{"kind":"model_set","model":"openai-responses/gpt-5.6"}"#
+        );
+        let back: EntryPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, e);
+    }
+
+    #[test]
+    fn an_assistant_item_without_a_model_serializes_as_before() {
+        let item = Item::Assistant {
+            blocks: vec![serde_json::json!({"type": "text", "text": "hi"})],
+            model: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&item).unwrap(),
+            r#"{"type":"assistant","blocks":[{"text":"hi","type":"text"}]}"#
+        );
+        let stamped = Item::Assistant {
+            blocks: Vec::new(),
+            model: Some("backup-model".into()),
+        };
+        let json = serde_json::to_string(&stamped).unwrap();
+        assert!(json.contains(r#""model":"backup-model""#));
+        let back: Item = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, stamped);
+    }
+
     /// 0066: a fold without a focus writes the entry it always did.
     #[test]
     fn a_compaction_entry_without_focus_serializes_byte_identical_to_before() {
