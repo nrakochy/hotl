@@ -347,11 +347,17 @@ fn update_line(update: &Value) -> Option<String> {
             }
             "fallback_model" => format!("· model fallback → {}", s("model")),
             "prompt_queued" => "· queued".to_string(),
+            "fold_skipped" => format!("(fold skipped: {})", s("reason")),
             "compacted" => {
+                let focus = update
+                    .get("focus")
+                    .and_then(Value::as_str)
+                    .map(|f| format!(" — focus: {f}"))
+                    .unwrap_or_default();
                 if update.get("degraded").and_then(Value::as_bool) == Some(true) {
-                    "(context compacted — degraded)".to_string()
+                    format!("(context compacted — degraded{focus})")
                 } else {
-                    "(context compacted)".to_string()
+                    format!("(context compacted{focus})")
                 }
             }
             "cleared" => format!("(cleared {} old tool results)", n("count")),
@@ -512,7 +518,15 @@ mod tests {
             },
             EngineEvent::FallbackModel { model: "m2".into() },
             EngineEvent::PromptQueued,
-            EngineEvent::Compacted { degraded: false },
+            EngineEvent::Compacted {
+                degraded: false,
+                focus: None,
+                usage: hotl_types::TokenUsage::default(),
+                estimate: 0,
+            },
+            EngineEvent::FoldSkipped {
+                reason: "nothing".into(),
+            },
             EngineEvent::TodosChanged { items: Vec::new() },
             EngineEvent::GoalChanged {
                 condition: Some("tests pass".into()),

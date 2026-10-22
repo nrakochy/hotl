@@ -572,6 +572,20 @@ pub enum EngineEvent {
     /// summarize call failed and the floor placeholder was used.
     Compacted {
         degraded: bool,
+        /// The focus the fold ran with, if any — `/compact <focus>` or
+        /// `session/fold` (0066).
+        focus: Option<String>,
+        /// What the digest cost. Informational here; billed through the next
+        /// `TurnDone`'s usage.
+        usage: TokenUsage,
+        /// The engine's estimate of the projection after the fold — what the
+        /// next request re-writes into the cache.
+        estimate: u64,
+    },
+    /// A human fold found nothing to fold (or the log is sealed): no entry,
+    /// no `Compacting`, just the reason (0066).
+    FoldSkipped {
+        reason: String,
     },
     /// Old tool results were cleared to stubs (0057) — the rung below
     /// `Compacted`, and the one a long exploration should hit first.
@@ -707,7 +721,8 @@ impl std::fmt::Debug for EngineEvent {
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),
             Self::BudgetNotice { pct, .. } => write!(f, "BudgetNotice({pct}%)"),
-            Self::Compacted { degraded } => write!(f, "Compacted({degraded})"),
+            Self::Compacted { degraded, .. } => write!(f, "Compacted({degraded})"),
+            Self::FoldSkipped { reason } => write!(f, "FoldSkipped({reason})"),
             Self::Cleared { count } => write!(f, "Cleared({count})"),
             Self::Ask { summary, .. } => write!(f, "Ask({summary})"),
             Self::Question { question, .. } => write!(f, "Question({})", question.header),
@@ -729,6 +744,16 @@ impl std::fmt::Debug for EngineEvent {
             Self::LedgerReport(s) => write!(f, "LedgerReport(samples={})", s.sample_count),
         }
     }
+}
+
+/// How the actor took a human fold request (`/compact`, `session/fold`; 0066).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldAdmission {
+    /// Idle: the fold is running now.
+    Started,
+    /// A turn is running: the fold lands when it ends, before the next
+    /// queued prompt.
+    Queued,
 }
 
 /// Which retry ladder a `Retrying` came from (0061 T15). The human is
@@ -1046,6 +1071,13 @@ pub enum SessionCmd {
     ContextBreakdown {
         reply: oneshot::Sender<hotl_types::ContextBreakdown>,
     },
+    /// A human fold (`/compact`, `session/fold`; 0066). Idle: runs now, the
+    /// reply says `Started` before the fold. Running: parks until the turn
+    /// ends, the reply says `Queued`. `focus` is already normalized.
+    Fold {
+        focus: Option<String>,
+        reply: oneshot::Sender<FoldAdmission>,
+    },
     /// Pre-actor proposal path (durable-ack before reply): the ONLY caller
     /// left is [`question_sink`]'s `PendingQuestion`/`QuestionResolved`
     /// entries, built and sent before the actor (and its masker) exist yet
@@ -1287,6 +1319,16 @@ impl SessionHandle {
     /// What currently fills the context window, by source (`/context`).
     /// `None` if the actor is gone. Appends nothing and publishes nothing, so
     /// unlike every other command here it is safe to call mid-turn.
+    /// Fold history now, or when the running turn ends (0066). `None` = the
+    /// session is gone. The caller normalizes `focus` (`compaction::normalize_focus`).
+    pub async fn fold(&self, focus: Option<String>) -> Option<FoldAdmission> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(SessionCmd::Fold { focus, reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok()
+    }
     pub async fn context_breakdown(&self) -> Option<hotl_types::ContextBreakdown> {
         let (tx, rx) = oneshot::channel();
         self.cmd

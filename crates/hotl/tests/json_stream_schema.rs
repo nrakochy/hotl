@@ -115,7 +115,15 @@ fn every_frame_is_tagged_and_versioned() {
         },
         EngineEvent::FallbackModel { model: "m2".into() },
         EngineEvent::PromptQueued,
-        EngineEvent::Compacted { degraded: false },
+        EngineEvent::Compacted {
+            degraded: false,
+            focus: None,
+            usage: hotl_types::TokenUsage::default(),
+            estimate: 0,
+        },
+        EngineEvent::FoldSkipped {
+            reason: "nothing".into(),
+        },
         EngineEvent::TodosChanged { items: Vec::new() },
         EngineEvent::PlanPresented {
             summary: "swap the parser".into(),

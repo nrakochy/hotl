@@ -1190,6 +1190,9 @@ pub(crate) async fn run(
     let mut carry_mispredictions: u32 = 0;
     let mut compact_streak: u32 = 0;
     let mut pipeline = Pipeline::default();
+    // A human fold waiting for the turn boundary (0066). Newest wins; a
+    // process exit drops it (decision 6).
+    let mut pending_fold: Option<FoldRequest> = None;
     // Auto-title bookkeeping (0071 T4): at most one title call per process,
     // and a `/rename` that lands first wins over it.
     let mut title = TitleState {
@@ -1317,6 +1320,26 @@ pub(crate) async fn run(
             }
             SessionCmd::Aside { question } => {
                 spawn_aside(&shared, &cmd_tx, &events, &head, question);
+            }
+            SessionCmd::Fold { focus, reply } => {
+                if running {
+                    pending_fold = Some(FoldRequest { focus });
+                    let _ = reply.send(crate::FoldAdmission::Queued);
+                } else {
+                    // Reply first: the ACP arm awaits it, and the fold can
+                    // take two minutes.
+                    let _ = reply.send(crate::FoldAdmission::Started);
+                    fold_now(
+                        &shared,
+                        &mut log,
+                        &mut head,
+                        &mut pipeline,
+                        focus.as_deref(),
+                        &events,
+                        &mut carry_usage,
+                    )
+                    .await;
+                }
             }
             SessionCmd::AsideResult { question, result } => {
                 // Log-only spend: replay drops `Usage`, no `Item` is written,
@@ -1627,6 +1650,7 @@ pub(crate) async fn run(
                         compact_streak: &mut compact_streak,
                         goal: &mut goal,
                         title: &mut title,
+                        pending_fold: &mut pending_fold,
                         cmd_tx: &cmd_tx,
                         events: &events,
                         current_turn: &current_turn,
@@ -1682,9 +1706,55 @@ struct TurnFinishedCtx<'a> {
     compact_streak: &'a mut u32,
     goal: &'a mut Option<GoalState>,
     title: &'a mut TitleState,
+    pending_fold: &'a mut Option<FoldRequest>,
     cmd_tx: &'a mpsc::WeakSender<SessionCmd>,
     events: &'a mpsc::Sender<EngineEvent>,
     current_turn: &'a Arc<Mutex<CancellationToken>>,
+}
+
+/// A human fold parked until the turn boundary (0066). Distinct from "nothing
+/// pending" even with no focus.
+struct FoldRequest {
+    focus: Option<String>,
+}
+
+/// What a fold produced (0066): whether the floor digest was used, what the
+/// summarize cost, and the projection's estimate after the re-point.
+pub(crate) struct Folded {
+    degraded: bool,
+    usage: TokenUsage,
+    estimate: u64,
+}
+
+/// Run a human fold now: `Compacted` on success (the digest's spend joins
+/// `carry_usage`, billed by the next `TurnDone`), `FoldSkipped` when there is
+/// nothing to fold. No streak accounting — a fold with nothing between it
+/// and the last one is the human's call.
+async fn fold_now(
+    shared: &Arc<SharedDeps>,
+    log: &mut SessionLog,
+    head: &mut Head,
+    pipeline: &mut Pipeline,
+    focus: Option<&str>,
+    events: &mpsc::Sender<EngineEvent>,
+    carry_usage: &mut TokenUsage,
+) {
+    match compact(shared, log, head, pipeline, None, events, focus).await {
+        Ok(folded) => {
+            *carry_usage += folded.usage;
+            let _ = events
+                .send(EngineEvent::Compacted {
+                    degraded: folded.degraded,
+                    focus: focus.map(str::to_owned),
+                    usage: folded.usage,
+                    estimate: folded.estimate,
+                })
+                .await;
+        }
+        Err(reason) => {
+            let _ = events.send(EngineEvent::FoldSkipped { reason }).await;
+        }
+    }
 }
 
 /// Auto-title bookkeeping (0071 T4). `armed` is the config flag, cleared the
@@ -1983,6 +2053,7 @@ async fn on_turn_finished(
                 ctx.current_turn,
                 &mut unrecoverable,
                 &mut folded,
+                ctx.pending_fold,
             )
             .await
         }
@@ -2331,6 +2402,8 @@ async fn on_turn_finished(
             ctx.events,
             ctx.current_turn,
             ctx.steers_held,
+            ctx.pending_fold,
+            ctx.carry_usage,
         )
         .await;
     }
@@ -2357,7 +2430,12 @@ async fn try_compact(
     // The fold's own summarize is spend the turn pays for, so it joins the
     // ending segment's on the way to carry and to the goal (0051 decision 6).
     folded: &mut TokenUsage,
+    // A human fold that was waiting for this boundary (0066): one fold, not
+    // two. A focused one drops the speculative digest, which never saw it.
+    pending_fold: &mut Option<FoldRequest>,
 ) -> Option<Outcome> {
+    let focus = pending_fold.take().and_then(|r| r.focus);
+    let spec = if focus.is_none() { spec } else { None };
     // INVARIANT: the streak counts folds with no intervening completed sample
     // — a long, productive turn folds as often as it needs to, and only a
     // fold-the-digest spiral (no progress between folds) trips the cap.
@@ -2382,13 +2460,20 @@ async fn try_compact(
         tokio::select! {
             biased;
             _ = cancel.cancelled() => return Some(Outcome::Cancelled),
-            compacted = compact(shared, log, head, pipeline, spec, events) => compacted,
+            compacted = compact(shared, log, head, pipeline, spec, events, focus.as_deref()) => compacted,
         }
     };
     match compacted {
-        Ok((degraded, fold_usage)) => {
-            *folded += fold_usage;
-            let _ = events.send(EngineEvent::Compacted { degraded }).await;
+        Ok(f) => {
+            *folded += f.usage;
+            let _ = events
+                .send(EngineEvent::Compacted {
+                    degraded: f.degraded,
+                    focus,
+                    usage: f.usage,
+                    estimate: f.estimate,
+                })
+                .await;
             if cancel.is_cancelled() {
                 return Some(Outcome::Cancelled);
             }
@@ -2463,6 +2548,8 @@ async fn end_turn(
     events: &mpsc::Sender<EngineEvent>,
     current_turn: &Arc<Mutex<CancellationToken>>,
     steers_held: bool,
+    pending_fold: &mut Option<FoldRequest>,
+    carry_usage: &mut TokenUsage,
 ) -> bool {
     annotate(shared, log, head, pipeline, &outcome).await;
     // Notification: the turn completed — fire-and-forget, computed before
@@ -2489,6 +2576,20 @@ async fn end_turn(
             mispredictions,
         })
         .await;
+    // The turn boundary (0066 decision 3): after `TurnDone`, before the next
+    // queued prompt — `turn_done → compacting → compacted → next prompt`.
+    if let Some(req) = pending_fold.take() {
+        fold_now(
+            shared,
+            log,
+            head,
+            pipeline,
+            req.focus.as_deref(),
+            events,
+            carry_usage,
+        )
+        .await;
+    }
     match queue.pop_front() {
         Some(next) => {
             start_turn(
@@ -3022,7 +3123,8 @@ async fn compact(
     pipeline: &mut Pipeline,
     spec: Option<crate::SpecDigest>,
     events: &mpsc::Sender<EngineEvent>,
-) -> Result<(bool, TokenUsage), String> {
+    focus: Option<&str>,
+) -> Result<Folded, String> {
     // Drain-before-BUILD-and-mint (commit-protocol.md §conflict table, the
     // Abort arm's steps 3→5). Both halves are load-bearing and fail
     // differently: minting after the drain keeps the fold chained onto the
@@ -3038,7 +3140,8 @@ async fn compact(
     // lineage (it only appends between folds), so its indices still name the
     // same items. Reset mode folds a wider span than the speculation covered,
     // so it never uses one; the turn doesn't speculate in reset mode.
-    if !shared.config.compaction_reset {
+    // A spec digest never saw a focus, so a focused fold pays for a fresh one.
+    if !shared.config.compaction_reset && focus.is_none() {
         if let Some(spec) = spec {
             let spec_usage = spec.usage;
             if spec.prefix_end < spec.kept_from && spec.kept_from <= head.items().len() {
@@ -3063,7 +3166,11 @@ async fn compact(
                 head.last_fold = head.leaf.clone();
                 head.repoint(compaction::apply(head.items(), &plan, &digest, &pins));
                 post_compact(shared, &spec.text).await;
-                return Ok((false, spec_usage));
+                return Ok(Folded {
+                    degraded: false,
+                    usage: spec_usage,
+                    estimate: head.estimated,
+                });
             }
         }
     }
@@ -3097,7 +3204,7 @@ async fn compact(
     // Timeout or two failed attempts: the floor digest keeps the session moving
     // rather than ending the turn on housekeeping.
     let (summary, fold_usage) = summarize_bounded(
-        summarize(shared, folded, Some(events)),
+        summarize(shared, folded, Some(events), focus),
         COMPACT_SUMMARIZE_TIMEOUT,
     )
     .await;
@@ -3114,7 +3221,7 @@ async fn compact(
         degraded,
         pinned: pins.clone(),
         source_range: head.fold_span(),
-        focus: None,
+        focus: focus.map(str::to_owned),
     };
     if !shared.append(log, pipeline, head, payload).await {
         return Err("session log is sealed".into());
@@ -3122,7 +3229,11 @@ async fn compact(
     head.last_fold = head.leaf.clone();
     head.repoint(compaction::apply(head.items(), &plan, &digest, &pins));
     post_compact(shared, &text).await;
-    Ok((degraded, fold_usage))
+    Ok(Folded {
+        degraded,
+        usage: fold_usage,
+        estimate: head.estimated,
+    })
 }
 
 /// Ask the `PreCompact` hooks what to keep. Bounded by
@@ -3195,6 +3306,8 @@ pub(crate) async fn summarize(
     // `None` for the speculative digest: background work, and a retry there is
     // not a wait the human is sitting through (0061 T16).
     events: Option<&mpsc::Sender<EngineEvent>>,
+    // A human fold's focus (0066); the ladder and the speculation pass `None`.
+    focus: Option<&str>,
 ) -> (Option<String>, TokenUsage) {
     let model = shared.config.utility();
     let request = SamplingRequest {
@@ -3205,7 +3318,7 @@ pub(crate) async fn summarize(
             // The plan rides along (0056 T2): its DECISIONS are on the
             // digest's COPY VERBATIM list, and the model cannot copy what it
             // was not shown.
-            text: compaction::summarize_prompt(folded, shared.plan_markdown().as_deref(), None),
+            text: compaction::summarize_prompt(folded, shared.plan_markdown().as_deref(), focus),
             synthetic: None,
             images: Vec::new(),
         })]),
@@ -4524,17 +4637,18 @@ mod tests {
             usage: hotl_types::TokenUsage::default(),
         };
         let (events, _rx) = tokio::sync::mpsc::channel(8);
-        let (degraded, _) = compact(
+        let folded = compact(
             &shared,
             &mut log,
             &mut head,
             &mut pipeline,
             Some(spec),
             &events,
+            None,
         )
         .await
         .expect("the fold must see the drained projection");
-        assert!(!degraded);
+        assert!(!folded.degraded);
 
         for ticket in tickets {
             assert_eq!(

@@ -189,9 +189,26 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         } => {
             json!({"type": "budget_notice", "pct": pct, "used_usd": used_usd, "cap_usd": cap_usd})
         }
-        EngineEvent::Compacted { degraded } => {
-            json!({"type": "compacted", "degraded": degraded})
+        // `focus` omitted when none (the `hit_ratio` rule); `usage` is the
+        // raw `TokenUsage`, `estimate` the post-fold projection size (0066).
+        EngineEvent::Compacted {
+            degraded,
+            focus,
+            usage,
+            estimate,
+        } => {
+            let mut v = json!({
+                "type": "compacted",
+                "degraded": degraded,
+                "usage": usage,
+                "estimate": estimate,
+            });
+            if let Some(f) = focus {
+                v["focus"] = json!(f);
+            }
+            v
         }
+        EngineEvent::FoldSkipped { reason } => json!({"type": "fold_skipped", "reason": reason}),
         EngineEvent::Cleared { count } => json!({"type": "cleared", "count": count}),
         EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
         // 0056 T3. `nodes` carries the same `Todo` shape `todos_changed`

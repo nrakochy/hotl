@@ -2960,13 +2960,20 @@ impl Surface {
                 used_usd,
                 cap_usd,
             } => eprintln!("· session spend {pct}% of budget (${used_usd:.2} of ${cap_usd:.2})"),
-            EngineEvent::Compacted { degraded } => {
+            EngineEvent::Compacted {
+                degraded, focus, ..
+            } => {
+                let focus = focus.map(|f| format!(" — focus: {f}")).unwrap_or_default();
                 if degraded {
-                    eprintln!("(context compacted — summary failed, earlier history dropped)");
+                    eprintln!(
+                        "(context compacted — summary failed, earlier history dropped{focus})"
+                    );
                 } else {
-                    eprintln!("(context compacted — earlier history summarized)");
+                    eprintln!("(context compacted — earlier history summarized{focus})");
                 }
             }
+            // Nothing in `-p` can request a fold; the match stays honest.
+            EngineEvent::FoldSkipped { reason } => eprintln!("(nothing to fold: {reason})"),
             EngineEvent::Cleared { count } => {
                 eprintln!("(cleared {count} old tool results — recall fetches any of them back)")
             }

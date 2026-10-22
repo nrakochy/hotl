@@ -572,7 +572,7 @@ fn spawn_speculation(
         let (text, usage) = tokio::select! {
             biased;
             _ = cancel.cancelled() => (None, hotl_types::TokenUsage::default()),
-            summarized = crate::actor::summarize(&shared, folded, None) => summarized,
+            summarized = crate::actor::summarize(&shared, folded, None, None) => summarized,
         };
         Some(crate::SpecDigest {
             prefix_end: plan.prefix_end,
