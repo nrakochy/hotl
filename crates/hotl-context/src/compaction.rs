@@ -165,6 +165,7 @@ pub const RECENT_RESULTS: usize = 8;
 pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(
     folded: &[I],
     plan_md: Option<&str>,
+    focus: Option<&str>,
 ) -> String {
     let mut out = format!(
         "Transcript to compress:\n\n{}",
@@ -173,7 +174,33 @@ pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(
     if let Some(plan) = plan_md.map(str::trim).filter(|p| !p.is_empty()) {
         out.push_str(&format!("\n\nThe session's plan:\n\n{plan}\n"));
     }
+    // A human fold's focus (0066): one paragraph after the plan, steering
+    // what the digest keeps in full. It never becomes a user item.
+    if let Some(focus) = focus.map(str::trim).filter(|f| !f.is_empty()) {
+        out.push_str(&format!(
+            "\n\nThe user asked this fold to keep one thing in focus:\n\n{focus}\n\n\
+             Carry everything that bears on it through STATE, DECISIONS, FILES and NEXT in \
+             full detail. The COPY VERBATIM rules above still apply to everything else.\n"
+        ));
+    }
     out
+}
+
+/// Longest focus a human fold may carry (the `session/set_goal` bound).
+pub const FOCUS_MAX: usize = 4000;
+
+/// The one validator for a fold's focus — the TUI, ACP and the engine all
+/// call it, the way `normalize_session_name` serves `/rename`. Trimmed;
+/// empty is "no focus"; over `FOCUS_MAX` is an error.
+pub fn normalize_focus(raw: &str) -> Result<Option<String>, &'static str> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if t.chars().count() > FOCUS_MAX {
+        return Err("focus must be 1–4000 chars after trimming");
+    }
+    Ok(Some(t.to_string()))
 }
 
 /// The plain-text transcript both small-model calls read (the compaction
@@ -305,7 +332,7 @@ mod tests {
                 data: "QkFTRTY0UEFZTE9BRA==".repeat(100).into(),
             }],
         }];
-        let prompt = summarize_prompt(&items, None);
+        let prompt = summarize_prompt(&items, None, None);
         assert!(prompt.contains("[user] look at [Image #1] please"));
         assert!(
             !prompt.contains("QkFTRTY0"),
@@ -491,9 +518,43 @@ mod tests {
         // far under what an unclipped pair of 5KB results would cost.
         let mut folded = vec![user("goal")];
         folded.extend((0..10).map(|_| results(&"z".repeat(5_000))));
-        let prompt = summarize_prompt(&folded, None);
+        let prompt = summarize_prompt(&folded, None, None);
         assert!(prompt.len() < 20_000, "{}", prompt.len());
         assert!(prompt.contains("[user] goal"));
+    }
+
+    /// 0066: the focus paragraph lands after the plan; blank is nothing.
+    #[test]
+    fn summarize_prompt_appends_the_focus_after_the_plan() {
+        let folded = vec![user("goal")];
+        let prompt = summarize_prompt(&folded, Some("- step one"), Some("the auth refactor"));
+        let plan_at = prompt.find("The session's plan:").unwrap();
+        let focus_at = prompt
+            .find("The user asked this fold to keep one thing in focus:")
+            .unwrap();
+        assert!(plan_at < focus_at);
+        assert!(prompt.contains("\n\nthe auth refactor\n\n"));
+        assert!(prompt
+            .trim_end()
+            .ends_with("still apply to everything else."));
+    }
+
+    #[test]
+    fn an_empty_or_blank_focus_adds_nothing() {
+        let folded = vec![user("goal")];
+        let none = summarize_prompt(&folded, None, None);
+        assert_eq!(summarize_prompt(&folded, None, Some("  ")), none);
+        assert_eq!(summarize_prompt(&folded, None, Some("")), none);
+        assert!(!none.contains("keep one thing in focus"));
+    }
+
+    #[test]
+    fn normalize_focus_trims_and_bounds() {
+        assert_eq!(normalize_focus("  x "), Ok(Some("x".into())));
+        assert_eq!(normalize_focus(""), Ok(None));
+        assert_eq!(normalize_focus("   "), Ok(None));
+        assert!(normalize_focus(&"y".repeat(FOCUS_MAX)).is_ok());
+        assert!(normalize_focus(&"y".repeat(FOCUS_MAX + 1)).is_err());
     }
 
     #[test]
@@ -504,7 +565,7 @@ mod tests {
         for n in 0..12 {
             folded.push(results(&format!("R{n}:{}", "z".repeat(5_000))));
         }
-        let prompt = summarize_prompt(&folded, None);
+        let prompt = summarize_prompt(&folded, None, None);
         let lines: Vec<&str> = prompt
             .lines()
             .filter(|l| l.starts_with("[tool result] "))
@@ -525,11 +586,11 @@ mod tests {
     fn prompt_carries_the_plan_artifact() {
         let folded = vec![user("goal")];
         let plan = "# Plan\n\nDECISIONS\n- keep the ULID, not a hash\n";
-        let prompt = summarize_prompt(&folded, Some(plan));
+        let prompt = summarize_prompt(&folded, Some(plan), None);
         assert!(prompt.contains("keep the ULID, not a hash"), "{prompt}");
         assert!(prompt.contains("The session's plan:"), "{prompt}");
         // No plan, and an empty one, both leave the prompt alone.
-        assert!(!summarize_prompt(&folded, None).contains("The session's plan"));
-        assert!(!summarize_prompt(&folded, Some("  \n")).contains("The session's plan"));
+        assert!(!summarize_prompt(&folded, None, None).contains("The session's plan"));
+        assert!(!summarize_prompt(&folded, Some("  \n"), None).contains("The session's plan"));
     }
 }

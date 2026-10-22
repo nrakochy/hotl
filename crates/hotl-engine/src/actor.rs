@@ -3055,6 +3055,7 @@ async fn compact(
                     degraded: false,
                     pinned: pins.clone(),
                     source_range: head.fold_span(),
+                    focus: None,
                 };
                 if !shared.append(log, pipeline, head, payload).await {
                     return Err("session log is sealed".into());
@@ -3113,6 +3114,7 @@ async fn compact(
         degraded,
         pinned: pins.clone(),
         source_range: head.fold_span(),
+        focus: None,
     };
     if !shared.append(log, pipeline, head, payload).await {
         return Err("session log is sealed".into());
@@ -3203,7 +3205,7 @@ pub(crate) async fn summarize(
             // The plan rides along (0056 T2): its DECISIONS are on the
             // digest's COPY VERBATIM list, and the model cannot copy what it
             // was not shown.
-            text: compaction::summarize_prompt(folded, shared.plan_markdown().as_deref()),
+            text: compaction::summarize_prompt(folded, shared.plan_markdown().as_deref(), None),
             synthetic: None,
             images: Vec::new(),
         })]),

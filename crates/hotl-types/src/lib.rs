@@ -429,6 +429,11 @@ pub enum EntryPayload {
         /// before the field existed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_range: Option<(String, String)>,
+        /// The focus a human fold ran with (`/compact <focus>`, 0066).
+        /// `None` for the ladder's folds and for every entry before the
+        /// field existed — such an entry serializes exactly as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<String>,
     },
     /// Re-point the projection to its first `keep_items` items — the
     /// `branch_move` of the commit-protocol vocabulary, expressed against
@@ -783,6 +788,41 @@ mod tests {
     /// The wire/log shape of an imageless user item is pinned to the exact
     /// pre-`images` bytes: this struct is persisted in session logs and
     /// serialized into provider requests, so an empty vec must stay invisible.
+    /// 0066: a fold without a focus writes the entry it always did.
+    #[test]
+    fn a_compaction_entry_without_focus_serializes_byte_identical_to_before() {
+        let entry = EntryPayload::Compaction {
+            digest: Vec::new(),
+            prefix_end: 1,
+            kept_from: 3,
+            degraded: false,
+            pinned: Vec::new(),
+            source_range: None,
+            focus: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"kind":"compaction","digest":[],"prefix_end":1,"kept_from":3,"degraded":false}"#
+        );
+    }
+
+    #[test]
+    fn a_compaction_entry_round_trips_its_focus() {
+        let entry = EntryPayload::Compaction {
+            digest: Vec::new(),
+            prefix_end: 1,
+            kept_from: 3,
+            degraded: false,
+            pinned: Vec::new(),
+            source_range: None,
+            focus: Some("x".into()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""focus":"x""#));
+        let back: EntryPayload = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, EntryPayload::Compaction { focus: Some(f), .. } if f == "x"));
+    }
+
     #[test]
     fn imageless_user_item_serializes_byte_identical_to_before() {
         let plain = Item::User {

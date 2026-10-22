@@ -4397,6 +4397,7 @@ mod fork_tests {
                     degraded: false,
                     pinned: Vec::new(),
                     source_range: None,
+                    focus: None,
                 },
                 11,
             )

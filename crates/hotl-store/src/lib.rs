@@ -2130,6 +2130,7 @@ mod tests {
                 degraded: false,
                 pinned: Vec::new(),
                 source_range: None,
+                focus: None,
             },
             3,
         )
@@ -3530,6 +3531,7 @@ mod tests {
                     degraded: false,
                     pinned: Vec::new(),
                     source_range: None,
+                    focus: None,
                 },
                 11,
             )

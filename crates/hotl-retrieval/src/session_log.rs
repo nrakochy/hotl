@@ -402,6 +402,7 @@ mod tests {
             degraded: false,
             pinned: Vec::new(),
             source_range: None,
+            focus: None,
         });
         // The projection no longer holds either item; the log still does.
         let replayed = hotl_store::replay(&log.path()).expect("replay");
