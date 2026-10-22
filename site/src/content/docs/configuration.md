@@ -566,6 +566,7 @@ hotl reclaims context cheapest-first, and only climbs to the next rung when the 
 | any size | **spill** — a single oversized tool result goes to a file, leaving a head+tail preview and a `read` pointer (`evict_tokens`, `evict_tokens_per_tool`) | nothing; the file is still on disk |
 | 60% | **clear** — tool results older than the last `keep_results` user turns become one-line `<cleared …/>` stubs | nothing; the session log still holds every byte, and `recall` fetches one back by id |
 | 80% | **fold** — earlier history is replaced by a typed summary (compaction) | a summarize call, and the detail the summary didn't keep |
+| on request | `/compact [focus]` runs the same fold at any fullness ([tui.md](../tui/#folding-on-purpose)) | the same summarize call |
 
 Clearing happens at most once per prompt and never touches the last `keep_results` turns, the turn in flight, or a `skill` result — those are the history the model is still working from. Set `keep_results = 0` to turn the rung off entirely and go straight from spilling to folding.
 
@@ -777,7 +778,8 @@ frame carries `"schema_version"` and a `"type"`: `text_delta`,
 `tool_auto_allowed`, `child_tool` (a sub-agent's tool activity, with the
 spawn call's `parent_id`, a `phase` of `start`/`done`, and `ok` on done
 frames only), `retrying`, `fallback_model`, `prompt_queued`,
-`compacted`, `todos_changed`, `ask_denied`, `question_no_human`, and a terminal
+`compacted` (now also with `focus`, `usage` and `estimate`), `fold_skipped`,
+`todos_changed`, `ask_denied`, `question_no_human`, and a terminal
 `turn_done` carrying token usage and a tagged outcome:
 
 ```json

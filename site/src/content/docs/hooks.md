@@ -120,7 +120,7 @@ or `{"decision":"allow"}` (the default for anything else). A `block` injects you
 
 **session_end** — stdin `{"event":"session_end","hookEventName":"SessionEnd","actor":"main"}`. Runs to completion at actor shutdown (bounded by its own timeout) rather than fire-and-forget — the process waits for it, so it's guaranteed to actually run before `hotl` exits.
 
-**pre_compact** — stdin `{"event":"pre_compact","hookEventName":"PreCompact","actor":"main","foldedIds":["t7","t8"],"keptFrom":12,"estimatePct":81}`, respond with:
+**pre_compact** — stdin `{"event":"pre_compact","hookEventName":"PreCompact","actor":"main","foldedIds":["t7","t8"],"keptFrom":12,"estimatePct":81}` (plus `"focus":"…"` when the fold was asked for one with `/compact <focus>`), respond with:
 ```json
 {"pin":["t7"]}
 ```

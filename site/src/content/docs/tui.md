@@ -312,6 +312,7 @@ own.
 | `/help` | Open the key overlay. `?` only works from an empty input; this works whatever you have typed. The overlay is generated from the live command table and the keymap, so it lists every command and shows vim keys only when `vim_mode` is on. |
 | `/status` | What this session is running: name, model, permission mode and plan state, reasoning effort, context window, todo count. |
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
+| `/compact [focus]` | Fold earlier history into the typed summary now, instead of waiting for the 80% rung. With a focus, the summary keeps everything about it in full. Runs when the current turn ends if one is running; the strip reads `folding history…` while it works and the notice says what it cost. See [Folding on purpose](#folding-on-purpose). |
 | `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
 | `/btw <question>` | A side question the model answers but will not remember: one extra sample over the same cached prefix the turn uses (cache-read prices for the whole history), the answer as a muted `?` card, nothing in the transcript or the log beyond the spend. Works mid-turn. A tool call the aside wanted is reported, never run. |
@@ -429,7 +430,32 @@ them. Restart hotl to change these:
 | `[history]` | The recall ring is loaded at startup; re-reading it would drop prompts submitted since |
 
 Under `hotl acp` the same thing is a `session/reload_config` call, so an editor
-or orchestrator embedding hotl gets it too.
+or orchestrator embedding hotl gets it too. Likewise `/compact` is
+`session/fold` with an optional `focus`; it answers `{"queued": true}` when a
+turn is running.
+
+### Folding on purpose
+
+The ladder folds for the window, at 80%. `/compact` folds for the work: before
+a phase switch, before a long pause, before handing the session to a cheaper
+model. It runs the same typed summary the ladder does — nothing new is folded,
+and there is still no `compact` tool the model can call (a model that could
+fold its own history would fold away the corrections it dislikes).
+
+A focus — `/compact the auth refactor` — adds one paragraph to the summarize
+prompt asking the digest to carry everything about it through STATE,
+DECISIONS, FILES and NEXT in full. The focus is recorded on the log entry and
+never becomes part of the conversation. If a turn is running, the fold waits
+for it to end and runs before the next queued prompt; it never interrupts, and
+a `/goal` loop's continuation is not a boundary — the fold waits for the loop
+to pause or finish. A second `/compact` before the first ran replaces it.
+
+The notice names the focus and the digest's cost (`history folded · focus: … ·
+digest 2.1k in / 420 out`); the strip adds `folded 2.5k · rewrite ~41k` — what
+the next turn will write back into the cache — and the ctx chip drops to the
+engine's estimate at once. The digest's spend joins the totals at the next
+turn's result, so `/cost` lags one turn. When nothing can fold (a fresh
+session), the notice says so.
 
 ### The permission-mode badge
 
