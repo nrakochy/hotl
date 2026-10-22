@@ -2121,7 +2121,7 @@ fn outcome_notice(kind: &str, text: Option<&str>) -> Option<String> {
 
 /// Compact token count: verbatim below 1000, else one decimal with a `k`/`M`
 /// suffix. The strip has one line to spend, so `12.0k` beats `12000`.
-pub(crate) fn tok(n: u64) -> String {
+pub fn tok(n: u64) -> String {
     match n {
         0..=999 => n.to_string(),
         1_000..=999_999 => format!("{:.1}k", n as f64 / 1_000.0),

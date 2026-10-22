@@ -19,6 +19,9 @@ semver promise of their own.
 - **`hotl export <session> [--md|--html]`** prints a past session's
   transcript — what the model saw, in order — as Markdown (default) or a
   self-contained HTML page, with secrets masked.
+- **`hotl stats [--days N] [--json]`**: sessions, turns, tool calls, tokens
+  and cost across every saved session, by model and by day. Cost reads `—`
+  when any session's model is not in the price catalog, never a partial sum.
 
 ## [0.28.0] - 2026-09-28
 

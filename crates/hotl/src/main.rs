@@ -44,6 +44,7 @@ mod shell_hooks;
 mod signals;
 mod skills_cli;
 mod spawn;
+mod stats;
 mod structured;
 mod term;
 #[cfg(test)]
@@ -117,6 +118,7 @@ fn main() {
         }
         Some("gc") => std::process::exit(gc::gc_main(&args)),
         Some("export") => std::process::exit(export::export_main(&args[1..])),
+        Some("stats") => std::process::exit(stats::stats_main(&args[1..])),
         Some("mcp") => std::process::exit(mcp_cli::mcp_main(&args)),
         Some("plugins") => std::process::exit(plugins_cli::plugins_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
@@ -177,6 +179,7 @@ fn print_help() {
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/blobs per [retention]\n  \
          hotl export <s>      print a session's transcript as Markdown (--html for a page); s = id, name, @last\n  \
+         hotl stats           sessions, turns, tool calls, tokens and cost by model and by day (--days N, --json)\n  \
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
          hotl mcp             list MCP servers and trust state; show/add/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
