@@ -213,6 +213,8 @@ fn convert_item(item: &Item, out: &mut Vec<Value>, send_images: bool, mark: bool
                     // (it cannot call `strip_foreign_reasoning`, which would
                     // strip its own `reasoning` blocks). Unknown block types
                     // are dropped the same way the typed views skip them.
+                    // A `/model` switch across dialects relies on this too
+                    // (0067): the log is never stripped; drop at render.
                     _ => {}
                 }
             }

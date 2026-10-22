@@ -914,6 +914,48 @@ mod tests {
         );
     }
 
+    /// 0067: a projection a Claude session wrote — items stamped with its
+    /// model, signed thinking inside — renders for this dialect with no
+    /// thinking anywhere: not as a block, not as prose.
+    #[test]
+    fn a_projection_from_an_anthropic_session_renders_without_thinking() {
+        let req = SamplingRequest {
+            model: "gpt-test".into(),
+            max_tokens: 512,
+            system: "sys".into(),
+            items: hotl_provider::arc_items(vec![
+                Item::User {
+                    text: "hi".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+                Item::Assistant {
+                    blocks: vec![
+                        json!({"type": "thinking", "thinking": "secret chain", "signature": "sig=="}),
+                        json!({"type": "text", "text": "answer"}),
+                    ],
+                    model: Some("anthropic/claude-opus-5".into()),
+                },
+            ]),
+            ephemeral_tail: hotl_provider::arc_items(vec![]),
+            tools: Vec::new().into(),
+            thinking: false,
+            effort: None,
+            cache: hotl_provider::CachePolicy::Off,
+            turn_context: None,
+            cache_key: None,
+        };
+        let body = OpenAiCompatProvider::body_for(&req, false, false);
+        let text = body.to_string();
+        assert!(!text.contains("secret chain"), "{text}");
+        assert!(!text.contains("thinking"), "{text}");
+        assert!(
+            !text.contains("claude-opus-5"),
+            "the stamp is never on the wire: {text}"
+        );
+        assert!(text.contains("answer"));
+    }
+
     #[test]
     fn body_shape_drops_thinking_and_splits_tool_results() {
         let req = SamplingRequest {

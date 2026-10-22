@@ -1301,6 +1301,8 @@ pub mod transform {
     /// must keep its own `reasoning` items (it filters exactly
     /// thinking/redacted_thinking itself). Only a dialect foreign to all of
     /// them — the chat-completions one — routes through here.
+    /// This is also what a `/model` switch across dialects relies on (0067):
+    /// the log is never stripped; foreign blocks drop here, at render.
     pub fn strip_foreign_reasoning(blocks: &[Value]) -> Vec<Value> {
         blocks
             .iter()

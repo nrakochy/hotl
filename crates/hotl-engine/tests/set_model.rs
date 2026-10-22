@@ -548,3 +548,69 @@ async fn a_parked_switch_applies_on_cancel() {
     assert!(order.contains(&"ModelChanged".to_string()), "{order:?}");
     assert_eq!(model_sets(&s.log_path), vec!["anthropic/other".to_string()]);
 }
+
+/// 0067 decision 3: hotl never strips thinking on a switch. A signed block
+/// stays in the log and the projection across A → B → A, and A gets its own
+/// block back unchanged on the third request.
+#[tokio::test]
+async fn signed_thinking_survives_a_round_trip_in_the_log() {
+    let signed =
+        serde_json::json!({"type": "thinking", "thinking": "private", "signature": "sig=="});
+    let first = vec![
+        Ok(StreamEvent::Started { request_id: None }),
+        Ok(StreamEvent::Completed {
+            stop: hotl_types::StopReason::EndTurn,
+            usage: hotl_types::TokenUsage::default(),
+            blocks: vec![
+                signed.clone(),
+                serde_json::json!({"type": "text", "text": "one"}),
+            ],
+        }),
+    ];
+    let mut s = session(vec![first, ScriptedProvider::text_reply("three")]);
+    run_turn(&mut s, "a").await;
+    let other = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+        "two",
+    )]));
+    let as_dyn: Arc<dyn Provider> = other.clone();
+    s.handle
+        .set_model(switch("openai/gpt-5", Some(as_dyn)))
+        .await
+        .unwrap();
+    next_event(&mut s).await;
+    run_turn(&mut s, "b").await;
+    let back: Arc<dyn Provider> = Arc::new(Router {
+        main: Arc::clone(&s.main),
+        summarize: Arc::clone(&s.summarize),
+        slow: false,
+    });
+    s.handle
+        .set_model(switch(&EngineConfig::default().model, Some(back)))
+        .await
+        .unwrap();
+    next_event(&mut s).await;
+    run_turn(&mut s, "c").await;
+    // The log still holds the signed block.
+    let models = entries(&s.log_path)
+        .into_iter()
+        .filter_map(|e| match e.payload {
+            EntryPayload::Item {
+                item: Item::Assistant { blocks, .. },
+            } => Some(blocks),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert!(models[0].contains(&signed), "{:?}", models[0]);
+    // The other dialect's request carried the item (dropping is the
+    // serializer's job, at render), and the third request carries it back
+    // unchanged.
+    assert!(other.requests()[0]
+        .items
+        .iter()
+        .any(|i| matches!(&**i, Item::Assistant { blocks, .. } if blocks.contains(&signed))));
+    let third = s.main.requests().pop().unwrap();
+    assert!(third
+        .items
+        .iter()
+        .any(|i| matches!(&**i, Item::Assistant { blocks, .. } if blocks.contains(&signed))));
+}

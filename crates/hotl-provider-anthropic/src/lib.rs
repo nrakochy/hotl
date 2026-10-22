@@ -692,6 +692,8 @@ fn ttl_marker(ttl: CacheTtl) -> Value {
 /// round-tripping untouched. Shared with `cache_plan::item_blocks` so the
 /// plan's block arithmetic and the rendered wire can never disagree about
 /// how many blocks an assistant item contributes.
+/// This is also what a `/model` switch across dialects relies on (0067): the
+/// log is never stripped; the other dialect's blocks drop here, at render.
 pub(crate) fn is_foreign_reasoning(b: &Value) -> bool {
     b.get("type").and_then(Value::as_str) == Some("reasoning")
 }
