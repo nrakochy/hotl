@@ -8,6 +8,17 @@ semver promise of their own.
 
 ### Added
 
+- **`/compact [focus]` folds history when you say so.** The same typed
+  summary the 80% rung writes, run on demand — before a phase switch, a long
+  pause, or a model change. A focus (`/compact the auth refactor`) keeps
+  everything about it in full. If a turn is running the fold waits for it to
+  end and runs before the next queued prompt; it never interrupts. The
+  notice says what the summary cost and the strip shows what the next turn
+  will re-write into the cache. Under `hotl acp` the same thing is
+  `session/fold`. The `compacted` frame gains `focus`, `usage` and
+  `estimate`; a new `fold_skipped` frame says why nothing folded.
+  `pre_compact` hooks see the focus. There is still no `compact` tool the
+  model can call.
 - **`hotl -p --ephemeral` runs a prompt and keeps no session.** The log lives
   in a temp dir for the run and is removed at exit. Sub-agents of that run
   vanish with it.

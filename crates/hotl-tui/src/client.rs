@@ -459,6 +459,13 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
                 .request("session/aside", json!({"question": question}))
                 .await?;
         }
+        Cmd::Fold(focus) => {
+            let params = match focus {
+                Some(f) => json!({"focus": f}),
+                None => json!({}),
+            };
+            client.request("session/fold", params).await?;
+        }
         // The ack is noise like rename/set_mode: the engine broadcasts
         // `config_reloaded` (or `config_reload_failed`), and that is what the
         // client acts on — no id-plumbing in the runtime's loop.

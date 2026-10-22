@@ -945,6 +945,10 @@ pub enum Cmd {
     /// Send `session/aside` (0071 T5); the answer comes back as
     /// `aside_result`.
     Aside(String),
+    /// Send `session/fold` (fire-and-forget; the ack is noise — the engine's
+    /// `compacting`/`compacted`/`fold_skipped` frames are the outcome). The
+    /// payload is the already-normalized focus (0066).
+    Fold(Option<String>),
     /// Tell the terminal what the program is doing (OSC 7501, 0071 T6).
     /// Emitted beside every `SetTitle`; the runtime dedupes and gates it.
     ProgramStatus(crate::program_status::ProgramStatus),
@@ -1915,14 +1919,56 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         "compacted" => {
             state.compacting = false;
             let degraded = v.get("degraded").and_then(Value::as_bool).unwrap_or(false);
-            notice(
-                state,
-                if degraded {
-                    "history folded — degraded".into()
-                } else {
-                    "history folded".into()
-                },
-            );
+            let mut line = if degraded {
+                "history folded — degraded".to_string()
+            } else {
+                "history folded".to_string()
+            };
+            // 0066: the focus and the digest's cost ride the frame. Totals
+            // are NOT touched here — the digest bills through the next
+            // `turn_done`, which the TUI already sums (decision 10).
+            if let Some(f) = v.get("focus").and_then(Value::as_str) {
+                line.push_str(&format!(" · focus: {f}"));
+            }
+            let digest = v.get("usage").map(|u| {
+                (
+                    u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0),
+                    u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0),
+                )
+            });
+            if let Some((input, output)) = digest {
+                line.push_str(&format!(
+                    " · digest {} in / {} out",
+                    tok(input),
+                    tok(output)
+                ));
+            }
+            notice(state, line);
+            // The strip: what the fold cost and what the next turn re-writes
+            // into the cache, until the next turn's usage line replaces it;
+            // the ctx chip takes the engine's estimate at once (decision 9).
+            if let Some(estimate) = v.get("estimate").and_then(Value::as_u64) {
+                let tail = match digest {
+                    Some((input, output)) => {
+                        format!(
+                            " · folded {} · rewrite ~{}",
+                            tok(input + output),
+                            tok(estimate)
+                        )
+                    }
+                    None => format!(" · rewrite ~{}", tok(estimate)),
+                };
+                match &mut state.usage_line {
+                    Some(line) => line.push_str(&tail),
+                    None => state.usage_line = Some(tail.trim_start_matches(" · ").to_string()),
+                }
+                state.live_context = Some(estimate);
+            }
+        }
+        // A human fold with nothing to fold (0066): say so, never silently.
+        "fold_skipped" => {
+            state.compacting = false;
+            notice(state, format!("nothing to fold — {}", text_of("reason")));
         }
         // The rung below `compacted`: no history was lost, so the notice says
         // so rather than sounding like a fold.
@@ -2991,6 +3037,25 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // No idle guard, unlike `/reload`: this appends nothing and replaces
         // nothing, so it is safe mid-turn.
         "context" => vec![Cmd::RequestContext],
+        // `/compact [focus]` (0066): the fold the ladder runs at 80%, on
+        // demand. Never a prompt; the engine queues it behind a live turn.
+        "compact" => {
+            let focus = match hotl_types::normalize_focus(arg) {
+                Ok(f) => f,
+                Err(_) => {
+                    notice(state, "usage: /compact [focus] (focus ≤ 4000 chars)".into());
+                    return Vec::new();
+                }
+            };
+            if state.compacting {
+                notice(state, "already folding".into());
+                return Vec::new();
+            }
+            if state.phase != Phase::Idle {
+                notice(state, "fold queued — runs when this turn ends".into());
+            }
+            vec![Cmd::Fold(focus)]
+        }
         // Every run of the `workflow` tool this process has started, with
         // per-phase progress — read-only, safe mid-turn like `/context`.
         "workflows" => vec![Cmd::RequestWorkflows],
@@ -7020,8 +7085,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Fifteen built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(16));
+        // Sixteen built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(17));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename` and `review` prefix-match, then the `refactor`
@@ -8107,12 +8172,94 @@ mod tests {
     #[test]
     fn unknown_slash_still_reaches_no_model() {
         let mut s = State::test_default();
-        let cmds = slash(&mut s, "compact");
-        assert!(
-            cmds.is_empty(),
-            "/compact is deferred; it must not become a prompt"
-        );
+        let cmds = slash(&mut s, "frobnicate");
+        assert!(cmds.is_empty(), "an unknown word must not become a prompt");
         assert!(last_notice(&s).contains("unknown command"));
+    }
+
+    /// 0066: `/compact` asks the engine to fold and is never a prompt.
+    #[test]
+    fn slash_compact_asks_the_engine_to_fold_and_never_prompts() {
+        let mut s = State::test_default();
+        let before = s.transcript.len();
+        assert_eq!(slash(&mut s, "compact"), vec![Cmd::Fold(None)]);
+        assert_eq!(
+            slash(&mut s, "compact finish the auth refactor"),
+            vec![Cmd::Fold(Some("finish the auth refactor".into()))]
+        );
+        assert_eq!(s.transcript.len(), before, "no notice at idle");
+    }
+
+    #[test]
+    fn slash_compact_mid_turn_still_sends_and_says_queued() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        assert_eq!(slash(&mut s, "compact"), vec![Cmd::Fold(None)]);
+        assert!(last_notice(&s).contains("queued"));
+    }
+
+    #[test]
+    fn slash_compact_while_folding_sends_nothing() {
+        let mut s = State::test_default();
+        s.compacting = true;
+        assert!(slash(&mut s, "compact").is_empty());
+        assert!(last_notice(&s).contains("already"));
+    }
+
+    #[test]
+    fn slash_compact_rejects_an_oversized_focus() {
+        let mut s = State::test_default();
+        let long = format!("compact {}", "x".repeat(4001));
+        assert!(slash(&mut s, &long).is_empty());
+        assert!(last_notice(&s).contains("usage"));
+    }
+
+    #[test]
+    fn a_compacted_frame_shows_focus_cost_and_drops_the_ctx_chip() {
+        let mut s = State::test_default();
+        s.session_usage.input = 999;
+        s.compacting = true;
+        upd(
+            &mut s,
+            json!({"type":"compacted","degraded":false,"focus":"the auth refactor",
+                   "usage":{"input_tokens":300,"output_tokens":40},"estimate":41000}),
+        );
+        assert!(!s.compacting);
+        let n = last_notice(&s);
+        assert!(n.contains("focus: the auth refactor"), "{n}");
+        assert!(n.contains("digest 300 in / 40 out"), "{n}");
+        assert!(
+            s.usage_line.as_deref().unwrap().contains("rewrite ~41.0k"),
+            "{:?}",
+            s.usage_line
+        );
+        assert!(s.usage_line.as_deref().unwrap().contains("folded 340"));
+        assert_eq!(s.live_context, Some(41_000));
+        assert_eq!(
+            s.session_usage.input, 999,
+            "totals are billed by turn_done, not here"
+        );
+    }
+
+    #[test]
+    fn a_compacted_frame_without_the_new_fields_still_notices() {
+        let mut s = State::test_default();
+        upd(&mut s, json!({"type":"compacted","degraded":false}));
+        assert_eq!(last_notice(&s), "history folded");
+        assert_eq!(s.usage_line, None);
+        assert_eq!(s.live_context, None);
+    }
+
+    #[test]
+    fn a_fold_skipped_frame_becomes_a_notice_and_clears_the_fold_flag() {
+        let mut s = State::test_default();
+        s.compacting = true;
+        upd(
+            &mut s,
+            json!({"type":"fold_skipped","reason":"nothing left to compact"}),
+        );
+        assert!(!s.compacting);
+        assert_eq!(last_notice(&s), "nothing to fold — nothing left to compact");
     }
 
     /// Finding 4 (minor): `complete::BUILTINS` and `slash_command`'s match
