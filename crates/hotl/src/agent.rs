@@ -279,13 +279,20 @@ pub(crate) struct ForkArgs {
 /// of `run_session` so the whole decision is testable without a provider: that
 /// function does real disk and env I/O from its first line onward.
 ///
-/// `Ok(None)` = no fork requested; seed as a fresh session does.
+/// `Ok(None)` = neither; seed as a fresh session does. The bool is `is_fork`:
+/// a `--resume` is the ACP `Load` shape (a new child log pinned to the
+/// parent's tip, whole chain kept, no `BranchMove`), a fork may cut back.
 fn headless_lineage(
     sessions_dir: &std::path::Path,
+    resume: Option<&str>,
     fork_from: Option<&str>,
     keep: Option<usize>,
     keep_turns: Option<usize>,
-) -> Result<Option<Resumed>, String> {
+) -> Result<Option<(Resumed, bool)>, String> {
+    if let Some(arg) = resume {
+        let id = resolve_session_ref(arg, &sessions_newest_first(sessions_dir))?;
+        return load_lineage(sessions_dir, &id, KeepSpec::All).map(|r| Some((r, false)));
+    }
     let Some(arg) = fork_from else {
         return Ok(None);
     };
@@ -295,7 +302,7 @@ fn headless_lineage(
         (_, Some(t)) => KeepSpec::Turns(t),
         _ => KeepSpec::All,
     };
-    load_lineage(sessions_dir, &id, keep).map(Some)
+    load_lineage(sessions_dir, &id, keep).map(|r| Some((r, true)))
 }
 
 /// The honesty clause, as a line the CLI can print. A fork always has perfect
@@ -456,6 +463,7 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
                     text,
                     parsed.json_events,
                     parsed.name,
+                    parsed.resume,
                     fork,
                     parsed.goal,
                     parsed.ephemeral,
@@ -1388,19 +1396,22 @@ async fn run_session(
     prompt: String,
     json_events: bool,
     name: Option<String>,
+    resume: Option<String>,
     fork: Option<ForkArgs>,
     goal: Option<String>,
     ephemeral: bool,
 ) -> i32 {
     // Resolved before the provider is even selected: a bad `--fork-from` is a
     // usage error, and paying for a scaffold to discover it is silly.
-    let lineage = match headless_lineage(
+    let (lineage, is_fork) = match headless_lineage(
         &sessions_dir(),
+        resume.as_deref(),
         fork.as_ref().map(|f| f.from.as_str()),
         fork.as_ref().and_then(|f| f.keep),
         fork.as_ref().and_then(|f| f.keep_turns),
     ) {
-        Ok(l) => l,
+        Ok(Some((l, is_fork))) => (Some(l), is_fork),
+        Ok(None) => (None, false),
         Err(msg) => {
             eprintln!("hotl: {msg}");
             return 2;
@@ -1451,7 +1462,7 @@ async fn run_session(
         scaffold.masker(),
         scaffold.clock.now_ms(),
         lineage.as_ref(),
-        lineage.is_some(),
+        is_fork,
     ) {
         Ok(l) => l,
         Err(e) => {
@@ -1465,6 +1476,14 @@ async fn run_session(
         // are about the store, not this run, and still run.
         scaffold.use_sessions_dir(log.dir().to_path_buf());
     }
+    // A resume keeps the chain's name unless `-n` says otherwise, as the
+    // console does; a fork never takes it (two live sessions, one name).
+    let name = name.or_else(|| {
+        lineage
+            .as_ref()
+            .filter(|_| !is_fork)
+            .and_then(|l| l.inherited_name.clone())
+    });
     if let Some(n) = &name {
         let _ = log.append(
             &hotl_types::EntryPayload::Rename { name: n.clone() },
@@ -1473,9 +1492,9 @@ async fn run_session(
     }
     // An explicit --goal is durably logged at create so the log and a later
     // resume agree; the actor seeds from `initial_goal` below (never a
-    // post-spawn SetGoal, which would append a duplicate entry). The
-    // headless lineage is always a fork, which never inherits a goal (0034
-    // decision 6) — only the flag can set one here.
+    // post-spawn SetGoal, which would append a duplicate entry). A fork never
+    // inherits a goal (0034 decision 6); a resume keeps the chain's unless the
+    // flag replaces it.
     if let Some(g) = &goal {
         let _ = log.append(
             &hotl_types::EntryPayload::GoalSet {
@@ -1485,6 +1504,12 @@ async fn run_session(
             scaffold.clock.now_ms(),
         );
     }
+    let goal = goal.or_else(|| {
+        lineage
+            .as_ref()
+            .filter(|_| !is_fork)
+            .and_then(|l| l.goal.clone())
+    });
     let session_id = log.session_id.clone();
     spawn_secret_audit(log.path().to_path_buf());
     let gc_config_dir = scaffold.config_dir.clone();
@@ -3080,6 +3105,9 @@ struct Args {
     /// `--ephemeral`: the log lives in a temp dir for the run and is removed
     /// at exit. Sub-agents of the run vanish with it.
     ephemeral: bool,
+    /// `--resume <id|name|@last>`: continue a session headless — the ACP
+    /// `Load` shape, a new log pinned to the chain's tip.
+    resume: Option<String>,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
@@ -3093,6 +3121,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut keep_turns: Option<usize> = None;
     let mut goal: Option<String> = None;
     let mut ephemeral = false;
+    let mut resume: Option<String> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -3114,6 +3143,16 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
             // `[permissions] mode` resolves to, headless or interactive.
             "--plan" => plan = true,
             "--ephemeral" => ephemeral = true,
+            "-r" | "--resume" => match iter.next() {
+                Some(v) if !v.starts_with('-') => resume = Some(v),
+                _ => {
+                    eprintln!(
+                        "hotl: {arg} needs a session: a list number only means something in the \
+                         console; use an id, a name, or @last"
+                    );
+                    return Err(2);
+                }
+            },
             "--json-schema" => schema = iter.next().map(PathBuf::from),
             "--fork-from" | "--keep" | "--keep-turns" => {
                 let Some(v) = iter.next() else {
@@ -3181,10 +3220,15 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         eprintln!("hotl: --ephemeral is not supported with --json-schema");
         return Err(2);
     }
-    // Headless has no `-r`, so "resuming" is always false here; the shared
-    // check still owns the --keep-without-a-fork and two-coordinates rules,
-    // in the same words the console uses.
-    if let Err(e) = crate::tui::check_lineage_flags(false, fork_from.is_some(), keep, keep_turns) {
+    if schema.is_some() && resume.is_some() {
+        eprintln!("hotl: --resume is not supported with --json-schema");
+        return Err(2);
+    }
+    // The shared check owns resume-vs-fork, --keep-without-a-fork and the
+    // two-coordinates rules, in the same words the console uses.
+    if let Err(e) =
+        crate::tui::check_lineage_flags(resume.is_some(), fork_from.is_some(), keep, keep_turns)
+    {
         eprintln!("hotl: {e}");
         return Err(2);
     }
@@ -3199,6 +3243,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         keep_turns,
         goal,
         ephemeral,
+        resume,
     })
 }
 
@@ -4230,9 +4275,11 @@ mod fork_tests {
             .unwrap();
 
         // Resolved by name, exactly as `hotl -p … --fork-from auth-explore` does.
-        let lineage = headless_lineage(dir.path(), Some("auth-explore"), None, Some(2))
-            .unwrap()
-            .expect("a fork was requested");
+        let (lineage, is_fork) =
+            headless_lineage(dir.path(), None, Some("auth-explore"), None, Some(2))
+                .unwrap()
+                .expect("a fork was requested");
+        assert!(is_fork);
         assert_eq!(lineage.items.len(), 5, "through the end of turn 2");
         assert_eq!(lineage.parent_id, parent_id);
 
@@ -4249,9 +4296,102 @@ mod fork_tests {
         );
 
         // And with no --fork-from at all, nothing is inherited.
-        assert!(headless_lineage(dir.path(), None, None, None)
+        assert!(headless_lineage(dir.path(), None, None, None, None)
             .unwrap()
             .is_none());
+    }
+
+    /// `hotl -p … --resume <name>` is the ACP `Load` shape: a new log pinned
+    /// to the parent's tip, the whole chain, no `BranchMove`.
+    #[test]
+    fn a_headless_resume_pins_the_parent_and_writes_no_branch_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_older, _a) = parent_with_three_turns(dir.path());
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+        parent
+            .append(
+                &EntryPayload::Rename {
+                    name: "nightly".into(),
+                },
+                3,
+            )
+            .unwrap();
+        drop(parent);
+
+        let (lineage, is_fork) = headless_lineage(dir.path(), Some("nightly"), None, None, None)
+            .unwrap()
+            .expect("a resume was requested");
+        assert!(!is_fork);
+        assert_eq!(lineage.parent_id, parent_id);
+        assert_eq!(lineage.items.len(), 7, "the whole chain, never cut back");
+
+        let child =
+            create_session_log(dir.path(), "m", Masker::empty(), 9, Some(&lineage), false).unwrap();
+        let own = hotl_store::replay(child.path()).unwrap();
+        assert_eq!(
+            own.header.parent_session_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+        assert_eq!(own.header.parent_tip_entry_id, lineage.parent_tip_entry_id);
+        let raw = std::fs::read_to_string(child.path()).unwrap();
+        assert!(
+            !raw.contains("branch_move"),
+            "a resume is not a fork: {raw}"
+        );
+        let chain = hotl_store::replay_chain(dir.path(), &child.session_id).unwrap();
+        let parent_chain = hotl_store::replay_chain(dir.path(), &parent_id).unwrap();
+        assert_eq!(chain.items, parent_chain.items);
+    }
+
+    /// The chain's name, todos and goal ride the resume; `-n` beats the name.
+    #[test]
+    fn a_headless_resume_inherits_name_todos_and_goal_but_an_explicit_name_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+        parent
+            .append(
+                &EntryPayload::Rename {
+                    name: "nightly".into(),
+                },
+                3,
+            )
+            .unwrap();
+        parent
+            .append(
+                &EntryPayload::Todos {
+                    items: vec![hotl_types::Todo {
+                        content: "finish".into(),
+                        ..Default::default()
+                    }],
+                    decisions: Vec::new(),
+                },
+                3,
+            )
+            .unwrap();
+        parent
+            .append(
+                &EntryPayload::GoalSet {
+                    condition: Some("tests pass".into()),
+                    outcome: None,
+                },
+                3,
+            )
+            .unwrap();
+        drop(parent);
+
+        let (lineage, is_fork) = headless_lineage(dir.path(), Some(&parent_id), None, None, None)
+            .unwrap()
+            .unwrap();
+        assert!(!is_fork);
+        assert_eq!(lineage.inherited_name.as_deref(), Some("nightly"));
+        assert_eq!(lineage.todos.len(), 1);
+        assert_eq!(lineage.goal.as_deref(), Some("tests pass"));
+        // The fork arm resolves the same lineage; `run_session` drops the
+        // goal and the name for a fork (0034 decision 6), by `is_fork`.
+        let (_, is_fork) = headless_lineage(dir.path(), None, Some(&parent_id), None, None)
+            .unwrap()
+            .unwrap();
+        assert!(is_fork);
     }
 
     #[test]
@@ -6838,6 +6978,31 @@ mod tests {
             .collect();
         let parsed = parse_args(args).expect("parses");
         assert_eq!(parsed.name.as_deref(), Some("fix-auth"));
+    }
+
+    #[test]
+    fn headless_resume_parses_and_is_exclusive_with_fork() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parsed = parse_args(args(&["-p", "hi", "--resume", "x"])).expect("parses");
+        assert_eq!(parsed.resume.as_deref(), Some("x"));
+        assert_eq!(
+            parse_args(args(&["-p", "hi", "-r", "@last"]))
+                .unwrap()
+                .resume
+                .as_deref(),
+            Some("@last")
+        );
+        assert!(matches!(
+            parse_args(args(&["-p", "hi", "--resume", "x", "--fork-from", "y"])),
+            Err(2)
+        ));
+        // A bare `-r` lists sessions in the console; headless it is a usage error.
+        assert!(matches!(parse_args(args(&["-r", "-p", "hi"])), Err(2)));
+        assert!(matches!(parse_args(args(&["-p", "hi", "-r"])), Err(2)));
+        assert!(matches!(
+            parse_args(args(&["-p", "hi", "--resume", "x", "--json-schema", "s"])),
+            Err(2)
+        ));
     }
 
     #[test]

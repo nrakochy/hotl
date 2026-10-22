@@ -11,6 +11,11 @@ semver promise of their own.
 - **`hotl -p --ephemeral` runs a prompt and keeps no session.** The log lives
   in a temp dir for the run and is removed at exit. Sub-agents of that run
   vanish with it.
+- **Headless `--resume <session>`.** `hotl -p "…" --resume nightly-gc` (or
+  `hotl resume nightly-gc -p "…"`) continues a session from a script the way
+  `hotl -r` does from the console: the chain's name, mode, plan, effort, todos
+  and goal carry over, and each run adds one log to the chain. Takes an id, a
+  name, or `@last`; list numbers stay console-only.
 
 ## [0.28.0] - 2026-09-28
 

@@ -94,6 +94,10 @@ fn main() {
         Some("resume") => {
             let mut rest = vec!["--resume".to_string()];
             rest.extend(args[1..].iter().cloned());
+            // `hotl resume <s> -p "…"` is the headless resume, not the console's.
+            if is_headless(&rest) {
+                std::process::exit(block_on(agent::agent_main(rest)));
+            }
             std::process::exit(block_on(tui::tui_main(rest)));
         }
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
@@ -160,6 +164,7 @@ fn print_help() {
          hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          \x20                   --goal <condition> keeps the turn going until a fast evaluator judges it met\n  \
          \x20                   --ephemeral keeps no session: the log lives in a temp dir and is removed at exit\n  \
+         \x20                   --resume <id|name|@last> continues a session from a script (hotl resume <s> -p works too)\n  \
          hotl --goal \"<cond>\"   headless goal loop with the condition as the prompt (no -p needed)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
@@ -332,6 +337,13 @@ mod tests {
         assert!(!is_headless(&v(&[])));
         assert!(!is_headless(&v(&["01ABC"])));
         assert!(!is_headless(&v(&["--resume"])));
+    }
+    /// `hotl resume <s> -p "…"`: the resume arm's rewrite keeps `-p`, so the
+    /// headless check sees it and the run never reaches the console's TTY guard.
+    #[test]
+    fn hotl_resume_with_p_routes_headless() {
+        assert!(is_headless(&v(&["--resume", "x", "-p", "hi"])));
+        assert!(!is_headless(&v(&["--resume", "x"])));
     }
 
     #[test]
