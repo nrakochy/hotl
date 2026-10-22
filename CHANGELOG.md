@@ -16,6 +16,9 @@ semver promise of their own.
   `hotl -r` does from the console: the chain's name, mode, plan, effort, todos
   and goal carry over, and each run adds one log to the chain. Takes an id, a
   name, or `@last`; list numbers stay console-only.
+- **`hotl export <session> [--md|--html]`** prints a past session's
+  transcript — what the model saw, in order — as Markdown (default) or a
+  self-contained HTML page, with secrets masked.
 
 ## [0.28.0] - 2026-09-28
 

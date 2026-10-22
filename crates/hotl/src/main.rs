@@ -31,6 +31,7 @@ mod config;
 #[allow(dead_code)]
 mod diffgen;
 mod doctor;
+mod export;
 mod gc;
 mod history;
 mod images;
@@ -115,6 +116,7 @@ fn main() {
             std::process::exit(setup::setup_main(&agent::config_dir(), force));
         }
         Some("gc") => std::process::exit(gc::gc_main(&args)),
+        Some("export") => std::process::exit(export::export_main(&args[1..])),
         Some("mcp") => std::process::exit(mcp_cli::mcp_main(&args)),
         Some("plugins") => std::process::exit(plugins_cli::plugins_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
@@ -174,6 +176,7 @@ fn print_help() {
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/blobs per [retention]\n  \
+         hotl export <s>      print a session's transcript as Markdown (--html for a page); s = id, name, @last\n  \
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
          hotl mcp             list MCP servers and trust state; show/add/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \
