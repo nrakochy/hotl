@@ -546,6 +546,12 @@ async fn run_loop(
     // 0033 Task 2: deltas mark the frame dirty and ride the 30 Hz tick that
     // is armed exactly when deltas can arrive; everything else draws now.
     let mut needs_draw = true;
+    let program_status_on = hotl_tui::program_status::enabled(
+        std::env::var("HOTL_PROGRAM_STATUS").ok().as_deref(),
+        std::env::var("TMUX").ok().as_deref(),
+        std::env::var("STY").ok().as_deref(),
+    );
+    let mut program_status = hotl_tui::program_status::Dedup::default();
     loop {
         // 0061 T28: paint before the queue drains, not after. `SendPrompt`
         // goes through `outbound`, which reads and base64-encodes every
@@ -573,6 +579,18 @@ async fn run_loop(
             match cmd {
                 Cmd::SetTitle(title) => {
                     let _ = execute!(io::stdout(), SetTitle(&title));
+                }
+                // OSC 7501 (0071 T6): written blind, deduped, and off under
+                // tmux/screen unless forced — they swallow it.
+                Cmd::ProgramStatus(status) => {
+                    if program_status_on {
+                        if let Some(seq) = program_status.next(&status) {
+                            use std::io::Write as _;
+                            let mut out = io::stdout();
+                            let _ = out.write_all(seq.as_bytes());
+                            let _ = out.flush();
+                        }
+                    }
                 }
                 Cmd::AppendHistory(text) => history.append(&text),
                 // The three arms that feed `update` back: whatever they
@@ -608,7 +626,21 @@ async fn run_loop(
                     ));
                     needs_draw = true;
                 }
-                Cmd::Quit => return Ok(0),
+                Cmd::Quit => {
+                    // The spec's goodbye: a `clear` so the tab stops showing
+                    // the last state.
+                    if program_status_on {
+                        use std::io::Write as _;
+                        let seq = hotl_tui::program_status::ProgramStatus::new(
+                            hotl_tui::program_status::ProgramState::Clear,
+                        )
+                        .encode();
+                        let mut out = io::stdout();
+                        let _ = out.write_all(seq.as_bytes());
+                        let _ = out.flush();
+                    }
+                    return Ok(0);
+                }
                 // `exec_wire_cmd` handled every other variant.
                 handled => debug_assert!(false, "unhandled cmd: {handled:?}"),
             }

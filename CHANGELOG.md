@@ -45,6 +45,11 @@ semver promise of their own.
   `x-request-id`), an HTTP error's text ends with `(request-id …)`, and each
   sample's `usage` log entry records the id — what a support ticket wants.
 
+- **The console reports its state to the terminal (OSC 7501).** Working,
+  blocked on a permission or a question, done, error, idle — the vocabulary
+  Ghostty's proposal, Pi and Claude Code use — so a terminal that implements
+  it can show whether hotl needs you. Written only outside tmux/screen (they
+  swallow it); `HOTL_PROGRAM_STATUS=1` forces it, `=0` turns it off.
 - **`/btw <question>`: a side question that is not remembered.** The model
   answers over the same cached prefix the turn uses (one extra sample at
   cache-read prices), the answer lands as a muted card, and nothing enters

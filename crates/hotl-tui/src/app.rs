@@ -945,6 +945,9 @@ pub enum Cmd {
     /// Send `session/aside` (0071 T5); the answer comes back as
     /// `aside_result`.
     Aside(String),
+    /// Tell the terminal what the program is doing (OSC 7501, 0071 T6).
+    /// Emitted beside every `SetTitle`; the runtime dedupes and gates it.
+    ProgramStatus(crate::program_status::ProgramStatus),
     Cancel,
     ReplyPermission {
         req_id: u64,
@@ -995,6 +998,15 @@ pub enum Cmd {
 }
 
 /// Terminal-tab title: `hotl` / `hotl · <name>`, plus a state suffix.
+/// The terminal's two views of the session at once: the title string and
+/// the OSC 7501 status the phase means (0071 T6).
+fn title_cmds(state: &State, suffix: &str) -> Vec<Cmd> {
+    vec![
+        Cmd::SetTitle(title(state, suffix)),
+        Cmd::ProgramStatus(crate::program_status::ProgramStatus::for_state(state)),
+    ]
+}
+
 fn title(state: &State, suffix: &str) -> String {
     match state.session_name.as_ref().or(state.session_title.as_ref()) {
         Some(n) => format!("hotl · {n}{suffix}"),
@@ -1104,7 +1116,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             state.completion = None;
             state.editor.clear_search();
             state.modal_scroll = 0;
-            vec![Cmd::SetTitle(title(state, " — waiting on you"))]
+            title_cmds(state, " — waiting on you")
         }
         Msg::QuestionRequest { req_id, question } => {
             state.phase = Phase::WaitingQuestion {
@@ -1119,7 +1131,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             state.completion = None;
             state.editor.clear_search();
             state.modal_scroll = 0;
-            vec![Cmd::SetTitle(title(state, " — waiting on you"))]
+            title_cmds(state, " — waiting on you")
         }
         Msg::EgressRequest { req_id, host } => {
             state.phase = Phase::WaitingEgress { req_id, host };
@@ -1127,7 +1139,7 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             state.completion = None;
             state.editor.clear_search();
             state.modal_scroll = 0;
-            vec![Cmd::SetTitle(title(state, " — waiting on you"))]
+            title_cmds(state, " — waiting on you")
         }
         Msg::PromptResult {
             outcome_kind,
@@ -1663,7 +1675,7 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
                 state.session_usage.add(usage);
             }
             if state.session_name.is_none() && state.session_title.is_some() {
-                return vec![Cmd::SetTitle(title(state, ""))];
+                return title_cmds(state, "");
             }
         }
         "goal_changed" => {
@@ -2107,7 +2119,13 @@ fn on_prompt_result(
     state.retry = None;
     state.compacting = false;
     state.goal_evaluating = false;
-    vec![Cmd::SetTitle(title(state, ""))]
+    vec![
+        Cmd::SetTitle(title(state, "")),
+        Cmd::ProgramStatus(crate::program_status::ProgramStatus::finished(
+            state,
+            kind == "error",
+        )),
+    ]
 }
 
 /// Every tool call this turn made — merged cards count all their absorbed
@@ -2679,7 +2697,9 @@ fn interrupt_or_detach(state: &mut State) -> Vec<Cmd> {
     );
     // One more cancel for the road: harmless if the turn is already dead,
     // decisive if the first one raced the wire.
-    vec![Cmd::Cancel, Cmd::SetTitle(title(state, ""))]
+    let mut cmds = vec![Cmd::Cancel];
+    cmds.extend(title_cmds(state, ""));
+    cmds
 }
 
 /// The display/wire fork: the transcript keeps `text` (tokens and all — what
@@ -2702,10 +2722,9 @@ fn submit(state: &mut State, text: String, payload: paste::PromptPayload) -> Vec
         // the turn before it.
         state.since_frame = 0;
         state.tool_input = None;
-        vec![
-            Cmd::SendPrompt(payload),
-            Cmd::SetTitle(title(state, " — working")),
-        ]
+        let mut cmds = vec![Cmd::SendPrompt(payload)];
+        cmds.extend(title_cmds(state, " — working"));
+        cmds
     } else {
         state.transcript.push(TranscriptItem::Steer {
             text: text.into(),
@@ -2742,7 +2761,9 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             } else {
                 " — working"
             };
-            vec![Cmd::Rename(name), Cmd::SetTitle(title(state, suffix))]
+            let mut cmds = vec![Cmd::Rename(name)];
+            cmds.extend(title_cmds(state, suffix));
+            cmds
         }
         // A toggle, not a mode switch: plan composes with whatever `/mode`
         // says. `on`/`off` are for scripted input, where a toggle is a race.
@@ -2882,11 +2903,12 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                         });
                         state.phase = Phase::Sampling { ticks: 0 };
                         state.scroll = Scroll::Follow;
-                        vec![
+                        let mut cmds = vec![
                             Cmd::SetGoal(Some(goal.clone())),
                             Cmd::SendPrompt(paste::PromptPayload::text_only(goal)),
-                            Cmd::SetTitle(title(state, " — working")),
-                        ]
+                        ];
+                        cmds.extend(title_cmds(state, " — working"));
+                        cmds
                     } else {
                         notice(
                             state,
@@ -3270,14 +3292,13 @@ fn resume_after_question(
     free_text: Option<String>,
 ) -> Vec<Cmd> {
     state.phase = Phase::Sampling { ticks: 0 };
-    vec![
-        Cmd::ReplyQuestion {
-            req_id,
-            selected,
-            free_text,
-        },
-        Cmd::SetTitle(title(state, " — working")),
-    ]
+    let mut cmds = vec![Cmd::ReplyQuestion {
+        req_id,
+        selected,
+        free_text,
+    }];
+    cmds.extend(title_cmds(state, " — working"));
+    cmds
 }
 
 /// The egress modal: two keys, both session-scoped. `y` allows the host for
@@ -3312,10 +3333,9 @@ fn resume_after_egress(state: &mut State, req_id: u64, allow: bool, host: &str) 
         notice(state, format!("denied \"{host}\" for this session"));
     }
     state.phase = Phase::Sampling { ticks: 0 };
-    vec![
-        Cmd::ReplyEgress { req_id, allow },
-        Cmd::SetTitle(title(state, " — working")),
-    ]
+    let mut cmds = vec![Cmd::ReplyEgress { req_id, allow }];
+    cmds.extend(title_cmds(state, " — working"));
+    cmds
 }
 
 fn resume_after_ask(
@@ -3326,15 +3346,14 @@ fn resume_after_ask(
     message: Option<String>,
 ) -> Vec<Cmd> {
     state.phase = Phase::Sampling { ticks: 0 };
-    vec![
-        Cmd::ReplyPermission {
-            req_id,
-            allow,
-            secret_reads,
-            message,
-        },
-        Cmd::SetTitle(title(state, " — working")),
-    ]
+    let mut cmds = vec![Cmd::ReplyPermission {
+        req_id,
+        allow,
+        secret_reads,
+        message,
+    }];
+    cmds.extend(title_cmds(state, " — working"));
+    cmds
 }
 
 fn on_tick(state: &mut State) {
@@ -4434,6 +4453,91 @@ mod tests {
         assert!(!s.compacting);
     }
 
+    /// 0071 T6: every phase change the terminal title reports, OSC 7501
+    /// reports too, with the spec's vocabulary.
+    #[test]
+    fn every_set_title_site_also_reports_a_program_status() {
+        use crate::program_status::{Kind, ProgramState, ProgramStatus};
+        fn status(cmds: &[Cmd]) -> ProgramStatus {
+            let mut found = cmds.iter().filter_map(|c| match c {
+                Cmd::ProgramStatus(s) => Some(s.clone()),
+                _ => None,
+            });
+            let s = found.next().expect("a program status beside the title");
+            assert!(found.next().is_none(), "exactly one per batch");
+            assert!(
+                cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))),
+                "it rides beside the title: {cmds:?}"
+            );
+            s
+        }
+        let mut s = State::test_default();
+        s.session_name = Some("fix-auth".into());
+        let st = status(&type_and_submit(&mut s, "go"));
+        assert_eq!(st.state, ProgramState::Working);
+        assert_eq!(st.msg.as_deref(), Some("fix-auth"));
+        let st = status(&update(
+            &mut s,
+            Msg::PermissionRequest {
+                req_id: 1,
+                summary: "bash: rm".into(),
+                protected_why: None,
+                diff: Vec::new(),
+            },
+        ));
+        assert_eq!(
+            (st.state, st.kind),
+            (ProgramState::Blocked, Some(Kind::Permission))
+        );
+        let st = status(&press(&mut s, KeyCode::Char('y')));
+        assert_eq!(st.state, ProgramState::Working);
+        let st = status(&update(
+            &mut s,
+            Msg::QuestionRequest {
+                req_id: 2,
+                question: Question {
+                    header: "Scope".into(),
+                    prompt: "How far?".into(),
+                    options: vec![QuestionOption {
+                        label: "MVP".into(),
+                        description: None,
+                    }],
+                    multi: false,
+                },
+            },
+        ));
+        assert_eq!(
+            (st.state, st.kind),
+            (ProgramState::Blocked, Some(Kind::Question))
+        );
+        let st = status(&press(&mut s, KeyCode::Char('1')));
+        assert_eq!(st.state, ProgramState::Working);
+        let st = status(&update(
+            &mut s,
+            Msg::EgressRequest {
+                req_id: 3,
+                host: "example.com".into(),
+            },
+        ));
+        assert_eq!(
+            (st.state, st.kind),
+            (ProgramState::Blocked, Some(Kind::Permission))
+        );
+        let st = status(&press(&mut s, KeyCode::Char('y')));
+        assert_eq!(st.state, ProgramState::Working);
+        let st = status(&on_result(&mut s, "done", None, &json!({})));
+        assert_eq!(st.state, ProgramState::Done);
+        type_and_submit(&mut s, "again");
+        let st = status(&on_result(&mut s, "error", Some("boom".into()), &json!({})));
+        assert_eq!(st.state, ProgramState::Error);
+        type_and_submit(&mut s, "once more");
+        press(&mut s, KeyCode::Esc); // Insert → Normal
+        press(&mut s, KeyCode::Esc); // interrupt
+        let st = status(&press(&mut s, KeyCode::Esc)); // detach: control is yours
+        assert_eq!(st.state, ProgramState::Idle);
+        assert_eq!(st.kind, None);
+    }
+
     /// 0071 T5: `/btw` sends the aside and parks a faint strip segment; the
     /// answer lands as a card and clears it; a bare `/btw` prints usage.
     #[test]
@@ -4504,7 +4608,9 @@ mod tests {
         );
         assert_eq!(s.session_title.as_deref(), Some("Fix the auth flow"));
         assert_eq!(title(&s, ""), "hotl · Fix the auth flow");
-        assert!(matches!(&cmds[..], [Cmd::SetTitle(t)] if t == "hotl · Fix the auth flow"));
+        assert!(
+            matches!(&cmds[..], [Cmd::SetTitle(t), Cmd::ProgramStatus(_)] if t == "hotl · Fix the auth flow")
+        );
         assert_eq!((s.session_usage.input, s.session_usage.output), (10, 5));
         slash(&mut s, "status");
         assert!(last_notice(&s).starts_with("title: Fix the auth flow (auto) ·"));
@@ -4920,7 +5026,9 @@ mod tests {
         ));
         // History gets the fully-expanded bytes; the wire gets paste content
         // plus the image path with data unfilled (the runtime seam's job).
-        let [Cmd::AppendHistory(h), Cmd::SendPrompt(p), Cmd::SetTitle(_)] = &cmds[..] else {
+        let [Cmd::AppendHistory(h), Cmd::SendPrompt(p), Cmd::SetTitle(_), Cmd::ProgramStatus(_)] =
+            &cmds[..]
+        else {
             panic!("unexpected cmds: {cmds:?}");
         };
         assert_eq!(h, "/tmp/shot.png and x\ny\nz");
@@ -5106,7 +5214,12 @@ mod tests {
         assert!(matches!(s.phase, Phase::Sampling { .. }));
         assert!(matches!(
             cmds[..],
-            [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(_)]
+            [
+                Cmd::AppendHistory(_),
+                Cmd::SendPrompt(_),
+                Cmd::SetTitle(_),
+                Cmd::ProgramStatus(_)
+            ]
         ));
     }
 
@@ -6516,7 +6629,7 @@ mod tests {
         assert_eq!(s.detached_turns, 1);
         assert!(cmds.contains(&Cmd::Cancel), "the dying turn is still told");
         assert!(
-            matches!(cmds.last(), Some(Cmd::SetTitle(t)) if t == "hotl"),
+            matches!(cmds.get(1), Some(Cmd::SetTitle(t)) if t == "hotl"),
             "the working suffix is dropped: {cmds:?}"
         );
     }
@@ -6725,7 +6838,7 @@ mod tests {
         // (the payload carried none), and the gauge is the strip's chip.
         assert_eq!(s.usage_line.as_deref(), Some("120 in · 45 out"));
         assert_eq!(s.live_context, Some(120));
-        assert!(matches!(&cmds[..], [Cmd::SetTitle(t)] if t == "hotl"));
+        assert!(matches!(&cmds[..], [Cmd::SetTitle(t), Cmd::ProgramStatus(_)] if t == "hotl"));
     }
 
     // `no_unreachable_phase_variants` retired here (0061 T23, decision 14):
@@ -7092,7 +7205,7 @@ mod tests {
         assert!(
             matches!(
                 &cmds[..],
-                [Cmd::AppendHistory(h), Cmd::SendPrompt(p), Cmd::SetTitle(_)]
+                [Cmd::AppendHistory(h), Cmd::SendPrompt(p), Cmd::SetTitle(_), Cmd::ProgramStatus(_)]
                     if h == "explain the bug" && p.text == "explain the bug"
             ),
             "the editor's real content must reach the model unchanged, got {cmds:?}"
@@ -7142,7 +7255,7 @@ mod tests {
         let cmds = type_and_submit(&mut s, "/rename fix-auth");
         assert_eq!(s.session_name.as_deref(), Some("fix-auth"));
         assert!(
-            matches!(&cmds[..], [Cmd::Rename(n), Cmd::SetTitle(t)]
+            matches!(&cmds[..], [Cmd::Rename(n), Cmd::SetTitle(t), Cmd::ProgramStatus(_)]
                 if n == "fix-auth" && t == "hotl · fix-auth"),
             "got {cmds:?}"
         );
@@ -7419,7 +7532,7 @@ mod tests {
         assert!(
             matches!(
                 &cmds[..],
-                [Cmd::SetGoal(Some(g)), Cmd::SendPrompt(p), Cmd::SetTitle(_)]
+                [Cmd::SetGoal(Some(g)), Cmd::SendPrompt(p), Cmd::SetTitle(_), Cmd::ProgramStatus(_)]
                     if g == "all tests pass" && p.text == "all tests pass" && p.images.is_empty()
             ),
             "got {cmds:?}"
@@ -7782,8 +7895,10 @@ mod tests {
             panic!("expected a prompt, got {cmds:?}");
         };
         assert!(
-            cmds.iter()
-                .all(|c| matches!(c, Cmd::SendPrompt(_) | Cmd::SetTitle(_))),
+            cmds.iter().all(|c| matches!(
+                c,
+                Cmd::SendPrompt(_) | Cmd::SetTitle(_) | Cmd::ProgramStatus(_)
+            )),
             "a prompt and nothing engine-side: {cmds:?}"
         );
         assert!(p.text.contains("agent_type: \"review\""), "{}", p.text);
@@ -8458,7 +8573,7 @@ mod tests {
         s.skills = vec!["rename".into()];
         let cmds = type_and_submit(&mut s, "/rename fix-auth");
         assert!(
-            matches!(&cmds[..], [Cmd::Rename(n), _] if n == "fix-auth"),
+            matches!(&cmds[..], [Cmd::Rename(n), _, _] if n == "fix-auth"),
             "got {cmds:?}"
         );
     }
@@ -8503,7 +8618,7 @@ mod tests {
         s.session_name = Some("fix-auth".into());
         let cmds = type_and_submit(&mut s, "hello");
         assert!(
-            matches!(&cmds[..], [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(t)] if t == "hotl · fix-auth — working"),
+            matches!(&cmds[..], [Cmd::AppendHistory(_), Cmd::SendPrompt(_), Cmd::SetTitle(t), Cmd::ProgramStatus(_)] if t == "hotl · fix-auth — working"),
             "got {cmds:?}"
         );
     }

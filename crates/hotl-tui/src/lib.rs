@@ -9,6 +9,7 @@ pub mod app;
 pub mod client;
 pub mod complete;
 pub mod paste;
+pub mod program_status;
 pub mod scroll;
 pub mod select;
 pub mod view;
