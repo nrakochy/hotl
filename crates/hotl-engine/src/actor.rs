@@ -3149,7 +3149,7 @@ async fn compact(
                     prefix_end: spec.prefix_end,
                     kept_from: spec.kept_from,
                 };
-                let pins = pre_compact_pins(shared, head, &plan).await;
+                let pins = pre_compact_pins(shared, head, &plan, None).await;
                 let digest = vec![compaction::digest_item(&spec.text)];
                 let payload = EntryPayload::Compaction {
                     digest: digest.clone(),
@@ -3200,7 +3200,7 @@ async fn compact(
         .await;
     let snapshot = Arc::clone(head.items());
     let folded = &snapshot[plan.prefix_end..plan.kept_from];
-    let pins = pre_compact_pins(shared, head, &plan).await;
+    let pins = pre_compact_pins(shared, head, &plan, focus).await;
     // Timeout or two failed attempts: the floor digest keeps the session moving
     // rather than ending the turn on housekeeping.
     let (summary, fold_usage) = summarize_bounded(
@@ -3243,6 +3243,7 @@ async fn pre_compact_pins(
     shared: &SharedDeps,
     head: &Head,
     plan: &compaction::Plan,
+    focus: Option<&str>,
 ) -> Vec<String> {
     crate::hooks::hook_gate!(
         shared.hooks,
@@ -3265,6 +3266,7 @@ async fn pre_compact_pins(
                 estimate_pct: ((head.estimated.saturating_mul(100)
                     / shared.config.context_window.max(1))
                 .min(100)) as u8,
+                focus: focus.map(str::to_owned),
             };
             crate::hooks::call_pre_compact(hooks, crate::hooks::ACTOR_MAIN, &info).await.pins
         },

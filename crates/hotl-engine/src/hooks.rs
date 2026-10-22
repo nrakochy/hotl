@@ -505,6 +505,8 @@ pub struct CompactInfo {
     pub kept_from: usize,
     /// How full the window was when the fold fired, as a percentage.
     pub estimate_pct: u8,
+    /// The focus a human fold was asked for (0066); `None` for the ladder's.
+    pub focus: Option<String>,
 }
 
 /// A `PreCompact` hook's answer: ids whose results ride through the fold
@@ -1017,6 +1019,7 @@ mod tests {
             folded_ids: vec!["t1".into()],
             kept_from: 3,
             estimate_pct: 82,
+            focus: None,
         };
         assert_eq!(
             call_pre_compact(&hooks, ACTOR_MAIN, &info).await,

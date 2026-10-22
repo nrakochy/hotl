@@ -559,7 +559,7 @@ impl Hooks for ShellHooks {
         info: &'a CompactInfo,
     ) -> BoxFuture<'a, PreCompactDecision> {
         Box::pin(async move {
-            let payload = json!({
+            let mut payload = json!({
                 "event": "pre_compact",
                 "hookEventName": claude_event_name("pre_compact"),
                 "actor": actor,
@@ -567,6 +567,10 @@ impl Hooks for ShellHooks {
                 "keptFrom": info.kept_from,
                 "estimatePct": info.estimate_pct
             });
+            // Present only when the fold was asked for one (0066).
+            if let Some(f) = &info.focus {
+                payload["focus"] = json!(f);
+            }
             let futures = self.pre_compact.iter().map(|hook| {
                 let payload = payload.clone();
                 async move {
@@ -747,6 +751,7 @@ mod tests {
             folded_ids: vec!["t1".into()],
             kept_from: 3,
             estimate_pct: 82,
+            focus: None,
         };
         hooks
             .pre_compact(hotl_engine::hooks::ACTOR_MAIN, &info)
@@ -824,6 +829,42 @@ mod tests {
 
     /// The envelope a real `~/.claude`-style script keys on, and the reply
     /// shape it answers with (0057 T3).
+    /// 0066: the envelope carries `focus` only for a focused human fold.
+    #[tokio::test]
+    async fn the_shell_envelope_omits_focus_when_none() {
+        if which_jq().is_none() {
+            return;
+        }
+        let hooks = load_str(
+            "[[hook]]\nevent = \"pre_compact\"\n\
+             command = \"if grep -q focus; then echo '{\\\"pin\\\":[\\\"has-focus\\\"]}'; \
+             else echo '{\\\"pin\\\":[\\\"no-focus\\\"]}'; fi\"\n",
+            concurrency(),
+        )
+        .expect("hooks configured");
+        let mut info = CompactInfo {
+            folded_ids: vec!["t1".into()],
+            kept_from: 3,
+            estimate_pct: 50,
+            focus: None,
+        };
+        assert_eq!(
+            hooks
+                .pre_compact(hotl_engine::hooks::ACTOR_MAIN, &info)
+                .await
+                .pins,
+            vec!["no-focus".to_string()]
+        );
+        info.focus = Some("the auth refactor".into());
+        assert_eq!(
+            hooks
+                .pre_compact(hotl_engine::hooks::ACTOR_MAIN, &info)
+                .await
+                .pins,
+            vec!["has-focus".to_string()]
+        );
+    }
+
     #[tokio::test]
     async fn a_shell_pre_compact_hook_pins_by_id() {
         let hooks = load_str(
@@ -838,6 +879,7 @@ mod tests {
             folded_ids: vec!["t7".into(), "t8".into()],
             kept_from: 12,
             estimate_pct: 81,
+            focus: None,
         };
         assert_eq!(
             hooks

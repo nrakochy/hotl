@@ -248,6 +248,52 @@ async fn an_in_process_pre_compact_hook_keeps_a_pinned_item_verbatim() {
     assert!(log.contains("\"pinned\":[\"t1\"]"), "the entry records it");
 }
 
+/// 0066: a human fold hands its focus to the hook; the ladder's fold has none.
+#[tokio::test]
+async fn a_focused_fold_hands_the_focus_to_the_pre_compact_hook() {
+    let seen: Arc<Mutex<Vec<CompactInfo>>> = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&seen);
+    let hooks = InProcessHooks::new().on_pre_compact(move |info| {
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(info.clone());
+        PreCompactDecision::default()
+    });
+    let mut s = session(Arc::new(hooks));
+    assert_eq!(
+        s.handle.fold(Some("keep t1".into())).await,
+        Some(hotl_engine::FoldAdmission::Started)
+    );
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(30), s.handle.events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event channel closed");
+        if matches!(
+            ev,
+            EngineEvent::Compacted { .. } | EngineEvent::FoldSkipped { .. }
+        ) {
+            break;
+        }
+    }
+    let first_focus = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .map(|i| i.focus.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(first_focus, vec![Some("keep t1".to_string())]);
+    // The ladder's own fold on the next prompt carries none.
+    let (_, compacted) = run(&mut s, "third").await;
+    let infos = seen
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if compacted {
+        assert_eq!(infos.last().unwrap().focus, None);
+    }
+}
+
 #[tokio::test]
 async fn post_compact_receives_the_digest() {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
