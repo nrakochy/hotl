@@ -29,7 +29,6 @@ pub struct Harness {
     /// Debug strings of every event seen, in order.
     pub seen: Vec<String>,
     log_path: std::path::PathBuf,
-    _dir: tempfile::TempDir,
     /// Extra temp dirs whose lifetime must match the harness (scenario
     /// fixtures the scripted tools read/write) — kept, not leaked.
     extra_dirs: Vec<tempfile::TempDir>,
@@ -93,7 +92,7 @@ impl Harness {
     /// The harness working directory (the engine's `cwd` for subdir hints;
     /// also a scratch space for files the scripted tools touch).
     pub fn dir(&self) -> &std::path::Path {
-        self._dir.path()
+        self.sessions_dir()
     }
 
     /// Tie a fixture temp dir's lifetime to the harness (it is removed when
@@ -355,9 +354,11 @@ impl Harness {
         wrap: Option<ProviderWrap>,
         system: &str,
     ) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let mut log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
-            .expect("session log");
+        // The store's own throwaway log: one discipline for "where does a
+        // temp log live", shared with `hotl -p --ephemeral`.
+        let mut log =
+            SessionLog::create_ephemeral(&config.model, Masker::empty(), 0).expect("session log");
+        let dir = log.dir().to_path_buf();
         if sync_noop {
             log.set_sync_noop(true);
         }
@@ -387,7 +388,7 @@ impl Harness {
             clock: Arc::new(SystemClock),
             log,
             system: system.into(),
-            cwd: dir.path().to_path_buf(),
+            cwd: dir,
             hooks,
             initial_items,
             initial_todos: Vec::new(),
@@ -402,8 +403,8 @@ impl Harness {
             provider,
             seen: Vec::new(),
             log_path,
-            _dir: dir,
             extra_dirs: Vec::new(),
+
             ask_reply: AskReply::Allow,
             steer_on_tool_start: None,
             steer_on_text_delta: None,

@@ -422,6 +422,9 @@ pub struct SessionLog {
     /// Test-only ack gate — see [`SessionLog::pause_ack_handle`].
     pause_acks: Arc<AtomicBool>,
     pub session_id: String,
+    /// Set by `create_ephemeral`: the log's own temp dir, removed after the
+    /// writer joins (`Drop` joins first; this field drops last).
+    _dir: Option<tempfile::TempDir>,
 }
 
 /// Who a new session descends from, and *how far*. The pair is one value
@@ -546,6 +549,7 @@ impl SessionLog {
             sync_noop,
             pause_acks,
             session_id: session_id.clone(),
+            _dir: None,
         };
         let (parent_session_id, parent_tip_entry_id) = match parent {
             Some(ParentRef {
@@ -572,6 +576,29 @@ impl SessionLog {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// A log that keeps no session: it lives in its own owner-only temp dir
+    /// and takes the dir, its blobs and any sibling logs with it on drop.
+    /// Everything that reads the file during the run (recall, eviction, a
+    /// child's seed, replay) works unchanged until then.
+    pub fn create_ephemeral(model: &str, masker: Masker, now_ms: u64) -> std::io::Result<Self> {
+        let dir = tempfile::Builder::new()
+            .prefix("hotl-ephemeral-")
+            .tempdir()?;
+        // tempdir() follows the umask; `create` makes this one owner-only.
+        let mut log = Self::create(&dir.path().join("sessions"), model, None, masker, now_ms)?;
+
+        log._dir = Some(dir);
+        Ok(log)
+    }
+
+    /// The directory the log lives in — what `replay_chain` and a child
+    /// builder take.
+    pub fn dir(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("a session log always lives in a directory")
     }
 
     /// A cheap clone of the log's own masker — the handle turn-side proposal
@@ -2986,6 +3013,64 @@ mod tests {
                 access.other_readers
             );
         }
+    }
+
+    #[test]
+    fn an_ephemeral_log_is_owner_only_and_vanishes_on_drop() {
+        use hotl_platform::PrivateFs as _;
+        let log = SessionLog::create_ephemeral("m", Masker::empty(), 1).unwrap();
+        let dir = log.dir().to_path_buf();
+        assert!(log.path().is_file());
+        for path in [log.path(), dir.as_path()] {
+            let access = hotl_platform::PRIVATE_FS.effective_access(path).unwrap();
+            assert!(
+                access.owner_only,
+                "{} is readable by {:?}",
+                path.display(),
+                access.other_readers
+            );
+        }
+        drop(log);
+        assert!(!dir.exists(), "the ephemeral dir outlived its log");
+    }
+
+    #[test]
+    fn an_ephemeral_log_replays_while_alive() {
+        let mut log = SessionLog::create_ephemeral("m", Masker::empty(), 1).unwrap();
+        for text in ["one", "two"] {
+            log.append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: text.into(),
+                        synthetic: None,
+                        images: Vec::new(),
+                    },
+                },
+                2,
+            )
+            .unwrap();
+        }
+        let replayed = replay(log.path()).unwrap();
+        assert_eq!(replayed.items.len(), 2);
+        let texts: Vec<_> = replayed
+            .items
+            .iter()
+            .map(|i| match i {
+                Item::User { text, .. } => text.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(texts, ["one", "two"]);
+    }
+
+    #[test]
+    fn an_ephemeral_logs_blobs_vanish_with_it() {
+        let log = SessionLog::create_ephemeral("m", Masker::empty(), 1).unwrap();
+        let blob = log.write_blob("toolu_1", "body").unwrap();
+        let blobs = blob.parent().unwrap().to_path_buf();
+        assert!(blobs.is_dir());
+        drop(log);
+        assert!(!blobs.exists(), ".blobs outlived the ephemeral log");
     }
 
     #[test]

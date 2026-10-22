@@ -44,15 +44,12 @@ type Client = AcpClient<WriteHalf<DuplexStream>>;
 /// ask) then replies with text.
 fn scripted_factory() -> acp::SessionFactory {
     Box::new(|_spec| {
-        let dir = tempfile::tempdir().expect("tmp");
-        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
             ScriptedProvider::text_reply("all done via tui"),
         ]));
-        // Keep the tempdir alive for the session's lifetime.
-        std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
@@ -93,8 +90,7 @@ fn scripted_factory() -> acp::SessionFactory {
 /// then replies with text — the tier-1 gap #4 golden.
 fn scripted_ask_user_factory() -> acp::SessionFactory {
     Box::new(|_spec| {
-        let dir = tempfile::tempdir().expect("tmp");
-        let log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
         let (event_tx, event_rx) = hotl_engine::event_channel();
@@ -119,7 +115,6 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             ),
             ScriptedProvider::text_reply("all done via tui"),
         ]));
-        std::mem::forget(dir);
         Ok(acp::SessionOpen {
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {

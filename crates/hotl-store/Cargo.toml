@@ -26,6 +26,8 @@ tokio = { workspace = true }
 # `project::id`'s cwd fallback: on Windows `std::fs::canonicalize` yields a
 # `\\?\` path, which is a different string for the same directory.
 dunce = { workspace = true }
+# `SessionLog::create_ephemeral` owns a temp dir that goes away on drop.
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+
