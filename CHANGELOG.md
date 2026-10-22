@@ -15,7 +15,8 @@ semver promise of their own.
   `hotl resume nightly-gc -p "…"`) continues a session from a script the way
   `hotl -r` does from the console: the chain's name, mode, plan, effort, todos
   and goal carry over, and each run adds one log to the chain. Takes an id, a
-  name, or `@last`; list numbers stay console-only.
+  name, or `@last`; list numbers stay console-only. The docs carry a cron
+  recipe built on it.
 - **`hotl export <session> [--md|--html]`** prints a past session's
   transcript — what the model saw, in order — as Markdown (default) or a
   self-contained HTML page, with secrets masked.

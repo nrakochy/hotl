@@ -30,7 +30,9 @@ before acting on them**. Recall's own results are never indexed, so a search
 can't find an earlier search.
 
 Nothing configures it and nothing leaves your machine: it reads the same
-JSONL files `hotl sessions` lists.
+JSONL files `hotl sessions` lists. The console's `hotl -r --search <text>`
+runs the same scan from the resume picker, so the two agree on what counts as
+a hit.
 
 ## Configuring a backend
 

@@ -21,13 +21,30 @@ through the same child builder, with one ask for the whole run. See
 
 ## Choosing an `agent_type`
 
-Three built-in agent types ship with hotl:
+Four built-in agent types ship with hotl:
 
 | `agent_type` | Tools | Use for |
 |---|---|---|
 | `general-purpose` *(default)* | Base builtins only: `read`/`edit`/`write`/`bash`/`glob`/`grep` — never the parent's `web_fetch`/`web_search`/MCP/skills/`recall` | Open-ended subtasks: research, implement, summarize. |
 | `explore` | Read-only (`read`/`glob`/`grep`) | Fast search — locate code, files, answers. Safe to fan out several at once. |
 | `plan` | Read-only | Investigate, then propose a step-by-step plan without touching the workspace. |
+| `review` | Read-only | A second opinion on a diff, a file, a commit range, or a question: findings as `path:line — severity — why`, never an edit. `/review` in the console spawns it. |
+
+## Reviewing with `/review`
+
+`/review [target]` in the console asks the model to spawn the built-in
+reviewer on the target — a file, a diff, a commit range, or (with no target)
+the uncommitted changes in the working tree — and relay its findings without
+acting on them. The reviewer runs in a fresh, read-only context: it reads the
+target in full, cites `path:line` for every finding, orders them by severity,
+separates bugs from style, and ends with a one-line verdict. It has no `bash`,
+so a git range it cannot reconstruct from files alone is reviewed by the files
+named. `[agents] review_model` gives it a stronger model than the session's;
+built-in names win over `agents/*.md`, so a repo cannot replace it with a
+rubber stamp. Headless, the same thing is `hotl -p "Use spawn with
+agent_type review on …"`. When one reviewer is not enough — several in
+parallel, with verification votes — reach for the `review-changes`
+[workflow](../workflows/) instead.
 
 Beyond the built-ins, define your own in `agents/*.md` under your config dir
 (`~/.config/hotl/agents/`, alongside `skills/`):

@@ -289,6 +289,7 @@ own.
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
 | `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
+| `/review [target]` | Spawn the built-in read-only reviewer on a file, a diff, a commit range, or (bare) the working tree, and relay its findings. A built-in, so a skill named `review` is shadowed — rename the skill. See [agents.md](../agents/#reviewing-with-review). |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
 | `/quit` | Leave the console (the session log is already on disk). |
 | `/<skill> [args]` | Load one of your skills by name and follow it, with the rest of the line passed as arguments — any attached images ride along too. |

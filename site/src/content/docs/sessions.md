@@ -112,7 +112,8 @@ back and you get the discount; leave a gap and the first request pays full price
 once, then caches normally. hotl prints a note when the session you are forking
 looks too cold for it.
 
-This is a script you run, not a cron job you schedule. (One residual worth
+This is a script you run, not a cron job you schedule — for the scheduled kind
+see [Unattended loops](#unattended-loops-cron) below. (One residual worth
 naming: cache matching looks back a bounded distance from the request's newest
 breakpoint, so a pathologically block-heavy final turn can leave a sliver of the
 tail uncached. The rolling anchors bound how big that sliver can get.)
@@ -126,6 +127,55 @@ per-sample todo reminder and turn context ride after the last marker, where
 they can change without touching the cached prefix. Earlier OpenAI models, and
 compatible servers, cache implicitly and get no breakpoints; a model name that
 hides the version can be forced either way with `[provider] cache_breakpoints`.
+
+## Unattended loops (cron)
+
+A cron job, a Makefile or a shell loop can drive hotl the way a person does:
+run a prompt, pick up yesterday's session by name, and read the exit code to
+tell "the cap stopped it" from "it broke".
+
+```sh
+#!/bin/sh
+# ~/bin/hotl-gc — a tidy-up loop; crontab: */30 * * * * ~/bin/hotl-gc >> ~/hotl-gc.log 2>&1
+set -u
+cd /path/to/repo || exit 2
+NAME="gc-$(date +%G-%V)"          # one chain per ISO week; see "Why a weekly name"
+if hotl export "$NAME" >/dev/null 2>&1; then OPEN="--resume $NAME"; else OPEN="-n $NAME"; fi
+flock -n /tmp/hotl-gc.lock \
+  hotl -p "Entering the GC pass. Fix one failing lint or one TODO you can finish in this \
+turn, run the checks, and stop. Say what you changed." $OPEN --goal 'tests_green("make check") and turns <= 6'
+case $? in
+  0) ;;                               # done
+  4) echo "stopped by a cap";;        # max_turns / max_cost_usd — raise or accept
+  5) echo "harness brake — look at the log";;
+  *) echo "failed ($?)";;
+esac
+```
+
+**What the loop may do.** Headless auto-denies every ask, so list what the
+loop is allowed in `[[allow]]`: `cargo`, `make`, `git add`, `git commit` —
+never `git push` from a loop.
+
+**The stop condition.** `--goal` is the loop's stop condition and `turns <= N`
+its ceiling. The [exit codes](../configuration/#exit-codes) say how it ended:
+`4` is a cap you set, `5` a brake the harness pulled, `1` a failure or an
+impossible goal.
+
+**Why a weekly name.** Every `--resume` adds one log to the chain, `hotl gc`
+never prunes an ancestor of a live chain, and replay keeps the newest 32 hops.
+A loop that resumed one name forever would keep every log and, past 32 runs,
+lose its oldest context. A dated name starts a fresh chain each week and lets
+`[retention]` reclaim the old ones. When the new week should remember how the
+last one ended, open it with `--fork-from @last --keep-turns 2 -n "$NAME"`
+instead of `-n "$NAME"`.
+
+**One at a time.** `flock` is there because cron does not wait for the
+previous run. Pipe `--json` into `jq` for a dashboard. `hotl stats --days 7`
+says what the loop cost; `hotl export "$NAME"` shows what it did.
+
+**Windows.** Task Scheduler runs the same command; the chain lives under
+`%LOCALAPPDATA%\hotl\data`. `flock` has no twin — use a lock file, or the
+scheduler's "do not start a new instance".
 
 ## Keeping the discount: phase instructions go in the prompt
 

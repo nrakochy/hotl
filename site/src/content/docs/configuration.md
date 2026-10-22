@@ -9,17 +9,19 @@ Reference for the command surface, config files, and environment variables of th
 
 | Command | Effect |
 |---|---|
-| `hotl [id-prefix\|--resume]` | The full-screen console: streaming transcript, activity strip, modal asks, vim input. Needs a terminal (no TTY → exit 2, use `-p`). See [tui.md](../tui/). |
+| `hotl [id-prefix\|--resume]` | The full-screen console: streaming transcript, activity strip, modal asks, vim input. Needs a terminal (no TTY → exit 2, use `-p`). `hotl -r --search <text>` lists only the sessions whose transcript mentions the text, with an excerpt, before you pick. See [tui.md](../tui/). |
 | `hotl -p "PROMPT"` | Headless one-shot: run PROMPT to completion, print the answer, exit. See [Headless](#headless--p----json). |
 | `hotl -p "PROMPT" --json` | Headless with a JSONL event stream on stdout instead of prose. |
-| `hotl resume [id-prefix]` | Continue an earlier session in the console (bare: pick from a numbered list). The seeded session replays the earlier one's full context from its log and ancestry. |
+| `hotl resume [id-prefix]` | Continue an earlier session in the console (bare: pick from a numbered list). The seeded session replays the earlier one's full context from its log and ancestry. With `-p` it is the headless resume (see [Headless](#headless--p----json)). |
 | `hotl --fork-from <n\|id\|name\|@last>` | Start a **new** session seeded with another's history, pinned to that session's state at fork time (the original can keep running). `--keep-turns <n>` / `--keep <items>` fork at a prefix instead of the head; `@last` is the newest session. Works headless too (`hotl -p "…" --fork-from …`). See [sessions.md](../sessions/). |
 | `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](../backgrounding/). |
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
 | `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/blobs per `[retention]`. See [below](#hotl-gc). |
 | `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
 | `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, MCP trust, memory, secrets audit. Exit 1 if any check FAILs. |
-| `hotl init zsh` | Print the zsh `:` prefix plugin to stdout; `eval "$(hotl init zsh)"` in `~/.zshrc` makes a line starting `: ` run as an agent prompt. |
+| `hotl init zsh\|bash\|fish` | Shell integration to stdout. zsh: the `:` prefix plugin plus tab completion (`eval "$(hotl init zsh)"` in `~/.zshrc`); bash and fish: completion only. See [shell.md](../shell/). |
+| `hotl export <id\|name\|@last> [--md\|--html]` | Print a past session's transcript — what the model saw, in order — as Markdown (default) or a self-contained HTML page, secrets masked. |
+| `hotl stats [--days N] [--json]` | Sessions, turns, tool calls, tokens and cost across every saved session, by model and by day. Cost reads `—` when any session's model is not in the price catalog. |
 | `hotl skills [add\|update\|remove]` | List every discovered skill with its source; manage skill marketplaces. See [skills.md](../skills/). |
 | `hotl workflows [list\|show <name> [--mermaid]\|check <file>]` | Saved workflow recipes: list them, print one as TOML or a Mermaid flowchart, or validate a plan file and print the summary its ask will show (exit 1 on errors). See [workflows.md](../workflows/). |
 | `hotl mcp [list\|show\|add\|untrust\|test]` | Inspect configured MCP servers and their trust grants. Read-mostly: it never writes `config.toml`, and there is no verb that grants trust. See [below](#hotl-mcp) and [mcp.md](../mcp/). |
@@ -61,6 +63,9 @@ keep_results = 4           # user turns whose tool results are never cleared
 compaction_reset = false   # fresh-slate compaction instead of in-place
 show_used_pct = false      # opt in to showing the model context-fullness each
                            # turn (default hidden: it induces premature wrap-up)
+instructions_max_bytes = 32768  # AGENTS.md/CLAUDE.md (root and nested) are cut
+                           # at a line past this; the model and you are both
+                           # told. 0 lifts the cap
 
 [behavior]
 sandbox = true             # false disables the bash sandbox floor
@@ -124,6 +129,8 @@ prefix_stagger_ms = 5000    # identical siblings wait this long for the first
                             # prefix is cached once instead of N times; 0 off
 child_idle_secs = 300       # a child that sends nothing for this long is
                             # stopped and reported unverifiable; 0 off
+# review_model = "…"        # a stronger model for the built-in `review`
+                            # agent only; omit to inherit the session's
 completion_grace_secs = 20  # after a child reports, how long it gets to exit
                             # before it is reaped — result kept either way
 
@@ -744,6 +751,19 @@ If you need non-interactive provisioning, register servers with a pasted `[[mcp]
 `-p` with something piped in does the same. A terminal with no prompt is still
 a usage error rather than a silent wait.
 
+**`--resume <id|name|@last>`** continues a session from a script the way `-r`
+does from the console (`hotl resume <s> -p "…"` is the same thing): the
+chain's name, mode, plan, effort, todos and goal carry over, an explicit `-n`
+or `--goal` replaces the inherited one, and each run adds one log to the
+chain. List numbers are console-only. See [Unattended
+loops](../sessions/#unattended-loops-cron) for the cron shape.
+
+**`--ephemeral`** runs the prompt and keeps no session: the log lives in a temp
+dir for the run and is removed at exit, and sub-agents of that run vanish with
+it. `recall`, eviction and replay work as usual while it runs. `hotl gc` and
+the secrets audit still run against the real store — they are about the store,
+not this run. Not available with `--json-schema`.
+
 `--json` emits one JSON object per line — a machine contract, not a log. Every
 frame carries `"schema_version"` and a `"type"`: `text_delta`,
 `thinking_delta` (with its `text`), `tool_start`, `tool_done`, `tool_denied`,
@@ -767,18 +787,28 @@ Consumers pinned to v1 must update.
 
 ### Exit codes
 
-| Code | Meaning |
-|---|---|
-| `0` | The turn completed (`Done`). |
-| `130` | Interrupted (`Ctrl-C` / cancelled). |
-| `1` | Any other outcome: error, refusal, turn-limit, doom-loop, tool-failure-budget, or a `doctor` FAIL. |
-| `2` | Bad usage, a reserved subcommand (`fleet`), or the console with no TTY. |
+The shell's twin of `turn_done.outcome.kind`: a script can tell "a cap I set
+stopped it" from "the harness pulled a brake" from "it broke" without parsing
+anything.
+
+| Code | Meaning | `outcome.kind` |
+|---|---|---|
+| `0` | Done. A `--goal` run: the verdict was `met`, or there was no goal. | `done` |
+| `1` | Failed, or the model refused; a `doctor` FAIL; a `--goal` run whose last verdict was `impossible` or `errored`. | `error`, `refused` |
+| `2` | Bad usage, a reserved subcommand (`fleet`), or the console with no TTY. | — |
+| `3` | Plan mode changed the working tree. | — |
+| `4` | Stopped by a **cap you set**: `max_turns`, `max_tool_calls`, `max_cost_usd`. | `turn_limit`, `budget` |
+| `5` | Stopped by a **brake the harness pulled**: doom loop, tool-failure budget, denial spiral; a `--goal` run whose last verdict was `stalled`. | `doom_loop`, `tool_failure_budget`, `denial_spiral` |
+| `130` | Interrupted (`Ctrl-C` / cancelled). | `cancelled` |
+
+The stderr sentence for a cap or a brake names its exit code, so a cron log
+explains its own status.
 
 ## Data at rest
 
 | Path | Contents |
 |---|---|
-| `~/.local/share/hotl/sessions/<ulid>.jsonl` | Append-only session logs. Permanent by design. Secret-named env values are masked at write time; the log is otherwise sensitive — treat it as such. |
+| `~/.local/share/hotl/sessions/<ulid>.jsonl` | Append-only session logs. Permanent by design. Secret-named env values are masked at write time; the log is otherwise sensitive — treat it as such. An `--ephemeral` run writes nothing here. |
 
 **Engine defaults (not user-configurable via env yet):** max 25 turns per prompt, 32000 max output tokens, adaptive thinking on, static prompt caching on, a tool that fails 5 times consecutively stops the turn.
 
