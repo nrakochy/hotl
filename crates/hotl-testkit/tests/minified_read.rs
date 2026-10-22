@@ -59,7 +59,11 @@ async fn served_by_read(minified: bool) -> (Harness, String) {
             ScriptedProvider::text_reply("done"),
         ],
         cfg(),
-        Registry::builtin_with(Diagnostics::default(), MinifyConfig::default()),
+        Registry::builtin_with(
+            hotl_tools::formatters::Formatters::default(),
+            Diagnostics::default(),
+            MinifyConfig::default(),
+        ),
     );
     h.keep_dir(dir);
     assert_eq!(
@@ -142,7 +146,11 @@ async fn a_minified_read_with_offset_is_refused_through_the_engine() {
             ScriptedProvider::text_reply("done"),
         ],
         cfg(),
-        Registry::builtin_with(Diagnostics::default(), MinifyConfig::default()),
+        Registry::builtin_with(
+            hotl_tools::formatters::Formatters::default(),
+            Diagnostics::default(),
+            MinifyConfig::default(),
+        ),
     );
     h.keep_dir(dir);
     h.prompt_and_wait("page through gen.rs").await;

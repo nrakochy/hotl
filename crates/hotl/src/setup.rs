@@ -149,6 +149,10 @@ prefix = \"git log\"
 # args = [\"--stdio\"]
 # description = \"project documentation search\"
 
+# --- post-edit formatters: format a file after edits ($FILE = the path) ---
+# [formatters]
+# rs = \"rustfmt --edition 2021 $FILE\"
+
 # --- post-edit diagnostics: run your check command after edits ---
 # [diagnostics]
 # rs = \"cargo check -q --message-format=short\"

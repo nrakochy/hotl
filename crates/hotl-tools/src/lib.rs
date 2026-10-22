@@ -11,6 +11,7 @@ pub mod b64;
 mod builtins;
 pub mod concurrency;
 pub mod diagnostics;
+pub mod formatters;
 pub(crate) mod fsguard;
 pub(crate) mod matcher;
 pub(crate) mod minified;
@@ -242,7 +243,11 @@ impl Registry {
         static BUILTIN: OnceLock<Registry> = OnceLock::new();
         BUILTIN
             .get_or_init(|| {
-                Self::builtin_with(diagnostics::Diagnostics::default(), MinifyConfig::default())
+                Self::builtin_with(
+                    formatters::Formatters::default(),
+                    diagnostics::Diagnostics::default(),
+                    MinifyConfig::default(),
+                )
             })
             .clone()
     }
@@ -250,8 +255,12 @@ impl Registry {
     /// Builtins with post-mutation diagnostics (M3a) shared by edit/write, and
     /// the `[minify]` section read/edit consult. Both are caller-supplied per
     /// call, so unlike `builtin` above this always builds fresh.
-    pub fn builtin_with(diag: diagnostics::Diagnostics, minify: MinifyConfig) -> Self {
-        Self::builtin_with_root(diag, minify, Arc::from(fsguard::workspace_root()))
+    pub fn builtin_with(
+        fmt: formatters::Formatters,
+        diag: diagnostics::Diagnostics,
+        minify: MinifyConfig,
+    ) -> Self {
+        Self::builtin_with_root(fmt, diag, minify, Arc::from(fsguard::workspace_root()))
     }
 
     /// The same builtins, resolving every relative path against `root` instead
@@ -263,10 +272,12 @@ impl Registry {
     /// the kernel write floor is process-wide and set once at startup, so a
     /// root outside it would pass `fsguard` and then be refused by the sandbox.
     pub fn builtin_with_root(
+        fmt: formatters::Formatters,
         diag: diagnostics::Diagnostics,
         minify: MinifyConfig,
         root: Arc<std::path::Path>,
     ) -> Self {
+        let fmt = Arc::new(fmt);
         let diag = Arc::new(diag);
         Self {
             tools: vec![
@@ -275,11 +286,13 @@ impl Registry {
                     root: root.clone(),
                 }),
                 Arc::new(EditTool {
+                    fmt: fmt.clone(),
                     diag: diag.clone(),
                     minify,
                     root: root.clone(),
                 }),
                 Arc::new(WriteTool {
+                    fmt,
                     diag,
                     root: root.clone(),
                 }),
@@ -628,6 +641,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = dunce::canonicalize(tmp.path()).unwrap();
         let rooted = Registry::builtin_with_root(
+            formatters::Formatters::default(),
             diagnostics::Diagnostics::default(),
             MinifyConfig::default(),
             Arc::from(root.as_path()),
@@ -702,10 +716,16 @@ mod tests {
     /// alias across calls the way the memoized `builtin()` now does.
     #[test]
     fn builtin_with_still_returns_fresh_instances() {
-        let a =
-            Registry::builtin_with(diagnostics::Diagnostics::default(), MinifyConfig::default());
-        let b =
-            Registry::builtin_with(diagnostics::Diagnostics::default(), MinifyConfig::default());
+        let a = Registry::builtin_with(
+            formatters::Formatters::default(),
+            diagnostics::Diagnostics::default(),
+            MinifyConfig::default(),
+        );
+        let b = Registry::builtin_with(
+            formatters::Formatters::default(),
+            diagnostics::Diagnostics::default(),
+            MinifyConfig::default(),
+        );
         assert!(!std::ptr::eq(
             a.get("read").expect("read"),
             b.get("read").expect("read")

@@ -1316,7 +1316,8 @@ impl Config {
         let raw = self.raw.as_ref()?;
         let hooks = raw.get("hook");
         let diags = raw.get("diagnostics");
-        if hooks.is_none() && diags.is_none() {
+        let fmts = raw.get("formatters");
+        if hooks.is_none() && diags.is_none() && fmts.is_none() {
             return None;
         }
         let mut doc = toml::map::Map::new();
@@ -1325,6 +1326,9 @@ impl Config {
         }
         if let Some(d) = diags {
             doc.insert("diagnostics".into(), d.clone());
+        }
+        if let Some(f) = fmts {
+            doc.insert("formatters".into(), f.clone());
         }
         toml::to_string(&toml::Value::Table(doc)).ok()
     }
@@ -1356,6 +1360,25 @@ mod tests {
             hotl_provider::timeouts::STREAM_IDLE
         );
         assert_eq!(hotl_provider::timeouts::STREAM_IDLE.as_secs(), 90);
+    }
+
+    /// 0071 T3: `[formatters]` rides the same slice `[diagnostics]` does,
+    /// so `/reload` and a child's registry both see it.
+    #[test]
+    fn hooks_toml_carries_the_formatters_table() {
+        let cfg = cfg_with("[formatters]\nrs = \"rustfmt $FILE\"\n");
+        let t = cfg
+            .hooks_toml()
+            .expect("a formatters-only file still yields the slice");
+        assert!(
+            t.contains("[formatters]") && t.contains("rustfmt $FILE"),
+            "{t}"
+        );
+        let f = hotl_tools::formatters::Formatters::from_toml(&t);
+        assert!(!f.is_empty());
+        assert!(cfg_with("[behavior]\nmouse = false\n")
+            .hooks_toml()
+            .is_none());
     }
 
     fn cfg_with(toml: &str) -> Config {

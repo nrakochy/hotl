@@ -264,7 +264,7 @@ fn help_text() -> &'static str {
          separate axis that composes with any mode: write/edit always ask, while bash,\n  \
          MCP, and the web tools still follow the mode.\n\n\
          CONFIG: ~/.config/hotl/config.toml (one file: [provider] [context] [behavior]\n  \
-         [permissions] [retention], plus [[allow]] [[mcp]] [[hook]] [diagnostics]). Env\n  \
+         [permissions] [retention], plus [[allow]] [[mcp]] [[hook]] [formatters] [diagnostics]). Env\n  \
          vars override (HOTL_MODEL, ANTHROPIC_API_KEY / OPENAI_API_KEY,\n  \
          HOTL_OPENAI_BASE_URL, HOTL_PERMISSIONS, HOTL_PLAN, HOTL_SANDBOX=off). Run\n  \
          `hotl setup` to write a starter.\n\n\

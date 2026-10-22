@@ -45,6 +45,11 @@ semver promise of their own.
   `x-request-id`), an HTTP error's text ends with `(request-id …)`, and each
   sample's `usage` log entry records the id — what a support ticket wants.
 
+- **`[formatters]`: run a formatter after every `edit`/`write`.** The twin
+  of `[diagnostics]`: extension → command, `$FILE` is the shell-quoted path
+  (`rs = "rustfmt --edition 2021 $FILE"`), it runs before the check command.
+  Its output never reaches the model on success; when the file changed, one
+  line says so, so the next edit re-reads first. Off unless configured.
 - **A thinking-block stall watchdog.** A thinking block that goes quiet for
   120 s while the socket keeps pinging is dropped and the sample retried
   (same ceiling as a mid-stream disconnect); the reasoning that streamed

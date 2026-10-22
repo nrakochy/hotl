@@ -1981,13 +1981,18 @@ fn build_registry(
 ) {
     let mut discovery_warnings: Vec<String> = Vec::new();
     // Everything is config.toml: [diagnostics] and [[mcp]] sections.
-    let diagnostics = cfg
-        .hooks_toml()
-        .map(|t| hotl_tools::diagnostics::Diagnostics::from_toml(&t))
+    let hooks_toml = cfg.hooks_toml();
+    let diagnostics = hooks_toml
+        .as_deref()
+        .map(hotl_tools::diagnostics::Diagnostics::from_toml)
+        .unwrap_or_default();
+    let formatters = hooks_toml
+        .as_deref()
+        .map(hotl_tools::formatters::Formatters::from_toml)
         .unwrap_or_default();
     let (minify, minify_warning) = minify_config(cfg);
     discovery_warnings.extend(minify_warning);
-    let mut registry = Registry::builtin_with(diagnostics, minify);
+    let mut registry = Registry::builtin_with(formatters, diagnostics, minify);
     // Agent Plugins (0032): loaded once, feeding both the MCP roster and
     // the skill tier below — one discovery walk, one warnings channel.
     let (plugins, plugin_warnings) = cfg.plugins.load(config_dir, &data_dir());
@@ -2199,7 +2204,15 @@ impl HotlChildBuilder {
             .as_deref()
             .map(hotl_tools::diagnostics::Diagnostics::from_toml)
             .unwrap_or_default();
-        let full = Registry::builtin_with_root(diagnostics, self.minify.clone(), root.into());
+        // Formatters ride the same captured slice: a child formats what it
+        // edits the way its parent does.
+        let formatters = self
+            .hooks_toml
+            .as_deref()
+            .map(hotl_tools::formatters::Formatters::from_toml)
+            .unwrap_or_default();
+        let full =
+            Registry::builtin_with_root(formatters, diagnostics, self.minify.clone(), root.into());
         let mut registry =
             hotl_tools::agents::filter_registry_under(def, &self.parent_scope, &full);
         // Registered *after* the def's filter, not through it: `report_result`
@@ -5369,6 +5382,29 @@ mod tests {
         let reg = cb.child_registry(&general, &cb.cwd, None);
         assert!(reg.get("write").is_some() && reg.get("bash").is_some());
         assert!(reg.get("spawn").is_none(), "children never recurse");
+    }
+
+    /// 0071 T3: a child formats what it edits the way its parent does — the
+    /// `[formatters]` table rides the captured `hooks_toml` slice.
+    #[tokio::test]
+    async fn a_child_registry_inherits_the_parent_formatters() {
+        let (mut cb, _store) = test_child_builder();
+        let dir = tempfile::tempdir().unwrap();
+        cb.hooks_toml = Some("[formatters]\nfoo = \"printf fmt > $FILE\"\n".into());
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let reg = cb.child_registry(&general, dir.path(), None);
+        let path = dir.path().join("x.foo");
+        let out = reg
+            .get("write")
+            .unwrap()
+            .run(
+                serde_json::json!({"path": path.to_str().unwrap(), "content": "raw"}),
+                Default::default(),
+            )
+            .await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("(formatted by"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "fmt");
     }
 
     /// 0058 T7 × 0059 T5: a sub-agent's tool calls draw against **its own**

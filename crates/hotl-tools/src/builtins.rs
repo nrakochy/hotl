@@ -657,6 +657,7 @@ async fn read_stream(file: tokio::fs::File, path: &str, input: &Value) -> ToolRe
 }
 
 pub struct WriteTool {
+    pub fmt: Arc<crate::formatters::Formatters>,
     pub diag: Arc<crate::diagnostics::Diagnostics>,
     /// See `ReadTool::root`.
     pub root: Arc<Path>,
@@ -665,6 +666,7 @@ pub struct WriteTool {
 impl Default for WriteTool {
     fn default() -> Self {
         Self {
+            fmt: Arc::default(),
             diag: Arc::default(),
             root: default_root(),
         }
@@ -699,7 +701,7 @@ impl Tool for WriteTool {
         Box::pin(async move {
             let root = &*self.root;
             let result = write_in(root, granted_extras(), &input).await;
-            with_diagnostics(&self.diag, &input, result).await
+            with_post_mutation(root, &self.fmt, &self.diag, &input, result).await
         })
     }
 }
@@ -764,6 +766,7 @@ fn guarded_write_bytes(
 }
 
 pub struct EditTool {
+    pub fmt: Arc<crate::formatters::Formatters>,
     pub diag: Arc<crate::diagnostics::Diagnostics>,
     pub minify: crate::MinifyConfig,
     /// See `ReadTool::root`.
@@ -773,6 +776,7 @@ pub struct EditTool {
 impl Default for EditTool {
     fn default() -> Self {
         Self {
+            fmt: Arc::default(),
             diag: Arc::default(),
             minify: crate::MinifyConfig::default(),
             root: default_root(),
@@ -821,13 +825,17 @@ impl Tool for EditTool {
             } else {
                 edit_in(root, extras, &input).await
             };
-            with_diagnostics(&self.diag, &input, result).await
+            with_post_mutation(root, &self.fmt, &self.diag, &input, result).await
         })
     }
 }
 
 /// Append the configured post-mutation check (M3a) to a successful result.
-pub(crate) async fn with_diagnostics(
+/// After a successful mutation: format, then check (0071 T3). The
+/// formatter's note (if any) lands before the diagnostic's report.
+pub(crate) async fn with_post_mutation(
+    root: &std::path::Path,
+    fmt: &crate::formatters::Formatters,
     diag: &crate::diagnostics::Diagnostics,
     input: &Value,
     result: ToolResult,
@@ -835,6 +843,16 @@ pub(crate) async fn with_diagnostics(
     let mut outcome = done(result);
     if !outcome.is_error {
         if let Ok(path) = str_arg(input, "path") {
+            if !fmt.is_empty() {
+                let abs = if std::path::Path::new(path).is_absolute() {
+                    std::path::PathBuf::from(path)
+                } else {
+                    root.join(path)
+                };
+                if let Some(note) = fmt.format(&abs).await {
+                    outcome.content.push_str(&note);
+                }
+            }
             if let Some(report) = diag.check(path).await {
                 outcome.content.push_str(&report);
             }
@@ -3174,6 +3192,33 @@ mod tests {
         );
         assert!(!ok.is_error);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "aaa\nBBB\naaa\n");
+    }
+
+    /// 0071 T3: format, then check — the formatter's note lands before the
+    /// diagnostic's report, and both see the same path.
+    #[test]
+    fn the_formatter_runs_before_the_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("probe.foo");
+        let p = path.to_str().unwrap();
+        let marker = dir.path().join("order.txt");
+        let m = marker.to_str().unwrap();
+        let w = WriteTool {
+            fmt: Arc::new(crate::formatters::Formatters::from_toml(&format!(
+                "[formatters]\nfoo = \"echo fmt >> {m}; printf changed > $FILE\"\n"
+            ))),
+            diag: Arc::new(crate::diagnostics::Diagnostics::from_toml(&format!(
+                "[diagnostics]\nfoo = \"echo diag >> {m}; echo checked; exit 1\"\n"
+            ))),
+            root: default_root(),
+        };
+        let out = run(&w, json!({"path": p, "content": "one\n"}));
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "fmt\ndiag\n");
+        let note = out.content.find("(formatted by").expect("the note");
+        let report = out.content.find("<diagnostics>").expect("the report");
+        assert!(note < report, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "changed");
     }
 
     #[test]
