@@ -132,6 +132,10 @@ pub struct EngineConfig {
     /// sample is dropped and retried (0071 T2). The socket's own idle
     /// watchdog never trips while pings keep coming; this one does.
     pub thinking_stall: std::time::Duration,
+    /// Title the session on the utility model after its first completed
+    /// turn (0071 T4). Off here; the interactive surfaces turn it on for a
+    /// session that has no name and no title yet. `-p` never does.
+    pub auto_title: bool,
     /// Bytes of a nested `AGENTS.md` the just-in-time load shows the model
     /// (0070 T9) — the same number the root load uses. `usize::MAX` = no cap.
     pub instructions_max_bytes: usize,
@@ -214,6 +218,7 @@ impl Default for EngineConfig {
             max_cost_usd: 0.0,
             context_window: 200_000,
             thinking_stall: hotl_provider::timeouts::THINKING_STALL,
+            auto_title: false,
             instructions_max_bytes: hotl_context::INSTRUCTIONS_BUDGET_BYTES,
             fast_model: None,
             utility_model: None,
@@ -621,6 +626,14 @@ pub enum EngineEvent {
     GoalChanged {
         condition: Option<String>,
     },
+    /// The session was titled by the utility model (0071 T4), or the call
+    /// came back unusable (`title: None`) and only the spend is reported.
+    /// `usage` is the title call's own cost — housekeeping the session pays
+    /// for is housekeeping the totals must show.
+    SessionTitled {
+        title: Option<String>,
+        usage: TokenUsage,
+    },
     /// The model handed the user a plan to approve or revise (`present_plan`,
     /// 0056 T3). The nodes are already durable — this is the surface's cue to
     /// show them and offer the two answers, not a request the engine waits on.
@@ -693,6 +706,9 @@ impl std::fmt::Debug for EngineEvent {
             Self::GoalChanged { condition } => {
                 write!(f, "GoalChanged(set={})", condition.is_some())
             }
+            Self::SessionTitled { title, .. } => {
+                write!(f, "SessionTitled(set={})", title.is_some())
+            }
             Self::GoalVerdict { verdict, turns, .. } => {
                 write!(f, "GoalVerdict({verdict:?},turns={turns})")
             }
@@ -708,6 +724,8 @@ pub enum RetryScope {
     Sample,
     Summarize,
     GoalEval,
+    /// The auto-title call (0071 T4).
+    Title,
 }
 
 /// What the goal evaluator concluded, engine-side vocabulary: the parser
@@ -954,6 +972,13 @@ pub enum SessionCmd {
     },
     /// Set the session's display name (durable: appended to the log).
     Rename(String),
+    /// The auto-title task reporting back (0071 T4). `title` is already
+    /// normalized; `None` = the model produced nothing usable, and only the
+    /// spend is recorded.
+    SetTitle {
+        title: Option<String>,
+        usage: TokenUsage,
+    },
     /// Set the session's effective permission mode (durable: appended to the
     /// log as `ModeSet`; takes effect immediately — no `Rules` reallocation).
     SetMode(PermissionMode),

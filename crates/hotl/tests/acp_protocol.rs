@@ -128,6 +128,7 @@ fn scripted_factory_recording(
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     })
 }
@@ -192,6 +193,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     })
 }
@@ -393,6 +395,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             previous_model: Some("old-m".into()),
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     })
 }
@@ -508,6 +511,95 @@ async fn a_cleared_inherited_effort_rides_as_null() {
 /// Resume re-derives the model from config; when the lineage log's model
 /// differs, the reply names it — a silent switch under an inherited
 /// transcript is a §5.7 lie. Same model (or a fresh session): key absent.
+/// 0071 T4: a restored title rides the open reply (absent when none), and a
+/// title the engine mints is broadcast as `session_titled`.
+#[tokio::test]
+async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
+    let factory: acp::SessionFactory = Box::new(move |spec| {
+        let title = match &spec {
+            acp::SessionSpec::Load { .. } => Some("Fix the auth flow".to_string()),
+            _ => None,
+        };
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::text_reply("answer"),
+            ScriptedProvider::text_reply("Minted title"),
+        ]));
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig {
+                    auto_title: title.is_none(),
+                    ..EngineConfig::default()
+                },
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            title,
+        })
+    });
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+    )
+    .await;
+    let open = next(&mut lines).await;
+    assert_eq!(open["result"]["title"], "Fix the auth flow");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+    )
+    .await;
+    let open = next(&mut lines).await;
+    assert!(open["result"].get("title").is_none(), "{open}");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+    let titled = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "session_titled"
+    })
+    .await;
+    assert_eq!(titled["params"]["update"]["title"], "Minted title");
+    assert_eq!(titled["params"]["update"]["usage"]["input_tokens"], 10);
+}
+
 #[tokio::test]
 async fn the_open_reply_names_the_previous_model() {
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -955,6 +1047,7 @@ async fn overlapping_prompts_resolve_in_order() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1172,6 +1265,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     });
     tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
@@ -1375,6 +1469,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1870,6 +1965,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);

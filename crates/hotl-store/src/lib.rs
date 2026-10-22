@@ -138,6 +138,7 @@ pub enum EntryKind {
     PendingAsk,
     AskResolved,
     Rename,
+    Title,
     ModeSet,
     PlanSet,
     EffortSet,
@@ -162,6 +163,7 @@ impl From<&EntryPayload> for EntryKind {
             EntryPayload::PendingAsk { .. } => EntryKind::PendingAsk,
             EntryPayload::AskResolved { .. } => EntryKind::AskResolved,
             EntryPayload::Rename { .. } => EntryKind::Rename,
+            EntryPayload::Title { .. } => EntryKind::Title,
             EntryPayload::ModeSet { .. } => EntryKind::ModeSet,
             EntryPayload::PlanSet { .. } => EntryKind::PlanSet,
             EntryPayload::EffortSet { .. } => EntryKind::EffortSet,
@@ -1350,6 +1352,9 @@ pub struct Replayed {
     pub items: Vec<hotl_types::Item>,
     /// The session's display name (last `Rename` in the chain, child wins).
     pub name: Option<String>,
+    /// A generated title (last `Title` in the chain, child wins) — a label
+    /// the picker shows as `(auto)`; a name always outranks it (0071 T4).
+    pub title: Option<String>,
     /// The session's effective permission mode (last `ModeSet` in the chain,
     /// child wins) — a raw string, forward-compat; the engine maps it to
     /// `PermissionMode`. `None` = no mode was ever set (use the process default).
@@ -1389,6 +1394,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let mut name = None;
+    let mut title = None;
     let mut mode = None;
     let mut plan = None;
     let mut effort = None;
@@ -1400,6 +1406,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         &mut items,
         &mut warnings,
         &mut name,
+        &mut title,
         &mut mode,
         &mut plan,
         &mut effort,
@@ -1412,6 +1419,7 @@ pub fn replay(path: &Path) -> Result<Replayed, String> {
         header: applied.header,
         items,
         name,
+        title,
         mode,
         plan,
         effort,
@@ -1527,6 +1535,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
     // Parent-first, so a child's rename/mode-set/todos naturally overwrites
     // the parent's.
     let mut name = None;
+    let mut title = None;
     let mut mode = None;
     let mut plan = None;
     let mut effort = None;
@@ -1545,6 +1554,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
             &mut items,
             &mut warnings,
             &mut name,
+            &mut title,
             &mut mode,
             &mut plan,
             &mut effort,
@@ -1561,6 +1571,7 @@ pub fn replay_chain(dir: &Path, session_id: &str) -> Result<Replayed, String> {
         header: newest_header,
         items,
         name,
+        title,
         mode,
         plan,
         effort,
@@ -1601,6 +1612,7 @@ fn apply_log(
     items: &mut Vec<hotl_types::Item>,
     warnings: &mut Vec<String>,
     name: &mut Option<String>,
+    title: &mut Option<String>,
     mode: &mut Option<String>,
     plan: &mut Option<bool>,
     effort: &mut Option<Option<String>>,
@@ -1719,6 +1731,8 @@ fn apply_log(
             }
             // Log-only, like PendingAsk: names the session, never the projection.
             EntryPayload::Rename { name: n } => *name = Some(n),
+            // Same log-only last-one-wins shape; a label beside the name.
+            EntryPayload::Title { title: t } => *title = Some(t),
             // Log-only, like Rename: sets the session's effective mode, never
             // the projection. Last one wins, exactly like the display name.
             EntryPayload::ModeSet { mode: m } => *mode = Some(m),
@@ -1838,12 +1852,39 @@ const NAME_TAIL_BYTES: u64 = 256 * 1024;
 /// `session_name_finds_the_last_rename_in_a_large_log` and
 /// `session_name_falls_back_to_a_full_scan_when_the_tail_has_no_rename`.
 pub fn session_name(path: &Path) -> Option<String> {
-    name_in_tail(path).or_else(|| name_by_full_scan(path))
+    label_in_tail(path, "\"rename\"", rename_of)
+        .or_else(|| label_by_full_scan(path, "\"rename\"", rename_of))
+}
+
+/// The last generated title in the log, the way `session_name` finds the
+/// last name (0071 T4). The picker shows it as `(auto)` when there is no
+/// name; it is never an address.
+pub fn session_title(path: &Path) -> Option<String> {
+    label_in_tail(path, "\"title\"", title_of)
+        .or_else(|| label_by_full_scan(path, "\"title\"", title_of))
+}
+
+fn rename_of(entry: Entry) -> Option<String> {
+    match entry.payload {
+        EntryPayload::Rename { name } => Some(name),
+        _ => None,
+    }
+}
+
+fn title_of(entry: Entry) -> Option<String> {
+    match entry.payload {
+        EntryPayload::Title { title } => Some(title),
+        _ => None,
+    }
 }
 
 /// Scan the last `NAME_TAIL_BYTES` backward. Reads bytes (not `read_to_string`)
 /// because the window boundary can land mid-codepoint.
-fn name_in_tail(path: &Path) -> Option<String> {
+fn label_in_tail(
+    path: &Path,
+    marker: &str,
+    extract: fn(Entry) -> Option<String>,
+) -> Option<String> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = File::open(path).ok()?;
     let len = file.metadata().ok()?.len();
@@ -1859,37 +1900,31 @@ fn name_in_tail(path: &Path) -> Option<String> {
         text.as_ref()
     };
     body.lines().rev().find_map(|line| {
-        if !line.contains("\"rename\"") {
+        if !line.contains(marker) {
             return None;
         }
-        match serde_json::from_str::<Entry>(line) {
-            Ok(Entry {
-                payload: EntryPayload::Rename { name },
-                ..
-            }) => Some(name),
-            _ => None,
-        }
+        serde_json::from_str::<Entry>(line).ok().and_then(extract)
     })
 }
 
-/// The original forward scan — the fallback when no rename is in the tail.
-fn name_by_full_scan(path: &Path) -> Option<String> {
+/// The original forward scan — the fallback when no entry is in the tail.
+fn label_by_full_scan(
+    path: &Path,
+    marker: &str,
+    extract: fn(Entry) -> Option<String>,
+) -> Option<String> {
     let file = File::open(path).ok()?;
-    let mut name = None;
+    let mut found = None;
     for line in BufReader::new(file).lines() {
         let Ok(line) = line else { break };
-        if !line.contains("\"rename\"") {
+        if !line.contains(marker) {
             continue;
         }
-        if let Ok(Entry {
-            payload: EntryPayload::Rename { name: n },
-            ..
-        }) = serde_json::from_str::<Entry>(&line)
-        {
-            name = Some(n);
+        if let Some(v) = serde_json::from_str::<Entry>(&line).ok().and_then(extract) {
+            found = Some(v);
         }
     }
-    name
+    found
 }
 
 /// Session files in `dir`, newest first: (session id, path, modified).
@@ -3646,6 +3681,103 @@ mod tests {
         let header = r#"{"id":"h1","parent_id":null,"ts_ms":0,"payload":{"kind":"header","header":{"format_version":1,"session_id":"01SELF2","parent_session_id":"01SELF2","model":"m","created_at_ms":0}}}"#;
         std::fs::write(&path, format!("{header}\n")).unwrap();
         assert!(ancestor_ids(dir.path(), "01SELF2").is_empty());
+    }
+
+    /// 0071 T4: a `Title` is log-only like `Rename`, the last one wins, and
+    /// it never touches the projection or the name.
+    #[test]
+    fn a_title_entry_is_log_only_and_the_last_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append(
+            &EntryPayload::Item {
+                item: Item::User {
+                    text: "hi".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+        for t in ["First draft", "Second draft"] {
+            log.append(&EntryPayload::Title { title: t.into() }, 3)
+                .unwrap();
+        }
+        let r = replay(log.path()).unwrap();
+        assert_eq!(r.items.len(), 1, "a title is not a projection item");
+        assert_eq!(r.title.as_deref(), Some("Second draft"));
+        assert_eq!(r.name, None, "a title is not a name");
+        assert_eq!(session_title(log.path()).as_deref(), Some("Second draft"));
+        assert_eq!(session_name(log.path()), None);
+        assert_eq!(
+            EntryKind::from(&EntryPayload::Title { title: "x".into() }),
+            EntryKind::Title
+        );
+    }
+
+    #[test]
+    fn session_title_finds_the_last_title_in_a_large_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append(
+            &EntryPayload::Title {
+                title: "early".into(),
+            },
+            2,
+        )
+        .unwrap();
+        let filler = "x".repeat(4096);
+        for _ in 0..128 {
+            log.append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: filler.clone(),
+                        synthetic: None,
+                        images: Vec::new(),
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        }
+        log.append(
+            &EntryPayload::Title {
+                title: "late".into(),
+            },
+            4,
+        )
+        .unwrap();
+        assert_eq!(session_title(log.path()).as_deref(), Some("late"));
+        assert_eq!(replay(log.path()).unwrap().title.as_deref(), Some("late"));
+    }
+
+    #[test]
+    fn session_title_falls_back_to_a_full_scan_when_the_tail_has_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        log.append(
+            &EntryPayload::Title {
+                title: "only".into(),
+            },
+            2,
+        )
+        .unwrap();
+        let filler = "x".repeat(4096);
+        for _ in 0..128 {
+            log.append(
+                &EntryPayload::Item {
+                    item: Item::User {
+                        text: filler.clone(),
+                        synthetic: None,
+                        images: Vec::new(),
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        }
+        assert_eq!(session_title(log.path()).as_deref(), Some("only"));
     }
 
     #[test]

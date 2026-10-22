@@ -536,6 +536,9 @@ pub struct State {
     /// Display name (badge + titles); seeded from the open handshake,
     /// updated by `/rename`.
     pub session_name: Option<String>,
+    /// A generated title (0071 T4), shown by the badge and the terminal title
+    /// only while the session has no name — a label, never an address.
+    pub session_title: Option<String>,
     /// Effective permission mode (`ask` | `bypass` | `dontask`).
     /// Seeded from the open handshake and corrected by every `mode_changed`
     /// notification, so it is what the engine enforces rather than what the
@@ -721,6 +724,7 @@ impl State {
             detached_turns: 0,
             pending_auto_rules: std::collections::HashMap::new(),
             session_name: None,
+            session_title: None,
             mode: "ask".into(),
             plan: false,
             effort: None,
@@ -979,7 +983,7 @@ pub enum Cmd {
 
 /// Terminal-tab title: `hotl` / `hotl · <name>`, plus a state suffix.
 fn title(state: &State, suffix: &str) -> String {
-    match &state.session_name {
+    match state.session_name.as_ref().or(state.session_title.as_ref()) {
         Some(n) => format!("hotl · {n}{suffix}"),
         None => format!("hotl{suffix}"),
     }
@@ -1620,6 +1624,19 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // impossible verdict). A confirmation of this surface's optimistic
         // update leaves the counters alone.
         "goal_evaluating" => state.goal_evaluating = true,
+        // 0071 T4: the title is a label the badge shows while the session has
+        // no name; the call's spend joins the totals like any other sample.
+        "session_titled" => {
+            if let Some(t) = v.get("title").and_then(Value::as_str) {
+                state.session_title = Some(t.to_string());
+            }
+            if let Some(usage) = v.get("usage") {
+                state.session_usage.add(usage);
+            }
+            if state.session_name.is_none() && state.session_title.is_some() {
+                return vec![Cmd::SetTitle(title(state, ""))];
+            }
+        }
         "goal_changed" => {
             state.goal_evaluating = false;
             let goal = v.get("goal").and_then(Value::as_str).map(str::to_string);
@@ -2888,7 +2905,15 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         // The single highest-value "what am I actually running?" answer, and
         // exactly the state the §5.7 mode bug proved users could not see.
         "status" => {
-            let name = state.session_name.as_deref().unwrap_or("(unnamed)");
+            let titled = state
+                .session_title
+                .as_deref()
+                .map(|t| format!("title: {t} (auto)"));
+            let name = state
+                .session_name
+                .as_deref()
+                .or(titled.as_deref())
+                .unwrap_or("(unnamed)");
             let todos = state.todos.len();
             let plan = if state.plan { " · plan" } else { "" };
             let goal = match &state.goal {
@@ -4353,6 +4378,40 @@ mod tests {
         upd(&mut s, json!({"type":"compacting","items":4}));
         on_result(&mut s, "done", None, &json!({}));
         assert!(!s.compacting);
+    }
+
+    /// 0071 T4: the badge and the terminal title show the generated title
+    /// only while the session has no name; the call's spend joins the totals.
+    #[test]
+    fn session_titled_fills_the_badge_unless_the_session_is_named() {
+        let mut s = State::test_default();
+        let cmds = upd(
+            &mut s,
+            json!({"type":"session_titled","title":"Fix the auth flow","usage":{"input_tokens":10,"output_tokens":5}}),
+        );
+        assert_eq!(s.session_title.as_deref(), Some("Fix the auth flow"));
+        assert_eq!(title(&s, ""), "hotl · Fix the auth flow");
+        assert!(matches!(&cmds[..], [Cmd::SetTitle(t)] if t == "hotl · Fix the auth flow"));
+        assert_eq!((s.session_usage.input, s.session_usage.output), (10, 5));
+        slash(&mut s, "status");
+        assert!(last_notice(&s).starts_with("title: Fix the auth flow (auto) ·"));
+
+        let mut named = State::test_default();
+        named.session_name = Some("fix-auth".into());
+        let cmds = upd(
+            &mut named,
+            json!({"type":"session_titled","title":"Generated","usage":{}}),
+        );
+        assert!(cmds.is_empty(), "a name outranks: {cmds:?}");
+        assert_eq!(title(&named, ""), "hotl · fix-auth");
+        // An unusable title: no key, only the spend.
+        let mut s2 = State::test_default();
+        upd(
+            &mut s2,
+            json!({"type":"session_titled","usage":{"input_tokens":3}}),
+        );
+        assert_eq!(s2.session_title, None);
+        assert_eq!(s2.session_usage.input, 3);
     }
 
     /// 0071 T2: a stall retry takes back the answer, never the reasoning

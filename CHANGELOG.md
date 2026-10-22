@@ -45,6 +45,11 @@ semver promise of their own.
   `x-request-id`), an HTTP error's text ends with `(request-id …)`, and each
   sample's `usage` log entry records the id — what a support ticket wants.
 
+- **Auto session titles.** After the first completed turn of an unnamed
+  console session, a ~50-token call on the utility model names it in at most
+  six words. The `-r` picker shows it as `<title> (auto)`, the badge and
+  terminal title use it until you `/rename`, and `-r <name>` never matches a
+  title. `[behavior] auto_title = false` turns it off; `-p` runs never title.
 - **`[formatters]`: run a formatter after every `edit`/`write`.** The twin
   of `[diagnostics]`: extension → command, `$FILE` is the shell-quoted path
   (`rs = "rustfmt --edition 2021 $FILE"`), it runs before the check command.

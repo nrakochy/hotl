@@ -462,6 +462,12 @@ pub enum EntryPayload {
     Rename {
         name: String,
     },
+    /// A generated title (0071 T4): a label, never an address — `-r <name>`
+    /// matches names only, and a `Rename` always outranks it. Log-only, last
+    /// one wins, like `Rename`.
+    Title {
+        title: String,
+    },
     /// Sets the session's effective permission mode (`/mode`,
     /// `session/set_mode`). Log-only, like `Rename` — not a projection item;
     /// the last one wins on replay, so `hotl resume` restores the mode the

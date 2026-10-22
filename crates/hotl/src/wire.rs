@@ -209,6 +209,15 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
         EngineEvent::GoalChanged { condition } => {
             json!({"type": "goal_changed", "goal": condition})
         }
+        // `title` is omitted, not null, when the call produced nothing usable;
+        // the spend still rides so a surface's totals stay true.
+        EngineEvent::SessionTitled { title, usage } => {
+            let mut v = json!({"type": "session_titled", "usage": usage});
+            if let Some(t) = title {
+                v["title"] = json!(t);
+            }
+            v
+        }
         // `usage` is the goal loop's cumulative spend, the evaluator's own
         // calls included — the raw `TokenUsage` shape, not `usage_frame`'s:
         // `update_frame` has no session model to price it with, and the
@@ -263,6 +272,7 @@ fn retry_scope_tag(scope: hotl_engine::RetryScope) -> &'static str {
         hotl_engine::RetryScope::Sample => "sample",
         hotl_engine::RetryScope::Summarize => "summarize",
         hotl_engine::RetryScope::GoalEval => "goal_eval",
+        hotl_engine::RetryScope::Title => "title",
     }
 }
 

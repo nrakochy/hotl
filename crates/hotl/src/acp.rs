@@ -196,6 +196,9 @@ pub struct SessionOpen {
     /// 0070 T9). The open reply carries them as `warnings`; the client shows
     /// each as a notice.
     pub warnings: Vec<String>,
+    /// The generated title a resume restored (0071 T4); the open reply
+    /// carries it as `title` (absent when none). A name outranks it.
+    pub title: Option<String>,
 }
 
 /// Builds a session per the client's request. The real binary wires engine
@@ -465,6 +468,7 @@ async fn handle_request(
                     let effort = open.effort.clone();
                     let previous_model = open.previous_model.clone();
                     let open_warnings = open.warnings.clone();
+                    let open_title = open.title.clone();
                     let sid = install_session(
                         open,
                         writer,
@@ -536,6 +540,9 @@ async fn handle_request(
                     }
                     if !open_warnings.is_empty() {
                         obj.insert("warnings".into(), json!(open_warnings));
+                    }
+                    if let Some(t) = open_title {
+                        obj.insert("title".into(), json!(t));
                     }
                     reply_ok(writer, id, reply).await;
                 }

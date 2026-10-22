@@ -680,6 +680,11 @@ pub struct BehaviorCfg {
     /// Seconds a parked permission ask waits for a human before it is denied.
     /// Resolve via [`BehaviorCfg::ask_expiry`] — absent means one hour.
     pub ask_expiry_secs: Option<u64>,
+    /// Title an unnamed console session on the utility model after its
+    /// first completed turn (0071 T4). Resolve via
+    /// [`BehaviorCfg::auto_title`] — absent means **on**. Headless runs
+    /// never title.
+    pub auto_title: Option<bool>,
 }
 
 impl BehaviorCfg {
@@ -693,6 +698,13 @@ impl BehaviorCfg {
     /// leaving them on strands nobody.
     pub fn vim_mode(&self) -> bool {
         self.vim_mode.unwrap_or(false)
+    }
+
+    /// Default **on** (0071 T4): one ~50-token call on the utility model per
+    /// unnamed console session, so the `-r` picker reads as a list of
+    /// conversations instead of ULIDs.
+    pub fn auto_title(&self) -> bool {
+        self.auto_title.unwrap_or(true)
     }
 
     /// Default **on**: the wheel scrolling the transcript is what most people

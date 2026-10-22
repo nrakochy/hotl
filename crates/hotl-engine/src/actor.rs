@@ -28,6 +28,11 @@ use hotl_context::goal::GoalVerdict;
 pub(crate) const TAIL_RATIO: f64 = 0.3;
 const SUMMARIZE_ATTEMPTS: u32 = 2;
 const SUMMARIZE_MAX_TOKENS: u32 = 2_000;
+/// The auto-title call (0071 T4): six words, no reasoning.
+const TITLE_MAX_TOKENS: u32 = 24;
+const TITLE_SYSTEM: &str = "Name this conversation in at most six words. Output only the name.";
+/// Bytes of the first prompt and the first answer shown to the titler.
+const TITLE_EXCERPT_BYTES: usize = 2 * 1024;
 /// Compactions without an intervening completed sample before giving up —
 /// prevents a fold-the-digest spiral when the tail alone overflows.
 /// INVARIANT: a fold with progress behind it never draws down this cap.
@@ -1183,6 +1188,12 @@ pub(crate) async fn run(
     let mut carry_mispredictions: u32 = 0;
     let mut compact_streak: u32 = 0;
     let mut pipeline = Pipeline::default();
+    // Auto-title bookkeeping (0071 T4): at most one title call per process,
+    // and a `/rename` that lands first wins over it.
+    let mut title = TitleState {
+        armed: shared.config.auto_title,
+        renamed: false,
+    };
 
     loop {
         // The oldest pending ack is held out of the FIFO for the duration of
@@ -1292,6 +1303,7 @@ pub(crate) async fn run(
                 .await
             }
             SessionCmd::Rename(name) => {
+                title.renamed = true;
                 let _ = shared
                     .append(
                         &mut log,
@@ -1299,6 +1311,24 @@ pub(crate) async fn run(
                         &mut head,
                         EntryPayload::Rename { name },
                     )
+                    .await;
+            }
+            SessionCmd::SetTitle { title: t, usage } => {
+                // A name that landed meanwhile outranks the title: the entry
+                // is not written, the spend is still reported.
+                let t = t.filter(|_| !title.renamed);
+                if let Some(t) = &t {
+                    let _ = shared
+                        .append(
+                            &mut log,
+                            &mut pipeline,
+                            &mut head,
+                            EntryPayload::Title { title: t.clone() },
+                        )
+                        .await;
+                }
+                let _ = events
+                    .send(EngineEvent::SessionTitled { title: t, usage })
                     .await;
             }
             SessionCmd::SetMode(mode) => {
@@ -1565,6 +1595,7 @@ pub(crate) async fn run(
                         carry_mispredictions: &mut carry_mispredictions,
                         compact_streak: &mut compact_streak,
                         goal: &mut goal,
+                        title: &mut title,
                         cmd_tx: &cmd_tx,
                         events: &events,
                         current_turn: &current_turn,
@@ -1619,9 +1650,90 @@ struct TurnFinishedCtx<'a> {
     carry_mispredictions: &'a mut u32,
     compact_streak: &'a mut u32,
     goal: &'a mut Option<GoalState>,
+    title: &'a mut TitleState,
     cmd_tx: &'a mpsc::WeakSender<SessionCmd>,
     events: &'a mpsc::Sender<EngineEvent>,
     current_turn: &'a Arc<Mutex<CancellationToken>>,
+}
+
+/// Auto-title bookkeeping (0071 T4). `armed` is the config flag, cleared the
+/// moment the one call is spawned; `renamed` records a `/rename` so the
+/// title arm can yield to it.
+struct TitleState {
+    armed: bool,
+    renamed: bool,
+}
+
+/// The first real prompt and the first assistant text after it, each capped
+/// — what the titler reads. `None` until both exist.
+fn title_material(items: &[Arc<Item>]) -> Option<String> {
+    let mut prompt: Option<&str> = None;
+    for item in items {
+        match &**item {
+            Item::User {
+                text,
+                synthetic: None,
+                ..
+            } if prompt.is_none() => prompt = Some(text),
+            Item::Assistant { blocks } if prompt.is_some() => {
+                let answer = assistant_text(blocks);
+                if answer.trim().is_empty() {
+                    continue;
+                }
+                let cap = |s: &str| -> String {
+                    let mut end = s.len().min(TITLE_EXCERPT_BYTES);
+                    while !s.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    s[..end].to_string()
+                };
+                return Some(format!(
+                    "User:\n{}\n\nAssistant:\n{}",
+                    cap(prompt.unwrap_or_default()),
+                    cap(&answer)
+                ));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Spawn the one auto-title call after the first completed turn, detached
+/// so the loop stays responsive; the answer comes back as `SetTitle`.
+fn spawn_title(shared: &Arc<SharedDeps>, cmd_tx: &mpsc::WeakSender<SessionCmd>, head: &Head) {
+    let Some(material) = title_material(&head.snapshot().durable) else {
+        return;
+    };
+    let request = SamplingRequest {
+        model: shared.config.utility(),
+        max_tokens: TITLE_MAX_TOKENS,
+        system: TITLE_SYSTEM.into(),
+        items: Arc::new(vec![Arc::new(Item::User {
+            text: material,
+            synthetic: None,
+            images: Vec::new(),
+        })]),
+        ephemeral_tail: empty_tail(),
+        tools: Vec::new().into(),
+        thinking: false,
+        effort: None,
+        cache: hotl_provider::CachePolicy::Off,
+        turn_context: None,
+        cache_key: None,
+    };
+    let shared = Arc::clone(shared);
+    let cmd_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        let (text, usage) = one_shot_text(&shared, request, None, crate::RetryScope::Title).await;
+        let title = text
+            .as_deref()
+            .and_then(|t| t.lines().next())
+            .and_then(hotl_types::normalize_session_name);
+        if let Some(tx) = cmd_tx.upgrade() {
+            let _ = tx.send(SessionCmd::SetTitle { title, usage }).await;
+        }
+    });
 }
 
 /// The active `/goal` (0034). In-memory only (the condition is separately
@@ -2025,6 +2137,15 @@ async fn on_turn_finished(
                     }
                 }
             }
+        }
+        // The first completed turn titles the session (0071 T4): once, never
+        // after an error or a cancel, and only while nothing has named it.
+        if ctx.title.armed
+            && !ctx.title.renamed
+            && !matches!(outcome, Outcome::Error { .. } | Outcome::Cancelled)
+        {
+            ctx.title.armed = false;
+            spawn_title(ctx.shared, ctx.cmd_tx, ctx.head);
         }
         let mut total = usage;
         total += std::mem::take(ctx.carry_usage);
@@ -2976,6 +3097,64 @@ pub(crate) async fn summarize(
                     // provider's own generator, so this is one more poll,
                     // and it is what marks the attempt as really consumed
                     // rather than left in flight.
+                    crate::turn::drain_to_end(&mut stream).await;
+                    break;
+                }
+            }
+        }
+        if let Some(t) = text.filter(|t| !t.trim().is_empty()) {
+            return (Some(t), spent);
+        }
+    }
+    (None, spent)
+}
+
+/// One bounded, retried text sample for a housekeeping call (0071 T4): the
+/// loop `summarize` and `evaluate_goal` each carry, lifted so the title and
+/// aside calls do not grow a fourth copy. Returns the first non-empty text
+/// and everything the attempts cost.
+pub(crate) async fn one_shot_text(
+    shared: &SharedDeps,
+    request: SamplingRequest,
+    events: Option<&mpsc::Sender<EngineEvent>>,
+    scope: crate::RetryScope,
+) -> (Option<String>, TokenUsage) {
+    let mut spent = TokenUsage::default();
+    for _ in 0..SUMMARIZE_ATTEMPTS {
+        let mut stream = shared.provider.stream(request.clone());
+        let mut text: Option<String> = None;
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(StreamEvent::Completed { blocks, usage, .. }) => {
+                    spent += usage;
+                    text = Some(assistant_text(&blocks));
+                }
+                Ok(StreamEvent::Retrying {
+                    attempt,
+                    max,
+                    reason,
+                    delay_ms,
+                    status,
+                    request_id,
+                }) => {
+                    if let Some(events) = events {
+                        let _ = events
+                            .send(EngineEvent::Retrying {
+                                attempt,
+                                max,
+                                reason,
+                                delay_ms,
+                                status,
+                                request_id,
+                                scope,
+                                discarded_partial: false,
+                            })
+                            .await;
+                    }
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    text = None;
                     crate::turn::drain_to_end(&mut stream).await;
                     break;
                 }

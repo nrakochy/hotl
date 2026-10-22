@@ -83,6 +83,7 @@ fn scripted_factory() -> acp::SessionFactory {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     })
 }
@@ -156,6 +157,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             previous_model: None,
             session_id,
             warnings: Vec::new(),
+            title: None,
         })
     })
 }

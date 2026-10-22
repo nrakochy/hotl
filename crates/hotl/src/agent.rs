@@ -40,6 +40,9 @@ pub(crate) struct Resumed {
     /// The chain's display name (last `Rename`, child wins). Resume adopts it;
     /// a **fork** deliberately ignores it — see D-A3.
     pub inherited_name: Option<String>,
+    /// The chain's generated title (last `Title`, child wins; 0071 T4). Same
+    /// inheritance as the name; a resumed chain is never re-titled.
+    pub title: Option<String>,
     pub items: Vec<hotl_types::Item>,
     /// The parent's last `ModeSet`, if any (durable, last-wins — same
     /// inheritance shape as the display name). `None` = the parent never
@@ -77,6 +80,10 @@ pub(crate) struct Inherited {
     /// never set (keep the configured default), inner `None` = deliberately
     /// cleared back to the provider's default.
     pub effort: Option<Option<Effort>>,
+    /// Title this session after its first completed turn (0071 T4). Only
+    /// the interactive factory sets it, and only for an unnamed, untitled
+    /// session.
+    pub auto_title: bool,
 }
 
 /// Resolve a [`KeepSpec`] to a projection length, rejecting anything that is
@@ -165,6 +172,7 @@ pub(crate) fn load_lineage(
         header,
         mut items,
         name,
+        title,
         mode,
         plan,
         effort,
@@ -182,6 +190,7 @@ pub(crate) fn load_lineage(
         parent_model: header.model,
         parent_tip_entry_id: tip_entry_id,
         inherited_name: name,
+        title,
         items,
         mode,
         plan,
@@ -730,6 +739,21 @@ pub(crate) async fn build_acp() -> Result<
                 scaffold.clock.now_ms(),
             );
         }
+        // The title copies forward the same way (0071 T4); a fork inherits
+        // neither label (D-A3).
+        let inherited_title = resumed
+            .as_ref()
+            .filter(|_| !is_fork)
+            .and_then(|r| r.title.clone());
+        if let Some(t) = &inherited_title {
+            let _ = log.append(
+                &hotl_types::EntryPayload::Title { title: t.clone() },
+                scaffold.clock.now_ms(),
+            );
+        }
+        // Title once, on the first completed turn, unless the session already
+        // has a name or a title (a resumed one is never re-titled).
+        let auto_title = scaffold.auto_title && requested.is_none() && inherited_title.is_none();
         // Copy-forward the inherited mode too (same reasoning as the name):
         // this log is now the single-file source of truth for `hotl resume`.
         // An unrecognized mode string (a future build's mode this binary
@@ -854,6 +878,7 @@ pub(crate) async fn build_acp() -> Result<
                         mode: mode_override,
                         plan: plan_override,
                         effort: effort_override,
+                        auto_title,
                     },
                     inherited_todos,
                     inherited_decisions,
@@ -880,6 +905,7 @@ pub(crate) async fn build_acp() -> Result<
             // `session/reload_config`) must name to replay this chain.
             session_id,
             warnings: notices,
+            title: inherited_title,
         })
     });
     Ok((factory, info, warnings))
@@ -1016,6 +1042,9 @@ struct Scaffold {
     /// The resolved `[provider] stream_idle_secs`, advertised at open so the
     /// strip can name the number it is counting toward (0071 T2).
     stream_idle_secs: u64,
+    /// `[behavior] auto_title` (0071 T4): the interactive factory titles a
+    /// session that opens with no name and no title. `-p` never does.
+    auto_title: bool,
     /// The ONE process-wide `SessionConcurrency` (shared `Arc` semaphores) —
     /// cloned into every registration site that needs it (web tools here,
     /// `spawn`'s `agents` permit at session-registration time), never rebuilt.
@@ -1175,6 +1204,7 @@ async fn scaffold(
         spawn_builder,
         sessions_dir,
         stream_idle_secs: cfg.provider.stream_idle().0.as_secs(),
+        auto_title: cfg.behavior.auto_title(),
         concurrency,
         agents_include_claude,
         prefix_stagger,
@@ -1272,6 +1302,7 @@ impl Scaffold {
             mode: mode_override,
             plan: plan_override,
             effort: effort_override,
+            auto_title,
         } = inherited;
         let rules = match (mode_override, plan_override) {
             (None, None) => self.rules.clone(),
@@ -1290,6 +1321,7 @@ impl Scaffold {
         if let Some(e) = effort_override {
             config.effort = e;
         }
+        config.auto_title = auto_title;
         SessionDeps {
             provider: self.provider.clone(),
             registry: self.registry.clone(),
@@ -1564,6 +1596,7 @@ async fn run_session(
                     mode: mode_override,
                     plan: plan_override,
                     effort: effort_override,
+                    auto_title: false,
                 },
                 initial_todos,
                 initial_decisions,
@@ -2990,6 +3023,12 @@ impl Surface {
                 Some(c) => eprintln!("· goal set: {c}"),
                 None => eprintln!("· goal cleared"),
             },
+            // `-p` never titles (0071 T4); the arm exists for the match.
+            EngineEvent::SessionTitled { title, .. } => {
+                if let Some(t) = title {
+                    eprintln!("· titled: {t}");
+                }
+            }
             EngineEvent::GoalVerdict {
                 verdict,
                 reason,
@@ -4542,6 +4581,24 @@ mod fork_tests {
             .unwrap()
             .unwrap();
         assert!(is_fork);
+    }
+
+    /// 0071 T4: a generated title is a label, not an address.
+    #[test]
+    fn resolve_session_ref_never_matches_a_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let (id, mut log) = parent_with_three_turns(dir.path());
+        log.append(
+            &EntryPayload::Title {
+                title: "nightly".into(),
+            },
+            3,
+        )
+        .unwrap();
+        drop(log);
+        let sessions = sessions_newest_first(dir.path());
+        assert!(resolve_session_ref("nightly", &sessions).is_err());
+        assert_eq!(resolve_session_ref(&id[..20], &sessions).unwrap(), id);
     }
 
     #[test]

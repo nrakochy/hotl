@@ -528,6 +528,27 @@ fn retrying_omits_status_when_the_error_had_none() {
     assert_eq!(f["delay_ms"], 900);
 }
 
+/// 0071 T4: `session_titled` carries the title only when there is one, and
+/// always the spend.
+#[test]
+fn session_titled_omits_the_title_when_unusable() {
+    let frame = |title: Option<String>| {
+        wire::update_frame(&EngineEvent::SessionTitled {
+            title,
+            usage: hotl_types::TokenUsage {
+                input_tokens: 7,
+                ..Default::default()
+            },
+        })
+        .expect("session_titled is a stream frame")
+    };
+    let none = frame(None);
+    assert_eq!(none["type"], "session_titled");
+    assert!(none.get("title").is_none(), "{none}");
+    assert_eq!(none["usage"]["input_tokens"], 7);
+    assert_eq!(frame(Some("Fix auth".into()))["title"], "Fix auth");
+}
+
 /// 0071 T1: the request id rides the frame only when the provider sent one.
 #[test]
 fn retrying_omits_request_id_when_the_provider_sent_none() {

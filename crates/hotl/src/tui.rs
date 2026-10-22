@@ -146,9 +146,11 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         effort,
         previous_model,
         warnings,
+        title,
     } = opened;
     state.model = model;
     state.session_name = session_name;
+    state.session_title = title;
     // Server-side truth, seeded before the post-open loop's first draw: the
     // badge must never render a mode the session is not actually running
     // (evaluation §5.7) — pre-open it rendered none at all.
@@ -400,6 +402,9 @@ struct Opened {
     /// Per-session startup notices from the server (an instruction file cut
     /// at its cap, 0070 T9).
     warnings: Vec<String>,
+    /// The generated title a resume restored (0071 T4), shown when there is
+    /// no name.
+    title: Option<String>,
     /// The inherited todo list at open (0040): the engine injects it into
     /// every request, so the client renders it or lies by omission (§5.7).
     todos: Vec<hotl_tools::todo::Todo>,
@@ -489,6 +494,7 @@ async fn handshake(
             .filter_map(Value::as_str)
             .map(String::from)
             .collect(),
+        title: v.get("title").and_then(Value::as_str).map(String::from),
     })
 }
 
@@ -1331,8 +1337,11 @@ fn pick_session(search: Option<&str>) -> Result<String, i32> {
         let from = hotl_store::session_parent(path)
             .map(|p| format!("  ↳ from {}", &p[..p.len().min(8)]))
             .unwrap_or_default();
-        match hotl_store::session_name(path) {
-            Some(name) => eprintln!("  {}) {id}  {name}  {}{from}", i + 1, age(*t)),
+        match picker_label(
+            hotl_store::session_name(path),
+            hotl_store::session_title(path),
+        ) {
+            Some(label) => eprintln!("  {}) {id}  {label}  {}{from}", i + 1, age(*t)),
             None => eprintln!("  {}) {id}  {}{from}", i + 1, age(*t)),
         }
         if let Some(e) = excerpt {
@@ -1351,6 +1360,12 @@ fn pick_session(search: Option<&str>) -> Result<String, i32> {
             Err(2)
         }
     }
+}
+
+/// What the picker prints after the id: the name, else the generated title
+/// marked as such (§5.7 — never claim a title is a name). `None` for neither.
+pub(crate) fn picker_label(name: Option<String>, title: Option<String>) -> Option<String> {
+    name.or_else(|| title.map(|t| format!("{t} (auto)")))
 }
 
 fn age(t: SystemTime) -> String {
@@ -1766,6 +1781,21 @@ mod tests {
         assert_eq!(args.name.as_deref(), Some("fix-auth"));
         assert_eq!(parse_tui_args(&v(&["-n"])).unwrap_err(), 2);
         assert_eq!(parse_tui_args(&v(&["--name", "   "])).unwrap_err(), 2);
+    }
+
+    /// 0071 T4: the picker never claims a title is a name.
+    #[test]
+    fn a_name_outranks_a_title_in_the_picker_label() {
+        let label = super::picker_label;
+        assert_eq!(
+            label(Some("fix-auth".into()), Some("Fix the auth flow".into())).as_deref(),
+            Some("fix-auth")
+        );
+        assert_eq!(
+            label(None, Some("Fix the auth flow".into())).as_deref(),
+            Some("Fix the auth flow (auto)")
+        );
+        assert_eq!(label(None, None), None);
     }
 
     #[test]
