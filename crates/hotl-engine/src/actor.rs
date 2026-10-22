@@ -629,7 +629,6 @@ fn apply_ack(
 pub(crate) struct ActiveModel {
     /// `provider/model` as the log records it (`== model` at startup; the
     /// engine does not know the provider name).
-    #[allow(dead_code)] // read by the switch (0067 T3)
     pub spec: String,
     pub model: String,
     pub provider: Arc<dyn Provider>,
@@ -941,7 +940,6 @@ impl SharedDeps {
 
     /// Install a switched model (0067). The turn that is running keeps its
     /// own `Arc`; the next `Turn::new` reads this one.
-    #[allow(dead_code)] // called by the switch (0067 T3)
     pub(crate) fn set_active(&self, next: Arc<ActiveModel>) {
         *self
             .active
@@ -1252,6 +1250,8 @@ pub(crate) async fn run(
     // A human fold waiting for the turn boundary (0066). Newest wins; a
     // process exit drops it (decision 6).
     let mut pending_fold: Option<FoldRequest> = None;
+    // A `/model` switch waiting for the turn boundary (0067). Newest wins.
+    let mut pending_model: Option<crate::ModelSwitch> = None;
     // Auto-title bookkeeping (0071 T4): at most one title call per process,
     // and a `/rename` that lands first wins over it.
     let mut title = TitleState {
@@ -1500,6 +1500,33 @@ pub(crate) async fn run(
                     )
                     .await;
             }
+            SessionCmd::SetModel { switch, reply } => {
+                let verdict = admit_model_switch(&shared, &head, &switch);
+                match verdict {
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                    Ok(false) => {
+                        let _ = reply.send(Ok(true)); // already the active model
+                    }
+                    Ok(true) if running || awaiting_tool_results(head.items()) => {
+                        pending_model = Some(switch);
+                        let _ = reply.send(Ok(false));
+                    }
+                    Ok(true) => {
+                        apply_model_switch(
+                            &shared,
+                            &mut log,
+                            &mut head,
+                            &mut pipeline,
+                            switch,
+                            &events,
+                        )
+                        .await;
+                        let _ = reply.send(Ok(true));
+                    }
+                }
+            }
             SessionCmd::SetEffort(effort) => {
                 // Same shape as `SetPlan`: atomic first so the next request
                 // carries it, then the durable entry `hotl resume` replays.
@@ -1696,6 +1723,32 @@ pub(crate) async fn run(
                     Boundary::TurnEnded,
                 )
                 .await;
+                // The boundary a parked `/model` lands on (0067): before the
+                // next queued prompt starts. The window check runs again —
+                // the turn that just ended may have grown the projection.
+                if let Some(switch) = pending_model.take() {
+                    match admit_model_switch(&shared, &head, &switch) {
+                        Ok(true) => {
+                            apply_model_switch(
+                                &shared,
+                                &mut log,
+                                &mut head,
+                                &mut pipeline,
+                                switch,
+                                &events,
+                            )
+                            .await;
+                        }
+                        Ok(false) => {}
+                        Err(reason) => {
+                            let _ = events
+                                .send(EngineEvent::FoldSkipped {
+                                    reason: format!("model switch dropped — {reason}"),
+                                })
+                                .await;
+                        }
+                    }
+                }
                 on_turn_finished(
                     TurnFinishedCtx {
                         shared: &shared,
@@ -1770,6 +1823,74 @@ struct TurnFinishedCtx<'a> {
     cmd_tx: &'a mpsc::WeakSender<SessionCmd>,
     events: &'a mpsc::Sender<EngineEvent>,
     current_turn: &'a Arc<Mutex<CancellationToken>>,
+}
+
+/// Whether a switch may be applied (0067): `Ok(false)` = it is already the
+/// active model (nothing to do); `Err` = the projection would not fit the
+/// new window (decision 4: refuse with the numbers, never 400 later).
+fn admit_model_switch(
+    shared: &SharedDeps,
+    head: &Head,
+    switch: &crate::ModelSwitch,
+) -> Result<bool, String> {
+    let active = shared.active();
+    if switch.spec == active.spec {
+        return Ok(false);
+    }
+    let window = switch.profile.context_window.max(1);
+    let limit = (window as f64 * crate::turn::COMPACT_TRIGGER) as u64;
+    if head.estimated > limit {
+        return Err(format!(
+            "context ~{} tok exceeds {}'s {} tok window (80% = {} tok) — fold first (/compact) \
+             or pick a larger model",
+            head.estimated, switch.spec, window, limit
+        ));
+    }
+    Ok(true)
+}
+
+/// Install the switch: swap the active model, then the durable `ModelSet`,
+/// then the event — a reader of the log sees the entry before any item the
+/// new model produced (0067 decision 9).
+async fn apply_model_switch(
+    shared: &Arc<SharedDeps>,
+    log: &mut SessionLog,
+    head: &mut Head,
+    pipeline: &mut Pipeline,
+    switch: crate::ModelSwitch,
+    events: &mpsc::Sender<EngineEvent>,
+) {
+    let current = shared.active();
+    let dialect_changed = current.dialect_changed || switch.provider.is_some();
+    let next = Arc::new(ActiveModel {
+        spec: switch.spec.clone(),
+        model: switch.model,
+        provider: switch
+            .provider
+            .unwrap_or_else(|| Arc::clone(&current.provider)),
+        profile: switch.profile,
+        dialect_changed,
+    });
+    let context_window = next.profile.context_window;
+    shared.set_active(Arc::clone(&next));
+    let _ = shared
+        .append(
+            log,
+            pipeline,
+            head,
+            EntryPayload::ModelSet {
+                model: switch.spec.clone(),
+            },
+        )
+        .await;
+    let _ = events
+        .send(EngineEvent::ModelChanged {
+            model: switch.spec,
+            previous: current.spec.clone(),
+            context_tokens: head.estimated,
+            context_window,
+        })
+        .await;
 }
 
 /// A human fold parked until the turn boundary (0066). Distinct from "nothing

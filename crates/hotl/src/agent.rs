@@ -2974,6 +2974,15 @@ impl Surface {
             }
             // Nothing in `-p` can request a fold; the match stays honest.
             EngineEvent::FoldSkipped { reason } => eprintln!("(nothing to fold: {reason})"),
+            EngineEvent::ModelChanged {
+                model,
+                previous,
+                context_tokens,
+                ..
+            } => eprintln!(
+                "(model → {model}, was {previous}; the prompt cache is cold: ~{context_tokens} \
+                 tok rebuild on the next turn)"
+            ),
             EngineEvent::Cleared { count } => {
                 eprintln!("(cleared {count} old tool results — recall fetches any of them back)")
             }

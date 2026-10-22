@@ -560,6 +560,15 @@ pub enum EngineEvent {
     FallbackModel {
         model: String,
     },
+    /// A `/model` switch was applied (0067): the next request runs `model`.
+    /// `context_tokens` is the projection's estimate at apply time — what
+    /// the cold prompt cache rebuilds; `context_window` is the new model's.
+    ModelChanged {
+        model: String,
+        previous: String,
+        context_tokens: u64,
+        context_window: u64,
+    },
     PromptQueued,
     /// A session spend budget crossed one of its thresholds (0059 T5).
     /// Fires once per threshold per session; `pct` is 50, 80 or 100.
@@ -719,6 +728,7 @@ impl std::fmt::Debug for EngineEvent {
             Self::Delegation { subagent_runs, .. } => write!(f, "Delegation({subagent_runs})"),
             Self::Retrying { attempt, scope, .. } => write!(f, "Retrying({attempt},{scope:?})"),
             Self::FallbackModel { model } => write!(f, "FallbackModel({model})"),
+            Self::ModelChanged { model, .. } => write!(f, "ModelChanged({model})"),
             Self::PromptQueued => write!(f, "PromptQueued"),
             Self::BudgetNotice { pct, .. } => write!(f, "BudgetNotice({pct}%)"),
             Self::Compacted { degraded, .. } => write!(f, "Compacted({degraded})"),
@@ -1087,6 +1097,14 @@ pub enum SessionCmd {
     /// `EffortSet`; takes effect on the next request). `None` = the provider's
     /// own default, which must round-trip so a user can clear the setting.
     SetEffort(Option<Effort>),
+    /// Switch the session model (`/model`, `session/set_model`; 0067). Idle:
+    /// applied now (`Ok(true)`). Running or awaiting tool results: parked
+    /// for the turn boundary (`Ok(false)`); a later switch replaces it. A
+    /// switch whose window cannot hold the projection is refused (`Err`).
+    SetModel {
+        switch: ModelSwitch,
+        reply: oneshot::Sender<Result<bool, String>>,
+    },
     /// Full-state replace of the `todo_write` checklist (durable: appended
     /// to the log as `Todos`, last-wins on replay — same shape as
     /// `Rename`/`SetMode`). The actor is the list's sole owner; the tool
@@ -1333,6 +1351,18 @@ impl SessionHandle {
     /// `None` restores the provider's own default.
     pub async fn set_effort(&self, effort: Option<Effort>) {
         let _ = self.cmd.send(SessionCmd::SetEffort(effort)).await;
+    }
+    /// Switch the session model (0067). `Ok(true)` applied now, `Ok(false)`
+    /// parked for the turn boundary, `Err` refused (the projection would not
+    /// fit the new window) or the session is gone.
+    pub async fn set_model(&self, switch: ModelSwitch) -> Result<bool, String> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd
+            .send(SessionCmd::SetModel { switch, reply: tx })
+            .await
+            .map_err(|_| "the session is gone".to_string())?;
+        rx.await
+            .unwrap_or_else(|_| Err("the session is gone".to_string()))
     }
     /// Full-state replace of the todo checklist (a durable `todos` log
     /// entry). Exposed mainly for tests that pre-seed a list; the real

@@ -209,6 +209,20 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             v
         }
         EngineEvent::FoldSkipped { reason } => json!({"type": "fold_skipped", "reason": reason}),
+        // Additive (0067): the next request runs `model`; `context_tokens` is
+        // what the cold prompt cache rebuilds.
+        EngineEvent::ModelChanged {
+            model,
+            previous,
+            context_tokens,
+            context_window,
+        } => json!({
+            "type": "model_changed",
+            "model": model,
+            "previous": previous,
+            "context_tokens": context_tokens,
+            "context_window": context_window,
+        }),
         EngineEvent::Cleared { count } => json!({"type": "cleared", "count": count}),
         EngineEvent::TodosChanged { items } => json!({"type": "todos_changed", "items": items}),
         // 0056 T3. `nodes` carries the same `Todo` shape `todos_changed`

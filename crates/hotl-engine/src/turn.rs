@@ -24,7 +24,7 @@ use crate::{AskReply, EngineEvent, Outcome, SessionCmd, TurnEnd};
 
 /// Compaction triggers when the estimated next request crosses this share of
 /// the window (M2; the estimate overcounts, so the miss direction is early).
-const COMPACT_TRIGGER: f64 = 0.8;
+pub(crate) const COMPACT_TRIGGER: f64 = 0.8;
 /// Speculative compaction starts here: the digest summarize fires in the
 /// background so it is (usually) already done when [`COMPACT_TRIGGER`] hits,
 /// and the fold needs no blocking model call.
@@ -1389,9 +1389,13 @@ impl Turn {
         // the ephemeral tail is a separate channel and can never slip into
         // the count (T2-1).
         self.anchor = Some((reported, snapshot.durable.len() + 1));
+        // The dispatched model (0067): the session's, or the fallback the
+        // turn walked to. Stamped once here — the projected tail and the
+        // committed item are the same value, so speculation's leaf check
+        // (`is_structural_prefix`) keeps matching.
         let assistant = Item::Assistant {
             blocks: blocks.clone(),
-            model: None,
+            model: Some(self.models[self.model_idx].clone()),
         };
         self.projected_tail.push(Arc::new(assistant.clone()));
         self.ledger.stamp(Phase::BatchProposed);

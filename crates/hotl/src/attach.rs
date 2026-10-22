@@ -348,6 +348,7 @@ fn update_line(update: &Value) -> Option<String> {
             "fallback_model" => format!("· model fallback → {}", s("model")),
             "prompt_queued" => "· queued".to_string(),
             "fold_skipped" => format!("(fold skipped: {})", s("reason")),
+            "model_changed" => format!("· model → {} (was {})", s("model"), s("previous")),
             "compacted" => {
                 let focus = update
                     .get("focus")
@@ -526,6 +527,12 @@ mod tests {
             },
             EngineEvent::FoldSkipped {
                 reason: "nothing".into(),
+            },
+            EngineEvent::ModelChanged {
+                model: "openai/gpt-5".into(),
+                previous: "m".into(),
+                context_tokens: 12,
+                context_window: 200_000,
             },
             EngineEvent::TodosChanged { items: Vec::new() },
             EngineEvent::GoalChanged {

@@ -124,6 +124,12 @@ fn every_frame_is_tagged_and_versioned() {
         EngineEvent::FoldSkipped {
             reason: "nothing".into(),
         },
+        EngineEvent::ModelChanged {
+            model: "openai/gpt-5".into(),
+            previous: "m".into(),
+            context_tokens: 12,
+            context_window: 200_000,
+        },
         EngineEvent::TodosChanged { items: Vec::new() },
         EngineEvent::PlanPresented {
             summary: "swap the parser".into(),
