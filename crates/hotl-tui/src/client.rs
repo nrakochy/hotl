@@ -339,6 +339,7 @@ pub fn translate(
     msg: ServerMsg,
     prompt_ids: &mut VecDeque<u64>,
     steer_ids: &mut VecDeque<u64>,
+    model_ids: &mut VecDeque<u64>,
 ) -> Option<Msg> {
     match msg {
         ServerMsg::Update(v) => Some(Msg::Update(v)),
@@ -361,6 +362,10 @@ pub fn translate(
             if let Some(pos) = prompt_ids.iter().position(|&p| p == id) {
                 prompt_ids.remove(pos);
                 return Some(prompt_result_msg(result));
+            }
+            if let Some(pos) = model_ids.iter().position(|&p| p == id) {
+                model_ids.remove(pos);
+                return Some(Msg::ModelAck { result });
             }
             let pos = steer_ids.iter().position(|&p| p == id)?;
             steer_ids.remove(pos);
@@ -412,6 +417,7 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
     client: &mut AcpClient<W>,
     prompt_ids: &mut VecDeque<u64>,
     steer_ids: &mut VecDeque<u64>,
+    model_ids: &mut VecDeque<u64>,
 ) -> io::Result<Option<Cmd>> {
     match cmd {
         Cmd::SendPrompt(p) => {
@@ -445,6 +451,14 @@ pub async fn exec_wire_cmd<W: AsyncWrite + Unpin>(
             client
                 .request("session/set_effort", json!({"effort": wire}))
                 .await?;
+        }
+        // The ack is read (0067): queued-or-applied, warnings, or a refusal.
+        Cmd::SetModel(spec) => {
+            model_ids.push_back(
+                client
+                    .request("session/set_model", json!({"model": spec}))
+                    .await?,
+            );
         }
         // The ack is noise like set_mode: the engine's `goal_changed`
         // broadcast is what corrects the optimistic update. `None` rides as
@@ -554,7 +568,7 @@ mod tests {
                 outcome_kind,
                 outcome_text,
                 ..
-            }) = translate(msg, &mut ids, &mut steer_ids)
+            }) = translate(msg, &mut ids, &mut steer_ids, &mut VecDeque::new())
             else {
                 panic!("not a prompt result")
             };
@@ -574,7 +588,7 @@ mod tests {
             id: 99,
             result: Ok(json!({"ok": true})),
         };
-        assert!(translate(ack, &mut ids, &mut steer_ids).is_none());
+        assert!(translate(ack, &mut ids, &mut steer_ids, &mut VecDeque::new()).is_none());
         assert_eq!(ids.len(), 1, "an unrelated ack consumes no prompt id");
     }
 
@@ -586,7 +600,8 @@ mod tests {
             id: 7,
             result: Err("images[0] is empty".into()),
         };
-        let Some(Msg::SteerRejected { why }) = translate(msg, &mut prompt_ids, &mut steer_ids)
+        let Some(Msg::SteerRejected { why }) =
+            translate(msg, &mut prompt_ids, &mut steer_ids, &mut VecDeque::new())
         else {
             panic!("a steer error must become a message");
         };
@@ -602,7 +617,7 @@ mod tests {
             id: 7,
             result: Ok(Value::Null),
         };
-        assert!(translate(msg, &mut prompt_ids, &mut steer_ids).is_none());
+        assert!(translate(msg, &mut prompt_ids, &mut steer_ids, &mut VecDeque::new()).is_none());
         assert!(steer_ids.is_empty(), "the id is consumed either way");
     }
 
@@ -645,9 +660,15 @@ mod tests {
 
         let mut ids = VecDeque::new();
         let mut steer_ids = VecDeque::new();
-        let err = exec_wire_cmd(Cmd::ReloadConfig, &mut client, &mut ids, &mut steer_ids)
-            .await
-            .expect_err("the failure propagates through the dispatcher");
+        let err = exec_wire_cmd(
+            Cmd::ReloadConfig,
+            &mut client,
+            &mut ids,
+            &mut steer_ids,
+            &mut VecDeque::new(),
+        )
+        .await
+        .expect_err("the failure propagates through the dispatcher");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
     }
 
@@ -1019,10 +1040,16 @@ mod tests {
         let mut ids = VecDeque::new();
         let mut steer_ids = VecDeque::new();
         assert!(
-            exec_wire_cmd(Cmd::ReloadConfig, &mut client, &mut ids, &mut steer_ids)
-                .await
-                .expect("the write succeeded")
-                .is_none(),
+            exec_wire_cmd(
+                Cmd::ReloadConfig,
+                &mut client,
+                &mut ids,
+                &mut steer_ids,
+                &mut VecDeque::new()
+            )
+            .await
+            .expect("the write succeeded")
+            .is_none(),
             "the wire half handles it; nothing returns to the runtime"
         );
         assert!(
@@ -1047,9 +1074,15 @@ mod tests {
         let mut ids = VecDeque::new();
         let mut steer_ids = VecDeque::new();
         assert_eq!(
-            exec_wire_cmd(Cmd::ReloadSettings, &mut client, &mut ids, &mut steer_ids)
-                .await
-                .expect("the write succeeded"),
+            exec_wire_cmd(
+                Cmd::ReloadSettings,
+                &mut client,
+                &mut ids,
+                &mut steer_ids,
+                &mut VecDeque::new()
+            )
+            .await
+            .expect("the write succeeded"),
             Some(Cmd::ReloadSettings)
         );
     }

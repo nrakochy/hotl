@@ -233,11 +233,12 @@ async fn exec(
     client: &mut Client,
     prompt_ids: &mut VecDeque<u64>,
     steer_ids: &mut VecDeque<u64>,
+    model_ids: &mut VecDeque<u64>,
 ) {
     for cmd in cmds {
         // The terminal-bound remainder (title, editor, history, quit) has no
         // meaning in a headless test; the runtime handles those.
-        let _ = exec_wire_cmd(cmd, client, prompt_ids, steer_ids)
+        let _ = exec_wire_cmd(cmd, client, prompt_ids, steer_ids, model_ids)
             .await
             .expect("the duplex write succeeded");
     }
@@ -296,13 +297,14 @@ async fn type_prompt(
     client: &mut Client,
     prompt_ids: &mut VecDeque<u64>,
     steer_ids: &mut VecDeque<u64>,
+    model_ids: &mut VecDeque<u64>,
     text: &str,
 ) {
     for c in text.chars() {
         press(state, KeyCode::Char(c));
     }
     let cmds = press(state, KeyCode::Enter);
-    exec(cmds, client, prompt_ids, steer_ids).await;
+    exec(cmds, client, prompt_ids, steer_ids, model_ids).await;
 }
 
 #[tokio::test]
@@ -311,12 +313,14 @@ async fn prompt_stream_ask_allow_done_golden() {
     let mut state = State::new(true, "m".into());
     let mut prompt_ids = VecDeque::new();
     let mut steer_ids = VecDeque::new();
+    let mut model_ids = VecDeque::new();
 
     type_prompt(
         &mut state,
         &mut client,
         &mut prompt_ids,
         &mut steer_ids,
+        &mut model_ids,
         "go",
     )
     .await;
@@ -328,13 +332,25 @@ async fn prompt_stream_ask_allow_done_golden() {
 
     let mut saw_streaming_strip = false;
     loop {
-        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids, &mut steer_ids) else {
+        let Some(msg) = translate(
+            next(&mut reader).await,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        ) else {
             continue;
         };
         let is_ask = matches!(msg, Msg::PermissionRequest { .. });
         let is_result = matches!(msg, Msg::PromptResult { .. });
         let cmds = update(&mut state, msg);
-        exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+        exec(
+            cmds,
+            &mut client,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        )
+        .await;
         if is_ask {
             let rows = draw(&state);
             assert!(
@@ -353,7 +369,14 @@ async fn prompt_stream_ask_allow_done_golden() {
                 cmds[..],
                 [Cmd::ReplyPermission { allow: true, .. }, ..]
             ));
-            exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+            exec(
+                cmds,
+                &mut client,
+                &mut prompt_ids,
+                &mut steer_ids,
+                &mut model_ids,
+            )
+            .await;
         }
         if matches!(state.phase, Phase::Streaming { chars, .. } if chars > 0)
             && !saw_streaming_strip
@@ -404,6 +427,7 @@ async fn dropped_image_paste_compacts_and_echoes_golden() {
     let mut state = State::new(true, "m".into());
     let mut prompt_ids = VecDeque::new();
     let mut steer_ids = VecDeque::new();
+    let mut model_ids = VecDeque::new();
 
     update(&mut state, Msg::Paste("/tmp/shot.png ".into()));
     for c in " what is this?".chars() {
@@ -416,7 +440,14 @@ async fn dropped_image_paste_compacts_and_echoes_golden() {
     );
 
     let cmds = press(&mut state, KeyCode::Enter);
-    exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+    exec(
+        cmds,
+        &mut client,
+        &mut prompt_ids,
+        &mut steer_ids,
+        &mut model_ids,
+    )
+    .await;
     let rows = draw(&state);
     assert!(
         rows.iter()
@@ -437,18 +468,25 @@ async fn ask_user_option_pick_golden() {
     let mut state = State::new(true, "m".into());
     let mut prompt_ids = VecDeque::new();
     let mut steer_ids = VecDeque::new();
+    let mut model_ids = VecDeque::new();
 
     type_prompt(
         &mut state,
         &mut client,
         &mut prompt_ids,
         &mut steer_ids,
+        &mut model_ids,
         "go",
     )
     .await;
 
     loop {
-        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids, &mut steer_ids) else {
+        let Some(msg) = translate(
+            next(&mut reader).await,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        ) else {
             continue;
         };
         assert!(
@@ -458,7 +496,14 @@ async fn ask_user_option_pick_golden() {
         let is_question = matches!(msg, Msg::QuestionRequest { .. });
         let is_result = matches!(msg, Msg::PromptResult { .. });
         let cmds = update(&mut state, msg);
-        exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+        exec(
+            cmds,
+            &mut client,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        )
+        .await;
         if is_question {
             let rows = draw(&state);
             let all = rows.join("\n");
@@ -476,7 +521,14 @@ async fn ask_user_option_pick_golden() {
                 [Cmd::ReplyQuestion { selected, free_text: None, .. }, ..]
                 if selected == &vec!["MVP".to_string()]
             ));
-            exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+            exec(
+                cmds,
+                &mut client,
+                &mut prompt_ids,
+                &mut steer_ids,
+                &mut model_ids,
+            )
+            .await;
         }
         if is_result {
             break;
@@ -497,23 +549,37 @@ async fn deny_with_reason_reaches_engine() {
     let mut state = State::new(true, "m".into());
     let mut prompt_ids = VecDeque::new();
     let mut steer_ids = VecDeque::new();
+    let mut model_ids = VecDeque::new();
 
     type_prompt(
         &mut state,
         &mut client,
         &mut prompt_ids,
         &mut steer_ids,
+        &mut model_ids,
         "go",
     )
     .await;
     loop {
-        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids, &mut steer_ids) else {
+        let Some(msg) = translate(
+            next(&mut reader).await,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        ) else {
             continue;
         };
         let is_ask = matches!(msg, Msg::PermissionRequest { .. });
         let is_result = matches!(msg, Msg::PromptResult { .. });
         let cmds = update(&mut state, msg);
-        exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+        exec(
+            cmds,
+            &mut client,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        )
+        .await;
         if is_ask {
             press(&mut state, KeyCode::Char('n'));
             for c in "wrong dir".chars() {
@@ -522,7 +588,14 @@ async fn deny_with_reason_reaches_engine() {
             let cmds = press(&mut state, KeyCode::Enter);
             assert!(matches!(&cmds[..],
                 [Cmd::ReplyPermission { allow: false, message: Some(m), .. }, ..] if m == "wrong dir"));
-            exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+            exec(
+                cmds,
+                &mut client,
+                &mut prompt_ids,
+                &mut steer_ids,
+                &mut model_ids,
+            )
+            .await;
         }
         if is_result {
             break;
@@ -551,26 +624,47 @@ async fn drag_select_copies_transcript_prose_without_the_spine_golden() {
     let mut state = State::new(true, "m".into());
     let mut prompt_ids = VecDeque::new();
     let mut steer_ids = VecDeque::new();
+    let mut model_ids = VecDeque::new();
 
     type_prompt(
         &mut state,
         &mut client,
         &mut prompt_ids,
         &mut steer_ids,
+        &mut model_ids,
         "go",
     )
     .await;
     loop {
-        let Some(msg) = translate(next(&mut reader).await, &mut prompt_ids, &mut steer_ids) else {
+        let Some(msg) = translate(
+            next(&mut reader).await,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        ) else {
             continue;
         };
         let is_ask = matches!(msg, Msg::PermissionRequest { .. });
         let is_result = matches!(msg, Msg::PromptResult { .. });
         let cmds = update(&mut state, msg);
-        exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+        exec(
+            cmds,
+            &mut client,
+            &mut prompt_ids,
+            &mut steer_ids,
+            &mut model_ids,
+        )
+        .await;
         if is_ask {
             let cmds = press(&mut state, KeyCode::Char('y'));
-            exec(cmds, &mut client, &mut prompt_ids, &mut steer_ids).await;
+            exec(
+                cmds,
+                &mut client,
+                &mut prompt_ids,
+                &mut steer_ids,
+                &mut model_ids,
+            )
+            .await;
         }
         if is_result {
             break;

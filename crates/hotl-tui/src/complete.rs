@@ -27,12 +27,16 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 16] = [
+const BUILTINS: [(&str, &str); 17] = [
     ("rename", "name this session"),
     ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
     ("goal", "run until a condition is met"),
     ("effort", "set reasoning depth"),
+    (
+        "model",
+        "switch the session model (provider/model, or default)",
+    ),
     ("reload", "re-read config.toml"),
     ("help", "show the key bindings"),
     ("status", "what this session is running"),
@@ -207,6 +211,14 @@ mod tests {
     }
 
     /// 0047 P0 T3: `/effort` was dispatched but never offered.
+    /// 0067: `/model` is offered; `/mod` lists both `mode` and `model`.
+    #[test]
+    fn model_is_offered_from_slash() {
+        let cmds = builtins();
+        let c = recompute(&cmds, "/model", (0, 6), false).expect("popup");
+        assert_eq!(names(&cmds, &c), vec!["model"]);
+    }
+
     #[test]
     fn effort_is_offered_from_slash() {
         let cmds = builtins();
@@ -230,6 +242,7 @@ mod tests {
                 "plan",
                 "quit",
                 "clear",
+                "model",
                 "effort",
                 "reload",
                 "rename",
@@ -284,7 +297,7 @@ mod tests {
         let c = recompute(&cmds, "/mod", (0, 4), false).expect("open");
         assert_eq!(
             names(&cmds, &c),
-            vec!["mod", "mode"],
+            vec!["mod", "mode", "model"],
             "the shorter skill name must sort ahead of the longer builtin"
         );
         assert_eq!(c.selected, 0);

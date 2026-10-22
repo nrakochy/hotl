@@ -539,6 +539,7 @@ async fn run_loop(
 ) -> io::Result<i32> {
     let mut prompt_ids: VecDeque<u64> = VecDeque::new();
     let mut steer_ids: VecDeque<u64> = VecDeque::new();
+    let mut model_ids: VecDeque<u64> = VecDeque::new();
     // The animation's own rate, armed only while a turn runs — idle schedules
     // no wakeups, which is also why the idle wave is a frozen frame.
     let mut ticker = tokio::time::interval(Duration::from_millis(1_000 / hotl_tui::anim::TICK_HZ));
@@ -572,7 +573,8 @@ async fn run_loop(
                 Cmd::SendSteer(p) => Cmd::SendSteer(outbound(p).await),
                 other => other,
             };
-            let Some(cmd) = exec_wire_cmd(cmd, client, &mut prompt_ids, &mut steer_ids).await?
+            let Some(cmd) =
+                exec_wire_cmd(cmd, client, &mut prompt_ids, &mut steer_ids, &mut model_ids).await?
             else {
                 continue;
             };
@@ -668,7 +670,7 @@ async fn run_loop(
                 )),
             },
             sm = read_server_msg(reader) => match sm {
-                Some(m) => translate(m, &mut prompt_ids, &mut steer_ids),
+                Some(m) => translate(m, &mut prompt_ids, &mut steer_ids, &mut model_ids),
                 None => return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     "the session server closed the connection",

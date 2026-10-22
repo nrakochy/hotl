@@ -878,6 +878,11 @@ pub enum Msg {
     SteerRejected {
         why: String,
     },
+    /// `session/set_model`'s ack (0067): `Ok` carries `applied`, `model` and
+    /// `warnings`; `Err` the resolver's or the engine's refusal.
+    ModelAck {
+        result: Result<serde_json::Value, String>,
+    },
     Key(KeyEvent),
     /// Bracketed-paste payload. Literal text, never keys — see `Msg::Key`.
     /// A multi-line paste used to arrive as one `Enter` per line and submit
@@ -938,6 +943,10 @@ pub enum Cmd {
     /// Send `session/set_effort` (fire-and-forget). `None` = back to the
     /// provider's default, sent as the wire word `"default"`.
     SetEffort(Option<String>),
+    /// Send `session/set_model` (0067). Not optimistic: the engine's
+    /// `model_changed` event is the only thing that moves the strip; the ack
+    /// comes back as `Msg::ModelAck` (queued, warnings, or the error).
+    SetModel(String),
     /// Send `session/set_goal` (fire-and-forget; the ack is noise — the
     /// engine's `goal_changed` broadcast is what corrects the optimism).
     /// `None` clears.
@@ -1029,6 +1038,7 @@ fn from_wire(msg: &Msg) -> bool {
             | Msg::EgressRequest { .. }
             | Msg::PromptResult { .. }
             | Msg::SteerRejected { .. }
+            | Msg::ModelAck { .. }
     )
 }
 
@@ -1151,6 +1161,30 @@ pub fn update(state: &mut State, msg: Msg) -> Vec<Cmd> {
             usage,
             finished_at,
         } => on_prompt_result(state, &outcome_kind, outcome_text, &usage, finished_at),
+        Msg::ModelAck { result } => {
+            match result {
+                Ok(v) => {
+                    let model = v.get("model").and_then(Value::as_str).unwrap_or("?");
+                    if v.get("applied").and_then(Value::as_bool) == Some(false) {
+                        notice(
+                            state,
+                            format!("model → {model} queued for the turn boundary"),
+                        );
+                    }
+                    for w in v
+                        .get("warnings")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        notice(state, w.to_string());
+                    }
+                }
+                Err(e) => notice(state, e),
+            }
+            Vec::new()
+        }
         Msg::SteerRejected { why } => {
             clear_newest_queued_steer(state);
             notice(state, format!("steer rejected: {why}"));
@@ -1801,6 +1835,34 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         "fallback_model" => {
             state.model = text_of("model");
             notice(state, format!("model fallback → {}", state.model));
+        }
+        // `/model` applied (0067): server-driven like `fallback_model`. The
+        // frame carries the new window so the ctx chip divides by what the
+        // engine uses, and the cache cost the next turn pays.
+        "model_changed" => {
+            state.model = text_of("model");
+            if let Some(w) = v.get("context_window").and_then(Value::as_u64) {
+                if w > 0 {
+                    state.context_window = w;
+                }
+            }
+            let rebuild = v.get("context_tokens").and_then(Value::as_u64).unwrap_or(0);
+            notice(
+                state,
+                format!(
+                    "model → {} · prefix cache cold: ~{} tok rebuild on the next turn",
+                    state.model,
+                    tok(rebuild)
+                ),
+            );
+            return title_cmds(
+                state,
+                if state.phase == Phase::Idle {
+                    ""
+                } else {
+                    " — working"
+                },
+            );
         }
         // Server-side truth, not a client guess: the badge showed "ask" while
         // the shipped default ran "bypass" (evaluation §5.7). Optimistic
@@ -2847,6 +2909,16 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
         }
         // Reports rather than cycles when bare: a five-rung cycle is
         // unguessable, unlike `/plan`'s two-state toggle.
+        // `/model [provider/model|default]` (0067): bare reports; a spec is
+        // sent and NOT shown on the strip until the engine says it applied.
+        "model" => match arg.trim() {
+            "" => {
+                let report = format!("model {}", state.model);
+                notice(state, report);
+                Vec::new()
+            }
+            spec => vec![Cmd::SetModel(spec.to_string())],
+        },
         "effort" => match arg.trim() {
             "" => {
                 let report = format!("effort {}", effort_report(state));
@@ -7085,8 +7157,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Sixteen built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(17));
+        // Seventeen built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(18));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename` and `review` prefix-match, then the `refactor`
@@ -7456,6 +7528,88 @@ mod tests {
     }
 
     /// No cycling: five rungs are unguessable, unlike `/plan`'s two states.
+    /// 0067: `/model` reports bare, sends a spec without touching the strip,
+    /// and the engine's `model_changed` is what moves it — with the cache cost.
+    #[test]
+    fn slash_model_bare_reports_and_emits_no_cmd() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/model");
+        assert!(cmds.is_empty(), "got {cmds:?}");
+        assert_eq!(last_notice(&s), "model test-model");
+    }
+
+    #[test]
+    fn slash_model_emits_set_model_without_touching_the_strip() {
+        let mut s = State::test_default();
+        let cmds = type_and_submit(&mut s, "/model openai-responses/gpt-5.6");
+        assert_eq!(cmds, vec![Cmd::SetModel("openai-responses/gpt-5.6".into())]);
+        assert_eq!(s.model, "test-model", "no optimistic update");
+    }
+
+    #[test]
+    fn slash_model_default_emits_the_default_word() {
+        let mut s = State::test_default();
+        assert_eq!(
+            type_and_submit(&mut s, "/model default"),
+            vec![Cmd::SetModel("default".into())]
+        );
+    }
+
+    #[test]
+    fn model_changed_updates_the_strip_and_says_the_cache_cost() {
+        let mut s = State::test_default();
+        let cmds = upd(
+            &mut s,
+            json!({"type":"model_changed","model":"openai/gpt-5","previous":"test-model",
+                   "context_tokens":41_000,"context_window":400_000}),
+        );
+        assert_eq!(s.model, "openai/gpt-5");
+        assert_eq!(s.context_window, 400_000);
+        assert_eq!(
+            last_notice(&s),
+            "model → openai/gpt-5 · prefix cache cold: ~41.0k tok rebuild on the next turn"
+        );
+        assert!(cmds.iter().any(|c| matches!(c, Cmd::SetTitle(_))));
+    }
+
+    #[test]
+    fn a_queued_ack_notices_the_boundary() {
+        let mut s = State::test_default();
+        update(
+            &mut s,
+            Msg::ModelAck {
+                result: Ok(json!({"ok": true, "model": "anthropic/x", "applied": false,
+                                  "warnings": ["`x` is not in the catalog"]})),
+            },
+        );
+        let notices: Vec<String> = s
+            .transcript
+            .iter()
+            .filter_map(|i| match i {
+                TranscriptItem::Notice { text } => Some(text.as_str().to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            vec![
+                "model → anthropic/x queued for the turn boundary".to_string(),
+                "`x` is not in the catalog".to_string()
+            ]
+        );
+        assert_eq!(s.model, "test-model", "the ack never moves the strip");
+        update(
+            &mut s,
+            Msg::ModelAck {
+                result: Err("session/set_model: unknown provider `nope`".into()),
+            },
+        );
+        assert_eq!(
+            last_notice(&s),
+            "session/set_model: unknown provider `nope`"
+        );
+    }
+
     #[test]
     fn slash_effort_bare_reports_and_emits_no_cmd() {
         let mut s = State::test_default();
