@@ -86,7 +86,7 @@ fn scripted_factory_recording(
                 name
             }
         };
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::tool_call("t1", "bash", json!({"command": "echo hi"})),
@@ -148,7 +148,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
                 .unwrap()
                 .push(format!("fork:{session_id}:{keep:?}")),
         }
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
@@ -343,7 +343,7 @@ async fn keep_params_are_rejected_without_a_fork_and_against_each_other() {
 /// reply must surface so the status strip is true at open (§5.7).
 fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactory {
     Box::new(move |_spec| {
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         let todos = vec![hotl_types::Todo {
             content: "wire the gate".into(),
@@ -912,7 +912,7 @@ async fn initialize_new_prompt_permission_and_result() {
 #[tokio::test]
 async fn overlapping_prompts_resolve_in_order() {
     let factory: acp::SessionFactory = Box::new(|_spec| {
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         let provider = Arc::new(ScriptedProvider::new(vec![
             ScriptedProvider::text_reply("first turn"),
@@ -1132,7 +1132,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             acp::SessionSpec::New { name } => name,
             acp::SessionSpec::Load { name, .. } | acp::SessionSpec::Fork { name, .. } => name,
         };
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {
@@ -1304,7 +1304,7 @@ async fn named_open_and_rename() {
 #[tokio::test]
 async fn ask_user_round_trip_via_session_request_question() {
     let factory: acp::SessionFactory = Box::new(|_spec| {
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         let (cmd_tx, cmd_rx) = hotl_engine::session_channel();
         let (event_tx, event_rx) = hotl_engine::event_channel();
@@ -1828,7 +1828,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             acp::SessionSpec::Load { .. } => Some("all tests pass".to_string()),
             acp::SessionSpec::New { .. } | acp::SessionSpec::Fork { .. } => None,
         };
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 0).expect("log");
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
             handle: spawn_session(SessionDeps {

@@ -159,6 +159,7 @@ fn print_help() {
          \x20                   --keep <items> / --keep-turns <n> fork at a prefix instead of the head\n  \
          hotl -p \"prompt\"     headless one-shot (--json for events; --json-schema <f> for validated JSON)\n  \
          \x20                   --goal <condition> keeps the turn going until a fast evaluator judges it met\n  \
+         \x20                   --ephemeral keeps no session: the log lives in a temp dir and is removed at exit\n  \
          hotl --goal \"<cond>\"   headless goal loop with the condition as the prompt (no -p needed)\n  \
          hotl bg [prompt]     background a session (detached socket server; attach later)\n  \
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \

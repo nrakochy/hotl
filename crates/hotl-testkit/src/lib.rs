@@ -356,8 +356,8 @@ impl Harness {
     ) -> Self {
         // The store's own throwaway log: one discipline for "where does a
         // temp log live", shared with `hotl -p --ephemeral`.
-        let mut log =
-            SessionLog::create_ephemeral(&config.model, Masker::empty(), 0).expect("session log");
+        let mut log = SessionLog::create_ephemeral(&config.model, None, Masker::empty(), 0)
+            .expect("session log");
         let dir = log.dir().to_path_buf();
         if sync_noop {
             log.set_sync_noop(true);

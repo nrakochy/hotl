@@ -381,12 +381,43 @@ pub(crate) fn create_session_log(
     lineage: Option<&Resumed>,
     is_fork: bool,
 ) -> Result<SessionLog, String> {
+    create_session_log_in(
+        LogHome::Store(sessions_dir),
+        model,
+        masker,
+        now_ms,
+        lineage,
+        is_fork,
+    )
+}
+
+/// Where a headless run's log lives: the real store, or a temp dir that
+/// vanishes at exit (`-p --ephemeral`).
+#[derive(Clone, Copy)]
+pub(crate) enum LogHome<'a> {
+    Store(&'a std::path::Path),
+    Ephemeral,
+}
+
+/// `create_session_log` with the ephemeral choice. The lineage, if any, is
+/// still read from the real store; only the new log moves.
+pub(crate) fn create_session_log_in(
+    home: LogHome<'_>,
+    model: &str,
+    masker: Masker,
+    now_ms: u64,
+    lineage: Option<&Resumed>,
+    is_fork: bool,
+) -> Result<SessionLog, String> {
     let parent = lineage.map(|r| hotl_store::ParentRef {
         session_id: r.parent_id.clone(),
         tip_entry_id: r.parent_tip_entry_id.clone(),
     });
-    let mut log = SessionLog::create(sessions_dir, model, parent, masker, now_ms)
-        .map_err(|e| format!("could not create session log: {e}"))?;
+    let mut log = match home {
+        LogHome::Store(dir) => SessionLog::create(dir, model, parent, masker, now_ms),
+        LogHome::Ephemeral => SessionLog::create_ephemeral(model, parent, masker, now_ms),
+    }
+    .map_err(|e| format!("could not create session log: {e}"))?;
     if is_fork {
         record_fork_point(
             &mut log,
@@ -420,7 +451,17 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
             Err(code) => code,
         },
         (None, Some(prompt)) => match prompt.resolve() {
-            Ok(text) => run_session(text, parsed.json_events, parsed.name, fork, parsed.goal).await,
+            Ok(text) => {
+                run_session(
+                    text,
+                    parsed.json_events,
+                    parsed.name,
+                    fork,
+                    parsed.goal,
+                    parsed.ephemeral,
+                )
+                .await
+            }
             Err(code) => code,
         },
         // Reachable via e.g. `hotl --json` with no -p (main.rs routes any
@@ -953,8 +994,12 @@ struct Scaffold {
     /// Builds an isolated sub-agent child (M4/tier-1 gap #6). `spawn` itself
     /// registers per-session (see `spawn_session_with_todos`), not here — a
     /// `fork` needs a weak sender bound to *that* session's own actor, which
-    /// doesn't exist yet at scaffold time.
-    spawn_builder: Arc<dyn crate::spawn::ChildBuilder>,
+    /// doesn't exist yet at scaffold time. Concrete, not `dyn`, so
+    /// `use_sessions_dir` can re-point it.
+    spawn_builder: Arc<HotlChildBuilder>,
+    /// Where this process's sessions (and its children's) are written. The
+    /// real store unless `-p --ephemeral` points it at the run's temp dir.
+    sessions_dir: PathBuf,
     /// The ONE process-wide `SessionConcurrency` (shared `Arc` semaphores) —
     /// cloned into every registration site that needs it (web tools here,
     /// `spawn`'s `agents` permit at session-registration time), never rebuilt.
@@ -1058,6 +1103,7 @@ async fn scaffold(
     // Loaded before the child builder, not after: a child now runs the
     // parent's hooks (0058 T3), so the builder has to be handed them.
     let hooks = load_hooks(&cfg, concurrency.clone());
+    let sessions_dir = sessions_dir();
     let spawn_builder = child_builder(
         provider.clone(),
         hooks.clone(),
@@ -1072,7 +1118,7 @@ async fn scaffold(
         sandbox_enforced,
         initial_helper_key.clone(),
         cfg.agents.isolation(),
-        sessions_dir(),
+        sessions_dir.clone(),
         concurrency.clone(),
     );
     // `spawn`'s own registration (agent.rs::spawn_session_with_todos) needs a
@@ -1110,6 +1156,7 @@ async fn scaffold(
         hooks,
         initial_helper_key,
         spawn_builder,
+        sessions_dir,
         concurrency,
         agents_include_claude,
         prefix_stagger,
@@ -1131,6 +1178,17 @@ fn print_warnings(warnings: &[String]) {
 }
 
 impl Scaffold {
+    /// Point every session this process writes — children and `recall`'s
+    /// lineage walk included — at `dir` instead of the real store. Both
+    /// capture sites move together so an ephemeral run cannot half-leak.
+    fn use_sessions_dir(&mut self, dir: PathBuf) {
+        self.spawn_builder = Arc::new(HotlChildBuilder {
+            sessions_dir: dir.clone(),
+            ..(*self.spawn_builder).clone()
+        });
+        self.sessions_dir = dir;
+    }
+
     /// Session masker: env-named secrets plus the helper-acquired key.
     /// Refreshed keys are NOT re-registered: keys never enter log entries;
     /// this registration is defense-in-depth for the startup key.
@@ -1150,7 +1208,7 @@ impl Scaffold {
     /// session — see `HotlChildBuilder`, which always passes `None`).
     fn spawn_registration(&self, session_id: String) -> SpawnRegistration {
         SpawnRegistration {
-            builder: self.spawn_builder.clone(),
+            builder: self.spawn_builder.clone() as Arc<dyn crate::spawn::ChildBuilder>,
             prefix_stagger: self.prefix_stagger,
             child_deadlines: self.child_deadlines,
             concurrency: self.concurrency.clone(),
@@ -1168,7 +1226,7 @@ impl Scaffold {
     /// so the tool is always advertised.
     fn recall_registration(&self, session_id: String) -> RecallRegistration {
         RecallRegistration {
-            sessions_dir: sessions_dir(),
+            sessions_dir: self.sessions_dir.clone(),
             session_id,
             config_dir: self.config_dir.clone(),
             backends: self.retrieval.clone(),
@@ -1332,6 +1390,7 @@ async fn run_session(
     name: Option<String>,
     fork: Option<ForkArgs>,
     goal: Option<String>,
+    ephemeral: bool,
 ) -> i32 {
     // Resolved before the provider is even selected: a bad `--fork-from` is a
     // usage error, and paying for a scaffold to discover it is silly.
@@ -1372,7 +1431,7 @@ async fn run_session(
     // `scaffold`; harmless to keep alive longer than needed since a
     // finished warm task's guard is a no-op on drop.
     let _wire_arm = provider.arm();
-    let scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
+    let mut scaffold = match scaffold(provider, model, &secrets, cfg, key_source).await {
         Ok(s) => s,
         Err(msg) => {
             eprintln!("hotl: {msg}");
@@ -1381,8 +1440,13 @@ async fn run_session(
     };
     print_warnings(&scaffold.warnings);
 
-    let mut log = match create_session_log(
-        &sessions_dir(),
+    let home = if ephemeral {
+        LogHome::Ephemeral
+    } else {
+        LogHome::Store(&scaffold.sessions_dir)
+    };
+    let mut log = match create_session_log_in(
+        home,
         &scaffold.model,
         scaffold.masker(),
         scaffold.clock.now_ms(),
@@ -1395,6 +1459,12 @@ async fn run_session(
             return 1;
         }
     };
+    if ephemeral {
+        // Children and `recall` follow the log into the temp dir, so the
+        // whole run vanishes together. The store's gc and secret audit below
+        // are about the store, not this run, and still run.
+        scaffold.use_sessions_dir(log.dir().to_path_buf());
+    }
     if let Some(n) = &name {
         let _ = log.append(
             &hotl_types::EntryPayload::Rename { name: n.clone() },
@@ -1979,6 +2049,7 @@ fn build_registry(
 /// A `ChildBuilder` that spawns an isolated sub-agent sharing the parent's
 /// provider/rules/config but with a builtins-only registry (no spawn, no MCP —
 /// a clean, non-recursive child). M4.
+#[derive(Clone)]
 struct HotlChildBuilder {
     provider: Arc<dyn hotl_provider::Provider>,
     /// What the *spawning* session could do. A def narrows against it and
@@ -2367,7 +2438,7 @@ fn child_builder(
     default_isolation: hotl_tools::agents::Isolation,
     sessions_dir: PathBuf,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
-) -> Arc<dyn crate::spawn::ChildBuilder> {
+) -> Arc<HotlChildBuilder> {
     Arc::new(HotlChildBuilder {
         provider,
         hooks,
@@ -3006,6 +3077,9 @@ struct Args {
     /// `--goal <condition>`: run the goal loop headless — the turn keeps
     /// continuing until the evaluator judges the condition met/impossible.
     goal: Option<String>,
+    /// `--ephemeral`: the log lives in a temp dir for the run and is removed
+    /// at exit. Sub-agents of the run vanish with it.
+    ephemeral: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
@@ -3018,6 +3092,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut keep: Option<usize> = None;
     let mut keep_turns: Option<usize> = None;
     let mut goal: Option<String> = None;
+    let mut ephemeral = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -3038,6 +3113,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
             // The plan axis, not a mode: `--plan` composes with whatever
             // `[permissions] mode` resolves to, headless or interactive.
             "--plan" => plan = true,
+            "--ephemeral" => ephemeral = true,
             "--json-schema" => schema = iter.next().map(PathBuf::from),
             "--fork-from" | "--keep" | "--keep-turns" => {
                 let Some(v) = iter.next() else {
@@ -3101,6 +3177,10 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         eprintln!("hotl: --goal is not supported with --json-schema");
         return Err(2);
     }
+    if schema.is_some() && ephemeral {
+        eprintln!("hotl: --ephemeral is not supported with --json-schema");
+        return Err(2);
+    }
     // Headless has no `-r`, so "resuming" is always false here; the shared
     // check still owns the --keep-without-a-fork and two-coordinates rules,
     // in the same words the console uses.
@@ -3118,6 +3198,7 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         keep,
         keep_turns,
         goal,
+        ephemeral,
     })
 }
 
@@ -4795,6 +4876,44 @@ mod tests {
             1,
             "exactly the child's own log lands in the injected dir"
         );
+    }
+
+    /// `-p --ephemeral`: a builder pointed at the ephemeral log's dir writes
+    /// the child there and nothing in the real store, and the dir goes with
+    /// the parent log.
+    #[tokio::test]
+    async fn an_ephemeral_runs_children_land_in_its_temp_dir() {
+        let (mut cb, real) = test_child_builder();
+        let parent = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).unwrap();
+        cb.sessions_dir = parent.dir().to_path_buf();
+        cb.provider = Arc::new(hotl_provider::ScriptedProvider::new(vec![
+            hotl_provider::ScriptedProvider::text_reply("child result"),
+        ]));
+        let general = hotl_tools::agents::builtin("general-purpose").unwrap();
+        let mut handle = cb
+            .spawn_child(&general, Vec::new(), None, None)
+            .expect("child spawns")
+            .handle;
+        handle.prompt("go".into()).await;
+        loop {
+            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
+                .await
+                .expect("event timeout")
+                .expect("event channel closed");
+            if matches!(ev, EngineEvent::TurnDone { .. }) {
+                break;
+            }
+        }
+        assert_eq!(
+            hotl_store::list_sessions(parent.dir()).len(),
+            2,
+            "parent + child"
+        );
+        assert!(hotl_store::list_sessions(real.path()).is_empty());
+        let dir = parent.dir().to_path_buf();
+        drop(handle);
+        drop(parent);
+        assert!(!dir.exists(), "the children outlived the ephemeral run");
     }
 
     /// Task 4's named trap: `child_builder()` captures a *clone* of
@@ -6772,6 +6891,42 @@ mod tests {
             Some(Prompt::Stdin)
         );
         assert_eq!(headless_prompt(None, None), None);
+    }
+
+    #[test]
+    fn ephemeral_parses_and_refuses_json_schema() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parsed = parse_args(args(&["-p", "hi", "--ephemeral"])).expect("parses");
+        assert!(parsed.ephemeral);
+        assert!(!parse_args(args(&["-p", "hi"])).unwrap().ephemeral);
+        // A fork reads its parent and persists nothing: legal.
+        assert!(parse_args(args(&["-p", "hi", "--ephemeral", "--fork-from", "@last"])).is_ok());
+        assert!(matches!(
+            parse_args(args(&[
+                "-p",
+                "hi",
+                "--ephemeral",
+                "--json-schema",
+                "s.json"
+            ])),
+            Err(2)
+        ));
+    }
+
+    /// An ephemeral run's log goes to its own temp dir, never the store, and
+    /// the lineage it forks from is still read from the store.
+    #[test]
+    fn an_ephemeral_run_leaves_the_sessions_dir_untouched() {
+        let real = tempfile::tempdir().unwrap();
+        let log = create_session_log_in(LogHome::Ephemeral, "m", Masker::empty(), 9, None, false)
+            .unwrap();
+        assert!(log.path().is_file());
+        assert_ne!(log.dir(), real.path());
+        assert!(hotl_store::list_sessions(real.path()).is_empty());
+        let dir = log.dir().to_path_buf();
+        drop(log);
+        assert!(!dir.exists(), "the ephemeral run left its log behind");
+        assert!(hotl_store::list_sessions(real.path()).is_empty());
     }
 
     /// Finding 1 (CRITICAL) regression. hotl's real `-p` one-shot binary

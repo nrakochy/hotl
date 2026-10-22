@@ -6,6 +6,12 @@ semver promise of their own.
 
 ## [Unreleased]
 
+### Added
+
+- **`hotl -p --ephemeral` runs a prompt and keeps no session.** The log lives
+  in a temp dir for the run and is removed at exit. Sub-agents of that run
+  vanish with it.
+
 ## [0.28.0] - 2026-09-28
 
 ### Added

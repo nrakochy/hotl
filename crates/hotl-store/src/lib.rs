@@ -582,12 +582,17 @@ impl SessionLog {
     /// and takes the dir, its blobs and any sibling logs with it on drop.
     /// Everything that reads the file during the run (recall, eviction, a
     /// child's seed, replay) works unchanged until then.
-    pub fn create_ephemeral(model: &str, masker: Masker, now_ms: u64) -> std::io::Result<Self> {
+    pub fn create_ephemeral(
+        model: &str,
+        parent: Option<ParentRef>,
+        masker: Masker,
+        now_ms: u64,
+    ) -> std::io::Result<Self> {
         let dir = tempfile::Builder::new()
             .prefix("hotl-ephemeral-")
             .tempdir()?;
         // tempdir() follows the umask; `create` makes this one owner-only.
-        let mut log = Self::create(&dir.path().join("sessions"), model, None, masker, now_ms)?;
+        let mut log = Self::create(&dir.path().join("sessions"), model, parent, masker, now_ms)?;
 
         log._dir = Some(dir);
         Ok(log)
@@ -3018,7 +3023,7 @@ mod tests {
     #[test]
     fn an_ephemeral_log_is_owner_only_and_vanishes_on_drop() {
         use hotl_platform::PrivateFs as _;
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 1).unwrap();
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 1).unwrap();
         let dir = log.dir().to_path_buf();
         assert!(log.path().is_file());
         for path in [log.path(), dir.as_path()] {
@@ -3036,7 +3041,7 @@ mod tests {
 
     #[test]
     fn an_ephemeral_log_replays_while_alive() {
-        let mut log = SessionLog::create_ephemeral("m", Masker::empty(), 1).unwrap();
+        let mut log = SessionLog::create_ephemeral("m", None, Masker::empty(), 1).unwrap();
         for text in ["one", "two"] {
             log.append(
                 &EntryPayload::Item {
@@ -3065,7 +3070,7 @@ mod tests {
 
     #[test]
     fn an_ephemeral_logs_blobs_vanish_with_it() {
-        let log = SessionLog::create_ephemeral("m", Masker::empty(), 1).unwrap();
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 1).unwrap();
         let blob = log.write_blob("toolu_1", "body").unwrap();
         let blobs = blob.parent().unwrap().to_path_buf();
         assert!(blobs.is_dir());
