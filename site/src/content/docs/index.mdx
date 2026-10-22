@@ -68,7 +68,9 @@ import { Card, CardGrid } from '@astrojs/starlight/components';
 		[Background sessions →](./backgrounding/)
 	</Card>
 	<Card title="tmux-native, out of the box" icon="laptop">
-		`hotl watch` in a pane discovers every AI agent in your tmux session:
+		`hotl watch` in a pane discovers every AI agent in your tmux session
+		(by pane title and pane text; the console's OSC 7501 status is not
+		visible under tmux, so the dashboard scrapes):
 
 		- live status per agent, a ping when one blocks on you, `enter` jumps
 		  focus to its pane

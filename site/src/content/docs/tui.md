@@ -23,6 +23,25 @@ Bare `hotl` **is** the console (the `tui` subcommand and the old line-based REPL
 
 The console is a pure ACP client of the same engine `-p` headless uses — same permission gate, same session logs.
 
+### What the terminal is told
+
+Two things, both for the terminal's own chrome:
+
+- **The title.** `hotl · <name> — working` / `— waiting on you`, or bare
+  `hotl` when idle. The name is the session's `-n`/`/rename` name, else its
+  generated title ([sessions.md](../sessions/#resuming)).
+- **OSC 7501 program status.** `working`, `blocked` (with `kind=permission`
+  or `kind=question`), `done`, `error`, `idle`, and `clear` on quit — the
+  vocabulary Ghostty's proposal, Pi and Claude Code share, so a terminal that
+  implements it can show whether hotl needs you without the pane being
+  visible. The message is the session's name or title only, never prompt or
+  model text. Written blind (an unknown OSC is ignored) and only outside
+  tmux and screen, which swallow it; `HOTL_PROGRAM_STATUS=1` forces it on,
+  `=0` turns it off. `hotl watch` still finds the console by its title and
+  pane text under tmux.
+
+Tool-card paths are plain text; OSC 8 hyperlinks are not emitted (tracker row).
+
 ## Theming
 
 The console wears the same palette as `hotl watch`, from the same `[settings.theme]` table in `~/.config/hotl/config.toml`:
@@ -239,6 +258,12 @@ collapsed to the first three lines with a `[+N lines · ctrl-t]` trailer.
 at the engine, which is what you want if you are not reading it — it is billed
 either way.
 
+A thinking block that goes quiet for two minutes while the connection keeps
+pinging is dropped and the sample retried (`retrying (attempt 1) — thinking
+block stalled for 120s`). The reasoning that already streamed stays on
+screen — it is still true — and a second block follows. `[provider]
+thinking_stall_secs` changes the number.
+
 There is **no bell, ever** — salience is visual only. `hotl watch` is the thing that pings across panes; the console itself is silent.
 
 ## Prompting and steering
@@ -289,6 +314,7 @@ own.
 | `/context` | What is *filling* the window, by source (see [The context report](#the-context-report)). Safe to run mid-turn. |
 | `/workflows` | Every run of the `workflow` tool this process has started, with per-phase progress, tokens and elapsed time — live, so safe mid-run. See [workflows.md](../workflows/#watching-it). |
 | `/cost` | Session token totals and, when the provider reports one, cost. |
+| `/btw <question>` | A side question the model answers but will not remember: one extra sample over the same cached prefix the turn uses (cache-read prices for the whole history), the answer as a muted `?` card, nothing in the transcript or the log beyond the spend. Works mid-turn. A tool call the aside wanted is reported, never run. |
 | `/review [target]` | Spawn the built-in read-only reviewer on a file, a diff, a commit range, or (bare) the working tree, and relay its findings. A built-in, so a skill named `review` is shadowed — rename the skill. See [agents.md](../agents/#reviewing-with-review). |
 | `/clear` | Clear the **transcript view**. The session log and the model's context are untouched. |
 | `/quit` | Leave the console (the session log is already on disk). |

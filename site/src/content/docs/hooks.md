@@ -17,6 +17,26 @@ py = "ruff check ."
 
 After a successful `edit`/`write` to a `.rs` file, `cargo check` runs (under the sandbox floor, 30 s timeout) and up to 30 lines of its output are appended to the tool result — so the agent notices breakage in the same step it caused it. A clean, quiet check adds nothing.
 
+## Post-edit formatters
+
+The twin of diagnostics, run first — format, then check:
+
+```toml
+[formatters]
+rs = "rustfmt --edition 2021 $FILE"
+ts = "prettier --write $FILE"
+go = "gofmt -w $FILE"
+```
+
+`$FILE` is replaced by the shell-quoted absolute path of the file just written; a command without it runs as-is in the session's working directory (`cargo fmt -q`). Same sandbox floor, reaper and 30 s timeout as `bash` and the diagnostic.
+
+Two rules keep it quiet:
+
+- **Silent on success.** The formatter's output never reaches the model when it succeeds. One exception, which is not command output: when the file's bytes changed, the tool result gains one line — `(formatted by `rustfmt …` — re-read before editing it again)` — because the `edit` result's snippet shows pre-format text, and a silent reformat would make the model's next `old_string` miss, which costs a whole sample.
+- **The head on failure.** A non-zero exit or a timeout appends `FAILED — `<command>`` and up to 30 lines, wrapped in `<formatter>…</formatter>` with the same defang every untrusted path gets.
+
+Off unless configured. Sub-agents format what they edit the way their parent does.
+
 ## Hooks (intercept tool calls, prompts, and turn-end)
 
 hotl deliberately supports six events — not Claude's ~35 — each with a concrete consumer:

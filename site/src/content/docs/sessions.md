@@ -27,6 +27,14 @@ hotl resume [arg]       # the subcommand spelling of -r
 
 A resumed session that was interrupted mid-turn finishes that turn on load.
 
+The picker's label is the session's name, else a generated title marked
+`(auto)`: after an unnamed console session's first completed turn, a
+~50-token call on the utility model names it in at most six words. Names
+outrank titles everywhere — the badge, the terminal title, the picker — and
+`-r <name>` matches names only, never a title. `/rename` mid-first-turn wins
+over the title; a resumed chain is never re-titled; a fork inherits neither
+label. `[behavior] auto_title = false` turns it off; `-p` runs never title.
+
 The console shows the inherited reality immediately, before any turn runs:
 the status strip carries the inherited context fullness (`N% ctx`) and todo
 list, and `/effort` reports the inherited level. Usage counters and cost

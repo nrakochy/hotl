@@ -54,6 +54,8 @@ api_key_helper = "..."                      # command whose trimmed stdout is th
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
 max_tokens = 64000                          # per-sample output cap (thinking + text); clamped to the model's catalogued maximum
 cache_breakpoints = true                    # OpenAI dialects only: explicit GPT-5.6 prompt-cache breakpoints; absent = on for model names at or past gpt-5.6, off otherwise
+stream_idle_secs = 90                       # a stream with no byte at all (pings included) for this long is dead and retried; floor 15
+thinking_stall_secs = 120                   # an open thinking block with no delta for this long (pings still coming) is dropped and retried; floor 15
 
 [context]
 window = 200000            # usually unnecessary — looked up per model; see below
@@ -75,6 +77,8 @@ mouse = true               # false stops mouse capture: no wheel scroll, no drag
 copy_on_select = true      # false stops a mouse drag copying to the clipboard
                            # (needs mouse = true; without capture there are no
                            # drag events to act on)
+auto_title = true          # false: never spend a utility-model call naming an
+                           # unnamed console session after its first turn
 max_turns = 100            # model steps one prompt may spend (a tool round-trip
                            # costs one). -1 = unlimited: run until the model is
                            # done, the context fills, or you interrupt.
@@ -166,6 +170,9 @@ description = "project documentation search"
 event = "pre_tool"
 command = "/usr/local/bin/guard"
 
+[formatters]               # post-edit formatters, run before the check (see hooks.md)
+rs = "rustfmt --edition 2021 $FILE"         # $FILE = the shell-quoted path
+
 [diagnostics]              # post-edit checks (see hooks.md)
 rs = "cargo check -q --message-format=short"
 
@@ -204,7 +211,7 @@ feel; it's opt-in, the default stays `tokyo-night`.
 
 `config.toml` is read at startup. In the console, `/reload` re-reads it and rebuilds the engine against the new file, keeping the session — the transcript, the model's context, the todos, the session name, its permission mode, and plan mode all carry forward. `hotl acp` clients reach the same thing as `session/reload_config`.
 
-Most of the file reloads: `[provider]`, `[[allow]]`, `[[mcp]]`, `[[hook]]`, `[diagnostics]`, `[skills]`, `[agents]`, `[workflows]`, saved workflow recipes, `[context]`, `[behavior]`, `[settings]`, `system-prompt.md`. A reload that fails to parse or to select a provider changes nothing and says so — the running engine keeps serving.
+Most of the file reloads: `[provider]`, `[[allow]]`, `[[mcp]]`, `[[hook]]`, `[formatters]`, `[diagnostics]`, `[skills]`, `[agents]`, `[workflows]`, saved workflow recipes, `[context]`, `[behavior]`, `[settings]`, `system-prompt.md`. A reload that fails to parse or to select a provider changes nothing and says so — the running engine keeps serving.
 
 These are fixed for the life of the process; restart to change them:
 
@@ -380,9 +387,9 @@ to run anything. They still deny in-process.
 
 Declare external tool servers. Each is exposed to the model through one `mcp` tool; the **first** use of a server prompts you to approve its binary (shown with its SHA-256), and a changed binary re-prompts. Server output is sanitized before it reaches the model. Full guide: [mcp.md](../mcp/).
 
-### Post-edit diagnostics (`[diagnostics]`) and hooks (`[[hook]]`)
+### Post-edit formatters (`[formatters]`), diagnostics (`[diagnostics]`) and hooks (`[[hook]]`)
 
-`[diagnostics]` runs a check command after a successful `edit`/`write` (under the sandbox floor, 30 s timeout). `[[hook]]` intercepts tool calls. Full guide: [hooks.md](../hooks/).
+`[formatters]` runs a format command after a successful `edit`/`write`, then `[diagnostics]` runs a check command (both under the sandbox floor, 30 s timeout). `[[hook]]` intercepts tool calls. Full guide: [hooks.md](../hooks/).
 
 ### Network egress (`[network]`)
 
