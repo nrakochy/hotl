@@ -161,7 +161,7 @@ pub struct AgentDef {
 
 /// The three built-in agent types, matching the corpus convergence (03):
 /// `general-purpose` (full access), `explore`/`plan` (read-only).
-pub const BUILTIN_NAMES: [&str; 3] = ["general-purpose", "explore", "plan"];
+pub const BUILTIN_NAMES: [&str; 4] = ["general-purpose", "explore", "plan", "review"];
 
 /// A built-in agent type by name, or `None` if `name` isn't one of the
 /// three. Built-in names always win over a same-named user definition —
@@ -214,6 +214,29 @@ pub fn builtin(name: &str) -> Option<AgentDef> {
                  (`read`/`glob`/`grep`), then propose a concrete, step-by-step implementation \
                  plan. You cannot edit files or run commands — describe what should change; do \
                  not do it yourself."
+                    .into(),
+            ),
+            tools: ToolScope::ReadOnly,
+            model: None,
+            effort: None,
+            isolation: Isolation::None,
+            max_turns: None,
+            source: AgentSource::BuiltIn,
+        }),
+        "review" => Some(AgentDef {
+            name: "review".into(),
+            description: "Read-only second opinion on a diff, a file, a commit range, or a \
+                question: findings with `path:line`, severity, and why — never edits, never \
+                runs commands."
+                .into(),
+            system_prompt: Some(
+                "You are a code reviewer in a fresh, read-only context. Read the target in full \
+                 before judging it. Report each finding as `path:line — severity — what and why`, \
+                 ordered by severity, with bugs separated from style. You have only `read`, \
+                 `glob` and `grep` — no `bash` — so if the target is a git range or \"the working \
+                 tree\" and the diff cannot be reconstructed from files alone, say so and review \
+                 the files named instead. Never claim to have changed anything. If there is \
+                 nothing to report, say \"no findings\" plainly. End with a one-line verdict."
                     .into(),
             ),
             tools: ToolScope::ReadOnly,
@@ -456,8 +479,30 @@ mod tests {
     fn builtins_present_and_read_only_explore() {
         assert_eq!(builtin("explore").unwrap().tools, ToolScope::ReadOnly);
         assert_eq!(builtin("plan").unwrap().tools, ToolScope::ReadOnly);
+        assert_eq!(builtin("review").unwrap().tools, ToolScope::ReadOnly);
+        assert!(is_read_only(&builtin("review").unwrap()));
         assert_eq!(builtin("general-purpose").unwrap().tools, ToolScope::All);
         assert!(builtin("nope").is_none());
+        for name in BUILTIN_NAMES {
+            assert!(builtin(name).is_some(), "{name}");
+        }
+    }
+
+    /// A repo-shipped `agents/review.md` cannot replace the built-in reviewer:
+    /// built-ins win in `resolve`, which is why the model knob is config.
+    #[test]
+    fn list_includes_review_and_a_user_review_md_does_not_replace_it() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(
+            dir.path().join("agents/review.md"),
+            "---\nname: review\ndescription: mine\ntools: all\n---\nrubber stamp\n",
+        )
+        .unwrap();
+        let d = resolve(dir.path(), false, "review").unwrap();
+        assert_eq!(d.source, AgentSource::BuiltIn);
+        assert_eq!(d.tools, ToolScope::ReadOnly);
+        assert!(list(dir.path(), false).iter().any(|(n, _)| n == "review"));
     }
 
     #[test]

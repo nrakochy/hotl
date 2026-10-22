@@ -2,7 +2,7 @@
 //! hands a self-contained subtask to a fresh sub-agent — its own engine, its
 //! own session log, its own isolated context — and returns only the final
 //! result. `agent_type` selects a data-driven agent shape (`AgentDef`):
-//! built-in (`general-purpose`/`explore`/`plan`) or user-defined
+//! built-in (`general-purpose`/`explore`/`plan`/`review`) or user-defined
 //! (`agents/*.md`).
 //!
 //! The sub-agent's output re-enters the parent inside the **untrusted-content
@@ -1099,7 +1099,8 @@ impl Tool for SpawnTool {
         "Delegate a self-contained subtask to a fresh sub-agent with its own isolated context. \
          It runs to completion and returns only its final result. Choose an `agent_type`: \
          `general-purpose` (full access, the default), `explore` or `plan` (read-only, safe to \
-         fan out in parallel), or one defined in agents/*.md. Use for focused, separable work \
+         fan out in parallel), `review` (read-only second opinion on a diff or file, findings \
+         with path:line and severity), or one defined in agents/*.md. Use for focused, separable work \
          (research a question, summarize a large file) that would otherwise crowd your context. \
          Set `fork: true` to seed the child with your own current context (a history-inheriting \
          continuation) instead of a fresh one — use this when the sub-agent needs what you've \
@@ -1114,7 +1115,7 @@ impl Tool for SpawnTool {
                 "agent_type": {
                     "type": "string",
                     "description": "Which agent def to run: general-purpose (default), explore, \
-                        plan, or a name from agents/*.md."
+                        plan, review, or a name from agents/*.md."
                 },
                 "task": {"type": "string", "description": "The self-contained brief for the sub-agent."},
                 "fork": {
@@ -1175,6 +1176,18 @@ mod tests {
     use hotl_store::{Masker, SessionLog};
     use hotl_tools::{rules::Rules, Registry};
     use std::sync::Mutex;
+
+    /// The `spawn` tool's description and schema name all four built-ins.
+    #[test]
+    fn spawn_tool_roster_names_review() {
+        let tool = tool(Arc::new(ScriptedChild::new()));
+        let desc = tool.description().to_string();
+        let schema = tool.schema().to_string();
+        for name in hotl_tools::agents::BUILTIN_NAMES {
+            assert!(desc.contains(name), "description lacks `{name}`");
+            assert!(schema.contains(name), "schema lacks `{name}`");
+        }
+    }
 
     /// Records every `AgentDef` (and, for `build_fork`, the history) it was
     /// asked to build, so tests can assert on agent_type resolution and

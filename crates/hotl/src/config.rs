@@ -249,6 +249,10 @@ pub struct AgentsCfg {
     /// After a child reports, how long it gets to actually exit before it is
     /// reaped — its result is kept either way. `0` disables. Default: 20s.
     pub completion_grace_secs: Option<u64>,
+    /// A stronger model for the built-in `review` agent only; omit to inherit
+    /// the parent's (0070 T10). A config key, not a user def: built-in names
+    /// win over `agents/*.md` on purpose.
+    pub review_model: Option<String>,
 }
 
 impl AgentsCfg {

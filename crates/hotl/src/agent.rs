@@ -1132,6 +1132,7 @@ async fn scaffold(
         cfg.agents.isolation(),
         sessions_dir.clone(),
         concurrency.clone(),
+        cfg.agents.review_model.clone(),
     );
     // `spawn`'s own registration (agent.rs::spawn_session_with_todos) needs a
     // *clone* of this same instance (shared Arc semaphores) — cloned before
@@ -2116,6 +2117,8 @@ struct HotlChildBuilder {
     /// The parent's Layer-B budget, cloned: parent and every child draw
     /// subprocess permits from the one shared pool.
     concurrency: hotl_tools::concurrency::SessionConcurrency,
+    /// `[agents] review_model`: applied to the built-in `review` def only.
+    review_model: Option<String>,
 }
 
 impl HotlChildBuilder {
@@ -2135,6 +2138,13 @@ impl HotlChildBuilder {
         let mut config = self.config.clone();
         if let Some(model) = &def.model {
             config.model = model.clone();
+        }
+        // The only per-built-in override: a user file cannot shadow `review`
+        // (`resolve` keeps built-ins first), so the knob lives in config.
+        if def.source == hotl_tools::agents::AgentSource::BuiltIn && def.name == "review" {
+            if let Some(m) = &self.review_model {
+                config.model = m.clone();
+            }
         }
         // Task 4 (mode-derived 1h TTL): children pin FiveMinutes
         // deliberately — short-lived, no human pauses to amortize a 1h
@@ -2468,6 +2478,7 @@ fn child_builder(
     default_isolation: hotl_tools::agents::Isolation,
     sessions_dir: PathBuf,
     concurrency: hotl_tools::concurrency::SessionConcurrency,
+    review_model: Option<String>,
 ) -> Arc<HotlChildBuilder> {
     Arc::new(HotlChildBuilder {
         provider,
@@ -2486,6 +2497,7 @@ fn child_builder(
         default_isolation,
         sessions_dir,
         concurrency,
+        review_model,
     })
 }
 
@@ -4962,8 +4974,30 @@ mod tests {
             default_isolation: hotl_tools::agents::Isolation::None,
             sessions_dir: store.path().to_path_buf(),
             concurrency: Default::default(),
+            review_model: None,
         };
         (cb, store)
+    }
+
+    /// `[agents] review_model` reaches the built-in reviewer and nothing else.
+    #[test]
+    fn review_model_overrides_the_builtin_reviewers_model_only() {
+        let (mut cb, _store) = test_child_builder();
+        cb.review_model = Some("stronger-model".into());
+        let review = hotl_tools::agents::builtin("review").unwrap();
+        assert_eq!(cb.child_config(&review).model, "stronger-model");
+        let parent = cb.config.model.clone();
+        let explore = hotl_tools::agents::builtin("explore").unwrap();
+        assert_eq!(cb.child_config(&explore).model, parent);
+        let mut named = hotl_tools::agents::builtin("review").unwrap();
+        named.model = Some("def-model".into());
+        assert_eq!(
+            cb.child_config(&named).model,
+            "stronger-model",
+            "config outranks a def's own model for the built-in"
+        );
+        cb.review_model = None;
+        assert_eq!(cb.child_config(&review).model, parent);
     }
 
     /// Frontmatter beats config, config covers silent defs, and a read-only

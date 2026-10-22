@@ -32,6 +32,9 @@ semver promise of their own.
   and nested) and `memory/MEMORY.md` over the cap are cut at a line; the model
   is told where the cut is, and a startup notice says so to you. `[context]
   instructions_max_bytes` changes the cap; `0` lifts it.
+- **A built-in `review` sub-agent** (read-only, fresh context): findings
+  with `path:line` and severity, never an edit. `[agents] review_model` gives
+  it a stronger model than the session's.
 
 ### Changed
 
