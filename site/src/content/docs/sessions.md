@@ -39,9 +39,11 @@ The console shows the inherited reality immediately, before any turn runs:
 the status strip carries the inherited context fullness (`N% ctx`) and todo
 list, and `/effort` reports the inherited level. Usage counters and cost
 start at zero for the resumed session — only the context gauge carries over.
-If the configured model changed since the session last ran, a one-line
-transcript notice names the switch: the inherited transcript was produced by
-the previous model.
+A resumed session runs the last model `/model` switched it to, when this
+machine can serve it; otherwise it falls back to the configured model with a
+warning naming the one it could not run. If the model changed since the
+session last ran — by config or by `/model` — a one-line transcript notice
+names the switch: the inherited transcript was produced by the previous model.
 
 ## Forking
 

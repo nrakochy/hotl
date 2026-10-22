@@ -47,6 +47,8 @@ auth = "api_key"                            # or "subscription": hotl holds no c
 fast_model = "..."                          # cheap model for compaction summaries; absent = claude-haiku-4-5 on catalogued Anthropic models, else the session model
 utility_model = "..."                       # model for one-off calls the session pays for but never shows
                                             # (compaction digests, goal checks); absent = fast_model, then the session model
+fallback_models = ["claude-sonnet-5"]       # tried in order when the session model is unreachable (never on auth/billing errors);
+                                            # at most two, same provider as `model`; no env twin
 effort = "high"                             # low | medium | high | xhigh | max; absent = xhigh on catalogued Anthropic models, else the provider's default
                                             # or a per-phase table, applied at turn start:
                                             # effort = { plan = "xhigh", implement = "high", verify = "xhigh" }
@@ -633,6 +635,16 @@ The phase is derived once, **at turn start**, so every sample inside one turn is
 
 A phase you leave out inherits the session's effort, and so does a rung that names no level (it warns at startup rather than failing the file). The schedule is configuration, not a decision: it writes no durable entry, `hotl resume` re-derives it, and `HOTL_EFFORT` stays a scalar. The moment you run `/effort <rung>` the session is **pinned** and the schedule stops — a rung you set by hand outranks a rung a table chose. A bare `/effort` names the schedule while it still governs.
 
+### Switching models (`/model`, `[provider] fallback_models`)
+
+`/model <provider/model>` (or `session/set_model` under `hotl acp`) changes the session model for every turn from the next one on. The switch waits for the turn boundary, is written to the log, and every assistant item records the model that produced it, so `hotl resume` runs the last model you switched to and `hotl export` can tell which model wrote what. The prefix cache is cold after a switch — the next turn re-writes the whole context — and the console notice says so with the token count.
+
+A switch across dialects (`anthropic/…` ↔ `openai/…` or `openai-responses/…`) swaps the provider under the session. History is never stripped: the other dialect's signed thinking stays in the log and is dropped only at the wire, so switching back restores it. The configured `fast_model`, `utility_model` and `fallback_models` belong to the startup provider; after a cross-dialect switch housekeeping (compaction digests, `/goal` verdicts) runs on the session model instead, and the fallback chain is empty until you switch back. Reasoning effort and permission mode are untouched. Sub-agents keep the model they were started on.
+
+A model whose window cannot hold the current context is refused outright rather than failing on the next request — run `/compact` and try again.
+
+`fallback_models` is the availability chain: when the session model is unreachable (a 529, a timeout — never an auth or billing error) the turn is retried on the next model in the list, and the item it produces is stamped with the fallback. Chains are short by design (see [RELIABILITY.md](https://github.com/nrakochy/hotl/blob/master/docs/RELIABILITY.md)): the first two entries are kept and a longer list warns. Entries are bare names on the session's provider; an entry with another provider's prefix is dropped with a warning, a same-provider prefix is stripped, and the session model or a duplicate is ignored. Under a catalogued session model, an uncatalogued fallback or one with a narrower window warns — compaction is sized to the session model. None of this refuses to start; it is configuration only, with no environment variable.
+
 ### Session budgets (`[behavior] max_tool_calls`, `max_cost_usd`)
 
 Two caps that bound a whole **session**, not a turn — a fresh prompt does not refill them:
@@ -779,6 +791,8 @@ frame carries `"schema_version"` and a `"type"`: `text_delta`,
 spawn call's `parent_id`, a `phase` of `start`/`done`, and `ok` on done
 frames only), `retrying`, `fallback_model`, `prompt_queued`,
 `compacted` (now also with `focus`, `usage` and `estimate`), `fold_skipped`,
+`model_changed` (with `model`, `previous`, `context_tokens` and
+`context_window` — the cache cost of the switch),
 `todos_changed`, `ask_denied`, `question_no_human`, and a terminal
 `turn_done` carrying token usage and a tagged outcome:
 

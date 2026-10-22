@@ -8,6 +8,27 @@ semver promise of their own.
 
 ### Added
 
+- **`/model <provider/model>` switches the session model.** Also
+  `session/set_model` under `hotl acp`. The switch lands on the turn
+  boundary — queued while a turn runs, never mid-turn — and is written to the
+  log, so `hotl resume` runs the last model you switched to. Every assistant
+  item now records the model that produced it (`hotl export` can tell which
+  model wrote what); an unswitched session's log is byte-identical to before.
+  Switching across dialects swaps the provider under the session and never
+  strips history: the other dialect's thinking stays in the log and is
+  dropped only at the wire, so switching back restores it. Housekeeping
+  (compaction digests, `/goal` verdicts) follows the session model after a
+  cross-dialect switch; sub-agents keep their startup model; effort and mode
+  are untouched. A model whose window cannot hold the current context is
+  refused — `/compact` first. The notice names the cache cost: the next
+  turn re-writes the whole context. `-p --json` gains an additive
+  `model_changed` frame.
+- **`[provider] fallback_models` is now configurable.** The availability
+  chain (retried on 529s and timeouts, never on auth or billing errors) was
+  wired but had no config key. At most two entries on the session's
+  provider; a longer list, another provider's prefix, an uncatalogued entry
+  or a narrower window warns at startup, and nothing refuses to start. Config
+  only — there is no environment variable.
 - **`/compact [focus]` folds history when you say so.** The same typed
   summary the 80% rung writes, run on demand — before a phase switch, a long
   pause, or a model change. A focus (`/compact the auth refactor`) keeps
