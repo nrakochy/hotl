@@ -43,6 +43,9 @@ pub(crate) struct Resumed {
     /// The chain's generated title (last `Title`, child wins; 0071 T4). Same
     /// inheritance as the name; a resumed chain is never re-titled.
     pub title: Option<String>,
+    /// The chain's last `/model` switch (last `ModelSet`, child wins; 0067),
+    /// a `provider/model` spec. Resume runs it when this machine can.
+    pub model: Option<String>,
     pub items: Vec<hotl_types::Item>,
     /// The parent's last `ModeSet`, if any (durable, last-wins — same
     /// inheritance shape as the display name). `None` = the parent never
@@ -84,6 +87,16 @@ pub(crate) struct Inherited {
     /// the interactive factory sets it, and only for an unnamed, untitled
     /// session.
     pub auto_title: bool,
+}
+
+/// A resumed `/model` switch (0067), resolved by the factory: the provider
+/// (when the dialect differs from the configured one), the bare model, the
+/// spec the log recorded, and the profile the model name decides.
+pub(crate) struct ResumedModel {
+    pub switch: hotl_engine::ModelSwitch,
+    /// The configured provider's names (fallbacks, `fast_model`,
+    /// `utility_model`) do not apply on another dialect.
+    pub dialect_changed: bool,
 }
 
 /// Resolve a [`KeepSpec`] to a projection length, rejecting anything that is
@@ -176,6 +189,7 @@ pub(crate) fn load_lineage(
         mode,
         plan,
         effort,
+        model,
         todos,
         decisions,
         goal,
@@ -187,7 +201,10 @@ pub(crate) fn load_lineage(
     items.truncate(n);
     Ok(Resumed {
         parent_id: header.session_id,
-        parent_model: header.model,
+        // The last `/model` switch, else the header's model (0067): what the
+        // "model changed since this session last ran" notice compares.
+        parent_model: model.clone().unwrap_or(header.model),
+        model,
         parent_tip_entry_id: tip_entry_id,
         inherited_name: name,
         title,
@@ -689,6 +706,7 @@ pub(crate) async fn build_acp() -> Result<
         context_window: scaffold.config.context_window,
         stream_idle_secs: scaffold.stream_idle_secs,
         model: scaffold.model.clone(),
+        model_resolver: Some(model_resolver()),
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
         // §S3.2 (TUI/ACP handshake trigger): the provider is process-wide
@@ -797,6 +815,42 @@ pub(crate) async fn build_acp() -> Result<
                 scaffold.clock.now_ms(),
             );
         }
+        // A resumed `/model` switch (0067): run it when this machine can
+        // serve it, else warn and run the configured model. A fork inherits
+        // the model too (it is the history's dialect). The entry copies
+        // forward so this log is self-contained.
+        let configured_spec = {
+            let (p, m) = selected_model(&crate::config::Config::load(&config_dir()), &EnvSecrets);
+            format!("{p}/{m}")
+        };
+        let mut running_spec = configured_spec.clone();
+        let mut resumed_model: Option<ResumedModel> = None;
+        let mut model_notices: Vec<String> = Vec::new();
+        if let Some(spec) = resumed.as_ref().and_then(|r| r.model.clone()) {
+            if spec != configured_spec {
+                let cfg = crate::config::Config::load(&config_dir());
+                match resolve_switch(&cfg, &EnvSecrets, &spec) {
+                    Ok((switch, mut switch_warnings)) => {
+                        model_notices.append(&mut switch_warnings);
+                        running_spec = switch.spec.clone();
+                        let _ = log.append(
+                            &hotl_types::EntryPayload::ModelSet {
+                                model: switch.spec.clone(),
+                            },
+                            scaffold.clock.now_ms(),
+                        );
+                        resumed_model = Some(ResumedModel {
+                            dialect_changed: switch.provider.is_some(),
+                            switch,
+                        });
+                    }
+                    Err(e) => model_notices.push(format!(
+                        "this session last ran `{spec}`, which this machine cannot serve ({e}); \
+                         running the configured model instead"
+                    )),
+                }
+            }
+        }
         // Copy-forward the inherited effort, same shape as the mode: this log
         // is the single-file source of truth for `hotl resume`. An
         // unrecognized level (a future build's rung) copies forward as history
@@ -849,7 +903,8 @@ pub(crate) async fn build_acp() -> Result<
             .to_string();
         let plan = plan_override.unwrap_or_else(|| scaffold.rules.plan());
         let session_id = log.session_id.clone();
-        let (initial, notices) = session_context(&scaffold, &resumed, plan);
+        let (initial, mut notices) = session_context(&scaffold, &resumed, plan);
+        notices.append(&mut model_notices);
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
         }
@@ -860,10 +915,19 @@ pub(crate) async fn build_acp() -> Result<
         // it parsed to `Some(None)` above, so both run the provider default.
         let todos_wire = inherited_todos.clone();
         let effort_wire = effort_override.map(|o| o.map(|e| e.as_str().to_string()));
+        // Compared against the model actually running (0067): a resumed
+        // switch this machine serves is not a change.
+        let running_bare = running_spec
+            .split_once('/')
+            .map_or(running_spec.as_str(), |(_, m)| m);
         let previous_model = resumed
             .as_ref()
             .map(|r| r.parent_model.clone())
-            .filter(|m| *m != scaffold.model);
+            .filter(|m| {
+                let bare = m.split_once('/').map_or(m.as_str(), |(_, b)| b);
+                bare != running_bare
+            });
+        let open_model = (running_spec != configured_spec).then(|| running_spec.clone());
         let handle = spawn_interactive_session(
             (*scaffold.registry).clone(),
             Some(scaffold.spawn_registration(session_id.clone())),
@@ -871,7 +935,7 @@ pub(crate) async fn build_acp() -> Result<
             scaffold.hooks.clone(),
             scaffold.plan_artifact_path(),
             |registry| {
-                let mut deps = scaffold.deps(
+                let mut deps = scaffold.deps_with_model(
                     log,
                     initial,
                     Inherited {
@@ -883,6 +947,7 @@ pub(crate) async fn build_acp() -> Result<
                     inherited_todos,
                     inherited_decisions,
                     inherited_goal.clone(),
+                    resumed_model,
                 );
                 deps.registry = registry;
                 deps
@@ -906,6 +971,7 @@ pub(crate) async fn build_acp() -> Result<
             session_id,
             warnings: notices,
             title: inherited_title,
+            model: open_model,
         })
     });
     Ok((factory, info, warnings))
@@ -1298,6 +1364,30 @@ impl Scaffold {
         initial_decisions: Vec<hotl_types::Decision>,
         initial_goal: Option<String>,
     ) -> SessionDeps {
+        self.deps_with_model(
+            log,
+            initial_items,
+            inherited,
+            initial_todos,
+            initial_decisions,
+            initial_goal,
+            None,
+        )
+    }
+
+    /// `deps` for a session resuming a `/model` switch (0067): the switched
+    /// provider, model and profile replace the scaffold's.
+    #[allow(clippy::too_many_arguments)]
+    fn deps_with_model(
+        &self,
+        log: SessionLog,
+        initial_items: Vec<hotl_types::Item>,
+        inherited: Inherited,
+        initial_todos: Vec<hotl_types::Todo>,
+        initial_decisions: Vec<hotl_types::Decision>,
+        initial_goal: Option<String>,
+        model: Option<ResumedModel>,
+    ) -> SessionDeps {
         let Inherited {
             mode: mode_override,
             plan: plan_override,
@@ -1322,8 +1412,30 @@ impl Scaffold {
             config.effort = e;
         }
         config.auto_title = auto_title;
+        let mut provider = self.provider.clone();
+        if let Some(ResumedModel {
+            switch,
+            dialect_changed,
+        }) = model
+        {
+            config.model = switch.model;
+            config.model_spec = Some(switch.spec);
+            config.context_window = switch.profile.context_window;
+            config.max_tokens = switch.profile.max_tokens;
+            config.token_profile = switch.profile.token_profile;
+            if let Some(p) = switch.provider {
+                provider = p;
+            }
+            if dialect_changed {
+                // The configured names belong to the startup provider
+                // (0067 decisions 5 and 7).
+                config.fallback_models.clear();
+                config.fast_model = None;
+                config.utility_model = None;
+            }
+        }
         SessionDeps {
-            provider: self.provider.clone(),
+            provider,
             registry: self.registry.clone(),
             rules,
             sandbox_enforced: self.sandbox_enforced,
@@ -1422,6 +1534,115 @@ fn plan_exit_code(workspace: &std::path::Path) -> i32 {
             0
         }
     }
+}
+
+/// What a model name decides (0067): the window, the tokenizer profile and
+/// the output cap. Startup (`engine_config`) and a `/model` switch
+/// (`resolve_switch`) share this so the two can never derive differently.
+pub(crate) fn model_profile(
+    model: &str,
+    secrets: &dyn SecretStore,
+    cfg: &crate::config::Config,
+) -> (hotl_engine::ModelProfile, Vec<String>) {
+    let mut warnings = Vec::new();
+    // Env > `[context] window` > the model catalog > the fallback. Before
+    // this call site existed every uncatalogued *and* catalogued model got
+    // the 200_000 default, so 1M models compacted at 160K (A1).
+    let env_window = secrets.get("HOTL_CONTEXT_WINDOW");
+    let (context_window, window_warning) = cfg.context.resolve_window(model, env_window.as_deref());
+    warnings.extend(window_warning);
+    let mut max_tokens = secrets
+        .get("HOTL_MAX_TOKENS")
+        .and_then(|v| v.parse().ok())
+        .or(cfg.provider.max_tokens)
+        .unwrap_or(EngineConfig::default().max_tokens);
+    // Never ask a model for more output than its catalog says it can emit.
+    if let Some(cap) = hotl_provider::catalog::max_output_tokens(model) {
+        max_tokens = max_tokens.min(cap);
+    }
+    (
+        hotl_engine::ModelProfile {
+            context_window,
+            max_tokens,
+            // The same catalog row's chars-per-token ratio (tracker #63).
+            // One ruler for the compaction trigger, the clear trigger, the
+            // spill threshold and `/context`.
+            token_profile: cfg.context.token_profile(model),
+        },
+        warnings,
+    )
+}
+
+/// `/model <raw>` → a switch the engine can install (0067). `default` is the
+/// configured spec; a bare name is Anthropic (`selected_model`'s rule). The
+/// provider half is validated and its key source checked the way startup
+/// does, so a missing key is this error, not a 401 on the next turn. The
+/// provider is rebuilt only when the dialect differs from the configured
+/// one; a same-dialect switch keeps the running provider.
+pub(crate) fn resolve_switch(
+    cfg: &crate::config::Config,
+    secrets: &dyn SecretStore,
+    raw: &str,
+) -> Result<(hotl_engine::ModelSwitch, Vec<String>), String> {
+    let (configured_provider, configured_model) = selected_model(cfg, secrets);
+    let raw = raw.trim();
+    let (provider_name, model) = if raw.is_empty() || raw == "default" {
+        (configured_provider.clone(), configured_model.clone())
+    } else {
+        match raw.split_once('/') {
+            Some((p, m)) if !m.is_empty() => (p.to_ascii_lowercase(), m.to_string()),
+            _ => ("anthropic".to_string(), raw.to_string()),
+        }
+    };
+    let provider_name = match provider_name.as_str() {
+        "oai" => "openai".to_string(),
+        other => other.to_string(),
+    };
+    let auth = auth_mode(cfg, secrets)?;
+    let provider = if provider_name == configured_provider {
+        None
+    } else {
+        let (provider, _source) = match provider_name.as_str() {
+            "anthropic" => resolve_anthropic(cfg, secrets, auth)?,
+            "openai" => resolve_openai(cfg, secrets, auth)?,
+            "openai-responses" => resolve_openai_responses(cfg, secrets, auth)?,
+            other => {
+                return Err(format!(
+                    "unknown provider `{other}`. Supported: anthropic/<model>, openai/<model>, \
+                     openai-responses/<model>"
+                ))
+            }
+        };
+        Some(provider)
+    };
+    let (profile, mut warnings) = model_profile(&model, secrets, cfg);
+    if hotl_provider::catalog::lookup(&configured_model).is_some()
+        && hotl_provider::catalog::lookup(&model).is_none()
+    {
+        warnings.push(format!(
+            "`{model}` is not in the catalog: no price, and compaction uses the \
+             {}-token window unless [context] window says otherwise",
+            profile.context_window
+        ));
+    }
+    Ok((
+        hotl_engine::ModelSwitch {
+            spec: format!("{provider_name}/{model}"),
+            model,
+            provider,
+            profile,
+        },
+        warnings,
+    ))
+}
+
+/// The `session/set_model` resolver the ACP server is handed (0067): reads
+/// `config.toml` and the environment at call time, like `reload_hook`.
+pub(crate) fn model_resolver() -> crate::acp::ModelResolver {
+    Arc::new(|raw: &str| {
+        let cfg = crate::config::Config::load(&config_dir());
+        resolve_switch(&cfg, &EnvSecrets, raw)
+    })
 }
 
 /// Env-named secrets plus, when a helper minted this process's key, that
@@ -3565,34 +3786,19 @@ fn engine_config(
         model: model.to_string(),
         ..Default::default()
     };
-    // Env > `[context] window` > the model catalog > the fallback. Before
-    // this call site existed every uncatalogued *and* catalogued model got
-    // the 200_000 default, so 1M models compacted at 160K (A1).
-    let env_window = secrets.get("HOTL_CONTEXT_WINDOW");
-    let (window, window_warning) = cfg.context.resolve_window(model, env_window.as_deref());
-    config.context_window = window;
-    warnings.extend(window_warning);
-    // The same catalog row's chars-per-token ratio (tracker #63). One ruler
-    // for the compaction trigger, the clear trigger, the spill threshold and
-    // `/context` — a denser tokenizer is budgeted as denser, not as ASCII.
-    config.token_profile = cfg.context.token_profile(model);
+    // Everything the model name decides, derived once here and again on a
+    // `/model` switch through the same function (0067).
+    let (profile, profile_warnings) = model_profile(model, secrets, cfg);
+    config.context_window = profile.context_window;
+    config.token_profile = profile.token_profile;
+    config.max_tokens = profile.max_tokens;
+    warnings.extend(profile_warnings);
     if let Some(turns) = secrets
         .get("HOTL_MAX_TURNS")
         .and_then(|v| v.parse().ok())
         .or(cfg.behavior.max_turns)
     {
         config.max_turns = turns;
-    }
-    if let Some(mt) = secrets
-        .get("HOTL_MAX_TOKENS")
-        .and_then(|v| v.parse().ok())
-        .or(cfg.provider.max_tokens)
-    {
-        config.max_tokens = mt;
-    }
-    // Never ask a model for more output than its catalog says it can emit.
-    if let Some(cap) = hotl_provider::catalog::max_output_tokens(model) {
-        config.max_tokens = config.max_tokens.min(cap);
     }
     config.fast_model = secrets
         .get("HOTL_FAST_MODEL")
@@ -4268,6 +4474,29 @@ mod fork_tests {
             );
         }
         (log.session_id.clone(), log)
+    }
+
+    /// 0067: the previous-model notice compares against the last `/model`
+    /// switch, not the header, when the chain switched.
+    #[test]
+    fn parent_model_is_the_last_model_set_else_the_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let (parent_id, mut parent) = parent_with_three_turns(dir.path());
+        let r = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
+        assert_eq!(r.parent_model, "m");
+        assert_eq!(r.model, None);
+        parent
+            .append(
+                &EntryPayload::ModelSet {
+                    model: "openai/gpt-5".into(),
+                },
+                3,
+            )
+            .unwrap();
+        drop(parent);
+        let r = load_lineage(dir.path(), &parent_id, KeepSpec::All).unwrap();
+        assert_eq!(r.parent_model, "openai/gpt-5");
+        assert_eq!(r.model.as_deref(), Some("openai/gpt-5"));
     }
 
     #[test]
@@ -7423,6 +7652,38 @@ mod tests {
             Some(Prompt::Stdin)
         );
         assert_eq!(headless_prompt(None, None), None);
+    }
+
+    /// 0067: the resolver's three answers — same dialect keeps the provider,
+    /// `default` is the configured spec, an unknown provider is the startup
+    /// error text. Cross-dialect needs a key; that is `resolve_openai`'s job.
+    #[test]
+    fn resolve_switch_keeps_the_provider_for_a_same_dialect_switch() {
+        let cfg = config_from_toml("[provider]\nmodel = \"anthropic/claude-opus-4-8\"\n");
+        let secrets = MapSecrets::default();
+        let (sw, warnings) = resolve_switch(&cfg, &secrets, "claude-haiku-4-5").unwrap();
+        assert_eq!(sw.spec, "anthropic/claude-haiku-4-5");
+        assert_eq!(sw.model, "claude-haiku-4-5");
+        assert!(
+            sw.provider.is_none(),
+            "same dialect: the running provider stays"
+        );
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (sw, _) = resolve_switch(&cfg, &secrets, "default").unwrap();
+        assert_eq!(sw.spec, "anthropic/claude-opus-4-8");
+        let (sw, warnings) = resolve_switch(&cfg, &secrets, "anthropic/gateway-alias").unwrap();
+        assert_eq!(sw.spec, "anthropic/gateway-alias");
+        assert!(
+            warnings.iter().any(|w| w.contains("not in the catalog")),
+            "{warnings:?}"
+        );
+        let err = resolve_switch(&cfg, &secrets, "nope/x").unwrap_err();
+        assert!(err.contains("unknown provider `nope`"), "{err}");
+        let err = resolve_switch(&cfg, &secrets, "openai/gpt-5").unwrap_err();
+        assert!(
+            err.contains("OPENAI_API_KEY"),
+            "a cross-dialect switch needs the key: {err}"
+        );
     }
 
     #[test]

@@ -84,6 +84,7 @@ fn scripted_factory() -> acp::SessionFactory {
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     })
 }
@@ -158,6 +159,7 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     })
 }
@@ -182,6 +184,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             default_plan: false,
             context_window: 200_000,
             stream_idle_secs: 90,
+            model_resolver: None,
             model: "m".into(),
         },
         None,

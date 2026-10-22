@@ -542,6 +542,23 @@ fn retrying_omits_status_when_the_error_had_none() {
     assert_eq!(f["delay_ms"], 900);
 }
 
+/// 0067: `model_changed` is an additive stream frame with the cache cost.
+#[test]
+fn model_changed_is_a_stream_frame_with_the_cache_cost() {
+    let f = wire::update_frame(&EngineEvent::ModelChanged {
+        model: "openai/gpt-5".into(),
+        previous: "anthropic/claude-opus-5".into(),
+        context_tokens: 41_000,
+        context_window: 200_000,
+    })
+    .expect("model_changed is a stream frame");
+    assert_eq!(f["type"], "model_changed");
+    assert_eq!(f["model"], "openai/gpt-5");
+    assert_eq!(f["previous"], "anthropic/claude-opus-5");
+    assert_eq!(f["context_tokens"], 41_000);
+    assert_eq!(f["context_window"], 200_000);
+}
+
 /// 0066: `compacted` carries the focus only when there was one, the digest's
 /// usage, and the post-fold estimate; `fold_skipped` is its own frame.
 #[test]

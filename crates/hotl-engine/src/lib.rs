@@ -80,6 +80,10 @@ pub use turn::STREAM_RETRY_MAX;
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     pub model: String,
+    /// The `provider/model` spec the session is running when it differs from
+    /// the bare `model` (a resumed `/model` switch; 0067). `None` = the
+    /// spec is the model name as configured.
+    pub model_spec: Option<String>,
     pub max_tokens: u32,
     /// Model samples one prompt may spend before the turn is cut short with
     /// [`Outcome::TurnLimit`]. Every tool round-trip costs one, so this is a
@@ -199,6 +203,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             model: "claude-opus-4-8".into(),
+            model_spec: None,
             // Anthropic recommends ≥64K output headroom at high/xhigh effort,
             // and adaptive thinking shares this cap.
             max_tokens: 64_000,

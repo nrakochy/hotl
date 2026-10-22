@@ -43,6 +43,7 @@ fn server_info() -> acp::ServerInfo {
         default_plan: false,
         context_window: 200_000,
         stream_idle_secs: 90,
+        model_resolver: None,
         // Uncatalogued deliberately: matches `scripted_factory`'s session log
         // model ("m"), and keeps `cost_usd` absent for scenarios that don't
         // test pricing.
@@ -129,6 +130,7 @@ fn scripted_factory_recording(
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     })
 }
@@ -194,6 +196,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     })
 }
@@ -396,6 +399,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     })
 }
@@ -560,6 +564,7 @@ async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
             session_id,
             warnings: Vec::new(),
             title,
+            model: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -870,6 +875,7 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     });
     tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
@@ -1268,6 +1274,7 @@ async fn overlapping_prompts_resolve_in_order() {
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1486,6 +1493,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     });
     tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
@@ -1690,6 +1698,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1826,6 +1835,7 @@ async fn the_session_reports_its_effective_mode() {
             default_plan: false,
             context_window: 1_000_000,
             stream_idle_secs: 90,
+            model_resolver: None,
             model: "m".into(),
         },
         None,
@@ -1963,6 +1973,321 @@ async fn set_plan_is_its_own_axis_and_the_legacy_plan_mode_word_still_works() {
 /// `session/set_effort` acks with the effective level, broadcasts
 /// `effort_changed`, round-trips the cleared case as JSON `null`, and rejects
 /// a rung it does not carry.
+/// 0067: a resolver that never touches a key — `provider/model` becomes a
+/// same-dialect switch; `openai/…` a cross-dialect one with a scripted
+/// provider; `nope/…` the startup error text.
+fn test_resolver() -> acp::ModelResolver {
+    Arc::new(|raw: &str| {
+        let raw = raw.trim();
+        let (provider, model) = match raw.split_once('/') {
+            Some((p, m)) => (p.to_string(), m.to_string()),
+            None => ("anthropic".to_string(), raw.to_string()),
+        };
+        let provider_obj: Option<Arc<dyn hotl_provider::Provider>> = match provider.as_str() {
+            "anthropic" => None,
+            "openai" => Some(Arc::new(ScriptedProvider::new(vec![
+                ScriptedProvider::text_reply("from openai"),
+            ]))),
+            other => {
+                return Err(format!(
+                    "unknown provider `{other}`. Supported: anthropic/<model>, openai/<model>, \
+                     openai-responses/<model>"
+                ))
+            }
+        };
+        Ok((
+            hotl_engine::ModelSwitch {
+                spec: format!("{provider}/{model}"),
+                model,
+                provider: provider_obj,
+                profile: hotl_engine::ModelProfile {
+                    context_window: 200_000,
+                    max_tokens: 8_000,
+                    token_profile: hotl_context::TokenProfile::CONSERVATIVE,
+                },
+            },
+            Vec::new(),
+        ))
+    })
+}
+
+fn server_info_with_resolver() -> acp::ServerInfo {
+    acp::ServerInfo {
+        model_resolver: Some(test_resolver()),
+        ..server_info()
+    }
+}
+
+#[tokio::test]
+async fn set_model_acks_applied_and_the_engine_broadcasts_model_changed() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info_with_resolver(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 2).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"model":"anthropic/other"}}),
+    )
+    .await;
+    // Applied at once: the engine's broadcast and the ack arrive in either
+    // order, so collect both.
+    let (mut ack, mut changed) = (None, None);
+    for _ in 0..8 {
+        if ack.is_some() && changed.is_some() {
+            break;
+        }
+        let m = next(&mut lines).await;
+        if m["id"] == json!(3) {
+            ack = Some(m);
+        } else if m["params"]["update"]["type"] == "model_changed" {
+            changed = Some(m);
+        }
+    }
+    let ack = ack.expect("the ack");
+    assert_eq!(ack["result"]["applied"], true, "{ack}");
+    assert_eq!(ack["result"]["model"], "anthropic/other");
+    let changed = changed.expect("the broadcast");
+    assert_eq!(changed["params"]["update"]["model"], "anthropic/other");
+    assert_eq!(changed["params"]["update"]["context_window"], 200_000);
+    assert!(changed["params"]["update"]["context_tokens"].is_number());
+}
+
+#[tokio::test]
+async fn set_model_during_a_turn_acks_queued_then_broadcasts_at_the_boundary() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info_with_resolver(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 2).await;
+    // The scripted turn asks for permission and waits: a turn is running.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+    let ask = next_matching(&mut lines, |m| m["method"] == "session/request_permission").await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_model","params":{"model":"anthropic/other"}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 4).await;
+    assert_eq!(ack["result"]["applied"], false, "parked: {ack}");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id": ask["id"],"result":{"allow": true}}),
+    )
+    .await;
+    let changed = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "model_changed"
+    })
+    .await;
+    assert_eq!(changed["params"]["update"]["model"], "anthropic/other");
+}
+
+#[tokio::test]
+async fn set_model_rejects_an_unknown_provider_and_changes_nothing() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info_with_resolver(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 2).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"model":"nope/x"}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 3).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown provider"),
+        "{err}"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/set_model","params":{}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 4).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("params.model"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn set_model_without_a_resolver_is_an_error_not_a_silent_no_op() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 2).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/set_model","params":{"model":"anthropic/other"}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 3).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("not supported"),
+        "{err}"
+    );
+}
+
+/// 0067: the open reply's `model` is the model the session runs — a
+/// resumed switch when the factory restored one, else the process default.
+#[tokio::test]
+async fn a_resumed_session_runs_its_last_model_set() {
+    let factory: acp::SessionFactory = Box::new(move |spec| {
+        let switched = matches!(spec, acp::SessionSpec::Load { .. });
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider: Arc::new(ScriptedProvider::new(vec![])),
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig::default(),
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            title: None,
+            model: switched.then(|| "openai-responses/gpt-5.6".to_string()),
+        })
+    });
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    let _ = read_until_id(&mut lines, 1).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/load","params":{"sessionId":"S1"}}),
+    )
+    .await;
+    let open = read_until_id(&mut lines, 2).await;
+    assert_eq!(
+        open["result"]["model"], "openai-responses/gpt-5.6",
+        "{open}"
+    );
+    assert!(open["result"].get("previousModel").is_none());
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+    )
+    .await;
+    let open = read_until_id(&mut lines, 3).await;
+    assert_eq!(open["result"]["model"], server_info().model, "{open}");
+}
+
 #[tokio::test]
 async fn set_effort_acks_broadcasts_and_rejects_unknown_levels() {
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -2187,6 +2512,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             session_id,
             warnings: Vec::new(),
             title: None,
+            model: None,
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -2289,6 +2615,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         default_plan: false,
         context_window: 900_000,
         stream_idle_secs: 90,
+        model_resolver: None,
         model: "m2".into(),
     };
     // What `SessionSpec::Load` the replacement factory is handed, so this test

@@ -199,6 +199,9 @@ pub struct SessionOpen {
     /// The generated title a resume restored (0071 T4); the open reply
     /// carries it as `title` (absent when none). A name outranks it.
     pub title: Option<String>,
+    /// The `provider/model` this session runs when it is not the process
+    /// default (a resumed `/model` switch; 0067). The open reply's `model`.
+    pub model: Option<String>,
 }
 
 /// Builds a session per the client's request. The real binary wires engine
@@ -215,6 +218,13 @@ pub type Reload = Box<
     dyn FnMut() -> BoxFuture<'static, Result<(SessionFactory, ServerInfo, Vec<String>), String>>
         + Send,
 >;
+
+/// `session/set_model`'s engine knowledge (0067): turn `provider/model` (or
+/// `default`) into a switch the engine can install, validating the provider
+/// half and the key the way startup does. `None` on connections that cannot
+/// switch. Returns the switch and any warnings (an uncatalogued model, say).
+pub type ModelResolver =
+    Arc<dyn Fn(&str) -> Result<(hotl_engine::ModelSwitch, Vec<String>), String> + Send + Sync>;
 
 /// One skill as `initialize` advertises it. The description is client-facing
 /// only — front ends render it in the `/` completion menu. Content still
@@ -239,7 +249,7 @@ pub struct WorkflowInfo {
 /// What `serve` advertises to a client before any session exists. Bundled
 /// rather than passed positionally: `serve` is already at the argument count
 /// where this workspace reaches for `#[allow(clippy::too_many_arguments)]`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ServerInfo {
     pub skills: Vec<SkillInfo>,
     pub workflows: Vec<WorkflowInfo>,
@@ -257,6 +267,8 @@ pub struct ServerInfo {
     /// The stream idle watchdog in seconds (0071 T2) — what the strip's
     /// `stalled … · retry at Ns` names.
     pub stream_idle_secs: u64,
+    /// How `session/set_model` resolves a spec (0067); `None` = unsupported.
+    pub model_resolver: Option<ModelResolver>,
     /// The session's primary model — prices `turn_done`'s `usage.cost_usd`
     /// (Task 5 cost telemetry). One process serves one model for its whole
     /// lifetime (process-per-session), so this is fixed for every
@@ -264,6 +276,21 @@ pub struct ServerInfo {
     /// model used mid-turn is still priced as this one (see
     /// `wire::usage_frame`).
     pub model: String,
+}
+
+impl std::fmt::Debug for ServerInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerInfo")
+            .field("model", &self.model)
+            .field("default_mode", &self.default_mode)
+            .field("default_plan", &self.default_plan)
+            .field("context_window", &self.context_window)
+            .field("stream_idle_secs", &self.stream_idle_secs)
+            .field("skills", &self.skills.len())
+            .field("workflows", &self.workflows.len())
+            .field("model_resolver", &self.model_resolver.is_some())
+            .finish()
+    }
 }
 
 /// The `skills` array `initialize` and `config_reloaded` both carry.
@@ -469,6 +496,7 @@ async fn handle_request(
                     let previous_model = open.previous_model.clone();
                     let open_warnings = open.warnings.clone();
                     let open_title = open.title.clone();
+                    let open_model = open.model.clone().unwrap_or_else(|| info.model.clone());
                     let sid = install_session(
                         open,
                         writer,
@@ -544,6 +572,9 @@ async fn handle_request(
                     if let Some(t) = open_title {
                         obj.insert("title".into(), json!(t));
                     }
+                    // The model this session actually runs (a resumed switch
+                    // may differ from the process default).
+                    obj.insert("model".into(), json!(open_model));
                     reply_ok(writer, id, reply).await;
                 }
                 Err(e) => reply_err(writer, id, &e).await,
@@ -703,6 +734,44 @@ async fn handle_request(
                 json!({"type": "effort_changed", "effort": wire}),
             )
             .await;
+        }
+        // `/model` (0067). The ack says whether the switch applied now or
+        // waits for the turn boundary; the engine's `model_changed` event —
+        // relayed like every event — is the only thing that moves a surface.
+        "session/set_model" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let Some(raw) = msg.pointer("/params/model").and_then(Value::as_str) else {
+                return reply_err(
+                    writer,
+                    id,
+                    "session/set_model requires params.model (provider/model, or default)",
+                )
+                .await;
+            };
+            let Some(resolver) = info.model_resolver.as_ref() else {
+                return reply_err(
+                    writer,
+                    id,
+                    "session/set_model is not supported on this connection",
+                )
+                .await;
+            };
+            let (switch, warnings) = match resolver(raw) {
+                Ok(r) => r,
+                Err(e) => return reply_err(writer, id, &format!("session/set_model: {e}")).await,
+            };
+            let spec = switch.spec.clone();
+            match state.handle.set_model(switch).await {
+                Ok(applied) => reply_ok(
+                    writer,
+                    id,
+                    json!({"ok": true, "model": spec, "applied": applied, "warnings": warnings}),
+                )
+                .await,
+                Err(e) => reply_err(writer, id, &format!("session/set_model: {e}")).await,
+            }
         }
         "session/set_goal" => {
             let Some(state) = session.as_ref() else {

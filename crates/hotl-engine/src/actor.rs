@@ -820,7 +820,11 @@ impl SharedDeps {
         let system: Arc<str> = deps.system.into();
         let system_estimate = tokens::estimate_text_with(&system, &deps.config.token_profile);
         let active = Arc::new(ActiveModel {
-            spec: deps.config.model.clone(),
+            spec: deps
+                .config
+                .model_spec
+                .clone()
+                .unwrap_or_else(|| deps.config.model.clone()),
             model: deps.config.model.clone(),
             provider: deps.provider,
             profile: crate::ModelProfile::from_config(&deps.config),
