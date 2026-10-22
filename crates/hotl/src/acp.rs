@@ -756,6 +756,44 @@ async fn handle_request(
             state.handle.steer_with(text.to_string(), images).await;
             reply_ok(writer, id, json!({"queued": true})).await;
         }
+        // `/compact [focus]` (0066): ack with whether it ran now or waits for
+        // the turn boundary; the fold's own frames ride `session/update`.
+        "session/fold" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "no session — call session/new first").await;
+            };
+            let focus = match msg.pointer("/params/focus") {
+                None | Some(Value::Null) => None,
+                Some(Value::String(raw)) => match hotl_types::normalize_focus(raw) {
+                    Ok(f) => f,
+                    Err(_) => {
+                        return reply_err(
+                            writer,
+                            id,
+                            "session/fold: focus must be 1–4000 chars after trimming",
+                        )
+                        .await
+                    }
+                },
+                Some(_) => {
+                    return reply_err(
+                        writer,
+                        id,
+                        "session/fold: focus must be 1–4000 chars after trimming",
+                    )
+                    .await
+                }
+            };
+            match state.handle.fold(focus).await {
+                Some(hotl_engine::FoldAdmission::Started) => {
+                    reply_ok(writer, id, json!({"queued": false})).await
+                }
+                Some(hotl_engine::FoldAdmission::Queued) => {
+                    reply_ok(writer, id, json!({"queued": true})).await
+                }
+                None => reply_err(writer, id, "session/fold: the session is gone").await,
+            }
+        }
         "session/cancel" => {
             if let Some(state) = session.as_ref() {
                 state.handle.interrupt();

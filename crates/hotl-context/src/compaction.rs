@@ -186,22 +186,9 @@ pub fn summarize_prompt<I: std::borrow::Borrow<Item>>(
     out
 }
 
-/// Longest focus a human fold may carry (the `session/set_goal` bound).
-pub const FOCUS_MAX: usize = 4000;
-
-/// The one validator for a fold's focus — the TUI, ACP and the engine all
-/// call it, the way `normalize_session_name` serves `/rename`. Trimmed;
-/// empty is "no focus"; over `FOCUS_MAX` is an error.
-pub fn normalize_focus(raw: &str) -> Result<Option<String>, &'static str> {
-    let t = raw.trim();
-    if t.is_empty() {
-        return Ok(None);
-    }
-    if t.chars().count() > FOCUS_MAX {
-        return Err("focus must be 1–4000 chars after trimming");
-    }
-    Ok(Some(t.to_string()))
-}
+/// The fold-focus validator lives beside `normalize_session_name` so the
+/// console (which does not depend on this crate) calls the same one.
+pub use hotl_types::{normalize_focus, FOCUS_MAX};
 
 /// The plain-text transcript both small-model calls read (the compaction
 /// summarizer and the goal evaluator): tool results clipped per-item, images

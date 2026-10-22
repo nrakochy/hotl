@@ -924,6 +924,130 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
     assert_eq!(answer["params"]["update"]["usage"]["input_tokens"], 10);
 }
 
+/// 0066: `session/fold` acks whether it ran now; a fresh session has
+/// nothing to fold, which comes back as a `fold_skipped` update.
+#[tokio::test]
+async fn session_fold_at_idle_acks_now_and_relays_the_outcome() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/fold","params":{}}),
+    )
+    .await;
+    let ack = next_matching(&mut lines, |m| m["id"] == 3).await;
+    assert_eq!(ack["result"]["queued"], false, "{ack}");
+    let skipped = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "fold_skipped"
+    })
+    .await;
+    assert!(!skipped["params"]["update"]["reason"]
+        .as_str()
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        skipped["params"]["schemaVersion"],
+        acp::UPDATE_SCHEMA_VERSION
+    );
+}
+
+#[tokio::test]
+async fn session_fold_without_a_session_is_an_error() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/fold","params":{}}),
+    )
+    .await;
+    let err = next(&mut lines).await;
+    assert!(err["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("session"));
+}
+
+#[tokio::test]
+async fn session_fold_rejects_a_bad_focus() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    tokio::spawn(acp::serve(
+        sread,
+        swrite,
+        scripted_factory(),
+        server_info(),
+        None,
+    ));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"session/new"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/fold","params":{"focus":"x".repeat(4001)}}),
+    )
+    .await;
+    let err = next_matching(&mut lines, |m| m["id"] == 3).await;
+    assert!(
+        err["error"]["message"].as_str().unwrap().contains("focus"),
+        "{err}"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/fold","params":{"focus":7}}),
+    )
+    .await;
+    let err = next_matching(&mut lines, |m| m["id"] == 4).await;
+    assert!(err["error"].is_object(), "{err}");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/fold","params":{"focus":"   "}}),
+    )
+    .await;
+    let ack = next_matching(&mut lines, |m| m["id"] == 5).await;
+    assert_eq!(ack["result"]["queued"], false, "blank = no focus: {ack}");
+}
+
 #[tokio::test]
 async fn session_context_without_a_session_is_an_error() {
     let (client, server) = tokio::io::duplex(64 * 1024);

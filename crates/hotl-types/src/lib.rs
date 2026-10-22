@@ -710,6 +710,23 @@ pub fn bare_model(model: &str) -> &str {
 
 /// A session display name: trimmed, non-empty, at most 64 chars.
 /// The one validator every entry point (CLI, ACP, TUI) funnels through.
+/// Longest focus a human fold may carry (the `session/set_goal` bound; 0066).
+pub const FOCUS_MAX: usize = 4000;
+
+/// The one validator for a fold's focus — the TUI, ACP and the engine all
+/// call it, the way `normalize_session_name` serves `/rename`. Trimmed;
+/// empty is "no focus"; over `FOCUS_MAX` is an error.
+pub fn normalize_focus(raw: &str) -> Result<Option<String>, &'static str> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    if t.chars().count() > FOCUS_MAX {
+        return Err("focus must be 1–4000 chars after trimming");
+    }
+    Ok(Some(t.to_string()))
+}
+
 pub fn normalize_session_name(raw: &str) -> Option<String> {
     let name = raw.trim();
     (!name.is_empty() && name.chars().count() <= 64).then(|| name.to_string())

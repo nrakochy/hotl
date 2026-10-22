@@ -536,6 +536,46 @@ fn retrying_omits_status_when_the_error_had_none() {
     assert_eq!(f["delay_ms"], 900);
 }
 
+/// 0066: `compacted` carries the focus only when there was one, the digest's
+/// usage, and the post-fold estimate; `fold_skipped` is its own frame.
+#[test]
+fn compacted_carries_focus_usage_and_estimate() {
+    let frame = |focus: Option<String>| {
+        wire::update_frame(&EngineEvent::Compacted {
+            degraded: false,
+            focus,
+            usage: hotl_types::TokenUsage {
+                input_tokens: 300,
+                output_tokens: 40,
+                ..Default::default()
+            },
+            estimate: 41_000,
+        })
+        .expect("compacted is a stream frame")
+    };
+    let bare = frame(None);
+    assert!(bare.get("focus").is_none(), "{bare}");
+    assert_eq!(bare["usage"]["input_tokens"], 300);
+    assert_eq!(bare["usage"]["output_tokens"], 40);
+    assert!(bare["usage"].get("cache_read_input_tokens").is_some());
+    assert!(bare["usage"].get("cache_creation_input_tokens").is_some());
+    assert_eq!(bare["estimate"], 41_000);
+    assert_eq!(
+        frame(Some("the auth refactor".into()))["focus"],
+        "the auth refactor"
+    );
+}
+
+#[test]
+fn fold_skipped_is_a_stream_frame() {
+    let f = wire::update_frame(&EngineEvent::FoldSkipped {
+        reason: "nothing left to compact".into(),
+    })
+    .expect("fold_skipped is a stream frame");
+    assert_eq!(f["type"], "fold_skipped");
+    assert_eq!(f["reason"], "nothing left to compact");
+}
+
 /// 0071 T4: `session_titled` carries the title only when there is one, and
 /// always the spend.
 #[test]
