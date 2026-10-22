@@ -27,7 +27,7 @@ pub struct Completion {
 
 /// The TUI's own commands, in `slash_command`'s dispatch order. Descriptions
 /// are hand-written here because built-ins have no roster to read them from.
-const BUILTINS: [(&str, &str); 13] = [
+const BUILTINS: [(&str, &str); 14] = [
     ("rename", "name this session"),
     ("plan", "toggle plan mode (file edits always ask)"),
     ("mode", "set the permission mode"),
@@ -39,6 +39,10 @@ const BUILTINS: [(&str, &str); 13] = [
     ("context", "what is filling the context window"),
     ("workflows", "runs of the workflow tool, with progress"),
     ("cost", "token and cost breakdown"),
+    (
+        "review",
+        "second opinion on a diff, in a fresh read-only agent",
+    ),
     ("clear", "clear the transcript view"),
     ("quit", "leave the console"),
 ];
@@ -174,7 +178,7 @@ mod tests {
     fn table() -> Vec<Command> {
         let mut cmds = builtins();
         for (name, description) in [
-            ("review", "review a pull request"),
+            ("refactor", "refactor a module"),
             ("rag-recall", "search the retrieval index"),
             ("superpowers:brainstorming", "turn an idea into a design"),
             // Shorter than every builtin — pins "built-ins first" against the
@@ -223,11 +227,12 @@ mod tests {
                 "effort",
                 "reload",
                 "rename",
+                "review",
                 "status",
                 "context",
                 "workflows",
                 "run",
-                "review",
+                "refactor",
                 "rag-recall",
                 "superpowers:brainstorming",
             ],
@@ -244,7 +249,7 @@ mod tests {
         let c = recompute(&cmds, "/re", (0, 3), false).expect("open");
         assert_eq!(
             names(&cmds, &c),
-            vec!["reload", "rename", "review", "rag-recall"],
+            vec!["reload", "rename", "review", "refactor", "rag-recall"],
             "`rag-recall` contains `re` (at \"rag-\"[re]\"call\") and must sort below the prefix hits; \
              `mode` has no `r` at all and must not appear"
         );

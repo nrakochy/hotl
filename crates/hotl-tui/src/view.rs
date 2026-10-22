@@ -6144,8 +6144,8 @@ mod tests {
     fn with_popup() -> State {
         let mut s = State::new(true, "m".into());
         s.commands.push(crate::complete::Command {
-            name: "review".into(),
-            description: "review a pull request".into(),
+            name: "refactor".into(),
+            description: "refactor a module".into(),
             builtin: false,
         });
         s.commands.push(crate::complete::Command {
@@ -6168,9 +6168,14 @@ mod tests {
         let rows = draw(&s);
         let popup: Vec<&String> = rows[..INPUT_TOP]
             .iter()
-            .filter(|r| r.contains("/reload") || r.contains("/rename") || r.contains("/review"))
+            .filter(|r| {
+                r.contains("/reload")
+                    || r.contains("/rename")
+                    || r.contains("/review")
+                    || r.contains("/refactor")
+            })
             .collect();
-        assert_eq!(popup.len(), 3, "every match renders: {rows:#?}");
+        assert_eq!(popup.len(), 4, "every match renders: {rows:#?}");
         assert!(
             popup[0].contains("› /reload"),
             "the first match is marked: {}",

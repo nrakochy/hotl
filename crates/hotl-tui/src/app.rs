@@ -2954,6 +2954,33 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             Vec::new()
         }
         "quit" => vec![Cmd::Quit],
+        // The built-in reviewer (0070 T11): a prompt, never an engine call.
+        // The model spawns the read-only `review` def; a skill of this name
+        // is shadowed, as every built-in shadows.
+        "review" => {
+            let target = payload
+                .text
+                .trim()
+                .strip_prefix('/')
+                .and_then(|r| r.split_once(char::is_whitespace))
+                .map(|(_, a)| a.trim())
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    "the uncommitted changes in the working tree (`git diff` and untracked files)"
+                        .to_string()
+                });
+            let text = format!(
+                "Use the `spawn` tool with `agent_type: \"review\"` and this task: \"Review {target}. \
+                 Report findings as path:line — severity — what and why, ordered by severity, and \
+                 end with a one-line verdict.\" Relay its findings verbatim; do not act on them."
+            );
+            let payload = paste::PromptPayload {
+                text: text.clone(),
+                images: payload.images,
+            };
+            submit(state, text, payload)
+        }
         other if state.skills.iter().any(|s| s == other) => {
             // Desugars to an ordinary prompt: the model calls the skill tool,
             // so the TUI never reads skill files itself. The ARGUMENTS come
@@ -6639,20 +6666,20 @@ mod tests {
 
     #[test]
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Twelve built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(14));
+        // Fourteen built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(15));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
-        // `reload`, `rename` and `review` prefix-match; no other built-in
-        // contains "re".
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(3));
+        // `reload`, `rename` and `review` prefix-match, then the `refactor`
+        // skill; no other built-in contains "re".
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(4));
     }
 
     #[test]
     fn arrows_move_the_selection_and_saturate_at_both_ends() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/re");
         press(&mut s, KeyCode::Down);
         assert_eq!(selected(&s), "rename");
@@ -6667,12 +6694,12 @@ mod tests {
         for _ in 0..10 {
             press(&mut s, KeyCode::Down);
         }
-        assert_eq!(selected(&s), "review", "down saturates at the bottom");
+        assert_eq!(selected(&s), "refactor", "down saturates at the bottom");
     }
 
     #[test]
     fn tab_completes_the_selection_without_starting_a_turn() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/re");
         let cmds = press(&mut s, KeyCode::Tab);
         assert!(cmds.is_empty(), "tab is not a submit: {cmds:?}");
@@ -6686,7 +6713,7 @@ mod tests {
 
     #[test]
     fn enter_runs_the_highlighted_command_not_the_literal_text() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/pl");
         let cmds = press(&mut s, KeyCode::Enter);
         assert!(matches!(&cmds[..], [Cmd::SetPlan(true)]), "got {cmds:?}");
@@ -6704,15 +6731,19 @@ mod tests {
     /// the builtin case; this is its skill-row counterpart.
     #[test]
     fn selecting_a_skill_in_the_popup_and_pressing_enter_dispatches_it() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
-        type_str(&mut s, "/rev");
-        assert_eq!(selected(&s), "review", "the skill is the highlighted match");
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
+        type_str(&mut s, "/ref");
+        assert_eq!(
+            selected(&s),
+            "refactor",
+            "the skill is the highlighted match"
+        );
         let cmds = press(&mut s, KeyCode::Enter);
         let Some(Cmd::SendPrompt(p)) = cmds.first() else {
             panic!("expected a prompt, got {cmds:?}");
         };
         assert!(
-            p.text.contains("Load the skill `review`"),
+            p.text.contains("Load the skill `refactor`"),
             "the popup selection must dispatch the skill, not the literal typed word: {}",
             p.text
         );
@@ -6720,7 +6751,7 @@ mod tests {
 
     #[test]
     fn esc_dismisses_and_stays_dismissed_until_the_slash_is_gone() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/re");
         press(&mut s, KeyCode::Esc);
         assert!(s.completion.is_none());
@@ -6739,7 +6770,7 @@ mod tests {
     /// editor's Insert→Normal transition once the popup is gone.
     #[test]
     fn the_first_esc_dismisses_the_popup_and_the_second_reaches_normal_mode() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/re");
         press(&mut s, KeyCode::Esc);
         assert_eq!(s.editor.mode(), crate::vim::Mode::Insert);
@@ -6753,7 +6784,7 @@ mod tests {
     /// swallowed the first Esc — the search only ended on the second one.
     #[test]
     fn ctrl_r_closes_a_stale_popup_and_the_first_esc_ends_the_search() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/re");
         assert!(s.completion.is_some(), "popup open before ctrl-r");
         ctrl(&mut s, 'r');
@@ -6777,7 +6808,7 @@ mod tests {
     /// keyboard, and a stale menu must not linger over its card.
     #[test]
     fn a_permission_ask_mid_typing_closes_the_open_popup() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/re");
         assert!(s.completion.is_some(), "popup open before the ask arrives");
         ask(&mut s);
@@ -6789,7 +6820,7 @@ mod tests {
 
     #[test]
     fn an_argument_closes_the_popup_before_submit() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/mode ");
         assert!(s.completion.is_none());
         let cmds = type_and_submit(&mut s, "bypass");
@@ -6806,7 +6837,7 @@ mod tests {
     /// favor of a bogus `/rename`.
     #[test]
     fn editor_done_clears_a_stale_popup_so_enter_submits_the_real_text() {
-        let mut s = with_skills(&[("review", "review a pull request")]);
+        let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/re");
         assert!(
             s.completion.is_some(),
@@ -7502,16 +7533,71 @@ mod tests {
         found
     }
 
+    /// 0070 T11: `/review [target]` is a prompt the model turns into a
+    /// `spawn` of the built-in reviewer — never an engine call of its own.
+    #[test]
+    fn slash_review_desugars_to_a_spawn_prompt_with_the_target() {
+        let mut s = State::test_default();
+        let cmds = slash(&mut s, "review src/foo.rs");
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
+            panic!("expected a prompt, got {cmds:?}");
+        };
+        assert!(
+            cmds.iter()
+                .all(|c| matches!(c, Cmd::SendPrompt(_) | Cmd::SetTitle(_))),
+            "a prompt and nothing engine-side: {cmds:?}"
+        );
+        assert!(p.text.contains("agent_type: \"review\""), "{}", p.text);
+        assert!(p.text.contains("Review src/foo.rs."), "{}", p.text);
+        assert!(p.text.ends_with("do not act on them."));
+    }
+
+    #[test]
+    fn slash_review_without_a_target_reviews_the_working_tree() {
+        let mut s = State::test_default();
+        let cmds = slash(&mut s, "review");
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
+            panic!("{cmds:?}");
+        };
+        assert!(
+            p.text
+                .contains("Review the uncommitted changes in the working tree"),
+            "{}",
+            p.text
+        );
+    }
+
+    #[test]
+    fn slash_review_is_a_builtin_so_a_skill_named_review_is_shadowed() {
+        let mut s = State::test_default();
+        s.set_skills(vec![("review".into(), "a skill".into())]);
+        let cmds = slash(&mut s, "review HEAD~1..HEAD");
+        let Some(Cmd::SendPrompt(p)) = cmds.first() else {
+            panic!("{cmds:?}");
+        };
+        assert!(p.text.contains("agent_type: \"review\""), "{}", p.text);
+        assert!(!p.text.contains("Load the skill"));
+        // And the popup lists it once, as the built-in.
+        assert_eq!(s.commands.iter().filter(|c| c.name == "review").count(), 2);
+        assert!(
+            s.commands
+                .iter()
+                .find(|c| c.name == "review")
+                .unwrap()
+                .builtin
+        );
+    }
+
     /// 0044: `/<recipe>` desugars to a prompt naming the saved workflow; the
     /// model makes the tool call. Arguments ride verbatim; none means no
     /// trailing clause. Precedence is builtin > skill > workflow.
     #[test]
     fn a_saved_workflow_slash_desugars_to_a_prompt_below_builtins_and_skills() {
         let mut s = State::test_default();
-        s.set_skills(vec![("review".into(), String::new())]);
+        s.set_skills(vec![("refactor".into(), String::new())]);
         s.set_workflows(vec![
             ("review-changes".into(), String::new()),
-            ("review".into(), String::new()),
+            ("refactor".into(), String::new()),
             ("context".into(), String::new()),
         ]);
         let cmds = slash(&mut s, "review-changes crates/hotl-workflow");
@@ -7536,11 +7622,15 @@ mod tests {
 
         // A skill wins over a same-named recipe; a builtin over both.
         s.phase = Phase::Idle;
-        let cmds = slash(&mut s, "review");
+        let cmds = slash(&mut s, "refactor");
         let Some(Cmd::SendPrompt(p)) = cmds.first() else {
             panic!("{cmds:?}")
         };
-        assert!(p.text.starts_with("Load the skill `review`"), "{}", p.text);
+        assert!(
+            p.text.starts_with("Load the skill `refactor`"),
+            "{}",
+            p.text
+        );
         assert_eq!(slash(&mut s, "context"), vec![Cmd::RequestContext]);
         assert_eq!(slash(&mut s, "workflows"), vec![Cmd::RequestWorkflows]);
     }
@@ -7856,25 +7946,25 @@ mod tests {
     #[test]
     fn set_workflows_extends_completion_below_skills_and_hides_shadowed_names() {
         let mut s = State::test_default();
-        s.set_skills(vec![("review".into(), "a skill".into())]);
+        s.set_skills(vec![("refactor".into(), "a skill".into())]);
         s.set_workflows(vec![
             ("review-changes".into(), "a recipe".into()),
-            ("review".into(), "shadowed by the skill".into()),
+            ("refactor".into(), "shadowed by the skill".into()),
             ("help".into(), "shadowed by a builtin".into()),
         ]);
-        assert_eq!(s.workflows, vec!["review-changes", "review", "help"]);
+        assert_eq!(s.workflows, vec!["review-changes", "refactor", "help"]);
         let names: Vec<&str> = s.commands.iter().map(|c| c.name.as_str()).collect();
-        let review_at = names.iter().position(|n| *n == "review").unwrap();
+        let review_at = names.iter().position(|n| *n == "refactor").unwrap();
         let recipe_at = names.iter().position(|n| *n == "review-changes").unwrap();
         assert!(review_at < recipe_at, "skills before workflows: {names:?}");
-        assert_eq!(names.iter().filter(|n| **n == "review").count(), 1);
+        assert_eq!(names.iter().filter(|n| **n == "refactor").count(), 1);
         assert_eq!(names.iter().filter(|n| **n == "help").count(), 1);
         assert!(!s.commands[recipe_at].builtin);
         // Re-seeding skills keeps the workflow rows (a reload sends both).
         s.set_skills(Vec::new());
         assert!(s.commands.iter().any(|c| c.name == "review-changes"));
         assert!(
-            s.commands.iter().any(|c| c.name == "review"),
+            s.commands.iter().any(|c| c.name == "refactor"),
             "no longer shadowed"
         );
     }

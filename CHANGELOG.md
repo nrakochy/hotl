@@ -35,6 +35,9 @@ semver promise of their own.
 - **A built-in `review` sub-agent** (read-only, fresh context): findings
   with `path:line` and severity, never an edit. `[agents] review_model` gives
   it a stronger model than the session's.
+- **`/review [target]` in the console** spawns the built-in reviewer on a
+  file, a diff, a commit range, or the working tree, and relays its findings.
+  It is a built-in, so a skill named `review` is shadowed — rename the skill.
 
 ### Changed
 
