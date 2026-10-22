@@ -510,6 +510,7 @@ async fn a_transient_error_leaves_the_goal_armed() {
             status: 429,
             message: "slow down".into(),
             retry_after: None,
+            request_id: None,
         })],
     ]));
     let (mut handle, log_path) = session(provider, dir.path());

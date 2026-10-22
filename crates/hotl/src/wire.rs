@@ -150,6 +150,7 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             reason,
             delay_ms,
             status,
+            request_id,
             scope,
             discarded_partial,
         } => {
@@ -164,6 +165,10 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             // Omitted, not `null`, when the error carried no status.
             if let Some(status) = status {
                 v["status"] = json!(status);
+            }
+            // Same rule: the id is there when the provider sent one.
+            if let Some(id) = request_id {
+                v["request_id"] = json!(id);
             }
             // Omitted, not `null`, when there is nothing to take back — the
             // same additive rule `usage_frame` follows.

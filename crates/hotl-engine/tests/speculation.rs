@@ -282,6 +282,7 @@ async fn a_speculative_summarize_retry_is_not_forwarded() {
             reason: "HTTP 429: slow down".into(),
             delay_ms: 0,
             status: Some(429),
+            request_id: None,
         }),
     );
     let summarize = Arc::new(ScriptedProvider::new(vec![

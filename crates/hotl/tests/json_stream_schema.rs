@@ -99,6 +99,7 @@ fn every_frame_is_tagged_and_versioned() {
             reason: "429".into(),
             delay_ms: 1_500,
             status: Some(429),
+            request_id: None,
             scope: hotl_engine::RetryScope::Sample,
             discarded_partial: false,
         },
@@ -108,6 +109,7 @@ fn every_frame_is_tagged_and_versioned() {
             reason: "stream interrupted: HTTP 529: overloaded_error".into(),
             delay_ms: 800,
             status: Some(529),
+            request_id: None,
             scope: hotl_engine::RetryScope::Summarize,
             discarded_partial: true,
         },
@@ -476,6 +478,7 @@ fn retrying_carries_delay_max_status_and_scope() {
         reason: "HTTP 429".into(),
         delay_ms: 4_000,
         status: Some(429),
+        request_id: None,
         scope: hotl_engine::RetryScope::Sample,
         discarded_partial: false,
     })
@@ -497,6 +500,7 @@ fn retrying_carries_delay_max_status_and_scope() {
             reason: "boom".into(),
             delay_ms: 0,
             status: None,
+            request_id: None,
             scope,
             discarded_partial: false,
         })
@@ -515,12 +519,33 @@ fn retrying_omits_status_when_the_error_had_none() {
         reason: "stream idle for 300s".into(),
         delay_ms: 900,
         status: None,
+        request_id: None,
         scope: hotl_engine::RetryScope::Sample,
         discarded_partial: false,
     })
     .expect("retrying is a stream frame");
     assert!(f.get("status").is_none(), "{f}");
     assert_eq!(f["delay_ms"], 900);
+}
+
+/// 0071 T1: the request id rides the frame only when the provider sent one.
+#[test]
+fn retrying_omits_request_id_when_the_provider_sent_none() {
+    let frame = |request_id: Option<String>| {
+        wire::update_frame(&EngineEvent::Retrying {
+            attempt: 1,
+            max: 5,
+            reason: "HTTP 529".into(),
+            delay_ms: 900,
+            status: Some(529),
+            request_id,
+            scope: hotl_engine::RetryScope::Sample,
+            discarded_partial: false,
+        })
+        .expect("retrying is a stream frame")
+    };
+    assert!(frame(None).get("request_id").is_none());
+    assert_eq!(frame(Some("req_1".into()))["request_id"], "req_1");
 }
 
 /// 0061 T14: a fold blocks the actor for a hook and a model call. The size

@@ -130,7 +130,12 @@ impl CachePolicy {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Started,
+    Started {
+        /// The provider's request id (`request-id` / `x-request-id`), the
+        /// thing a support ticket wants. Absent when the response had none.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
     BlockStart {
         index: usize,
         kind: String,
@@ -161,6 +166,9 @@ pub enum StreamEvent {
         delay_ms: u64,
         /// The HTTP status behind it, when there was one.
         status: Option<u16>,
+        /// The request id of the attempt that failed, when the response had one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     /// Terminal event: the provider-assembled verbatim assistant blocks
     /// (echo these back on the next request — replay-safe by construction).
@@ -177,16 +185,35 @@ pub enum StreamEvent {
 pub enum ProviderError {
     #[error("authentication failed: {0}")]
     Auth(String),
-    #[error("HTTP {status}: {message}")]
+    #[error("HTTP {status}: {message}{}", request_id_suffix(request_id))]
     Http {
         status: u16,
         message: String,
         retry_after: Option<u64>,
+        /// The response's request id, when it had one; rides `Display` so
+        /// every error surface carries it without a new wire field.
+        request_id: Option<String>,
     },
     #[error("transport error: {0}")]
     Transport(String),
     #[error("stream parse error: {0}")]
     Parse(String),
+}
+
+/// ` (request-id …)` for `ProviderError::Http`'s `Display`, empty when none.
+fn request_id_suffix(id: &Option<String>) -> String {
+    id.as_deref()
+        .map(|i| format!(" (request-id {i})"))
+        .unwrap_or_default()
+}
+
+/// The provider's request id from a response: `request-id` (Anthropic)
+/// first, then `x-request-id` (OpenAI). Both are read on every dialect
+/// because a gateway may relay either spelling.
+pub fn request_id_of(header: impl Fn(&str) -> Option<String>) -> Option<String> {
+    ["request-id", "x-request-id"]
+        .iter()
+        .find_map(|h| header(h))
 }
 
 pub trait Provider: Send + Sync {
@@ -426,7 +453,7 @@ impl ScriptedProvider {
         stop: StopReason,
     ) -> Vec<Result<StreamEvent, ProviderError>> {
         vec![
-            Ok(StreamEvent::Started),
+            Ok(StreamEvent::Started { request_id: None }),
             Ok(StreamEvent::BlockStart {
                 index: 0,
                 kind: "text".into(),
@@ -464,7 +491,7 @@ impl ScriptedProvider {
     /// sealed nothing. Pair with [`Self::error_after`].
     pub fn partial_text(text: &str) -> Vec<Result<StreamEvent, ProviderError>> {
         vec![
-            Ok(StreamEvent::Started),
+            Ok(StreamEvent::Started { request_id: None }),
             Ok(StreamEvent::BlockStart {
                 index: 0,
                 kind: "text".into(),
@@ -484,7 +511,7 @@ impl ScriptedProvider {
     ) -> Vec<Result<StreamEvent, ProviderError>> {
         let block = serde_json::json!({"type": "tool_use", "id": id, "name": name, "input": input});
         vec![
-            Ok(StreamEvent::Started),
+            Ok(StreamEvent::Started { request_id: None }),
             Ok(StreamEvent::BlockStart {
                 index: 0,
                 kind: "tool_use".into(),
@@ -946,6 +973,57 @@ pub mod retry {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::{request_id_of, StreamEvent};
+
+        /// 0071 T1: an absent request id writes the bytes it always did, and
+        /// a present one rides `Display` into every error surface.
+        #[test]
+        fn started_and_retrying_without_a_request_id_serialize_as_before() {
+            let started =
+                serde_json::to_string(&StreamEvent::Started { request_id: None }).unwrap();
+            assert_eq!(started, r#"{"event":"started"}"#);
+            let retrying = serde_json::to_string(&StreamEvent::Retrying {
+                attempt: 1,
+                max: 5,
+                reason: "x".into(),
+                delay_ms: 0,
+                status: None,
+                request_id: None,
+            })
+            .unwrap();
+            assert!(!retrying.contains("request_id"), "{retrying}");
+            let with = serde_json::to_string(&StreamEvent::Started {
+                request_id: Some("req_1".into()),
+            })
+            .unwrap();
+            assert_eq!(with, r#"{"event":"started","request_id":"req_1"}"#);
+            let err = ProviderError::Http {
+                status: 500,
+                message: "boom".into(),
+                retry_after: None,
+                request_id: Some("req_9".into()),
+            };
+            assert_eq!(err.to_string(), "HTTP 500: boom (request-id req_9)");
+            let bare = ProviderError::Http {
+                status: 500,
+                message: "boom".into(),
+                retry_after: None,
+                request_id: None,
+            };
+            assert_eq!(bare.to_string(), "HTTP 500: boom");
+            assert_eq!(
+                request_id_of(|h| (h == "x-request-id").then(|| "oai_1".to_string())),
+                Some("oai_1".into())
+            );
+            assert_eq!(
+                request_id_of(|h| match h {
+                    "request-id" => Some("anth".to_string()),
+                    _ => Some("other".to_string()),
+                }),
+                Some("anth".into()),
+                "request-id wins when both are present"
+            );
+        }
 
         #[test]
         fn overflow_detection() {
@@ -955,18 +1033,21 @@ pub mod retry {
                     r#"{"error":{"message":"prompt is too long: 210000 tokens > 200000 maximum"}}"#
                         .into(),
                 retry_after: None,
+                request_id: None,
             };
             assert!(is_context_overflow(&overflow));
             let oai = ProviderError::Http {
                 status: 400,
                 message: "This model's maximum context length is 128000 tokens".into(),
                 retry_after: None,
+                request_id: None,
             };
             assert!(is_context_overflow(&oai));
             let plain_400 = ProviderError::Http {
                 status: 400,
                 message: "bad schema".into(),
                 retry_after: None,
+                request_id: None,
             };
             assert!(!is_context_overflow(&plain_400));
         }
@@ -980,6 +1061,7 @@ pub mod retry {
                 status: 429,
                 message: String::new(),
                 retry_after: Some(3600),
+                request_id: None,
             };
             assert_eq!(
                 classify(&hostile, 1),
@@ -996,6 +1078,7 @@ pub mod retry {
                 status: 529,
                 message: String::new(),
                 retry_after: None,
+                request_id: None,
             };
             assert_eq!(MAX_ATTEMPTS, 5);
             for (attempt, secs) in [(1u32, 1u64), (2, 2), (3, 4), (4, 8)] {
@@ -1019,7 +1102,8 @@ pub mod retry {
                 status_of(&ProviderError::Http {
                     status: 429,
                     message: "slow".into(),
-                    retry_after: None
+                    retry_after: None,
+                    request_id: None,
                 }),
                 Some(429)
             );
@@ -1076,6 +1160,7 @@ pub mod retry {
                 status,
                 message: String::new(),
                 retry_after: None,
+                request_id: None,
             };
             assert!(is_unrecoverable(&ProviderError::Auth("revoked".into())));
             for status in [401, 402, 403, 404] {
@@ -1095,6 +1180,7 @@ pub mod retry {
                 status: 529,
                 message: String::new(),
                 retry_after: Some(7),
+                request_id: None,
             };
             assert_eq!(
                 classify(&overload, 1),
@@ -1118,6 +1204,7 @@ pub mod retry {
                 status: 400,
                 message: String::new(),
                 retry_after: None,
+                request_id: None,
             };
             assert_eq!(classify(&bad_req, 1), Decision::Fatal);
         }

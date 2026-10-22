@@ -178,7 +178,7 @@ async fn tool_input_progress_precedes_tool_start_and_counts_bytes() {
     let block = json!({"type": "tool_use", "id": "t1", "name": "read",
                        "input": {"path": "Cargo.toml", "limit": 5}});
     let script = vec![
-        Ok(StreamEvent::Started),
+        Ok(StreamEvent::Started { request_id: None }),
         Ok(StreamEvent::BlockStart {
             index: 0,
             kind: "tool_use".into(),

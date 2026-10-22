@@ -506,6 +506,7 @@ mod tests {
                 reason: "429".into(),
                 delay_ms: 1_500,
                 status: Some(429),
+                request_id: None,
                 scope: hotl_engine::RetryScope::Sample,
                 discarded_partial: false,
             },

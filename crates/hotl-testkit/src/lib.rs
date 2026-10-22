@@ -594,7 +594,7 @@ pub fn tool_batch(
         })
         .collect();
     vec![
-        Ok(StreamEvent::Started),
+        Ok(StreamEvent::Started { request_id: None }),
         Ok(StreamEvent::Completed {
             stop: hotl_types::StopReason::ToolUse,
             usage: hotl_types::TokenUsage {

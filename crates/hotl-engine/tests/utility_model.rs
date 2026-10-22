@@ -189,6 +189,7 @@ async fn run_collecting_retries(retry_digest: bool, retry_verdict: bool) -> Vec<
             reason: "HTTP 429: slow down".into(),
             delay_ms: 0,
             status: Some(429),
+            request_id: None,
         })
     };
     let mut main = scripts(&path);

@@ -29,7 +29,7 @@ impl Provider for SlowFinish {
     ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         Box::pin(futures_util::stream::unfold(0u8, |i| async move {
             match i {
-                0 => Some((Ok(StreamEvent::Started), 1)),
+                0 => Some((Ok(StreamEvent::Started { request_id: None }), 1)),
                 1 => Some((
                     Ok(StreamEvent::TextDelta {
                         index: 0,

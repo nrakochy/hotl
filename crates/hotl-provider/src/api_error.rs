@@ -166,6 +166,7 @@ mod tests {
             status: 400,
             message: detail(Some("ValidationException"), r#"{"message":"bad request"}"#),
             retry_after: None,
+            request_id: None,
         }
         .to_string();
         assert_eq!(rendered, "HTTP 400: ValidationException: bad request");

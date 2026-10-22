@@ -2951,6 +2951,7 @@ pub(crate) async fn summarize(
                     reason,
                     delay_ms,
                     status,
+                    request_id,
                 }) => {
                     if let Some(events) = events {
                         let _ = events
@@ -2960,6 +2961,7 @@ pub(crate) async fn summarize(
                                 reason,
                                 delay_ms,
                                 status,
+                                request_id,
                                 scope: crate::RetryScope::Summarize,
                                 discarded_partial: false,
                             })
@@ -3038,6 +3040,7 @@ async fn evaluate_goal(
                     reason,
                     delay_ms,
                     status,
+                    request_id,
                 }) => {
                     let _ = events
                         .send(EngineEvent::Retrying {
@@ -3046,6 +3049,7 @@ async fn evaluate_goal(
                             reason,
                             delay_ms,
                             status,
+                            request_id,
                             scope: crate::RetryScope::GoalEval,
                             discarded_partial: false,
                         })
@@ -3881,6 +3885,7 @@ mod tests {
 
         let payload = hotl_types::EntryPayload::Usage {
             usage: hotl_types::TokenUsage::default(),
+            request_id: None,
         };
         let prepared =
             hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), old_epoch)
@@ -3919,6 +3924,7 @@ mod tests {
         let newer_epoch = shared.rules_epoch() + 1;
         let payload = hotl_types::EntryPayload::Usage {
             usage: hotl_types::TokenUsage::default(),
+            request_id: None,
         };
         let prepared =
             hotl_store::prepare_payload(&payload, &hotl_store::Masker::empty(), newer_epoch)

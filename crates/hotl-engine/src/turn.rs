@@ -787,6 +787,8 @@ enum SampleEnd {
         reason: String,
         /// The status behind it, when there was one (0061 T15).
         status: Option<u16>,
+        /// The dead attempt's request id, when the provider sent one.
+        request_id: Option<String>,
         discarded_partial: bool,
     },
     Fatal(String),
@@ -1308,7 +1310,7 @@ impl Turn {
         // projection exactly as the boundary published it.
         let mut stream = stream;
         let mut attempt = 1;
-        let (stop, usage, mut blocks) = loop {
+        let (stop, usage, mut blocks, request_id) = loop {
             match self.collect_stream(stream, attempt).await {
                 Ok(completed) => break completed,
                 Err(SampleEnd::Interrupted {
@@ -1316,6 +1318,7 @@ impl Turn {
                     delay,
                     reason,
                     status,
+                    request_id,
                     discarded_partial,
                 }) => {
                     // Jitter first, then report: what the surface counts down
@@ -1327,6 +1330,7 @@ impl Turn {
                         reason,
                         delay_ms: wait.as_millis() as u64,
                         status,
+                        request_id,
                         scope: crate::RetryScope::Sample,
                         discarded_partial,
                     })
@@ -1392,7 +1396,7 @@ impl Turn {
             .propose_pipelined(
                 vec![
                     EntryPayload::Item { item: assistant },
-                    EntryPayload::Usage { usage },
+                    EntryPayload::Usage { usage, request_id },
                 ],
                 // This commit IS what closes the sample: the stream is
                 // drained and the blocks are final.
@@ -2474,9 +2478,11 @@ impl Turn {
         &mut self,
         stream: BoxStream<'static, Result<StreamEvent, ProviderError>>,
         attempt: u32,
-    ) -> Result<(StopReason, TokenUsage, Vec<Value>), SampleEnd> {
+    ) -> Result<(StopReason, TokenUsage, Vec<Value>, Option<String>), SampleEnd> {
         let mut stream = stream;
         let mut completed = None;
+        // The provider's request id for this attempt, from `Started`.
+        let mut request_id: Option<String> = None;
         // The two facts the re-sample decision needs. `saw_first_byte`
         // separates "the provider never answered" (the availability ladder's
         // job, model fallback and all) from "it answered and then died";
@@ -2501,6 +2507,9 @@ impl Turn {
                         saw_first_byte = true;
                         self.ledger.stamp(Phase::FirstByte);
                         match &event {
+                            StreamEvent::Started { request_id: id } => {
+                                request_id = id.clone();
+                            }
                             StreamEvent::BlockStart { index, kind } if kind == "tool_use" => {
                                 open_tool_use = Some(*index);
                                 input_calls += 1;
@@ -2538,7 +2547,7 @@ impl Turn {
                         }
                         if let StreamEvent::Completed { stop, usage, blocks } = event {
                             self.ledger.stamp(Phase::LastBlockEnd);
-                            completed = Some((stop, usage, blocks));
+                            completed = Some((stop, usage, blocks, request_id.clone()));
                         } else {
                             self.forward(event).await;
                         }
@@ -2565,6 +2574,7 @@ impl Turn {
                                     delay,
                                     reason: format!("stream interrupted: {e}"),
                                     status: retry::status_of(&e),
+                                    request_id: request_id.clone(),
                                     discarded_partial: forwarded_text,
                                 });
                             }
@@ -3105,12 +3115,14 @@ impl Turn {
                 reason,
                 delay_ms,
                 status,
+                request_id,
             } => EngineEvent::Retrying {
                 attempt,
                 max,
                 reason,
                 delay_ms,
                 status,
+                request_id,
                 scope: crate::RetryScope::Sample,
                 discarded_partial: false,
             },
@@ -4066,6 +4078,7 @@ mod tests {
         let masker = Arc::new(hotl_store::Masker::empty());
         let payload = EntryPayload::Usage {
             usage: TokenUsage::default(),
+            request_id: None,
         };
         let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
         assert!(prepared.item.is_none());
@@ -4079,6 +4092,7 @@ mod tests {
         );
         let payload = EntryPayload::Usage {
             usage: TokenUsage::default(),
+            request_id: None,
         };
         let prepared = prepare_entry(&payload, &masker, 0).await.expect("prepare");
         let raw = hotl_store::serialize_payload(&payload).unwrap();
@@ -4161,7 +4175,8 @@ mod tests {
     fn payload_size_estimate_is_zero_for_kinds_that_never_offload() {
         assert_eq!(
             payload_size_estimate(&EntryPayload::Usage {
-                usage: TokenUsage::default()
+                usage: TokenUsage::default(),
+                request_id: None,
             }),
             0
         );

@@ -1705,9 +1705,14 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             if v.get("discarded_partial").and_then(Value::as_bool) == Some(true) {
                 truncate_open_assistant(state);
             }
+            // The request id is what a support ticket wants.
+            let id = match v.get("request_id").and_then(Value::as_str) {
+                Some(id) => format!(" · request-id {id}"),
+                None => String::new(),
+            };
             notice(
                 state,
-                format!("retrying (attempt {attempt}) — {}", text_of("reason")),
+                format!("retrying (attempt {attempt}) — {}{id}", text_of("reason")),
             );
             // The countdown the strip runs (0061 T22): the phase kept
             // animating its old text through the whole backoff, which read as
@@ -4344,6 +4349,30 @@ mod tests {
         upd(&mut s, json!({"type":"compacting","items":4}));
         on_result(&mut s, "done", None, &json!({}));
         assert!(!s.compacting);
+    }
+
+    /// 0071 T1: the retry notice names the request id when there is one —
+    /// what the owner pastes into a support ticket.
+    #[test]
+    fn a_retry_notice_names_the_request_id() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"HTTP 529: overloaded","request_id":"req_abc"}),
+        );
+        assert_eq!(
+            last_notice(&s),
+            "retrying (attempt 1) — HTTP 529: overloaded · request-id req_abc"
+        );
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":2,"reason":"HTTP 529: overloaded"}),
+        );
+        assert_eq!(
+            last_notice(&s),
+            "retrying (attempt 2) — HTTP 529: overloaded"
+        );
     }
 
     /// 0061 T22: a backoff parks a countdown, and the first frame that proves

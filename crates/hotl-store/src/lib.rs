@@ -3858,7 +3858,8 @@ mod tests {
         );
         assert_eq!(
             EntryKind::from(&EntryPayload::Usage {
-                usage: Default::default()
+                usage: Default::default(),
+                request_id: None,
             }),
             EntryKind::Usage
         );

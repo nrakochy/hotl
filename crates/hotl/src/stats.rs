@@ -73,7 +73,10 @@ fn fold_log(path: &std::path::Path, skipped: &mut u64) -> Option<(String, String
                 model = Some(header.model);
                 day = Some(hotl_context::civil_date_utc(header.created_at_ms));
             }
-            EntryPayload::Usage { usage } => row.usage += usage,
+            EntryPayload::Usage {
+                usage,
+                request_id: None,
+            } => row.usage += usage,
             EntryPayload::Item { item } => match item {
                 Item::User {
                     synthetic: None, ..
@@ -284,6 +287,7 @@ mod tests {
                         output_tokens: *output,
                         ..Default::default()
                     },
+                    request_id: None,
                 },
             );
         }

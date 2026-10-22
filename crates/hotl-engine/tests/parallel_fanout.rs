@@ -73,7 +73,7 @@ fn probe_batch(n: usize) -> Vec<Result<StreamEvent, hotl_provider::ProviderError
         .map(|i| json!({"type": "tool_use", "id": format!("p{i}"), "name": "probe", "input": {"n": i}}))
         .collect();
     vec![
-        Ok(StreamEvent::Started),
+        Ok(StreamEvent::Started { request_id: None }),
         Ok(StreamEvent::Completed {
             stop: StopReason::ToolUse,
             usage: TokenUsage {
@@ -230,7 +230,7 @@ async fn a_nesting_tool_draws_no_subproc_permit() {
         concurrency: concurrency.clone(),
     }));
     let batch = vec![
-        Ok(StreamEvent::Started),
+        Ok(StreamEvent::Started { request_id: None }),
         Ok(StreamEvent::Completed {
             stop: StopReason::ToolUse,
             usage: TokenUsage::default(),

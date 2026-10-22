@@ -76,6 +76,7 @@ impl SseAssembler for Assembler {
                     status,
                     message: format!("in-stream error: {msg}"),
                     retry_after: None,
+                    request_id: None,
                 })
             }
             _ => Ok(vec![]),

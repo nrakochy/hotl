@@ -410,6 +410,7 @@ impl SseAssembler for ResponsesAssembler {
                     status,
                     message: format!("in-stream error: {msg}"),
                     retry_after: None,
+                    request_id: None,
                 })
             }
             // response.created / response.in_progress / content_part.* /
@@ -797,6 +798,8 @@ enum Attempt {
         wait: std::time::Duration,
         /// The status behind it, when there was one (0061 T15).
         status: Option<u16>,
+        /// The failed response's request id, when it had one.
+        request_id: Option<String>,
     },
     Fail(ProviderError),
 }
@@ -807,6 +810,10 @@ fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
             reason,
             wait: hotl_provider::retry::with_jitter(delay),
             status: hotl_provider::retry::status_of(&err),
+            request_id: match &err {
+                ProviderError::Http { request_id, .. } => request_id.clone(),
+                _ => None,
+            },
         },
         hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
     }
@@ -817,6 +824,12 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
         return Attempt::Ok(resp);
     }
     let status = resp.status().as_u16();
+    let request_id = hotl_provider::request_id_of(|h| {
+        resp.headers()
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    });
     let retry_after = resp
         .headers()
         .get("retry-after")
@@ -837,6 +850,7 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
         status,
         message,
         retry_after,
+        request_id,
     };
     classify_send(err, attempt, format!("HTTP {status}"))
 }
@@ -962,7 +976,7 @@ impl Provider for OpenAiResponsesProvider {
                 };
                 match outcome {
                     Attempt::Ok(resp) => break resp,
-                    Attempt::Retry { reason, wait, status } => {
+                    Attempt::Retry { reason, wait, status, request_id } => {
                         attempts_used = attempt;
                         // The delay reported is the one about to be slept, so
                         // a countdown on screen is the truth.
@@ -972,6 +986,7 @@ impl Provider for OpenAiResponsesProvider {
                             reason,
                             delay_ms: wait.as_millis() as u64,
                             status,
+                            request_id,
                         });
                         tokio::time::sleep(wait).await;
                     }
@@ -987,6 +1002,7 @@ impl Provider for OpenAiResponsesProvider {
                                         // A probe or an auth refresh, not a backoff.
                                         delay_ms: 0,
                                         status: None,
+                            request_id: None,
                                     });
                                 }
                                 Err(ke) => {
@@ -1019,6 +1035,7 @@ impl Provider for OpenAiResponsesProvider {
                             // A probe or an auth refresh, not a backoff.
                             delay_ms: 0,
                             status: None,
+                            request_id: None,
                         });
                     }
                     Attempt::Fail(e) => {
@@ -1027,7 +1044,9 @@ impl Provider for OpenAiResponsesProvider {
                     }
                 }
             };
-            yield Ok(StreamEvent::Started);
+            yield Ok(StreamEvent::Started {
+                request_id: hotl_provider::request_id_of(|h| response.headers().get(h).and_then(|v| v.to_str().ok()).map(String::from)),
+            });
             let inner = hotl_provider::drive_sse(
                 response.bytes_stream(),
                 ResponsesAssembler::default(),
@@ -2052,7 +2071,7 @@ mod tests {
         let p = OpenAiResponsesProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
         let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
         let oks: Vec<_> = events.into_iter().map(|e| e.expect("no error")).collect();
-        assert!(matches!(oks[0], StreamEvent::Started));
+        assert!(matches!(oks[0], StreamEvent::Started { .. }));
         assert!(oks
             .iter()
             .any(|e| matches!(e, StreamEvent::BlockStart { index: 0, .. })));
@@ -2078,6 +2097,32 @@ mod tests {
     }
 
     /// The Responses twin of the retry test.
+    /// 0071 T1: `x-request-id` rides `Started` on success and the error text on a
+    /// failure, on this dialect.
+    #[tokio::test]
+    async fn x_request_id_rides_started_and_http_errors() {
+        const WITH_ID_500: &str = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\nx-request-id: req_bad\r\ncontent-length: 4\r\nconnection: close\r\n\r\nboom";
+        let ok_with_id: &'static str = Box::leak(
+            SSE_OK
+                .replacen("\r\n\r\n", "\r\nx-request-id: req_ok\r\n\r\n", 1)
+                .into_boxed_str(),
+        );
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![WITH_ID_500, ok_with_id], seen.clone()).await;
+        let p = OpenAiResponsesProvider::new(base, Arc::new(hotl_provider::key::StaticKey(None)));
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        let retry_id = events.iter().find_map(|e| match e {
+            Ok(StreamEvent::Retrying { request_id, .. }) => Some(request_id.clone()),
+            _ => None,
+        });
+        assert_eq!(retry_id, Some(Some("req_bad".into())), "{events:?}");
+        let started_id = events.iter().find_map(|e| match e {
+            Ok(StreamEvent::Started { request_id }) => Some(request_id.clone()),
+            _ => None,
+        });
+        assert_eq!(started_id, Some(Some("req_ok".into())), "{events:?}");
+    }
+
     #[tokio::test]
     async fn a_429_is_retried_over_a_real_socket() {
         const RETRY_429: &str = "HTTP/1.1 429 Too Many Requests\r\ncontent-type: text/plain\r\nretry-after: 0\r\ncontent-length: 5\r\nconnection: close\r\n\r\nslow!";
@@ -2175,7 +2220,7 @@ mod tests {
                 if reason.contains("prompt-cache breakpoints")),
             "{oks:?}"
         );
-        assert!(matches!(oks[1], StreamEvent::Started));
+        assert!(matches!(oks[1], StreamEvent::Started { .. }));
         assert!(matches!(oks.last(), Some(StreamEvent::Completed { .. })));
         {
             let reqs = seen.lock().unwrap();
@@ -2197,7 +2242,10 @@ mod tests {
         // Latched: the second call on the same provider never probes.
         assert!(!p.wants_explicit(&static_req()));
         let events: Vec<_> = p.stream(static_req()).collect::<Vec<_>>().await;
-        assert!(matches!(events[0], Ok(StreamEvent::Started)), "{events:?}");
+        assert!(
+            matches!(events[0], Ok(StreamEvent::Started { .. })),
+            "{events:?}"
+        );
         let reqs = seen.lock().unwrap();
         assert_eq!(reqs.len(), 3);
         assert!(!has_cache_fields(&reqs[2]), "{}", reqs[2]);

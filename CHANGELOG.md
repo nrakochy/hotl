@@ -40,6 +40,11 @@ semver promise of their own.
   file, a diff, a commit range, or the working tree, and relays its findings.
   It is a built-in, so a skill named `review` is shadowed — rename the skill.
 
+- **Provider request ids on retries and errors.** A `retrying` notice and
+  frame now name the failed attempt's request id (`request-id` or
+  `x-request-id`), an HTTP error's text ends with `(request-id …)`, and each
+  sample's `usage` log entry records the id — what a support ticket wants.
+
 ### Changed
 
 - **Headless exit codes tell the stops apart (breaking for scripts).** `4` =

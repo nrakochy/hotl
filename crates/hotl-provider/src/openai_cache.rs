@@ -102,6 +102,7 @@ mod tests {
             status,
             message: message.into(),
             retry_after: None,
+            request_id: None,
         };
         assert!(rejects_breakpoints(&http(
             400,

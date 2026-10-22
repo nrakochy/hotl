@@ -2285,7 +2285,7 @@ mod tests {
                 .collect();
             let provider = Arc::new(ScriptedProvider::new(vec![
                 vec![
-                    Ok(hotl_provider::StreamEvent::Started),
+                    Ok(hotl_provider::StreamEvent::Started { request_id: None }),
                     Ok(hotl_provider::StreamEvent::Completed {
                         stop: hotl_types::StopReason::ToolUse,
                         usage: hotl_types::TokenUsage::default(),

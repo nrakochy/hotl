@@ -82,7 +82,7 @@ fn tool_batch(
         )
         .collect();
     vec![
-        Ok(StreamEvent::Started),
+        Ok(StreamEvent::Started { request_id: None }),
         Ok(StreamEvent::Completed {
             stop: StopReason::ToolUse,
             usage: TokenUsage {

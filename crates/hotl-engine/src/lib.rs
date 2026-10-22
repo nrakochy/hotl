@@ -536,6 +536,9 @@ pub enum EngineEvent {
         delay_ms: u64,
         /// The HTTP status behind it, when there was one.
         status: Option<u16>,
+        /// The request id of the attempt that died, when the provider sent
+        /// one — what a support ticket wants (0071 T1).
+        request_id: Option<String>,
         /// Which ladder this is: the human is waiting on all three, and only
         /// the sample one used to say so.
         scope: RetryScope,
@@ -1615,6 +1618,7 @@ mod tests {
         let payload = hotl_store::prepare_payload(
             &EntryPayload::Usage {
                 usage: TokenUsage::default(),
+                request_id: None,
             },
             &masker,
             0,

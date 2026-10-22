@@ -834,6 +834,8 @@ enum Attempt {
         wait: std::time::Duration,
         /// The status behind it, when there was one (0061 T15).
         status: Option<u16>,
+        /// The failed response's request id, when it had one.
+        request_id: Option<String>,
     },
     Fail(ProviderError),
 }
@@ -844,6 +846,10 @@ fn classify_send(err: ProviderError, attempt: u32, reason: String) -> Attempt {
             reason,
             wait: hotl_provider::retry::with_jitter(delay),
             status: hotl_provider::retry::status_of(&err),
+            request_id: match &err {
+                ProviderError::Http { request_id, .. } => request_id.clone(),
+                _ => None,
+            },
         },
         hotl_provider::retry::Decision::Fatal => Attempt::Fail(err),
     }
@@ -854,6 +860,12 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
         return Attempt::Ok(resp);
     }
     let status = resp.status().as_u16();
+    let request_id = hotl_provider::request_id_of(|h| {
+        resp.headers()
+            .get(h)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from)
+    });
     let retry_after = resp
         .headers()
         .get("retry-after")
@@ -874,6 +886,7 @@ async fn classify_response(resp: reqwest::Response, attempt: u32) -> Attempt {
         status,
         message,
         retry_after,
+        request_id,
     };
     classify_send(err, attempt, format!("HTTP {status}"))
 }
@@ -1050,7 +1063,7 @@ impl Provider for AnthropicProvider {
                 };
                 match outcome {
                     Attempt::Ok(resp) => break resp,
-                    Attempt::Retry { reason, wait, status } => {
+                    Attempt::Retry { reason, wait, status, request_id } => {
                         attempts_used = attempt;
                         // The delay reported is the one about to be slept, so
                         // a countdown on screen is the truth.
@@ -1060,13 +1073,14 @@ impl Provider for AnthropicProvider {
                             reason,
                             delay_ms: wait.as_millis() as u64,
                             status,
+                            request_id,
                         });
                         tokio::time::sleep(wait).await;
                     }
                     Attempt::Fail(ProviderError::Auth(msg)) => {
                         // attempts_used deliberately unchanged.
                         match handle_auth_fail(&source, &mut auth_retry, msg).await {
-                            Ok(reason) => yield Ok(StreamEvent::Retrying { attempt, max: hotl_provider::retry::MAX_ATTEMPTS, reason, delay_ms: 0, status: None }),
+                            Ok(reason) => yield Ok(StreamEvent::Retrying { attempt, max: hotl_provider::retry::MAX_ATTEMPTS, reason, delay_ms: 0, status: None, request_id: None }),
                             Err(e) => {
                                 yield Err(e);
                                 return;
@@ -1079,7 +1093,9 @@ impl Provider for AnthropicProvider {
                     }
                 }
             };
-            yield Ok(StreamEvent::Started);
+            yield Ok(StreamEvent::Started {
+                request_id: hotl_provider::request_id_of(|h| response.headers().get(h).and_then(|v| v.to_str().ok()).map(String::from)),
+            });
             let inner = hotl_provider::drive_sse(
                 response.bytes_stream(),
                 sse::Assembler::default(),
@@ -1585,6 +1601,33 @@ mod tests {
 
     /// End-to-end retry: 429 → backoff → success, over a real socket.
     /// `retry-after: 0` keeps it instant; the policy itself is unit-tested.
+    /// 0071 T1: `request-id` rides `Started` on success and the error text on a
+    /// failure, on this dialect.
+    #[tokio::test]
+    async fn the_request_id_header_rides_started_and_http_errors() {
+        const WITH_ID_500: &str = "HTTP/1.1 500 Internal Server Error\r\ncontent-type: text/plain\r\nrequest-id: req_bad\r\ncontent-length: 4\r\nconnection: close\r\n\r\nboom";
+        let ok_with_id: &'static str = Box::leak(
+            SSE_OK
+                .replacen("\r\n\r\n", "\r\nrequest-id: req_ok\r\n\r\n", 1)
+                .into_boxed_str(),
+        );
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let base = tcp_double(vec![WITH_ID_500, ok_with_id], seen.clone()).await;
+        let p = AnthropicProvider::new(Arc::new(hotl_provider::key::StaticKey(Some("k".into()))))
+            .with_base_url(&base);
+        let events: Vec<_> = p.stream(sampling_req()).collect::<Vec<_>>().await;
+        let retry_id = events.iter().find_map(|e| match e {
+            Ok(StreamEvent::Retrying { request_id, .. }) => Some(request_id.clone()),
+            _ => None,
+        });
+        assert_eq!(retry_id, Some(Some("req_bad".into())), "{events:?}");
+        let started_id = events.iter().find_map(|e| match e {
+            Ok(StreamEvent::Started { request_id }) => Some(request_id.clone()),
+            _ => None,
+        });
+        assert_eq!(started_id, Some(Some("req_ok".into())), "{events:?}");
+    }
+
     #[tokio::test]
     async fn a_429_is_retried_over_a_real_socket() {
         let seen = Arc::new(StdMutex::new(Vec::new()));

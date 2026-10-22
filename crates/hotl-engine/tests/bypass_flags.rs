@@ -225,7 +225,7 @@ async fn run_flag_batches(batches: Vec<Vec<(String, &str, Value)>>) -> Vec<(Stri
             })
             .collect();
         scripts.push(vec![
-            Ok(hotl_provider::StreamEvent::Started),
+            Ok(hotl_provider::StreamEvent::Started { request_id: None }),
             Ok(hotl_provider::StreamEvent::Completed {
                 stop: hotl_types::StopReason::ToolUse,
                 usage: hotl_types::TokenUsage {

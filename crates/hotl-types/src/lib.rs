@@ -396,6 +396,11 @@ pub enum EntryPayload {
     },
     Usage {
         usage: TokenUsage,
+        /// The provider's request id for this sample (0071 T1). Absent in
+        /// older logs and when the response carried none — the bytes do not
+        /// change for a session that never sees one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
     },
     Cancelled {
         reason: String,
@@ -1083,6 +1088,40 @@ mod tests {
     #[test]
     fn hit_ratio_never_divides_by_zero() {
         assert_eq!(TokenUsage::default().hit_ratio(), None);
+    }
+
+    /// 0071 T1: a `Usage` entry with no request id is the entry it always was.
+    #[test]
+    fn a_usage_entry_without_a_request_id_is_byte_identical() {
+        let usage = TokenUsage {
+            input_tokens: 3,
+            output_tokens: 4,
+            ..Default::default()
+        };
+        let old = serde_json::json!({"kind": "usage", "usage": usage});
+        let new = serde_json::to_value(EntryPayload::Usage {
+            usage,
+            request_id: None,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&new).unwrap(),
+            serde_json::to_string(&old).unwrap()
+        );
+        let with = serde_json::to_value(EntryPayload::Usage {
+            usage,
+            request_id: Some("req_1".into()),
+        })
+        .unwrap();
+        assert_eq!(with["request_id"], "req_1");
+        let back: EntryPayload = serde_json::from_value(old).unwrap();
+        assert!(matches!(
+            back,
+            EntryPayload::Usage {
+                request_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]

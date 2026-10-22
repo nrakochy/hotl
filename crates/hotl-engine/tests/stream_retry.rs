@@ -23,6 +23,8 @@ struct Ran {
     retries: Vec<(u32, String, bool)>,
     /// `(max, delay_ms, status)` per retry (0061 T15).
     reported: Vec<(u32, u64, Option<u16>)>,
+    /// The request id each retry frame carried (0071 T1).
+    retry_ids: Vec<Option<String>>,
     text: String,
     log: String,
     requests: usize,
@@ -33,6 +35,7 @@ fn overloaded() -> ProviderError {
         status: 529,
         message: "overloaded_error".into(),
         retry_after: None,
+        request_id: None,
     }
 }
 
@@ -64,6 +67,7 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
 
     let mut retries = Vec::new();
     let mut reported = Vec::new();
+    let mut retry_ids = Vec::new();
     let mut text = String::new();
     let outcome = loop {
         let event = tokio::time::timeout(Duration::from_secs(30), handle.events.recv())
@@ -77,11 +81,13 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
                 reason,
                 delay_ms,
                 status,
+                request_id,
                 discarded_partial,
                 ..
             } => {
                 retries.push((attempt, reason, discarded_partial));
                 reported.push((max, delay_ms, status));
+                retry_ids.push(request_id);
             }
             EngineEvent::TextDelta(t) => text.push_str(&t),
             EngineEvent::TurnDone { outcome, .. } => break outcome,
@@ -101,6 +107,7 @@ async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
         outcome,
         retries,
         reported,
+        retry_ids,
         text,
         log: std::fs::read_to_string(&log_path).expect("read log"),
         requests,
@@ -175,6 +182,50 @@ async fn a_mid_stream_retry_reports_status_and_the_delay_it_will_sleep() {
     );
 }
 
+/// 0071 T1: the id the provider sent on `Started` lands in the sample's
+/// `Usage` entry, so a log line can be matched to a support ticket.
+#[tokio::test]
+async fn a_sample_usage_entry_records_the_request_id() {
+    let mut script = ScriptedProvider::text_reply("hi");
+    script[0] = Ok(StreamEvent::Started {
+        request_id: Some("req_1".into()),
+    });
+    let r = run(vec![script]).await;
+    assert!(matches!(r.outcome, Outcome::Done { .. }));
+    let ids: Vec<Option<String>> = r
+        .log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
+        .filter_map(|e| match e.payload {
+            EntryPayload::Usage { request_id, .. } => Some(request_id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![Some("req_1".into())]);
+}
+
+/// 0071 T1: the retry frame names the attempt that died, not the one about
+/// to be sent; a provider that sent no id writes no key.
+#[tokio::test]
+async fn a_retry_frame_carries_the_request_id_of_the_attempt_that_died() {
+    let mut dead = ScriptedProvider::partial_text("half a th");
+    dead[0] = Ok(StreamEvent::Started {
+        request_id: Some("req_dead".into()),
+    });
+    let r = run(vec![
+        ScriptedProvider::error_after(dead, overloaded()),
+        ScriptedProvider::text_reply("the whole answer"),
+    ])
+    .await;
+    assert_eq!(r.retry_ids, vec![Some("req_dead".to_string())]);
+    let r = run(vec![
+        ScriptedProvider::error_after(ScriptedProvider::partial_text("half"), overloaded()),
+        ScriptedProvider::text_reply("the whole answer"),
+    ])
+    .await;
+    assert_eq!(r.retry_ids, vec![None]);
+}
+
 /// A dead connection is the same class as a 529 — the idle watchdog reports
 /// `Transport`, and that was equally fatal before.
 #[tokio::test]
@@ -241,7 +292,7 @@ async fn repeated_interruptions_stop_at_the_cap() {
 #[tokio::test]
 async fn a_sealed_tool_use_block_is_not_resampled() {
     let sealed = vec![
-        Ok(StreamEvent::Started),
+        Ok(StreamEvent::Started { request_id: None }),
         Ok(StreamEvent::BlockStart {
             index: 0,
             kind: "tool_use".into(),
@@ -294,7 +345,10 @@ async fn a_resampled_turn_bills_only_the_sample_that_completed() {
         .lines()
         .filter_map(|l| serde_json::from_str::<hotl_types::Entry>(l).ok())
         .filter_map(|e| match e.payload {
-            EntryPayload::Usage { usage } => Some(usage),
+            EntryPayload::Usage {
+                usage,
+                request_id: None,
+            } => Some(usage),
             _ => None,
         })
         .collect();
