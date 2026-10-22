@@ -79,6 +79,67 @@ add-zsh-hook precmd  hotl-osc133-precmd
 add-zsh-hook preexec hotl-osc133-preexec
 "#;
 
+/// Every word the dispatch `match` below knows, with a one-line description.
+/// `print_help` stays a hand-set literal; the tests tie the two together and
+/// tie both to the completion scripts, so a new verb cannot land in one place
+/// only. `__sessions` is the completions' session source, hidden from help.
+#[allow(dead_code)] // read by the drift tests
+const SUBCOMMANDS: [(&str, &str); 22] = [
+    ("watch", "tmux agent dashboard"),
+    ("fleet", "reserved (orchestrate)"),
+    (
+        "doctor",
+        "check provider keys, sandbox, config, session store",
+    ),
+    ("resume", "resume a session (same as -r)"),
+    ("acp", "serve the ACP protocol over stdio"),
+    ("bg", "background a session"),
+    ("attach", "connect to a backgrounded session"),
+    (
+        "approve",
+        "answer what a backgrounded session is waiting on",
+    ),
+    ("serve", "the backgrounded session's server (internal)"),
+    ("setup", "write default config"),
+    ("gc", "prune old sessions and blobs"),
+    ("mcp", "list MCP servers and trust state"),
+    ("plugins", "list Agent Plugins"),
+    ("skills", "list skills and marketplaces"),
+    ("workflows", "list saved workflows"),
+    ("update", "install the latest release"),
+    ("init", "print shell integration (zsh, bash, fish)"),
+    ("export", "print a session transcript"),
+    ("stats", "sessions, turns, tokens and cost"),
+    ("help", "show help"),
+    ("version", "print the version"),
+    ("__sessions", "id<TAB>name lines for completion (internal)"),
+];
+
+const ZSH_COMPLETION: &str = include_str!("completions/hotl.zsh");
+const BASH_COMPLETION: &str = include_str!("completions/hotl.bash");
+const FISH_COMPLETION: &str = include_str!("completions/hotl.fish");
+
+/// `hotl init <shell>`: zsh gets the `:` prefix plugin and completion in one
+/// eval; bash and fish get completion only.
+fn init_script(shell: &str) -> Option<String> {
+    match shell {
+        "zsh" => Some(format!("{ZSH_PLUGIN}\n{ZSH_COMPLETION}")),
+        "bash" => Some(BASH_COMPLETION.to_string()),
+        "fish" => Some(FISH_COMPLETION.to_string()),
+        _ => None,
+    }
+}
+
+/// `hotl __sessions`: `id<TAB>name` per line, newest first, 20 rows — what
+/// the completion scripts read after `-r`, `--resume`, `--fork-from`, `export`.
+fn print_sessions_for_completion() {
+    let dir = agent::sessions_dir();
+    for (id, path, _) in agent::sessions_newest_first(&dir).into_iter().take(20) {
+        let name = hotl_store::session_name(&path).unwrap_or_default();
+        println!("{id}\t{name}");
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
@@ -125,17 +186,20 @@ fn main() {
         Some("workflows") => std::process::exit(workflows_cli::workflows_main(&args)),
         Some("update") => std::process::exit(block_on(update::update_main(&args, &version_line()))),
         Some("init") => {
-            // Binary-generated shell integration (the `:` prefix).
-            match args.get(1).map(String::as_str) {
-                Some("zsh") => print!("{}", ZSH_PLUGIN),
-                _ => {
+            // Binary-generated shell integration: the zsh `:` prefix plugin
+            // plus completion; completion alone for bash and fish.
+            match args.get(1).map(String::as_str).and_then(init_script) {
+                Some(script) => print!("{script}"),
+                None => {
                     eprintln!(
-                        "usage: hotl init zsh   # then: eval \"$(hotl init zsh)\" in ~/.zshrc"
+                        "usage: hotl init zsh|bash|fish   # then: eval \"$(hotl init zsh)\" in \
+                         ~/.zshrc (no PowerShell completion yet)"
                     );
                     std::process::exit(2);
                 }
             }
         }
+        Some("__sessions") => print_sessions_for_completion(),
         Some("--help") | Some("-h") | Some("help") => print_help(),
         Some("--version") | Some("-V") | Some("version") => print_version(),
         _ => {
@@ -159,8 +223,12 @@ fn is_headless(args: &[String]) -> bool {
 }
 
 fn print_help() {
-    println!(
-        "hotl — human on the loop\n\n\
+    println!("{}", help_text());
+}
+
+/// The help text as a string, so a test can check every verb is in it.
+fn help_text() -> &'static str {
+    "hotl — human on the loop\n\n\
          USAGE:\n  hotl [id-prefix]     console TUI (execute); -n/--name names the session\n  \
          hotl -r [n|id|name]  resume: bare lists sessions; arg = list number, id-prefix, or name\n  \
          \x20                   -r --search <text> lists only sessions whose transcript mentions it\n  \
@@ -175,7 +243,8 @@ fn print_help() {
          hotl attach [id]     connect to a backgrounded session (bare: list them)\n  \
          hotl approve <id>    answer what a backgrounded session is waiting on\n  \
          hotl watch           tmux agent dashboard (watch)\n  \
-         hotl init zsh        print the zsh `:` prefix plugin (eval it in ~/.zshrc)\n  \
+         hotl acp             serve the ACP protocol over stdio (for editors and orchestrators)\n  \
+         hotl init <shell>    zsh: the `:` prefix plugin + completion (eval it in ~/.zshrc); bash/fish: completion\n  \
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
          hotl gc [--dry-run]  prune old sessions/blobs per [retention]\n  \
@@ -188,7 +257,8 @@ fn print_help() {
          hotl update          install the latest release (--check to only look)\n  \
          hotl resume [arg]    same as -r\n  \
          hotl fleet           reserved (orchestrate)\n  \
-         hotl --version       print the version (-V, or `hotl version`)\n\n\
+         hotl version         print the version (-V, --version)\n  \
+         hotl help            this text (-h, --help)\n\n\
          PERMISSIONS: [permissions] mode = bypass (default, no per-action y/N) | ask |\n  \
          dontask (deny anything not pre-approved). `--plan` (or /plan, HOTL_PLAN=1) is a\n  \
          separate axis that composes with any mode: write/edit always ask, while bash,\n  \
@@ -199,7 +269,6 @@ fn print_help() {
          HOTL_OPENAI_BASE_URL, HOTL_PERMISSIONS, HOTL_PLAN, HOTL_SANDBOX=off). Run\n  \
          `hotl setup` to write a starter.\n\n\
          TUI: type to prompt · type mid-turn to steer · y/n answers asks · ? help · ctrl-c quits"
-    );
 }
 
 /// The one-line version banner, shared by `--version` and `hotl update` so the
@@ -345,6 +414,101 @@ mod tests {
         assert!(!is_headless(&v(&["01ABC"])));
         assert!(!is_headless(&v(&["--resume"])));
     }
+    /// The subcommand word list is written in four places (the dispatch
+    /// `match` via `SUBCOMMANDS`, help, and each completion script's
+    /// `# Subcommands:` line); these two tests keep them equal.
+    fn script_subcommands(script: &str) -> Vec<&str> {
+        script
+            .lines()
+            .find_map(|l| l.strip_prefix("# Subcommands: "))
+            .expect("a `# Subcommands:` line")
+            .split_whitespace()
+            .collect()
+    }
+
+    #[test]
+    fn every_dispatched_subcommand_is_in_help_and_in_all_three_completions() {
+        let help = super::help_text();
+        for (name, _) in super::SUBCOMMANDS {
+            if matches!(name, "serve" | "fleet" | "__sessions") {
+                continue;
+            }
+            assert!(
+                help.contains(&format!("hotl {name}")),
+                "help lacks `{name}`"
+            );
+            for (shell, script) in [
+                ("zsh", super::ZSH_COMPLETION),
+                ("bash", super::BASH_COMPLETION),
+                ("fish", super::FISH_COMPLETION),
+            ] {
+                assert!(
+                    script_subcommands(script).contains(&name),
+                    "{shell} completion lacks `{name}`"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_subcommand_in_a_completion_is_dispatched() {
+        let dispatched: Vec<&str> = super::SUBCOMMANDS.iter().map(|(n, _)| *n).collect();
+        for (shell, script) in [
+            ("zsh", super::ZSH_COMPLETION),
+            ("bash", super::BASH_COMPLETION),
+            ("fish", super::FISH_COMPLETION),
+        ] {
+            for name in script_subcommands(script) {
+                assert!(
+                    dispatched.contains(&name),
+                    "{shell} completion names `{name}`, which the dispatch does not know"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn init_zsh_prints_plugin_then_completion() {
+        let out = super::init_script("zsh").unwrap();
+        assert!(out.starts_with(super::ZSH_PLUGIN.lines().next().unwrap()));
+        assert!(out.contains("_hotl()"));
+        assert!(out.contains("compdef _hotl hotl"));
+        assert!(super::init_script("bash")
+            .unwrap()
+            .contains("complete -F _hotl hotl"));
+        assert!(super::init_script("fish")
+            .unwrap()
+            .contains("complete -c hotl"));
+        assert!(super::init_script("powershell").is_none());
+    }
+
+    /// `zsh -n` / `bash -n` parse the scripts; fish only when it is installed.
+    #[test]
+    #[cfg(unix)]
+    fn shell_completions_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let check = |shell: &str, body: &str, required: bool| {
+            let path = dir.path().join(format!("hotl.{shell}"));
+            std::fs::write(&path, body).unwrap();
+            match std::process::Command::new(shell)
+                .arg("-n")
+                .arg(&path)
+                .output()
+            {
+                Ok(out) => assert!(
+                    out.status.success(),
+                    "{shell} -n failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+                Err(_) if !required => eprintln!("{shell} not installed; skipped"),
+                Err(e) => panic!("{shell}: {e}"),
+            }
+        };
+        check("zsh", &super::init_script("zsh").unwrap(), false);
+        check("bash", super::BASH_COMPLETION, false);
+        check("fish", super::FISH_COMPLETION, false);
+    }
+
     /// `hotl resume <s> -p "…"`: the resume arm's rewrite keeps `-p`, so the
     /// headless check sees it and the run never reaches the console's TTY guard.
     #[test]

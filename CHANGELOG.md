@@ -24,6 +24,10 @@ semver promise of their own.
   when any session's model is not in the price catalog, never a partial sum.
 - **`hotl -r --search <text>`** shows only the sessions whose transcript
   mentions the text, with a one-line excerpt, before you pick.
+- **Tab completion.** `hotl init zsh` now also installs completions; `hotl
+  init bash` and `hotl init fish` print completion scripts for those shells.
+  Session ids and names complete after `-r`, `--resume`, `--fork-from` and
+  `export`.
 
 ### Changed
 
