@@ -202,12 +202,26 @@ fn render_list(config_dir: &Path, data_dir: &Path) -> String {
     if let Some(tool) = &tool {
         let width = tool
             .roster()
-            .map(|(n, _, _)| n.chars().count())
+            .map(|r| r.name.chars().count())
             .max()
             .unwrap_or(0);
-        for (name, source, desc) in tool.roster() {
-            out.push_str(&format!("{name:<width$}  {source:<12}  {}\n", clip(desc)));
+        for r in tool.roster() {
+            let flags = if r.flags.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", r.flags.join(", "))
+            };
+            out.push_str(&format!(
+                "{:<width$}  {:<12}  {}{flags}\n",
+                r.name,
+                r.source,
+                clip(r.description)
+            ));
+            if !r.paths.is_empty() {
+                out.push_str(&format!("{:<width$}  paths: {}\n", "", r.paths.join(", ")));
+            }
         }
+        warnings.extend(tool.warnings().map(String::from));
     }
     if out.is_empty() {
         out.push_str("no skills discovered\n");

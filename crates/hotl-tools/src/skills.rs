@@ -61,11 +61,52 @@ struct SkillEntry {
     description: String,
     path: PathBuf,
     base_dir: PathBuf,
+    /// `paths:` globs from the frontmatter, verbatim (0068 D3).
+    paths: Vec<String>,
+    /// `disable-model-invocation: true` — reachable by exact name only (D4).
+    disable_model_invocation: bool,
+    /// `user-invocable: false` — out of the client catalog (D4).
+    user_invocable: bool,
+    /// `argument-hint:` — the opt-in for `$ARGUMENTS` in a `SKILL.md` (D5).
+    argument_hint: Option<String>,
+    /// Frontmatter problems, reported once as discovery warnings.
+    warnings: Vec<String>,
+}
+
+/// What hotl reads out of a `SKILL.md` frontmatter (0068 T1).
+#[derive(Debug, Default, PartialEq)]
+struct SkillMeta {
+    name: Option<String>,
+    description: String,
+    paths: Vec<String>,
+    disable_model_invocation: bool,
+    user_invocable: bool,
+    argument_hint: Option<String>,
+    warnings: Vec<String>,
 }
 
 pub struct SkillTool {
     entries: Vec<SkillEntry>,
     description: String,
+}
+
+/// One `hotl skills list` row (0068 T1): the flags column names what the
+/// frontmatter asked for.
+#[derive(Debug, PartialEq)]
+pub struct RosterRow<'a> {
+    pub name: &'a str,
+    pub source: &'a str,
+    pub description: &'a str,
+    /// `model-hidden`, `user-hidden`, `paths`, `args` — in that order.
+    pub flags: Vec<&'static str>,
+    pub paths: &'a [String],
+}
+
+impl<'a> RosterRow<'a> {
+    /// `(name, source, description)` — the pre-0068 row, for tests.
+    pub fn triple(&self) -> (&'a str, &'a str, &'a str) {
+        (self.name, self.source, self.description)
+    }
 }
 
 impl SkillTool {
@@ -120,11 +161,37 @@ impl SkillTool {
         })
     }
 
-    /// `(name, source, description)` rows, name-sorted — `hotl skills list`.
-    pub fn roster(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+    /// One row per skill, name-sorted — `hotl skills list`.
+    pub fn roster(&self) -> impl Iterator<Item = RosterRow<'_>> {
+        self.entries.iter().map(|e| {
+            let mut flags = Vec::new();
+            if e.disable_model_invocation {
+                flags.push("model-hidden");
+            }
+            if !e.user_invocable {
+                flags.push("user-hidden");
+            }
+            if !e.paths.is_empty() {
+                flags.push("paths");
+            }
+            if e.argument_hint.is_some() {
+                flags.push("args");
+            }
+            RosterRow {
+                name: &e.name,
+                source: &e.source,
+                description: &e.description,
+                flags,
+                paths: &e.paths,
+            }
+        })
+    }
+
+    /// Frontmatter problems found at discovery, one line each.
+    pub fn warnings(&self) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
-            .map(|e| (e.name.as_str(), e.source.as_str(), e.description.as_str()))
+            .flat_map(|e| e.warnings.iter().map(String::as_str))
     }
 
     /// Every name `{"name"}` accepts: the bare name plus any
@@ -352,6 +419,11 @@ fn list_flat(dir: &Path) -> Vec<SkillEntry> {
                 description: first_line(&text),
                 base_dir: dir.to_path_buf(),
                 path,
+                paths: Vec::new(),
+                disable_model_invocation: false,
+                user_invocable: true,
+                argument_hint: None,
+                warnings: Vec::new(),
             })
         })
         .collect()
@@ -368,20 +440,41 @@ fn list_skill_dirs(dir: &Path) -> Vec<SkillEntry> {
 }
 
 /// One `<dir>/SKILL.md` skill: frontmatter name, falling back to the
-/// directory name.
+/// directory name — also when the frontmatter name fails the name grammar
+/// (D8): it becomes a roster line, a `/` command and a hint, so it must be
+/// clean.
 fn read_skill_dir(base_dir: &Path) -> Option<SkillEntry> {
     let path = base_dir.join("SKILL.md");
     let text = std::fs::read_to_string(&path).ok()?;
     let dir_name = base_dir.file_name()?.to_str()?.to_string();
-    let (fm_name, description) = parse_frontmatter(&text);
+    let mut meta = parse_frontmatter(&text);
+    let name = match meta.name.take() {
+        Some(n) => match normalize_marketplace_name(&n) {
+            Some(n) => n,
+            None => {
+                meta.warnings.push(format!(
+                    "{}: `name: {n}` is not a valid skill name (letters, digits, \
+                     `.`/`_`/`-`, alphanumeric first, ≤ 64 chars); using `{dir_name}`",
+                    path.display()
+                ));
+                dir_name
+            }
+        },
+        None => dir_name,
+    };
     Some(SkillEntry {
-        name: fm_name.unwrap_or(dir_name),
+        name,
         qualified: None,
         source: String::new(),
         tier: 0,
-        description,
+        description: meta.description,
         path,
         base_dir: base_dir.to_path_buf(),
+        paths: meta.paths,
+        disable_model_invocation: meta.disable_model_invocation,
+        user_invocable: meta.user_invocable,
+        argument_hint: meta.argument_hint,
+        warnings: meta.warnings,
     })
 }
 
@@ -426,28 +519,82 @@ fn version_key(name: &str) -> Vec<u64> {
 }
 
 /// Lenient SKILL.md frontmatter: a `---` fence with `name:`/`description:`
-/// lines. Anything else falls back to the first non-empty body line — the
+/// lines plus the keys the agent ecosystem settled on (`paths:`,
+/// `disable-model-invocation:`, `user-invocable:`, `argument-hint:`).
+/// Anything else falls back to the first non-empty body line — the
 /// flat-file behavior. No YAML dependency; a multi-line description keeps
-/// its first line (the roster truncates anyway).
-fn parse_frontmatter(text: &str) -> (Option<String>, String) {
-    if let Some(rest) = text.strip_prefix("---") {
-        if let Some(end) = rest.find("\n---") {
-            let fence = &rest[..end];
-            let get = |key: &str| {
-                fence
-                    .lines()
-                    .find_map(|l| l.strip_prefix(key))
-                    .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
-                    .filter(|v| !v.is_empty())
-            };
-            if let Some(description) = get("description:") {
-                return (get("name:"), description);
+/// its first line (the roster truncates anyway). `paths:` takes an inline
+/// list, a comma string, or `- item` lines under the key; a boolean is
+/// `true`/`false` or the default plus a warning.
+fn parse_frontmatter(text: &str) -> SkillMeta {
+    let mut meta = SkillMeta {
+        user_invocable: true,
+        ..SkillMeta::default()
+    };
+    let Some(rest) = text.strip_prefix("---") else {
+        meta.description = first_line(text);
+        return meta;
+    };
+    let Some(end) = rest.find("\n---") else {
+        meta.description = first_line(text);
+        return meta;
+    };
+    let fence = &rest[..end];
+    let lines: Vec<&str> = fence.lines().collect();
+    let value = |key: &str| {
+        lines
+            .iter()
+            .find_map(|l| l.strip_prefix(key))
+            .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+            .filter(|v| !v.is_empty())
+    };
+    meta.name = value("name:");
+    meta.description = value("description:").unwrap_or_else(|| first_line(&rest[end + 4..]));
+    meta.argument_hint = value("argument-hint:");
+    for (key, default) in [
+        ("disable-model-invocation:", false),
+        ("user-invocable:", true),
+    ] {
+        let Some(raw) = lines.iter().find_map(|l| l.strip_prefix(key)) else {
+            continue;
+        };
+        let flag = match raw.trim().trim_matches(['"', '\'']) {
+            "true" => true,
+            "false" => false,
+            other => {
+                meta.warnings.push(format!(
+                    "`{key} {other}` is not true/false; using {default}"
+                ));
+                default
             }
-            let body = &rest[end + 4..];
-            return (get("name:"), first_line(body));
+        };
+        if key.starts_with("disable") {
+            meta.disable_model_invocation = flag;
+        } else {
+            meta.user_invocable = flag;
         }
     }
-    (None, first_line(text))
+    if let Some(i) = lines.iter().position(|l| l.starts_with("paths:")) {
+        let inline = lines[i]["paths:".len()..].trim();
+        if inline.is_empty() {
+            // Block list: `- item` lines directly under the key.
+            meta.paths = lines[i + 1..]
+                .iter()
+                .map_while(|l| l.trim_start().strip_prefix("- "))
+                .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+                .filter(|v| !v.is_empty())
+                .collect();
+        } else {
+            meta.paths = inline
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .split(',')
+                .map(|v| v.trim().trim_matches(['"', '\'']).to_string())
+                .filter(|v| !v.is_empty())
+                .collect();
+        }
+    }
+    meta
 }
 
 fn first_line(text: &str) -> String {
@@ -723,7 +870,7 @@ mod tests {
         let tool = SkillTool::new(dir.path(), false, &[], &[]).expect("a skill exists");
         assert!(tool.description().contains("hotl: deploy"));
         assert_eq!(
-            tool.roster().collect::<Vec<_>>(),
+            tool.roster().map(|r| r.triple()).collect::<Vec<_>>(),
             vec![("deploy", "hotl", "Deploy checklist")]
         );
 
@@ -981,7 +1128,7 @@ mod tests {
         );
         // Version dedup is a roster fact now that descriptions left the
         // tool description.
-        let descs: Vec<&str> = tool.roster().map(|(_, _, d)| d).collect();
+        let descs: Vec<&str> = tool.roster().map(|r| r.description).collect();
         assert!(
             descs.iter().any(|d| d.contains("(new)")) && !descs.iter().any(|d| d.contains("(old)")),
             "higher version wins: {descs:?}"
@@ -1090,7 +1237,7 @@ mod tests {
         // Roster rows carry source labels.
         let rows: Vec<(String, String)> = tool
             .roster()
-            .map(|(n, s, _)| (n.to_string(), s.to_string()))
+            .map(|r| (r.name.to_string(), r.source.to_string()))
             .collect();
         assert!(rows.contains(&("deploy".into(), "hotl".into())), "{rows:?}");
         assert!(
@@ -1127,6 +1274,69 @@ mod tests {
     }
 
     #[test]
+    fn frontmatter_reads_paths_as_inline_comma_or_block_list() {
+        let inline = parse_frontmatter(
+            "---\nname: x\ndescription: d\npaths: [\"src/**\", 'tests/*.rs']\n---\nbody\n",
+        );
+        assert_eq!(inline.paths, vec!["src/**", "tests/*.rs"]);
+        let comma = parse_frontmatter("---\ndescription: d\npaths: src/**, docs/**\n---\n");
+        assert_eq!(comma.paths, vec!["src/**", "docs/**"]);
+        let block = parse_frontmatter(
+            "---\ndescription: d\npaths:\n  - src/**\n  - \"crates/*/src/**\"\nargument-hint: <file>\n---\n",
+        );
+        assert_eq!(block.paths, vec!["src/**", "crates/*/src/**"]);
+        assert_eq!(block.argument_hint.as_deref(), Some("<file>"));
+        assert_eq!(block.description, "d");
+        assert!(block.warnings.is_empty(), "{:?}", block.warnings);
+        // A fence with no keys hotl reads still falls back to the body.
+        let none = parse_frontmatter("---\nfoo: bar\n---\n# Title\nbody\n");
+        assert!(none.paths.is_empty());
+        assert_eq!(none.description, "Title");
+    }
+
+    #[test]
+    fn frontmatter_booleans_default_and_reject_junk_with_a_warning() {
+        let plain = parse_frontmatter("---\ndescription: d\n---\n");
+        assert!(!plain.disable_model_invocation && plain.user_invocable);
+        let set = parse_frontmatter(
+            "---\ndescription: d\ndisable-model-invocation: true\nuser-invocable: false\n---\n",
+        );
+        assert!(set.disable_model_invocation && !set.user_invocable);
+        assert!(set.warnings.is_empty());
+        let junk = parse_frontmatter(
+            "---\ndescription: d\ndisable-model-invocation: yes\nuser-invocable: 0\n---\n",
+        );
+        assert!(
+            !junk.disable_model_invocation && junk.user_invocable,
+            "defaults"
+        );
+        assert_eq!(junk.warnings.len(), 2, "{:?}", junk.warnings);
+        assert!(junk.warnings[0].contains("not true/false"));
+    }
+
+    #[test]
+    fn an_invalid_frontmatter_name_falls_back_to_the_directory_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write_skill(
+            &dir.path().join("review"),
+            "name: Review the PR!\ndescription: d",
+            "body",
+        );
+        let e = read_skill_dir(&dir.path().join("review")).unwrap();
+        assert_eq!(e.name, "review");
+        assert_eq!(e.warnings.len(), 1, "{:?}", e.warnings);
+        assert!(e.warnings[0].contains("not a valid skill name"));
+        write_skill(
+            &dir.path().join("ok"),
+            "name: code-review\ndescription: d",
+            "body",
+        );
+        let e = read_skill_dir(&dir.path().join("ok")).unwrap();
+        assert_eq!(e.name, "code-review");
+        assert!(e.warnings.is_empty());
+    }
+
+    #[test]
     fn malformed_frontmatter_falls_back_to_first_line() {
         let dir = tempfile::tempdir().unwrap();
         let user = dir.path().join("claude-skills");
@@ -1146,7 +1356,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            tool.roster().collect::<Vec<_>>(),
+            tool.roster().map(|r| r.triple()).collect::<Vec<_>>(),
             vec![("odd", "claude", "Odd skill")]
         );
     }
