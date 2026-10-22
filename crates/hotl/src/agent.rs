@@ -2700,6 +2700,31 @@ struct Surface {
     /// The workspace, when this headless run is in plan mode (0056 T3).
     /// `Some` arms the end-of-run check that plan mode changed no files.
     plan_workspace: Option<PathBuf>,
+    /// The last goal verdict seen, so a `--goal` run's exit code can say
+    /// how the goal ended, not just that the turn did.
+    last_goal_verdict: Option<hotl_engine::GoalVerdictKind>,
+}
+
+/// Exit 4: a cap you set stopped the run (`max_turns`, `max_tool_calls`,
+/// `max_cost_usd`).
+const EXIT_CAP: i32 = 4;
+/// Exit 5: a brake the harness pulled (doom loop, tool-failure budget,
+/// denial spiral, a stalled goal).
+const EXIT_BRAKE: i32 = 5;
+
+/// A `--goal` run's exit after a clean turn: the verdict's class wins over
+/// the turn's `0`, so a cron loop never reads "done" for a goal the
+/// evaluator gave up on.
+fn goal_exit_code(code: i32, verdict: Option<hotl_engine::GoalVerdictKind>) -> i32 {
+    use hotl_engine::GoalVerdictKind as V;
+    if code != 0 {
+        return code;
+    }
+    match verdict {
+        Some(V::Impossible | V::Errored) => 1,
+        Some(V::Stalled) => EXIT_BRAKE,
+        _ => 0,
+    }
 }
 
 impl Surface {
@@ -2713,6 +2738,7 @@ impl Surface {
             model,
             sigint: crate::signals::Interrupt::new().expect("interrupt handler"),
             plan_workspace: None,
+            last_goal_verdict: None,
         }
     }
 
@@ -2730,8 +2756,11 @@ impl Surface {
             tokio::select! {
                 maybe_event = self.handle.events.recv() => {
                     let Some(event) = maybe_event else { return 1 };
+                    if let EngineEvent::GoalVerdict { verdict, .. } = &event {
+                        self.last_goal_verdict = Some(*verdict);
+                    }
                     let done_code = if let EngineEvent::TurnDone { ref outcome, .. } = event {
-                        Some(exit_code(outcome))
+                        Some(goal_exit_code(exit_code(outcome), self.last_goal_verdict))
                     } else {
                         None
                     };
@@ -2950,24 +2979,32 @@ impl Surface {
             Outcome::Done { .. } => {}
             Outcome::Cancelled => eprintln!("\n(interrupted)"),
             Outcome::TurnLimit => eprintln!(
-                "\nhotl: stopped after {} model steps (the max_turns cap).\n\
+                "\nhotl: stopped after {} model steps (the max_turns cap, exit {EXIT_CAP}).\n\
                  Raise it with `[behavior] max_turns` in config.toml or \
                  HOTL_MAX_TURNS; `-1` removes the cap entirely.",
                 self.max_turns
             ),
             Outcome::Refused => eprintln!("\nhotl: the model declined this request."),
             Outcome::DoomLoop { pattern } => {
-                eprintln!("\nhotl: stopped — the model kept repeating: {pattern}")
+                eprintln!(
+                    "\nhotl: stopped — the model kept repeating: {pattern} (exit {EXIT_BRAKE})"
+                )
             }
             Outcome::ToolFailureBudget { tool } => {
-                eprintln!("\nhotl: stopped — `{tool}` failed too many times in a row.")
+                eprintln!(
+                    "\nhotl: stopped — `{tool}` failed too many times in a row (exit {EXIT_BRAKE})."
+                )
             }
             Outcome::DenialSpiral { consecutive, total } => eprintln!(
-                "\nhotl: stopped — {consecutive} calls denied in a row ({total} this turn). \
-                 Change what you are asking it to do, or relax the rule that is denying it."
+                "\nhotl: stopped — {consecutive} calls denied in a row ({total} this turn, exit \
+                 {EXIT_BRAKE}). Change what you are asking it to do, or relax the rule that is \
+                 denying it."
             ),
             Outcome::Budget { kind, used, cap } => {
-                eprintln!("\nhotl: {}", hotl_engine::budget_refusal(kind, *used, *cap))
+                eprintln!(
+                    "\nhotl: {} (exit {EXIT_CAP})",
+                    hotl_engine::budget_refusal(kind, *used, *cap)
+                )
             }
             Outcome::Error { message } => eprintln!("\nhotl: {message}"),
         }
@@ -3604,11 +3641,17 @@ fn layer_c_warning(worker_threads: Option<usize>) -> Option<String> {
     })
 }
 
+/// The shell's twin of `turn_done.outcome.kind`: 0 done, 1 failed or
+/// refused, 4 a cap you set, 5 a brake the harness pulled, 130 interrupted.
 fn exit_code(outcome: &Outcome) -> i32 {
     match outcome {
         Outcome::Done { .. } => 0,
         Outcome::Cancelled => 130,
-        _ => 1,
+        Outcome::TurnLimit | Outcome::Budget { .. } => EXIT_CAP,
+        Outcome::DoomLoop { .. }
+        | Outcome::ToolFailureBudget { .. }
+        | Outcome::DenialSpiral { .. } => EXIT_BRAKE,
+        Outcome::Error { .. } | Outcome::Refused => 1,
     }
 }
 
@@ -7003,6 +7046,99 @@ mod tests {
             parse_args(args(&["-p", "hi", "--resume", "x", "--json-schema", "s"])),
             Err(2)
         ));
+    }
+
+    #[test]
+    fn exit_codes_separate_caps_from_brakes_from_failures() {
+        let cases: Vec<(Outcome, i32)> = vec![
+            (
+                Outcome::Done {
+                    text: String::new(),
+                },
+                0,
+            ),
+            (Outcome::Cancelled, 130),
+            (Outcome::TurnLimit, 4),
+            (
+                Outcome::Budget {
+                    kind: "tool_calls".into(),
+                    used: 10.0,
+                    cap: 10.0,
+                },
+                4,
+            ),
+            (
+                Outcome::DoomLoop {
+                    pattern: "x".into(),
+                },
+                5,
+            ),
+            (
+                Outcome::ToolFailureBudget {
+                    tool: "bash".into(),
+                },
+                5,
+            ),
+            (
+                Outcome::DenialSpiral {
+                    consecutive: 3,
+                    total: 3,
+                },
+                5,
+            ),
+            (Outcome::Refused, 1),
+            (
+                Outcome::Error {
+                    message: "boom".into(),
+                },
+                1,
+            ),
+        ];
+        for (outcome, want) in cases {
+            assert_eq!(exit_code(&outcome), want, "{outcome:?}");
+        }
+    }
+
+    #[test]
+    fn a_goal_that_stalls_exits_as_a_brake_and_an_impossible_one_as_a_failure() {
+        use hotl_engine::GoalVerdictKind as V;
+        assert_eq!(goal_exit_code(0, Some(V::Stalled)), EXIT_BRAKE);
+        assert_eq!(goal_exit_code(0, Some(V::Impossible)), 1);
+        assert_eq!(goal_exit_code(0, Some(V::Errored)), 1);
+        assert_eq!(goal_exit_code(0, Some(V::Met)), 0);
+        assert_eq!(goal_exit_code(0, Some(V::NotYet)), 0);
+        assert_eq!(goal_exit_code(0, Some(V::EvalFailed)), 0);
+        assert_eq!(goal_exit_code(0, None), 0);
+        // A turn that did not end cleanly keeps its own code.
+        assert_eq!(goal_exit_code(EXIT_CAP, Some(V::Stalled)), EXIT_CAP);
+        assert_eq!(goal_exit_code(130, Some(V::Impossible)), 130);
+    }
+
+    /// `run_until_idle`'s order: the goal verdict adjusts a clean `0`, then
+    /// a plan-dirty tree still outranks a clean goal.
+    #[test]
+    fn plan_dirty_still_outranks_a_clean_goal() {
+        let dir = tempfile::tempdir().unwrap();
+        // Not a git repository: the check cannot run and reports clean.
+        assert_eq!(plan_exit_code(dir.path()), 0);
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo.path())
+                .env("GIT_DIR", repo.path().join(".git"))
+                .output()
+                .expect("git")
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.path().join("new.txt"), "x").unwrap();
+        let code = goal_exit_code(0, Some(hotl_engine::GoalVerdictKind::Met));
+        let final_code = if code == 0 {
+            plan_exit_code(repo.path())
+        } else {
+            code
+        };
+        assert_eq!(final_code, 3);
     }
 
     #[test]

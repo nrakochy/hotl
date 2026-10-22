@@ -25,6 +25,15 @@ semver promise of their own.
 - **`hotl -r --search <text>`** shows only the sessions whose transcript
   mentions the text, with a one-line excerpt, before you pick.
 
+### Changed
+
+- **Headless exit codes tell the stops apart (breaking for scripts).** `4` =
+  a cap you set stopped it (`max_turns`, `max_tool_calls`, `max_cost_usd`),
+  `5` = a harness brake stopped it (doom loop, tool-failure budget, denial
+  spiral, a stalled `--goal`), `1` = it failed or the model refused (and an
+  `impossible` goal). `0`, `2`, `3` and `130` are unchanged. A script that
+  tested `$? -eq 1` for a turn limit must test `4`.
+
 ## [0.28.0] - 2026-09-28
 
 ### Added
