@@ -603,6 +603,16 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
             segs.push(Segment::blocked(stall_text(secs, state.stream_idle_secs)));
         }
     }
+    // A `/btw` in flight (0071 T5): faint, beside the phase — the phase is
+    // whatever the turn is doing.
+    if let Some((_, ticks)) = &state.aside_pending {
+        segs.push(Segment {
+            text: format!("aside · {}s", secs(*ticks)),
+            short: None,
+            rank: RANK_TODO,
+            tone: Tone::Plain,
+        });
+    }
     if let Some(count) = todos_count(&state.todos) {
         segs.push(Segment {
             text: format!("{count} {}", todos_label(&state.todos)),

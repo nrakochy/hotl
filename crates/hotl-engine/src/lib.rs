@@ -634,6 +634,18 @@ pub enum EngineEvent {
         title: Option<String>,
         usage: TokenUsage,
     },
+    /// A `/btw` answer (0071 T5). `usage` is the aside's own sample, which
+    /// joins the session totals; nothing of it is in the log but a `Usage`.
+    AsideDone {
+        question: String,
+        text: String,
+        usage: TokenUsage,
+    },
+    /// The aside's bound or ladder gave up.
+    AsideFailed {
+        question: String,
+        reason: String,
+    },
     /// The model handed the user a plan to approve or revise (`present_plan`,
     /// 0056 T3). The nodes are already durable — this is the surface's cue to
     /// show them and offer the two answers, not a request the engine waits on.
@@ -709,6 +721,8 @@ impl std::fmt::Debug for EngineEvent {
             Self::SessionTitled { title, .. } => {
                 write!(f, "SessionTitled(set={})", title.is_some())
             }
+            Self::AsideDone { text, .. } => write!(f, "AsideDone(len={})", text.len()),
+            Self::AsideFailed { reason, .. } => write!(f, "AsideFailed({reason})"),
             Self::GoalVerdict { verdict, turns, .. } => {
                 write!(f, "GoalVerdict({verdict:?},turns={turns})")
             }
@@ -726,6 +740,8 @@ pub enum RetryScope {
     GoalEval,
     /// The auto-title call (0071 T4).
     Title,
+    /// A `/btw` aside (0071 T5).
+    Aside,
 }
 
 /// What the goal evaluator concluded, engine-side vocabulary: the parser
@@ -979,6 +995,15 @@ pub enum SessionCmd {
         title: Option<String>,
         usage: TokenUsage,
     },
+    /// `/btw` (0071 T5): a side question sampled over the byte-identical
+    /// cached prefix, never written to the log as an item. Allowed mid-turn.
+    Aside { question: String },
+    /// The detached aside task reporting back: the answer (or why there is
+    /// none) and what it cost.
+    AsideResult {
+        question: String,
+        result: Result<(String, TokenUsage), String>,
+    },
     /// Set the session's effective permission mode (durable: appended to the
     /// log as `ModeSet`; takes effect immediately — no `Rules` reallocation).
     SetMode(PermissionMode),
@@ -1202,6 +1227,11 @@ impl SessionHandle {
     /// Name the session durably (a `rename` log entry; last one wins).
     pub async fn rename(&self, name: String) {
         let _ = self.cmd.send(SessionCmd::Rename(name)).await;
+    }
+    /// Ask a side question over the cached prefix (0071 T5). The answer
+    /// arrives as `AsideDone`; nothing enters the transcript.
+    pub async fn aside(&self, question: String) {
+        let _ = self.cmd.send(SessionCmd::Aside { question }).await;
     }
     /// Set the session's effective permission mode durably (a `mode_set` log
     /// entry; last one wins). Takes effect immediately: the running actor

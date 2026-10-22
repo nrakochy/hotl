@@ -306,6 +306,7 @@ fn item_fingerprint(item: &TranscriptItem, thinking_expanded: bool, band_keys: b
             }
         }
         TranscriptItem::Notice { text } => (5u8, text_key(text)).hash(&mut h),
+        TranscriptItem::Aside { question, text } => (11u8, question, text_key(text)).hash(&mut h),
         // A new variant without its own discriminant byte would collide with
         // `Notice` and render a stale block after the numbers changed — a bug
         // no unit test catches and every use does.
@@ -698,6 +699,7 @@ fn speaker(item: &TranscriptItem) -> Speaker {
         TranscriptItem::Thinking { .. }
         | TranscriptItem::Tool { .. }
         | TranscriptItem::Notice { .. }
+        | TranscriptItem::Aside { .. }
         | TranscriptItem::Error { .. }
         | TranscriptItem::Report(_)
         | TranscriptItem::WorkflowsReport(_)
@@ -1263,6 +1265,29 @@ fn item_block<'a>(
                 Style::new().fg(p.muted).italic(),
             )]),
         ),
+        // A `/btw` exchange (0071 T5): a muted two-row block, the question
+        // first, so it cannot read as part of the conversation.
+        TranscriptItem::Aside { question, text } => {
+            let mut lines = vec![Line::styled(
+                format!("? {question}"),
+                Style::new().fg(p.muted).italic(),
+            )];
+            lines.extend(
+                text.as_str()
+                    .lines()
+                    .map(|l| Line::styled(l.to_string(), Style::new().fg(p.muted))),
+            );
+            (
+                Spine {
+                    indent: 0,
+                    marker: "?",
+                    cont: " ",
+                    marker_style: Style::new().fg(p.muted),
+                    cont_style: Style::new(),
+                },
+                prose(lines),
+            )
+        }
         // A failed turn: red with a ✗, never the muted notice spine, so an
         // execution error cannot be mistaken for the routine chatter near it.
         TranscriptItem::Error { text } => (

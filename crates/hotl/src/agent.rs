@@ -3029,6 +3029,9 @@ impl Surface {
                     eprintln!("· titled: {t}");
                 }
             }
+            // Headless has no `/btw`; the arms exist for the match.
+            EngineEvent::AsideDone { text, .. } => eprintln!("· aside: {text}"),
+            EngineEvent::AsideFailed { reason, .. } => eprintln!("· aside failed: {reason}"),
             EngineEvent::GoalVerdict {
                 verdict,
                 reason,

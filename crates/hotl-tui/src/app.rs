@@ -246,6 +246,12 @@ pub enum TranscriptItem {
     Notice {
         text: Streamed,
     },
+    /// A `/btw` exchange (0071 T5): the question and its answer, muted — it
+    /// is not part of the task and the model will not remember it.
+    Aside {
+        question: String,
+        text: Streamed,
+    },
     /// A turn that failed outright (provider/transport error, sealed log, panic).
     /// Its own variant, not a `Notice`: an error must not read as muted chatter.
     Error {
@@ -539,6 +545,9 @@ pub struct State {
     /// A generated title (0071 T4), shown by the badge and the terminal title
     /// only while the session has no name — a label, never an address.
     pub session_title: Option<String>,
+    /// A `/btw` in flight (0071 T5): the question and ticks since it was
+    /// sent, for the strip's `aside · Ns` segment. `None` = none pending.
+    pub aside_pending: Option<(String, u64)>,
     /// Effective permission mode (`ask` | `bypass` | `dontask`).
     /// Seeded from the open handshake and corrected by every `mode_changed`
     /// notification, so it is what the engine enforces rather than what the
@@ -725,6 +734,7 @@ impl State {
             pending_auto_rules: std::collections::HashMap::new(),
             session_name: None,
             session_title: None,
+            aside_pending: None,
             mode: "ask".into(),
             plan: false,
             effort: None,
@@ -932,6 +942,9 @@ pub enum Cmd {
     /// engine's `goal_changed` broadcast is what corrects the optimism).
     /// `None` clears.
     SetGoal(Option<String>),
+    /// Send `session/aside` (0071 T5); the answer comes back as
+    /// `aside_result`.
+    Aside(String),
     Cancel,
     ReplyPermission {
         req_id: u64,
@@ -1624,6 +1637,22 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
         // impossible verdict). A confirmation of this surface's optimistic
         // update leaves the counters alone.
         "goal_evaluating" => state.goal_evaluating = true,
+        // `/btw` (0071 T5): a card, never a modal — the human may be steering
+        // a live turn while the aside is in flight.
+        "aside_result" => {
+            state.aside_pending = None;
+            if let Some(usage) = v.get("usage") {
+                state.session_usage.add(usage);
+            }
+            state.transcript.push(TranscriptItem::Aside {
+                question: text_of("question"),
+                text: text_of("text").into(),
+            });
+        }
+        "aside_failed" => {
+            state.aside_pending = None;
+            notice(state, format!("aside failed — {}", text_of("reason")));
+        }
         // 0071 T4: the title is a label the badge shows while the session has
         // no name; the call's spend joins the totals like any other sample.
         "session_titled" => {
@@ -2988,6 +3017,28 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
             Vec::new()
         }
         "quit" => vec![Cmd::Quit],
+        // `/btw <question>` (0071 T5): a side question over the cached
+        // prefix, answered as a card, never remembered. Allowed mid-turn.
+        "btw" => {
+            let question = payload
+                .text
+                .trim()
+                .strip_prefix('/')
+                .and_then(|r| r.split_once(char::is_whitespace))
+                .map(|(_, a)| a.trim().to_string())
+                .filter(|q| !q.is_empty());
+            let Some(question) = question else {
+                notice(
+                    state,
+                    "usage: /btw <question> — a side question the model answers but will not \
+                     remember"
+                        .into(),
+                );
+                return Vec::new();
+            };
+            state.aside_pending = Some((question.clone(), 0));
+            vec![Cmd::Aside(question)]
+        }
         // The built-in reviewer (0070 T11): a prompt, never an engine call.
         // The model spawns the read-only `review` def; a skill of this name
         // is shadowed, as every built-in shadows.
@@ -3291,6 +3342,9 @@ fn on_tick(state: &mut State) {
     // measures the time the loop actually spends working.
     if state.goal.is_some() {
         state.goal_ticks += 1;
+    }
+    if let Some((_, ticks)) = &mut state.aside_pending {
+        *ticks += 1;
     }
     match &mut state.phase {
         Phase::Sampling { ticks } | Phase::Streaming { ticks, .. } => *ticks += 1,
@@ -4378,6 +4432,65 @@ mod tests {
         upd(&mut s, json!({"type":"compacting","items":4}));
         on_result(&mut s, "done", None, &json!({}));
         assert!(!s.compacting);
+    }
+
+    /// 0071 T5: `/btw` sends the aside and parks a faint strip segment; the
+    /// answer lands as a card and clears it; a bare `/btw` prints usage.
+    #[test]
+    fn slash_btw_sends_an_aside_and_parks_a_strip_segment() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        let cmds = slash(&mut s, "btw what does this return?");
+        assert!(
+            matches!(&cmds[..], [Cmd::Aside(q)] if q == "what does this return?"),
+            "{cmds:?}"
+        );
+        assert_eq!(
+            s.aside_pending.as_ref().map(|(q, _)| q.as_str()),
+            Some("what does this return?")
+        );
+        for _ in 0..(3 * crate::anim::TICK_HZ) {
+            update(&mut s, Msg::Tick);
+        }
+        assert!(
+            crate::anim::strip_segments(&s)
+                .iter()
+                .any(|g| g.text == "aside · 3s"),
+            "{:?}",
+            crate::anim::strip_segments(&s)
+        );
+    }
+
+    #[test]
+    fn an_aside_result_lands_as_a_card_and_clears_the_segment() {
+        let mut s = State::test_default();
+        slash(&mut s, "btw why?");
+        upd(
+            &mut s,
+            json!({"type":"aside_result","question":"why?","text":"because","usage":{"input_tokens":4,"output_tokens":1}}),
+        );
+        assert!(s.aside_pending.is_none());
+        assert!(matches!(
+            s.transcript.last(),
+            Some(TranscriptItem::Aside { question, text }) if question == "why?" && text.as_str() == "because"
+        ));
+        assert_eq!((s.session_usage.input, s.session_usage.output), (4, 1));
+        slash(&mut s, "btw again?");
+        upd(
+            &mut s,
+            json!({"type":"aside_failed","question":"again?","reason":"timed out"}),
+        );
+        assert!(s.aside_pending.is_none());
+        assert_eq!(last_notice(&s), "aside failed — timed out");
+    }
+
+    #[test]
+    fn a_bare_btw_prints_usage() {
+        let mut s = State::test_default();
+        let cmds = slash(&mut s, "btw");
+        assert!(cmds.is_empty());
+        assert!(last_notice(&s).starts_with("usage: /btw <question>"));
+        assert!(s.aside_pending.is_none());
     }
 
     /// 0071 T4: the badge and the terminal title show the generated title
@@ -6794,8 +6907,8 @@ mod tests {
     fn typing_a_slash_opens_the_popup_and_narrows_as_you_type() {
         let mut s = with_skills(&[("refactor", "refactor a module")]);
         type_str(&mut s, "/");
-        // Fourteen built-ins plus the one skill.
-        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(15));
+        // Fifteen built-ins plus the one skill.
+        assert_eq!(s.completion.as_ref().map(|c| c.matches.len()), Some(16));
         type_str(&mut s, "re");
         assert_eq!(selected(&s), "reload");
         // `reload`, `rename` and `review` prefix-match, then the `refactor`

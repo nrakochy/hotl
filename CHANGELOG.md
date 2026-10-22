@@ -45,6 +45,11 @@ semver promise of their own.
   `x-request-id`), an HTTP error's text ends with `(request-id …)`, and each
   sample's `usage` log entry records the id — what a support ticket wants.
 
+- **`/btw <question>`: a side question that is not remembered.** The model
+  answers over the same cached prefix the turn uses (one extra sample at
+  cache-read prices), the answer lands as a muted card, and nothing enters
+  the transcript or the log beyond the spend. Works mid-turn; a tool call
+  the aside wanted is reported, never run. ACP: `session/aside`.
 - **Auto session titles.** After the first completed turn of an unnamed
   console session, a ~50-token call on the utility model names it in at most
   six words. The `-r` picker shows it as `<title> (auto)`, the badge and

@@ -887,6 +887,23 @@ async fn handle_request(
         // What currently fills the context window, by source. A read: it
         // appends nothing and publishes nothing, so unlike `reload_config`
         // there is no idle guard and no session rebuild.
+        // `/btw` (0071 T5): ack, then the engine broadcasts `aside_result`
+        // (or `aside_failed`) through the update stream like any event.
+        "session/aside" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "session/aside requires an open session").await;
+            };
+            let Some(question) = msg
+                .pointer("/params/question")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|q| !q.is_empty())
+            else {
+                return reply_err(writer, id, "session/aside requires params.question").await;
+            };
+            state.handle.aside(question.to_string()).await;
+            reply_ok(writer, id, json!({"ok": true})).await;
+        }
         "session/context" => {
             let Some(state) = session.as_ref() else {
                 return reply_err(writer, id, "session/context requires an open session").await;

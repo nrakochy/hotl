@@ -218,6 +218,14 @@ pub fn update_frame(event: &EngineEvent) -> Option<Value> {
             }
             v
         }
+        EngineEvent::AsideDone {
+            question,
+            text,
+            usage,
+        } => json!({"type": "aside_result", "question": question, "text": text, "usage": usage}),
+        EngineEvent::AsideFailed { question, reason } => {
+            json!({"type": "aside_failed", "question": question, "reason": reason})
+        }
         // `usage` is the goal loop's cumulative spend, the evaluator's own
         // calls included — the raw `TokenUsage` shape, not `usage_frame`'s:
         // `update_frame` has no session model to price it with, and the
@@ -273,6 +281,7 @@ fn retry_scope_tag(scope: hotl_engine::RetryScope) -> &'static str {
         hotl_engine::RetryScope::Summarize => "summarize",
         hotl_engine::RetryScope::GoalEval => "goal_eval",
         hotl_engine::RetryScope::Title => "title",
+        hotl_engine::RetryScope::Aside => "aside",
     }
 }
 

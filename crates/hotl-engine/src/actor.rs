@@ -33,6 +33,8 @@ const TITLE_MAX_TOKENS: u32 = 24;
 const TITLE_SYSTEM: &str = "Name this conversation in at most six words. Output only the name.";
 /// Bytes of the first prompt and the first answer shown to the titler.
 const TITLE_EXCERPT_BYTES: usize = 2 * 1024;
+/// Wall-clock bound on a `/btw` aside (0071 T5).
+const ASIDE_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 /// Compactions without an intervening completed sample before giving up —
 /// prevents a fold-the-digest spiral when the tail alone overflows.
 /// INVARIANT: a fold with progress behind it never draws down this cap.
@@ -1313,6 +1315,35 @@ pub(crate) async fn run(
                     )
                     .await;
             }
+            SessionCmd::Aside { question } => {
+                spawn_aside(&shared, &cmd_tx, &events, &head, question);
+            }
+            SessionCmd::AsideResult { question, result } => {
+                // Log-only spend: replay drops `Usage`, no `Item` is written,
+                // so compaction and replay never see the aside.
+                let event = match result {
+                    Ok((text, usage)) => {
+                        let _ = shared
+                            .append(
+                                &mut log,
+                                &mut pipeline,
+                                &mut head,
+                                EntryPayload::Usage {
+                                    usage,
+                                    request_id: None,
+                                },
+                            )
+                            .await;
+                        EngineEvent::AsideDone {
+                            question,
+                            text,
+                            usage,
+                        }
+                    }
+                    Err(reason) => EngineEvent::AsideFailed { question, reason },
+                };
+                let _ = events.send(event).await;
+            }
             SessionCmd::SetTitle { title: t, usage } => {
                 // A name that landed meanwhile outranks the title: the entry
                 // is not written, the spend is still reported.
@@ -1697,6 +1728,143 @@ fn title_material(items: &[Arc<Item>]) -> Option<String> {
         }
     }
     None
+}
+
+/// The roster the turn would advertise right now — the aside carries it so
+/// its request is the same cached prefix, and refuses to run any of it.
+fn current_tool_defs(shared: &SharedDeps) -> Arc<[ToolDef]> {
+    if shared.effective_wrapup() {
+        shared
+            .registry
+            .filtered(|t| t.read_only() || t.name() == "report_result")
+            .defs()
+            .into()
+    } else if shared.effective_plan() {
+        shared.registry.without_edit_tools().defs().into()
+    } else {
+        shared.registry.without_plan_tools().defs().into()
+    }
+}
+
+/// `/btw` (0071 T5): one sample over the turn's exact request plus the
+/// question on the ephemeral tail. The durable prefix is byte-identical by
+/// construction, so the whole history is cache-read priced. Detached: the
+/// loop stays responsive, and the answer comes back as `AsideResult`.
+fn spawn_aside(
+    shared: &Arc<SharedDeps>,
+    cmd_tx: &mpsc::WeakSender<SessionCmd>,
+    events: &mpsc::Sender<EngineEvent>,
+    head: &Head,
+    question: String,
+) {
+    let snapshot = head.snapshot();
+    let mut tail: Vec<Arc<Item>> = (*snapshot.tail).clone();
+    tail.push(Arc::new(Item::User {
+        text: format!(
+            "<aside>Side question from the operator. Answer briefly. This exchange is not \
+             part of the task and will not be remembered.\n{question}</aside>"
+        ),
+        synthetic: None,
+        images: Vec::new(),
+    }));
+    let request = SamplingRequest {
+        // The session model, not the utility one: the point is the cached
+        // prefix, and only the session model has it.
+        model: shared.config.model.clone(),
+        max_tokens: shared.config.max_tokens,
+        system: Arc::clone(&shared.system),
+        items: Arc::clone(&snapshot.durable),
+        ephemeral_tail: Arc::new(tail),
+        tools: current_tool_defs(shared),
+        thinking: false,
+        effort: None,
+        cache: if shared.config.cache_static {
+            hotl_provider::CachePolicy::Static {
+                prefix_ttl: shared.config.cache_ttl,
+            }
+        } else {
+            hotl_provider::CachePolicy::Off
+        },
+        turn_context: None,
+        cache_key: Some(Arc::clone(&shared.session_id)),
+    };
+    let shared = Arc::clone(shared);
+    let cmd_tx = cmd_tx.clone();
+    let events = events.clone();
+    tokio::spawn(async move {
+        let result = match tokio::time::timeout(
+            ASIDE_BOUND,
+            aside_sample(&shared, request, &events),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "the aside took longer than {}s and was dropped",
+                ASIDE_BOUND.as_secs()
+            )),
+        };
+        if let Some(tx) = cmd_tx.upgrade() {
+            let _ = tx.send(SessionCmd::AsideResult { question, result }).await;
+        }
+    });
+}
+
+/// One aside sample. A `tool_use` stop is reported, never run — an aside has
+/// no permission context.
+async fn aside_sample(
+    shared: &SharedDeps,
+    request: SamplingRequest,
+    events: &mpsc::Sender<EngineEvent>,
+) -> Result<(String, TokenUsage), String> {
+    let mut stream = shared.provider.stream(request);
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::Completed {
+                stop,
+                blocks,
+                usage,
+            }) => {
+                let mut text = assistant_text(&blocks);
+                if stop == hotl_types::StopReason::ToolUse {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(
+                        "(the aside wanted to run a tool — asides can't; ask in the main prompt)",
+                    );
+                }
+                return Ok((text, usage));
+            }
+            Ok(StreamEvent::Retrying {
+                attempt,
+                max,
+                reason,
+                delay_ms,
+                status,
+                request_id,
+            }) => {
+                let _ = events
+                    .send(EngineEvent::Retrying {
+                        attempt,
+                        max,
+                        reason,
+                        delay_ms,
+                        status,
+                        request_id,
+                        scope: crate::RetryScope::Aside,
+                        discarded_partial: false,
+                    })
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                crate::turn::drain_to_end(&mut stream).await;
+                return Err(e.to_string());
+            }
+        }
+    }
+    Err("the aside's stream ended without an answer".into())
 }
 
 /// Spawn the one auto-title call after the first completed turn, detached

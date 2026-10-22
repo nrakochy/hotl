@@ -828,6 +828,102 @@ async fn session_context_returns_an_ack_and_broadcasts_a_report() {
     assert!(system["tokens"].as_u64().expect("u64") > 0);
 }
 
+/// 0071 T5: `session/aside` acks thinly; the engine broadcasts the answer.
+#[tokio::test]
+async fn session_aside_acks_then_broadcasts_the_answer() {
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    let (sread, swrite) = tokio::io::split(server);
+    let factory: acp::SessionFactory = Box::new(move |_spec| {
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        let provider = Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
+            "it returns a Result",
+        )]));
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig::default(),
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            session_id,
+            warnings: Vec::new(),
+            title: None,
+        })
+    });
+    tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
+    let (cread, mut cwrite) = tokio::io::split(client);
+    let mut lines = BufReader::new(cread).lines();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":1,"method":"session/aside","params":{"question":"x"}}),
+    )
+    .await;
+    assert!(
+        next(&mut lines).await["error"].is_object(),
+        "no session yet"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":2,"method":"initialize"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":3,"method":"session/new"}),
+    )
+    .await;
+    next(&mut lines).await;
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/aside","params":{"question":"  "}}),
+    )
+    .await;
+    assert!(
+        next(&mut lines).await["error"].is_object(),
+        "an empty question"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/aside","params":{"question":"what does it return?"}}),
+    )
+    .await;
+    let ack = next(&mut lines).await;
+    assert_eq!(ack["result"]["ok"], true);
+    let answer = next_matching(&mut lines, |m| {
+        m["params"]["update"]["type"] == "aside_result"
+    })
+    .await;
+    assert_eq!(
+        answer["params"]["update"]["question"],
+        "what does it return?"
+    );
+    assert_eq!(answer["params"]["update"]["text"], "it returns a Result");
+    assert_eq!(answer["params"]["update"]["usage"]["input_tokens"], 10);
+}
+
 #[tokio::test]
 async fn session_context_without_a_session_is_an_error() {
     let (client, server) = tokio::io::duplex(64 * 1024);
