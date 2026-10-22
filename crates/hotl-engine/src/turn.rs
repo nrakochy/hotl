@@ -561,7 +561,8 @@ fn spawn_speculation(
     snapshot: &Arc<Vec<Arc<Item>>>,
     cancel: &CancellationToken,
 ) -> Option<tokio::task::JoinHandle<Option<crate::SpecDigest>>> {
-    let tail_budget = (shared.config.context_window as f64 * crate::actor::TAIL_RATIO) as u64;
+    let tail_budget =
+        (shared.active().profile.context_window as f64 * crate::actor::TAIL_RATIO) as u64;
     let plan = hotl_context::compaction::plan(snapshot, tail_budget, hotl_types::IMAGE_B64_BUDGET)?;
     let shared = Arc::clone(shared);
     let snapshot = Arc::clone(snapshot);
@@ -814,6 +815,9 @@ struct Turn {
     tool_defs_plan: Arc<[ToolDef]>,
     /// The wrap-up roster (0058 T8): reads plus `report_result`, nothing else.
     tool_defs_wrapup: Arc<[ToolDef]>,
+    /// The model, provider and profile this turn runs on, taken once at
+    /// `new` (0067): a `/model` switch never reaches a running turn.
+    active: Arc<crate::actor::ActiveModel>,
     models: Vec<String>,
     model_idx: usize,
     /// The trailing tool-call signatures the doom-loop detector reads —
@@ -926,10 +930,14 @@ impl Turn {
         cancel: CancellationToken,
         cont: crate::TurnContinuation,
     ) -> Self {
-        // `models` is rebuilt from config — only the *index* carries, so a
-        // config change between folds is still honored.
-        let mut models = vec![shared.config.model.clone()];
-        models.extend(shared.config.fallback_models.iter().cloned());
+        // The turn pins the model it starts on (0067): `models` is rebuilt
+        // from the active model — only the *index* carries. The fallback
+        // chain is the startup dialect's; a cross-dialect switch drops it.
+        let active = shared.active();
+        let mut models = vec![active.model.clone()];
+        if !active.dialect_changed {
+            models.extend(shared.config.fallback_models.iter().cloned());
+        }
         let head = shared.head();
         let started_ms = shared.clock.now_ms();
         Self {
@@ -941,6 +949,7 @@ impl Turn {
                 .defs()
                 .into(),
             shared,
+            active,
             cmd_tx,
             events,
             cancel,
@@ -1296,7 +1305,7 @@ impl Turn {
                     Ok(request) => request,
                     Err(end) => return end,
                 };
-                self.shared.provider.stream(request)
+                self.active.provider.stream(request)
             }
         };
         self.ledger.stamp(Phase::RequestBuilt);
@@ -1344,7 +1353,7 @@ impl Turn {
                         Ok(request) => request,
                         Err(end) => return end,
                     };
-                    stream = self.shared.provider.stream(request);
+                    stream = self.active.provider.stream(request);
                     attempt = failed + 1;
                 }
                 Err(end) => return end,
@@ -2290,7 +2299,7 @@ impl Turn {
         &mut self,
         snapshot: &crate::actor::Snapshot,
     ) -> Result<SamplingRequest, SampleEnd> {
-        let window = self.shared.config.context_window.max(1);
+        let window = self.active.profile.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
         let image_bytes = hotl_context::tokens::image_b64_bytes(&snapshot.durable);
         // The ladder, cheapest first: clearing costs no model call and no
@@ -2343,7 +2352,7 @@ impl Turn {
         let info = hotl_provider::catalog::lookup(&self.models[self.model_idx])?;
         let projected = self.shared.spent_usd()
             + (estimate as f64 * info.input_usd_per_mtok
-                + self.shared.config.max_tokens as f64 * info.output_usd_per_mtok)
+                + self.active.profile.max_tokens as f64 * info.output_usd_per_mtok)
                 / 1_000_000.0;
         (projected > cap).then(|| (self.shared.spent_usd(), cap))
     }
@@ -2358,7 +2367,7 @@ impl Turn {
         estimate: u64,
         image_bytes: usize,
     ) {
-        let window = self.shared.config.context_window.max(1);
+        let window = self.active.profile.context_window.max(1);
         if self.speculation.is_none()
             && !self.shared.config.compaction_reset
             && should_speculate(estimate, window, image_bytes)
@@ -2386,7 +2395,7 @@ impl Turn {
     /// Deliberately does NOT fire the speculative *compaction* digest: that
     /// is `build_request`'s, once, on the sequential path.
     fn speculative_request(&self, snapshot: &crate::actor::Snapshot) -> Option<SamplingRequest> {
-        let window = self.shared.config.context_window.max(1);
+        let window = self.active.profile.context_window.max(1);
         let estimate = self.estimate_tokens(snapshot);
         // A speculative sample spends real money: the cost cap applies to it
         // exactly as to the sequential build. Declining to speculate is all
@@ -2424,7 +2433,7 @@ impl Turn {
         estimate: u64,
         sample_no: u32,
     ) -> SamplingRequest {
-        let window = self.shared.config.context_window.max(1);
+        let window = self.active.profile.context_window.max(1);
         let used_pct = self
             .shared
             .config
@@ -2452,7 +2461,7 @@ impl Turn {
         );
         SamplingRequest {
             model: self.models[self.model_idx].clone(),
-            max_tokens: self.shared.config.max_tokens,
+            max_tokens: self.active.profile.max_tokens,
             system: Arc::clone(&self.shared.system),
             items: Arc::clone(&snapshot.durable),
             ephemeral_tail: Arc::clone(&snapshot.tail),
@@ -2644,7 +2653,7 @@ impl Turn {
     /// `tail` are equal by construction. The totals are identical to what a
     /// flat snapshot produced.
     fn estimate_tokens(&self, snapshot: &crate::actor::Snapshot) -> u64 {
-        let profile = &self.shared.config.token_profile;
+        let profile = &self.active.profile.token_profile;
         anchored_estimate(
             self.anchor,
             self.shared.system_estimate,
@@ -2707,7 +2716,7 @@ impl Turn {
         }
         if hotl_context::tokens::estimate_text_with(
             &outcome.content,
-            &self.shared.config.token_profile,
+            &self.active.profile.token_profile,
         ) <= threshold
         {
             return;
@@ -2879,7 +2888,7 @@ impl Turn {
         let Some(request) = self.speculative_request(&predicted) else {
             return;
         };
-        let stream = self.shared.provider.stream(request);
+        let stream = self.active.provider.stream(request);
         self.speculative = Some(Speculation {
             expected_leaf,
             stream: SyncStream::new(stream),
@@ -2914,7 +2923,7 @@ impl Turn {
                     .map(|i| {
                         hotl_context::tokens::estimate_item_with(
                             i,
-                            &self.shared.config.token_profile,
+                            &self.active.profile.token_profile,
                         )
                     })
                     .sum::<u64>(),

@@ -746,6 +746,50 @@ impl std::fmt::Debug for EngineEvent {
     }
 }
 
+/// Everything `engine_config` derives from the model name, so startup and a
+/// `/model` switch share one derivation (0067).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelProfile {
+    pub context_window: u64,
+    pub max_tokens: u32,
+    pub token_profile: hotl_context::TokenProfile,
+}
+
+impl ModelProfile {
+    /// The startup value: what the config already resolved for its model.
+    pub fn from_config(config: &EngineConfig) -> Self {
+        Self {
+            context_window: config.context_window,
+            max_tokens: config.max_tokens,
+            token_profile: config.token_profile,
+        }
+    }
+}
+
+/// What a `/model` switch carries (0067). Built outside the engine — the
+/// engine cannot construct providers — and only installed by it.
+pub struct ModelSwitch {
+    /// `provider/model`, normalized — what the log records.
+    pub spec: String,
+    /// The bare model the wire sees (`req.model`).
+    pub model: String,
+    /// `Some` only when the dialect changes; `None` keeps the running
+    /// provider (and its warm pool and one-shot probe latches).
+    pub provider: Option<Arc<dyn Provider>>,
+    pub profile: ModelProfile,
+}
+
+impl std::fmt::Debug for ModelSwitch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelSwitch")
+            .field("spec", &self.spec)
+            .field("model", &self.model)
+            .field("provider", &self.provider.is_some())
+            .field("profile", &self.profile)
+            .finish()
+    }
+}
+
 /// How the actor took a human fold request (`/compact`, `session/fold`; 0066).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoldAdmission {

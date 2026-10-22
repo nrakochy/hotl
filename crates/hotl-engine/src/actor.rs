@@ -622,8 +622,27 @@ fn apply_ack(
 
 /// Dependencies shared with turn tasks. The log is *not* here: only the actor
 /// loop writes it, so it lives as a local in [`run`].
-pub(crate) struct SharedDeps {
+/// The model a session is running right now (0067): model, provider, window,
+/// output cap and tokenizer profile change together or not at all. A turn
+/// takes the `Arc` once, so "a switch lands on a turn boundary" is a property
+/// of the type, not discipline at twenty read sites.
+pub(crate) struct ActiveModel {
+    /// `provider/model` as the log records it (`== model` at startup; the
+    /// engine does not know the provider name).
+    #[allow(dead_code)] // read by the switch (0067 T3)
+    pub spec: String,
+    pub model: String,
     pub provider: Arc<dyn Provider>,
+    pub profile: crate::ModelProfile,
+    /// The startup dialect is gone: the fallback chain and the housekeeping
+    /// model names belonged to it.
+    pub dialect_changed: bool,
+}
+
+pub(crate) struct SharedDeps {
+    /// The one thing every model read goes through. A `RwLock` held for a
+    /// pointer copy — no new crate.
+    active: std::sync::RwLock<Arc<ActiveModel>>,
     pub registry: Arc<Registry>,
     pub rules: Arc<Rules>,
     /// The session's *current effective* permission mode — separate from
@@ -801,8 +820,15 @@ impl SharedDeps {
         let session_id: Arc<str> = deps.log.session_id.as_str().into();
         let system: Arc<str> = deps.system.into();
         let system_estimate = tokens::estimate_text_with(&system, &deps.config.token_profile);
-        let shared = Self {
+        let active = Arc::new(ActiveModel {
+            spec: deps.config.model.clone(),
+            model: deps.config.model.clone(),
             provider: deps.provider,
+            profile: crate::ModelProfile::from_config(&deps.config),
+            dialect_changed: false,
+        });
+        let shared = Self {
+            active: std::sync::RwLock::new(active),
             registry: deps.registry,
             rules: deps.rules,
             mode,
@@ -901,6 +927,39 @@ impl SharedDeps {
         let mode = hotl_tools::rules::enforced_mode(mode);
         self.mode.store(mode_to_u8(mode), Ordering::Relaxed);
         mode
+    }
+
+    /// The active model, provider and profile (0067): a pointer copy.
+    pub(crate) fn active(&self) -> Arc<ActiveModel> {
+        Arc::clone(
+            &self
+                .active
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Install a switched model (0067). The turn that is running keeps its
+    /// own `Arc`; the next `Turn::new` reads this one.
+    #[allow(dead_code)] // called by the switch (0067 T3)
+    pub(crate) fn set_active(&self, next: Arc<ActiveModel>) {
+        *self
+            .active
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+    }
+
+    /// The model a one-off call takes. Same dialect: `utility_model` →
+    /// `fast_model` → the session model, as configured. After a
+    /// cross-dialect switch: the active session model — the configured names
+    /// belong to the startup provider (0067 decision 7).
+    pub(crate) fn housekeeping_model(&self) -> String {
+        let active = self.active();
+        if active.dialect_changed {
+            active.model.clone()
+        } else {
+            self.config.utility()
+        }
     }
 
     /// Plan mode right now — the second axis `evaluate` gates against.
@@ -1553,13 +1612,14 @@ pub(crate) async fn run(
                 // The one arm that reads and returns. No append, no publish,
                 // no `.await` — that is what makes `/context` safe mid-turn.
                 let snap = head.snapshot();
+                let active = shared.active();
                 let _ = reply.send(hotl_context::breakdown::breakdown(
                     &shared.system,
-                    tool_tokens(&shared.registry, &shared.config.token_profile),
+                    tool_tokens(&shared.registry, &active.profile.token_profile),
                     &snap.durable,
                     &snap.tail,
-                    shared.config.context_window,
-                    &shared.config.token_profile,
+                    active.profile.context_window,
+                    &active.profile.token_profile,
                 ));
             }
             SessionCmd::Propose { entries, reply } => {
@@ -1841,7 +1901,7 @@ fn spawn_aside(
         // The session model, not the utility one: the point is the cached
         // prefix, and only the session model has it.
         model: shared.config.model.clone(),
-        max_tokens: shared.config.max_tokens,
+        max_tokens: shared.active().profile.max_tokens,
         system: Arc::clone(&shared.system),
         items: Arc::clone(&snapshot.durable),
         ephemeral_tail: Arc::new(tail),
@@ -1887,7 +1947,7 @@ async fn aside_sample(
     request: SamplingRequest,
     events: &mpsc::Sender<EngineEvent>,
 ) -> Result<(String, TokenUsage), String> {
-    let mut stream = shared.provider.stream(request);
+    let mut stream = shared.active().provider.stream(request);
     while let Some(event) = stream.next().await {
         match event {
             Ok(StreamEvent::Completed {
@@ -1944,7 +2004,7 @@ fn spawn_title(shared: &Arc<SharedDeps>, cmd_tx: &mpsc::WeakSender<SessionCmd>, 
         return;
     };
     let request = SamplingRequest {
-        model: shared.config.utility(),
+        model: shared.housekeeping_model(),
         max_tokens: TITLE_MAX_TOKENS,
         system: TITLE_SYSTEM.into(),
         items: Arc::new(vec![Arc::new(Item::User {
@@ -3174,7 +3234,7 @@ async fn compact(
             }
         }
     }
-    let tail_budget = (shared.config.context_window as f64 * TAIL_RATIO) as u64;
+    let tail_budget = (shared.active().profile.context_window as f64 * TAIL_RATIO) as u64;
     let Some(plan) = compaction::plan(head.items(), tail_budget, hotl_types::IMAGE_B64_BUDGET)
     else {
         return Err("context window exhausted — nothing left to compact".into());
@@ -3264,7 +3324,7 @@ async fn pre_compact_pins(
                 folded_ids,
                 kept_from: plan.kept_from,
                 estimate_pct: ((head.estimated.saturating_mul(100)
-                    / shared.config.context_window.max(1))
+                    / shared.active().profile.context_window.max(1))
                 .min(100)) as u8,
                 focus: focus.map(str::to_owned),
             };
@@ -3311,7 +3371,7 @@ pub(crate) async fn summarize(
     // A human fold's focus (0066); the ladder and the speculation pass `None`.
     focus: Option<&str>,
 ) -> (Option<String>, TokenUsage) {
-    let model = shared.config.utility();
+    let model = shared.housekeeping_model();
     let request = SamplingRequest {
         model,
         max_tokens: SUMMARIZE_MAX_TOKENS,
@@ -3341,7 +3401,7 @@ pub(crate) async fn summarize(
     };
     let mut spent = TokenUsage::default();
     for _ in 0..SUMMARIZE_ATTEMPTS {
-        let mut stream = shared.provider.stream(request.clone());
+        let mut stream = shared.active().provider.stream(request.clone());
         let mut text: Option<String> = None;
         while let Some(event) = stream.next().await {
             match event {
@@ -3406,7 +3466,7 @@ pub(crate) async fn one_shot_text(
 ) -> (Option<String>, TokenUsage) {
     let mut spent = TokenUsage::default();
     for _ in 0..SUMMARIZE_ATTEMPTS {
-        let mut stream = shared.provider.stream(request.clone());
+        let mut stream = shared.active().provider.stream(request.clone());
         let mut text: Option<String> = None;
         while let Some(event) = stream.next().await {
             match event {
@@ -3463,7 +3523,7 @@ async fn evaluate_goal(
     evidence: &[hotl_context::goal::EvidenceLine],
     events: &mpsc::Sender<EngineEvent>,
 ) -> (Option<(GoalVerdict, String)>, TokenUsage) {
-    let model = shared.config.utility();
+    let model = shared.housekeeping_model();
     let request = SamplingRequest {
         model,
         max_tokens: GOAL_EVAL_MAX_TOKENS,
@@ -3488,7 +3548,7 @@ async fn evaluate_goal(
     // attempt counts even when the reply is unparseable (0051 decision 6).
     let mut spent = TokenUsage::default();
     for _ in 0..GOAL_EVAL_ATTEMPTS {
-        let mut stream = shared.provider.stream(request.clone());
+        let mut stream = shared.active().provider.stream(request.clone());
         let mut text: Option<String> = None;
         while let Some(event) = stream.next().await {
             match event {
