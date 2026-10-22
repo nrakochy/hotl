@@ -1636,6 +1636,72 @@ pub(crate) fn resolve_switch(
     ))
 }
 
+/// Validates `[provider] fallback_models` against the session model: at most
+/// two kept, all on the session's provider, bare names, no duplicates. Every
+/// problem is a warning; the chain is trimmed, never refused.
+fn fallback_chain(
+    raw: &[String],
+    session_provider: &str,
+    session_model: &str,
+    warnings: &mut Vec<String>,
+) -> Vec<String> {
+    let session_info = hotl_provider::catalog::lookup(session_model);
+    let mut chain: Vec<String> = Vec::new();
+    for entry in raw {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        let bare = match entry.split_once('/') {
+            Some((p, m)) => {
+                let p = match p.to_ascii_lowercase().as_str() {
+                    "oai" => "openai".to_string(),
+                    other => other.to_string(),
+                };
+                if p != session_provider {
+                    warnings.push(format!(
+                        "fallback `{entry}` is on another provider; fallbacks run on the \
+                         session's provider"
+                    ));
+                    continue;
+                }
+                m
+            }
+            None => entry,
+        };
+        if bare == session_model || chain.iter().any(|m| m == bare) {
+            continue;
+        }
+        if chain.len() == 2 {
+            warnings.push(
+                "fallback_models: keeping the first two (chains are ≤3 models, \
+                 docs/RELIABILITY.md)"
+                    .to_string(),
+            );
+            break;
+        }
+        if let Some(session) = session_info {
+            match hotl_provider::catalog::lookup(bare) {
+                None => warnings.push(format!(
+                    "fallback `{bare}` is not in the catalog: no price, and the {}-token \
+                     window fallback applies if it is reached",
+                    hotl_provider::catalog::FALLBACK_CONTEXT_WINDOW
+                )),
+                Some(info) if info.context_window < session.context_window => {
+                    warnings.push(format!(
+                        "fallback `{bare}` has a {}-token window, narrower than the session \
+                         model's {}; compaction is sized to the session model",
+                        info.context_window, session.context_window
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        chain.push(bare.to_string());
+    }
+    chain
+}
+
 /// The `session/set_model` resolver the ACP server is handed (0067): reads
 /// `config.toml` and the environment at call time, like `reload_hook`.
 pub(crate) fn model_resolver() -> crate::acp::ModelResolver {
@@ -3817,6 +3883,12 @@ fn engine_config(
     config.utility_model = secrets
         .get("HOTL_UTILITY_MODEL")
         .or_else(|| cfg.provider.utility_model.clone());
+    // `[provider] fallback_models` (0067 T7): validated, never refused. Config
+    // only — the owner declined an env twin.
+    if let Some(raw) = &cfg.provider.fallback_models {
+        let (session_provider, _) = selected_model(cfg, secrets);
+        config.fallback_models = fallback_chain(raw, &session_provider, model, &mut warnings);
+    }
     if let Some(t) = secrets
         .get("HOTL_EVICT_TOKENS")
         .and_then(|v| v.parse().ok())
@@ -6646,6 +6718,112 @@ mod tests {
                 .0
                 .context_window,
             50_000
+        );
+    }
+
+    fn chain_for(model_line: &str, fallbacks: &str) -> (Vec<String>, Vec<String>) {
+        let cfg = config_from_toml(&format!(
+            "[provider]\n{model_line}\nfallback_models = {fallbacks}\n"
+        ));
+        let (_, bare) = selected_model(&cfg, &MapSecrets::default());
+        let (config, warnings) = engine_config(&bare, &MapSecrets::default(), &cfg);
+        (config.fallback_models, warnings)
+    }
+
+    #[test]
+    fn fallback_models_parse_from_the_provider_table() {
+        let (chain, warnings) = chain_for(
+            "model = \"anthropic/claude-opus-5\"",
+            "[\"claude-sonnet-5\", \"claude-opus-4-8\"]",
+        );
+        assert_eq!(chain, vec!["claude-sonnet-5", "claude-opus-4-8"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        // Absent key: the chain stays empty, as before 0067.
+        let cfg = config_from_toml("[provider]\nmodel = \"anthropic/claude-opus-5\"\n");
+        let (config, _) = engine_config("claude-opus-5", &MapSecrets::default(), &cfg);
+        assert!(config.fallback_models.is_empty());
+    }
+
+    #[test]
+    fn a_fourth_fallback_is_dropped_with_a_warning() {
+        let (chain, warnings) = chain_for(
+            "model = \"anthropic/claude-opus-5\"",
+            "[\"claude-sonnet-5\", \"claude-opus-4-8\", \"claude-opus-4-7\"]",
+        );
+        assert_eq!(chain, vec!["claude-sonnet-5", "claude-opus-4-8"]);
+        assert!(
+            warnings.iter().any(|w| w.contains("keeping the first two")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_fallback_on_another_provider_is_dropped_with_a_warning() {
+        let (chain, warnings) = chain_for(
+            "model = \"anthropic/claude-opus-5\"",
+            "[\"openai/gpt-5\", \"claude-sonnet-5\"]",
+        );
+        assert_eq!(chain, vec!["claude-sonnet-5"]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`openai/gpt-5` is on another provider")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_same_provider_prefix_is_stripped() {
+        // `req.model` wants the bare name; the session model and a duplicate
+        // are dropped without a word.
+        let (chain, warnings) = chain_for(
+            "model = \"anthropic/claude-opus-5\"",
+            "[\"anthropic/claude-sonnet-5\", \"claude-opus-5\", \"claude-sonnet-5\"]",
+        );
+        assert_eq!(chain, vec!["claude-sonnet-5"]);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn an_uncatalogued_fallback_under_a_catalogued_session_warns() {
+        let (chain, warnings) = chain_for(
+            "model = \"anthropic/claude-opus-5\"",
+            "[\"claude-mystery-9\"]",
+        );
+        assert_eq!(chain, vec!["claude-mystery-9"]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("`claude-mystery-9` is not in the catalog")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn a_narrower_fallback_window_warns() {
+        let (chain, warnings) = chain_for(
+            "model = \"anthropic/claude-opus-5\"",
+            "[\"claude-haiku-4-5\"]",
+        );
+        assert_eq!(chain, vec!["claude-haiku-4-5"]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("narrower than the session model")),
+            "{warnings:?}"
+        );
+    }
+
+    #[test]
+    fn an_uncatalogued_session_gets_no_catalog_warning() {
+        let (chain, warnings) = chain_for(
+            "model = \"openai/gpt-5\"",
+            "[\"gpt-5-mini\", \"oai/gpt-4-1\"]",
+        );
+        assert_eq!(chain, vec!["gpt-5-mini", "gpt-4-1"]);
+        assert!(
+            !warnings.iter().any(|w| w.contains("fallback")),
+            "{warnings:?}"
         );
     }
 

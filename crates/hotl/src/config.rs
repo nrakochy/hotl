@@ -428,6 +428,11 @@ pub struct ProviderCfg {
     /// shows: compaction digests and goal evaluations. Absent = `fast_model`,
     /// then the session model.
     pub utility_model: Option<String>,
+    /// Availability-only fallbacks, tried in order when the session model is
+    /// unreachable (never on auth or billing errors). At most two — three
+    /// models in all. Bare names on the session's provider; a `provider/`
+    /// prefix must match it. Config only: no env twin.
+    pub fallback_models: Option<Vec<String>>,
     /// Reasoning depth: either one rung (`low | medium | high | xhigh | max`)
     /// or a per-phase table (`{ plan = "xhigh", implement = "high" }`).
     /// Absent = the provider's default. Text, not a typed enum: an
