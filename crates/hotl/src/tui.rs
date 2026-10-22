@@ -1045,6 +1045,8 @@ pub(crate) struct RawTuiArgs {
     pub fork_from: Option<String>,
     pub keep: Option<usize>,
     pub keep_turns: Option<usize>,
+    /// `--search <text>`: show only sessions whose transcript mentions it.
+    pub search: Option<String>,
 }
 
 /// The console's argument surface: `[id-prefix]`, `-r/--resume [arg]`,
@@ -1072,6 +1074,7 @@ fn parse_tui_flags(args: &[String]) -> Result<RawTuiArgs, String> {
                 _ => out.resume_bare = true,
             },
             "--fork-from" => out.fork_from = Some(value(&mut it, "--fork-from")?),
+            "--search" => out.search = Some(value(&mut it, "--search")?),
             "--keep" => out.keep = Some(count(&value(&mut it, "--keep")?, "--keep")?),
             "--keep-turns" => {
                 out.keep_turns = Some(count(&value(&mut it, "--keep-turns")?, "--keep-turns")?)
@@ -1104,6 +1107,9 @@ fn parse_tui_flags(args: &[String]) -> Result<RawTuiArgs, String> {
         out.keep,
         out.keep_turns,
     )?;
+    if out.search.is_some() && !out.resume_bare {
+        return Err("`--search` filters the resume picker; it needs a bare `-r`".to_string());
+    }
     Ok(out)
 }
 
@@ -1155,12 +1161,13 @@ fn parse_tui_args(args: &[String]) -> Result<TuiArgs, i32> {
         fork_from,
         keep,
         keep_turns,
+        search,
     } = raw;
     let sessions = newest_first();
     let spec = match spec {
         Some(arg) if spec_is_positional => Some(by_prefix(&arg)?),
         Some(arg) => Some(resolve_session_arg(&arg, &sessions)?),
-        None if resume_bare => Some(pick_session()?),
+        None if resume_bare => Some(pick_session(search.as_deref())?),
         None => None,
     };
     let fork_from = match fork_from {
@@ -1231,15 +1238,66 @@ fn newest_first() -> Vec<(String, PathBuf, SystemTime)> {
     crate::agent::sessions_newest_first(&crate::agent::sessions_dir())
 }
 
-/// Plain pre-TUI list prompt (the in-TUI picker is a v1 cut).
-fn pick_session() -> Result<String, i32> {
+/// The sessions whose log mentions `needle`, newest first, each with one
+/// excerpt — the same scan `recall` runs, so the two agree on what a hit is.
+pub(crate) fn filter_sessions(
+    sessions: Vec<(String, PathBuf, SystemTime)>,
+    needle: &str,
+) -> Vec<(String, PathBuf, SystemTime, String)> {
+    let needle = needle.to_lowercase();
+    sessions
+        .into_iter()
+        .filter_map(|(id, path, t)| {
+            let hit = hotl_retrieval::session_log::scan_log(&path, &needle, 1, None)
+                .ok()?
+                .pop()?;
+            Some((id, path, t, hit.2))
+        })
+        .collect()
+}
+
+/// One line of excerpt for the picker, clipped to the terminal width.
+fn excerpt_line(excerpt: &str) -> String {
+    let width = crossterm::terminal::size()
+        .map(|(w, _)| usize::from(w))
+        .unwrap_or(120)
+        .clamp(40, 120)
+        .saturating_sub(8);
+    let flat: String = excerpt.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut cut: String = flat.chars().take(width).collect();
+    if cut.len() < flat.len() {
+        cut.push('…');
+    }
+    cut
+}
+
+/// Plain pre-TUI list prompt (the in-TUI picker is a v1 cut). With a
+/// `search` filter, only matching sessions are listed, each with an excerpt.
+fn pick_session(search: Option<&str>) -> Result<String, i32> {
     let sessions = newest_first();
     if sessions.is_empty() {
         eprintln!("hotl: no sessions to resume");
         return Err(2);
     }
+    let sessions: Vec<(String, PathBuf, SystemTime, Option<String>)> = match search {
+        Some(needle) => {
+            let found = filter_sessions(sessions, needle);
+            if found.is_empty() {
+                eprintln!("hotl: no session mentions `{needle}`");
+                return Err(2);
+            }
+            found
+                .into_iter()
+                .map(|(id, p, t, e)| (id, p, t, Some(e)))
+                .collect()
+        }
+        None => sessions
+            .into_iter()
+            .map(|(id, p, t)| (id, p, t, None))
+            .collect(),
+    };
     eprintln!("pick a session:");
-    for (i, (id, path, t)) in sessions.iter().enumerate().take(20) {
+    for (i, (id, path, t, excerpt)) in sessions.iter().enumerate().take(20) {
         // A header-only first-line read per row — cheap enough for a listing
         // that already stats every file.
         let from = hotl_store::session_parent(path)
@@ -1248,6 +1306,9 @@ fn pick_session() -> Result<String, i32> {
         match hotl_store::session_name(path) {
             Some(name) => eprintln!("  {}) {id}  {name}  {}{from}", i + 1, age(*t)),
             None => eprintln!("  {}) {id}  {}{from}", i + 1, age(*t)),
+        }
+        if let Some(e) = excerpt {
+            eprintln!("      ↪ {}", excerpt_line(e));
         }
     }
     eprint!("> ");
@@ -1673,6 +1734,58 @@ mod tests {
         assert_eq!(args.name.as_deref(), Some("fix-auth"));
         assert_eq!(parse_tui_args(&v(&["-n"])).unwrap_err(), 2);
         assert_eq!(parse_tui_args(&v(&["--name", "   "])).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn search_requires_resume_and_rejects_a_positional() {
+        let err = parse_tui_flags(&v(&["--search", "x"])).unwrap_err();
+        assert!(err.contains("needs a bare `-r`"), "{err}");
+        let err = parse_tui_flags(&v(&["-r", "3", "--search", "x"])).unwrap_err();
+        assert!(err.contains("needs a bare `-r`"), "{err}");
+        let err = parse_tui_flags(&v(&["--fork-from", "a", "--search", "x"])).unwrap_err();
+        assert!(err.contains("needs a bare `-r`"), "{err}");
+        let a = parse_tui_flags(&v(&["-r", "--search", "pelican"])).unwrap();
+        assert!(a.resume_bare);
+        assert_eq!(a.search.as_deref(), Some("pelican"));
+    }
+
+    #[test]
+    fn the_picker_filter_keeps_only_matching_sessions() {
+        use hotl_store::{Masker, SessionLog};
+        let dir = tempfile::tempdir().unwrap();
+        let mut hit = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        hit.append(
+            &hotl_types::EntryPayload::Item {
+                item: hotl_types::Item::User {
+                    text: "remember the word Pelican".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+        let mut miss = SessionLog::create(dir.path(), "m", None, Masker::empty(), 1).unwrap();
+        miss.append(
+            &hotl_types::EntryPayload::Item {
+                item: hotl_types::Item::User {
+                    text: "nothing here".into(),
+                    synthetic: None,
+                    images: Vec::new(),
+                },
+            },
+            2,
+        )
+        .unwrap();
+        let found =
+            super::filter_sessions(crate::agent::sessions_newest_first(dir.path()), "pelican");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, hit.session_id);
+        assert!(found[0].3.contains("Pelican"), "{}", found[0].3);
+        assert!(
+            super::filter_sessions(crate::agent::sessions_newest_first(dir.path()), "heron")
+                .is_empty()
+        );
     }
 
     #[test]

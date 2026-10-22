@@ -122,6 +122,46 @@ fn clip(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// One matching line of a log: `(entry id, ts_ms, excerpt)`.
+pub type ScanHit = (String, u64, String);
+
+/// The scan `recall` and the console's `-r --search` share, so the two can
+/// never disagree about what counts as a hit (or about the recursion guard).
+/// `needle_lower` is already lowercased; newest line first; at most `k`.
+pub fn scan_log(
+    path: &Path,
+    needle_lower: &str,
+    k: usize,
+    cancel: Option<&CancellationToken>,
+) -> std::io::Result<Vec<ScanHit>> {
+    let body = std::fs::read_to_string(path)?;
+    let mut hits = Vec::new();
+    // Newest first: the most recent statement about a thing is the one most
+    // likely still true.
+    for line in body.lines().rev() {
+        if cancel.is_some_and(|c| c.is_cancelled()) {
+            break;
+        }
+        let Ok(entry) = serde_json::from_str::<Entry>(line) else {
+            continue;
+        };
+        let EntryPayload::Item { item } = entry.payload else {
+            continue;
+        };
+        let Some(text) = searchable(&item) else {
+            continue;
+        };
+        if !text.to_lowercase().contains(needle_lower) {
+            continue;
+        }
+        hits.push((entry.id, entry.ts_ms, clip(&text, EXCERPT_CAP).to_string()));
+        if hits.len() >= k {
+            break;
+        }
+    }
+    Ok(hits)
+}
+
 impl Retriever for SessionLogRetriever {
     fn name(&self) -> &str {
         "session-log"
@@ -147,40 +187,24 @@ impl Retriever for SessionLogRetriever {
             if needle.trim().is_empty() {
                 return Err("`query` cannot be empty for the session log.".into());
             }
-            let mut hits = Vec::new();
-            'logs: for (session, path) in self.lineage() {
-                let body = std::fs::read_to_string(&path)
+            let mut hits: Vec<Hit> = Vec::new();
+            for (session, path) in self.lineage() {
+                if cancel.is_cancelled() {
+                    break;
+                }
+                let found = scan_log(&path, &needle, query.k - hits.len(), Some(&cancel))
                     .map_err(|e| format!("read {}: {e}", path.display()))?;
-                // Newest first: the most recent statement about a thing is the
-                // one most likely still true.
-                for line in body.lines().rev() {
-                    if cancel.is_cancelled() {
-                        break 'logs;
-                    }
-                    let Ok(entry) = serde_json::from_str::<Entry>(line) else {
-                        continue;
-                    };
-                    let EntryPayload::Item { item } = entry.payload else {
-                        continue;
-                    };
-                    let Some(text) = searchable(&item) else {
-                        continue;
-                    };
-                    if !text.to_lowercase().contains(&needle) {
-                        continue;
-                    }
-                    hits.push(Hit {
-                        source: SourceRef::Session {
-                            session: session.clone(),
-                            entry: entry.id,
-                        },
-                        excerpt: clip(&text, EXCERPT_CAP).to_string(),
-                        score: None,
-                        indexed_at_unix: Some(entry.ts_ms / 1000),
-                    });
-                    if hits.len() >= query.k {
-                        break 'logs;
-                    }
+                hits.extend(found.into_iter().map(|(entry, ts_ms, excerpt)| Hit {
+                    source: SourceRef::Session {
+                        session: session.clone(),
+                        entry,
+                    },
+                    excerpt,
+                    score: None,
+                    indexed_at_unix: Some(ts_ms / 1000),
+                }));
+                if hits.len() >= query.k {
+                    break;
                 }
             }
             Ok(hits)
@@ -284,6 +308,38 @@ mod tests {
         r.search(&query(text), CancellationToken::new())
             .await
             .expect("search")
+    }
+
+    #[test]
+    fn scan_log_finds_newest_first_and_caps_at_k() {
+        let mut log = Log::new("s", None);
+        let first = log.user("pelican one");
+        let second = log.user("pelican two");
+        let third = log.user("heron");
+        let hits = scan_log(&log.path(), "pelican", 10, None).unwrap();
+        let ids: Vec<&str> = hits.iter().map(|h| h.0.as_str()).collect();
+        assert_eq!(ids, [second.as_str(), first.as_str()]);
+        assert!(hits[0].2.contains("pelican two"));
+        assert_eq!(scan_log(&log.path(), "pelican", 1, None).unwrap().len(), 1);
+        assert!(scan_log(&log.path(), "heron", 5, None).unwrap()[0].0 == third);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(scan_log(&log.path(), "pelican", 10, Some(&cancelled))
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn scan_log_skips_recall_results() {
+        let mut log = Log::new("s", None);
+        log.result(
+            "t1",
+            "<result source=\"recall:session-log\">pelican</result>",
+        );
+        log.result("t2", "a plain pelican");
+        let hits = scan_log(&log.path(), "pelican", 10, None).unwrap();
+        assert_eq!(hits.len(), 1, "{hits:?}");
+        assert!(hits[0].2.contains("t2"));
     }
 
     #[tokio::test]

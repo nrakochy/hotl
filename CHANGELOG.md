@@ -22,6 +22,8 @@ semver promise of their own.
 - **`hotl stats [--days N] [--json]`**: sessions, turns, tool calls, tokens
   and cost across every saved session, by model and by day. Cost reads `—`
   when any session's model is not in the price catalog, never a partial sum.
+- **`hotl -r --search <text>`** shows only the sessions whose transcript
+  mentions the text, with a one-line excerpt, before you pick.
 
 ## [0.28.0] - 2026-09-28
 
