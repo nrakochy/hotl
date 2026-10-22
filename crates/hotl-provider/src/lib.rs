@@ -35,10 +35,19 @@ pub mod timeouts {
     /// server loading model weights can delay headers by a minute.
     pub const HEADERS: Duration = Duration::from_secs(120);
 
-    /// Maximum gap between two SSE chunks once the stream is open. Long
-    /// enough for extended thinking between pings, short enough that a dead
-    /// connection is noticed within a coffee break.
-    pub const STREAM_IDLE: Duration = Duration::from_secs(300);
+    /// Maximum gap between two SSE chunks once the stream is open. Anthropic
+    /// pings every 10–15 s, so 90 s is a dead socket, not a thinking model
+    /// (0071 T2; `[provider] stream_idle_secs` overrides).
+    pub const STREAM_IDLE: Duration = Duration::from_secs(90);
+
+    /// How long an open `thinking` block may go without a delta while pings
+    /// keep the socket alive, before the engine drops the stream and
+    /// re-samples (0071 T2; `[provider] thinking_stall_secs` overrides).
+    pub const THINKING_STALL: Duration = Duration::from_secs(120);
+
+    /// The floor both knobs are clamped to: below it a slow provider reads
+    /// as dead.
+    pub const FLOOR: Duration = Duration::from_secs(15);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -381,6 +390,13 @@ impl futures_util::Stream for ScriptedStream {
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
         match this.script.get(this.pos) {
+            // The hang marker: stay open forever, like a socket that only
+            // pings. Spent, not restored on drop — the watchdog that drops
+            // it must get the next script, as a real retry gets a new socket.
+            Some(Err(ProviderError::Transport(m))) if m == ScriptedProvider::HANG => {
+                this.exhausted = true;
+                std::task::Poll::Pending
+            }
             Some(event) => {
                 this.pos += 1;
                 std::task::Poll::Ready(Some(event.clone()))
@@ -485,6 +501,36 @@ impl ScriptedProvider {
         let mut script = events;
         script.push(Err(err));
         script
+    }
+
+    /// The marker `hang_after` plants: a stream that never yields again and
+    /// never ends.
+    pub const HANG: &'static str = "scripted: hang forever";
+
+    /// A sample that streams `events` and then stays open without another
+    /// byte — the shape a stalled thinking block has (0071 T2).
+    pub fn hang_after(
+        events: Vec<Result<StreamEvent, ProviderError>>,
+    ) -> Vec<Result<StreamEvent, ProviderError>> {
+        let mut script = events;
+        script.push(Err(ProviderError::Transport(Self::HANG.into())));
+        script
+    }
+
+    /// `Started`, a `thinking` block start and one delta — then nothing is
+    /// sealed. Pair with [`Self::hang_after`].
+    pub fn partial_thinking(text: &str) -> Vec<Result<StreamEvent, ProviderError>> {
+        vec![
+            Ok(StreamEvent::Started { request_id: None }),
+            Ok(StreamEvent::BlockStart {
+                index: 0,
+                kind: "thinking".into(),
+            }),
+            Ok(StreamEvent::ThinkingDelta {
+                index: 0,
+                text: text.into(),
+            }),
+        ]
     }
 
     /// `n` text deltas inside an open block — a stream that has started but
@@ -834,6 +880,13 @@ pub mod retry {
             },
             _ => Decision::Fatal,
         }
+    }
+
+    /// The ladder's own base delay for `attempt` (1 s doubling, capped) —
+    /// what a watchdog that has no error to classify sleeps before
+    /// re-sampling (0071 T2).
+    pub fn base_delay(attempt: u32) -> Duration {
+        Duration::from_secs(1u64 << attempt.saturating_sub(1).min(16)).min(RETRY_AFTER_CAP)
     }
 
     /// Full jitter (AWS "Exponential Backoff and Jitter"): a uniform draw in

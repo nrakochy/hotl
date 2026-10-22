@@ -40,8 +40,14 @@ fn overloaded() -> ProviderError {
 }
 
 async fn run(scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>) -> Ran {
+    run_with(scripts, EngineConfig::default()).await
+}
+
+async fn run_with(
+    scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+    config: EngineConfig,
+) -> Ran {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = EngineConfig::default();
     let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
         .expect("session log");
     let provider = Arc::new(ScriptedProvider::new(scripts));
@@ -224,6 +230,139 @@ async fn a_retry_frame_carries_the_request_id_of_the_attempt_that_died() {
     ])
     .await;
     assert_eq!(r.retry_ids, vec![None]);
+}
+
+fn stall_config() -> EngineConfig {
+    EngineConfig {
+        thinking_stall: Duration::from_millis(50),
+        ..EngineConfig::default()
+    }
+}
+
+/// 0071 T2: a thinking block that goes quiet while the socket stays open is
+/// dropped and re-sampled — the idle watchdog would never see it.
+#[tokio::test]
+async fn a_stalled_thinking_block_is_retried_before_the_idle_timeout() {
+    let r = run_with(
+        vec![
+            ScriptedProvider::hang_after(ScriptedProvider::partial_thinking("let me think")),
+            ScriptedProvider::text_reply("the answer"),
+        ],
+        stall_config(),
+    )
+    .await;
+    assert!(matches!(r.outcome, Outcome::Done { .. }), "{:?}", r.outcome);
+    assert_eq!(r.retries.len(), 1, "{:?}", r.retries);
+    let (attempt, reason, discarded) = &r.retries[0];
+    assert_eq!(*attempt, 1);
+    assert_eq!(reason, "thinking block stalled for 0s");
+    assert!(
+        !discarded,
+        "streamed reasoning stays on screen; no answer was rendered"
+    );
+    assert_eq!(r.requests, 2);
+    assert_eq!(r.text, "the answer");
+}
+
+#[tokio::test]
+async fn a_stalled_thinking_block_past_the_ceiling_ends_the_turn() {
+    let scripts = (0..8)
+        .map(|_| ScriptedProvider::hang_after(ScriptedProvider::partial_thinking("…")))
+        .collect();
+    let r = run_with(scripts, stall_config()).await;
+    let Outcome::Error { message } = &r.outcome else {
+        panic!("{:?}", r.outcome);
+    };
+    assert!(message.contains("thinking block stalled"), "{message}");
+    assert_eq!(r.retries.len(), hotl_engine::STREAM_RETRY_MAX as usize);
+    assert_eq!(r.requests, hotl_engine::STREAM_RETRY_MAX as usize + 1);
+}
+
+#[tokio::test]
+async fn a_sealed_tool_use_vetoes_the_thinking_stall_retry() {
+    let mut script = vec![
+        Ok(StreamEvent::Started { request_id: None }),
+        Ok(StreamEvent::BlockStart {
+            index: 0,
+            kind: "tool_use".into(),
+        }),
+        Ok(StreamEvent::BlockEnd { index: 0 }),
+        Ok(StreamEvent::BlockStart {
+            index: 1,
+            kind: "thinking".into(),
+        }),
+    ];
+    script = ScriptedProvider::hang_after(script);
+    let r = run_with(
+        vec![script, ScriptedProvider::text_reply("never reached")],
+        stall_config(),
+    )
+    .await;
+    assert!(
+        matches!(r.outcome, Outcome::Error { .. }),
+        "{:?}",
+        r.outcome
+    );
+    assert!(r.retries.is_empty(), "{:?}", r.retries);
+    assert_eq!(r.requests, 1);
+}
+
+/// A text block that goes quiet after the thinking block closed is the idle
+/// watchdog's business, not this one's: the stream hangs until the test's
+/// own bound, and no stall retry fires.
+#[tokio::test]
+async fn the_thinking_timer_is_disarmed_at_block_end() {
+    let mut script = ScriptedProvider::partial_thinking("done thinking");
+    script.push(Ok(StreamEvent::BlockEnd { index: 0 }));
+    script.push(Ok(StreamEvent::BlockStart {
+        index: 1,
+        kind: "text".into(),
+    }));
+    script.push(Ok(StreamEvent::TextDelta {
+        index: 1,
+        text: "half".into(),
+    }));
+    let script = ScriptedProvider::hang_after(script);
+    let provider = Arc::new(ScriptedProvider::new(vec![script]));
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = stall_config();
+    let log = SessionLog::create(dir.path(), &config.model, None, Masker::empty(), 0)
+        .expect("session log");
+    let mut handle: SessionHandle = spawn_session(SessionDeps {
+        concurrency: Default::default(),
+        provider: provider.clone(),
+        registry: Arc::new(Registry::builtin()),
+        rules: Arc::new(Rules::default()),
+        sandbox_enforced: true,
+        clock: Arc::new(SystemClock),
+        log,
+        system: "test-system".into(),
+        cwd: dir.path().to_path_buf(),
+        hooks: None,
+        initial_items: Vec::new(),
+        initial_todos: Vec::new(),
+        initial_decisions: Vec::new(),
+        plan_files: None,
+        initial_goal: None,
+        config,
+    });
+    handle.prompt("go".into()).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(400);
+    loop {
+        let next = tokio::time::timeout_at(deadline, handle.events.recv()).await;
+        match next {
+            Ok(Some(EngineEvent::Retrying { reason, .. })) => {
+                panic!("the stall timer fired after its block closed: {reason}")
+            }
+            Ok(Some(EngineEvent::TurnDone { outcome, .. })) => {
+                panic!("the turn ended: {outcome:?}")
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => panic!("event channel closed"),
+            Err(_) => break, // still hanging on the text block, as it should
+        }
+    }
+    assert_eq!(provider.request_count(), 1);
 }
 
 /// A dead connection is the same class as a 529 — the idle watchdog reports

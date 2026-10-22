@@ -391,6 +391,10 @@ const RANK_GOAL: u8 = 6;
 /// long enough that a normal think never trips it.
 pub const QUIET_AFTER: u64 = 10 * TICK_HZ;
 
+/// Ticks of silence after which `quiet` becomes `stalled` (0071 T2): where
+/// "slow model" stops being a plausible reading.
+pub const STALL_WARN_AFTER: u64 = 60 * TICK_HZ;
+
 impl Segment {
     fn keep(text: impl Into<String>) -> Self {
         Self {
@@ -419,6 +423,18 @@ impl Segment {
             rank,
             tone: Tone::Plain,
         }
+    }
+}
+
+/// The quiet segment's text: `quiet Ns` until a minute, then `stalled Ns`
+/// naming the retry the engine will take, when the server advertised it.
+pub fn stall_text(secs: u64, stream_idle_secs: Option<u64>) -> String {
+    if secs * TICK_HZ < STALL_WARN_AFTER {
+        return format!("quiet {secs}s");
+    }
+    match stream_idle_secs {
+        Some(idle) => format!("stalled {secs}s · retry at {idle}s"),
+        None => format!("stalled {secs}s"),
     }
 }
 
@@ -584,7 +600,7 @@ pub fn strip_segments(state: &State) -> Vec<Segment> {
         Phase::Sampling { .. } | Phase::Streaming { .. } | Phase::Tool { .. }
     ) {
         if let Some(secs) = quiet_secs(state.since_frame) {
-            segs.push(Segment::blocked(format!("quiet {secs}s")));
+            segs.push(Segment::blocked(stall_text(secs, state.stream_idle_secs)));
         }
     }
     if let Some(count) = todos_count(&state.todos) {
@@ -1192,6 +1208,31 @@ mod tests {
             selected: 0,
         };
         assert_eq!(strip_text(&s), "waiting on you");
+    }
+
+    /// 0071 T2: a minute of silence is a stall, named with the retry the
+    /// engine will take when the server said what it is.
+    #[test]
+    fn the_strip_escalates_quiet_to_stalled_at_sixty_seconds() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling {
+            ticks: 60 * TICK_HZ,
+        };
+        s.since_frame = 59 * TICK_HZ;
+        assert_eq!(strip_text(&s), "thinking · 60s · quiet 59s");
+        s.since_frame = 60 * TICK_HZ;
+        assert_eq!(strip_text(&s), "thinking · 60s · stalled 60s");
+        s.stream_idle_secs = Some(90);
+        assert_eq!(
+            strip_text(&s),
+            "thinking · 60s · stalled 60s · retry at 90s"
+        );
+        let seg = strip_segments(&s)
+            .into_iter()
+            .find(|g| g.text.starts_with("stalled"))
+            .expect("the stalled segment");
+        assert_eq!(seg.tone, Tone::Blocked);
+        assert_eq!(seg.rank, KEEP, "it never drops");
     }
 
     /// It is a claim about the engine, not a decoration on the phase — so it

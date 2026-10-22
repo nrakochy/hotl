@@ -251,6 +251,9 @@ pub struct ServerInfo {
     pub default_plan: bool,
     /// Model context window in tokens — what a UI's fullness gauge divides by.
     pub context_window: u64,
+    /// The stream idle watchdog in seconds (0071 T2) — what the strip's
+    /// `stalled … · retry at Ns` names.
+    pub stream_idle_secs: u64,
     /// The session's primary model — prices `turn_done`'s `usage.cost_usd`
     /// (Task 5 cost telemetry). One process serves one model for its whole
     /// lifetime (process-per-session), so this is fixed for every
@@ -394,6 +397,7 @@ async fn handle_request(
                     "defaultMode": info.default_mode,
                     "defaultPlan": info.default_plan,
                     "contextWindow": info.context_window,
+                    "streamIdleSecs": info.stream_idle_secs,
                 }),
             )
             .await;

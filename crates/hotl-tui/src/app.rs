@@ -565,6 +565,9 @@ pub struct State {
     /// Model context window in tokens, from the handshake. What the context
     /// gauge divides by; `DEFAULT_CONTEXT_WINDOW` until a server reports one.
     pub context_window: u64,
+    /// The server's stream idle watchdog in seconds (0071 T2), so the strip
+    /// can say when a stalled stream will be retried. `None` = not advertised.
+    pub stream_idle_secs: Option<u64>,
     /// What the last turn actually cost the provider — the exact figure a
     /// `/context` report shows beside its estimate. `on_prompt_result`
     /// computes it for the strip's `% ctx` segment and used to discard it.
@@ -725,6 +728,7 @@ impl State {
             budget: None,
             effort_schedule: None,
             context_window: DEFAULT_CONTEXT_WINDOW,
+            stream_idle_secs: None,
             live_context: None,
             open_context: None,
             stream_mark: 0,
@@ -4349,6 +4353,40 @@ mod tests {
         upd(&mut s, json!({"type":"compacting","items":4}));
         on_result(&mut s, "done", None, &json!({}));
         assert!(!s.compacting);
+    }
+
+    /// 0071 T2: a stall retry takes back the answer, never the reasoning
+    /// that streamed — it is still true, and the notice says why there will
+    /// be a second block.
+    #[test]
+    fn a_thinking_stall_retry_keeps_the_streamed_reasoning_on_screen() {
+        let mut s = State::test_default();
+        s.phase = Phase::Sampling { ticks: 0 };
+        upd(
+            &mut s,
+            json!({"type":"thinking_delta","text":"let me reason"}),
+        );
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":1,"reason":"thinking block stalled for 120s","discarded_partial":false}),
+        );
+        assert!(
+            s.transcript
+                .iter()
+                .any(|i| matches!(i, TranscriptItem::Thinking { text } if text.as_str() == "let me reason")),
+            "{:?}",
+            s.transcript
+        );
+        // Even a discarding retry leaves a thinking item alone.
+        upd(
+            &mut s,
+            json!({"type":"retrying","attempt":2,"reason":"x","discarded_partial":true}),
+        );
+        assert!(s
+            .transcript
+            .iter()
+            .any(|i| matches!(i, TranscriptItem::Thinking { .. })));
+        assert_eq!(last_notice(&s), "retrying (attempt 2) — x");
     }
 
     /// 0071 T1: the retry notice names the request id when there is one —

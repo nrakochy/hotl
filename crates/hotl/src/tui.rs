@@ -140,6 +140,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         effort_schedule,
         goal,
         context_window,
+        stream_idle_secs,
         context_tokens,
         todos,
         effort,
@@ -158,6 +159,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
     // A resumed goal's counters start at zero (reset-on-resume, per docs).
     state.goal = goal;
     state.context_window = context_window;
+    state.stream_idle_secs = stream_idle_secs;
     // The rest of at-open reality (0040), same seeded-before-first-draw
     // rule: the strip's context gauge and todo suffix, and the effort
     // `/status` reports, must be true before any turn runs.
@@ -262,7 +264,7 @@ async fn open_session(
 /// over the server default (a resumed session inherits and coerces its own);
 /// both fall back so a newer client against an older server still runs — it
 /// simply shows the library default instead of guessing.
-fn open_settings(hello: &Value, opened: &Value) -> (String, bool, u64) {
+fn open_settings(hello: &Value, opened: &Value) -> (String, bool, u64, Option<u64>) {
     let mode = opened
         .get("mode")
         .or_else(|| hello.get("defaultMode"))
@@ -279,7 +281,12 @@ fn open_settings(hello: &Value, opened: &Value) -> (String, bool, u64) {
         .and_then(Value::as_u64)
         .filter(|&w| w > 0)
         .unwrap_or(hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
-    (mode, plan, window)
+    // Absent on an older server: the strip then says `stalled Ns` alone.
+    let stream_idle_secs = hello
+        .get("streamIdleSecs")
+        .and_then(Value::as_u64)
+        .filter(|&s| s > 0);
+    (mode, plan, window, stream_idle_secs)
 }
 
 /// The 0040 additive keys off the open reply: the at-open context estimate,
@@ -384,6 +391,9 @@ struct Opened {
     /// session's is `None`. Counters start at zero — reset-on-resume.
     goal: Option<String>,
     context_window: u64,
+    /// The stream idle watchdog the server runs (0071 T2); `None` on an
+    /// older server.
+    stream_idle_secs: Option<u64>,
     /// The engine's at-open context estimate (0040) — the strip's `% ctx`
     /// before any turn completes. `None` = an older server.
     context_tokens: Option<u64>,
@@ -448,7 +458,7 @@ async fn handshake(
     }
     .map_err(|e| e.to_string())?;
     let v = wait_response(reader, open).await?;
-    let (mode, plan, context_window) = open_settings(&hello, &v);
+    let (mode, plan, context_window, stream_idle_secs) = open_settings(&hello, &v);
     let (context_tokens, todos, effort, previous_model) = open_extras(&v);
     Ok(Opened {
         name: v.get("name").and_then(Value::as_str).map(String::from),
@@ -466,6 +476,7 @@ async fn handshake(
             .map(String::from),
         goal: v.get("goal").and_then(Value::as_str).map(String::from),
         context_window,
+        stream_idle_secs,
         context_tokens,
         todos,
         effort,
@@ -1580,12 +1591,16 @@ mod tests {
     fn handshake_reads_the_mode_and_context_window() {
         let hello = json!({"defaultMode": "auto", "contextWindow": 1_000_000});
         let opened = json!({"sessionId": "s", "name": null, "mode": "plan"});
-        let (mode, _plan, window) = super::open_settings(&hello, &opened);
+        let (mode, _plan, window, idle) = super::open_settings(&hello, &opened);
+        assert_eq!(idle, None);
+        let (_, _, _, idle) = super::open_settings(&json!({"streamIdleSecs": 90}), &opened);
+        assert_eq!(idle, Some(90), "open_extras_parses_stream_idle_secs");
         assert_eq!(mode, "plan", "the session's mode beats the server default");
         assert_eq!(window, 1_000_000);
 
         // An older server that reports neither must not brick the client.
-        let (mode, _plan, window) = super::open_settings(&json!({}), &json!({}));
+        let (mode, _plan, window, idle) = super::open_settings(&json!({}), &json!({}));
+        assert_eq!(idle, None, "an older server advertises no watchdog");
         assert_eq!(mode, "ask");
         assert_eq!(window, hotl_tui::app::DEFAULT_CONTEXT_WINDOW);
     }

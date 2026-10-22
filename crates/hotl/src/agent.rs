@@ -678,6 +678,7 @@ pub(crate) async fn build_acp() -> Result<
         default_mode: scaffold.rules.mode().as_str().to_string(),
         default_plan: scaffold.rules.plan(),
         context_window: scaffold.config.context_window,
+        stream_idle_secs: scaffold.stream_idle_secs,
         model: scaffold.model.clone(),
     };
     let factory: crate::acp::SessionFactory = Box::new(move |spec| {
@@ -1012,6 +1013,9 @@ struct Scaffold {
     /// Where this process's sessions (and its children's) are written. The
     /// real store unless `-p --ephemeral` points it at the run's temp dir.
     sessions_dir: PathBuf,
+    /// The resolved `[provider] stream_idle_secs`, advertised at open so the
+    /// strip can name the number it is counting toward (0071 T2).
+    stream_idle_secs: u64,
     /// The ONE process-wide `SessionConcurrency` (shared `Arc` semaphores) —
     /// cloned into every registration site that needs it (web tools here,
     /// `spawn`'s `agents` permit at session-registration time), never rebuilt.
@@ -1170,6 +1174,7 @@ async fn scaffold(
         initial_helper_key,
         spawn_builder,
         sessions_dir,
+        stream_idle_secs: cfg.provider.stream_idle().0.as_secs(),
         concurrency,
         agents_include_claude,
         prefix_stagger,
@@ -3543,6 +3548,12 @@ fn engine_config(
         config.evict_threshold_tokens = t;
     }
     config.instructions_max_bytes = cfg.context.instructions_cap();
+    // The two stream watchdogs (0071 T2): the idle one reaches the dialect
+    // in `select_provider`; the thinking one is engine-side. Both warn here.
+    let (stall, stall_warning) = cfg.provider.thinking_stall();
+    config.thinking_stall = stall;
+    warnings.extend(stall_warning);
+    warnings.extend(cfg.provider.stream_idle().1);
     if let Some(k) = cfg.context.keep_results {
         config.keep_results_turns = k;
     }
@@ -3919,6 +3930,11 @@ fn resolve_anthropic(
         let source: Arc<dyn hotl_provider::key::KeySource> =
             Arc::new(hotl_provider::key::StaticKey(None));
         let provider = AnthropicProvider::new(source.clone())
+            .with_timeouts(
+                hotl_provider::timeouts::CONNECT,
+                hotl_provider::timeouts::HEADERS,
+                cfg.provider.stream_idle().0,
+            )
             .with_base_url(&base)
             .subscription();
         return Ok((Arc::new(provider), source));
@@ -3936,7 +3952,11 @@ fn resolve_anthropic(
                 .to_string(),
         );
     }
-    let mut provider = AnthropicProvider::new(source.clone());
+    let mut provider = AnthropicProvider::new(source.clone()).with_timeouts(
+        hotl_provider::timeouts::CONNECT,
+        hotl_provider::timeouts::HEADERS,
+        cfg.provider.stream_idle().0,
+    );
     if let Some(base) = &base {
         warn_cleartext(base, auth, key.is_some() || source.refreshable());
         provider = provider.with_base_url(base);
@@ -3993,7 +4013,11 @@ fn openai_chat_provider(
     base: String,
     source: Arc<dyn hotl_provider::key::KeySource>,
 ) -> hotl_provider_openai::OpenAiCompatProvider {
-    let provider = hotl_provider_openai::OpenAiCompatProvider::new(base, source);
+    let provider = hotl_provider_openai::OpenAiCompatProvider::new(base, source).with_timeouts(
+        hotl_provider::timeouts::CONNECT,
+        hotl_provider::timeouts::HEADERS,
+        cfg.provider.stream_idle().0,
+    );
     match cfg.provider.cache_breakpoints {
         Some(on) => provider.cache_breakpoints(on),
         None => provider,
@@ -4006,7 +4030,12 @@ fn openai_responses_provider(
     base: String,
     source: Arc<dyn hotl_provider::key::KeySource>,
 ) -> hotl_provider_openai_responses::OpenAiResponsesProvider {
-    let provider = hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source);
+    let provider = hotl_provider_openai_responses::OpenAiResponsesProvider::new(base, source)
+        .with_timeouts(
+            hotl_provider::timeouts::CONNECT,
+            hotl_provider::timeouts::HEADERS,
+            cfg.provider.stream_idle().0,
+        );
     match cfg.provider.cache_breakpoints {
         Some(on) => provider.cache_breakpoints(on),
         None => provider,

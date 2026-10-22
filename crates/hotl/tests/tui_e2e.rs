@@ -179,6 +179,7 @@ async fn start_with(factory: acp::SessionFactory) -> (Client, Reader) {
             default_mode: "ask".into(),
             default_plan: false,
             context_window: 200_000,
+            stream_idle_secs: 90,
             model: "m".into(),
         },
         None,

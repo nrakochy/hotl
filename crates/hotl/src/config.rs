@@ -449,6 +449,63 @@ pub struct ProviderCfg {
     /// endpoint rejects `prompt_cache_options` (hotl also probes once and backs
     /// off on its own).
     pub cache_breakpoints: Option<bool>,
+    /// Seconds a stream may go without any byte (pings included) before it
+    /// is treated as dead and retried. Default 90; floor 15; `0` is ignored
+    /// with a warning (0071 T2).
+    pub stream_idle_secs: Option<u64>,
+    /// Seconds an open thinking block may go without a delta, while pings
+    /// keep the socket alive, before the sample is retried. Default 120;
+    /// floor 15; `0` is ignored with a warning (0071 T2).
+    pub thinking_stall_secs: Option<u64>,
+}
+
+impl ProviderCfg {
+    /// A watchdog knob resolved to a duration: the default when unset,
+    /// clamped to the floor, and `0` ignored with a warning rather than a
+    /// refusal (the `effort` posture).
+    fn watchdog(
+        value: Option<u64>,
+        key: &str,
+        default: std::time::Duration,
+    ) -> (std::time::Duration, Option<String>) {
+        let floor = hotl_provider::timeouts::FLOOR;
+        match value {
+            None => (default, None),
+            Some(0) => (
+                default,
+                Some(format!(
+                    "[provider] {key} = 0 is not a value — a stream needs a watchdog; using {}s",
+                    default.as_secs()
+                )),
+            ),
+            Some(n) if std::time::Duration::from_secs(n) < floor => (
+                floor,
+                Some(format!(
+                    "[provider] {key} = {n} is below the {}s floor; using the floor",
+                    floor.as_secs()
+                )),
+            ),
+            Some(n) => (std::time::Duration::from_secs(n), None),
+        }
+    }
+
+    /// `stream_idle_secs` resolved (0071 T2).
+    pub fn stream_idle(&self) -> (std::time::Duration, Option<String>) {
+        Self::watchdog(
+            self.stream_idle_secs,
+            "stream_idle_secs",
+            hotl_provider::timeouts::STREAM_IDLE,
+        )
+    }
+
+    /// `thinking_stall_secs` resolved (0071 T2).
+    pub fn thinking_stall(&self) -> (std::time::Duration, Option<String>) {
+        Self::watchdog(
+            self.thinking_stall_secs,
+            "thinking_stall_secs",
+            hotl_provider::timeouts::THINKING_STALL,
+        )
+    }
 }
 
 /// `[provider] effort`, either spelling. Untagged: a bare string is the
@@ -1276,6 +1333,30 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0071 T2: the watchdogs floor at 15 s, `0` is ignored with a warning,
+    /// and the resolved idle is what every dialect's `with_timeouts` gets.
+    #[test]
+    fn stream_idle_secs_floors_at_fifteen_and_reaches_every_dialect() {
+        let cfg = cfg_with("[provider]\nstream_idle_secs = 5\nthinking_stall_secs = 0\n");
+        let (idle, warn) = cfg.provider.stream_idle();
+        assert_eq!(idle, std::time::Duration::from_secs(15));
+        assert!(warn.unwrap().contains("floor"));
+        let (stall, warn) = cfg.provider.thinking_stall();
+        assert_eq!(stall, hotl_provider::timeouts::THINKING_STALL);
+        assert!(warn.unwrap().contains("= 0 is not a value"));
+        let cfg = cfg_with("[provider]\nstream_idle_secs = 45\n");
+        assert_eq!(
+            cfg.provider.stream_idle(),
+            (std::time::Duration::from_secs(45), None)
+        );
+        let cfg = cfg_with("");
+        assert_eq!(
+            cfg.provider.stream_idle().0,
+            hotl_provider::timeouts::STREAM_IDLE
+        );
+        assert_eq!(hotl_provider::timeouts::STREAM_IDLE.as_secs(), 90);
+    }
 
     fn cfg_with(toml: &str) -> Config {
         let dir = tempfile::tempdir().unwrap();

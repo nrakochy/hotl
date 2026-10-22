@@ -45,8 +45,19 @@ semver promise of their own.
   `x-request-id`), an HTTP error's text ends with `(request-id …)`, and each
   sample's `usage` log entry records the id — what a support ticket wants.
 
+- **A thinking-block stall watchdog.** A thinking block that goes quiet for
+  120 s while the socket keeps pinging is dropped and the sample retried
+  (same ceiling as a mid-stream disconnect); the reasoning that streamed
+  stays on screen. `[provider] thinking_stall_secs` changes the number.
+
 ### Changed
 
+- **The stream idle watchdog is 90 s, not 300 s.** Anthropic pings every
+  10–15 s, so 90 s of silence is a dead socket, not a thinking model.
+  `[provider] stream_idle_secs` overrides it (floor 15 s).
+- **The strip says `stalled`.** After a minute without a wire frame the
+  `quiet Ns` segment becomes `stalled Ns · retry at 90s`, naming the number
+  the engine will act on.
 - **Headless exit codes tell the stops apart (breaking for scripts).** `4` =
   a cap you set stopped it (`max_turns`, `max_tool_calls`, `max_cost_usd`),
   `5` = a harness brake stopped it (doom loop, tool-failure budget, denial

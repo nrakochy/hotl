@@ -2492,7 +2492,14 @@ impl Turn {
         let mut saw_first_byte = false;
         let mut sealed_tool_use = false;
         let mut open_tool_use: Option<usize> = None;
-        let mut forwarded_text = false;
+        // Answer text the surface rendered: what a re-sample has to take
+        // back. Streamed reasoning stays on screen — it is still true.
+        let mut forwarded_answer = false;
+        // The thinking-stall watchdog (0071 T2): armed from a thinking
+        // block's start to its end, reset by every delta inside it.
+        let mut open_thinking: Option<usize> = None;
+        let mut last_thinking = tokio::time::Instant::now();
+        let stall = self.shared.config.thinking_stall;
         // 0062 T3: writing-a-tool-call liveness, cumulative per sample; a new
         // call reports at once, then at most every 250 ms, and once more sealed.
         let mut input_calls: u32 = 0;
@@ -2502,6 +2509,24 @@ impl Turn {
             tokio::select! {
                 biased;
                 _ = self.cancel.cancelled() => return Err(SampleEnd::Cancelled),
+                // Fires only while a thinking block is open and has gone
+                // quiet. Dropping the stream closes the body — no drain: the
+                // socket is alive and would ping forever.
+                _ = tokio::time::sleep_until(last_thinking + stall), if open_thinking.is_some() => {
+                    drop(stream);
+                    let reason = format!("thinking block stalled for {}s", stall.as_secs());
+                    if !sealed_tool_use && attempt <= STREAM_RETRY_MAX {
+                        return Err(SampleEnd::Interrupted {
+                            attempt,
+                            delay: retry::base_delay(attempt),
+                            reason,
+                            status: None,
+                            request_id: request_id.clone(),
+                            discarded_partial: forwarded_answer,
+                        });
+                    }
+                    return Err(SampleEnd::Fatal(reason));
+                }
                 next = stream.next() => match next {
                     Some(Ok(event)) => {
                         saw_first_byte = true;
@@ -2515,14 +2540,25 @@ impl Turn {
                                 input_calls += 1;
                                 input_last_frame = None;
                             }
+                            StreamEvent::BlockStart { index, kind } if kind == "thinking" => {
+                                open_thinking = Some(*index);
+                                last_thinking = tokio::time::Instant::now();
+                            }
                             StreamEvent::ToolInputDelta { json, .. } => {
                                 input_bytes += json.len() as u64;
                             }
                             StreamEvent::BlockEnd { index } if open_tool_use == Some(*index) => {
                                 sealed_tool_use = true;
                             }
-                            StreamEvent::TextDelta { .. } | StreamEvent::ThinkingDelta { .. } => {
-                                forwarded_text = true;
+                            StreamEvent::BlockEnd { index } if open_thinking == Some(*index) => {
+                                open_thinking = None;
+                            }
+                            StreamEvent::TextDelta { .. } => {
+                                forwarded_answer = true;
+                            }
+                            // A delta is a delta, empty ones included.
+                            StreamEvent::ThinkingDelta { .. } => {
+                                last_thinking = tokio::time::Instant::now();
                             }
                             _ => {}
                         }
@@ -2575,7 +2611,7 @@ impl Turn {
                                     reason: format!("stream interrupted: {e}"),
                                     status: retry::status_of(&e),
                                     request_id: request_id.clone(),
-                                    discarded_partial: forwarded_text,
+                                    discarded_partial: forwarded_answer,
                                 });
                             }
                         }

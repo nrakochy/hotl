@@ -128,6 +128,10 @@ pub struct EngineConfig {
     pub max_cost_usd: f64,
     /// Model context window in tokens; compaction triggers at 80% (M2).
     pub context_window: u64,
+    /// How long an open thinking block may go without a delta before the
+    /// sample is dropped and retried (0071 T2). The socket's own idle
+    /// watchdog never trips while pings keep coming; this one does.
+    pub thinking_stall: std::time::Duration,
     /// Bytes of a nested `AGENTS.md` the just-in-time load shows the model
     /// (0070 T9) — the same number the root load uses. `usize::MAX` = no cap.
     pub instructions_max_bytes: usize,
@@ -209,6 +213,7 @@ impl Default for EngineConfig {
             max_tool_calls: 0,
             max_cost_usd: 0.0,
             context_window: 200_000,
+            thinking_stall: hotl_provider::timeouts::THINKING_STALL,
             instructions_max_bytes: hotl_context::INSTRUCTIONS_BUDGET_BYTES,
             fast_model: None,
             utility_model: None,

@@ -42,6 +42,7 @@ fn server_info() -> acp::ServerInfo {
         default_mode: "ask".into(),
         default_plan: false,
         context_window: 200_000,
+        stream_idle_secs: 90,
         // Uncatalogued deliberately: matches `scripted_factory`'s session log
         // model ("m"), and keeps `cost_usd` absent for scenarios that don't
         // test pricing.
@@ -1509,6 +1510,7 @@ async fn the_session_reports_its_effective_mode() {
             default_mode: "auto".into(),
             default_plan: false,
             context_window: 1_000_000,
+            stream_idle_secs: 90,
             model: "m".into(),
         },
         None,
@@ -1969,6 +1971,7 @@ async fn reload_config_swaps_the_engine_and_broadcasts_the_new_truth() {
         default_mode: "auto".into(),
         default_plan: false,
         context_window: 900_000,
+        stream_idle_secs: 90,
         model: "m2".into(),
     };
     // What `SessionSpec::Load` the replacement factory is handed, so this test
