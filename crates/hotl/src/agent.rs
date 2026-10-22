@@ -542,12 +542,14 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
             scaffold.clock.now_ms(),
         );
     }
-    let mut items = initial_items(
+    let (mut items, notices) = initial_items_capped(
         &scaffold.config_dir,
         &scaffold.cwd,
         &scaffold.model,
         &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
+        scaffold.config.instructions_max_bytes,
     );
+    print_warnings(&notices);
     items.push(crate::structured::contract_item(&schema));
     record_fresh_seed(&mut log, &items, scaffold.clock.now_ms());
     let session_id = log.session_id.clone();
@@ -822,7 +824,7 @@ pub(crate) async fn build_acp() -> Result<
             .to_string();
         let plan = plan_override.unwrap_or_else(|| scaffold.rules.plan());
         let session_id = log.session_id.clone();
-        let initial = session_context(&scaffold, &resumed, plan);
+        let (initial, notices) = session_context(&scaffold, &resumed, plan);
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
         }
@@ -876,6 +878,7 @@ pub(crate) async fn build_acp() -> Result<
             // This log's own id — the one a later `session/load` (and so
             // `session/reload_config`) must name to replay this chain.
             session_id,
+            warnings: notices,
         })
     });
     Ok((factory, info, warnings))
@@ -953,7 +956,8 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         );
     }
     let session_id = log.session_id.clone();
-    let initial_items = session_context(&scaffold, &None, scaffold.rules.plan());
+    let (initial_items, notices) = session_context(&scaffold, &None, scaffold.rules.plan());
+    print_warnings(&notices);
     record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
     let handle = spawn_interactive_session(
         (*scaffold.registry).clone(),
@@ -1518,7 +1522,8 @@ async fn run_session(
                                                                     // instructions are already items 0..k of it, so re-injecting them would
                                                                     // both duplicate the content and rewrite the very prefix the fork exists
                                                                     // to reuse (D-A6).
-    let initial_items = session_context(&scaffold, &lineage, scaffold.rules.plan());
+    let (initial_items, notices) = session_context(&scaffold, &lineage, scaffold.rules.plan());
+    print_warnings(&notices);
     if lineage.is_none() {
         record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
     }
@@ -2491,16 +2496,17 @@ fn session_context(
     scaffold: &Scaffold,
     resumed: &Option<Resumed>,
     plan: bool,
-) -> Vec<hotl_types::Item> {
+) -> (Vec<hotl_types::Item>, Vec<String>) {
     match resumed {
-        Some(r) => r.items.clone(),
-        None => fresh_context(
+        Some(r) => (r.items.clone(), Vec::new()),
+        None => fresh_context_capped(
             &scaffold.config_dir,
             &scaffold.cwd,
             &scaffold.model,
             &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
             plan,
             scaffold.plan_files.as_ref(),
+            scaffold.config.instructions_max_bytes,
         ),
     }
 }
@@ -2509,6 +2515,7 @@ fn session_context(
 /// (`--plan`, `HOTL_PLAN`, `[permissions] plan`, ACP `session/new`), the
 /// reminder that says so. The runtime toggle says it from the actor's
 /// `SetPlan` arm instead; a resumed session replays whichever it already had.
+#[cfg(test)]
 fn fresh_context(
     config_dir: &std::path::Path,
     cwd: &std::path::Path,
@@ -2517,7 +2524,29 @@ fn fresh_context(
     plan: bool,
     plan_files: Option<&hotl_engine::PlanFiles>,
 ) -> Vec<hotl_types::Item> {
-    let mut items = initial_items(config_dir, cwd, model, date);
+    fresh_context_capped(
+        config_dir,
+        cwd,
+        model,
+        date,
+        plan,
+        plan_files,
+        hotl_context::INSTRUCTIONS_BUDGET_BYTES,
+    )
+    .0
+}
+
+/// `fresh_context` with the instruction cap and the truncation notices.
+fn fresh_context_capped(
+    config_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    model: &str,
+    date: &str,
+    plan: bool,
+    plan_files: Option<&hotl_engine::PlanFiles>,
+    instructions_max: usize,
+) -> (Vec<hotl_types::Item>, Vec<String>) {
+    let (mut items, notices) = initial_items_capped(config_dir, cwd, model, date, instructions_max);
     if plan {
         items.push(hotl_types::Item::User {
             text: format!(
@@ -2531,7 +2560,7 @@ fn fresh_context(
     if let Some(item) = plan_files.and_then(carryover_reminder) {
         items.push(item);
     }
-    items
+    (items, notices)
 }
 
 /// A plan the last session in this project left open (0056 T2). Fresh
@@ -3307,23 +3336,46 @@ fn spawn_secret_audit(current_log: PathBuf) {
 
 /// Session-start context: environment facts (0030), user memory (M2), then
 /// project instructions.
+#[cfg(test)]
 fn initial_items(
     config_dir: &std::path::Path,
     cwd: &std::path::Path,
     model: &str,
     date: &str,
 ) -> Vec<hotl_types::Item> {
+    initial_items_capped(
+        config_dir,
+        cwd,
+        model,
+        date,
+        hotl_context::INSTRUCTIONS_BUDGET_BYTES,
+    )
+    .0
+}
+
+/// `initial_items` with the instruction-file cap, and the human half of any
+/// truncation notice (the model half is inside the item already).
+fn initial_items_capped(
+    config_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    model: &str,
+    date: &str,
+    instructions_max: usize,
+) -> (Vec<hotl_types::Item>, Vec<String>) {
     let mut items = vec![hotl_context::environment(cwd, model, date)];
+    let mut notices = Vec::new();
     if let Some(orientation) = workspace_orientation_item(cwd) {
         items.push(orientation);
     }
-    if let Some(memory) = load_memory(config_dir) {
+    if let Some((memory, notice)) = load_memory(config_dir) {
         items.push(memory);
+        notices.extend(notice);
     }
-    if let Some(instructions) = project_instructions(cwd) {
+    if let Some((instructions, notice)) = project_instructions(cwd, instructions_max) {
         items.push(instructions);
+        notices.extend(notice);
     }
-    items
+    (items, notices)
 }
 
 /// The shared deadline for the orientation's git reads (0033 Task 8a): the
@@ -3478,6 +3530,7 @@ fn engine_config(
     {
         config.evict_threshold_tokens = t;
     }
+    config.instructions_max_bytes = cfg.context.instructions_cap();
     if let Some(k) = cfg.context.keep_results {
         config.keep_results_turns = k;
     }

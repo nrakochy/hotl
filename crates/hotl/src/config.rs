@@ -519,6 +519,22 @@ pub struct ContextCfg {
     /// built-in `bash`/`grep` defaults; a named tool's entry wins.
     #[serde(default)]
     pub evict_tokens_per_tool: std::collections::BTreeMap<String, u64>,
+    /// Bytes of `AGENTS.md`/`CLAUDE.md` (root and nested) shown to the model
+    /// before the file is cut at a line and both sides are told (0070 T9).
+    /// Default 32 KB; `0` lifts the cap.
+    pub instructions_max_bytes: Option<usize>,
+}
+
+impl ContextCfg {
+    /// The resolved instruction-file cap: the config key, `0` meaning "no
+    /// cap", else the built-in 32 KB.
+    pub fn instructions_cap(&self) -> usize {
+        match self.instructions_max_bytes {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            None => hotl_context::INSTRUCTIONS_BUDGET_BYTES,
+        }
+    }
 }
 
 impl ContextCfg {

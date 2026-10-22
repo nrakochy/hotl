@@ -144,6 +144,7 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         todos,
         effort,
         previous_model,
+        warnings,
     } = opened;
     state.model = model;
     state.session_name = session_name;
@@ -190,6 +191,11 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         state
             .transcript
             .push(hotl_tui::app::TranscriptItem::Notice { text: hint.into() });
+    }
+    for w in warnings {
+        state
+            .transcript
+            .push(hotl_tui::app::TranscriptItem::Notice { text: w.into() });
     }
     // A prompt typed and entered during the open window fires now, through
     // the normal submit path — exactly one SendPrompt, history included.
@@ -381,6 +387,9 @@ struct Opened {
     /// The engine's at-open context estimate (0040) — the strip's `% ctx`
     /// before any turn completes. `None` = an older server.
     context_tokens: Option<u64>,
+    /// Per-session startup notices from the server (an instruction file cut
+    /// at its cap, 0070 T9).
+    warnings: Vec<String>,
     /// The inherited todo list at open (0040): the engine injects it into
     /// every request, so the client renders it or lies by omission (§5.7).
     todos: Vec<hotl_tools::todo::Todo>,
@@ -461,6 +470,14 @@ async fn handshake(
         todos,
         effort,
         previous_model,
+        warnings: v
+            .get("warnings")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(String::from)
+            .collect(),
     })
 }
 

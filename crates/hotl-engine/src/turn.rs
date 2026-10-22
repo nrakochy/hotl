@@ -2615,9 +2615,13 @@ impl Turn {
             let Some(path) = tu.input.get("path").and_then(Value::as_str) else {
                 continue;
             };
-            let Some((marker, item)) =
-                hotl_context::nested_instructions(&self.shared.cwd, Path::new(path))
-            else {
+            // The human half of a truncation notice has no channel mid-turn;
+            // the model half rides inside the envelope.
+            let Some((marker, item, _notice)) = hotl_context::nested_instructions(
+                &self.shared.cwd,
+                Path::new(path),
+                self.shared.config.instructions_max_bytes,
+            ) else {
                 continue;
             };
             if self.injected_hints.contains(&marker) || self.in_projection(&marker) {

@@ -37,6 +37,7 @@ pub const DEFAULT_CONFIG: &str = "\
 # evict_tokens = 20000       # offload tool results larger than this (0 disables)
 # compaction_reset = false   # fresh-slate compaction instead of in-place
 # show_used_pct = true       # show context-fullness in each turn's status
+# instructions_max_bytes = 32768  # cap on AGENTS.md/CLAUDE.md shown to the model; 0 lifts it
 
 [minify]
 # `read`/`edit` with minified:true serve a token-stream view of source code

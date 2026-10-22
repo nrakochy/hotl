@@ -126,6 +126,7 @@ fn scripted_factory_recording(
             effort: None,
             previous_model: None,
             session_id,
+            warnings: Vec::new(),
         })
     })
 }
@@ -189,6 +190,7 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
             effort: None,
             previous_model: None,
             session_id,
+            warnings: Vec::new(),
         })
     })
 }
@@ -389,6 +391,7 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
             effort: effort.clone(),
             previous_model: Some("old-m".into()),
             session_id,
+            warnings: Vec::new(),
         })
     })
 }
@@ -950,6 +953,7 @@ async fn overlapping_prompts_resolve_in_order() {
             effort: None,
             previous_model: None,
             session_id,
+            warnings: Vec::new(),
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1166,6 +1170,7 @@ async fn prompt_images_are_validated_at_the_wire() {
             effort: None,
             previous_model: None,
             session_id,
+            warnings: Vec::new(),
         })
     });
     tokio::spawn(acp::serve(sread, swrite, factory, server_info(), None));
@@ -1368,6 +1373,7 @@ async fn ask_user_round_trip_via_session_request_question() {
             effort: None,
             previous_model: None,
             session_id,
+            warnings: Vec::new(),
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);
@@ -1861,6 +1867,7 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
             effort: None,
             previous_model: None,
             session_id,
+            warnings: Vec::new(),
         })
     });
     let (client, server) = tokio::io::duplex(64 * 1024);

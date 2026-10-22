@@ -569,7 +569,8 @@ fn sessions_check(sessions_dir: &Path) -> Check {
 
 fn memory_check(config_dir: &Path) -> Check {
     match hotl_context::load_memory(config_dir) {
-        Some(_) => ok("memory: memory/MEMORY.md loads at session start".into()),
+        Some((_, Some(notice))) => ok(format!("memory: loads, but is cut — {notice}")),
+        Some((_, None)) => ok("memory: memory/MEMORY.md loads at session start".into()),
         None => ok(format!(
             "memory: none (create {}/memory/MEMORY.md to enable)",
             config_dir.display()

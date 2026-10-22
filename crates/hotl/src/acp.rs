@@ -192,6 +192,10 @@ pub struct SessionOpen {
     /// this connection hands clients. `session/reload_config` resumes through
     /// this; resuming through the handle id silently fails to replay.
     pub session_id: String,
+    /// Per-session startup notices (an instruction file cut at the cap,
+    /// 0070 T9). The open reply carries them as `warnings`; the client shows
+    /// each as a notice.
+    pub warnings: Vec<String>,
 }
 
 /// Builds a session per the client's request. The real binary wires engine
@@ -456,6 +460,7 @@ async fn handle_request(
                     let todos = open.todos.clone();
                     let effort = open.effort.clone();
                     let previous_model = open.previous_model.clone();
+                    let open_warnings = open.warnings.clone();
                     let sid = install_session(
                         open,
                         writer,
@@ -524,6 +529,9 @@ async fn handle_request(
                     }
                     if let Some(sched) = effort_schedule {
                         obj.insert("effortSchedule".into(), json!(sched));
+                    }
+                    if !open_warnings.is_empty() {
+                        obj.insert("warnings".into(), json!(open_warnings));
                     }
                     reply_ok(writer, id, reply).await;
                 }

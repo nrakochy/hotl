@@ -128,6 +128,9 @@ pub struct EngineConfig {
     pub max_cost_usd: f64,
     /// Model context window in tokens; compaction triggers at 80% (M2).
     pub context_window: u64,
+    /// Bytes of a nested `AGENTS.md` the just-in-time load shows the model
+    /// (0070 T9) — the same number the root load uses. `usize::MAX` = no cap.
+    pub instructions_max_bytes: usize,
     /// Housekeeping model (compaction summarize); defaults to `model`.
     pub fast_model: Option<String>,
     /// The one-off-call role (0059 T2): compaction digests and goal
@@ -206,6 +209,7 @@ impl Default for EngineConfig {
             max_tool_calls: 0,
             max_cost_usd: 0.0,
             context_window: 200_000,
+            instructions_max_bytes: hotl_context::INSTRUCTIONS_BUDGET_BYTES,
             fast_model: None,
             utility_model: None,
             compaction_reset: false,

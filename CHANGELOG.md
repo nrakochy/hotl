@@ -28,6 +28,10 @@ semver promise of their own.
   init bash` and `hotl init fish` print completion scripts for those shells.
   Session ids and names complete after `-r`, `--resume`, `--fork-from` and
   `export`.
+- **Instruction files are capped at 32 KB.** `AGENTS.md`/`CLAUDE.md` (root
+  and nested) and `memory/MEMORY.md` over the cap are cut at a line; the model
+  is told where the cut is, and a startup notice says so to you. `[context]
+  instructions_max_bytes` changes the cap; `0` lifts it.
 
 ### Changed
 
