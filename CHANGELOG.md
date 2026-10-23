@@ -8,6 +8,17 @@ semver promise of their own.
 
 ### Added
 
+- **`hotl -w [name]` works in a git worktree.** The session gets its own
+  worktree on branch `name` (or `hotl/<session id>`), cut from your local
+  `HEAD` under `<repo>/.git/hotl-worktrees/`, so two sessions on one repo
+  stop stepping on each other. File tools and `bash` start there, the model's
+  orientation shows the branch, sub-agents merge back into it, the title and
+  `hotl watch` carry `⎇ <branch>`, and `hotl -r` reopens it (recreating a
+  deleted directory from its branch; `--no-worktree` returns to the main
+  checkout). Works for the console, `-p`, and `hotl bg`. Uncommitted changes
+  stay in the main checkout; worktrees are kept on exit and locked while a
+  session has them open. `hotl gc`, run inside the repo, sweeps them: live
+  ones are kept, clean orphans go, everything else asks (default no).
 - **Sub-agents can run in the background.** `spawn {…, background: true}`
   returns at once with the child's id and the model keeps working; the
   child's typed result arrives as a notification — the same text the
@@ -185,6 +196,10 @@ semver promise of their own.
 
 ### Fixed
 
+- **An isolated sub-agent spawned inside a linked worktree no longer silently
+  runs shared-cwd.** Its worktree is now cut under the repository's common
+  `.git` dir, and a spawn from below the repository root degrades to
+  shared-cwd on purpose instead of landing outside the sandbox floor.
 - **A background job that ended behind the turn's last sample was never
   answered.** Its notification landed in the context, but no turn followed;
   the model now gets one, like a notification released at turn end.

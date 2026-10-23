@@ -66,6 +66,7 @@ mod tests {
                 argv: "claude".into(),
             },
             cwd: cwd.into(),
+            branch: None,
             status: Status::Idle,
             status_line: None,
             prompt: None,

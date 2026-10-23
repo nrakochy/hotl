@@ -315,6 +315,31 @@ impl Registry {
         }
     }
 
+    /// The six rooted builtins — what [`Self::builtin_with_root`] makes.
+    pub const ROOTED: [&'static str; 6] = ["read", "edit", "write", "bash", "glob", "grep"];
+
+    /// This registry with its six file tools re-rooted at `root` (0065 T5): a
+    /// session that works in a git worktree keeps every other tool it was
+    /// built with — MCP, skills, web, the per-session registrations — and
+    /// rediscovers nothing. `root` obeys `builtin_with_root`'s rule: the
+    /// process workspace or a directory beneath it.
+    pub fn rerooted(
+        &self,
+        fmt: formatters::Formatters,
+        diag: diagnostics::Diagnostics,
+        minify: MinifyConfig,
+        root: Arc<std::path::Path>,
+    ) -> Registry {
+        let mut out = Self::builtin_with_root(fmt, diag, minify, root);
+        out.tools.extend(
+            self.tools
+                .iter()
+                .filter(|t| !Self::ROOTED.contains(&t.name()))
+                .cloned(),
+        );
+        out
+    }
+
     /// Register an additional tool (MCP meta-tool, skills — M3).
     ///
     /// INVARIANT: names are unique. `get` returns the first registration, so a
@@ -995,5 +1020,86 @@ mod tests {
         // Ordinary source and docs stay unescalated.
         assert!(execute_later_reason("src/lib.rs").is_none());
         assert!(execute_later_reason("README.md").is_none());
+    }
+}
+
+/// 0065 T5 — re-rooting a registry.
+#[cfg(test)]
+mod reroot_tests {
+    use super::*;
+    use serde_json::json;
+
+    struct Marker;
+    impl Tool for Marker {
+        fn name(&self) -> &'static str {
+            "marker"
+        }
+        fn description(&self) -> &str {
+            "stands in for an MCP or skill tool"
+        }
+        fn schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+        fn permission(&self, _: &serde_json::Value) -> Permission {
+            Permission::None
+        }
+        fn run<'a>(
+            &'a self,
+            _: serde_json::Value,
+            _: tokio_util::sync::CancellationToken,
+        ) -> futures_util::future::BoxFuture<'a, ToolOutcome> {
+            Box::pin(async { ToolOutcome::ok("marked") })
+        }
+    }
+
+    /// Every rooted tool resolves under the new root; the rest ride along.
+    #[tokio::test]
+    async fn rerooted_leaves_no_tool_rooted_at_the_process_cwd() {
+        let main = tempfile::tempdir().unwrap();
+        let root = main.path().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(main.path().join("only-in-main.txt"), "x").unwrap();
+        let mut registry = Registry::builtin_with_root(
+            Default::default(),
+            Default::default(),
+            MinifyConfig::default(),
+            Arc::from(main.path()),
+        );
+        registry.register(Box::new(Marker));
+        let rerooted = registry.rerooted(
+            Default::default(),
+            Default::default(),
+            MinifyConfig::default(),
+            Arc::from(root.as_path()),
+        );
+        assert_eq!(rerooted.tools.len(), registry.tools.len());
+        for name in Registry::ROOTED {
+            assert!(rerooted.get(name).is_some(), "{name}");
+        }
+        assert!(
+            rerooted.get("marker").is_some(),
+            "the extra tool rode along"
+        );
+        let glob = rerooted
+            .get("glob")
+            .unwrap()
+            .run(json!({"pattern": "*.txt"}), Default::default())
+            .await;
+        assert!(
+            !glob.content.contains("only-in-main"),
+            "a glob from the worktree must not see the main checkout: {}",
+            glob.content
+        );
+        let write = rerooted
+            .get("write")
+            .unwrap()
+            .run(
+                json!({"path": "made.txt", "content": "wt"}),
+                Default::default(),
+            )
+            .await;
+        assert!(!write.is_error, "{}", write.content);
+        assert!(root.join("made.txt").exists());
+        assert!(!main.path().join("made.txt").exists());
     }
 }

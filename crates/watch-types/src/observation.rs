@@ -25,6 +25,10 @@ pub struct Location {
 pub struct AgentObservation {
     pub agent: Agent,
     pub cwd: String,
+    /// The git branch the agent's session works on (0065), read from the
+    /// pane title — the cwd column is tmux's, which is the main checkout for
+    /// a hotl worktree session.
+    pub branch: Option<String>,
     pub status: Status,
     pub status_line: Option<String>,
     /// The question the pane is currently putting to the human (an agent's
@@ -52,6 +56,7 @@ mod tests {
                 argv: "claude".into(),
             },
             cwd: "/tmp/proj".into(),
+            branch: None,
             status: Status::Idle,
             status_line: None,
             prompt: None,

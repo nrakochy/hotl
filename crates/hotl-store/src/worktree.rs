@@ -310,7 +310,63 @@ pub struct Lock {
     pub pid: u32,
 }
 
+/// A locked [`SessionWorktree`]: the lock is released when this drops (a
+/// clean exit). A crash keeps it, and `hotl gc` reads the dead pid.
+#[derive(Debug)]
+pub struct Leased {
+    wt: SessionWorktree,
+}
+
+impl Leased {
+    pub fn worktree(&self) -> &SessionWorktree {
+        &self.wt
+    }
+    pub fn path(&self) -> &Path {
+        self.wt.path()
+    }
+    pub fn branch(&self) -> &str {
+        self.wt.branch()
+    }
+}
+
+impl Drop for Leased {
+    fn drop(&mut self) {
+        self.wt.unlock();
+    }
+}
+
 impl SessionWorktree {
+    /// The checks `open` would fail on that need no session yet (0065 T5):
+    /// git present, `workspace` the repo toplevel, and the branch name (when
+    /// known) well-formed. Run before a log is minted so a refusal leaves
+    /// nothing behind.
+    pub fn precheck(workspace: &Path, branch: Option<&str>) -> Result<(), String> {
+        if !git_available() {
+            return Err("git is not on PATH, so a worktree cannot be made".into());
+        }
+        let top = toplevel(workspace)
+            .ok_or_else(|| format!("{} is not inside a git repository", workspace.display()))?;
+        let here = dunce::canonicalize(workspace).map_err(|e| e.to_string())?;
+        if here != top {
+            return Err(format!(
+                "run hotl -w from the repository root: {}",
+                top.display()
+            ));
+        }
+        if let Some(branch) = branch {
+            if git_ok(&top, &["check-ref-format", "--branch", branch]).is_none() {
+                return Err(format!("`{branch}` is not a valid git branch name"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Lock it for `session_id` and hand back the guard that unlocks on drop.
+    pub fn lease(self, session_id: &str) -> Leased {
+        self.lock(session_id);
+        Leased { wt: self }
+    }
+
     /// `git -C <workspace> worktree add -b <branch> <path> HEAD` — the local
     /// `HEAD`, never a remote ref. A branch that already exists and is free is
     /// reused (`worktree add <path> <branch>`), which is what resume relies on.
@@ -1222,5 +1278,402 @@ mod session_tests {
         std::fs::create_dir_all(&sub).unwrap();
         assert!(Worktree::create(&sub, "01JSUB").is_none());
         assert!(Worktree::create(root, "01JTOP").is_some());
+    }
+}
+
+#[cfg(test)]
+mod lease_tests {
+    use super::*;
+
+    #[test]
+    fn a_lease_unlocks_on_drop_and_precheck_refuses_before_a_log_exists() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        git_ok(root, &["init", "-q", "-b", "main"]).unwrap();
+        git_ok(root, &["config", "user.email", "t@example.com"]).unwrap();
+        git_ok(root, &["config", "user.name", "t"]).unwrap();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        git_ok(root, &["add", "-A"]).unwrap();
+        git_ok(root, &["commit", "-qm", "init"]).unwrap();
+        assert!(SessionWorktree::precheck(root, Some("ok-name")).is_ok());
+        assert!(SessionWorktree::precheck(root, None).is_ok());
+        assert!(SessionWorktree::precheck(root, Some("a..b"))
+            .unwrap_err()
+            .contains("branch name"));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert!(SessionWorktree::precheck(&sub, None)
+            .unwrap_err()
+            .contains("repository root"));
+        let leased = SessionWorktree::open(root, "fix-auth")
+            .unwrap()
+            .lease("01JSID");
+        assert_eq!(leased.branch(), "fix-auth");
+        assert_eq!(
+            list_session_worktrees(root)[0]
+                .lock
+                .as_ref()
+                .unwrap()
+                .session_id,
+            "01JSID"
+        );
+        drop(leased);
+        assert_eq!(list_session_worktrees(root)[0].lock, None);
+    }
+}
+
+/// What `hotl gc`'s worktree sweep did (0065 T8).
+#[derive(Debug, Default)]
+pub struct WorktreeSweep {
+    /// Worktree names removed (with their merged branch).
+    pub removed: Vec<String>,
+    /// `(name, session id)` kept because a live pid holds the lock.
+    pub kept_live: Vec<(String, String)>,
+    /// `(name, reason)` kept because the ask said no — or was never put
+    /// (dry run, no tty).
+    pub kept_declined: Vec<(String, String)>,
+    /// How many worktrees went through the ask.
+    pub asked: usize,
+    pub dry_run: bool,
+}
+
+/// How one session worktree sorts (0065 §gc).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Bin {
+    /// A live pid holds the lock.
+    Live { session_id: String },
+    /// Not live, its session log gone, clean, and merged or empty: removed
+    /// without an ask.
+    Clean,
+    /// Everything else, with the reason it needs a human.
+    Ask { reason: String },
+}
+
+/// Sort one worktree. `alive` answers "is this pid running" (injected so a
+/// test can lie about it); `sessions_dir` is where its session's log would be.
+pub fn bin_worktree(
+    workspace: &Path,
+    listed: &Listed,
+    sessions_dir: &Path,
+    alive: &dyn Fn(u32) -> bool,
+) -> Bin {
+    if let Some(lock) = &listed.lock {
+        if alive(lock.pid) {
+            return Bin::Live {
+                session_id: lock.session_id.clone(),
+            };
+        }
+    }
+    let mut reasons = Vec::new();
+    // No lock means no session id, which means "unknown": that is an ask.
+    let session_gone = match &listed.lock {
+        Some(lock) => !sessions_dir
+            .join(format!("{}.jsonl", lock.session_id))
+            .exists(),
+        None => false,
+    };
+    if !session_gone {
+        reasons.push("session log still exists".to_string());
+    }
+    let dirty =
+        git_ok(&listed.path, &["status", "--porcelain"]).is_none_or(|o| !o.stdout.is_empty());
+    if dirty {
+        reasons.push("dirty".to_string());
+    }
+    let ahead = match &listed.branch {
+        None => 0,
+        Some(b) => commits_not_on_head(workspace, b),
+    };
+    if ahead > 0 {
+        let head = git_ok(workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|| "HEAD".into());
+        reasons.push(format!(
+            "{ahead} commit{} not on {head}",
+            if ahead == 1 { "" } else { "s" }
+        ));
+    }
+    if reasons.is_empty() {
+        Bin::Clean
+    } else {
+        Bin::Ask {
+            reason: reasons.join(", "),
+        }
+    }
+}
+
+/// `rev-list --count HEAD..<branch>` in the main checkout: 0 = merged or
+/// empty. Unreadable counts as unmerged (fail closed).
+fn commits_not_on_head(workspace: &Path, branch: &str) -> u64 {
+    git_ok(
+        workspace,
+        &["rev-list", "--count", &format!("HEAD..{branch}")],
+    )
+    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+    .unwrap_or(1)
+}
+
+/// Remove one session worktree and, when its branch is fully merged, the
+/// branch (`branch -d`, never `-D`). The lock is cleared first: a dead
+/// session's lock would otherwise refuse the remove.
+pub fn remove_session_worktree(workspace: &Path, listed: &Listed) -> Result<(), String> {
+    let path = listed.path.display().to_string();
+    let _ = git_ok(workspace, &["worktree", "unlock", &path]);
+    let out =
+        git(workspace, &["worktree", "remove", "--force", &path]).ok_or("could not run git")?;
+    if !out.status.success() && listed.path.exists() {
+        return Err(first_line(&out.stderr));
+    }
+    let _ = std::fs::remove_dir_all(&listed.path);
+    let _ = git_ok(workspace, &["worktree", "prune"]);
+    if let Some(b) = &listed.branch {
+        if commits_not_on_head(workspace, b) == 0 {
+            let _ = git_ok(workspace, &["branch", "-d", b]);
+        }
+    }
+    Ok(())
+}
+
+/// `hotl gc`'s sweep of `<toplevel>/.git/hotl-worktrees/*` (0065 §gc): live
+/// ones are kept, clean orphans go without a word, and everything else goes
+/// through `ask` — never under `dry_run`, which only lists. Pure over the
+/// injected `ask` and `alive` so tests drive it.
+pub fn sweep_worktrees(
+    workspace: &Path,
+    sessions_dir: &Path,
+    dry_run: bool,
+    alive: &dyn Fn(u32) -> bool,
+    ask: &mut dyn FnMut(&Listed, &str) -> bool,
+) -> WorktreeSweep {
+    let mut sweep = WorktreeSweep {
+        dry_run,
+        ..Default::default()
+    };
+    for listed in list_session_worktrees(workspace) {
+        let name = listed
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match bin_worktree(workspace, &listed, sessions_dir, alive) {
+            Bin::Live { session_id } => sweep.kept_live.push((name, session_id)),
+            Bin::Clean => {
+                if dry_run {
+                    sweep
+                        .kept_declined
+                        .push((name, "clean, session gone (would remove)".into()));
+                } else if let Err(e) = remove_session_worktree(workspace, &listed) {
+                    sweep
+                        .kept_declined
+                        .push((name, format!("remove failed: {e}")));
+                } else {
+                    sweep.removed.push(name);
+                }
+            }
+            Bin::Ask { reason } => {
+                if dry_run {
+                    sweep.kept_declined.push((name, reason));
+                    continue;
+                }
+                sweep.asked += 1;
+                if ask(&listed, &reason) {
+                    match remove_session_worktree(workspace, &listed) {
+                        Ok(()) => sweep.removed.push(name),
+                        Err(e) => sweep
+                            .kept_declined
+                            .push((name, format!("remove failed: {e}"))),
+                    }
+                } else {
+                    sweep.kept_declined.push((name, reason));
+                }
+            }
+        }
+    }
+    sweep
+}
+
+/// 0065 T8 — the gc sweep's bins.
+#[cfg(test)]
+mod sweep_tests {
+    use super::*;
+
+    fn repo() -> Option<tempfile::TempDir> {
+        if !git_available() {
+            return None;
+        }
+        let tmp = tempfile::tempdir().ok()?;
+        let dir = tmp.path();
+        git_ok(dir, &["init", "-q", "-b", "main"])?;
+        git_ok(dir, &["config", "user.email", "t@example.com"])?;
+        git_ok(dir, &["config", "user.name", "t"])?;
+        std::fs::write(dir.join("a.txt"), "a1\n").unwrap();
+        git_ok(dir, &["add", "-A"])?;
+        git_ok(dir, &["commit", "-qm", "init"])?;
+        Some(tmp)
+    }
+
+    fn lock_dead(wt: &SessionWorktree, session_id: &str) {
+        let _ = git_ok(
+            wt.workspace(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                &lock_reason(session_id, 999_999),
+                &wt.path().display().to_string(),
+            ],
+        );
+    }
+
+    fn names(v: &[(String, String)]) -> Vec<&str> {
+        v.iter().map(|(n, _)| n.as_str()).collect()
+    }
+
+    #[test]
+    fn gc_removes_a_clean_worktree_whose_session_is_gone_and_deletes_the_merged_branch() {
+        let Some(tmp) = repo() else { return };
+        let root = tmp.path();
+        let sessions = tempfile::tempdir().unwrap();
+        let wt = SessionWorktree::open(root, "done").unwrap();
+        lock_dead(&wt, "01JGONE");
+        let mut asked = 0;
+        let sweep = sweep_worktrees(root, sessions.path(), false, &|_| false, &mut |_, _| {
+            asked += 1;
+            false
+        });
+        assert_eq!(sweep.removed, vec!["done"]);
+        assert_eq!(asked, 0, "clean + gone + merged needs no ask");
+        assert!(!wt.path().exists());
+        assert!(
+            git_ok(
+                root,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/done"]
+            )
+            .is_none(),
+            "the merged (empty) branch is gone"
+        );
+        assert!(list_session_worktrees(root).is_empty());
+    }
+
+    #[test]
+    fn gc_keeps_an_unmerged_worktree_when_the_ask_says_no_and_removes_it_on_yes() {
+        let Some(tmp) = repo() else { return };
+        let root = tmp.path();
+        let sessions = tempfile::tempdir().unwrap();
+        let wt = SessionWorktree::open(root, "work").unwrap();
+        std::fs::write(wt.path().join("b.txt"), "b\n").unwrap();
+        git_ok(wt.path(), &["add", "-A"]).unwrap();
+        git_ok(wt.path(), &["commit", "-qm", "b"]).unwrap();
+        std::fs::write(wt.path().join("c.txt"), "dirty\n").unwrap();
+        lock_dead(&wt, "01JGONE");
+        let mut seen = String::new();
+        let sweep = sweep_worktrees(
+            root,
+            sessions.path(),
+            false,
+            &|_| false,
+            &mut |_, reason| {
+                seen = reason.to_string();
+                false
+            },
+        );
+        assert_eq!(sweep.asked, 1);
+        assert_eq!(names(&sweep.kept_declined), vec!["work"]);
+        assert!(
+            seen.contains("1 commit not on main") && seen.contains("dirty"),
+            "{seen}"
+        );
+        assert!(wt.path().exists());
+        let sweep = sweep_worktrees(root, sessions.path(), false, &|_| false, &mut |_, _| true);
+        assert_eq!(sweep.removed, vec!["work"]);
+        assert!(!wt.path().exists());
+        assert!(
+            git_ok(
+                root,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/work"]
+            )
+            .is_some(),
+            "an unmerged branch is never deleted (`-d`, not `-D`)"
+        );
+    }
+
+    #[test]
+    fn gc_never_asks_about_a_worktree_locked_by_a_live_pid_and_treats_a_dead_one_as_not_live() {
+        let Some(tmp) = repo() else { return };
+        let root = tmp.path();
+        let sessions = tempfile::tempdir().unwrap();
+        let wt = SessionWorktree::open(root, "busy").unwrap();
+        wt.lock("01JLIVE");
+        let sweep = sweep_worktrees(
+            root,
+            sessions.path(),
+            false,
+            &|pid| pid == std::process::id(),
+            &mut |_, _| panic!("a live worktree is never asked about"),
+        );
+        assert_eq!(
+            sweep.kept_live,
+            vec![("busy".to_string(), "01JLIVE".to_string())]
+        );
+        assert!(wt.path().exists());
+        // The same lock with the pid dead: clean + gone → removed, no ask.
+        let sweep = sweep_worktrees(root, sessions.path(), false, &|_| false, &mut |_, _| {
+            panic!("clean and gone needs no ask")
+        });
+        assert_eq!(sweep.removed, vec!["busy"]);
+    }
+
+    #[test]
+    fn gc_dry_run_lists_and_deletes_nothing_and_a_live_session_log_means_an_ask() {
+        let Some(tmp) = repo() else { return };
+        let root = tmp.path();
+        let sessions = tempfile::tempdir().unwrap();
+        std::fs::write(sessions.path().join("01JKEPT.jsonl"), "{}\n").unwrap();
+        let kept = SessionWorktree::open(root, "kept").unwrap();
+        lock_dead(&kept, "01JKEPT");
+        let gone = SessionWorktree::open(root, "gone").unwrap();
+        lock_dead(&gone, "01JGONE");
+        let sweep = sweep_worktrees(root, sessions.path(), true, &|_| false, &mut |_, _| {
+            panic!("a dry run never asks")
+        });
+        assert!(sweep.removed.is_empty() && sweep.dry_run);
+        let mut declined = names(&sweep.kept_declined);
+        declined.sort();
+        assert_eq!(declined, vec!["gone", "kept"]);
+        assert!(kept.path().exists() && gone.path().exists());
+        // Wet: the retained session's clean worktree still asks (owner rule).
+        let mut asked = Vec::new();
+        let sweep = sweep_worktrees(
+            root,
+            sessions.path(),
+            false,
+            &|_| false,
+            &mut |l, reason| {
+                asked.push((l.branch.clone().unwrap(), reason.to_string()));
+                false
+            },
+        );
+        assert_eq!(sweep.removed, vec!["gone"]);
+        assert_eq!(
+            asked,
+            vec![("kept".to_string(), "session log still exists".to_string())]
+        );
+        // An unlocked worktree has no session id to look up: an ask.
+        let anon = SessionWorktree::open(root, "anon").unwrap();
+        let _ = anon;
+        let sweep = sweep_worktrees(
+            root,
+            sessions.path(),
+            false,
+            &|_| false,
+            &mut |_, reason| {
+                assert!(reason.contains("session log still exists"));
+                false
+            },
+        );
+        assert!(names(&sweep.kept_declined).contains(&"anon"));
     }
 }

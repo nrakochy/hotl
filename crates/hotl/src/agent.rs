@@ -55,6 +55,10 @@ pub(crate) struct Resumed {
     /// inheritance shape. `None` = never set, so the resumed session falls
     /// back to a legacy `mode: "plan"` if present, else its own default.
     pub plan: Option<bool>,
+    /// The chain's git worktree as `(path, branch)` (last `WorktreeSet`,
+    /// child wins; 0065). Resume reopens it; a fork inherits it unless `-w`
+    /// opens a new one.
+    pub worktree: Option<(String, String)>,
     /// The parent's last `EffortSet`, if any. Doubly optional like
     /// `hotl_store::Replayed::effort`: outer `None` = never set, inner `None`
     /// = deliberately cleared back to the provider's default.
@@ -193,6 +197,7 @@ pub(crate) fn load_lineage(
         todos,
         decisions,
         goal,
+        worktree,
         tip_entry_id,
         ..
     } = replayed;
@@ -211,6 +216,7 @@ pub(crate) fn load_lineage(
         items,
         mode,
         plan,
+        worktree,
         effort,
         // D-A11: todos describe the parent's *final* state. A fork cut back to
         // an earlier prefix would inherit a checklist about work its own
@@ -493,6 +499,8 @@ pub async fn agent_main(args: Vec<String>) -> i32 {
                     fork,
                     parsed.goal,
                     parsed.ephemeral,
+                    parsed.worktree,
+                    parsed.no_worktree,
                 )
                 .await
             }
@@ -581,7 +589,7 @@ async fn structured_main(prompt: &str, schema_path: &std::path::Path, name: Opti
     record_fresh_seed(&mut log, &items, scaffold.clock.now_ms());
     let session_id = log.session_id.clone();
     // Headless never writes memory (0069 decision 6).
-    let mut spawn_reg = scaffold.spawn_registration(session_id.clone());
+    let mut spawn_reg = scaffold.spawn_registration(session_id.clone(), None);
     spawn_reg.memory_write = false;
     let mut handle = spawn_session_with_todos(
         (*scaffold.registry).clone(),
@@ -727,16 +735,17 @@ pub(crate) async fn build_acp() -> Result<
         // typing-time trigger (first composer keystroke) has no ACP signal
         // to hang off today — see the task report for that deferral.
         scaffold.provider.arm().detach();
-        let (resumed, requested, is_fork) = match spec {
-            crate::acp::SessionSpec::New { name } => (None, name, false),
+        let (resumed, requested, is_fork, worktree_arg, no_worktree) = match spec {
+            crate::acp::SessionSpec::New { name, worktree } => (None, name, false, worktree, false),
             crate::acp::SessionSpec::Load {
                 session_id: sid,
                 name,
+                no_worktree,
             } => {
                 let resumed = load_lineage(&sessions_dir(), &sid, KeepSpec::All)?;
                 // An explicit rename-on-resume beats the inherited name.
                 let name = name.or_else(|| resumed.inherited_name.clone());
-                (Some(resumed), name, false)
+                (Some(resumed), name, false, None, no_worktree)
             }
             // A fork is a resume that (a) may stop at a prefix and (b) never
             // takes the parent's name: two live sessions sharing one name
@@ -745,8 +754,19 @@ pub(crate) async fn build_acp() -> Result<
                 session_id: sid,
                 keep,
                 name,
-            } => (Some(load_lineage(&sessions_dir(), &sid, keep)?), name, true),
+                worktree,
+            } => (
+                Some(load_lineage(&sessions_dir(), &sid, keep)?),
+                name,
+                true,
+                worktree,
+                false,
+            ),
         };
+        // The worktree (0065): a cheap refusal before any log is minted.
+        if let Some(arg) = &worktree_arg {
+            hotl_store::worktree::SessionWorktree::precheck(&scaffold.cwd, arg.name())?;
+        }
         let mut log = create_session_log(
             &sessions_dir(),
             &scaffold.model,
@@ -909,7 +929,41 @@ pub(crate) async fn build_acp() -> Result<
             .to_string();
         let plan = plan_override.unwrap_or_else(|| scaffold.rules.plan());
         let session_id = log.session_id.clone();
-        let (initial, mut notices) = session_context(&scaffold, &resumed, plan);
+        // The session root (0065): a new worktree, the chain's reopened, or
+        // the main checkout. `-w` on a fork opens a new one and does not
+        // inherit the parent's.
+        let opened = match (
+            &worktree_arg,
+            resumed.as_ref().and_then(|r| r.worktree.clone()),
+        ) {
+            (Some(arg), _) => Some(open_worktree(
+                &scaffold.cwd,
+                scaffold.clock.now_ms(),
+                &mut log,
+                arg,
+            )?),
+            (None, Some(inherited)) => reopen_worktree(
+                &scaffold.cwd,
+                scaffold.clock.now_ms(),
+                &mut log,
+                &inherited,
+                no_worktree,
+            )?,
+            (None, None) => None,
+        };
+        let root = opened.as_ref().map(|o| o.lease.path().to_path_buf());
+        let (initial, mut notices) = session_context(
+            &scaffold,
+            &resumed,
+            plan,
+            root.as_deref(),
+            opened.as_ref().map(|o| o.note.as_str()),
+        );
+        if let Some(o) = &opened {
+            if resumed.is_some() {
+                notices.push(o.note.clone());
+            }
+        }
         notices.append(&mut model_notices);
         if resumed.is_none() {
             record_fresh_seed(&mut log, &initial, scaffold.clock.now_ms());
@@ -934,9 +988,15 @@ pub(crate) async fn build_acp() -> Result<
                 bare != running_bare
             });
         let open_model = (running_spec != configured_spec).then(|| running_spec.clone());
+        let worktree_wire = opened.as_ref().map(|o| {
+            (
+                o.lease.path().display().to_string(),
+                o.lease.branch().to_string(),
+            )
+        });
         let handle = spawn_interactive_session(
-            (*scaffold.registry).clone(),
-            Some(scaffold.spawn_registration(session_id.clone())),
+            scaffold.registry_rooted(root.as_deref()),
+            Some(scaffold.spawn_registration(session_id.clone(), root.as_deref())),
             Some(scaffold.recall_registration(session_id.clone())),
             scaffold.hooks.clone(),
             scaffold.plan_artifact_path(),
@@ -956,11 +1016,16 @@ pub(crate) async fn build_acp() -> Result<
                     resumed_model,
                 );
                 deps.registry = registry;
+                if let Some(r) = &root {
+                    deps.cwd = r.clone();
+                }
                 deps
             },
         );
         Ok(crate::acp::SessionOpen {
             handle,
+            worktree: worktree_wire,
+            lease: opened.map(|o| o.lease),
             name: requested,
             mode,
             plan,
@@ -1014,7 +1079,21 @@ pub(crate) fn reload_hook() -> crate::acp::Reload {
 
 /// `hotl serve --id <id> [--prompt <p>]`: build a session and host it on a
 /// unix socket for `hotl attach` (the detached-session server behind `hotl bg`).
-pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>) -> i32 {
+pub async fn serve_main(
+    id: String,
+    prompt: Option<String>,
+    name: Option<String>,
+    worktree: Option<crate::tui::WorktreeArg>,
+) -> i32 {
+    // `-w name` names the session like the console does (0065 T4).
+    let name = name.or_else(|| crate::tui::implied_name(worktree.as_ref()));
+    if let Some(arg) = &worktree {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Err(e) = hotl_store::worktree::SessionWorktree::precheck(&cwd, arg.name()) {
+            eprintln!("hotl serve: {e}");
+            return 2;
+        }
+    }
     let secrets = EnvSecrets;
     let cfg = crate::config::Config::load(&config_dir());
     let (provider, model, key_source) = match select_provider(&cfg, &secrets) {
@@ -1060,12 +1139,31 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
         );
     }
     let session_id = log.session_id.clone();
-    let (initial_items, notices) = session_context(&scaffold, &None, scaffold.rules.plan());
+    // The worktree (0065): held across `serve` so a clean `/stop` unlocks.
+    let opened = match &worktree {
+        Some(arg) => match open_worktree(&scaffold.cwd, scaffold.clock.now_ms(), &mut log, arg) {
+            Ok(o) => Some(o),
+            Err(e) => {
+                eprintln!("hotl serve: {e}");
+                return 1;
+            }
+        },
+        None => None,
+    };
+    let root = opened.as_ref().map(|o| o.lease.path().to_path_buf());
+    let (initial_items, notices) = session_context(
+        &scaffold,
+        &None,
+        scaffold.rules.plan(),
+        root.as_deref(),
+        opened.as_ref().map(|o| o.note.as_str()),
+    );
     print_warnings(&notices);
     record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
+    let _lease = opened.map(|o| o.lease);
     let handle = spawn_interactive_session(
-        (*scaffold.registry).clone(),
-        Some(scaffold.spawn_registration(session_id.clone())),
+        scaffold.registry_rooted(root.as_deref()),
+        Some(scaffold.spawn_registration(session_id.clone(), root.as_deref())),
         Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
         scaffold.plan_artifact_path(),
@@ -1079,6 +1177,9 @@ pub async fn serve_main(id: String, prompt: Option<String>, name: Option<String>
                 None,
             );
             deps.registry = registry;
+            if let Some(r) = &root {
+                deps.cwd = r.clone();
+            }
             deps
         },
     );
@@ -1363,12 +1464,47 @@ impl Scaffold {
             .map(|f| f.dir.join("current.md").display().to_string())
     }
 
+    /// The shared registry with its file tools rooted at `root` (0065 T5): a
+    /// worktree session's `read`/`write`/`edit`/`glob`/`grep`/`bash` resolve
+    /// there while MCP, skills and the rest ride along untouched. `None` is
+    /// today's registry, cloned.
+    fn registry_rooted(&self, root: Option<&std::path::Path>) -> Registry {
+        let Some(root) = root else {
+            return (*self.registry).clone();
+        };
+        let b = &self.spawn_builder;
+        let diagnostics = b
+            .hooks_toml
+            .as_deref()
+            .map(hotl_tools::diagnostics::Diagnostics::from_toml)
+            .unwrap_or_default();
+        let formatters = b
+            .hooks_toml
+            .as_deref()
+            .map(hotl_tools::formatters::Formatters::from_toml)
+            .unwrap_or_default();
+        self.registry
+            .rerooted(formatters, diagnostics, b.minify.clone(), root.into())
+    }
+
     /// What every top-level session's `spawn_session_with_todos` call needs
-    /// to register a per-session `spawn` tool (never used for a child's own
-    /// session — see `HotlChildBuilder`, which always passes `None`).
-    fn spawn_registration(&self, session_id: String) -> SpawnRegistration {
+    /// to register a per-session `spawn` tool. `root` (0065): a worktree
+    /// session's children are built from it — `Worktree::create(&root, …)`
+    /// nests them under the main `.git` and merges back into the worktree.
+    fn spawn_registration(
+        &self,
+        session_id: String,
+        root: Option<&std::path::Path>,
+    ) -> SpawnRegistration {
+        let builder: Arc<HotlChildBuilder> = match root {
+            Some(r) => Arc::new(HotlChildBuilder {
+                cwd: r.to_path_buf(),
+                ..(*self.spawn_builder).clone()
+            }),
+            None => self.spawn_builder.clone(),
+        };
         SpawnRegistration {
-            builder: self.spawn_builder.clone() as Arc<dyn crate::spawn::ChildBuilder>,
+            builder: builder as Arc<dyn crate::spawn::ChildBuilder>,
             nested: false,
             memory_write: self
                 .config
@@ -1805,6 +1941,7 @@ fn masker_with_helper(initial_helper_key: Option<&str>) -> Masker {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_session(
     prompt: String,
     json_events: bool,
@@ -1813,7 +1950,17 @@ async fn run_session(
     fork: Option<ForkArgs>,
     goal: Option<String>,
     ephemeral: bool,
+    worktree: Option<crate::tui::WorktreeArg>,
+    no_worktree: bool,
 ) -> i32 {
+    // The worktree's cheap refusals (0065) before a provider is even selected.
+    if let Some(arg) = &worktree {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        if let Err(e) = hotl_store::worktree::SessionWorktree::precheck(&cwd, arg.name()) {
+            eprintln!("hotl: {e}");
+            return 2;
+        }
+    }
     // Resolved before the provider is even selected: a bad `--fork-from` is a
     // usage error, and paying for a scaffold to discover it is silly.
     let (lineage, is_fork) = match headless_lineage(
@@ -1923,6 +2070,44 @@ async fn run_session(
             .filter(|_| !is_fork)
             .and_then(|l| l.goal.clone())
     });
+    // The session root (0065): a new worktree, the chain's reopened, or the
+    // main checkout. The lease lives until this function returns — after
+    // `finish()` — so a clean exit unlocks (T7).
+    let opened = match (&worktree, lineage.as_ref().and_then(|l| l.worktree.clone())) {
+        (Some(arg), _) => {
+            match open_worktree(&scaffold.cwd, scaffold.clock.now_ms(), &mut log, arg) {
+                Ok(o) => Some(o),
+                Err(e) => {
+                    eprintln!("hotl: {e}");
+                    return 1;
+                }
+            }
+        }
+        (None, Some(inherited)) => {
+            match reopen_worktree(
+                &scaffold.cwd,
+                scaffold.clock.now_ms(),
+                &mut log,
+                &inherited,
+                no_worktree,
+            ) {
+                Ok(o) => o,
+                Err(e) => {
+                    eprintln!("hotl: {e}");
+                    return 1;
+                }
+            }
+        }
+        (None, None) => None,
+    };
+    let root = opened.as_ref().map(|o| o.lease.path().to_path_buf());
+    // A fresh session's note rides its context (and the notices); a resumed
+    // one has its context already, so the note is a line here.
+    let worktree_note = opened.as_ref().map(|o| o.note.clone());
+    if let (Some(n), Some(_)) = (&worktree_note, &lineage) {
+        eprintln!("hotl: {n}");
+    }
+    let _lease = opened.map(|o| o.lease);
     let session_id = log.session_id.clone();
     spawn_secret_audit(log.path().to_path_buf());
     let gc_config_dir = scaffold.config_dir.clone();
@@ -1931,7 +2116,13 @@ async fn run_session(
                                                                     // instructions are already items 0..k of it, so re-injecting them would
                                                                     // both duplicate the content and rewrite the very prefix the fork exists
                                                                     // to reuse (D-A6).
-    let (initial_items, notices) = session_context(&scaffold, &lineage, scaffold.rules.plan());
+    let (initial_items, notices) = session_context(
+        &scaffold,
+        &lineage,
+        scaffold.rules.plan(),
+        root.as_deref(),
+        worktree_note.as_deref(),
+    );
     print_warnings(&notices);
     if lineage.is_none() {
         record_fresh_seed(&mut log, &initial_items, scaffold.clock.now_ms());
@@ -1954,10 +2145,10 @@ async fn run_session(
         .and_then(|l| l.effort.clone())
         .map(|raw| raw.and_then(|s| s.parse::<Effort>().ok()));
     // Headless never writes memory (0069 decision 6).
-    let mut spawn_reg = scaffold.spawn_registration(session_id.clone());
+    let mut spawn_reg = scaffold.spawn_registration(session_id.clone(), root.as_deref());
     spawn_reg.memory_write = false;
     let handle = spawn_session_with_todos(
-        (*scaffold.registry).clone(),
+        scaffold.registry_rooted(root.as_deref()),
         Some(spawn_reg),
         Some(scaffold.recall_registration(session_id.clone())),
         scaffold.hooks.clone(),
@@ -1978,6 +2169,9 @@ async fn run_session(
                 goal,
             );
             deps.registry = registry;
+            if let Some(r) = &root {
+                deps.cwd = r.clone();
+            }
             clamp_headless_memory(&mut deps.config);
             deps
         },
@@ -3129,20 +3323,141 @@ fn session_context(
     scaffold: &Scaffold,
     resumed: &Option<Resumed>,
     plan: bool,
+    root: Option<&std::path::Path>,
+    worktree_note: Option<&str>,
 ) -> (Vec<hotl_types::Item>, Vec<String>) {
     match resumed {
         Some(r) => (r.items.clone(), Vec::new()),
         None => fresh_context_capped(
             &scaffold.config_dir,
-            &scaffold.cwd,
+            root.unwrap_or(&scaffold.cwd),
             &scaffold.model,
             &hotl_context::civil_date_utc(scaffold.clock.now_ms()),
             plan,
             scaffold.plan_files.as_ref(),
             scaffold.config.instructions_max_bytes,
             scaffold.config.memory_files.as_ref(),
+            worktree_note,
         ),
     }
+}
+
+/// A session's worktree, open and locked, with the one line both the human
+/// and the model read about it (0065).
+#[derive(Debug)]
+struct OpenedWorktree {
+    lease: hotl_store::worktree::Leased,
+    note: String,
+}
+
+/// `-w [name]`: open the worktree on its branch (derived from the session id
+/// when unnamed), lock it for this session and record it in the log.
+fn open_worktree(
+    cwd: &std::path::Path,
+    now_ms: u64,
+    log: &mut SessionLog,
+    arg: &crate::tui::WorktreeArg,
+) -> Result<OpenedWorktree, String> {
+    let branch = arg
+        .name()
+        .map(str::to_string)
+        .unwrap_or_else(|| hotl_store::worktree::derived_branch(&log.session_id));
+    let wt = hotl_store::worktree::SessionWorktree::open(cwd, &branch)?;
+    let _ = log.append(
+        &hotl_types::EntryPayload::WorktreeSet {
+            path: Some(wt.path().display().to_string()),
+            branch: Some(branch.clone()),
+        },
+        now_ms,
+    );
+    let note = worktree_note(cwd, wt.path(), &branch, None);
+    Ok(OpenedWorktree {
+        lease: wt.lease(&log.session_id),
+        note,
+    })
+}
+
+/// Resume or fork: reopen the chain's worktree (recreating a gone directory
+/// from its branch), or write the `--no-worktree` tombstone. A live lock held
+/// by another process, or a gone branch, refuses with the way out.
+fn reopen_worktree(
+    cwd: &std::path::Path,
+    now_ms: u64,
+    log: &mut SessionLog,
+    inherited: &(String, String),
+    no_worktree: bool,
+) -> Result<Option<OpenedWorktree>, String> {
+    use hotl_store::worktree::{list_session_worktrees, Reopened, SessionWorktree};
+    let (path, branch) = inherited;
+    if no_worktree {
+        let _ = log.append(
+            &hotl_types::EntryPayload::WorktreeSet {
+                path: None,
+                branch: None,
+            },
+            now_ms,
+        );
+        return Ok(None);
+    }
+    let path = std::path::Path::new(path);
+    let me = std::process::id();
+    if let Some(lock) = list_session_worktrees(cwd)
+        .into_iter()
+        .find(|l| l.path == path)
+        .and_then(|l| l.lock)
+    {
+        if lock.pid != me && hotl_platform::process::pid_alive(lock.pid) {
+            return Err(format!(
+                "session {} is already open (pid {}) in {}",
+                lock.session_id,
+                lock.pid,
+                path.display()
+            ));
+        }
+    }
+    let (wt, how) = SessionWorktree::reopen(cwd, path, branch).map_err(|e| {
+        format!(
+            "this session worked on branch `{branch}`, which cannot be reopened ({e}); resume in \
+             the main checkout with --no-worktree"
+        )
+    })?;
+    // Copy-forward, like the name: this log is self-contained.
+    let _ = log.append(
+        &hotl_types::EntryPayload::WorktreeSet {
+            path: Some(wt.path().display().to_string()),
+            branch: Some(branch.clone()),
+        },
+        now_ms,
+    );
+    let note = worktree_note(
+        cwd,
+        wt.path(),
+        branch,
+        (how == Reopened::RecreatedFromBranch).then_some(branch.as_str()),
+    );
+    Ok(Some(OpenedWorktree {
+        lease: wt.lease(&log.session_id),
+        note,
+    }))
+}
+
+/// `working in worktree .git/hotl-worktrees/fix-auth on branch fix-auth`.
+fn worktree_note(
+    cwd: &std::path::Path,
+    path: &std::path::Path,
+    branch: &str,
+    recreated_from: Option<&str>,
+) -> String {
+    let canon = dunce::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let rel = path
+        .strip_prefix(&canon)
+        .or_else(|_| path.strip_prefix(cwd))
+        .unwrap_or(path);
+    let mut note = format!("working in worktree {} on branch {branch}", rel.display());
+    if let Some(b) = recreated_from {
+        note.push_str(&format!(" (recreated from branch {b})"));
+    }
+    note
 }
 
 /// [`initial_items`] plus, for a session that *starts* in plan mode
@@ -3167,6 +3482,7 @@ fn fresh_context(
         plan_files,
         hotl_context::INSTRUCTIONS_BUDGET_BYTES,
         None,
+        None,
     )
     .0
 }
@@ -3182,9 +3498,42 @@ fn fresh_context_capped(
     plan_files: Option<&hotl_engine::PlanFiles>,
     instructions_max: usize,
     memory: Option<&hotl_engine::MemoryFiles>,
+    worktree_note: Option<&str>,
 ) -> (Vec<hotl_types::Item>, Vec<String>) {
-    let (mut items, notices) =
+    let (mut items, mut notices) =
         initial_items_capped(config_dir, cwd, model, date, instructions_max, memory);
+    // The worktree line (0065): right after the orientation item (which ran
+    // in the worktree, so the branch is already there), and on the human's
+    // transcript as a notice.
+    if let Some(note) = worktree_note {
+        // The env block and the orientation both wear `Environment`; the
+        // note follows the last of them.
+        let at = items
+            .iter()
+            .rposition(|i| {
+                matches!(
+                    i,
+                    hotl_types::Item::User {
+                        synthetic: Some(hotl_types::SyntheticReason::Environment),
+                        ..
+                    }
+                )
+            })
+            .map_or(items.len(), |p| p + 1)
+            .min(items.len());
+        items.insert(
+            at,
+            hotl_types::Item::User {
+                text: format!(
+                    "<system-reminder>You are {note}. Relative paths resolve inside the worktree; \
+                     the main checkout is untouched.</system-reminder>"
+                ),
+                synthetic: Some(hotl_types::SyntheticReason::SystemReminder),
+                images: Vec::new(),
+            },
+        );
+        notices.push(note.to_string());
+    }
     if plan {
         items.push(hotl_types::Item::User {
             text: format!(
@@ -3860,6 +4209,10 @@ struct Args {
     /// `--resume <id|name|@last>`: continue a session headless — the ACP
     /// `Load` shape, a new log pinned to the chain's tip.
     resume: Option<String>,
+    /// `-w [name]` (0065): work in a git worktree on that branch.
+    worktree: Option<crate::tui::WorktreeArg>,
+    /// `--no-worktree`: resume in the main checkout.
+    no_worktree: bool,
 }
 
 fn parse_args(args: Vec<String>) -> Result<Args, i32> {
@@ -3874,9 +4227,21 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
     let mut goal: Option<String> = None;
     let mut ephemeral = false;
     let mut resume: Option<String> = None;
+    let mut worktree: Option<crate::tui::WorktreeArg> = None;
+    let mut no_worktree = false;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            // Optional value, the `-r` peek pattern.
+            "-w" | "--worktree" => {
+                worktree = Some(match iter.as_slice().first() {
+                    Some(next) if !next.starts_with('-') => {
+                        crate::tui::WorktreeArg::Named(iter.next().expect("peeked"))
+                    }
+                    _ => crate::tui::WorktreeArg::Derived,
+                })
+            }
+            "--no-worktree" => no_worktree = true,
             // `-p -` and a bare `-p` both read stdin. A following flag is
             // not a prompt: `-p --json` means "prompt on stdin, JSON out".
             "-p" | "--print" => {
@@ -3984,6 +4349,18 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         eprintln!("hotl: {e}");
         return Err(2);
     }
+    if let Err(e) =
+        crate::tui::check_worktree_flags(worktree.is_some(), resume.is_some(), no_worktree)
+    {
+        eprintln!("hotl: {e}");
+        return Err(2);
+    }
+    // `structured_main` is its own construction path; no root is threaded.
+    if schema.is_some() && worktree.is_some() {
+        eprintln!("hotl: -w/--worktree is not supported with --json-schema");
+        return Err(2);
+    }
+    let name = name.or_else(|| crate::tui::implied_name(worktree.as_ref()));
     Ok(Args {
         prompt,
         json_events,
@@ -3996,6 +4373,8 @@ fn parse_args(args: Vec<String>) -> Result<Args, i32> {
         goal,
         ephemeral,
         resume,
+        worktree,
+        no_worktree,
     })
 }
 
@@ -8055,6 +8434,30 @@ mod tests {
         assert_eq!(parsed.name.as_deref(), Some("fix-auth"));
     }
 
+    /// 0065 T4: the headless parser speaks the same worktree rules as the
+    /// console, in the same words.
+    #[test]
+    fn parse_args_accepts_worktree() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let parsed = parse_args(args(&["-p", "hi", "-w", "fix-auth"])).expect("parses");
+        assert_eq!(
+            parsed.worktree,
+            Some(crate::tui::WorktreeArg::Named("fix-auth".into()))
+        );
+        assert_eq!(parsed.name.as_deref(), Some("fix-auth"), "-w implies -n");
+        let parsed = parse_args(args(&["-w", "-p", "hi"])).expect("parses");
+        assert_eq!(parsed.worktree, Some(crate::tui::WorktreeArg::Derived));
+        assert_eq!(parsed.name, None);
+        assert!(parse_args(args(&["-p", "hi", "--resume", "x", "-w"])).is_err());
+        assert!(parse_args(args(&["-p", "hi", "--no-worktree"])).is_err());
+        let parsed = parse_args(args(&["-p", "hi", "--resume", "x", "--no-worktree"])).unwrap();
+        assert!(parsed.no_worktree);
+        assert!(
+            parse_args(args(&["-p", "hi", "--json-schema", "s.json", "-w"])).is_err(),
+            "structured runs have no root to thread"
+        );
+    }
+
     #[test]
     fn headless_resume_parses_and_is_exclusive_with_fork() {
         let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
@@ -8824,5 +9227,268 @@ mod depth_tests {
             "{facts:?}"
         );
         assert_eq!(facts.tool_calls, 1, "the child's one spawn call");
+    }
+}
+
+/// 0065 T5–T7 — the session root: open, reopen, the log entries, the note,
+/// the lock's life.
+#[cfg(test)]
+mod worktree_session_tests {
+    use super::*;
+    use crate::tui::WorktreeArg;
+    use hotl_store::worktree::{list_session_worktrees, SessionWorktree};
+    use hotl_store::{Masker, SessionLog};
+
+    fn git(dir: &std::path::Path, args: &[&str]) -> Option<std::process::Output> {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+    }
+
+    fn repo() -> Option<tempfile::TempDir> {
+        if !hotl_store::worktree::git_available() {
+            return None;
+        }
+        let tmp = tempfile::tempdir().ok()?;
+        let d = tmp.path();
+        git(d, &["init", "-q", "-b", "main"])?;
+        git(d, &["config", "user.email", "t@example.com"])?;
+        git(d, &["config", "user.name", "t"])?;
+        std::fs::write(d.join("a.txt"), "a\n").unwrap();
+        git(d, &["add", "-A"])?;
+        git(d, &["commit", "-qm", "init"])?;
+        Some(tmp)
+    }
+
+    fn log_in(store: &std::path::Path) -> SessionLog {
+        SessionLog::create(store, "m", None, Masker::empty(), 1).unwrap()
+    }
+
+    #[test]
+    fn a_worktree_session_logs_the_worktree_set_locks_and_unlocks_on_drop() {
+        let Some(repo) = repo() else { return };
+        let store = tempfile::tempdir().unwrap();
+        let mut log = log_in(store.path());
+        let sid = log.session_id.clone();
+        let opened = open_worktree(
+            repo.path(),
+            2,
+            &mut log,
+            &WorktreeArg::Named("fix-auth".into()),
+        )
+        .unwrap();
+        assert_eq!(opened.lease.branch(), "fix-auth");
+        assert!(opened
+            .note
+            .starts_with("working in worktree .git/hotl-worktrees/fix-auth on branch fix-auth"));
+        let recorded = hotl_store::session_worktree(log.path()).unwrap();
+        assert_eq!(recorded.1, "fix-auth");
+        assert_eq!(std::path::Path::new(&recorded.0), opened.lease.path());
+        let listed = list_session_worktrees(repo.path());
+        assert_eq!(listed[0].lock.as_ref().unwrap().session_id, sid);
+        assert_eq!(listed[0].lock.as_ref().unwrap().pid, std::process::id());
+        drop(opened);
+        assert_eq!(
+            list_session_worktrees(repo.path())[0].lock,
+            None,
+            "a clean end unlocks (T7)"
+        );
+        // Derived: the branch is the session id under `hotl/`.
+        let mut log2 = log_in(store.path());
+        let derived = open_worktree(repo.path(), 3, &mut log2, &WorktreeArg::Derived).unwrap();
+        assert_eq!(derived.lease.branch(), format!("hotl/{}", log2.session_id));
+    }
+
+    #[test]
+    fn resume_reopens_the_same_worktree_and_relocks_it() {
+        let Some(repo) = repo() else { return };
+        let store = tempfile::tempdir().unwrap();
+        let mut log = log_in(store.path());
+        let first = open_worktree(
+            repo.path(),
+            2,
+            &mut log,
+            &WorktreeArg::Named("fix-auth".into()),
+        )
+        .unwrap();
+        let inherited = (
+            first.lease.path().display().to_string(),
+            "fix-auth".to_string(),
+        );
+        drop(first);
+        let mut child = log_in(store.path());
+        let again = reopen_worktree(repo.path(), 3, &mut child, &inherited, false)
+            .unwrap()
+            .expect("reopened");
+        assert_eq!(again.lease.path().display().to_string(), inherited.0);
+        assert!(!again.note.contains("recreated"), "{}", again.note);
+        assert_eq!(
+            list_session_worktrees(repo.path())[0]
+                .lock
+                .as_ref()
+                .unwrap()
+                .session_id,
+            child.session_id,
+            "relocked for the new log"
+        );
+        assert_eq!(
+            hotl_store::session_worktree(child.path()).unwrap().1,
+            "fix-auth",
+            "copied forward"
+        );
+    }
+
+    #[test]
+    fn resume_recreates_a_deleted_worktree_from_its_branch() {
+        let Some(repo) = repo() else { return };
+        let store = tempfile::tempdir().unwrap();
+        let mut log = log_in(store.path());
+        let first = open_worktree(
+            repo.path(),
+            2,
+            &mut log,
+            &WorktreeArg::Named("fix-auth".into()),
+        )
+        .unwrap();
+        std::fs::write(first.lease.path().join("b.txt"), "b\n").unwrap();
+        git(first.lease.path(), &["add", "-A"]).unwrap();
+        git(first.lease.path(), &["commit", "-qm", "b"]).unwrap();
+        let inherited = (
+            first.lease.path().display().to_string(),
+            "fix-auth".to_string(),
+        );
+        drop(first);
+        std::fs::remove_dir_all(&inherited.0).unwrap();
+        let mut child = log_in(store.path());
+        let again = reopen_worktree(repo.path(), 3, &mut child, &inherited, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            again.note.contains("recreated from branch fix-auth"),
+            "{}",
+            again.note
+        );
+        assert!(again.lease.path().join("b.txt").exists());
+    }
+
+    #[test]
+    fn resume_refuses_when_the_branch_is_gone_unless_no_worktree() {
+        let Some(repo) = repo() else { return };
+        let store = tempfile::tempdir().unwrap();
+        let mut log = log_in(store.path());
+        let first =
+            open_worktree(repo.path(), 2, &mut log, &WorktreeArg::Named("gone".into())).unwrap();
+        let inherited = (first.lease.path().display().to_string(), "gone".to_string());
+        drop(first);
+        std::fs::remove_dir_all(&inherited.0).unwrap();
+        git(repo.path(), &["worktree", "prune"]).unwrap();
+        git(repo.path(), &["branch", "-D", "gone"]).unwrap();
+        let mut child = log_in(store.path());
+        let err = reopen_worktree(repo.path(), 3, &mut child, &inherited, false).unwrap_err();
+        assert!(err.contains("--no-worktree"), "{err}");
+        assert!(err.contains("gone"), "{err}");
+        // `--no-worktree` writes the tombstone and roots nowhere.
+        let none = reopen_worktree(repo.path(), 4, &mut child, &inherited, true).unwrap();
+        assert!(none.is_none());
+        assert_eq!(
+            hotl_store::session_worktree(child.path()),
+            None,
+            "the tombstone folds"
+        );
+        assert_eq!(hotl_store::replay(child.path()).unwrap().worktree, None);
+    }
+
+    #[test]
+    fn a_second_open_of_a_live_worktree_session_is_refused() {
+        let Some(repo) = repo() else { return };
+        let store = tempfile::tempdir().unwrap();
+        let mut log = log_in(store.path());
+        let first =
+            open_worktree(repo.path(), 2, &mut log, &WorktreeArg::Named("busy".into())).unwrap();
+        let inherited = (first.lease.path().display().to_string(), "busy".to_string());
+        // Another live process holds it: a lock whose pid is a running child.
+        let mut sleeper = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        drop(first);
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "lock",
+                "--reason",
+                &format!("hotl 01JOTHER pid {}", sleeper.id()),
+                &inherited.0,
+            ],
+        )
+        .unwrap();
+        let mut child = log_in(store.path());
+        let err = reopen_worktree(repo.path(), 3, &mut child, &inherited, false).unwrap_err();
+        assert!(err.contains("already open"), "{err}");
+        assert!(err.contains(&sleeper.id().to_string()), "{err}");
+        let _ = sleeper.kill();
+        let _ = sleeper.wait();
+        // Dead now: the stale lock is not an owner.
+        let again = reopen_worktree(repo.path(), 4, &mut child, &inherited, false).unwrap();
+        assert!(again.is_some());
+        // The same branch a second time from `-w` is refused by git itself.
+        let mut other = log_in(store.path());
+        let err = open_worktree(
+            repo.path(),
+            5,
+            &mut other,
+            &WorktreeArg::Named("busy".into()),
+        )
+        .unwrap_err();
+        assert!(err.contains("busy"), "{err}");
+    }
+
+    /// The orientation ran in the worktree (so the model reads its branch),
+    /// and the note follows it as a system reminder; the human gets it as a
+    /// notice.
+    #[test]
+    fn the_orientation_item_names_the_worktree_branch_and_the_note_follows_it() {
+        let Some(repo) = repo() else { return };
+        let wt = SessionWorktree::open(repo.path(), "fix-auth").unwrap();
+        let config_dir = tempfile::tempdir().unwrap();
+        let note = worktree_note(repo.path(), wt.path(), "fix-auth", None);
+        let (items, notices) = fresh_context_capped(
+            config_dir.path(),
+            wt.path(),
+            "m",
+            "2026-10-23",
+            false,
+            None,
+            hotl_context::INSTRUCTIONS_BUDGET_BYTES,
+            None,
+            Some(&note),
+        );
+        let texts: Vec<&str> = items
+            .iter()
+            .filter_map(|i| match i {
+                hotl_types::Item::User { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        let orientation = texts
+            .iter()
+            .position(|t| t.contains("branch: fix-auth") || t.contains("fix-auth"))
+            .expect("the orientation names the branch");
+        assert!(
+            texts[orientation + 1].contains(&note),
+            "the note follows the orientation: {:?}",
+            texts
+        );
+        assert!(texts[orientation + 1].contains("<system-reminder>"));
+        assert_eq!(notices, vec![note]);
+        assert!(worktree_note(repo.path(), wt.path(), "x", Some("x"))
+            .ends_with("(recreated from branch x)"));
     }
 }

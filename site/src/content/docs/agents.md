@@ -328,7 +328,10 @@ isolation: worktree
 The def's own `isolation:` wins where both are set. Read-only defs
 (`explore`, `plan`, anything with a read-only tool scope) are never isolated
 — they cannot write, and a checkout per child would be pure cost on the
-fan-out hot path.
+fan-out hot path. Children of a session that itself works in a worktree
+(`hotl -w`, see [sessions.md](../sessions/#worktrees)) nest under the main
+repo's `.git/hotl-worktrees/` and merge back into the session's worktree, not
+the main checkout.
 
 **What the child starts from.** A copy of your **current working tree** —
 including uncommitted and untracked files, so the child reads what you are

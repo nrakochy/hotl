@@ -41,6 +41,7 @@ pub fn observations(
         out.push(AgentObservation {
             agent,
             cwd: pane.current_path.clone(),
+            branch: crate::status::hotl_title_branch(&pane.title),
             status,
             status_line: status_line(&tail),
             prompt,

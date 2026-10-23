@@ -148,11 +148,13 @@ pub async fn tui_main(args: Vec<String>) -> i32 {
         warnings,
         title,
         memory_mode,
+        worktree,
     } = opened;
     state.model = model;
     state.memory_mode = memory_mode;
     state.session_name = session_name;
     state.session_title = title;
+    state.session_branch = worktree.map(|(_, branch)| branch);
     // Server-side truth, seeded before the post-open loop's first draw: the
     // badge must never render a mode the session is not actually running
     // (evaluation §5.7) — pre-open it rendered none at all.
@@ -407,6 +409,8 @@ struct Opened {
     /// The generated title a resume restored (0071 T4), shown when there is
     /// no name.
     title: Option<String>,
+    /// The session's git worktree as `(path, branch)` (0065), when it has one.
+    worktree: Option<(String, String)>,
     /// The inherited todo list at open (0040): the engine injects it into
     /// every request, so the client renders it or lies by omission (§5.7).
     todos: Vec<hotl_tools::todo::Todo>,
@@ -443,11 +447,16 @@ async fn handshake(
         fork_from,
         keep,
         keep_turns,
+        worktree,
+        no_worktree,
     } = args;
     // A fork rides `session/load` as extension params rather than a new
     // method: existing clients ignore what they don't know, so the wire stays
     // backward-compatible. Turn resolution is deliberately server-side — the
-    // projection those turns are counted against only exists there.
+    // projection those turns are counted against only exists there. The
+    // worktree (0065) rides the same way: `worktree` is a branch name or
+    // `@derived`, `noWorktree` only on a resume.
+    let worktree = worktree.as_ref().map(|w| w.wire().to_string());
     let open = match (spec, fork_from) {
         (_, Some(sid)) => {
             let mut params = json!({"sessionId": sid, "name": name, "fork": true});
@@ -457,13 +466,24 @@ async fn handshake(
             if let Some(t) = keep_turns {
                 params["keepTurns"] = json!(t);
             }
+            if let Some(w) = &worktree {
+                params["worktree"] = json!(w);
+            }
             client.request("session/load", params).await
         }
-        (None, None) => client.request("session/new", json!({"name": name})).await,
+        (None, None) => {
+            let mut params = json!({"name": name});
+            if let Some(w) = &worktree {
+                params["worktree"] = json!(w);
+            }
+            client.request("session/new", params).await
+        }
         (Some(sid), None) => {
-            client
-                .request("session/load", json!({"sessionId": sid, "name": name}))
-                .await
+            let mut params = json!({"sessionId": sid, "name": name});
+            if no_worktree {
+                params["noWorktree"] = json!(true);
+            }
+            client.request("session/load", params).await
         }
     }
     .map_err(|e| e.to_string())?;
@@ -504,7 +524,18 @@ async fn handshake(
             .map(String::from)
             .collect(),
         title: v.get("title").and_then(Value::as_str).map(String::from),
+        worktree: parse_worktree(&v),
     })
+}
+
+/// The open reply's `worktree: {path, branch}` (0065); absent on a
+/// main-checkout session and on an older server.
+fn parse_worktree(opened: &Value) -> Option<(String, String)> {
+    let w = opened.get("worktree")?;
+    Some((
+        w.get("path")?.as_str()?.to_string(),
+        w.get("branch")?.as_str()?.to_string(),
+    ))
 }
 
 async fn wait_response(reader: &mut ServerReader, want: u64) -> Result<Value, String> {
@@ -1118,6 +1149,23 @@ pub(crate) struct TuiArgs {
     pub fork_from: Option<String>,
     pub keep: Option<usize>,
     pub keep_turns: Option<usize>,
+    /// `-w [name]` (0065): work in a git worktree on that branch.
+    pub worktree: Option<WorktreeArg>,
+    /// `--no-worktree`: resume in the main checkout and write the tombstone.
+    pub no_worktree: bool,
+}
+
+pub(crate) use crate::acp::WorktreeArg;
+
+impl WorktreeArg {
+    /// `-w` takes an optional value: the next token, unless it is a flag or
+    /// absent (the `-r` peek pattern).
+    fn take(it: &mut std::iter::Peekable<std::slice::Iter<String>>) -> Self {
+        match it.peek() {
+            Some(v) if !v.starts_with('-') => Self::Named(it.next().cloned().unwrap_or_default()),
+            _ => Self::Derived,
+        }
+    }
 }
 
 /// The console's flags as typed, before any of them touch the store. Split out
@@ -1138,10 +1186,13 @@ pub(crate) struct RawTuiArgs {
     pub keep_turns: Option<usize>,
     /// `--search <text>`: show only sessions whose transcript mentions it.
     pub search: Option<String>,
+    pub worktree: Option<WorktreeArg>,
+    pub no_worktree: bool,
 }
 
 /// The console's argument surface: `[id-prefix]`, `-r/--resume [arg]`,
-/// `-n/--name <name>`, `--fork-from <arg>` with `--keep`/`--keep-turns`.
+/// `-n/--name <name>`, `--fork-from <arg>` with `--keep`/`--keep-turns`,
+/// `-w/--worktree [name]`, `--no-worktree`.
 /// `hotl resume [arg]` arrives here rewritten to `--resume` by main.rs.
 fn parse_tui_flags(args: &[String]) -> Result<RawTuiArgs, String> {
     let mut out = RawTuiArgs::default();
@@ -1165,6 +1216,8 @@ fn parse_tui_flags(args: &[String]) -> Result<RawTuiArgs, String> {
                 _ => out.resume_bare = true,
             },
             "--fork-from" => out.fork_from = Some(value(&mut it, "--fork-from")?),
+            "-w" | "--worktree" => out.worktree = Some(WorktreeArg::take(&mut it)),
+            "--no-worktree" => out.no_worktree = true,
             "--search" => out.search = Some(value(&mut it, "--search")?),
             "--keep" => out.keep = Some(count(&value(&mut it, "--keep")?, "--keep")?),
             "--keep-turns" => {
@@ -1198,10 +1251,56 @@ fn parse_tui_flags(args: &[String]) -> Result<RawTuiArgs, String> {
         out.keep,
         out.keep_turns,
     )?;
+    check_worktree_flags(
+        out.worktree.is_some(),
+        out.spec.is_some() || out.resume_bare,
+        out.no_worktree,
+    )?;
     if out.search.is_some() && !out.resume_bare {
         return Err("`--search` filters the resume picker; it needs a bare `-r`".to_string());
     }
+    // `-w name` names the session too, so the title and `hotl -r name` work
+    // with one flag (0065, owner-confirmed). A derived worktree names nothing.
+    if out.name.is_none() {
+        out.name = implied_name(out.worktree.as_ref());
+    }
     Ok(out)
+}
+
+/// The session name `-w <name>` implies when `-n` is absent — the branch
+/// name, when it also passes the session-name grammar.
+pub(crate) fn implied_name(worktree: Option<&WorktreeArg>) -> Option<String> {
+    worktree
+        .and_then(WorktreeArg::name)
+        .and_then(hotl_types::normalize_session_name)
+}
+
+/// The worktree flags' rules (0065), shared with the headless parser so both
+/// refuse the same nonsense in the same words. A resumed session already has a
+/// worktree, or had none; a tombstone needs a session to write it into.
+pub(crate) fn check_worktree_flags(
+    worktree: bool,
+    resuming: bool,
+    no_worktree: bool,
+) -> Result<(), String> {
+    if worktree && resuming {
+        return Err(
+            "-w/--worktree cannot be combined with resume — a resumed session already has a \
+             worktree, or had none; fork it (--fork-from <s> -w <name>) to start a new one"
+                .to_string(),
+        );
+    }
+    if no_worktree && !resuming {
+        return Err(
+            "--no-worktree only means something with a resume: it reopens the session in the \
+             main checkout instead of its worktree"
+                .to_string(),
+        );
+    }
+    if no_worktree && worktree {
+        return Err("pass one of -w or --no-worktree, not both".to_string());
+    }
+    Ok(())
 }
 
 fn count(raw: &str, flag: &str) -> Result<usize, String> {
@@ -1253,6 +1352,8 @@ fn parse_tui_args(args: &[String]) -> Result<TuiArgs, i32> {
         keep,
         keep_turns,
         search,
+        worktree,
+        no_worktree,
     } = raw;
     let sessions = newest_first();
     let spec = match spec {
@@ -1284,6 +1385,8 @@ fn parse_tui_args(args: &[String]) -> Result<TuiArgs, i32> {
         fork_from,
         keep,
         keep_turns,
+        worktree,
+        no_worktree,
     })
 }
 
@@ -1394,13 +1497,20 @@ fn pick_session(search: Option<&str>) -> Result<String, i32> {
         let from = hotl_store::session_parent(path)
             .map(|p| format!("  ↳ from {}", &p[..p.len().min(8)]))
             .unwrap_or_default();
-        match picker_label(
-            hotl_store::session_name(path),
-            hotl_store::session_title(path),
-        ) {
-            Some(label) => eprintln!("  {}) {id}  {label}  {}{from}", i + 1, age(*t)),
-            None => eprintln!("  {}) {id}  {}{from}", i + 1, age(*t)),
-        }
+        eprintln!(
+            "{}",
+            picker_row(
+                i + 1,
+                id,
+                picker_label(
+                    hotl_store::session_name(path),
+                    hotl_store::session_title(path),
+                ),
+                hotl_store::session_worktree(path).map(|(_, b)| b),
+                &age(*t),
+                &from,
+            )
+        );
         if let Some(e) = excerpt {
             eprintln!("      ↪ {}", excerpt_line(e));
         }
@@ -1423,6 +1533,28 @@ fn pick_session(search: Option<&str>) -> Result<String, i32> {
 /// marked as such (§5.7 — never claim a title is a name). `None` for neither.
 pub(crate) fn picker_label(name: Option<String>, title: Option<String>) -> Option<String> {
     name.or_else(|| title.map(|t| format!("{t} (auto)")))
+}
+
+/// One picker line: `  3) 01JC…  fix-auth  ⎇ fix-auth  2h ago  ↳ from 01JB…`.
+/// The branch (0065) follows the label; a derived worktree's session has no
+/// label, so its row reads `id  ⎇ hotl/id`.
+fn picker_row(
+    n: usize,
+    id: &str,
+    label: Option<String>,
+    branch: Option<String>,
+    age: &str,
+    from: &str,
+) -> String {
+    let mut row = format!("  {n}) {id}");
+    if let Some(label) = label {
+        row.push_str(&format!("  {label}"));
+    }
+    if let Some(b) = branch {
+        row.push_str(&format!("  ⎇ {b}"));
+    }
+    row.push_str(&format!("  {age}{from}"));
+    row
 }
 
 fn age(t: SystemTime) -> String {
@@ -1818,6 +1950,111 @@ mod tests {
         let args = parse_tui_args(&v(&[])).unwrap();
         assert_eq!(args.spec, None);
         assert_eq!(args.name, None);
+    }
+
+    /// 0065 T4: `-w` takes an optional name, implies `-n`, and refuses the
+    /// combinations that mean nothing.
+    #[test]
+    fn parse_tui_flags_accepts_worktree_with_and_without_a_name() {
+        use super::WorktreeArg;
+        let a = parse_tui_flags(&v(&["-w", "fix-auth"])).unwrap();
+        assert_eq!(a.worktree, Some(WorktreeArg::Named("fix-auth".into())));
+        assert_eq!(
+            a.name.as_deref(),
+            Some("fix-auth"),
+            "-w name implies -n name"
+        );
+        let a = parse_tui_flags(&v(&["--worktree"])).unwrap();
+        assert_eq!(a.worktree, Some(WorktreeArg::Derived));
+        assert_eq!(a.name, None, "a derived worktree names nothing");
+        let a = parse_tui_flags(&v(&["-w", "--plan"])).unwrap();
+        assert_eq!(
+            a.worktree,
+            Some(WorktreeArg::Derived),
+            "a flag is not a name"
+        );
+        let a = parse_tui_flags(&v(&["-w", "fix-auth", "-n", "other"])).unwrap();
+        assert_eq!(a.name.as_deref(), Some("other"), "an explicit -n wins");
+        assert_eq!(
+            WorktreeArg::from_wire(WorktreeArg::Derived.wire()),
+            WorktreeArg::Derived
+        );
+        assert_eq!(
+            WorktreeArg::from_wire(WorktreeArg::Named("x".into()).wire()),
+            WorktreeArg::Named("x".into())
+        );
+    }
+
+    #[test]
+    fn worktree_and_resume_reject_each_other_and_no_worktree_needs_a_resume() {
+        use super::{check_worktree_flags, WorktreeArg};
+        for args in [
+            &["-r", "x", "-w", "y"][..],
+            &["-r", "-w"],
+            &["01J", "-w", "y"],
+            &["--fork-from", "x", "--no-worktree"],
+            &["--no-worktree"],
+            &["-r", "x", "--no-worktree", "-w"],
+        ] {
+            let err = parse_tui_flags(&v(args)).unwrap_err();
+            assert!(
+                err.contains("worktree"),
+                "{args:?} should be refused for its worktree flags: {err}"
+            );
+        }
+        let a = parse_tui_flags(&v(&["-r", "x", "--no-worktree"])).unwrap();
+        assert!(a.no_worktree);
+        let a = parse_tui_flags(&v(&["--fork-from", "x", "-w", "y"])).unwrap();
+        assert_eq!(
+            a.worktree,
+            Some(WorktreeArg::Named("y".into())),
+            "a fork may open one"
+        );
+        assert_eq!(
+            check_worktree_flags(true, true, false).unwrap_err(),
+            check_worktree_flags(true, true, false).unwrap_err(),
+        );
+    }
+
+    /// 0065 T9: the picker shows the branch after the label; a derived
+    /// worktree's session has no label, so its row is `id  ⎇ hotl/id`.
+    #[test]
+    fn pick_session_shows_the_branch() {
+        use super::picker_row;
+        assert_eq!(
+            picker_row(
+                3,
+                "01JC",
+                Some("fix-auth".into()),
+                Some("fix-auth".into()),
+                "2h ago",
+                ""
+            ),
+            "  3) 01JC  fix-auth  ⎇ fix-auth  2h ago"
+        );
+        assert_eq!(
+            picker_row(
+                1,
+                "01JD",
+                None,
+                Some("hotl/01JD".into()),
+                "1m ago",
+                "  ↳ from 01JC"
+            ),
+            "  1) 01JD  ⎇ hotl/01JD  1m ago  ↳ from 01JC"
+        );
+        assert_eq!(
+            picker_row(2, "01JE", Some("plain".into()), None, "3d ago", ""),
+            "  2) 01JE  plain  3d ago"
+        );
+        assert_eq!(
+            super::parse_worktree(
+                &json!({"worktree": {"path": "/r/.git/hotl-worktrees/x", "branch": "x"}})
+            ),
+            Some(("/r/.git/hotl-worktrees/x".into(), "x".into()))
+        );
+        assert_eq!(super::parse_worktree(&json!({})), None);
+        assert_eq!(super::parse_worktree(&json!({"worktree": null})), None);
     }
 
     #[test]

@@ -165,14 +165,23 @@ fn main() {
             std::process::exit(block_on(tui::tui_main(rest)));
         }
         Some("acp") => std::process::exit(block_on(agent::acp_main())),
-        Some("bg") => std::process::exit(bg::bg_main(bg_prompt(&args), bg_name(&args).as_deref())),
+        Some("bg") => std::process::exit(bg::bg_main(
+            bg_prompt(&args),
+            bg_name(&args).as_deref(),
+            bg_worktree(&args).as_ref(),
+        )),
         Some("attach") => std::process::exit(block_on(attach::attach_main(
             args.get(1).map(String::as_str),
         ))),
         Some("approve") => std::process::exit(block_on(approve_cli::approve_main(&args[1..]))),
         Some("serve") => {
-            let (id, prompt, name) = parse_serve_args(&args);
-            std::process::exit(block_on(agent::serve_main(id, prompt, name)));
+            let ServeArgs {
+                id,
+                prompt,
+                name,
+                worktree,
+            } = parse_serve_args(&args);
+            std::process::exit(block_on(agent::serve_main(id, prompt, name, worktree)));
         }
         Some("setup") => {
             let force = args.iter().any(|a| a == "--force" || a == "-f");
@@ -231,6 +240,7 @@ fn print_help() {
 fn help_text() -> &'static str {
     "hotl — human on the loop\n\n\
          USAGE:\n  hotl [id-prefix]     console TUI (execute); -n/--name names the session\n  \
+         \x20                   -w/--worktree [name] work in a git worktree on branch <name> (default: hotl/<session id>)\n  \
          hotl -r [n|id|name]  resume: bare lists sessions; arg = list number, id-prefix, or name\n  \
          \x20                   -r --search <text> lists only sessions whose transcript mentions it\n  \
          hotl --fork-from <s> start a NEW session with another's history (s = the -r arg, or @last)\n  \
@@ -248,7 +258,7 @@ fn help_text() -> &'static str {
          hotl init <shell>    zsh: the `:` prefix plugin + completion (eval it in ~/.zshrc); bash/fish: completion\n  \
          hotl doctor          check provider keys, sandbox, config, session store\n  \
          hotl setup           write default config (safe defaults)\n  \
-         hotl gc [--dry-run]  prune old sessions/blobs per [retention]\n  \
+         hotl gc [--dry-run]  prune old sessions/blobs per [retention]; sweeps session worktrees when run in a repo\n  \
          hotl export <s>      print a session's transcript as Markdown (--html for a page); s = id, name, @last\n  \
          hotl stats           sessions, turns, tool calls, tokens and cost by model and by day (--days N, --json)\n  \
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
@@ -292,16 +302,36 @@ fn print_version() {
 }
 
 /// The optional opening prompt for `hotl bg`: the first non-flag arg that is
-/// not a flag's value.
+/// not a flag's value. `-w`'s value is optional, so a non-flag token right
+/// after it is its name — put the prompt first, or name the branch.
 fn bg_prompt(args: &[String]) -> Option<&str> {
-    let mut it = args.iter().skip(1);
+    let mut it = args.iter().skip(1).peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
             "-n" | "--name" => {
                 it.next(); // skip the flag's value
             }
+            "-w" | "--worktree" => {
+                if it.peek().is_some_and(|v| !v.starts_with('-')) {
+                    it.next();
+                }
+            }
             s if !s.starts_with('-') => return Some(s),
             _ => {}
+        }
+    }
+    None
+}
+
+/// The `-w`/`--worktree [name]` request for `hotl bg` (0065).
+fn bg_worktree(args: &[String]) -> Option<tui::WorktreeArg> {
+    let mut it = args.iter().skip(1).peekable();
+    while let Some(a) = it.next() {
+        if matches!(a.as_str(), "-w" | "--worktree") {
+            return Some(match it.peek() {
+                Some(v) if !v.starts_with('-') => tui::WorktreeArg::Named((*v).clone()),
+                _ => tui::WorktreeArg::Derived,
+            });
         }
     }
     None
@@ -320,26 +350,39 @@ fn bg_name(args: &[String]) -> Option<String> {
     None
 }
 
-/// `--id <id>`, `--prompt <p>`, `--name <n>` for `hotl serve`; a missing id
-/// is generated.
-fn parse_serve_args(args: &[String]) -> (String, Option<String>, Option<String>) {
+/// What `hotl serve` was started with: `--id <id>`, `--prompt <p>`,
+/// `--name <n>`, `--worktree <name|@derived>` (0065). A missing id is
+/// generated.
+struct ServeArgs {
+    id: String,
+    prompt: Option<String>,
+    name: Option<String>,
+    worktree: Option<tui::WorktreeArg>,
+}
+
+fn parse_serve_args(args: &[String]) -> ServeArgs {
     let mut id = None;
     let mut prompt = None;
     let mut name = None;
+    let mut worktree = None;
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--id" => id = it.next().cloned(),
             "--prompt" => prompt = it.next().cloned(),
             "--name" => name = it.next().cloned(),
+            // Always spelled on the wire: `@derived` is a request, an absent
+            // flag is none.
+            "--worktree" => worktree = it.next().map(|w| tui::WorktreeArg::from_wire(w)),
             _ => {}
         }
     }
-    (
-        id.unwrap_or_else(|| format!("bg-{}", std::process::id())),
+    ServeArgs {
+        id: id.unwrap_or_else(|| format!("bg-{}", std::process::id())),
         prompt,
         name,
-    )
+        worktree,
+    }
 }
 
 /// One-shot CLI paths run current_thread per the async policy (no pool
@@ -520,9 +563,43 @@ mod tests {
 
     #[test]
     fn serve_args_carry_a_name() {
-        let (_, _, name) =
-            super::parse_serve_args(&v(&["serve", "--id", "x", "--name", "fix-auth"]));
-        assert_eq!(name.as_deref(), Some("fix-auth"));
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--name", "fix-auth"]));
+        assert_eq!(a.name.as_deref(), Some("fix-auth"));
+        assert_eq!(a.worktree, None);
+    }
+
+    /// 0065: the derived case is spelled on the wire, so an absent flag and a
+    /// derived request never read the same.
+    #[test]
+    fn serve_args_carry_a_derived_worktree() {
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--worktree", "@derived"]));
+        assert_eq!(a.worktree, Some(crate::tui::WorktreeArg::Derived));
+        let a = super::parse_serve_args(&v(&["serve", "--id", "x", "--worktree", "fix-auth"]));
+        assert_eq!(
+            a.worktree,
+            Some(crate::tui::WorktreeArg::Named("fix-auth".into()))
+        );
+        // `hotl bg`: `-w` alone derives; a following non-flag token is its
+        // name, so the prompt goes first.
+        assert_eq!(
+            super::bg_worktree(&v(&["bg", "do the thing", "-w"])),
+            Some(crate::tui::WorktreeArg::Derived)
+        );
+        assert_eq!(
+            super::bg_prompt(&v(&["bg", "do the thing", "-w"])),
+            Some("do the thing")
+        );
+        assert_eq!(
+            super::bg_worktree(&v(&["bg", "-w", "fix-auth", "do the thing"])),
+            Some(crate::tui::WorktreeArg::Named("fix-auth".into()))
+        );
+        assert_eq!(
+            super::bg_prompt(&v(&["bg", "-w", "fix-auth", "do the thing"])),
+            Some("do the thing")
+        );
+        assert_eq!(super::bg_worktree(&v(&["bg", "hi"])), None);
+        assert!(super::help_text().contains("-w/--worktree [name]"));
+        assert!(super::help_text().contains("sweeps session worktrees"));
     }
 
     #[test]

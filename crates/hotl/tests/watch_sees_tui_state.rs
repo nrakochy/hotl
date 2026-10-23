@@ -166,3 +166,34 @@ fn watch_sees_idle_when_the_turn_finishes() {
     );
     assert_eq!(seen_by_watch(&state, &cmds), Status::Idle);
 }
+
+/// 0065 T9: a worktree session's branch rides the title between the name and
+/// the phase; watch still reads the phase and can read the branch.
+#[test]
+fn watch_reads_the_phase_and_the_branch_of_a_worktree_session() {
+    let mut state = session();
+    state.session_name = Some("fix-auth".into());
+    state.session_branch = Some("fix-auth".into());
+    let cmds = ask(&mut state);
+    let title = pane_title(&cmds);
+    assert!(title.contains("hotl · fix-auth ⎇ fix-auth"), "{title}");
+    assert_eq!(seen_by_watch(&state, &cmds), Status::Blocked);
+    assert_eq!(
+        watch_tmux::hotl_title_branch(&title).as_deref(),
+        Some("fix-auth")
+    );
+    let cmds = update(
+        &mut state,
+        Msg::PromptResult {
+            outcome_kind: "end_turn".into(),
+            outcome_text: None,
+            usage: serde_json::json!({}),
+            finished_at: None,
+        },
+    );
+    assert_eq!(seen_by_watch(&state, &cmds), Status::Idle);
+    assert_eq!(
+        watch_tmux::hotl_title_branch(&pane_title(&cmds)).as_deref(),
+        Some("fix-auth")
+    );
+}

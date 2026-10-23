@@ -49,6 +49,8 @@ fn memory_factory(mem: std::path::PathBuf) -> acp::SessionFactory {
         let provider = Arc::new(ScriptedProvider::new(vec![]));
         Ok(acp::SessionOpen {
             memory_mode: Some("read-write".into()),
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -193,6 +195,8 @@ fn scripted_factory() -> acp::SessionFactory {
         ]));
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -262,6 +266,8 @@ fn scripted_ask_user_factory() -> acp::SessionFactory {
         ]));
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {
                     concurrency: Default::default(),

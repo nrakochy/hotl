@@ -13,6 +13,10 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+/// The session-worktree sweep (0065 T8) lives with the git plumbing; `hotl gc`
+/// reaches it from here beside the retention report.
+pub use crate::worktree::{sweep_worktrees, WorktreeSweep};
+
 /// What to keep. A session is pruned if it exceeds *either* limit. Both `None`
 /// = keep everything (the safe default; GC is opt-in).
 #[derive(Debug, Clone, Default)]

@@ -12,6 +12,7 @@ fn obs(pane: &str) -> AgentObservation {
             argv: "claude".into(),
         },
         cwd: format!("/tmp/{pane}"),
+        branch: None,
         status: Status::Idle,
         status_line: None,
         prompt: None,

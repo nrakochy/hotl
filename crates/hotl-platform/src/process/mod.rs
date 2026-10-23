@@ -20,6 +20,39 @@ pub type ActiveProcessControl = WindowsProcessControl;
 #[cfg(windows)]
 pub type ActiveReaper = WindowsReaper;
 
+/// Whether a process with this pid exists right now (0065: `hotl gc` reads a
+/// worktree lock's pid). Unix: `kill(pid, 0)` — `EPERM` is alive too, just not
+/// ours. Windows: the process opens and has not exited.
+pub fn pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        // SAFETY: signal 0 delivers nothing; it only checks the pid.
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        // SAFETY: plain Win32 calls on a handle we close.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code: u32 = 0;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            ok && code == STILL_ACTIVE as u32
+        }
+    }
+}
+
 /// Two things Unix does with process groups and Windows does with job objects,
 /// behind one contract.
 pub trait ProcessControl: crate::sealed::Sealed {

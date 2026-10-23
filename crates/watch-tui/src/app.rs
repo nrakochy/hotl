@@ -236,6 +236,7 @@ mod tests {
                 argv: "claude".into(),
             },
             cwd: format!("/tmp/{pane}"),
+            branch: None,
             status,
             status_line: None,
             prompt: None,

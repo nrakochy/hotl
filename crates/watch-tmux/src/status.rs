@@ -116,6 +116,19 @@ fn hotl_title_status(title: &str) -> Option<Status> {
     })
 }
 
+/// The worktree branch a hotl title carries (0065): `hotl · name ⎇ branch —
+/// working` → `branch`. Between the name and the phase suffix, so the status
+/// read above is untouched. `None` for any other title.
+pub fn hotl_title_branch(title: &str) -> Option<String> {
+    let t = title.trim();
+    if t != "hotl" && !t.starts_with("hotl ") {
+        return None;
+    }
+    let (_, rest) = t.split_once(" ⎇ ")?;
+    let branch = rest.split(" — ").next()?.trim();
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 pub struct HotlDetector;
 impl StatusDetector for HotlDetector {
     fn classify(&self, sig: &Signals) -> Status {
@@ -422,6 +435,37 @@ enter to select · esc to cancel · ↑↓ to navigate";
     #[test]
     fn hotl_hint_only_tail_has_no_prompt() {
         assert_eq!(extract_prompt("hotl", "zsh", TUI_ASK_HINT), None);
+    }
+
+    /// 0065 T9: the branch sits between the name and the phase.
+    #[test]
+    fn hotl_title_status_still_reads_the_phase_with_a_branch_and_the_branch_parses() {
+        assert_eq!(
+            hotl_title_status("hotl · fix-auth ⎇ fix-auth — working"),
+            Some(Status::Working)
+        );
+        assert_eq!(
+            hotl_title_status("hotl ⎇ hotl/01JC — waiting on you"),
+            Some(Status::Blocked)
+        );
+        assert_eq!(
+            hotl_title_status("hotl · fix-auth ⎇ fix-auth"),
+            Some(Status::Idle)
+        );
+        assert_eq!(
+            hotl_title_branch("hotl · fix-auth ⎇ fix-auth — working").as_deref(),
+            Some("fix-auth")
+        );
+        assert_eq!(
+            hotl_title_branch("hotl ⎇ hotl/01JC — waiting on you").as_deref(),
+            Some("hotl/01JC")
+        );
+        assert_eq!(
+            hotl_title_branch("hotl · fix-auth ⎇ fix-auth").as_deref(),
+            Some("fix-auth")
+        );
+        assert_eq!(hotl_title_branch("hotl · fix-auth — working"), None);
+        assert_eq!(hotl_title_branch("vim ⎇ main"), None);
     }
 
     #[test]

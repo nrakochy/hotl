@@ -126,14 +126,52 @@ pub enum KeepSpec {
     Turns(usize),
 }
 
+/// What `-w`/`--worktree` asked for (0065): a branch by name, or one derived
+/// from the session id (`hotl/<id>`), which only exists once the log does.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorktreeArg {
+    Derived,
+    Named(String),
+}
+
+impl WorktreeArg {
+    /// How `hotl bg` spells it to `hotl serve`, and the ACP `worktree`
+    /// param: a derived request and an absent flag must differ on the wire.
+    pub(crate) fn wire(&self) -> &str {
+        match self {
+            Self::Derived => "@derived",
+            Self::Named(n) => n,
+        }
+    }
+
+    pub(crate) fn from_wire(raw: &str) -> Self {
+        match raw {
+            "@derived" => Self::Derived,
+            n => Self::Named(n.to_string()),
+        }
+    }
+
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::Derived => None,
+            Self::Named(n) => Some(n),
+        }
+    }
+}
+
 /// What a client asked the factory to produce.
 pub enum SessionSpec {
     New {
         name: Option<String>,
+        /// `-w [name]` (0065): open a git worktree for this session.
+        worktree: Option<WorktreeArg>,
     },
     Load {
         session_id: String,
         name: Option<String>,
+        /// `--no-worktree` (0065): reopen in the main checkout, tombstone the
+        /// chain's worktree.
+        no_worktree: bool,
     },
     /// A **new** session seeded with another's projection — optionally only a
     /// prefix of it — pinned to that session's fork-time tip. Unlike `Load`,
@@ -143,6 +181,9 @@ pub enum SessionSpec {
         session_id: String,
         keep: KeepSpec,
         name: Option<String>,
+        /// `-w [name]` on a fork opens a new worktree from `HEAD` and does not
+        /// inherit the parent's (0065).
+        worktree: Option<WorktreeArg>,
     },
 }
 
@@ -151,6 +192,12 @@ pub enum SessionSpec {
 pub struct SessionOpen {
     pub handle: SessionHandle,
     pub name: Option<String>,
+    /// The session's git worktree as `(path, branch)` (0065); the open reply's
+    /// `worktree`. Absent for a main-checkout session.
+    pub worktree: Option<(String, String)>,
+    /// The worktree's lock, held for the session's life: dropping it on a
+    /// clean close is what unlocks (0065 T7). `None` without a worktree.
+    pub lease: Option<hotl_store::worktree::Leased>,
     /// This session's effective permission mode at open (inherited-and-coerced
     /// on resume, else the configured default).
     /// INVARIANT: equals what the engine's `Rules` will actually enforce.
@@ -392,6 +439,9 @@ struct SessionState {
     store_id: String,
     handle: SessionHandle,
     drain: tokio::task::JoinHandle<()>,
+    /// The worktree lock (0065 T7): unlocked when this state drops — a
+    /// replaced session, a closed connection, a clean quit.
+    _lease: Option<hotl_store::worktree::Leased>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -455,6 +505,16 @@ async fn handle_request(
                 .pointer("/params/fork")
                 .and_then(Value::as_bool)
                 .unwrap_or(false);
+            // `-w [name]` (0065) rides as `worktree`: a branch name, or
+            // `@derived` for one named after the session id.
+            let worktree = msg
+                .pointer("/params/worktree")
+                .and_then(Value::as_str)
+                .map(WorktreeArg::from_wire);
+            let no_worktree = msg
+                .pointer("/params/noWorktree")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let spec = if method == "session/load" {
                 let keep = match keep_spec(msg) {
                     Ok(k) => k,
@@ -468,15 +528,26 @@ async fn handle_request(
                     )
                     .await;
                 }
+                if worktree.is_some() && !is_fork {
+                    return reply_err(
+                        writer,
+                        id,
+                        "params.worktree only applies to a new session or a fork — a resumed \
+                         session already has a worktree, or had none",
+                    )
+                    .await;
+                }
                 match msg.pointer("/params/sessionId").and_then(Value::as_str) {
                     Some(sid) if is_fork => SessionSpec::Fork {
                         session_id: sid.to_string(),
                         keep,
                         name,
+                        worktree,
                     },
                     Some(sid) => SessionSpec::Load {
                         session_id: sid.to_string(),
                         name,
+                        no_worktree,
                     },
                     None => {
                         return reply_err(writer, id, "session/load requires params.sessionId")
@@ -484,7 +555,7 @@ async fn handle_request(
                     }
                 }
             } else {
-                SessionSpec::New { name }
+                SessionSpec::New { name, worktree }
             };
             match factory(spec) {
                 Ok(open) => {
@@ -502,6 +573,7 @@ async fn handle_request(
                     let open_title = open.title.clone();
                     let open_model = open.model.clone().unwrap_or_else(|| info.model.clone());
                     let memory_mode = open.memory_mode.clone();
+                    let open_worktree = open.worktree.clone();
                     let sid = install_session(
                         open,
                         writer,
@@ -582,6 +654,11 @@ async fn handle_request(
                     obj.insert("model".into(), json!(open_model));
                     if let Some(m) = memory_mode {
                         obj.insert("memoryMode".into(), json!(m));
+                    }
+                    // The session's worktree (0065): absent for a main-checkout
+                    // session, so an old client sees exactly today's reply.
+                    if let Some((path, branch)) = open_worktree {
+                        obj.insert("worktree".into(), json!({"path": path, "branch": branch}));
                     }
                     reply_ok(writer, id, reply).await;
                 }
@@ -994,6 +1071,7 @@ async fn handle_request(
             let spec = SessionSpec::Load {
                 session_id: store_id,
                 name: None,
+                no_worktree: false,
             };
             match factory(spec) {
                 Ok(open) => {
@@ -1296,7 +1374,8 @@ fn install_session(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
     }
-    let state = start_session(
+    let lease = open.lease;
+    let mut state = start_session(
         open.handle,
         open.session_id,
         writer.clone(),
@@ -1307,6 +1386,7 @@ fn install_session(
         next_id,
         model.to_string(),
     );
+    state._lease = lease;
     let sid = state.id.clone();
     *session = Some(state);
     sid
@@ -1347,6 +1427,7 @@ fn start_session(
         store_id,
         handle,
         drain,
+        _lease: None,
     }
 }
 

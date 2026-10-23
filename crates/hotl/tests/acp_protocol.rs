@@ -67,8 +67,10 @@ fn scripted_factory_recording(
         // Echo the requested name back, as the real factory does — resolving
         // the open's name is the factory's job, not the protocol layer's.
         let name = match spec {
-            acp::SessionSpec::New { name } => name,
-            acp::SessionSpec::Load { name, session_id } => {
+            acp::SessionSpec::New { name, .. } => name,
+            acp::SessionSpec::Load {
+                name, session_id, ..
+            } => {
                 if let Some(loads) = &loads {
                     loads.lock().unwrap().push(session_id);
                 }
@@ -78,6 +80,7 @@ fn scripted_factory_recording(
                 name,
                 session_id,
                 keep,
+                ..
             } => {
                 if let Some(loads) = &loads {
                     loads
@@ -96,6 +99,8 @@ fn scripted_factory_recording(
         ]));
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -158,6 +163,8 @@ fn interrupted_factory(seen: Arc<std::sync::Mutex<Vec<String>>>) -> acp::Session
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
@@ -363,6 +370,8 @@ fn inherited_state_factory(effort: Option<Option<String>>) -> acp::SessionFactor
         }];
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![ScriptedProvider::text_reply(
@@ -535,6 +544,8 @@ async fn the_open_reply_carries_the_title_and_session_titled_is_broadcast() {
         ]));
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -850,6 +861,8 @@ async fn session_aside_acks_then_broadcasts_the_answer() {
         )]));
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -1247,6 +1260,8 @@ async fn overlapping_prompts_resolve_in_order() {
         ]));
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider,
@@ -1460,13 +1475,15 @@ async fn prompt_images_are_validated_at_the_wire() {
     // completes without this test also having to answer a permission ask.
     let factory: acp::SessionFactory = Box::new(move |spec| {
         let name = match spec {
-            acp::SessionSpec::New { name } => name,
+            acp::SessionSpec::New { name, .. } => name,
             acp::SessionSpec::Load { name, .. } | acp::SessionSpec::Fork { name, .. } => name,
         };
         let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![
@@ -1666,6 +1683,8 @@ async fn ask_user_round_trip_via_session_request_question() {
         ]));
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: hotl_engine::spawn_session_with_channels(
                 SessionDeps {
                     concurrency: Default::default(),
@@ -2233,6 +2252,8 @@ async fn a_resumed_session_runs_its_last_model_set() {
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![])),
@@ -2489,6 +2510,8 @@ async fn the_open_reply_carries_the_resumed_goal_and_a_forks_is_null() {
         let session_id = log.session_id.clone();
         Ok(acp::SessionOpen {
             memory_mode: None,
+            worktree: None,
+            lease: None,
             handle: spawn_session(SessionDeps {
                 concurrency: Default::default(),
                 provider: Arc::new(ScriptedProvider::new(vec![])),
@@ -2882,6 +2905,8 @@ fn memory_factory(
             effort: None,
             previous_model: None,
             memory_mode: Some(mode.as_str().to_string()),
+            worktree: None,
+            lease: None,
             session_id,
             warnings: Vec::new(),
             title: None,
@@ -3133,6 +3158,8 @@ fn jobs_factory(command: &str) -> acp::SessionFactory {
             effort: None,
             previous_model: None,
             memory_mode: None,
+            worktree: None,
+            lease: None,
             session_id,
             warnings: Vec::new(),
             title: None,
@@ -3370,6 +3397,8 @@ fn children_factory() -> acp::SessionFactory {
             effort: None,
             previous_model: None,
             memory_mode: None,
+            worktree: None,
+            lease: None,
             session_id,
             warnings: Vec::new(),
             title: None,

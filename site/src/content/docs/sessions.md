@@ -87,6 +87,57 @@ neither means anything without `--fork-from`.
 forks and resumes eventually sheds its oldest history, with a warning when it
 does. When you see that warning, start fresh rather than chaining further.
 
+## Worktrees
+
+```
+hotl -w fix-auth              # a fresh git worktree on branch fix-auth, from the local HEAD
+hotl -w                       # branch and directory named after the session id: hotl/<id>
+hotl -p "do it" -w fix-auth   # headless too; hotl bg -w fix-auth as well
+hotl -r fix-auth              # reopens the same worktree
+hotl -r fix-auth --no-worktree   # …or back in the main checkout
+```
+
+`-w [name]` starts the session in its own git worktree so two sessions on
+one repo stop stepping on each other. The worktree lives at
+`<repo>/.git/hotl-worktrees/<name>` — under `.git/`, so it is invisible to
+the main checkout's `git status`, `glob` and `rg`, and inside the sandbox's
+write floor without moving it. Run `hotl -w` from the repository root; from a
+subdirectory it refuses and names the root. The branch is cut from your
+**local** `HEAD`, never a remote ref, so unpushed commits are there; an
+existing, free branch is reused.
+
+What changes inside the session: `read`/`write`/`edit`/`glob`/`grep` resolve
+relative paths in the worktree, `bash` starts there, the orientation item
+the model reads shows the worktree's branch and status, and sub-agents
+spawned from the session merge back into **it**. The first transcript line
+says `working in worktree .git/hotl-worktrees/fix-auth on branch fix-auth`;
+the terminal title reads `hotl · fix-auth ⎇ fix-auth`, and `hotl watch`
+shows the branch. `-w name` also names the session (`-n name`) unless you
+pass `-n` yourself; a bare `-w` names nothing.
+
+Rules worth knowing:
+
+- **Uncommitted changes stay where they are.** The worktree starts at
+  `HEAD`; your dirty main checkout is not copied into it (Amp's shape).
+- **Kept on exit.** Quitting never removes a worktree; `hotl gc`, run in the
+  repo, does — see [configuration.md](../configuration/#hotl-gc). While a
+  session is open the worktree is locked (`git worktree list` shows
+  `locked hotl <id> pid <n>`); a clean exit unlocks it, a crash leaves the
+  lock for `gc` to read.
+- **Resume reopens it.** `hotl -r` on a worktree session relocks and roots
+  there; a directory you deleted is recreated from its branch; a branch you
+  deleted refuses, and `--no-worktree` resumes in the main checkout and
+  remembers that. A second `hotl -r` of a session that is still open
+  elsewhere is refused. A fork inherits its parent's worktree; `--fork-from
+  X -w name` opens a new one from the current `HEAD` instead. `-w` with `-r`
+  is an error.
+- **`bash` is not confined to the worktree.** The kernel floor is the
+  checkout you ran `hotl` in; a `cd ../../..` reaches the main tree. The
+  file tools are rooted; `bash` is cooperative.
+- **Nothing gitignored is there.** A worktree has no `.env` and no
+  `target/`; point `CARGO_TARGET_DIR` (or your build's equivalent) at a
+  shared directory if cold builds hurt.
+
 ## Phase pipelines
 
 The reason forking exists. Multi-phase work — explore, then plan, then refine —

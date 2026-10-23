@@ -16,7 +16,7 @@ Reference for the command surface, config files, and environment variables of th
 | `hotl --fork-from <n\|id\|name\|@last>` | Start a **new** session seeded with another's history, pinned to that session's state at fork time (the original can keep running). `--keep-turns <n>` / `--keep <items>` fork at a prefix instead of the head; `@last` is the newest session. Works headless too (`hotl -p "…" --fork-from …`). See [sessions.md](../sessions/). |
 | `hotl bg [prompt]` | Background a session as a detached socket server; `hotl attach` to reach it. See [backgrounding.md](../backgrounding/). |
 | `hotl attach [id]` | Connect to a backgrounded session (bare: list live ones). |
-| `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/blobs per `[retention]`. See [below](#hotl-gc). |
+| `hotl gc [--dry-run] [--days N] [--keep N]` | Prune old sessions/blobs per `[retention]`; in a git repo, also sweep session worktrees. See [below](#hotl-gc). |
 | `hotl setup [--force]` | Write a commented starter `config.toml` (never overwrites without `--force`). |
 | `hotl doctor` | Non-mutating checks: provider/keys, sandbox, config, allow-rules, session store, MCP trust, memory, secrets audit. Exit 1 if any check FAILs. |
 | `hotl init zsh\|bash\|fish` | Shell integration to stdout. zsh: the `:` prefix plugin plus tab completion (`eval "$(hotl init zsh)"` in `~/.zshrc`); bash and fish: completion only. See [shell.md](../shell/). |
@@ -792,6 +792,16 @@ Protected paths outrank admin grants; admin denies outrank everything.
 ## hotl gc
 
 `hotl gc [--dry-run] [--days N] [--keep N]` prunes whole sessions (log + evicted-result blobs, plus any legacy `shadow/<ulid>.git` left by releases before 0.26) older than `max_age_days` or beyond `max_sessions`, and sweeps dead backgrounded-session sockets. Flags override `[retention]`. With no policy and no flags it's a no-op that tells you so. `--dry-run` lists what would go without deleting.
+
+Run inside a git repository, `hotl gc` also sweeps the session worktrees under `.git/hotl-worktrees/` (`hotl -w`, see [sessions.md](../sessions/#worktrees)), with or without a retention policy. Each one lands in one of three bins:
+
+| Bin | Rule | What happens |
+|---|---|---|
+| live | the lock names a pid that is running | kept: `kept fix-auth: live (session 01JC…)` |
+| clean, session gone | not live, the session's log is gone, nothing uncommitted, and the branch is merged or empty | removed without an ask, branch deleted (`branch -d`) |
+| everything else | the session log still exists, or uncommitted changes, or commits not on your branch | asks `fix-auth (fix-auth): 3 commits not on master, dirty — remove? [y/N]` (default no); `--dry-run` or no terminal lists it and deletes nothing |
+
+The no-ask bin needs a session's log to be gone, which is `[retention]`'s doing — without a policy, every worktree goes through the ask. An unmerged branch is never deleted. The startup prune never sweeps worktrees.
 
 ## hotl mcp
 

@@ -206,6 +206,8 @@ rules never move the kernel floor in either direction.
 
 On hosts with no sandbox mechanism (older Linux kernels, or `HOTL_SANDBOX=off`), the floor is simply absent — every `bash` ask is marked `UNSANDBOXED`, and allow-rules for `bash` stop working. The gate still holds; the confinement doesn't.
 
+The floor is the checkout you ran `hotl` in, fixed at startup. A session started with `hotl -w` ([sessions.md](../sessions/#worktrees)) works in a worktree *under* that checkout's `.git/`, so the floor is unchanged: the file tools (`read`/`write`/`edit`/`glob`/`grep`) are rooted in the worktree and cannot name their way out of it, while `bash` starts there but can still `cd` back into the main tree — the same cooperative isolation sub-agent worktrees have.
+
 ### `sandboxed:` means it was proven, not that it was configured
 
 At startup hotl spawns one throwaway sandboxed process that tries to write a file outside the confinement, and only reports the floor as enforced if that write **fails**. Until this check existed, "enforced" meant "the sandbox binary is on disk" — and since that single answer is what lets `bash` allow-rules auto-approve without asking you, a profile that failed to apply for any reason meant *unconfined* commands being auto-approved silently. Now a host that can't demonstrate confinement degrades loudly instead of claiming it.

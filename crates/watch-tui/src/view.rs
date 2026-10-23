@@ -56,7 +56,12 @@ pub fn rows(agents: &[AgentObservation], cursor: usize, tick: u32) -> Vec<Row> {
     for (idx, o) in agents.iter().enumerate() {
         out.push(Row::Agent {
             glyph: glyph_for(o.status, tick),
-            name: project_name(&o.cwd),
+            // The worktree branch (0065) rides after the project: the cwd is
+            // the main checkout for a hotl worktree session.
+            name: match &o.branch {
+                Some(b) => format!("{} ⎇ {b}", project_name(&o.cwd)),
+                None => project_name(&o.cwd),
+            },
             subtitle: o
                 .status_line
                 .clone()
@@ -200,6 +205,7 @@ mod tests {
                 argv: "claude".into(),
             },
             cwd: cwd.into(),
+            branch: None,
             status,
             status_line: None,
             prompt: None,

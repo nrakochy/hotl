@@ -587,6 +587,9 @@ pub struct State {
     /// A generated title (0071 T4), shown by the badge and the terminal title
     /// only while the session has no name — a label, never an address.
     pub session_title: Option<String>,
+    /// The git branch of the session's worktree (0065), from the open reply;
+    /// rides the title so `hotl watch` can show it.
+    pub session_branch: Option<String>,
     /// A `/btw` in flight (0071 T5): the question and ticks since it was
     /// sent, for the strip's `aside · Ns` segment. `None` = none pending.
     pub aside_pending: Option<(String, u64)>,
@@ -784,6 +787,7 @@ impl State {
             pending_auto_rules: std::collections::HashMap::new(),
             session_name: None,
             session_title: None,
+            session_branch: None,
             aside_pending: None,
             mode: "ask".into(),
             plan: false,
@@ -1094,9 +1098,16 @@ fn title_cmds(state: &State, suffix: &str) -> Vec<Cmd> {
 }
 
 fn title(state: &State, suffix: &str) -> String {
+    // The branch (0065) sits between the name and the phase: `hotl watch`
+    // reads the prefix and the suffix and parses the branch from between.
+    let branch = state
+        .session_branch
+        .as_deref()
+        .map(|b| format!(" ⎇ {b}"))
+        .unwrap_or_default();
     match state.session_name.as_ref().or(state.session_title.as_ref()) {
-        Some(n) => format!("hotl · {n}{suffix}"),
-        None => format!("hotl{suffix}"),
+        Some(n) => format!("hotl · {n}{branch}{suffix}"),
+        None => format!("hotl{branch}{suffix}"),
     }
 }
 
@@ -5066,6 +5077,23 @@ mod tests {
         assert!(cmds.is_empty());
         assert!(last_notice(&s).starts_with("usage: /btw <question>"));
         assert!(s.aside_pending.is_none());
+    }
+
+    /// 0065 T9: the worktree branch rides the title between the name and the
+    /// phase suffix — and alone after `hotl` when the session has no name.
+    #[test]
+    fn title_carries_the_branch_between_name_and_phase() {
+        let mut s = State::test_default();
+        s.session_branch = Some("fix-auth".into());
+        assert_eq!(title(&s, " — working"), "hotl ⎇ fix-auth — working");
+        s.session_name = Some("fix-auth".into());
+        assert_eq!(
+            title(&s, " — working"),
+            "hotl · fix-auth ⎇ fix-auth — working"
+        );
+        assert_eq!(title(&s, ""), "hotl · fix-auth ⎇ fix-auth");
+        s.session_branch = None;
+        assert_eq!(title(&s, ""), "hotl · fix-auth");
     }
 
     /// 0071 T4: the badge and the terminal title show the generated title

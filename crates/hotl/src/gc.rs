@@ -22,6 +22,11 @@ pub fn gc_main(args: &[String]) -> i32 {
         max_sessions: flag_keep.or(cfg.retention.max_sessions),
     };
 
+    // The session-worktree sweep (0065 T8) runs first and regardless of the
+    // policy: it is about the repo you are standing in, not the store.
+    let data_dir = data_dir();
+    sweep_worktrees_here(&data_dir.join("sessions"), dry_run);
+
     if policy.is_noop() {
         println!(
             "no retention policy set — nothing pruned.\n\
@@ -30,7 +35,6 @@ pub fn gc_main(args: &[String]) -> i32 {
         return 0;
     }
 
-    let data_dir = data_dir();
     let report = gc(&data_dir, &policy, dry_run);
     let sockets = sweep_dead_sockets(dry_run);
 
@@ -51,6 +55,61 @@ pub fn gc_main(args: &[String]) -> i32 {
         }
     }
     0
+}
+
+/// `hotl gc` inside a git repo: sort every `.git/hotl-worktrees/*` into live
+/// (kept), clean orphan (removed), or ask (y/N on a tty, default N; listed
+/// and kept otherwise). Outside a repo nothing is printed.
+fn sweep_worktrees_here(sessions_dir: &std::path::Path, dry_run: bool) {
+    let Ok(cwd) = std::env::current_dir() else {
+        return;
+    };
+    if hotl_store::worktree::list_session_worktrees(&cwd).is_empty() {
+        return;
+    }
+    let tty = {
+        use std::io::IsTerminal;
+        std::io::stdin().is_terminal()
+    };
+    let mut ask = |listed: &hotl_store::worktree::Listed, reason: &str| -> bool {
+        if !tty {
+            return false;
+        }
+        let name = listed
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let branch = listed.branch.as_deref().unwrap_or("detached");
+        eprint!("{name} ({branch}): {reason} — remove? [y/N] ");
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim(), "y" | "Y" | "yes")
+    };
+    let sweep = hotl_store::retention::sweep_worktrees(
+        &cwd,
+        sessions_dir,
+        dry_run,
+        &hotl_platform::process::pid_alive,
+        &mut ask,
+    );
+    let verb = if dry_run { "would remove" } else { "removed" };
+    for name in &sweep.removed {
+        println!("{verb} worktree {name} (branch merged)");
+    }
+    for (name, sid) in &sweep.kept_live {
+        println!("kept {name}: live (session {sid})");
+    }
+    for (name, reason) in &sweep.kept_declined {
+        let hint = if dry_run || !tty {
+            " (answer y to remove)"
+        } else {
+            ""
+        };
+        println!("kept {name}: {reason}{hint}");
+    }
 }
 
 /// Remove `run/<id>.sock` files whose server is gone (connect refused). The
