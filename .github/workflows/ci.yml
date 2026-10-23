@@ -20,6 +20,13 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  # No debuginfo beyond line tables: faster links (PDBs on Windows) and a
+  # smaller cache to save. Backtraces keep file:line.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  # Every harness crate; the watch crates have their own job.
+  HARNESS_EXCLUDE: --workspace --exclude hotl-theme --exclude hotl-watch-types --exclude hotl-watch-tmux --exclude hotl-watch-listener --exclude hotl-watch-tui
+
 jobs:
   # Workspace-wide formatting gate. Separate from the build jobs so a
   # style-only failure is legible at a glance, and cheap (no build cache).
@@ -43,6 +50,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: watch
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Clippy (watch crates)
         run: cargo clippy -p hotl-theme -p hotl-watch-types -p hotl-watch-tmux -p hotl-watch-listener -p hotl-watch-tui --all-targets -- -D warnings
       - name: Test (watch crates)
@@ -59,48 +68,64 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      # Saved even when the suite fails: rust-cache's default skips the save
+      # then, and a run of red masters left this job building cold every time.
       - uses: Swatinem/rust-cache@v2
         with:
           key: harness
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       # The grep tool spawns the `rg` binary, which the runner image does not
       # ship — without it the grep test dies at spawn, before reaching the
       # exit-code semantics it exists to pin. Installed rather than
       # skipped-when-absent: a test that quietly evaporates on the one machine
       # gating master is not coverage.
-      - name: Install ripgrep
-        run: sudo apt-get update && sudo apt-get install -y ripgrep
+      #
       # The tmux smoke (crates/hotl/tests/tmux_smoke.rs) drives the real binary
-      # under a private tmux server; same rule as ripgrep — installed, and
+      # under a private tmux server; same rule — installed, and
       # HOTL_TMUX_SMOKE=required below turns a skip into a failure here.
-      - name: Install tmux
-        run: sudo apt-get install -y tmux
+      - name: Install ripgrep and tmux
+        run: sudo apt-get update && sudo apt-get install -y ripgrep tmux
       - name: Clippy (harness crates + binary)
-        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-provider-openai-responses -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-retrieval -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --all-targets -- -D warnings
+        run: cargo clippy ${{ env.HARNESS_EXCLUDE }} --all-targets -- -D warnings
       - name: Test (harness crates + binary)
         # `--no-fail-fast`: run every crate's tests even after one fails, so a
         # single run surfaces the whole failure set instead of one-per-round.
         env:
           HOTL_TMUX_SMOKE: required
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-provider-openai-responses -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-retrieval -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --locked --no-fail-fast
+        run: cargo test ${{ env.HARNESS_EXCLUDE }} --locked --no-fail-fast
       # The Anthropic marker budget is enforced by a runtime compare, not the
-      # `debug_assert` beside it; only a release build proves that. Linux
-      # only — the invariant is platform-independent, a second release build
-      # is not.
+      # `debug_assert` beside it; only a release build proves that, and only
+      # the two `marker` tests exercise it. LTO is off: the assert is compiled
+      # out either way, and fat release settings only add build time. Linux
+      # only — the invariant is platform-independent.
       - name: Test (release profile, cache-marker budget)
-        run: cargo test --release -p hotl-provider-anthropic --locked
+        env:
+          CARGO_PROFILE_RELEASE_LTO: "false"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+        run: cargo test --release -p hotl-provider-anthropic --locked marker
+      # The whole suite, not just the cfg-gated tests: the feature coerces the
+      # permission mode at runtime, which every test through the rules sees.
+      # One invocation so both crates share one build. Linux only — the
+      # coercion is platform-independent.
       - name: Test (security-enforced feature)
-        run: |
-          cargo test -p hotl-tools --features security-enforced --locked
-          cargo test -p hotl --features security-enforced --locked
+        run: cargo test -p hotl-tools -p hotl --features hotl/security-enforced --locked
       # Decision D1's escape hatch, gated because it is easy to break silently:
       # every internal crate between `hotl` and `hotl-tools` has to opt out of
       # default features *and* forward `minify`, or feature unification pulls
       # the C-compiling tree-sitter stack back in and this build stops being
-      # pure Rust. A `cargo check` would not notice; the grep does.
+      # pure Rust. A `cargo check` would not notice; the grep does. The grep
+      # also runs against the Windows target graph, so the Windows leg need
+      # not rebuild for it.
       - name: Build without the minify feature (no C toolchain)
         run: |
           cargo test -p hotl --no-default-features --locked
-          ! cargo tree -p hotl --no-default-features -e normal | grep -q tree-sitter
+          for target in x86_64-unknown-linux-gnu x86_64-pc-windows-msvc; do
+            if cargo tree -p hotl --no-default-features -e normal --target "$target" | grep -q tree-sitter; then
+              echo "::error::tree-sitter is in the no-minify graph for $target"
+              exit 1
+            fi
+          done
 
   # The Windows twin of `harness`. Real execution, not a cross-check: the
   # `msrv` job already catches Windows-breaking *compilation* on every PR, and
@@ -110,8 +135,14 @@ jobs:
   # Clippy with `-D warnings` on this leg is what keeps the inactive `#[cfg]`
   # arm honest — a split generates `unused_imports`/`dead_code` on the other
   # arm constantly, and nothing else in CI compiles that arm.
+  #
+  # The feature variants (security-enforced, no-minify) run on Linux only:
+  # neither has Windows-specific behavior, and they cost this leg ~4 minutes.
   harness-windows:
     runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -120,6 +151,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: harness-windows
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       # Same reason as the Linux leg: the grep tool spawns `rg`, and a test
       # that evaporates at spawn is not coverage. Chocolatey exits 0 even when
       # its feed 503s and installs nothing, so retry until `rg` is actually
@@ -142,24 +175,16 @@ jobs:
           if ($rg) { Add-Content -Path $env:GITHUB_PATH -Value $rg.DirectoryName }
           if (-not (Get-Command rg -ErrorAction SilentlyContinue)) { throw "ripgrep is not installed after 5 attempts" }
           rg --version
+      # nextest runs every test binary in one pool instead of one binary at a
+      # time — the suite was ~5 minutes serial here. Prebuilt from nexte.st,
+      # the same trust shape as dist's installer. It skips doctests; Linux
+      # runs those.
+      - name: Install cargo-nextest
+        run: curl -LsSf https://get.nexte.st/latest/windows-tar | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
       - name: Clippy (harness crates + binary)
-        run: cargo clippy -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-provider-openai-responses -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-retrieval -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --all-targets -- -D warnings
+        run: cargo clippy ${{ env.HARNESS_EXCLUDE }} --all-targets -- -D warnings
       - name: Test (harness crates + binary)
-        # `--no-fail-fast`: run every crate's tests even after one fails, so a
-        # single run surfaces the whole failure set instead of one-per-round.
-        run: cargo test -p hotl-types -p hotl-platform -p hotl-provider -p hotl-provider-anthropic -p hotl-provider-openai -p hotl-provider-openai-responses -p hotl-minify -p hotl-tools -p hotl-store -p hotl-context -p hotl-retrieval -p hotl-mcp -p hotl-tui -p hotl-engine -p hotl-workflow -p hotl-testkit -p hotl --locked --no-fail-fast
-      - name: Test (security-enforced feature)
-        run: |
-          cargo test -p hotl-tools --features security-enforced --locked
-          cargo test -p hotl --features security-enforced --locked
-      # windows-latest ships MSVC Build Tools, so the six tree-sitter grammars
-      # compile with no extra setup — but the feature-unification guard still
-      # has to run here, because a crate forgetting `default-features = false`
-      # breaks the pure-Rust build on every platform at once.
-      - name: Build without the minify feature (no C toolchain)
-        run: |
-          cargo test -p hotl --no-default-features --locked
-          if (cargo tree -p hotl --no-default-features -e normal | Select-String -Quiet tree-sitter) { exit 1 }
+        run: cargo nextest run ${{ env.HARNESS_EXCLUDE }} --locked --no-fail-fast
       # Git for Windows puts `sh.exe` on the runner, so the leg above exercises
       # the bash tool for real. This one removes it from PATH and asserts the
       # tool drops out of the registry cleanly rather than falling back to a
@@ -194,6 +219,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: msrv
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/master' }}
       - name: Check at the declared MSRV
         run: cargo check --workspace --locked --all-targets
       # NO Windows cross-check here. It was tried and it cannot work: `ring`'s
