@@ -89,6 +89,7 @@ struct SkillMeta {
 pub struct SkillTool {
     entries: Vec<SkillEntry>,
     description: String,
+    report: CatalogReport,
     /// One rule per skill with `paths:` (0068 D3); the engine matches tool
     /// input paths against them and injects the hint.
     path_rules: Vec<SkillPathRule>,
@@ -165,6 +166,20 @@ pub struct SkillRoots {
     pub claude_user: Option<PathBuf>,
     /// Tier 7: `~/.claude/plugins/cache`.
     pub plugin_cache: Option<PathBuf>,
+    /// The always-sent roster must fit this many bytes (0068 D6); the caller
+    /// converts its token budget with the session's tokenizer profile.
+    /// `None` = unbounded (today's roster).
+    pub catalog_budget_bytes: Option<usize>,
+}
+
+/// How the roster was made to fit its budget (D6): every rung taken, for
+/// `hotl skills list` and `hotl doctor`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CatalogReport {
+    pub bytes: usize,
+    pub budget_bytes: Option<usize>,
+    /// One line per ladder rung taken, in order. Empty = nothing moved.
+    pub steps: Vec<String>,
 }
 
 impl SkillRoots {
@@ -195,6 +210,7 @@ impl SkillRoots {
             agents_user: agents.then(|| home.join(".agents/skills")),
             claude_user: claude.then(|| home.join(".claude/skills")),
             plugin_cache: claude.then(|| home.join(".claude/plugins/cache")),
+            catalog_budget_bytes: None,
         }
     }
 
@@ -265,11 +281,12 @@ impl SkillTool {
                 e.path.display()
             ));
         }
-        let description = describe(&entries);
+        let (description, report) = describe_within(&entries, roots.catalog_budget_bytes);
         (
             Some(Self {
                 entries,
                 description,
+                report,
                 path_rules,
             }),
             warnings,
@@ -279,6 +296,11 @@ impl SkillTool {
     /// The compiled `paths:` rules, for the engine's hint (0068 D3).
     pub fn path_rules(&self) -> &[SkillPathRule] {
         &self.path_rules
+    }
+
+    /// How the roster fit its budget (D6).
+    pub fn catalog_report(&self) -> &CatalogReport {
+        &self.report
     }
 
     /// One row per skill, name-sorted — `hotl skills list`.
@@ -356,18 +378,88 @@ fn in_roster(e: &&SkillEntry) -> bool {
     model_visible(e) && e.paths.is_empty()
 }
 
+/// How far one source has been squeezed on the budget ladder (D6).
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
+enum Rung {
+    /// Every name, unless the source is past `ROLLUP_THRESHOLD` (then the
+    /// sample — today's rollup).
+    Full,
+    /// Three names and a count, whatever the size.
+    Sample,
+    /// `source (N)` and nothing else.
+    Count,
+    /// Off the roster; counted in the trailer.
+    Dropped,
+}
+
 /// The always-sent tool description: one line per source, large sources
 /// collapsed. Descriptions are deliberately absent — `query` searches
 /// them, including inside collapsed sources, so a skill that is not named
-/// here is still reachable.
-fn describe(entries: &[SkillEntry]) -> String {
-    let mut sources: Vec<(u8, &str)> = Vec::new();
+/// here is still reachable. With a budget the roster is squeezed one rung
+/// at a time, lowest tier first, until it fits; tier 0 (the owner's flat
+/// root) never moves, so an unmeetable budget keeps it and says how many
+/// sources went.
+fn describe_within(entries: &[SkillEntry], budget: Option<usize>) -> (String, CatalogReport) {
+    let mut sources: Vec<(u8, &str, Rung)> = Vec::new();
     for e in entries.iter().filter(in_roster) {
-        if !sources.iter().any(|(_, s)| *s == e.source.as_str()) {
-            sources.push((e.tier, &e.source));
+        if !sources.iter().any(|(_, s, _)| *s == e.source.as_str()) {
+            // A source past the rollup threshold starts at the sample —
+            // today's rollup — so its first rung is a real change.
+            let count = entries
+                .iter()
+                .filter(in_roster)
+                .filter(|x| x.source == e.source)
+                .count();
+            let rung = if count > ROLLUP_THRESHOLD {
+                Rung::Sample
+            } else {
+                Rung::Full
+            };
+            sources.push((e.tier, &e.source, rung));
         }
     }
-    sources.sort_unstable();
+    sources.sort_unstable_by(|a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+    let mut steps = Vec::new();
+    loop {
+        let text = render_roster(entries, &sources);
+        let fits = budget.is_none_or(|b| text.len() <= b);
+        // Lowest tier first (highest number), then name order within a tier.
+        let next = sources
+            .iter_mut()
+            .rev()
+            .filter(|(tier, _, rung)| *tier > 0 && *rung < Rung::Dropped)
+            .min_by_key(|(tier, name, _)| (std::cmp::Reverse(*tier), name.to_string()));
+        match (fits, next) {
+            (true, _) | (false, None) => {
+                return (
+                    text.clone(),
+                    CatalogReport {
+                        bytes: text.len(),
+                        budget_bytes: budget,
+                        steps,
+                    },
+                )
+            }
+            (false, Some((_, name, rung))) => {
+                *rung = match rung {
+                    Rung::Full => Rung::Sample,
+                    Rung::Sample => Rung::Count,
+                    _ => Rung::Dropped,
+                };
+                steps.push(format!(
+                    "{name}: {}",
+                    match rung {
+                        Rung::Sample => "collapsed to three names and a count",
+                        Rung::Count => "collapsed to a count",
+                        _ => "dropped from the roster ({\"query\"} still reaches it)",
+                    }
+                ));
+            }
+        }
+    }
+}
+
+fn render_roster(entries: &[SkillEntry], sources: &[(u8, &str, Rung)]) -> String {
     let mut out = String::from(
         "Load one of the user's saved skills (procedures/checklists). \
          {\"name\"} loads one and is the usual call; {\"query\"} searches \
@@ -375,24 +467,37 @@ fn describe(entries: &[SkillEntry]) -> String {
          below); {\"source\"} lists one source; no arguments lists \
          everything.",
     );
-    for (_, source) in sources {
+    let mut dropped = 0;
+    for (_, source, rung) in sources {
         let names: Vec<&str> = entries
             .iter()
             .filter(in_roster)
-            .filter(|e| e.source == source)
+            .filter(|e| e.source == *source)
             .map(|e| e.name.as_str())
             .collect();
-        out.push_str("\n  ");
-        if names.len() > ROLLUP_THRESHOLD {
-            out.push_str(&format!(
-                "{source} ({}): {}, +{} more — {{\"source\":\"{source}\"}} lists them",
+        match *rung {
+            Rung::Dropped => {
+                dropped += 1;
+                continue;
+            }
+            Rung::Full => out.push_str(&format!("\n  {source}: {}", names.join(", "))),
+            Rung::Sample => out.push_str(&format!(
+                "\n  {source} ({}): {}, +{} more — {{\"source\":\"{source}\"}} lists them",
                 names.len(),
-                names[..ROLLUP_SAMPLE].join(", "),
-                names.len() - ROLLUP_SAMPLE,
-            ));
-        } else {
-            out.push_str(&format!("{source}: {}", names.join(", ")));
+                names[..names.len().min(ROLLUP_SAMPLE)].join(", "),
+                names.len().saturating_sub(ROLLUP_SAMPLE),
+            )),
+            Rung::Count => out.push_str(&format!(
+                "\n  {source} ({}) — {{\"source\":\"{source}\"}} lists them",
+                names.len()
+            )),
         }
+    }
+    if dropped > 0 {
+        out.push_str(&format!(
+            "\n  +{dropped} more source{} — {{\"query\"}} searches them",
+            if dropped == 1 { "" } else { "s" }
+        ));
     }
     out
 }
@@ -1031,8 +1136,162 @@ mod tests {
             agents_user: None,
             claude_user: include_claude.then(|| claude_user.to_path_buf()),
             plugin_cache: include_claude.then(|| plugin_cache.to_path_buf()),
+            catalog_budget_bytes: None,
         })
         .0
+    }
+
+    /// `n` skills under `root/<name>/SKILL.md`, names `prefix-000`….
+    fn many(root: &Path, prefix: &str, n: usize) {
+        for i in 0..n {
+            write_skill(
+                &root.join(format!("{prefix}-{i:03}")),
+                &format!("name: {prefix}-{i:03}\ndescription: number {i}"),
+                "body",
+            );
+        }
+    }
+
+    /// 300-skill marketplace + 20-skill user root + flat: the marketplace
+    /// collapses first, then the user root, and the flat root never moves.
+    #[test]
+    fn the_roster_fits_its_budget_by_collapsing_the_lowest_tier_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("skills");
+        std::fs::create_dir_all(&flat).unwrap();
+        for n in ["deploy", "release", "review"] {
+            std::fs::write(flat.join(format!("{n}.md")), format!("# {n}\n")).unwrap();
+        }
+        many(&dir.path().join("mkt"), "mkt", 300);
+        many(&dir.path().join("agents"), "user", 20);
+        let roots = SkillRoots {
+            flat: Some(flat),
+            marketplaces: vec![("mkt".into(), dir.path().join("mkt"))],
+            agents_user: Some(dir.path().join("agents")),
+            catalog_budget_bytes: None,
+            ..Default::default()
+        };
+        let (tool, _) = SkillTool::with_roots(&roots);
+        let free = tool.unwrap();
+        // Unbounded: the two big sources are already at today's rollup.
+        assert!(free.catalog_report().steps.is_empty());
+        let unbounded = free.description().len();
+
+        // A budget just under the unbounded size: one rung on the lowest tier.
+        let (tool, _) = SkillTool::with_roots(&SkillRoots {
+            catalog_budget_bytes: Some(unbounded - 1),
+            ..roots.clone()
+        });
+        let tool = tool.unwrap();
+        let report = tool.catalog_report();
+        assert_eq!(report.steps.len(), 1, "{report:?}");
+        assert!(
+            report.steps[0].starts_with("agents:"),
+            "lowest tier first: {report:?}"
+        );
+        assert!(report.bytes < unbounded);
+        assert!(
+            tool.description().contains("mkt (300): mkt-000"),
+            "mkt untouched: {}",
+            tool.description()
+        );
+        assert!(
+            tool.description().contains("agents (20) —"),
+            "{}",
+            tool.description()
+        );
+
+        // Tight: both big sources go; the flat root stays whole.
+        let (tool, _) = SkillTool::with_roots(&SkillRoots {
+            catalog_budget_bytes: Some(330),
+            ..roots.clone()
+        });
+        let tool = tool.unwrap();
+        let desc = tool.description();
+        assert!(desc.contains("hotl: deploy, release, review"), "{desc}");
+        assert!(
+            desc.contains("+2 more sources — {\"query\"} searches them"),
+            "{desc}"
+        );
+        assert!(desc.len() <= 330, "{} bytes: {desc}", desc.len());
+        let steps = &tool.catalog_report().steps;
+        assert!(
+            steps.iter().filter(|s| s.starts_with("agents:")).count() == 2,
+            "{steps:?}"
+        );
+        assert!(
+            steps.iter().filter(|s| s.starts_with("mkt:")).count() == 2,
+            "{steps:?}"
+        );
+        // Every dropped skill is still loadable and searchable.
+        assert!(tool
+            .run_impl(&json!({"name": "mkt-299"}))
+            .content
+            .contains("body"));
+        assert!(tool
+            .run_impl(&json!({"query": "user-007"}))
+            .content
+            .starts_with("user-007"));
+    }
+
+    #[test]
+    fn the_ladder_is_deterministic_for_the_same_roster() {
+        let dir = tempfile::tempdir().unwrap();
+        many(&dir.path().join("a"), "aa", 15);
+        many(&dir.path().join("b"), "bb", 15);
+        let roots = SkillRoots {
+            marketplaces: vec![
+                ("a".into(), dir.path().join("a")),
+                ("b".into(), dir.path().join("b")),
+            ],
+            catalog_budget_bytes: Some(360),
+            ..Default::default()
+        };
+        let one = SkillTool::with_roots(&roots).0.unwrap();
+        let two = SkillTool::with_roots(&roots).0.unwrap();
+        assert_eq!(one.description(), two.description());
+        assert_eq!(one.catalog_report(), two.catalog_report());
+        assert!(
+            !one.catalog_report().steps.is_empty(),
+            "{:?}",
+            one.catalog_report()
+        );
+        // Same tier: name order decides who moves first.
+        assert!(
+            one.catalog_report().steps[0].starts_with("a:"),
+            "{:?}",
+            one.catalog_report()
+        );
+    }
+
+    #[test]
+    fn an_unmeetable_budget_keeps_tier_zero_and_says_how_many_sources_it_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let flat = dir.path().join("skills");
+        std::fs::create_dir_all(&flat).unwrap();
+        for i in 0..10 {
+            std::fs::write(flat.join(format!("flat-{i:02}.md")), "# f\n").unwrap();
+        }
+        many(&dir.path().join("mkt"), "mkt", 5);
+        many(&dir.path().join("claude"), "cl", 5);
+        let (tool, _) = SkillTool::with_roots(&SkillRoots {
+            flat: Some(flat),
+            marketplaces: vec![("mkt".into(), dir.path().join("mkt"))],
+            claude_user: Some(dir.path().join("claude")),
+            catalog_budget_bytes: Some(1),
+            ..Default::default()
+        });
+        let tool = tool.unwrap();
+        let desc = tool.description();
+        assert!(
+            desc.contains("hotl: flat-00, flat-01"),
+            "tier 0 is whole: {desc}"
+        );
+        assert!(!desc.contains("mkt") && !desc.contains("cl-00"), "{desc}");
+        assert!(desc.contains("+2 more sources"), "{desc}");
+        let report = tool.catalog_report();
+        assert!(report.bytes > 1, "over budget, and honest about it");
+        assert_eq!(report.steps.len(), 6, "{report:?}");
     }
 
     #[test]
@@ -1208,6 +1467,25 @@ mod tests {
         // Expanding the source lists every collapsed skill.
         let expanded = tool.run_impl(&json!({"source": "big"}));
         assert_eq!(expanded.content.lines().count(), 300);
+
+        // With an explicit budget the same roster squeezes further: the
+        // sample line goes to a bare count, and the report says so.
+        let (tool, _) = SkillTool::with_roots(&SkillRoots {
+            flat: Some(flat),
+            marketplaces: vec![("big".into(), dir.path().join("big"))],
+            catalog_budget_bytes: Some(desc.len() - 1),
+            ..Default::default()
+        });
+        let tool = tool.unwrap();
+        assert!(
+            tool.description().contains("big (300) —"),
+            "{}",
+            tool.description()
+        );
+        assert_eq!(
+            tool.catalog_report().steps,
+            vec!["big: collapsed to a count"]
+        );
     }
 
     /// The card names the skill, so loads aren't an indistinguishable `skill`.
@@ -1626,6 +1904,7 @@ mod tests {
             agents_user: Some(dir.path().join("agents")),
             claude_user: Some(dir.path().join("claude")),
             plugin_cache: Some(dir.path().join("cache")),
+            catalog_budget_bytes: None,
         });
         let tool = tool.unwrap();
         let body = |n: &str| tool.run_impl(&json!({"name": n})).content;

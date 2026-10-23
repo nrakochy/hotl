@@ -72,6 +72,9 @@ pub struct SkillsCfg {
     pub project: Option<bool>,
     /// `false` stops reading `~/.agents/skills`. Default: on (0068).
     pub agents: Option<bool>,
+    /// Token budget for the always-sent skill roster (0068 D6). Absent: 2 %
+    /// of the session's context window, floor 400, cap 10,000.
+    pub catalog_tokens: Option<u32>,
     /// `[skills.marketplaces]` — extra skill sources: name → local path
     /// (read in place) or git URL (managed checkout; `hotl skills add`).
     #[serde(default)]

@@ -202,15 +202,28 @@ fn render_list(config_dir: &Path, data_dir: &Path, cwd: &Path) -> String {
         .iter()
         .map(|p| (p.name.clone(), p.skill_dirs.clone()))
         .collect();
-    let roots = hotl_tools::skills::SkillRoots::new(
-        config_dir,
-        cwd,
-        cfg.skills.project.unwrap_or(true),
-        cfg.skills.agents.unwrap_or(true),
-        cfg.skills.claude.unwrap_or(true),
-        marketplaces,
-        plugin_skills,
+    // The same budget the session gets: the configured model's window and
+    // tokenizer profile, read as `scaffold` reads them.
+    let secrets = hotl_platform::EnvSecrets;
+    let (_, model) = crate::agent::selected_model(&cfg, &secrets);
+    let (profile, _) = crate::agent::model_profile(&model, &secrets, &cfg);
+    let budget = crate::agent::skill_catalog_budget_bytes(
+        &cfg,
+        profile.context_window,
+        &profile.token_profile,
     );
+    let roots = hotl_tools::skills::SkillRoots {
+        catalog_budget_bytes: Some(budget),
+        ..hotl_tools::skills::SkillRoots::new(
+            config_dir,
+            cwd,
+            cfg.skills.project.unwrap_or(true),
+            cfg.skills.agents.unwrap_or(true),
+            cfg.skills.claude.unwrap_or(true),
+            marketplaces,
+            plugin_skills,
+        )
+    };
     let (tool, skill_warnings) = hotl_tools::skills::SkillTool::with_roots(&roots);
     warnings.extend(skill_warnings);
     let mut out = String::new();
@@ -239,6 +252,19 @@ fn render_list(config_dir: &Path, data_dir: &Path, cwd: &Path) -> String {
     }
     if out.is_empty() {
         out.push_str("no skills discovered\n");
+    }
+    if let Some(tool) = &tool {
+        let r = tool.catalog_report();
+        out.push_str(&format!(
+            "catalog: {} bytes of {} ({} step{})\n",
+            r.bytes,
+            r.budget_bytes.unwrap_or(0),
+            r.steps.len(),
+            if r.steps.len() == 1 { "" } else { "s" }
+        ));
+        for s in &r.steps {
+            out.push_str(&format!("  {s}\n"));
+        }
     }
     for w in &warnings {
         out.push_str(&format!("warning: {w}\n"));
