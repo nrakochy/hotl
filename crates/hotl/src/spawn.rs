@@ -771,21 +771,22 @@ impl SpawnTool {
                 return ToolOutcome::err(why);
             }
         };
-        // An external agent's handshake; a no-op for hotl's own child.
-        if let Err(e) = built.handle.start().await {
-            let why = format!("Could not start sub-agent: {e}");
-            abandon(&why);
-            if let Some(wt) = built.worktree.take() {
-                wt.remove();
-            }
-            return ToolOutcome::err(why);
-        }
         // D8, the half only the build can answer: isolation was asked for and
         // is unavailable here, so a background child would share the tree.
         if background && !read_only && built.worktree.is_none() {
             built.handle.interrupt();
             let why = d8_refusal(agent_type);
             abandon(&why);
+            return ToolOutcome::err(why);
+        }
+        // An external agent's handshake, after D8 so a refused child never
+        // runs; a no-op for hotl's own child.
+        if let Err(e) = built.handle.start().await {
+            let why = format!("Could not start sub-agent: {e}");
+            abandon(&why);
+            if let Some(wt) = built.worktree.take() {
+                wt.remove();
+            }
             return ToolOutcome::err(why);
         }
         // The shared-tree guard, now decided *after* the build — whether this
