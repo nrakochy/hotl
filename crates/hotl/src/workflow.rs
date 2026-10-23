@@ -24,7 +24,9 @@ use serde_json::{json, Value};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::spawn::{drain_child, merge_back, mutating_child_lock, Child, ChildBuilder, MergeBack};
+use crate::spawn::{
+    drain_child, merge_back, mutating_child_lock, Child, ChildBuilder, ChildSession as _, MergeBack,
+};
 
 /// Result bodies past this are truncated in the tool result; the full JSON
 /// is always on disk at `<data_dir>/workflows/<run_id>/result.json`.
@@ -698,7 +700,7 @@ impl ChildRunner {
             self.builder.build(&def, &brief, None)
         };
         let Child {
-            handle: mut child,
+            handle,
             worktree,
             isolation_unavailable,
             report_path: _,
@@ -714,6 +716,14 @@ impl ChildRunner {
         } else {
             Some(mutating_child_lock().lock().await)
         };
+        let mut child = crate::spawn::Erased(handle);
+        if let Err(e) = child.start().await {
+            if let Some(wt) = worktree {
+                let _creating = self.creation.lock().await;
+                wt.remove();
+            }
+            return fail(format!("could not start the agent: {e}"));
+        }
         child.prompt(brief).await;
         // Summed outside the loop's own total so a failed attempt's tokens
         // still count. Owned captures: a borrowed one makes the closure's
@@ -729,10 +739,17 @@ impl ChildRunner {
                     &mut child,
                     schema,
                     crate::structured::MAX_RETRIES,
-                    async move |h: &mut hotl_engine::SessionHandle| {
+                    async move |h: &mut crate::spawn::Erased| {
                         let (text, usage) = settle(
-                            drain_child(h, &cancel, None, lead.as_ref(), Default::default(), None)
-                                .await,
+                            drain_child(
+                                &mut *h.0,
+                                &cancel,
+                                None,
+                                lead.as_ref(),
+                                Default::default(),
+                                None,
+                            )
+                            .await,
                         );
                         *lock(&used) += usage;
                         if text.is_ok() {
@@ -747,7 +764,7 @@ impl ChildRunner {
             None => {
                 let (text, usage) = settle(
                     drain_child(
-                        &mut child,
+                        &mut *child.0,
                         &cancel,
                         None,
                         lead.as_ref(),
@@ -992,7 +1009,11 @@ mod tests {
                 .map_or(std::env::temp_dir(), |w| w.path().to_path_buf());
             Ok(Child {
                 model: "m".into(),
-                handle: session(Arc::new(ScriptedProvider::new(replies)), registry, cwd),
+                handle: Box::new(session(
+                    Arc::new(ScriptedProvider::new(replies)),
+                    registry,
+                    cwd,
+                )),
                 worktree,
                 isolation_unavailable: false,
                 report_path: None,

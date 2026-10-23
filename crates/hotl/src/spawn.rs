@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 /// child's lifetime, and the merge-back has to happen exactly once, when that
 /// lifetime ends.
 pub struct Child {
-    pub handle: SessionHandle,
+    pub handle: Box<dyn ChildSession>,
     /// What the child samples with — its bill is priced at this (0072 D11).
     pub model: String,
     pub worktree: Option<hotl_store::worktree::Worktree>,
@@ -44,6 +44,129 @@ pub struct Child {
     /// tool (0058 T1). `None` means the child was never given the tool, so the
     /// caller must not re-prompt it for a report it cannot make.
     pub report_path: Option<PathBuf>,
+}
+
+/// What drives a child, whatever runs it (0077 D2): hotl's own session, or an
+/// external agent translated into the same events. `drain_child`, the report
+/// nudges and the band forwarding see only this.
+pub trait ChildSession: Send + Sync {
+    fn events(&mut self) -> &mut tokio::sync::mpsc::Receiver<EngineEvent>;
+    fn prompt(&self, text: String) -> BoxFuture<'_, ()>;
+    /// A prompt carrying a provenance tag (the structured loop's retry).
+    fn prompt_tagged(
+        &self,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+    ) -> BoxFuture<'_, ()>;
+    /// A tagged prompt constrained to `schema` where the session can do that.
+    fn prompt_structured(
+        &self,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+        schema: Arc<Value>,
+    ) -> BoxFuture<'_, ()>;
+    fn continue_turn(&self) -> BoxFuture<'_, ()>;
+    fn steer(&self, text: String) -> BoxFuture<'_, ()>;
+    fn interrupt(&self);
+    fn set_wrapup(&self, on: bool) -> BoxFuture<'_, ()>;
+    /// Anything the child must finish before its first prompt; an `Err` is
+    /// a start failure the caller reports as one.
+    fn start(&mut self) -> BoxFuture<'_, Result<(), String>> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+    /// End the child: stop its turn and let it wind down, bounded by `grace`.
+    fn finish(self: Box<Self>, grace: std::time::Duration) -> BoxFuture<'static, ()>;
+}
+
+impl ChildSession for SessionHandle {
+    fn events(&mut self) -> &mut tokio::sync::mpsc::Receiver<EngineEvent> {
+        &mut self.events
+    }
+    fn prompt(&self, text: String) -> BoxFuture<'_, ()> {
+        Box::pin(SessionHandle::prompt(self, text))
+    }
+    fn prompt_tagged(
+        &self,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(SessionHandle::prompt_tagged(self, text, synthetic))
+    }
+    fn prompt_structured(
+        &self,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+        schema: Arc<Value>,
+    ) -> BoxFuture<'_, ()> {
+        Box::pin(SessionHandle::prompt_structured(
+            self, text, synthetic, schema,
+        ))
+    }
+    fn continue_turn(&self) -> BoxFuture<'_, ()> {
+        Box::pin(SessionHandle::continue_turn(self))
+    }
+    fn steer(&self, text: String) -> BoxFuture<'_, ()> {
+        Box::pin(SessionHandle::steer(self, text))
+    }
+    fn interrupt(&self) {
+        SessionHandle::interrupt(self)
+    }
+    fn set_wrapup(&self, on: bool) -> BoxFuture<'_, ()> {
+        Box::pin(SessionHandle::set_wrapup(self, on))
+    }
+    fn finish(self: Box<Self>, grace: std::time::Duration) -> BoxFuture<'static, ()> {
+        Box::pin(async move {
+            SessionHandle::interrupt(&self);
+            SessionHandle::finish(*self, grace).await;
+        })
+    }
+}
+
+/// A boxed child as a plain type, for a caller generic over the session
+/// (the structured loop): the `dyn`'s object lifetime, once erased, trips the
+/// async closure's higher-ranked bound; a struct has no lifetime to erase.
+pub struct Erased(pub Box<dyn ChildSession>);
+
+impl ChildSession for Erased {
+    fn events(&mut self) -> &mut tokio::sync::mpsc::Receiver<EngineEvent> {
+        self.0.events()
+    }
+    fn prompt(&self, text: String) -> BoxFuture<'_, ()> {
+        self.0.prompt(text)
+    }
+    fn prompt_tagged(
+        &self,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+    ) -> BoxFuture<'_, ()> {
+        self.0.prompt_tagged(text, synthetic)
+    }
+    fn prompt_structured(
+        &self,
+        text: String,
+        synthetic: hotl_types::SyntheticReason,
+        schema: Arc<Value>,
+    ) -> BoxFuture<'_, ()> {
+        self.0.prompt_structured(text, synthetic, schema)
+    }
+    fn continue_turn(&self) -> BoxFuture<'_, ()> {
+        self.0.continue_turn()
+    }
+    fn steer(&self, text: String) -> BoxFuture<'_, ()> {
+        self.0.steer(text)
+    }
+    fn interrupt(&self) {
+        self.0.interrupt()
+    }
+    fn set_wrapup(&self, on: bool) -> BoxFuture<'_, ()> {
+        self.0.set_wrapup(on)
+    }
+    fn start(&mut self) -> BoxFuture<'_, Result<(), String>> {
+        self.0.start()
+    }
+    fn finish(self: Box<Self>, grace: std::time::Duration) -> BoxFuture<'static, ()> {
+        self.0.finish(grace)
+    }
 }
 
 /// Builds a fresh child session from a resolved [`AgentDef`], seeded with a
@@ -586,7 +709,7 @@ impl SpawnTool {
         } else {
             self.builder.build(&def, &brief, Some(&scratch))
         };
-        let built = match build_result {
+        let mut built = match build_result {
             Ok(c) => c,
             Err(e) => {
                 let why = format!("Could not start sub-agent: {e}");
@@ -594,6 +717,15 @@ impl SpawnTool {
                 return ToolOutcome::err(why);
             }
         };
+        // An external agent's handshake; a no-op for hotl's own child.
+        if let Err(e) = built.handle.start().await {
+            let why = format!("Could not start sub-agent: {e}");
+            abandon(&why);
+            if let Some(wt) = built.worktree.take() {
+                wt.remove();
+            }
+            return ToolOutcome::err(why);
+        }
         // D8, the half only the build can answer: isolation was asked for and
         // is unavailable here, so a background child would share the tree.
         if background && !read_only && built.worktree.is_none() {
@@ -761,7 +893,7 @@ impl ChildRun {
     /// One turn of the child, to its typed result.
     async fn drive(&mut self, start: Start, cancel: &CancellationToken) -> Ran {
         run_child(
-            &mut self.child.handle,
+            &mut *self.child.handle,
             self.child.report_path.as_deref(),
             start,
             cancel,
@@ -986,8 +1118,7 @@ async fn child_task(mut run: ChildRun, start: Start) {
 
 /// Stop a child's session: interrupt its turn, then let its actor run its
 /// own session-end hook, briefly.
-async fn end_child(handle: SessionHandle) {
-    handle.interrupt();
+async fn end_child(handle: Box<dyn ChildSession>) {
     handle.finish(std::time::Duration::from_millis(500)).await;
 }
 
@@ -1009,7 +1140,7 @@ struct Ran {
 /// that ran out of budget, then the typed result (nudged for if missing).
 #[allow(clippy::too_many_arguments)]
 async fn run_child(
-    child: &mut SessionHandle,
+    child: &mut dyn ChildSession,
     report_path: Option<&Path>,
     start: Start,
     cancel: &CancellationToken,
@@ -1378,7 +1509,7 @@ fn write_task_md(
 /// from its last words if it never does. Always returns a value: the parent
 /// model gets a shape whatever the child did.
 async fn collect_report(
-    child: &mut SessionHandle,
+    child: &mut dyn ChildSession,
     cancel: &CancellationToken,
     forward: &Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
     path: &Path,
@@ -1455,7 +1586,7 @@ pub(crate) struct Drained {
 /// `ChildTool`. Bypass flags and text/thinking deltas stay dropped in v1.
 /// `steer` (0072 `send`): text arriving here is steered into the child.
 pub(crate) async fn drain_child(
-    child: &mut SessionHandle,
+    child: &mut dyn ChildSession,
     cancel: &CancellationToken,
     forward: Option<(tokio::sync::mpsc::WeakSender<EngineEvent>, String)>,
     lead: Option<&LeadGuard>,
@@ -1515,7 +1646,7 @@ pub(crate) async fn drain_child(
                 }
                 continue;
             }
-            event = child.events.recv() => match event {
+            event = child.events().recv() => match event {
                 Some(EngineEvent::Ask { reply, .. }) => {
                     // A sub-agent has no human on the loop — deny with a reason
                     // the sub-agent's model can act on.
@@ -1947,7 +2078,7 @@ pub(crate) mod tests {
     /// gets `ProbeChild`'s real worktree instead.
     fn child_of(handle: SessionHandle) -> Child {
         Child {
-            handle,
+            handle: Box::new(handle),
             model: "m".into(),
             worktree: None,
             isolation_unavailable: false,
@@ -2118,7 +2249,7 @@ pub(crate) mod tests {
             }
             Ok(Child {
                 model: "m".into(),
-                handle: spawn_session(SessionDeps {
+                handle: Box::new(spawn_session(SessionDeps {
                     concurrency: Default::default(),
                     provider,
                     registry: Arc::new(registry),
@@ -2138,7 +2269,7 @@ pub(crate) mod tests {
                         max_turns: self.max_turns,
                         ..Default::default()
                     },
-                }),
+                })),
                 worktree: None,
                 isolation_unavailable: false,
                 report_path: report.map(|d| d.join(hotl_tools::report_tool::RESPONSE_FILE)),
@@ -2966,7 +3097,7 @@ pub(crate) mod tests {
         let mut child = ScriptedChild::new().build(&def, "go", None).unwrap().handle;
         child.prompt("go".into()).await;
         let drained = drain_child(
-            &mut child,
+            &mut *child,
             &CancellationToken::new(),
             None,
             None,
@@ -3396,7 +3527,7 @@ pub(crate) mod tests {
             });
             Ok(Child {
                 model: "m".into(),
-                handle,
+                handle: Box::new(handle),
                 worktree,
                 isolation_unavailable: false,
                 report_path: None,
@@ -3508,7 +3639,7 @@ pub(crate) mod tests {
             });
             Ok(Child {
                 model: "m".into(),
-                handle,
+                handle: Box::new(handle),
                 worktree: Some(worktree),
                 isolation_unavailable: false,
                 report_path: None,

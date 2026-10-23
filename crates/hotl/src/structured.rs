@@ -43,14 +43,15 @@ pub async fn run_structured(
 /// has already issued the first prompt and drains the session its own way
 /// (`wait` answers asks, forwards events, whatever the surface needs). Usage
 /// is summed across every attempt.
-pub async fn structured_loop<F>(
-    handle: &mut SessionHandle,
+pub async fn structured_loop<H, F>(
+    handle: &mut H,
     schema: &Value,
     max_retries: u32,
     mut wait: F,
 ) -> Result<(Value, TokenUsage), String>
 where
-    F: AsyncFnMut(&mut SessionHandle) -> Result<(String, TokenUsage), String>,
+    H: crate::spawn::ChildSession + ?Sized,
+    F: AsyncFnMut(&mut H) -> Result<(String, TokenUsage), String>,
 {
     let validator = jsonschema::validator_for(schema)
         .map_err(|e| format!("the --json-schema file is not a valid JSON Schema: {e}"))?;

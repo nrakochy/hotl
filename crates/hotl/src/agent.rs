@@ -3167,7 +3167,7 @@ impl HotlChildBuilder {
         );
         Ok(crate::spawn::Child {
             model: config_model,
-            handle,
+            handle: Box::new(handle),
             worktree,
             isolation_unavailable,
             report_path: report.map(|d| d.join(hotl_tools::report_tool::RESPONSE_FILE)),
@@ -6334,10 +6334,11 @@ mod tests {
             .handle;
         handle.prompt("go".into()).await;
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.events().recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("event channel closed");
             if matches!(ev, EngineEvent::TurnDone { .. }) {
                 break;
             }
@@ -6367,10 +6368,11 @@ mod tests {
             .handle;
         handle.prompt("go".into()).await;
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.events().recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("event channel closed");
             if matches!(ev, EngineEvent::TurnDone { .. }) {
                 break;
             }
@@ -6415,10 +6417,11 @@ mod tests {
             .handle;
         handle.prompt("go".into()).await;
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.events().recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("event channel closed");
             if matches!(ev, EngineEvent::TurnDone { .. }) {
                 break;
             }
@@ -6452,10 +6455,11 @@ mod tests {
             .handle;
         handle.prompt("go".into()).await;
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.events().recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("event channel closed");
             if matches!(ev, EngineEvent::TurnDone { .. }) {
                 break;
             }
@@ -6598,10 +6602,11 @@ mod tests {
             .handle;
         handle.prompt("go".into()).await;
         let outcome = loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.events().recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("event channel closed");
             if let EngineEvent::TurnDone { outcome, .. } = ev {
                 break outcome;
             }
@@ -6643,10 +6648,11 @@ mod tests {
             .handle;
         handle.prompt("go".into()).await;
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.events().recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("event channel closed");
             if matches!(ev, EngineEvent::TurnDone { .. }) {
                 break;
             }
@@ -6804,10 +6810,11 @@ mod tests {
         handle.prompt("go".into()).await;
         let mut denied = false;
         loop {
-            let ev = tokio::time::timeout(std::time::Duration::from_secs(30), handle.events.recv())
-                .await
-                .expect("event timeout")
-                .expect("event channel closed");
+            let ev =
+                tokio::time::timeout(std::time::Duration::from_secs(30), handle.events().recv())
+                    .await
+                    .expect("event timeout")
+                    .expect("event channel closed");
             match ev {
                 EngineEvent::ToolDenied { name, .. } if name == "bash" => denied = true,
                 EngineEvent::TurnDone { .. } => break,
@@ -8962,7 +8969,7 @@ mod depth_tests {
         let mut child = cb.spawn_child(def, Vec::new(), None, None).unwrap();
         child.handle.prompt("go".into()).await;
         loop {
-            match child.handle.events.recv().await {
+            match child.handle.events().recv().await {
                 Some(hotl_engine::EngineEvent::TurnDone { .. }) | None => break,
                 _ => {}
             }
@@ -9164,7 +9171,7 @@ mod depth_tests {
             .unwrap();
         child.handle.prompt("go".into()).await;
         loop {
-            match child.handle.events.recv().await {
+            match child.handle.events().recv().await {
                 Some(hotl_engine::EngineEvent::TurnDone { .. }) | None => break,
                 _ => {}
             }
