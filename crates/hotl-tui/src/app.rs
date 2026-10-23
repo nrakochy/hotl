@@ -508,6 +508,9 @@ pub struct SessionUsage {
     /// Accumulated only across turns that reported a price. `None` means no
     /// turn ever did — the UI must then show nothing rather than `$0.00`.
     pub cost_usd: Option<f64>,
+    /// Cache keep-alive pings this session sent (0073 D6), and what they cost.
+    pub warm_pings: u32,
+    pub warm_cost_usd: Option<f64>,
 }
 
 impl SessionUsage {
@@ -2123,6 +2126,17 @@ fn on_update(state: &mut State, v: &Value) -> Vec<Cmd> {
             );
         }
         "jobs_report" => push_jobs_report(state, v),
+        // A cache keep-alive ping (0073 D6): its tokens join the totals (so
+        // `cache_read` and the cost stay honest) and the warm count moves.
+        "cache_warm" => {
+            if let Some(u) = v.get("usage") {
+                state.session_usage.add(u);
+            }
+            state.session_usage.warm_pings += 1;
+            if let Some(c) = v.get("cost_usd").and_then(Value::as_f64) {
+                *state.session_usage.warm_cost_usd.get_or_insert(0.0) += c;
+            }
+        }
         "children_report" => push_children_report(state, v),
         // 0056 T3. Only one plan is ever live: a second `present_plan`
         // supersedes the first, so the old card loses its keys.
@@ -3473,6 +3487,15 @@ fn slash_command(state: &mut State, rest: &str, payload: paste::PromptPayload) -
                 // worse than saying nothing.
                 None => text.push_str(" · cost not reported by the provider"),
             }
+            // Only when something was pinged (0073): a zero is not news.
+            if u.warm_pings > 0 {
+                match u.warm_cost_usd {
+                    Some(c) => {
+                        text.push_str(&format!(" · cache kept warm {}× (${c:.2})", u.warm_pings))
+                    }
+                    None => text.push_str(&format!(" · cache kept warm {}×", u.warm_pings)),
+                }
+            }
             notice(state, text);
             Vec::new()
         }
@@ -4539,6 +4562,67 @@ mod tests {
             "{}",
             last_notice(&s)
         );
+    }
+
+    /// A `cache_warm` frame (0073 D6) joins the totals and the `/cost` line;
+    /// the strip is unchanged (width is scarce; the hit ratio already shows
+    /// the effect).
+    #[test]
+    fn a_cache_warm_frame_shows_on_cost_and_not_on_the_strip() {
+        let mut s = State::test_default();
+        s.context_window = 200_000;
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({
+                "input_tokens": 100, "output_tokens": 1,
+                "cache_read_input_tokens": 50, "cache_creation_input_tokens": 0,
+            }),
+        );
+        let strip_before = s.usage_line.clone();
+        upd(
+            &mut s,
+            json!({
+                "type": "cache_warm",
+                "usage": {"input_tokens": 0, "output_tokens": 1, "cache_read_input_tokens": 100_000, "cache_creation_input_tokens": 0},
+                "cost_usd": 0.05
+            }),
+        );
+        upd(
+            &mut s,
+            json!({
+                "type": "cache_warm",
+                "usage": {"input_tokens": 0, "output_tokens": 1, "cache_read_input_tokens": 100_000, "cache_creation_input_tokens": 0},
+                "cost_usd": 0.05
+            }),
+        );
+        assert_eq!(s.session_usage.warm_pings, 2);
+        assert_eq!(
+            s.session_usage.cache_read, 200_050,
+            "the pings' reads join the totals"
+        );
+        assert_eq!(
+            s.usage_line, strip_before,
+            "the strip does not move on a ping"
+        );
+        slash(&mut s, "cost");
+        let text = last_notice(&s);
+        assert!(text.contains("cache kept warm 2× ($0.10)"), "{text}");
+    }
+
+    #[test]
+    fn cost_omits_the_warm_segment_when_nothing_was_pinged() {
+        let mut s = State::test_default();
+        on_result(
+            &mut s,
+            "done",
+            None,
+            &json!({"input_tokens": 5, "output_tokens": 1}),
+        );
+        slash(&mut s, "cost");
+        let text = last_notice(&s);
+        assert!(!text.contains("kept warm"), "{text}");
     }
 
     #[test]

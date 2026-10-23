@@ -541,6 +541,10 @@ pub struct ProviderCfg {
     /// endpoint rejects `prompt_cache_options` (hotl also probes once and backs
     /// off on its own).
     pub cache_breakpoints: Option<bool>,
+    /// Keep the 5-minute prompt cache alive while a long tool runs (0073 D5).
+    /// Absent = on; the saving rule and the 1-hour gate already confine it to
+    /// unattended sessions. `HOTL_CACHE_WARMING=0` is the env twin.
+    pub cache_warming: Option<bool>,
     /// Seconds a stream may go without any byte (pings included) before it
     /// is treated as dead and retried. Default 90; floor 15; `0` is ignored
     /// with a warning (0071 T2).
@@ -1931,6 +1935,23 @@ path_prefix = "/Volumes/secrets"
     }
 
     /// Absent = decide by model name; either literal is an override.
+    #[test]
+    fn provider_cache_warming_parses_as_a_tri_state() {
+        assert_eq!(cfg_with("").provider.cache_warming, None);
+        assert_eq!(
+            cfg_with("[provider]\ncache_warming = false\n")
+                .provider
+                .cache_warming,
+            Some(false)
+        );
+        assert_eq!(
+            cfg_with("[provider]\ncache_warming = true\n")
+                .provider
+                .cache_warming,
+            Some(true)
+        );
+    }
+
     #[test]
     fn provider_cache_breakpoints_parses_as_a_tri_state() {
         assert_eq!(cfg_with("").provider.cache_breakpoints, None);

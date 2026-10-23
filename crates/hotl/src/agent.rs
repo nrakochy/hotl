@@ -4658,6 +4658,12 @@ fn engine_config(
         .and_then(|v| v.parse().ok())
         .or(cfg.behavior.max_cost_usd)
         .unwrap_or(0.0);
+    // The cache keep-alive switch (0073 D5): env beats config, on by default.
+    config.cache_warming = secrets
+        .get("HOTL_CACHE_WARMING")
+        .and_then(|v| parse_switch(&v))
+        .or(cfg.provider.cache_warming)
+        .unwrap_or(true);
     // The cost cap needs a price, and hotl allowlists no model names: an
     // uncatalogued model simply is not capped. Say so once rather than let
     // someone believe a cap is guarding a session it cannot see.
@@ -5064,6 +5070,15 @@ fn resolve_openai(
         Arc::new(openai_chat_provider(cfg, base, source.clone())),
         source,
     ))
+}
+
+/// `0`/`false`/`off` → off, `1`/`true`/`on` → on, anything else → unset.
+fn parse_switch(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "0" | "false" | "off" | "no" => Some(false),
+        "1" | "true" | "on" | "yes" => Some(true),
+        _ => None,
+    }
 }
 
 /// The session's chat-completions provider. `[provider] cache_breakpoints`
@@ -6453,6 +6468,9 @@ mod tests {
         assert_eq!(cb.child_config(&silent).max_turns, 40);
         // The other overrides still ride the same step.
         assert_eq!(cb.child_config(&silent).cache_ttl, CacheTtl::FiveMinutes);
+        // 0073 T3: children inherit the keep-alive switch (they are the
+        // 5-minute sessions it exists for).
+        assert!(cb.child_config(&silent).cache_warming);
     }
 
     /// Built through the real frontmatter parse, so the parse-time validation
@@ -7393,6 +7411,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("config.toml"), toml).unwrap();
         crate::config::Config::load(dir.path())
+    }
+
+    /// 0073 D5: on by default; `[provider] cache_warming = false` turns the
+    /// keep-alive off and `HOTL_CACHE_WARMING` outranks the file.
+    #[test]
+    fn hotl_cache_warming_env_turns_the_keep_alive_off() {
+        let none = MapSecrets::default();
+        assert!(
+            engine_config("m", &none, &config_from_toml(""))
+                .0
+                .cache_warming
+        );
+        let off = config_from_toml("[provider]\ncache_warming = false\n");
+        assert!(!engine_config("m", &none, &off).0.cache_warming);
+        let env_off = MapSecrets::from([("HOTL_CACHE_WARMING", "0")]);
+        assert!(
+            !engine_config("m", &env_off, &config_from_toml(""))
+                .0
+                .cache_warming
+        );
+        let env_on = MapSecrets::from([("HOTL_CACHE_WARMING", "true")]);
+        assert!(
+            engine_config("m", &env_on, &off).0.cache_warming,
+            "env beats config"
+        );
+        let junk = MapSecrets::from([("HOTL_CACHE_WARMING", "maybe")]);
+        assert!(
+            !engine_config("m", &junk, &off).0.cache_warming,
+            "unparseable env is unset"
+        );
     }
 
     #[test]

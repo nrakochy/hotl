@@ -857,6 +857,34 @@ fn child_text_and_delegation_are_tagged_additive_frames() {
     assert_eq!(d["tool_calls"], json!(9));
 }
 
+/// 0073 D6: a keep-alive ping is a stream frame — usage, and a price when
+/// the model has one. Additive: `JSON_STREAM_SCHEMA_VERSION` stands.
+#[test]
+fn cache_warm_frames_are_streamable_and_versioned() {
+    let ev = EngineEvent::CacheWarmed {
+        usage: hotl_types::TokenUsage {
+            cache_read_input_tokens: 120_000,
+            output_tokens: 1,
+            ..Default::default()
+        },
+        cost_usd: Some(0.06),
+    };
+    let u = wire::update_frame(&ev).expect("cache_warm is a stream frame");
+    assert_eq!(u["type"], "cache_warm");
+    assert_eq!(u["usage"]["cache_read_input_tokens"], json!(120_000));
+    assert_eq!(u["usage"]["output_tokens"], json!(1));
+    assert_eq!(u["cost_usd"], json!(0.06));
+    let f = wire::json_frame(&ev, "test-model");
+    assert_eq!(f["schema_version"], json!(wire::JSON_STREAM_SCHEMA_VERSION));
+    // No price, no key — the additive rule `usage_frame` follows.
+    let unpriced = wire::update_frame(&EngineEvent::CacheWarmed {
+        usage: Default::default(),
+        cost_usd: None,
+    })
+    .unwrap();
+    assert!(unpriced.get("cost_usd").is_none());
+}
+
 #[test]
 fn thinking_deltas_carry_their_text() {
     // T3-15: the payload had no `text` field, so a consumer could not render
