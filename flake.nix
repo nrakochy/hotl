@@ -42,6 +42,13 @@
       # dirty working trees evaluable.
       date = self.lastModifiedDate or "19700101000000";
       version = "${cargoVersion}-unstable-${builtins.substring 0 4 date}-${builtins.substring 4 2 date}-${builtins.substring 6 2 date}";
+
+      # What the test suite needs on PATH; see `nativeCheckInputs` below.
+      checkTools = pkgs: [
+        pkgs.ripgrep
+        pkgs.git
+        pkgs.tmux
+      ];
     in
     {
       packages = forAllSystems (pkgs: rec {
@@ -57,7 +64,7 @@
           # backend (cargoHash) because it has no in-tree lockfile to read.
           cargoLock.lockFile = ./Cargo.lock;
 
-          # Tests off here, on in `checks.package`. Every consumer build
+          # Tests off here, on in `checks`. Every consumer build
           # compiles all workspace members locally; running the suite on top
           # roughly doubles a `home-manager switch`. `nix flake check` and CI
           # still run it.
@@ -65,7 +72,7 @@
 
           # The grep tool spawns the `rg` binary, so the suite needs it on
           # PATH. nativeCheckInputs, so it lands only where doCheck is on —
-          # inert here, active in `checks.package`, and the same input a
+          # inert here, active in `checks`, and the same input a
           # nixpkgs build (tests on) would want. Nothing reaches runtime: a
           # nix-installed hotl still finds `rg` only if the user has it, and
           # degrades to a legible error if not.
@@ -76,7 +83,7 @@
           # one assertion it exists to make.
           # `tmux` for the 0074 smoke; where a private server cannot start
           # (the darwin sandbox) the scenarios skip, as the sandbox tests do.
-          nativeCheckInputs = [ pkgs.ripgrep pkgs.git pkgs.tmux ];
+          nativeCheckInputs = checkTools pkgs;
 
           # Nothing here demands $HOME, but /homeless-shelter is not writable
           # and a single test reaching for it would be an opaque failure.
@@ -230,23 +237,85 @@
         default = hotl;
       });
 
-      # Full suite, on the same derivation the package output builds — so
-      # `nix flake check` stays predictive of the nixpkgs build, which keeps
-      # tests on.
-      checks = forAllSystems (pkgs: {
-        # preCheck and checkFlags live on the package itself, so what runs here
-        # is what a nixpkgs build would run — except the release-profile knobs.
-        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (old: {
-          doCheck = true;
-          # Thin LTO + codegen-units=1 (2497f71) exist for shipped-binary parity.
-          # checkPhase links ~70 test binaries in release mode; with the knobs on
-          # that is ~28 minutes of linking for tests that run in seconds.
-          env = (old.env or { }) // {
-            CARGO_PROFILE_RELEASE_LTO = "false";
-            CARGO_PROFILE_RELEASE_CODEGEN_UNITS = "16";
+      # Every workspace crate is its own Nix build step (crate2nix, generated at
+      # evaluation time from Cargo.lock), with its tests run in debug mode. A
+      # crate whose inputs did not change keeps its store path, so with a
+      # binary cache a push rebuilds and re-tests only the crates it touched
+      # and the ones above them. `packages.default` stays the nixpkgs-shaped
+      # build; nix-tag.yml builds it at every tag.
+      #
+      # The skip lists stay on the package (`checkFlags`) and are reused here.
+      checks = forAllSystems (
+        pkgs:
+        let
+          package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+          # nixpkgs' crate2nix ships tools.nix in its source: no flake input.
+          crate2nix = import "${pkgs.crate2nix.src}/tools.nix" { inherit pkgs; };
+          cargoNix =
+            pkgs.callPackage
+              (crate2nix.generatedCargoNix {
+                name = "hotl";
+                src = self;
+              })
+              {
+                release = false;
+                buildRustCrateForPkgs = fastDebugCrate;
+                defaultCrateOverrides = pkgs.defaultCrateOverrides // {
+                  # Its tests read site/ and .acp-registry/ and include another
+                  # crate's fixture, so it builds from the whole tree.
+                  hotl = _: {
+                    src = self;
+                    workspace_member = "crates/hotl";
+                  };
+                  # crate2nix unifies build-dependency features into normal ones;
+                  # cargo keeps them apart. tree-sitter's build-dep asks for
+                  # preserve_order (its build script never uses serde_json), which
+                  # would change every JSON key order the shipped binary writes.
+                  serde_json = attrs: {
+                    features = pkgs.lib.subtractLists [
+                      "preserve_order"
+                      "indexmap"
+                    ] attrs.features;
+                  };
+                };
+              };
+          # buildRustCrate's debug builds use debuginfo=2 and one codegen unit:
+          # slow, and the big crates run out of memory on a small runner. A
+          # crate's own extraRustcOpts come after the defaults, and rustc keeps
+          # the last value. crate2nix calls `.override` on this, so it must
+          # survive one.
+          fastDebugCrate =
+            p:
+            let
+              wrap = build: {
+                __functor =
+                  _: crate:
+                  build (crate // { extraRustcOpts = (crate.extraRustcOpts or [ ]) ++ [ "-C debuginfo=0" ]; });
+                override = args: wrap (build.override args);
+              };
+            in
+            wrap (p.buildRustCrate.override { defaultCodegenUnits = 16; });
+          # Cargo's workspace run unifies features across crates; a crate built
+          # alone gets only its own. hotl-tui turns hotl-theme's `ratatui` on.
+          testFeatures = {
+            hotl-theme = [ "ratatui" ];
           };
-        });
-      });
+          # The test runner sets no CARGO_MANIFEST_DIR; tests read it at runtime.
+          manifestDir = name: if name == "hotl" then "$PWD/crates/hotl" else "$PWD";
+        in
+        builtins.mapAttrs (
+          name: member:
+          member.build.override (
+            {
+              runTests = true;
+              testCrateFlags = package.checkFlags;
+              testInputs = checkTools pkgs;
+              testPreRun = "export HOME=$(mktemp -d) TMUX_TMPDIR=$HOME CARGO_MANIFEST_DIR=${manifestDir name}";
+            }
+            // pkgs.lib.optionalAttrs (testFeatures ? ${name}) { features = testFeatures.${name}; }
+          )
+        ) cargoNix.workspaceMembers
+      );
 
       # nixpkgs' own toolchain, not rust-overlay: it shares the cache.nixos.org
       # binaries the package build already pulls, and keeps the devShell honest
