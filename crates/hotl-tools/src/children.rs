@@ -66,6 +66,7 @@ pub struct ChildRecord {
     pub started_ms: u64,
     pub background: bool,
     pub isolated: bool,
+    pub read_only: bool,
     pub state: ChildState,
 }
 
@@ -95,6 +96,8 @@ pub struct ChildSpec {
     pub summary: String,
     pub background: bool,
     pub isolated: bool,
+    /// Its roster cannot write: a resume needs no shared-tree lock (D8).
+    pub read_only: bool,
     pub started_ms: u64,
     pub steer: mpsc::Sender<String>,
     pub resume: mpsc::Sender<ResumeRequest>,
@@ -242,6 +245,7 @@ impl Children {
                 started_ms: spec.started_ms,
                 background: spec.background,
                 isolated: spec.isolated,
+                read_only: spec.read_only,
                 state: ChildState::Running,
             },
             result: None,
@@ -277,7 +281,7 @@ impl Children {
             if !running {
                 return Claim::Nothing(known(&inner.slots));
             }
-            if inner.any_waiter.is_some() {
+            if inner.any_waiter.as_ref().is_some_and(|w| !w.is_closed()) {
                 return Claim::Busy;
             }
             let (tx, rx) = oneshot::channel();
@@ -292,7 +296,9 @@ impl Children {
             ChildState::Closed => Claim::Closed,
             ChildState::Done { .. } => claim_done(s),
             ChildState::Running | ChildState::Finishing => {
-                if s.waiter.is_some() {
+                // A waiter whose `wait` timed out or was cancelled dropped
+                // its receiver; the slot is free again.
+                if s.waiter.as_ref().is_some_and(|w| !w.is_closed()) {
                     return Claim::Busy;
                 }
                 let (tx, rx) = oneshot::channel();
@@ -358,6 +364,21 @@ impl Children {
             ended_ms: now_ms,
         };
         claimed
+    }
+
+    /// A foreground child's result went straight to its caller: the slot is
+    /// `Done { claimed: true }` and nothing is owed to the inbox.
+    pub fn settled(&self, id: &str, result: ChildResult, now_ms: u64) {
+        if let Some(s) = self.lock().slots.iter_mut().find(|s| s.record.id == id) {
+            if matches!(s.record.state, ChildState::Running | ChildState::Finishing) {
+                s.record.state = ChildState::Done {
+                    ok: result.ok,
+                    claimed: true,
+                    ended_ms: now_ms,
+                };
+                s.result = Some(result);
+            }
+        }
     }
 
     /// A parked child is being resumed: it runs again.
@@ -526,6 +547,7 @@ mod tests {
             summary: "look".into(),
             background,
             isolated: false,
+            read_only: true,
             started_ms: 1_000,
             steer,
             resume,
@@ -545,9 +567,15 @@ mod tests {
     fn a_parked_waiter_is_handed_the_result_and_no_notify_is_due() {
         let c = Children::new(8);
         let e = c.register(spec(true)).unwrap();
+        // A waiter that gave up frees the slot for the next one.
+        let Claim::Parked(stale) = c.claim(Some(&e.id)) else {
+            panic!()
+        };
+        drop(stale);
         let Claim::Parked(rx) = c.claim(Some(&e.id)) else {
             panic!("a running child parks the waiter");
         };
+        assert!(matches!(c.claim(Some(&e.id)), Claim::Busy));
         assert_eq!(c.finish(&e.id, result("done"), 5_000), Deliver::ToWaiter);
         let (id, got) = rx.blocking_recv().unwrap();
         assert_eq!((id.as_str(), got.text.as_str()), (e.id.as_str(), "done"));

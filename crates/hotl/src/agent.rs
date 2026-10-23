@@ -2223,7 +2223,8 @@ fn spawn_session_inner(
             .with_deadlines(child_deadlines.0, child_deadlines.1)
             .with_plan(plan_provider(Arc::clone(&head_cell)))
             .with_snapshot(snapshot)
-            .with_events(event_tx.downgrade()),
+            .with_events(event_tx.downgrade())
+            .with_notify(cmd_tx.downgrade()),
         ));
         // The workflow runner (0044) drives the same child builder; its
         // agents never see it either (`Registry::filtered`).
@@ -2787,6 +2788,7 @@ impl HotlChildBuilder {
             .clone()
             .unwrap_or_else(|| self.system.clone());
         let config = self.child_config(def);
+        let config_model = config.model.clone();
         // The parent's hooks under this child's own actor marker: a hook can
         // tell parent from child, and can still only deny — never grant.
         let hooks = self
@@ -2823,6 +2825,7 @@ impl HotlChildBuilder {
             },
         );
         Ok(crate::spawn::Child {
+            model: config_model,
             handle,
             worktree,
             isolation_unavailable,
@@ -2832,6 +2835,10 @@ impl HotlChildBuilder {
 }
 
 impl crate::spawn::ChildBuilder for HotlChildBuilder {
+    fn isolates(&self, def: &hotl_tools::agents::AgentDef) -> bool {
+        self.wants_isolation(def)
+    }
+
     fn build(
         &self,
         def: &hotl_tools::agents::AgentDef,

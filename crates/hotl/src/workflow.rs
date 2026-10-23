@@ -702,6 +702,7 @@ impl ChildRunner {
             worktree,
             isolation_unavailable,
             report_path: _,
+            model: _,
         } = match built {
             Ok(c) => c,
             Err(e) => return fail(format!("could not start the agent: {e}")),
@@ -730,7 +731,8 @@ impl ChildRunner {
                     crate::structured::MAX_RETRIES,
                     async move |h: &mut hotl_engine::SessionHandle| {
                         let (text, usage) = settle(
-                            drain_child(h, &cancel, None, lead.as_ref(), Default::default()).await,
+                            drain_child(h, &cancel, None, lead.as_ref(), Default::default(), None)
+                                .await,
                         );
                         *lock(&used) += usage;
                         if text.is_ok() {
@@ -744,7 +746,15 @@ impl ChildRunner {
             }
             None => {
                 let (text, usage) = settle(
-                    drain_child(&mut child, &cancel, None, lead.as_ref(), Default::default()).await,
+                    drain_child(
+                        &mut child,
+                        &cancel,
+                        None,
+                        lead.as_ref(),
+                        Default::default(),
+                        None,
+                    )
+                    .await,
                 );
                 *lock(&used) += usage;
                 text.map(Value::String)
@@ -981,6 +991,7 @@ mod tests {
                 .as_ref()
                 .map_or(std::env::temp_dir(), |w| w.path().to_path_buf());
             Ok(Child {
+                model: "m".into(),
                 handle: session(Arc::new(ScriptedProvider::new(replies)), registry, cwd),
                 worktree,
                 isolation_unavailable: false,

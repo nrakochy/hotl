@@ -504,6 +504,7 @@ impl Tool for RegisterChild {
                     summary: "fake".into(),
                     background: true,
                     isolated: false,
+                    read_only: true,
                     started_ms: 0,
                     steer,
                     resume,
