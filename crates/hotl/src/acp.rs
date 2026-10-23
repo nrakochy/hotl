@@ -2347,11 +2347,9 @@ pub struct AcpPayloads {
 }
 
 /// Where the ACP schema is published (0076 D3).
-#[allow(dead_code)] // read by `hotl schema` and the drift test (0076 task 4)
 pub const ACP_SCHEMA_ID: &str = "https://nrakochy.github.io/hotl/schema/acp-v1.schema.json";
 
 /// The published schema of every ACP payload, `$id` set to its URL.
-#[allow(dead_code)]
 pub fn acp_schema() -> Value {
     let mut v = serde_json::to_value(schemars::schema_for!(AcpPayloads))
         .expect("a schema always serializes");

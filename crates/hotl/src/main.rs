@@ -40,6 +40,7 @@ mod images;
 mod keysource;
 mod mcp_cli;
 mod plugins_cli;
+mod schema_cli;
 mod session_server;
 mod setup;
 mod shell_hooks;
@@ -162,7 +163,7 @@ add-zsh-hook preexec hotl-preexec
 /// tie both to the completion scripts, so a new verb cannot land in one place
 /// only. `__sessions` is the completions' session source, hidden from help.
 #[allow(dead_code)] // read by the drift tests
-const SUBCOMMANDS: [(&str, &str); 22] = [
+const SUBCOMMANDS: [(&str, &str); 23] = [
     ("watch", "tmux agent dashboard"),
     ("fleet", "reserved (orchestrate)"),
     (
@@ -188,6 +189,7 @@ const SUBCOMMANDS: [(&str, &str); 22] = [
     ("init", "print shell integration (zsh, bash, fish)"),
     ("export", "print a session transcript"),
     ("stats", "sessions, turns, tokens and cost"),
+    ("schema", "print a published wire schema (json-stream, acp)"),
     ("help", "show help"),
     ("version", "print the version"),
     ("__sessions", "id<TAB>name lines for completion (internal)"),
@@ -267,6 +269,7 @@ fn main() {
         Some("gc") => std::process::exit(gc::gc_main(&args)),
         Some("export") => std::process::exit(export::export_main(&args[1..])),
         Some("stats") => std::process::exit(stats::stats_main(&args[1..])),
+        Some("schema") => std::process::exit(schema_cli::schema_main(&args[1..])),
         Some("mcp") => std::process::exit(mcp_cli::mcp_main(&args)),
         Some("plugins") => std::process::exit(plugins_cli::plugins_main(&args)),
         Some("skills") => std::process::exit(skills_cli::skills_main(&args)),
@@ -340,6 +343,7 @@ fn help_text() -> &'static str {
          hotl gc [--dry-run]  prune old sessions/blobs per [retention]; sweeps session worktrees when run in a repo\n  \
          hotl export <s>      print a session's transcript as Markdown (--html for a page); s = id, name, @last\n  \
          hotl stats           sessions, turns, tool calls, tokens and cost by model and by day (--days N, --json)\n  \
+         hotl schema <w>      print a published wire schema: json-stream | acp\n  \
          hotl plugins         list Agent Plugins (skills + MCP); add/update/remove packages\n  \
          hotl mcp             list MCP servers and trust state; show/add/add --url/untrust/test\n  \
          hotl skills          list skills; add/update/remove marketplaces (skill sources)\n  \

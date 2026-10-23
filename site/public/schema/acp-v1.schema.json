@@ -1,0 +1,2638 @@
+{
+  "$defs": {
+    "Ack": {
+      "description": "`{\"ok\": true}`.",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "AcpOnlyUpdate": {
+      "description": "`session/update` bodies only the ACP surface sends.",
+      "oneOf": [
+        {
+          "description": "The turn ended; the usage rides the prompt result instead.",
+          "properties": {
+            "mispredictions": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "outcome": {
+              "$ref": "#/$defs/OutcomeFrame"
+            },
+            "type": {
+              "const": "turn_done",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "outcome"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "mode": {
+              "type": "string"
+            },
+            "type": {
+              "const": "mode_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "mode"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "plan": {
+              "type": "boolean"
+            },
+            "type": {
+              "const": "plan_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "plan"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "effort": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "effort_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "cap": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "entries": {
+              "items": {
+                "$ref": "#/$defs/MemoryEntryRow"
+              },
+              "type": "array"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "memory_report",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "mode",
+            "path",
+            "bytes",
+            "cap",
+            "entries"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "context_window": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "mode": {
+              "type": "string"
+            },
+            "model": {
+              "type": "string"
+            },
+            "plan": {
+              "type": "boolean"
+            },
+            "skills": {
+              "items": {
+                "$ref": "#/$defs/RosterEntry"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "config_reloaded",
+              "type": "string"
+            },
+            "warnings": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "workflows": {
+              "items": {
+                "$ref": "#/$defs/RosterEntry"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "type",
+            "model",
+            "mode",
+            "plan",
+            "context_window",
+            "skills",
+            "workflows",
+            "warnings"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "const": "config_reload_failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "rows": {
+              "items": {
+                "$ref": "#/$defs/ContextRow"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "context_report",
+              "type": "string"
+            },
+            "window": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "type",
+            "window",
+            "rows"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "jobs": {
+              "items": {
+                "$ref": "#/$defs/JobRow"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "jobs_report",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "jobs"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "children": {
+              "items": {
+                "$ref": "#/$defs/ChildRow"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "children_report",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "children"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "AcpUpdate": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Frame"
+        },
+        {
+          "$ref": "#/$defs/AcpOnlyUpdate"
+        }
+      ],
+      "description": "Any `session/update` body: a stream frame or an ACP-only kind. The\n`workflows_report` body is the workflow registry's own JSON (untyped here)."
+    },
+    "Cancelled": {
+      "properties": {
+        "cancelled": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "cancelled"
+      ],
+      "type": "object"
+    },
+    "ChildPhase": {
+      "enum": [
+        "start",
+        "done"
+      ],
+      "type": "string"
+    },
+    "ChildRow": {
+      "description": "One sub-agent in a `children_report`.",
+      "properties": {
+        "agent_type": {
+          "type": "string"
+        },
+        "background": {
+          "type": "boolean"
+        },
+        "call_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "id": {
+          "type": "string"
+        },
+        "isolated": {
+          "type": "boolean"
+        },
+        "ok": {
+          "description": "Set once `done`.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "started_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "description": "`running` | `done` | `closed`.",
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "agent_type",
+        "summary",
+        "started_ms",
+        "background",
+        "isolated",
+        "state",
+        "secs"
+      ],
+      "type": "object"
+    },
+    "ContextKind": {
+      "description": "What fills the context window, by source (`/context`, plan 0028).\n\nDeclaration order IS display order — `Ord` is derived, and both the engine\nand the TUI sort by it, so reordering these variants reorders the report.",
+      "oneOf": [
+        {
+          "enum": [
+            "system_prompt",
+            "tool_schemas",
+            "skills_roster",
+            "agents_roster",
+            "project_instructions",
+            "memory",
+            "todos",
+            "folded_history",
+            "messages",
+            "tool_results",
+            "harness_injections",
+            "images"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "A row this binary does not know. Absorbs a future engine's new kind\nwithout dropping its tokens on the floor — dropping them would\nundercount, the one direction this codebase treats as unacceptable.",
+          "type": "string"
+        }
+      ]
+    },
+    "ContextRow": {
+      "description": "One row of a `/context` breakdown. `kind` is a stable wire tag, never a\ndisplay string — the client owns the label.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/ContextKind"
+        },
+        "tokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "kind",
+        "tokens"
+      ],
+      "type": "object"
+    },
+    "EffortAck": {
+      "description": "`effort` is `null` when reset to the provider default.",
+      "properties": {
+        "effort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "EgressReply": {
+      "description": "What a client answers `session/request_egress` with. Schema only.",
+      "properties": {
+        "allow": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "allow"
+      ],
+      "type": "object"
+    },
+    "Frame": {
+      "description": "One `-p --json` frame (and, via `update_frame`, every ACP update body that\nmirrors one). Field order is the wire order: under `serde_json`'s\n`preserve_order` (on in the default build) a struct serializes in\ndeclaration order, so each variant lists its keys as the old literals did\n(0076 D2). Omitted-not-null fields are `Option` + `skip_serializing_if`.",
+      "oneOf": [
+        {
+          "description": "Streamed answer text.",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "text_delta",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Streamed reasoning text.",
+          "properties": {
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "thinking_delta",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A tool call started; `id` is the provider's `tool_use` id.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_start",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "summary"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A tool call finished; `lines`/`bytes` count the result the model got.",
+          "properties": {
+            "bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "lines": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "ok": {
+              "type": "boolean"
+            },
+            "type": {
+              "const": "tool_done",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "ok",
+            "lines",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The goal evaluator is judging the turn just finished.",
+          "properties": {
+            "turn": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "goal_evaluating",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "turn"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A call waits for a concurrency permit behind `ahead` others.",
+          "properties": {
+            "ahead": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_queued",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "summary",
+            "ahead"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A fold of `items` history items is starting.",
+          "properties": {
+            "items": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "compacting",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "items"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Liveness of a running tool: the tail of its output so far.",
+          "properties": {
+            "bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "id": {
+              "type": "string"
+            },
+            "lines": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "name": {
+              "type": "string"
+            },
+            "tail": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_progress",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "tail",
+            "lines",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The model is writing tool-call input: `calls` calls, `bytes` so far.",
+          "properties": {
+            "bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "calls": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "tool_input_progress",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "calls",
+            "bytes"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A call was denied before it ran.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_denied",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A call ran without an ask because an allow rule matched.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "rule": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_auto_allowed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "rule"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A protected-class call ran or was refused under bypass, with a notice.",
+          "properties": {
+            "denied": {
+              "type": "boolean"
+            },
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "const": "tool_flagged",
+              "type": "string"
+            },
+            "why": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "id",
+            "name",
+            "summary",
+            "why",
+            "denied"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A sub-agent's tool activity; `ok` only on the done phase.",
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "ok": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            },
+            "parent_id": {
+              "type": "string"
+            },
+            "phase": {
+              "$ref": "#/$defs/ChildPhase"
+            },
+            "summary": {
+              "type": "string"
+            },
+            "tokens": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "child_tool",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "parent_id",
+            "id",
+            "name",
+            "summary",
+            "phase"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A sub-agent's own words.",
+          "properties": {
+            "parent_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "child_text",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "parent_id",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One turn's delegation summary.",
+          "properties": {
+            "duplicate_work_paths": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "false_completions": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "subagent_runs": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tool_calls": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "delegation",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/TokenUsage"
+            }
+          },
+          "required": [
+            "type",
+            "subagent_runs",
+            "duplicate_work_paths",
+            "false_completions",
+            "usage",
+            "tool_calls"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A cache keep-alive ping was billed.",
+          "properties": {
+            "cost_usd": {
+              "format": "double",
+              "type": [
+                "number",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "cache_warm",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/TokenUsage"
+            }
+          },
+          "required": [
+            "type",
+            "usage"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A request is being retried after `delay_ms`.",
+          "properties": {
+            "attempt": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "delay_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "discarded_partial": {
+              "type": "boolean"
+            },
+            "max": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "request_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "scope": {
+              "$ref": "#/$defs/RetryScopeTag"
+            },
+            "status": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "retrying",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "attempt",
+            "max",
+            "reason",
+            "delay_ms",
+            "scope"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The turn moved to a fallback model.",
+          "properties": {
+            "model": {
+              "type": "string"
+            },
+            "type": {
+              "const": "fallback_model",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "model"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A prompt was queued behind the running turn.",
+          "properties": {
+            "type": {
+              "const": "prompt_queued",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Session spend crossed `pct` of `max_cost_usd`.",
+          "properties": {
+            "cap_usd": {
+              "format": "double",
+              "type": "number"
+            },
+            "pct": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "budget_notice",
+              "type": "string"
+            },
+            "used_usd": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "type",
+            "pct",
+            "used_usd",
+            "cap_usd"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A fold finished.",
+          "properties": {
+            "degraded": {
+              "type": "boolean"
+            },
+            "estimate": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "focus": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "compacted",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/TokenUsage"
+            }
+          },
+          "required": [
+            "type",
+            "degraded",
+            "usage",
+            "estimate"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A requested fold had nothing to fold.",
+          "properties": {
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "const": "fold_skipped",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The session's model changed; `context_tokens` is the cold-cache rebuild.",
+          "properties": {
+            "context_tokens": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "context_window": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "model": {
+              "type": "string"
+            },
+            "previous": {
+              "type": "string"
+            },
+            "type": {
+              "const": "model_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "model",
+            "previous",
+            "context_tokens",
+            "context_window"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The context ladder cleared `count` old tool results.",
+          "properties": {
+            "count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "cleared",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "count"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The todo list changed.",
+          "properties": {
+            "items": {
+              "items": {
+                "$ref": "#/$defs/Todo"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "todos_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "items"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The model presented a plan.",
+          "properties": {
+            "nodes": {
+              "items": {
+                "$ref": "#/$defs/Todo"
+              },
+              "type": "array"
+            },
+            "path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "const": "plan_presented",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "summary",
+            "nodes"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The goal was set (or cleared: `null`).",
+          "properties": {
+            "goal": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "goal_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A memory note was written.",
+          "properties": {
+            "bytes": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "date": {
+              "type": "string"
+            },
+            "note": {
+              "type": "string"
+            },
+            "path": {
+              "type": "string"
+            },
+            "type": {
+              "const": "memory_changed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "note",
+            "date",
+            "bytes",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A background job started.",
+          "properties": {
+            "command": {
+              "type": "string"
+            },
+            "detached": {
+              "type": "boolean"
+            },
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job": {
+              "type": "string"
+            },
+            "pid": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "job_started",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "job",
+            "pid",
+            "command",
+            "detached"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A background job ended.",
+          "properties": {
+            "id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "job": {
+              "type": "string"
+            },
+            "rc": {
+              "type": "string"
+            },
+            "secs": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "stopped_by": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "job_done",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "job",
+            "rc",
+            "secs"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The session got a generated title (omitted when none was usable).",
+          "properties": {
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "type": {
+              "const": "session_titled",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/TokenUsage"
+            }
+          },
+          "required": [
+            "type",
+            "usage"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A `/btw` side question was answered.",
+          "properties": {
+            "question": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "type": {
+              "const": "aside_result",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/TokenUsage"
+            }
+          },
+          "required": [
+            "type",
+            "question",
+            "text",
+            "usage"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A `/btw` side question failed.",
+          "properties": {
+            "question": {
+              "type": "string"
+            },
+            "reason": {
+              "type": "string"
+            },
+            "type": {
+              "const": "aside_failed",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "question",
+            "reason"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The goal evaluator's verdict; `usage` is the goal loop's spend.",
+          "properties": {
+            "evidence": {
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
+            "reason": {
+              "type": "string"
+            },
+            "turns": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "goal_verdict",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/TokenUsage"
+            },
+            "verdict": {
+              "$ref": "#/$defs/GoalVerdictTag"
+            }
+          },
+          "required": [
+            "type",
+            "verdict",
+            "reason",
+            "turns",
+            "usage"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The loop ledger's per-turn profile.",
+          "properties": {
+            "max_rss_bytes": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "overhead_p50_ns": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "overhead_p99_ns": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "phase_deltas": {
+              "items": {
+                "$ref": "#/$defs/PhaseDeltaSummary"
+              },
+              "type": "array"
+            },
+            "sample_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": {
+              "const": "ledger_report",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "sample_count",
+            "overhead_p50_ns",
+            "overhead_p99_ns",
+            "max_rss_bytes",
+            "phase_deltas"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The turn ended (`-p --json` only; ACP carries it as the prompt result).",
+          "properties": {
+            "mispredictions": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "outcome": {
+              "$ref": "#/$defs/OutcomeFrame"
+            },
+            "type": {
+              "const": "turn_done",
+              "type": "string"
+            },
+            "usage": {
+              "$ref": "#/$defs/UsageFrame"
+            }
+          },
+          "required": [
+            "type",
+            "outcome",
+            "usage"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Headless has no human: an ask was denied.",
+          "properties": {
+            "summary": {
+              "type": "string"
+            },
+            "type": {
+              "const": "ask_denied",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "summary"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Headless has no human: a question went unanswered.",
+          "properties": {
+            "header": {
+              "type": "string"
+            },
+            "options": {
+              "items": {
+                "$ref": "#/$defs/QuestionOption"
+              },
+              "type": "array"
+            },
+            "prompt": {
+              "type": "string"
+            },
+            "type": {
+              "const": "question_no_human",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "header",
+            "prompt",
+            "options"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "GoalAck": {
+      "properties": {
+        "goal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok"
+      ],
+      "type": "object"
+    },
+    "GoalVerdictTag": {
+      "enum": [
+        "not_yet",
+        "met",
+        "impossible",
+        "eval_failed",
+        "stalled",
+        "error"
+      ],
+      "type": "string"
+    },
+    "InitializeResult": {
+      "description": "The `initialize` result.",
+      "properties": {
+        "contextWindow": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "defaultMode": {
+          "type": "string"
+        },
+        "defaultPlan": {
+          "type": "boolean"
+        },
+        "protocolVersion": {
+          "description": "hotl's own dialect string — not upstream ACP's integer version.",
+          "type": "string"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "skills": {
+          "items": {
+            "$ref": "#/$defs/RosterEntry"
+          },
+          "type": "array"
+        },
+        "streamIdleSecs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "workflows": {
+          "items": {
+            "$ref": "#/$defs/RosterEntry"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "protocolVersion",
+        "schemaVersion",
+        "skills",
+        "workflows",
+        "defaultMode",
+        "defaultPlan",
+        "contextWindow",
+        "streamIdleSecs"
+      ],
+      "type": "object"
+    },
+    "JobRow": {
+      "description": "One background job in a `jobs_report`.",
+      "properties": {
+        "command": {
+          "type": "string"
+        },
+        "detached": {
+          "type": "boolean"
+        },
+        "id": {
+          "type": "string"
+        },
+        "pid": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "rc": {
+          "description": "The exit status once `done`; `null` while running.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "secs": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "started_ms": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "state": {
+          "description": "`running` | `done`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "pid",
+        "command",
+        "started_ms",
+        "detached",
+        "state",
+        "secs"
+      ],
+      "type": "object"
+    },
+    "MemoryEntryRow": {
+      "properties": {
+        "date": {
+          "type": "string"
+        },
+        "note": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "date",
+        "note"
+      ],
+      "type": "object"
+    },
+    "ModeAck": {
+      "properties": {
+        "mode": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok",
+        "mode"
+      ],
+      "type": "object"
+    },
+    "ModelAck": {
+      "properties": {
+        "applied": {
+          "description": "`false` = parked until the running turn ends.",
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ok",
+        "model",
+        "applied",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "OutcomeFrame": {
+      "description": "A turn outcome, tagged by `kind`.",
+      "oneOf": [
+        {
+          "properties": {
+            "kind": {
+              "const": "done",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "cancelled",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "turn_limit",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "refused",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "doom_loop",
+              "type": "string"
+            },
+            "pattern": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "pattern"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "tool_failure_budget",
+              "type": "string"
+            },
+            "tool": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "tool"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "`message` names the knob, for clients that show an outcome's text.",
+          "properties": {
+            "consecutive": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "kind": {
+              "const": "denial_spiral",
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "total": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "kind",
+            "consecutive",
+            "total",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "budget": {
+              "type": "string"
+            },
+            "cap": {
+              "format": "double",
+              "type": "number"
+            },
+            "kind": {
+              "const": "budget",
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            },
+            "used": {
+              "format": "double",
+              "type": "number"
+            }
+          },
+          "required": [
+            "kind",
+            "budget",
+            "used",
+            "cap",
+            "message"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "kind": {
+              "const": "error",
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "message"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PermissionReply": {
+      "anyOf": [
+        {
+          "description": "A typed answer for an ask that wants one.",
+          "properties": {
+            "respond": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "respond"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Allow with edited tool input.",
+          "properties": {
+            "input": true
+          },
+          "required": [
+            "input"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "allow": {
+              "type": "boolean"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "secretReads": {
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "allow"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "What a client answers `session/request_permission` with. Schema only:\n`ask_reply_from_result` reads these spellings in this priority (0076 D5)."
+    },
+    "Phase": {
+      "description": "The ten boundary events a turn's sample passes through. Declaration order\nis the critical-path order the design doc's per-phase deltas price\n(`SnapshotReady−BoundaryStart` prices the snapshot transport, etc.) — see\n[`DELTA_PAIRS`]. A doom-loop abort or a failed sample can legitimately\nskip phases past the point of failure; see [`LoopLedger::stamp`].\n\n`BatchProposed`/`WatermarkDurable` are the one place the critical path\nforks: a sample proposes once (the model's own assistant+usage entry) or\ntwice (that entry, then — only when a tool phase runs — the tool-results\nentry). These two phases use [`LoopLedger::restamp`] (last-wins, not\n`stamp`'s first-wins), so their recorded position always tracks the\nsample's REAL final commit — after `ToolsJoined` when a tool phase ran,\notherwise right after `LastBlockEnd`. Every other phase is written\nexactly once by construction, so `stamp`'s first-wins rule is what\napplies to them.\n\n**Declaration order is stamp order, not wall order** — and since S2c's\noptimistic dispatch those two genuinely diverge. A sample whose request\nwas dispatched at the *previous* boundary already had bytes on the wire\nbefore this sample's `BoundaryStart`: its true first byte can precede the\nprevious sample's `WatermarkDurable`, which is the overlap the mechanism\nexists for, not a measurement error. Every stamp is taken when the turn\n**observes** the event, so the recorded sequence stays monotone and the\nsummary needs no special case; what a reader must not do is treat\n`RequestBuilt→FirstByte` on an adopted sample as a round-trip\nmeasurement. It is the time to *notice* a byte that was already there,\nand it is legitimately near zero. ([`width`] saturates either way, so an\nout-of-order pair reports `0` rather than wrapping.)",
+      "enum": [
+        "BoundaryStart",
+        "SnapshotReady",
+        "RequestBuilt",
+        "FirstByte",
+        "LastBlockEnd",
+        "ToolsSpawned",
+        "ToolsJoined",
+        "BatchProposed",
+        "WatermarkDurable",
+        "BoundaryEnd"
+      ],
+      "type": "string"
+    },
+    "PhaseDeltaSummary": {
+      "description": "One attributable stage's timing across every sample in a flush.",
+      "properties": {
+        "from": {
+          "$ref": "#/$defs/Phase"
+        },
+        "p50_ns": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "p99_ns": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "to": {
+          "$ref": "#/$defs/Phase"
+        }
+      },
+      "required": [
+        "from",
+        "to",
+        "p50_ns",
+        "p99_ns"
+      ],
+      "type": "object"
+    },
+    "PlanAck": {
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "plan": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok",
+        "plan"
+      ],
+      "type": "object"
+    },
+    "PromptResult": {
+      "description": "The `session/prompt` result, sent when the turn ends.",
+      "properties": {
+        "mispredictions": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "outcome": {
+          "$ref": "#/$defs/OutcomeFrame"
+        },
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "usage": {
+          "$ref": "#/$defs/UsageFrame"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "outcome",
+        "usage"
+      ],
+      "type": "object"
+    },
+    "QuestionOption": {
+      "description": "One selectable choice in a structured [`Question`] (`ask_user`, tier-1\ngap #4). `description` is an optional one-line elaboration shown under\nthe label.",
+      "properties": {
+        "description": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "type": "object"
+    },
+    "QuestionReply": {
+      "anyOf": [
+        {
+          "description": "Option labels, as shown.",
+          "properties": {
+            "selected": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "selected"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "freeText": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "freeText"
+          ],
+          "type": "object"
+        }
+      ],
+      "description": "What a client answers `session/request_question` with. Schema only."
+    },
+    "Queued": {
+      "description": "`session/steer` and `session/aside`: `false` = there was no turn to queue on.",
+      "properties": {
+        "queued": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "queued"
+      ],
+      "type": "object"
+    },
+    "ReloadAck": {
+      "description": "`session/reload_config` with no open session.",
+      "properties": {
+        "model": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ok",
+        "model",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "ReloadSessionAck": {
+      "description": "`session/reload_config` with an open session (it is re-opened).",
+      "properties": {
+        "contextWindow": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "mode": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "ok": {
+          "type": "boolean"
+        },
+        "plan": {
+          "type": "boolean"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "ok",
+        "sessionId",
+        "model",
+        "mode",
+        "plan",
+        "contextWindow",
+        "warnings"
+      ],
+      "type": "object"
+    },
+    "RequestEgressParams": {
+      "description": "Server → client `session/request_egress` params.",
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "host"
+      ],
+      "type": "object"
+    },
+    "RequestPermissionParams": {
+      "description": "Server → client `session/request_permission` params.",
+      "properties": {
+        "protectedWhy": {
+          "description": "Why a protected path is involved, when one is.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "summary"
+      ],
+      "type": "object"
+    },
+    "RequestQuestionParams": {
+      "description": "Server → client `session/request_question` params.",
+      "properties": {
+        "header": {
+          "type": "string"
+        },
+        "multi": {
+          "type": "boolean"
+        },
+        "options": {
+          "items": {
+            "$ref": "#/$defs/QuestionOption"
+          },
+          "type": "array"
+        },
+        "prompt": {
+          "type": "string"
+        },
+        "sessionId": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "header",
+        "prompt",
+        "options",
+        "multi"
+      ],
+      "type": "object"
+    },
+    "RetryScopeTag": {
+      "enum": [
+        "sample",
+        "summarize",
+        "goal_eval",
+        "title",
+        "aside"
+      ],
+      "type": "string"
+    },
+    "RosterEntry": {
+      "description": "`{name, description}` — a skill or workflow in a roster.",
+      "properties": {
+        "description": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "description"
+      ],
+      "type": "object"
+    },
+    "SessionOpenResult": {
+      "description": "The `session/new` / `session/load` / fork result. Absent keys mean\nsomething different from `null` (probe failed / never set / same model).",
+      "properties": {
+        "contextTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "defaultEffort": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effort": {
+          "description": "Absent = never set; `null` = explicitly cleared.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "effortSchedule": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "goal": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "images": {
+          "description": "Feature detection: an old server never sends it.",
+          "type": "boolean"
+        },
+        "memoryMode": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "mode": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "plan": {
+          "type": "boolean"
+        },
+        "previousModel": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "title": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "todos": {
+          "items": {
+            "$ref": "#/$defs/Todo"
+          },
+          "type": "array"
+        },
+        "warnings": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "worktree": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorktreeInfo"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "sessionId",
+        "mode",
+        "plan",
+        "images",
+        "todos",
+        "warnings",
+        "model"
+      ],
+      "type": "object"
+    },
+    "SessionUpdateParams": {
+      "description": "`session/update` params.",
+      "properties": {
+        "schemaVersion": {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "sessionId": {
+          "type": "string"
+        },
+        "update": {
+          "$ref": "#/$defs/AcpUpdate"
+        }
+      },
+      "required": [
+        "schemaVersion",
+        "sessionId",
+        "update"
+      ],
+      "type": "object"
+    },
+    "StoppedAck": {
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "stopped": {
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "ok",
+        "stopped"
+      ],
+      "type": "object"
+    },
+    "Todo": {
+      "description": "A plan node. Everything past `active_form` is 0056 T1 — all defaulted and\nskipped when empty, so a v0.25 `Todos` entry still deserializes and a list\nthat uses none of it serializes to the same bytes it always did.",
+      "properties": {
+        "acceptance": {
+          "description": "One sentence describing what \"done\" looks like when no command can say.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active_form": {
+          "description": "Present-tense form shown while in progress (\"wiring the gate\"); optional.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "content": {
+          "type": "string"
+        },
+        "dependencies": {
+          "description": "Ids of nodes whose output this one needs. Resolved and cycle-checked\nat parse time.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "id": {
+          "description": "`n1..nN`, assigned by `parse_todos` when absent and preserved when the\nmodel sends one back — that stability is what makes `dependencies`\nsurvive a full-state rewrite.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "replan": {
+          "description": "The node's own result is expected to change the rest of the plan.",
+          "type": "boolean"
+        },
+        "status": {
+          "$ref": "#/$defs/TodoStatus"
+        },
+        "validate_cmd": {
+          "description": "The exact command that proves this node. Informational to `todo_write`\n— nothing refuses a completion; the goal gate (T4) reads it.",
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "content",
+        "status"
+      ],
+      "type": "object"
+    },
+    "TodoStatus": {
+      "description": "A session checklist item (`todo_write`, M4/tier-1 gap #3). Full-state\nreplace: the model rewrites the whole list each call, so there is no\nseparate id/patch shape to reconcile.\n\n`Failed`/`NeedsMoreSteps` (0056 T1) sit **before** the `#[serde(other)]`\narm, so an older binary reads them as `Unknown` — which every renderer\nalready tolerates — rather than failing the whole entry.",
+      "oneOf": [
+        {
+          "enum": [
+            "pending",
+            "in_progress",
+            "completed",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "Tried and did not work. Distinct from `Pending`: it has been attempted.",
+          "type": "string"
+        },
+        {
+          "const": "needs_more_steps",
+          "description": "The step turned out to be bigger than one step — it needs splitting.",
+          "type": "string"
+        }
+      ]
+    },
+    "TokenUsage": {
+      "description": "Normalized usage; fields absent from a provider response default to zero.",
+      "properties": {
+        "cache_creation_1h_input_tokens": {
+          "description": "Cache-write tokens billed at the 1-hour TTL rate (2x input, vs. 1.25x\nfor the 5-minute default). See `cache_creation_5m_input_tokens`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_creation_5m_input_tokens": {
+          "description": "Cache-write tokens billed at the 5-minute TTL rate — a refinement of\n`cache_creation_input_tokens` (which stays the authoritative total),\nnot a replacement for it. `skip_serializing_if` keeps a payload with\nno per-TTL breakdown byte-identical to one from before this field\nexisted: this struct is persisted in the session log and serialized\ninto `--json`/ACP frames, so a zero bucket must stay invisible on\nthe wire.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_creation_input_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_read_input_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "input_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "UsageFrame": {
+      "description": "`TokenUsage` plus the derived `hit_ratio` and `cost_usd`, each omitted\nwhen there is nothing to report.",
+      "properties": {
+        "cache_creation_1h_input_tokens": {
+          "description": "Cache-write tokens billed at the 1-hour TTL rate (2x input, vs. 1.25x\nfor the 5-minute default). See `cache_creation_5m_input_tokens`.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_creation_5m_input_tokens": {
+          "description": "Cache-write tokens billed at the 5-minute TTL rate — a refinement of\n`cache_creation_input_tokens` (which stays the authoritative total),\nnot a replacement for it. `skip_serializing_if` keeps a payload with\nno per-TTL breakdown byte-identical to one from before this field\nexisted: this struct is persisted in the session log and serialized\ninto `--json`/ACP frames, so a zero bucket must stay invisible on\nthe wire.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_creation_input_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cache_read_input_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "cost_usd": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "hit_ratio": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "input_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "output_tokens": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "WorktreeInfo": {
+      "description": "`{path, branch}` of a session's worktree.",
+      "properties": {
+        "branch": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "branch"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://nrakochy.github.io/hotl/schema/acp-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "Index type: exists so `schema_for!` puts every payload in `$defs`.",
+  "properties": {
+    "ack": {
+      "$ref": "#/$defs/Ack"
+    },
+    "cancelled": {
+      "$ref": "#/$defs/Cancelled"
+    },
+    "effortAck": {
+      "$ref": "#/$defs/EffortAck"
+    },
+    "egressReply": {
+      "$ref": "#/$defs/EgressReply"
+    },
+    "goalAck": {
+      "$ref": "#/$defs/GoalAck"
+    },
+    "initialize": {
+      "$ref": "#/$defs/InitializeResult"
+    },
+    "modeAck": {
+      "$ref": "#/$defs/ModeAck"
+    },
+    "modelAck": {
+      "$ref": "#/$defs/ModelAck"
+    },
+    "permissionReply": {
+      "$ref": "#/$defs/PermissionReply"
+    },
+    "planAck": {
+      "$ref": "#/$defs/PlanAck"
+    },
+    "promptResult": {
+      "$ref": "#/$defs/PromptResult"
+    },
+    "questionReply": {
+      "$ref": "#/$defs/QuestionReply"
+    },
+    "queued": {
+      "$ref": "#/$defs/Queued"
+    },
+    "reloadAck": {
+      "$ref": "#/$defs/ReloadAck"
+    },
+    "reloadSessionAck": {
+      "$ref": "#/$defs/ReloadSessionAck"
+    },
+    "requestEgress": {
+      "$ref": "#/$defs/RequestEgressParams"
+    },
+    "requestPermission": {
+      "$ref": "#/$defs/RequestPermissionParams"
+    },
+    "requestQuestion": {
+      "$ref": "#/$defs/RequestQuestionParams"
+    },
+    "sessionOpen": {
+      "$ref": "#/$defs/SessionOpenResult"
+    },
+    "sessionUpdate": {
+      "$ref": "#/$defs/SessionUpdateParams"
+    },
+    "stoppedAck": {
+      "$ref": "#/$defs/StoppedAck"
+    }
+  },
+  "required": [
+    "initialize",
+    "sessionOpen",
+    "promptResult",
+    "sessionUpdate",
+    "ack",
+    "planAck",
+    "modeAck",
+    "effortAck",
+    "modelAck",
+    "goalAck",
+    "stoppedAck",
+    "reloadAck",
+    "reloadSessionAck",
+    "queued",
+    "cancelled",
+    "requestPermission",
+    "requestQuestion",
+    "requestEgress",
+    "permissionReply",
+    "questionReply",
+    "egressReply"
+  ],
+  "title": "hotl ACP-dialect payloads",
+  "type": "object"
+}

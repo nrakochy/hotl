@@ -750,7 +750,6 @@ pub fn json_frame(event: &EngineEvent, model: &str) -> Value {
 }
 
 /// The published schema of one `-p --json` line, `$id` set to its URL.
-#[allow(dead_code)] // read by `hotl schema` and the drift test (0076 task 4)
 pub fn json_stream_schema() -> Value {
     let mut v = serde_json::to_value(schemars::schema_for!(JsonStreamLine))
         .expect("a schema always serializes");
@@ -760,6 +759,5 @@ pub fn json_stream_schema() -> Value {
 }
 
 /// Where the stream schema is published (0076 D3); bump the file with the major.
-#[allow(dead_code)]
 pub const JSON_STREAM_SCHEMA_ID: &str =
     "https://nrakochy.github.io/hotl/schema/json-stream-v2.schema.json";
