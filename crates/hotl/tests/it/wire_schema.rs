@@ -9,25 +9,7 @@ use hotl_engine::{EngineEvent, Outcome};
 use hotl_types::TokenUsage;
 use serde_json::{json, Value};
 
-#[path = "../src/wire.rs"]
-#[allow(dead_code)]
-mod wire;
-
-#[path = "../src/images.rs"]
-#[allow(dead_code)]
-mod images;
-
-#[path = "../src/acp.rs"]
-#[allow(dead_code)]
-mod acp;
-
-#[path = "../src/features.rs"]
-#[allow(dead_code)]
-mod features;
-
-#[path = "../src/schema_cli.rs"]
-#[allow(dead_code)]
-mod schema_cli;
+use crate::{acp, features, schema_cli, wire};
 
 /// Read at runtime: a compile-time `env!` goes stale under a shared `target/`.
 fn schema_dir() -> PathBuf {

@@ -13,9 +13,7 @@ use hotl_tools::net::EgressState;
 use hotl_tools::rules::Rules;
 use hotl_tools::sandbox::SandboxStatus;
 
-#[path = "../src/acp_child.rs"]
-#[allow(dead_code)]
-mod acp_child;
+use crate::acp_child;
 
 use acp_child::{AcpChild, AcpSpawn};
 

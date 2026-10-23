@@ -22,20 +22,7 @@ use ratatui::Terminal;
 use serde_json::{json, Value};
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 
-// The server module lives in the binary crate; pull it in directly.
-#[path = "../src/images.rs"]
-#[allow(dead_code)]
-mod images;
-
-#[path = "../src/acp.rs"]
-#[allow(dead_code)]
-mod acp;
-
-// `acp.rs` renders its frames through the shared renderer; pull that in too,
-// so `crate::wire` resolves the same way it does in the binary.
-#[path = "../src/wire.rs"]
-#[allow(dead_code)]
-mod wire;
+use crate::acp;
 
 type Reader = FrameReader<ReadHalf<DuplexStream>>;
 type Client = AcpClient<WriteHalf<DuplexStream>>;

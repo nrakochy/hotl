@@ -11,21 +11,7 @@ use hotl_tools::{rules::Rules, Registry};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-// The server module lives in the binary crate; pull it in directly. Some
-// items are only exercised by the real factory in the binary, not this test.
-#[path = "../src/images.rs"]
-#[allow(dead_code)]
-mod images;
-
-#[path = "../src/acp.rs"]
-#[allow(dead_code)]
-mod acp;
-
-// `acp.rs` renders its frames through the shared renderer; pull that in too,
-// so `crate::wire` resolves the same way it does in the binary.
-#[path = "../src/wire.rs"]
-#[allow(dead_code)]
-mod wire;
+use crate::acp;
 
 /// A session whose scripted model calls bash (a gated tool → a permission
 /// ask) then replies with text.

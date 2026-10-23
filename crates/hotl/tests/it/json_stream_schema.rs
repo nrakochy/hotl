@@ -3,8 +3,8 @@
 //! survived inside a stream declared a Tier-1 contract (evaluation §5.7).
 //! Every frame must be machine-parseable and version-stamped.
 //!
-//! The renderer module is pulled in by path, the way `acp_protocol.rs` and
-//! `tui_e2e.rs` reach `acp.rs`: `crates/hotl` is a binary crate with no lib
+//! The renderer module is pulled in by path at this binary's root
+//! (`main.rs`), with `acp.rs`: `crates/hotl` is a binary crate with no lib
 //! target, so `wire.rs` is deliberately self-contained (it depends on
 //! `hotl-engine` and `serde_json`, nothing else in the crate).
 
@@ -12,9 +12,7 @@ use hotl_engine::{EngineEvent, LedgerSummary, Outcome, Phase, PhaseDeltaSummary}
 use hotl_types::TokenUsage;
 use serde_json::json;
 
-#[path = "../src/wire.rs"]
-#[allow(dead_code)]
-mod wire;
+use crate::wire;
 
 #[test]
 fn every_frame_is_tagged_and_versioned() {
