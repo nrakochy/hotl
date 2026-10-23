@@ -1118,6 +1118,59 @@ async fn handle_request(
             payload["type"] = json!("workflows_report");
             notify(writer, &sid, payload).await;
         }
+        // `/jobs` (0064): thin ack, `jobs_report` broadcast — the
+        // `session/workflows` shape. Additive, so `UPDATE_SCHEMA_VERSION` stands.
+        "session/jobs" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "session/jobs requires an open session").await;
+            };
+            let jobs = state.handle.jobs().await;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            let rows: Vec<Value> = jobs
+                .iter()
+                .map(|j| {
+                    let (state_word, rc, ended) = match &j.state {
+                        hotl_tools::jobs::JobState::Running => ("running", Value::Null, now),
+                        hotl_tools::jobs::JobState::Done { rc, ended_ms } => {
+                            ("done", json!(rc.to_string()), *ended_ms)
+                        }
+                    };
+                    json!({
+                        "id": j.id, "pid": j.pid, "command": j.command,
+                        "started_ms": j.started_ms, "detached": j.detached,
+                        "state": state_word, "rc": rc,
+                        "secs": ended.saturating_sub(j.started_ms) / 1000,
+                    })
+                })
+                .collect();
+            reply_ok(writer, id, json!({"ok": true})).await;
+            notify(
+                writer,
+                &state.id,
+                json!({"type": "jobs_report", "jobs": rows}),
+            )
+            .await;
+        }
+        // `/jobs stop <id>` (0064): kills the tree; the `job_done` frame that
+        // follows is the outcome.
+        "session/jobs/stop" => {
+            let Some(state) = session.as_ref() else {
+                return reply_err(writer, id, "session/jobs/stop requires an open session").await;
+            };
+            let Some(job) = msg
+                .pointer("/params/job")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return reply_err(writer, id, "session/jobs/stop requires params.job").await;
+            };
+            let stopped = state.handle.stop_job(job).await;
+            reply_ok(writer, id, json!({"ok": true, "stopped": stopped})).await;
+        }
         other => reply_err(writer, id, &format!("unknown method `{other}`")).await,
     }
 }

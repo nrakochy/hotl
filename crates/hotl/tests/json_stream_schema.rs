@@ -130,6 +130,20 @@ fn every_frame_is_tagged_and_versioned() {
             context_tokens: 12,
             context_window: 200_000,
         },
+        EngineEvent::JobStarted {
+            id: Some("t9".into()),
+            job: "a1b2c3".into(),
+            pid: 4242,
+            command: "cargo nextest run".into(),
+            detached: false,
+        },
+        EngineEvent::JobDone {
+            id: Some("t9".into()),
+            job: "a1b2c3".into(),
+            rc: "0".into(),
+            secs: 252,
+            stopped_by: None,
+        },
         EngineEvent::TodosChanged { items: Vec::new() },
         EngineEvent::PlanPresented {
             summary: "swap the parser".into(),
@@ -315,6 +329,39 @@ fn budget_notice_is_tagged_and_carries_its_numbers() {
 }
 
 /// 0034: the goal frames are additive (`JSON_STREAM_SCHEMA_VERSION` stands).
+/// `job_started` / `job_done` (0064) carry the starting call's id and the
+/// short job id, so a surface can pair the job with its card.
+#[test]
+fn job_frames_are_tagged_and_carry_the_call_and_job_ids() {
+    let s = wire::update_frame(&EngineEvent::JobStarted {
+        id: Some("t9".into()),
+        job: "a1b2c3".into(),
+        pid: 4242,
+        command: "cargo nextest run".into(),
+        detached: true,
+    })
+    .unwrap();
+    assert_eq!(s["type"], "job_started");
+    assert_eq!(s["id"], "t9");
+    assert_eq!(s["job"], "a1b2c3");
+    assert_eq!(s["pid"], 4242);
+    assert_eq!(s["command"], "cargo nextest run");
+    assert_eq!(s["detached"], true);
+    let d = wire::update_frame(&EngineEvent::JobDone {
+        id: None,
+        job: "a1b2c3".into(),
+        rc: "killed:SIGKILL".into(),
+        secs: 900,
+        stopped_by: Some("timeout".into()),
+    })
+    .unwrap();
+    assert_eq!(d["type"], "job_done");
+    assert_eq!(d["id"], json!(null));
+    assert_eq!(d["rc"], "killed:SIGKILL");
+    assert_eq!(d["secs"], 900);
+    assert_eq!(d["stopped_by"], "timeout");
+}
+
 /// `memory_changed` (0069) is additive: note, date, the file's size and path.
 #[test]
 fn memory_frames_carry_their_payloads() {

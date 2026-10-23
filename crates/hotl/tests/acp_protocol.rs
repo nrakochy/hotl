@@ -3084,3 +3084,195 @@ async fn remember_in_read_only_mode_errors_without_a_permission_request() {
         "{err}"
     );
 }
+
+/// A session whose scripted model starts one background job (0064).
+#[cfg(unix)]
+fn jobs_factory(command: &str) -> acp::SessionFactory {
+    let command = command.to_string();
+    Box::new(move |_spec| {
+        let log = SessionLog::create_ephemeral("m", None, Masker::empty(), 0).expect("log");
+        let session_id = log.session_id.clone();
+        let provider = Arc::new(ScriptedProvider::new(vec![
+            ScriptedProvider::tool_call(
+                "t1",
+                "bash",
+                json!({"command": command, "background": true}),
+            ),
+            ScriptedProvider::text_reply("started it"),
+            ScriptedProvider::text_reply("saw it end"),
+        ]));
+        Ok(acp::SessionOpen {
+            handle: spawn_session(SessionDeps {
+                concurrency: Default::default(),
+                provider,
+                registry: Arc::new(Registry::builtin()),
+                rules: Arc::new(Rules::default()),
+                sandbox_enforced: false,
+                clock: Arc::new(SystemClock),
+                log,
+                system: "sys".into(),
+                cwd: std::env::temp_dir(),
+                hooks: None,
+                initial_items: Vec::new(),
+                initial_todos: Vec::new(),
+                initial_decisions: Vec::new(),
+                plan_files: None,
+                initial_goal: None,
+                config: EngineConfig {
+                    max_turns: 6,
+                    ..Default::default()
+                },
+            }),
+            name: None,
+            mode: "ask".into(),
+            plan: false,
+            default_effort: None,
+            effort_schedule: None,
+            goal: None,
+            todos: Vec::new(),
+            effort: None,
+            previous_model: None,
+            memory_mode: None,
+            session_id,
+            warnings: Vec::new(),
+            title: None,
+            model: None,
+        })
+    })
+}
+
+/// Drive a prompt to its result, allowing every permission ask; returns the
+/// `job_started` frame seen on the way.
+#[cfg(unix)]
+async fn prompt_and_collect_job(
+    cwrite: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    lines: &mut tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+    id: u64,
+) -> Value {
+    send(
+        cwrite,
+        json!({"jsonrpc":"2.0","id":id,"method":"session/prompt","params":{"text":"go"}}),
+    )
+    .await;
+    let mut started = None;
+    loop {
+        let m = next(lines).await;
+        match m.get("method").and_then(Value::as_str) {
+            Some("session/request_permission") => {
+                let rid = m["id"].clone();
+                send(
+                    cwrite,
+                    json!({"jsonrpc":"2.0","id":rid,"result":{"allow":true}}),
+                )
+                .await;
+            }
+            Some("session/update") if m["params"]["update"]["type"] == "job_started" => {
+                started = Some(m["params"]["update"].clone());
+            }
+            _ if m["id"] == json!(id) => break,
+            _ => {}
+        }
+    }
+    started.expect("a job_started frame")
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_jobs_reports_running_and_finished_jobs() {
+    let (mut cwrite, mut lines, _) = open_memory_session(jobs_factory("sleep 60")).await;
+    let started = prompt_and_collect_job(&mut cwrite, &mut lines, 3).await;
+    assert_eq!(started["id"], "t1", "the starting call's id");
+    let job = started["job"].as_str().unwrap().to_string();
+    assert_eq!(job.len(), 6);
+    assert_eq!(started["detached"], false);
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/jobs","params":{}}),
+    )
+    .await;
+    let mut report = None;
+    for _ in 0..8 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "jobs_report" {
+            report = Some(m["params"]["update"].clone());
+            break;
+        }
+    }
+    let r = report.expect("a jobs_report");
+    let rows = r["jobs"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["id"], job);
+    assert_eq!(rows[0]["state"], "running");
+    assert_eq!(rows[0]["rc"], json!(null));
+    assert_eq!(rows[0]["command"], "sleep 60");
+    assert!(rows[0]["pid"].as_u64().unwrap() > 0);
+    // Stop it; the report then shows it done with the kill recorded.
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/jobs/stop","params":{"job": job}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 5).await;
+    assert_eq!(ack["result"]["stopped"], true, "{ack}");
+    let mut done = None;
+    for _ in 0..40 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "job_done" {
+            done = Some(m["params"]["update"].clone());
+            break;
+        }
+    }
+    let d = done.expect("a job_done frame");
+    assert_eq!(d["job"], job);
+    assert_eq!(d["rc"], "killed:SIGKILL");
+    assert_eq!(d["stopped_by"], "/jobs");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn session_jobs_stop_kills_by_id_and_unknown_ids_say_so() {
+    let (mut cwrite, mut lines, _) = open_memory_session(jobs_factory("sleep 60")).await;
+    let started = prompt_and_collect_job(&mut cwrite, &mut lines, 3).await;
+    let job = started["job"].as_str().unwrap().to_string();
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":4,"method":"session/jobs/stop","params":{"job":"nope00"}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 4).await;
+    assert_eq!(ack["result"]["stopped"], false, "{ack}");
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":5,"method":"session/jobs/stop","params":{}}),
+    )
+    .await;
+    let err = read_until_id(&mut lines, 5).await;
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("params.job"),
+        "{err}"
+    );
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":6,"method":"session/jobs/stop","params":{"job": job}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 6).await;
+    assert_eq!(ack["result"]["stopped"], true, "{ack}");
+    // Twice is false: the job is no longer running.
+    for _ in 0..40 {
+        let m = next(&mut lines).await;
+        if m["method"] == "session/update" && m["params"]["update"]["type"] == "job_done" {
+            break;
+        }
+    }
+    send(
+        &mut cwrite,
+        json!({"jsonrpc":"2.0","id":7,"method":"session/jobs/stop","params":{"job": job}}),
+    )
+    .await;
+    let ack = read_until_id(&mut lines, 7).await;
+    assert_eq!(ack["result"]["stopped"], false, "{ack}");
+}
