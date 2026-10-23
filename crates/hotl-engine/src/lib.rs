@@ -170,6 +170,9 @@ pub struct EngineConfig {
     pub ask_expiry: std::time::Duration,
     /// Running background jobs per session (0064 D6, `[behavior] max_jobs`).
     pub max_jobs: usize,
+    /// Running plus parked sub-agents per session (0072 D7,
+    /// `[agents] max_children`).
+    pub max_children: usize,
     /// Skills with `paths:` globs (0068 D3): the turn hints the first time a
     /// tool input path matches one. Rides the config rather than
     /// `SessionDeps` so the hundred test literals stay as they are; children
@@ -277,6 +280,7 @@ impl Default for EngineConfig {
             memory_files: None,
             ask_expiry: std::time::Duration::from_secs(3600),
             max_jobs: 8,
+            max_children: hotl_tools::children::DEFAULT_MAX_CHILDREN,
             skill_paths: Arc::from(Vec::new()),
             tool_failure_budget: 5,
             max_tool_calls: 0,
@@ -1160,12 +1164,28 @@ pub enum SessionCmd {
         images: Vec<hotl_types::UserImage>,
     },
     /// A harness notification for the model (0064 D3: a background job
-    /// ended): idle → a tagged turn starts; running → held like a steer and
-    /// released at the next boundary, with a `Continue` at turn end so the
-    /// model answers it.
+    /// ended; 0072 D3: a background child reported): idle → a tagged turn
+    /// starts; running → held like a steer and released at the next
+    /// boundary, with a `Continue` at turn end so the model answers it.
+    /// `key` lets [`SessionCmd::Unnotify`] withdraw it while held; `charge`
+    /// is a child's bill, applied to the session's caps on admit (D11).
     Notify {
         text: String,
         synthetic: hotl_types::SyntheticReason,
+        key: Option<String>,
+        charge: Option<hotl_tools::children::ChildCharge>,
+    },
+    /// Drop a held notification by key (0072 D5: a `wait` claimed the result
+    /// the inbox was about to carry). A no-op once it has been released.
+    Unnotify { key: String },
+    /// The sub-agent registry, read (`/agents`). Safe mid-turn.
+    Children {
+        reply: oneshot::Sender<Vec<hotl_tools::children::ChildRecord>>,
+    },
+    /// Interrupt one child by id (`/agents stop`); `false` = no live child.
+    StopChild {
+        id: String,
+        reply: oneshot::Sender<bool>,
     },
     /// The job registry, read (`/jobs`). Safe mid-turn.
     Jobs {
@@ -1550,6 +1570,42 @@ impl SessionHandle {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
+    }
+    /// The session's sub-agents (0072), running and parked. Safe mid-turn.
+    pub async fn children(&self) -> Vec<hotl_tools::children::ChildRecord> {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd
+            .send(SessionCmd::Children { reply: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+    /// Interrupt one sub-agent (0072). `false` when no live child has that id.
+    pub async fn stop_child(&self, id: &str) -> bool {
+        let (tx, rx) = oneshot::channel();
+        if self
+            .cmd
+            .send(SessionCmd::StopChild {
+                id: id.to_string(),
+                reply: tx,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        rx.await.unwrap_or(false)
+    }
+    /// A weak sender to this session's actor, for the sinks a tool registers
+    /// after the session exists (0072: a background child's completion).
+    /// Weak for the reason every registry-held sender is: a strong one would
+    /// keep the actor alive after the handle is gone.
+    pub fn commands(&self) -> mpsc::WeakSender<SessionCmd> {
+        self.cmd.downgrade()
     }
     /// Kill one background job's tree (0064). `false` when no running job
     /// has that id.

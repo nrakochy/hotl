@@ -735,6 +735,9 @@ pub(crate) struct SharedDeps {
     /// The background job registry (0064): scoped into every tool call,
     /// read by `/jobs`, killed at session end.
     pub jobs: Arc<hotl_tools::jobs::JobContext>,
+    /// The sub-agent registry (0072): scoped into every tool call, read by
+    /// `/agents`, stopped at session end.
+    pub children: Arc<hotl_tools::children::Children>,
     /// What the harness observed commands do (0056 T4). Session-scoped, not
     /// turn-scoped: a goal loop spans turns, and "has this run since the last
     /// edit" is exactly the question a per-turn ledger could not answer.
@@ -795,6 +798,7 @@ impl SharedDeps {
         notifications: crate::hooks::NotificationDrain,
         head_rx: tokio::sync::watch::Receiver<Arc<ProjectionHead>>,
         jobs: Arc<hotl_tools::jobs::JobContext>,
+        children: Arc<hotl_tools::children::Children>,
     ) -> (Self, SessionLog) {
         let mode = AtomicU8::new(mode_to_u8(deps.rules.mode()));
         let plan = AtomicBool::new(deps.rules.plan());
@@ -863,6 +867,7 @@ impl SharedDeps {
             head_rx,
             plan_files: deps.plan_files,
             jobs,
+            children,
             command_ledger: std::sync::Mutex::new(hotl_context::goal::CommandLedger::default()),
         };
         (shared, deps.log)
@@ -1022,6 +1027,15 @@ impl SharedDeps {
     /// Count `n` calls against the session's tool-call budget.
     pub(crate) fn count_tool_calls(&self, n: u64) {
         self.tool_calls.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// A child's bill against this session's caps (0072 D11): its tokens
+    /// priced at its own model, its tool calls counted. Same threshold
+    /// notice `add_spend` gives a sample.
+    pub(crate) fn charge_child(&self, charge: &hotl_tools::children::ChildCharge) -> Option<u8> {
+        self.count_tool_calls(charge.tool_calls);
+        let cost = hotl_provider::catalog::cost_usd(&charge.model, &charge.usage).unwrap_or(0.0);
+        self.add_spend(cost)
     }
 
     /// Session spend so far, in USD.
@@ -1246,6 +1260,10 @@ pub(crate) async fn run(
     // Steers that arrived while a turn was live (or a tool batch open),
     // waiting for a boundary before they can be appended.
     let mut held_steers: Vec<HeldSteer> = Vec::new();
+    // A notification released at a mid-turn commit boundary that the model
+    // may never sample against (the sample it landed behind ended the turn):
+    // `TurnFinished` turns it into a `Continue` (0064 D3, 0072 T3).
+    let mut released_notice = false;
     // The job registry (0064): `<session>.jobs` beside the log. Its notify
     // closure reaches this very actor — a weak sender, like every sink the
     // actor's own state holds — and a completion rides `send` on a spawned
@@ -1299,6 +1317,8 @@ pub(crate) async fn run(
                                 .send(SessionCmd::Notify {
                                     text,
                                     synthetic: SyntheticReason::BackgroundJob,
+                                    key: None,
+                                    charge: None,
                                 })
                                 .await;
                         }
@@ -1307,7 +1327,12 @@ pub(crate) async fn run(
             }),
         )
     };
-    let (shared, mut log) = SharedDeps::new(deps, notifications, head_rx, jobs);
+    // The sub-agent registry (0072): the tools reach it through the
+    // `CHILDREN` task-local a turn scopes around each call.
+    let children = Arc::new(hotl_tools::children::Children::new(
+        deps.config.max_children,
+    ));
+    let (shared, mut log) = SharedDeps::new(deps, notifications, head_rx, jobs, children);
     let shared = Arc::new(shared);
     // Usage carried across compaction respawns within one logical turn.
     let mut carry_usage = TokenUsage::default();
@@ -1354,7 +1379,7 @@ pub(crate) async fn run(
                 // steer as one step — which is what turns a steer at the
                 // boundary into a clean adoption miss instead of a race
                 // (commit-protocol.md §Causal groups, the adoption rule).
-                release_steers(
+                released_notice |= release_steers(
                     &shared,
                     &mut log,
                     &mut head,
@@ -1436,11 +1461,28 @@ pub(crate) async fn run(
                         text,
                         images,
                         synthetic: SyntheticReason::Steer,
+                        key: None,
                     },
                 )
                 .await
             }
-            SessionCmd::Notify { text, synthetic } => {
+            SessionCmd::Notify {
+                text,
+                synthetic,
+                key,
+                charge,
+            } => {
+                // A child's bill is spend the moment it is known (0072 D11),
+                // whether the text lands now or at the next boundary.
+                if let Some(c) = charge {
+                    if let Some(pct) = shared.charge_child(&c) {
+                        let _ = events.try_send(EngineEvent::BudgetNotice {
+                            pct,
+                            used_usd: shared.spent_usd(),
+                            cap_usd: shared.config.max_cost_usd,
+                        });
+                    }
+                }
                 // D3: idle → a tagged turn starts; running → held like a
                 // steer, so it can never split a tool batch or precede the
                 // assistant item the model is still producing.
@@ -1451,6 +1493,7 @@ pub(crate) async fn run(
                             text,
                             images: Vec::new(),
                             synthetic,
+                            key,
                         },
                     );
                 } else {
@@ -1473,6 +1516,17 @@ pub(crate) async fn run(
                     )
                     .await;
                 }
+            }
+            SessionCmd::Unnotify { key } => {
+                // Held means not yet seen; released means the model has it,
+                // and the duplicate is its own (D5).
+                held_steers.retain(|s| s.key.as_deref() != Some(key.as_str()));
+            }
+            SessionCmd::Children { reply } => {
+                let _ = reply.send(shared.children.list());
+            }
+            SessionCmd::StopChild { id, reply } => {
+                let _ = reply.send(shared.children.stop(&id));
             }
             SessionCmd::Jobs { reply } => {
                 let _ = reply.send(shared.jobs.jobs.list());
@@ -1869,7 +1923,7 @@ pub(crate) async fn run(
                 if mode == crate::AckMode::Sync
                     && !matches!(result, crate::ProposeReply::StaleEpoch)
                 {
-                    release_steers(
+                    released_notice |= release_steers(
                         &shared,
                         &mut log,
                         &mut head,
@@ -1965,10 +2019,12 @@ pub(crate) async fn run(
                     unrecoverable,
                 )
                 .await;
-                // A notification released at turn end has nobody to answer
-                // it: ask for a continuation (D3). A queued prompt that just
-                // started a turn makes it a no-op; a closing session drops it.
-                if notified {
+                // A notification released at turn end — or behind the sample
+                // that ended the turn — has nobody to answer it: ask for a
+                // continuation (D3). A turn that did answer it, or a queued
+                // prompt that just started, makes it a no-op (the last item
+                // is then not a user item); a closing session drops it.
+                if notified || std::mem::take(&mut released_notice) {
                     if let Some(tx) = cmd_tx.upgrade() {
                         tokio::spawn(async move {
                             let _ = tx.send(SessionCmd::Continue).await;
@@ -1981,8 +2037,10 @@ pub(crate) async fn run(
             }
         }
     }
-    // Jobs die with the session (0064 D5), before the hook sees the end.
+    // Jobs and children die with the session (0064 D5, 0072 D6), before the
+    // hook sees the end.
     shared.jobs.jobs.kill_all();
+    shared.children.stop_all();
     // SessionEnd (Finding 1 fix): AWAITED, not fire-and-forget — the command
     // channel closed (every `SessionHandle`/turn task dropped its sender), so
     // this actor is shutting down for good and nothing needs it responsive
@@ -2520,6 +2578,7 @@ async fn on_turn_finished(
         if matches!(outcome, Outcome::Done { .. })
             && ctx.queue.is_empty()
             && ctx.shared.jobs.jobs.running_attached() == 0
+            && ctx.shared.children.running() == 0
         {
             if let Some(state) = ctx.goal.as_mut() {
                 state.turns += 1;
@@ -3159,6 +3218,8 @@ struct HeldSteer {
     text: String,
     images: Vec<hotl_types::UserImage>,
     synthetic: SyntheticReason,
+    /// A child's result (0072): `Unnotify` withdraws it by this while held.
+    key: Option<String>,
 }
 
 async fn append_steer(
@@ -4514,6 +4575,7 @@ mod tests {
                     text: "go".into(),
                     images: vec![big()],
                     synthetic: SyntheticReason::Steer,
+                    key: None,
                 },
             );
         }
@@ -4545,6 +4607,7 @@ mod tests {
                 text: "seed".into(),
                 images: vec![img(HELD_IMAGE_B64_MAX)],
                 synthetic: SyntheticReason::Steer,
+                key: None,
             },
         );
         // Second push both truncates (text alone is over HELD_BYTES_MAX) and
@@ -4555,6 +4618,7 @@ mod tests {
                 text: "y".repeat(HELD_BYTES_MAX + 4_096),
                 images: vec![img(1)],
                 synthetic: SyntheticReason::Steer,
+                key: None,
             },
         );
         let text = &held[0].text;
@@ -4730,6 +4794,7 @@ mod tests {
             crate::hooks::NotificationDrain::new(),
             head_rx,
             hotl_tools::jobs::JobContext::new(dir.join("s.jobs"), 8, Arc::new(|_| {})),
+            Arc::new(hotl_tools::children::Children::default()),
         );
         (Arc::new(shared), log, head)
     }
@@ -5115,6 +5180,7 @@ mod tests {
             text: "hold me".to_string(),
             images: Vec::new(),
             synthetic: SyntheticReason::Steer,
+            key: None,
         }];
         release_steers(
             &shared,
@@ -5138,6 +5204,7 @@ mod tests {
             text: "hold me".to_string(),
             images: Vec::new(),
             synthetic: SyntheticReason::Steer,
+            key: None,
         }];
         release_steers(
             &shared,

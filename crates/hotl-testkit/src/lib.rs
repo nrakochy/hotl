@@ -180,6 +180,17 @@ impl Harness {
         )
     }
 
+    /// Hooks and a custom registry at once (0072: a scripted tool registers
+    /// a child, the session-end hook checks it was stopped first).
+    pub fn with_hooks_and_registry(
+        scripts: Vec<Vec<Result<StreamEvent, ProviderError>>>,
+        config: EngineConfig,
+        hooks: Arc<dyn hotl_engine::hooks::Hooks>,
+        registry: Registry,
+    ) -> Self {
+        Self::build_with(scripts, config, Vec::new(), Some(hooks), registry)
+    }
+
     /// Construct a harness with a custom tool registry (concurrency probes,
     /// scripted tools).
     pub fn with_registry(

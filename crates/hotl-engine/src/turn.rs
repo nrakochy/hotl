@@ -1739,6 +1739,21 @@ impl Turn {
         self.maybe_evict(tu, &mut executed.outcome).await;
         if let Some(d) = &executed.outcome.facts.delegation {
             self.delegation.fold(d);
+            // A foreground child's bill (0072 D11): the parent's caps charge
+            // it here, the way a background child's rides `Notify.charge`.
+            let charge = hotl_tools::children::ChildCharge {
+                usage: d.usage,
+                model: d.model.clone(),
+                tool_calls: d.tool_calls,
+            };
+            if let Some(pct) = self.shared.charge_child(&charge) {
+                self.emit(EngineEvent::BudgetNotice {
+                    pct,
+                    used_usd: self.shared.spent_usd(),
+                    cap_usd: self.shared.config.max_cost_usd,
+                })
+                .await;
+            }
         }
         // The expectation check (0050 T5), before the outcome moves into the
         // failure budget. Only the *first* miss in a batch is recorded: the
@@ -2124,6 +2139,7 @@ impl Turn {
         // forwarded child events with its own card's id.
         // 0064: the job registry rides the same shape, so `bash
         // {background}` reaches this session's jobs and no other's.
+        // 0072: the sub-agent registry too, for `spawn`/`wait`/`send`/`resume`.
         let mut outcome = hotl_tools::PROGRESS_SINK
             .scope(
                 sink,
@@ -2133,7 +2149,10 @@ impl Turn {
                         secret_reads,
                         hotl_tools::jobs::JOBS.scope(
                             Arc::clone(&self.shared.jobs),
-                            tool.run(input, self.cancel.clone()),
+                            hotl_tools::children::CHILDREN.scope(
+                                Arc::clone(&self.shared.children),
+                                tool.run(input, self.cancel.clone()),
+                            ),
                         ),
                     ),
                 ),
