@@ -195,6 +195,12 @@ if ! grep -q "Version $new;" site/public/llms.txt; then
   exit 1
 fi
 
+# The ACP registry draft names the version and each release archive URL;
+# a test fails the build when it drifts.
+sed -E 's/"version": "[0-9]+\.[0-9]+\.[0-9]+"/"version": "'"$new"'"/; s#/download/v[0-9]+\.[0-9]+\.[0-9]+/#/download/'"$tag"'/#' \
+  .acp-registry/agent.json > .acp-registry/agent.json.tmp \
+  && mv .acp-registry/agent.json.tmp .acp-registry/agent.json
+
 # Promote the changelog: what was unreleased is now this version, and a fresh
 # empty [Unreleased] takes its place. The entries themselves are untouched —
 # they simply end up under a dated heading.
