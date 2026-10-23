@@ -4537,6 +4537,7 @@ mod tests {
         let child = |files: &[&str], false_completion: bool| hotl_tools::DelegationFacts {
             files_touched: files.iter().map(|s| s.to_string()).collect(),
             false_completion,
+            ..Default::default()
         };
         let mut t = DelegationTally::default();
         assert_eq!(

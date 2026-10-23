@@ -652,7 +652,7 @@ impl SpawnTool {
             )
         });
         let facts = hotl_tools::OutcomeFacts {
-            delegation: Some(hotl_tools::DelegationFacts {
+            delegation: Some(Box::new(hotl_tools::DelegationFacts {
                 files_touched: typed
                     .as_ref()
                     .and_then(|v| v.get("files_touched"))
@@ -665,7 +665,8 @@ impl SpawnTool {
                     })
                     .unwrap_or_default(),
                 false_completion,
-            }),
+                ..Default::default()
+            })),
             ..Default::default()
         };
         let dress = |text: String| {

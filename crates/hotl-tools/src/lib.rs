@@ -9,6 +9,7 @@ pub mod agents;
 pub mod ask;
 pub mod b64;
 mod builtins;
+pub mod children;
 pub mod concurrency;
 pub mod diagnostics;
 pub mod formatters;
@@ -114,7 +115,8 @@ pub struct OutcomeFacts {
     pub matched: Option<bool>,
     /// What one delegated sub-agent run reported (0058 T2). `Some` only for
     /// `spawn`; the turn folds these into its per-turn `delegation` frame.
-    pub delegation: Option<DelegationFacts>,
+    /// Boxed: a `ToolOutcome` rides every `Result<_, ToolOutcome>` in here.
+    pub delegation: Option<Box<DelegationFacts>>,
 }
 
 /// One `spawn` call's contribution to the turn's delegation summary.
@@ -126,6 +128,13 @@ pub struct DelegationFacts {
     /// The child claimed `completed` and the caller's own `validate_cmd`
     /// disagreed.
     pub false_completion: bool,
+    /// The child's own token bill, summed over its turns (0072 D11): the
+    /// parent's caps charge it, its context fullness does not.
+    pub usage: hotl_types::TokenUsage,
+    /// The model the child sampled with — what `usage` is priced at.
+    pub model: String,
+    /// Tool calls the child made, against the parent's `max_tool_calls`.
+    pub tool_calls: u64,
 }
 
 #[derive(Debug, Clone)]
