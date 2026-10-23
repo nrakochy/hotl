@@ -56,6 +56,7 @@ api_key_helper = "..."                      # command whose trimmed stdout is th
 api_key_helper_ttl_secs = 300               # re-run the helper when the cached key is older; absent = startup + auth-failure only
 max_tokens = 64000                          # per-sample output cap (thinking + text); clamped to the model's catalogued maximum
 cache_breakpoints = true                    # OpenAI dialects only: explicit GPT-5.6 prompt-cache breakpoints; absent = on for model names at or past gpt-5.6, off otherwise
+cache_warming = true                        # keep the 5-minute prompt cache alive while a long tool runs (one cache-read request when it saves ≥ $0.05); absent = on; env twin HOTL_CACHE_WARMING
 stream_idle_secs = 90                       # a stream with no byte at all (pings included) for this long is dead and retried; floor 15
 thinking_stall_secs = 120                   # an open thinking block with no delta for this long (pings still coming) is dropped and retried; floor 15
 
@@ -685,6 +686,19 @@ max_cost_usd = 5.0
 
 Crossing 50%, 80% or 100% of the spend budget raises one notice each — a transcript line and the console's strip meter. Either cap ending a turn produces a typed outcome (`budget` on the JSON stream) whose message names the knob to raise.
 
+**Cache keep-alive.** A session on the 5-minute prompt cache (`-p`, sub-agents,
+workflow steps) whose tool call is about to outlive it — a long test run, a
+sub-agent, a background job — sends one tiny cache-read request before the
+entry expires, so the next sample reads the history at the cache-read price
+instead of rewriting it. It fires only while a tool is running, only when the
+model's catalogued prices say the saving is at least $0.05 (about 10k cached
+tokens on Opus-class models), never on the 1-hour cache the console uses,
+and never on a model hotl cannot price. Each ping's tokens count toward
+`max_cost_usd` and the session totals; `/cost` shows `cache kept warm N× ($)`,
+`-p` prints `· cache kept warm (…)`, and `--json` emits a `cache_warm` frame.
+An endpoint that rejects the one-token request is tried once and left alone.
+`[provider] cache_warming = false` or `HOTL_CACHE_WARMING=0` turns it off.
+
 ### Ask expiry (`[behavior] ask_expiry_secs`)
 
 A permission ask raised while no client is attached (`hotl bg`, `hotl serve`) is **parked**: its reply channel is held and the ask is re-issued the moment you attach. Without a deadline, a session nobody returns to holds that turn open forever. After `ask_expiry_secs` — one hour by default — a parked ask is **denied**, the denial is recorded in the session log like any other, and the turn carries on. `0` restores the old wait-forever behavior. Headless (`dontask`) sessions are unaffected: they already deny immediately.
@@ -854,6 +868,18 @@ it. `recall`, eviction and replay work as usual while it runs. `hotl gc` and
 the secrets audit still run against the real store — they are about the store,
 not this run. Not available with `--json-schema`.
 
+**`--json-schema <file>`** makes the answer a single JSON object valid against
+the schema in `file`: the contract rides in as a tagged context item, the
+answer is checked here against your schema as written, and a mismatch is fed
+back for up to two retries. On a retry the turn also asks Anthropic for the
+schema directly (`output_config.format`), so the corrected answer is
+grammar-constrained — on models that support structured outputs, with a copy
+of the schema that has `additionalProperties: false` on every object and the
+numeric/string constraints stripped (the check here still enforces them). The
+first attempt is byte-for-byte what it was, a schema with `$ref` keeps the
+plain retry, and an endpoint that rejects the field is tried once and left
+alone. Other dialects keep the retry loop as it was.
+
 `--json` emits one JSON object per line — a machine contract, not a log. Every
 frame carries `"schema_version"` and a `"type"`: `text_delta`,
 `thinking_delta` (with its `text`), `tool_start`, `tool_done`, `tool_denied`,
@@ -863,7 +889,9 @@ frames only), `retrying`, `fallback_model`, `prompt_queued`,
 `compacted` (now also with `focus`, `usage` and `estimate`), `fold_skipped`,
 `model_changed` (with `model`, `previous`, `context_tokens` and
 `context_window` — the cache cost of the switch),
-`todos_changed`, `ask_denied`, `question_no_human`, and a terminal
+`todos_changed`, `ask_denied`, `question_no_human`, `cache_warm` (a cache
+keep-alive ping's `usage`, with `cost_usd` when the model has a price), and a
+terminal
 `turn_done` carrying token usage and a tagged outcome:
 
 ```json

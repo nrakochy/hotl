@@ -65,7 +65,11 @@ One more gateway-specific knob: a gateway alias that hides the model version
 (`sol-fast` in front of a GPT-5.6) never passes the name gate for explicit
 prompt-cache breakpoints, so set `[provider] cache_breakpoints = true` to
 turn them on by hand; if the gateway rejects the cache fields hotl notices
-the 400 once, retries without them and stays off for the session.
+the 400 once, retries without them and stays off for the session. The same
+rule reaches two more features: an alias hotl cannot find in its model
+catalog has no price and no capability row, so it gets no cache keep-alive
+and no `output_config.format` on `--json-schema` retries — the `max_cost_usd`
+posture. Name the real model (or add it to the catalog) to get both.
 
 ## Worked example: Bifrost with a virtual key
 

@@ -8,6 +8,24 @@ semver promise of their own.
 
 ### Added
 
+- **The prompt cache is kept alive while a long tool runs.** When a session is
+  on the 5-minute cache and a tool call (a long test run, a sub-agent, a
+  background job) is about to outlive it, hotl sends one tiny cache-read
+  request so the next sample reads the history instead of rewriting it. It
+  only fires when the saving is at least $0.05 by the model's own prices,
+  never while idle, never on the 1-hour cache that interactive sessions use,
+  and never on a model hotl cannot price. The spend counts toward the session
+  cap and shows on `/cost` as `cache kept warm N×`; `-p` prints one line per
+  ping and `--json` carries a `cache_warm` frame. `[provider] cache_warming =
+  false` (or `HOTL_CACHE_WARMING=0`) turns it off.
+- **`--json-schema` retries ask Anthropic for the schema directly.** On a
+  validation miss the retry turn carries `output_config.format` with the
+  schema, so the corrected answer is grammar-constrained; the first attempt is
+  byte-for-byte unchanged, the client-side check still runs against the full
+  schema (the API gets a copy with `additionalProperties: false` and the
+  numeric/string constraints stripped), and an endpoint that rejects the
+  field is probed once and left alone. Anthropic models that support
+  structured outputs only; other dialects keep the retry loop as it was.
 - **`hotl -w [name]` works in a git worktree.** The session gets its own
   worktree on branch `name` (or `hotl/<session id>`), cut from your local
   `HEAD` under `<repo>/.git/hotl-worktrees/`, so two sessions on one repo
