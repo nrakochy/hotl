@@ -253,20 +253,27 @@ pub fn all_mcp_servers_reporting(
     let (mut servers, warnings) = cfg.mcp_servers_reporting();
     for plugin in plugins {
         for s in &plugin.servers {
-            servers.push(hotl_mcp::config::ServerConfig {
-                name: format!("{}:{}", plugin.name, s.name),
-                command: Some(s.command.clone()),
-                args: s.args.clone(),
-                description: if s.description.is_empty() {
-                    format!("from plugin `{}`", plugin.name)
-                } else {
-                    s.description.clone()
+            let description = if s.description.is_empty() {
+                format!("from plugin `{}`", plugin.name)
+            } else {
+                s.description.clone()
+            };
+            let name = format!("{}:{}", plugin.name, s.name);
+            // A plugin's URL server (0063 T5) carries no token: the manifest
+            // schema has no place for one, and a literal header is refused.
+            servers.push(match &s.url {
+                Some(url) => hotl_mcp::config::ServerConfig {
+                    description,
+                    headers: s.headers.clone(),
+                    ..hotl_mcp::config::ServerConfig::http(&name, url)
                 },
-                env: s.env.clone(),
-                cwd: Some(s.cwd.clone()),
-                url: None,
-                headers: Vec::new(),
-                bearer_token_env: None,
+                None => hotl_mcp::config::ServerConfig {
+                    description,
+                    env: s.env.clone(),
+                    cwd: Some(s.cwd.clone()),
+                    args: s.args.clone(),
+                    ..hotl_mcp::config::ServerConfig::stdio(&name, &s.command, &[])
+                },
             });
         }
     }
@@ -2878,6 +2885,53 @@ path_prefix = "/Volumes/secrets"
 
     /// The roster composition: `[[mcp]]` entries plus `<plugin>:<server>`
     /// rows carrying the expanded env (reserved pair last) and cwd.
+    #[test]
+    fn a_plugin_url_server_registers_as_plugin_colon_server_with_a_url_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join("cfg");
+        let data_dir = dir.path().join("data");
+        let root = dir.path().join("acme");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("plugin.json"),
+            format!(
+                r#"{{"$schema": "{}", "name": "acme"}}"#,
+                hotl_tools::plugins::MANIFEST_SCHEMA
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("mcp.json"),
+            format!(
+                r#"{{"$schema": "{}", "mcpServers": {{"deploy": {{"type": "streamable-http",
+                    "url": "https://deploy.example.com/mcp", "headers": {{"X-Tenant": "t"}}}}}}}}"#,
+                hotl_tools::plugins::MCP_SCHEMA
+            ),
+        )
+        .unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("config.toml"),
+            format!("[plugins.sources]\nacme = {}\n", toml_path(&root)),
+        )
+        .unwrap();
+        let cfg = Config::load(&config_dir);
+        let (entries, warnings) = cfg.plugins.load(&config_dir, &data_dir);
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let (servers, mcp_warnings) = all_mcp_servers_reporting(&cfg, &entries);
+        assert!(mcp_warnings.is_empty(), "{mcp_warnings:?}");
+        assert_eq!(servers.len(), 1);
+        let s = &servers[0];
+        assert_eq!(s.name, "acme:deploy");
+        assert!(s.is_remote());
+        assert_eq!(s.headers, vec![("X-Tenant".to_string(), "t".to_string())]);
+        assert!(s.bearer_token_env.is_none());
+        s.validate().unwrap();
+        assert!(hotl_mcp::trust::Fingerprint::of(s)
+            .key()
+            .starts_with("fpu1:"));
+    }
+
     #[test]
     fn all_mcp_servers_appends_qualified_plugin_servers() {
         let dir = tempfile::tempdir().unwrap();

@@ -374,9 +374,11 @@ fn a_declared_transport_is_used() {
         &root,
         &data_base(dir.path()),
     );
+    // 0063 T5: the Streamable HTTP entry loads beside the stdio one.
     let names: Vec<&str> = out.servers.iter().map(|s| s.name.as_str()).collect();
-    assert_eq!(names, ["local"], "{:?}", out.reports);
-    assert!(out.reports[0].contains("unsupported transport"));
+    assert_eq!(names, ["local", "remote"], "{:?}", out.reports);
+    assert!(out.reports.is_empty(), "{:?}", out.reports);
+    assert_eq!(out.servers[1].url.as_deref(), Some("https://x.com/mcp"));
 }
 
 /// §7.2.1's remote requirements are enforced even though the transport
@@ -406,11 +408,8 @@ fn a_remote_url_and_header_requirements() {
         r#""r": {"type": "streamable-http", "url": "http://127.0.0.1/m"}"#,
     ] {
         let out = parse_mcp_json(&mcp_doc(good), &root, &data);
-        assert!(
-            out.reports[0].contains("unsupported transport"),
-            "{good} → {:?}",
-            out.reports
-        );
+        assert_eq!(out.servers.len(), 1, "{good} → {:?}", out.reports);
+        assert!(out.reports.is_empty(), "{good} → {:?}", out.reports);
     }
 }
 

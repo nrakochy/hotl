@@ -355,18 +355,20 @@ fn discover_skills(handle: &str, root: &Path, reports: &mut Vec<String>) -> Vec<
 /// The canonical 1.0.0 MCP configuration schema identifier (§7.2.1).
 pub const MCP_SCHEMA: &str = "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json";
 
-/// One valid stdio server from a plugin's `mcp.json`, after validation,
-/// containment, and placeholder expansion. `env` carries the configured
-/// pairs in order with the reserved (`PLUGIN_ROOT`, `PLUGIN_DATA`) pair
-/// appended **last** — §9.1's overlay order holds by construction when a
-/// launcher applies pairs first-to-last with last-wins.
+/// One valid server from a plugin's `mcp.json`, after validation,
+/// containment, and placeholder expansion. For a stdio server `env` carries
+/// the configured pairs in order with the reserved (`PLUGIN_ROOT`,
+/// `PLUGIN_DATA`) pair appended **last** — §9.1's overlay order holds by
+/// construction when a launcher applies pairs first-to-last with last-wins.
+/// For a Streamable HTTP server (0063 T5) `url` is set, `command`/`env` are
+/// empty and `cwd` is the plugin root; the config layer reads `url` first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginServer {
     /// The `mcpServers` member name, unqualified — the config layer
     /// composes `<plugin>:<server>`.
     pub name: String,
     /// Bare executable name, or the absolute root-joined path of a `./`
-    /// plugin-relative command.
+    /// plugin-relative command. Empty for a URL server.
     pub command: String,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
@@ -374,6 +376,12 @@ pub struct PluginServer {
     /// (§7.2.1).
     pub cwd: PathBuf,
     pub description: String,
+    /// A Streamable HTTP endpoint (§7.2.1 remote entry). The manifest's
+    /// remote object is closed over `type|url|headers`: no token here.
+    pub url: Option<String>,
+    /// Literal headers from the manifest; a literal `Authorization` is
+    /// refused at validation.
+    pub headers: Vec<(String, String)>,
 }
 
 /// The result of validating one `mcp.json` (§7.2.2). `disabled` is rule
@@ -478,16 +486,15 @@ pub fn parse_mcp_json(text: &str, root: &Path, data: &Path) -> McpOutcome {
             continue;
         }
         match validate_server(entry, root, data) {
-            Ok(ServerEntry::Stdio(mut server)) => {
+            Ok(ServerEntry::Stdio(mut server) | ServerEntry::Remote(mut server)) => {
                 server.name = name.clone();
                 servers.push(server);
             }
-            // §7.2.2 rule 4 — a *valid* remote entry, distinct wording
-            // from the invalid case so Appendix A's URL/header rows stay
-            // honest when a transport plan lands later.
+            // §7.2.2 rule 4 — a *valid* entry on a transport hotl does not
+            // speak, distinct wording from the invalid case.
             Ok(ServerEntry::Unsupported(transport)) => reports.push(format!(
-                "server `{name}` skipped — unsupported transport `{transport}` \
-                 (hotl connects over stdio only)"
+                "server `{name}` skipped — `{transport}` transport: SSE is deprecated \
+                 upstream; hotl connects over stdio or Streamable HTTP"
             )),
             Err(e) => reports.push(format!(
                 "server `{name}` entry invalid — {e}; entry skipped"
@@ -503,6 +510,8 @@ pub fn parse_mcp_json(text: &str, root: &Path, data: &Path) -> McpOutcome {
 
 enum ServerEntry {
     Stdio(PluginServer),
+    /// A Streamable HTTP server (0063 T5).
+    Remote(PluginServer),
     /// A fully valid entry whose declared transport hotl does not
     /// support; carries the transport name for the report.
     Unsupported(&'static str),
@@ -521,9 +530,20 @@ fn validate_server(entry: &Value, root: &Path, data: &Path) -> Result<ServerEntr
     match ty {
         "stdio" => validate_stdio(obj, root, data).map(ServerEntry::Stdio),
         "streamable-http" => {
-            validate_remote(obj).map(|()| ServerEntry::Unsupported("streamable-http"))
+            let (url, headers) = validate_remote(obj)?;
+            Ok(ServerEntry::Remote(PluginServer {
+                name: String::new(),
+                command: String::new(),
+                args: Vec::new(),
+                // No reserved pair: nothing is spawned for a URL server.
+                env: Vec::new(),
+                cwd: root.to_path_buf(),
+                description: String::new(),
+                url: Some(url),
+                headers,
+            }))
         }
-        "sse" => validate_remote(obj).map(|()| ServerEntry::Unsupported("sse")),
+        "sse" => validate_remote(obj).map(|_| ServerEntry::Unsupported("sse")),
         other => Err(format!("unknown `type` `{other}`")),
     }
 }
@@ -588,6 +608,8 @@ fn validate_stdio(
         env,
         cwd,
         description: String::new(),
+        url: None,
+        headers: Vec::new(),
     })
 }
 
@@ -675,7 +697,12 @@ pub fn valid_header_name(name: &str) -> bool {
 /// A remote (`streamable-http` / `sse`) entry: fully validated (§7.2.1's
 /// URL and header requirements) even though hotl then skips it — so a
 /// future transport plan changes one match arm, not the validation.
-fn validate_remote(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
+/// A valid remote entry's `(url, headers)`. A literal `Authorization` header
+/// is refused like the `[[mcp]]` lane's: a token belongs in the environment,
+/// not in a manifest.
+fn validate_remote(
+    obj: &serde_json::Map<String, Value>,
+) -> Result<(String, Vec<(String, String)>), String> {
     for key in obj.keys() {
         if !matches!(key.as_str(), "type" | "url" | "headers") {
             return Err(format!("unknown field `{key}` on a remote entry"));
@@ -686,6 +713,7 @@ fn validate_remote(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
         _ => return Err("`url` is required and must be a string".into()),
     };
     validate_remote_url(url)?;
+    let mut headers = Vec::new();
     if let Some(v) = obj.get("headers") {
         let Some(map) = v.as_object() else {
             return Err("`headers` must be an object of strings".into());
@@ -701,16 +729,24 @@ fn validate_remote(obj: &serde_json::Map<String, Value>) -> Result<(), String> {
                     "`headers` contains `{name}` more than once under different casing"
                 ));
             }
-            seen.push(folded);
+            seen.push(folded.clone());
             let ok = val
                 .as_str()
                 .is_some_and(|v| v.bytes().all(|b| b == b'\t' || (0x20..0x7f).contains(&b)));
             if !ok {
                 return Err(format!("`headers.{name}` is not a valid HTTP header value"));
             }
+            if folded == "authorization" {
+                return Err(
+                    "`headers` sets a literal `Authorization`; a token belongs in the \
+                     environment (`[[mcp]] bearer_token_env`), never in a manifest"
+                        .into(),
+                );
+            }
+            headers.push((name.clone(), val.as_str().unwrap_or("").to_string()));
         }
     }
-    Ok(())
+    Ok((url.to_string(), headers))
 }
 
 /// §7.2.1: absolute http(s), no user information, no fragment; plain
@@ -1183,11 +1219,11 @@ mod tests {
     }
 
     /// §7.2.1's own example, verbatim shapes: the stdio server loads with
-    /// expansion applied and the reserved pair appended last; both remote
-    /// entries validate and then skip as unsupported transports (§7.2.2
-    /// rule 4, owner decision 3).
+    /// expansion applied and the reserved pair appended last; the
+    /// Streamable HTTP entry loads as a URL server (0063 T5); the SSE entry
+    /// validates and then skips (§7.2.2 rule 4).
     #[test]
-    fn the_specs_mcp_example_loads_stdio_and_skips_remote_transports() {
+    fn the_specs_mcp_example_loads_stdio_and_streamable_http_and_skips_sse() {
         let dir = tempfile::tempdir().unwrap();
         let root = plugin_root(&dir.path().join("plugin"), "p");
         std::fs::create_dir_all(root.join("bin")).unwrap();
@@ -1215,9 +1251,20 @@ mod tests {
         );
         let out = parse_mcp_json(&text, &root, &data);
         assert!(!out.disabled);
-        assert_eq!(out.servers.len(), 1, "{:?}", out.reports);
-        let s = &out.servers[0];
-        assert_eq!(s.name, "local-validator");
+        assert_eq!(out.servers.len(), 2, "{:?}", out.reports);
+        let by_name = |n: &str| out.servers.iter().find(|s| s.name == n).expect(n);
+        let remote = by_name("deployment-api");
+        assert_eq!(
+            remote.url.as_deref(),
+            Some("https://deploy.example.com/mcp")
+        );
+        assert_eq!(
+            remote.headers,
+            vec![("X-Tenant".to_string(), "public-tenant".to_string())]
+        );
+        assert!(remote.env.is_empty(), "no reserved pair for a URL server");
+        assert!(remote.command.is_empty());
+        let s = by_name("local-validator");
         assert_eq!(s.command, root.join("bin/validator").to_string_lossy());
         assert_eq!(
             s.args,
@@ -1245,11 +1292,10 @@ mod tests {
             ],
             "configured pairs first, reserved pair last (§9.1)"
         );
-        assert_eq!(out.reports.len(), 2, "{:?}", out.reports);
+        assert_eq!(out.reports.len(), 1, "{:?}", out.reports);
         assert!(
-            out.reports
-                .iter()
-                .all(|r| r.contains("unsupported transport")),
+            out.reports[0].contains("legacy-events")
+                && out.reports[0].contains("SSE is deprecated"),
             "{:?}",
             out.reports
         );
@@ -1353,21 +1399,44 @@ mod tests {
                 out.reports[0]
             );
         }
+        // Valid Streamable HTTP entries load as URL servers (0063 T5).
         for good in [
             r#"{"type": "streamable-http", "url": "https://x.com/mcp"}"#,
             r#"{"type": "streamable-http", "url": "http://localhost:8080/mcp"}"#,
             r#"{"type": "streamable-http", "url": "http://127.0.0.1/mcp"}"#,
             r#"{"type": "streamable-http", "url": "http://[::1]:3000/mcp"}"#,
-            r#"{"type": "sse", "url": "https://x.com/sse", "headers": {"X-A": "v"}}"#,
         ] {
             let (out, _, _) = one_server(good);
-            assert!(
-                out.reports[0].contains("unsupported transport")
-                    && !out.reports[0].contains("invalid"),
-                "{good} → {}",
-                out.reports[0]
-            );
+            assert_eq!(out.servers.len(), 1, "{good} → {:?}", out.reports);
+            assert!(out.servers[0].url.is_some(), "{good}");
+            assert!(out.reports.is_empty(), "{good} → {:?}", out.reports);
         }
+        // A valid SSE entry still skips, with the deprecation wording.
+        let (out, _, _) =
+            one_server(r#"{"type": "sse", "url": "https://x.com/sse", "headers": {"X-A": "v"}}"#);
+        assert!(out.servers.is_empty());
+        assert!(
+            out.reports[0].contains("SSE is deprecated") && !out.reports[0].contains("invalid"),
+            "{}",
+            out.reports[0]
+        );
+    }
+
+    /// 0063 T5: a manifest cannot carry a token — a literal `Authorization`
+    /// header invalidates the entry, like the `[[mcp]]` lane.
+    #[test]
+    fn a_plugin_remote_entry_with_a_literal_authorization_header_is_skipped() {
+        let (out, _, _) = one_server(
+            r#"{"type": "streamable-http", "url": "https://x.com/mcp",
+                "headers": {"Authorization": "Bearer abc"}}"#,
+        );
+        assert!(out.servers.is_empty());
+        assert_eq!(out.reports.len(), 1, "{:?}", out.reports);
+        assert!(
+            out.reports[0].contains("invalid") && out.reports[0].contains("bearer_token_env"),
+            "{}",
+            out.reports[0]
+        );
     }
 
     /// §10.1/§7.2.2 rule 2: a version mismatch or unrecognized `$schema`

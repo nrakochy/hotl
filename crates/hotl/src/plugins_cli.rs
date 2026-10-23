@@ -333,7 +333,7 @@ mod tests {
         // Install-time validation: contents and the skipped transport are
         // visible now, not at first run.
         assert!(out.contains("1 skill(s), 1 MCP server(s)"), "{out}");
-        assert!(out.contains("unsupported transport"), "{out}");
+        assert!(out.contains("SSE is deprecated"), "{out}");
         let text = std::fs::read_to_string(dir.path().join("config.toml")).unwrap();
         assert!(text.contains("[plugins.sources]"), "{text}");
         assert!(!dir.path().join("plugins").exists(), "no clone for a path");
@@ -393,7 +393,7 @@ mod tests {
         );
         assert!(out.contains("acme:mem"), "{out}");
         assert!(
-            out.contains("skipped — unsupported transport `sse`"),
+            out.contains("skipped — `sse` transport: SSE is deprecated"),
             "{out}"
         );
         assert!(
