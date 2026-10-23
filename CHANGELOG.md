@@ -316,6 +316,20 @@ semver promise of their own.
 - **A shell command that needs longer than one call has an honest shape.**
   0.17.0 recorded the limit that a `cmd &` is reaped with the call; `bash
   {background: true}` is the way to keep it running.
+- **`hotl update` no longer fails with "Text file busy" on Linux.** When
+  another process was starting at the moment the new binary was written, the
+  `--version` check could not run it and the update gave up. It now retries
+  briefly before deciding the download is bad.
+- **The worktree note uses `/` on Windows too:** `working in worktree
+  .git/hotl-worktrees/fix-auth`, the same text on every platform.
+
+### Security
+
+- **Dependencies updated for the October advisories:** rustls 0.23.46,
+  rustls-webpki 0.103.16, webpki-roots 1.0.11 (distrusted emSign
+  intermediates), quinn-proto 0.11.19 and tokio 1.54.1
+  (RUSTSEC-2026-0338 to -0342, -0346 to -0349, -0381, -0382, -0386). clipboard-win moves off
+  a yanked 5.4.1.
 
 ## [0.28.0] - 2026-09-28
 
