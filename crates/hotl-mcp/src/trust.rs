@@ -17,111 +17,220 @@ use sha2::{Digest, Sha256};
 
 use crate::config::ServerConfig;
 
-/// Everything that decides *what program runs*, captured in one read.
+/// Everything that decides *where tool calls go*, captured in one read: for
+/// a program, what runs (`Command`); for a URL server, the address and the
+/// headers (`Url`, 0063 T2) — there is no binary to hash.
 ///
 /// `Display` is what the human is shown; [`Fingerprint::key`] is what gets
 /// persisted. Both derive from the same value, which is how H-07's
 /// "shown == recorded, from one read" discipline is preserved.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Fingerprint {
-    command: String,
-    args: Vec<String>,
-    hash: String,
-    /// Content hashes of any argument that resolves to an existing file — the
-    /// script/module an interpreter actually runs (`node server.js`,
-    /// `python x.py`). Hashing only `command` (the interpreter, which never
-    /// changes) left the real code outside the fingerprint (Vuln 5). Empty for
-    /// args that name no local file (`-m pkg`, `npx @pkg`, a `docker` image).
-    arg_hashes: Vec<(String, String)>,
-    /// The configured env overlay. Part of the fingerprint because a
-    /// configured env is a code-execution channel through an already-trusted
-    /// binary (`NODE_OPTIONS`, `PYTHONPATH`, `LD_PRELOAD`) — changing it must
-    /// re-raise the protected ask exactly like changing the args.
-    env: Vec<(String, String)>,
-    /// The configured working directory — it decides what relative paths the
-    /// server reads and writes, so it is screened and recorded too.
-    cwd: Option<PathBuf>,
+pub enum Fingerprint {
+    Command {
+        command: String,
+        args: Vec<String>,
+        hash: String,
+        /// Content hashes of any argument that resolves to an existing file —
+        /// the script/module an interpreter actually runs (`node server.js`,
+        /// `python x.py`). Hashing only `command` (the interpreter, which never
+        /// changes) left the real code outside the fingerprint (Vuln 5). Empty
+        /// for args that name no local file (`-m pkg`, `npx @pkg`, an image).
+        arg_hashes: Vec<(String, String)>,
+        /// The configured env overlay. Part of the fingerprint because a
+        /// configured env is a code-execution channel through an
+        /// already-trusted binary (`NODE_OPTIONS`, `PYTHONPATH`, `LD_PRELOAD`)
+        /// — changing it must re-raise the protected ask like changing args.
+        env: Vec<(String, String)>,
+        /// The configured working directory — it decides what relative paths
+        /// the server reads and writes, so it is screened and recorded too.
+        cwd: Option<PathBuf>,
+    },
+    Url {
+        url: String,
+        /// Header names with their values masked (first 4 chars then `…`;
+        /// 4 chars or fewer print as `…` alone) — the screen shows these.
+        headers: Vec<(String, String)>,
+        /// SHA-256 over the sorted `name=value` pairs — the key records this,
+        /// never a value.
+        headers_hash: String,
+        /// The *name* of the env var the token comes from. Never the value.
+        bearer_env: Option<String>,
+    },
+}
+
+/// `value` masked for the screen: the first 4 chars then `…`; 4 or fewer
+/// read as `…` alone.
+fn mask(value: &str) -> String {
+    if value.chars().count() <= 4 {
+        "…".to_string()
+    } else {
+        format!("{}…", value.chars().take(4).collect::<String>())
+    }
+}
+
+/// `scheme://host[:port]` of a URL, for the screen sentence.
+fn origin(url: &str) -> &str {
+    let Some(scheme_end) = url.find("://") else {
+        return url;
+    };
+    let rest = &url[scheme_end + 3..];
+    match rest.find(['/', '?', '#']) {
+        Some(i) => &url[..scheme_end + 3 + i],
+        None => url,
+    }
 }
 
 impl Fingerprint {
     /// Reads the binary **once**. Callers must not re-derive the parts.
     pub fn of(cfg: &ServerConfig) -> Self {
-        let arg_hashes = cfg
-            .args
-            .iter()
-            .filter_map(|a| {
-                let p = resolve(a);
-                p.is_file().then(|| (a.clone(), file_hash(&p)))
-            })
-            .collect();
-        // T1 interim: a URL server has no program to hash (T2 gives it its
-        // own fingerprint variant).
-        let command = cfg.command.clone().unwrap_or_default();
-        Self {
-            hash: binary_hash(&command),
-            command,
-            args: cfg.args.clone(),
-            arg_hashes,
-            env: cfg.env.clone(),
-            cwd: cfg.cwd.clone(),
+        match cfg.transport() {
+            crate::config::Transport::Http {
+                url,
+                headers,
+                bearer_token_env,
+            } => {
+                let mut pairs: Vec<String> =
+                    headers.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                pairs.sort();
+                let mut hasher = Sha256::new();
+                for p in &pairs {
+                    hasher.update(p.as_bytes());
+                    hasher.update([0]);
+                }
+                Self::Url {
+                    url: url.to_string(),
+                    headers: headers.iter().map(|(k, v)| (k.clone(), mask(v))).collect(),
+                    headers_hash: format!("{:x}", hasher.finalize()),
+                    bearer_env: bearer_token_env.map(str::to_string),
+                }
+            }
+            crate::config::Transport::Stdio {
+                command,
+                args,
+                env,
+                cwd,
+            } => {
+                let arg_hashes = args
+                    .iter()
+                    .filter_map(|a| {
+                        let p = resolve(a);
+                        p.is_file().then(|| (a.clone(), file_hash(&p)))
+                    })
+                    .collect();
+                Self::Command {
+                    command: command.to_string(),
+                    args: args.to_vec(),
+                    hash: binary_hash(command),
+                    arg_hashes,
+                    env: env.to_vec(),
+                    cwd: cwd.map(Path::to_path_buf),
+                }
+            }
         }
     }
 
     /// True when any argument resolves to a file inside `root` — the
     /// agent-writable workspace. Such a server's script can be rewritten by an
     /// auto-allowed in-workspace edit, so its trust must not be persisted
-    /// durably (`TrustStore::record` refuses it); it is re-screened each session.
+    /// durably (`TrustStore::record` refuses it); it is re-screened each
+    /// session. Never true for a URL server.
     pub fn has_arg_under(&self, root: &Path) -> bool {
-        self.arg_hashes
-            .iter()
-            .any(|(arg, _)| dunce::canonicalize(resolve(arg)).is_ok_and(|p| p.starts_with(root)))
+        match self {
+            Self::Command { arg_hashes, .. } => arg_hashes.iter().any(|(arg, _)| {
+                dunce::canonicalize(resolve(arg)).is_ok_and(|p| p.starts_with(root))
+            }),
+            Self::Url { .. } => false,
+        }
     }
 
     /// False when the binary could not be read. A grant is never recorded for
-    /// an unhashable binary, and one is never honoured (T2-7b).
+    /// an unhashable binary, and one is never honoured (T2-7b). A URL server
+    /// has nothing unreadable, so it is always hashed.
     pub fn is_hashed(&self) -> bool {
-        self.hash.starts_with("sha256:")
+        match self {
+            Self::Command { hash, .. } => hash.starts_with("sha256:"),
+            Self::Url { .. } => true,
+        }
     }
 
-    /// The recorded value. Versioned (`fp3:`) so a future scheme change
-    /// invalidates old grants by construction rather than by accident. NUL
-    /// cannot appear in an argv element or env pair, so the encoding is
-    /// injective.
+    /// The recorded value. Versioned (`fp3:` for a program, `fpu1:` for a
+    /// URL) so a future scheme change invalidates old grants by construction
+    /// rather than by accident, and so a URL server can never match a
+    /// program's grant. NUL cannot appear in an argv element or env pair, so
+    /// the encoding is injective.
     pub fn key(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(self.command.as_bytes());
-        hasher.update([0]);
-        for arg in &self.args {
-            hasher.update(arg.as_bytes());
-            hasher.update([0]);
-        }
-        hasher.update(self.hash.as_bytes());
-        hasher.update([0]);
-        for (arg, h) in &self.arg_hashes {
-            hasher.update(arg.as_bytes());
-            hasher.update([0]);
-            hasher.update(h.as_bytes());
-            hasher.update([0]);
-        }
-        // fp3: the scheme now folds in the configured env overlay and cwd
-        // (0032) — env reaches code execution through NODE_OPTIONS-class
-        // variables, so it must re-raise the screen like args do. Old
-        // `fp2:` grants no longer match — the safe direction (they
-        // re-raise the screen once; changelog-noted).
-        for (key, value) in &self.env {
-            hasher.update(key.as_bytes());
-            hasher.update([0]);
-            hasher.update(value.as_bytes());
-            hasher.update([0]);
-        }
-        match &self.cwd {
-            Some(cwd) => {
-                hasher.update([1]);
-                hasher.update(cwd.as_os_str().as_encoded_bytes());
+        match self {
+            Self::Command {
+                command,
+                args,
+                hash,
+                arg_hashes,
+                env,
+                cwd,
+            } => {
+                hasher.update(command.as_bytes());
+                hasher.update([0]);
+                for arg in args {
+                    hasher.update(arg.as_bytes());
+                    hasher.update([0]);
+                }
+                hasher.update(hash.as_bytes());
+                hasher.update([0]);
+                for (arg, h) in arg_hashes {
+                    hasher.update(arg.as_bytes());
+                    hasher.update([0]);
+                    hasher.update(h.as_bytes());
+                    hasher.update([0]);
+                }
+                // fp3: the scheme folds in the configured env overlay and cwd
+                // (0032) — env reaches code execution through NODE_OPTIONS-class
+                // variables, so it must re-raise the screen like args do. Old
+                // `fp2:` grants no longer match — the safe direction.
+                for (key, value) in env {
+                    hasher.update(key.as_bytes());
+                    hasher.update([0]);
+                    hasher.update(value.as_bytes());
+                    hasher.update([0]);
+                }
+                match cwd {
+                    Some(cwd) => {
+                        hasher.update([1]);
+                        hasher.update(cwd.as_os_str().as_encoded_bytes());
+                    }
+                    None => hasher.update([0]),
+                }
+                format!("fp3:{:x}", hasher.finalize())
             }
-            None => hasher.update([0]),
+            Self::Url {
+                url,
+                headers_hash,
+                bearer_env,
+                ..
+            } => {
+                hasher.update(url.as_bytes());
+                hasher.update([0]);
+                hasher.update(headers_hash.as_bytes());
+                hasher.update([0]);
+                match bearer_env {
+                    Some(v) => {
+                        hasher.update([1]);
+                        hasher.update(v.as_bytes());
+                    }
+                    None => hasher.update([0]),
+                }
+                format!("fpu1:{:x}", hasher.finalize())
+            }
         }
-        format!("fp3:{:x}", hasher.finalize())
+    }
+
+    /// The text `TrustStore::record` names when it refuses an unhashable
+    /// program: `(hash, command)`. A URL server never gets here.
+    fn unhashable_parts(&self) -> (&str, &str) {
+        match self {
+            Self::Command { hash, command, .. } => (hash, command),
+            Self::Url { url, .. } => ("", url),
+        }
     }
 }
 
@@ -129,27 +238,57 @@ impl fmt::Display for Fingerprint {
     /// The screen text. `tool.rs`'s `why` string reuses this verbatim rather
     /// than re-deriving the parts.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "binary: {}", self.command)?;
-        if !self.args.is_empty() {
-            write!(f, "\nargs: {:?}", self.args)?;
+        match self {
+            Self::Command {
+                command,
+                args,
+                hash,
+                arg_hashes,
+                env,
+                cwd,
+            } => {
+                write!(f, "binary: {command}")?;
+                if !args.is_empty() {
+                    write!(f, "\nargs: {args:?}")?;
+                }
+                // Everything `key()` records is shown: the screen and the grant
+                // come from one read (H-07). An env entry is a code-execution
+                // channel, so it is screened exactly like an argument.
+                if !env.is_empty() {
+                    let pairs: Vec<String> = env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                    write!(f, "\nenv: {}", pairs.join(" "))?;
+                }
+                if let Some(cwd) = cwd {
+                    write!(f, "\ncwd: {}", cwd.display())?;
+                }
+                write!(f, "\n  {hash}")?;
+                // Show the script/module each interpreter arg actually runs, so
+                // the human screens the real code, not just the interpreter.
+                for (arg, h) in arg_hashes {
+                    write!(f, "\n  {arg}: {h}")?;
+                }
+                Ok(())
+            }
+            Self::Url {
+                url,
+                headers,
+                bearer_env,
+                ..
+            } => {
+                write!(f, "hotl will send tool calls to {}", origin(url))?;
+                match bearer_env {
+                    Some(var) => write!(f, " with a token from ${var}.")?,
+                    None => write!(f, " with no token.")?,
+                }
+                write!(f, "\nurl: {url}")?;
+                if !headers.is_empty() {
+                    let pairs: Vec<String> =
+                        headers.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+                    write!(f, "\nheaders: {}", pairs.join(", "))?;
+                }
+                Ok(())
+            }
         }
-        // Everything `key()` records is shown: the screen and the grant
-        // come from one read (H-07). An env entry is a code-execution
-        // channel, so it is screened exactly like an argument.
-        if !self.env.is_empty() {
-            let pairs: Vec<String> = self.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-            write!(f, "\nenv: {}", pairs.join(" "))?;
-        }
-        if let Some(cwd) = &self.cwd {
-            write!(f, "\ncwd: {}", cwd.display())?;
-        }
-        write!(f, "\n  {}", self.hash)?;
-        // Show the script/module each interpreter arg actually runs, so the
-        // human screens the real code, not just the interpreter (Vuln 5).
-        for (arg, h) in &self.arg_hashes {
-            write!(f, "\n  {arg}: {h}")?;
-        }
-        Ok(())
     }
 }
 
@@ -235,10 +374,10 @@ impl TrustStore {
     /// `the_trust_file_is_written_atomically_and_privately`.
     pub fn record(&mut self, server: &str, fp: &Fingerprint) -> Result<(), String> {
         if !fp.is_hashed() {
+            let (hash, command) = fp.unhashable_parts();
             return Err(format!(
-                "the binary for `{server}` could not be hashed ({}); hotl will ask \
-                 again every time. Check that `{}` exists and is readable.",
-                fp.hash, fp.command
+                "the binary for `{server}` could not be hashed ({hash}); hotl will ask \
+                 again every time. Check that `{command}` exists and is readable."
             ));
         }
         self.approved.insert(server.to_string(), fp.key());
@@ -362,6 +501,138 @@ fn resolve(command: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `fp3:` encoding for a program must not move: a literal captured
+    /// from the pre-enum code, so every grant on disk keeps matching.
+    #[test]
+    fn command_fingerprint_key_is_unchanged() {
+        let fp = Fingerprint::Command {
+            command: "/x/bin".into(),
+            args: vec!["a".into(), "b".into()],
+            hash: "sha256:abc".into(),
+            arg_hashes: vec![("s.js".into(), "sha256:def".into())],
+            env: vec![("K".into(), "v".into())],
+            cwd: Some(PathBuf::from("/w")),
+        };
+        assert_eq!(
+            fp.key(),
+            "fp3:cc46aa5d171d09046813a5eb68a88ab7e1c9a52edcda0646cb4d392177da874b"
+        );
+    }
+
+    fn url_cfg(url: &str, headers: &[(&str, &str)], bearer: Option<&str>) -> ServerConfig {
+        ServerConfig {
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            bearer_token_env: bearer.map(str::to_string),
+            ..ServerConfig::http("gh", url)
+        }
+    }
+
+    #[test]
+    fn url_fingerprint_changes_with_url_headers_and_bearer_env() {
+        let a = Fingerprint::of(&url_cfg("https://a.example/mcp", &[], None));
+        let b = Fingerprint::of(&url_cfg("https://b.example/mcp", &[], None));
+        let c = Fingerprint::of(&url_cfg(
+            "https://a.example/mcp",
+            &[("X-Team", "core")],
+            None,
+        ));
+        let d = Fingerprint::of(&url_cfg("https://a.example/mcp", &[], Some("TOKEN")));
+        let keys = [a.key(), b.key(), c.key(), d.key()];
+        for k in &keys {
+            assert!(k.starts_with("fpu1:"), "{k}");
+        }
+        let distinct: std::collections::HashSet<&String> = keys.iter().collect();
+        assert_eq!(distinct.len(), 4, "{keys:?}");
+        // The same config twice is the same key.
+        assert_eq!(
+            a.key(),
+            Fingerprint::of(&url_cfg("https://a.example/mcp", &[], None)).key()
+        );
+    }
+
+    #[test]
+    fn url_fingerprint_ignores_header_order() {
+        let one = Fingerprint::of(&url_cfg(
+            "https://a.example/mcp",
+            &[("X-A", "1"), ("X-B", "2")],
+            None,
+        ));
+        let two = Fingerprint::of(&url_cfg(
+            "https://a.example/mcp",
+            &[("X-B", "2"), ("X-A", "1")],
+            None,
+        ));
+        assert_eq!(one.key(), two.key());
+        // A changed value is a changed key.
+        let three = Fingerprint::of(&url_cfg(
+            "https://a.example/mcp",
+            &[("X-A", "1"), ("X-B", "3")],
+            None,
+        ));
+        assert_ne!(one.key(), three.key());
+    }
+
+    #[test]
+    fn url_fingerprint_is_hashed_and_recordable() {
+        let dir = tempfile::tempdir().unwrap();
+        let fp = Fingerprint::of(&url_cfg("https://a.example/mcp", &[], Some("T")));
+        assert!(fp.is_hashed());
+        assert!(!fp.has_arg_under(dir.path()));
+        let mut store = TrustStore::load(dir.path());
+        store.record("gh", &fp).unwrap();
+        assert!(TrustStore::load(dir.path()).is_trusted("gh", &fp));
+        assert_eq!(
+            TrustStore::load(dir.path()).state("gh", &fp, dir.path()),
+            TrustState::Trusted
+        );
+    }
+
+    #[test]
+    fn the_url_screen_names_the_origin_and_masks_values() {
+        let fp = Fingerprint::of(&url_cfg(
+            "https://api.githubcopilot.com/mcp/",
+            &[("X-Team", "core-platform"), ("X-Short", "ab")],
+            Some("GITHUB_MCP_TOKEN"),
+        ));
+        let screen = fp.to_string();
+        assert!(
+            screen.starts_with(
+                "hotl will send tool calls to https://api.githubcopilot.com with a token from \
+                 $GITHUB_MCP_TOKEN."
+            ),
+            "{screen}"
+        );
+        assert!(screen.contains("X-Team: core…"), "{screen}");
+        assert!(!screen.contains("core-platform"), "{screen}");
+        assert!(screen.contains("X-Short: …"), "{screen}");
+        let plain = Fingerprint::of(&url_cfg("http://127.0.0.1:3845/mcp", &[], None));
+        assert!(
+            plain
+                .to_string()
+                .starts_with("hotl will send tool calls to http://127.0.0.1:3845 with no token."),
+            "{plain}"
+        );
+    }
+
+    #[test]
+    fn a_command_grant_never_matches_a_url_server_of_the_same_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("server");
+        std::fs::write(&bin, b"x").unwrap();
+        let program = Fingerprint::of(&cfg(bin.to_str().unwrap(), &[]));
+        let mut store = TrustStore::load(dir.path());
+        store.record("docs", &program).unwrap();
+        let url = Fingerprint::of(&url_cfg("https://docs.example/mcp", &[], None));
+        assert!(!store.is_trusted("docs", &url));
+        assert_eq!(store.state("docs", &url, dir.path()), TrustState::Untrusted);
+        // And the other way round.
+        store.record("docs", &url).unwrap();
+        assert!(!store.is_trusted("docs", &program));
+    }
 
     #[test]
     fn trust_roundtrip_and_hash_revocation() {

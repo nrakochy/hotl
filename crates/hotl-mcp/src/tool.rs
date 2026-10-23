@@ -409,24 +409,34 @@ impl Tool for McpTool {
         if trusted {
             Permission::Ask { summary }
         } else {
-            // An unhashable binary can never be recorded (T2-7b), so say so
-            // here rather than letting the screen reappear mysteriously.
-            let recurring = if fp.is_hashed() {
-                ""
-            } else {
-                "\nThis program cannot be hashed, so hotl cannot record the approval \
-                 and will ask again every time."
+            // `Fingerprint`'s Display *is* the screen text, so the value
+            // shown and the value recorded come from one read (H-07).
+            let why = match &fp {
+                Fingerprint::Url { .. } => format!(
+                    "first use of MCP server `{server}` (or its address or headers \
+                     changed).\n{fp}\nApproving lets this server's output into the \
+                     model's context."
+                ),
+                Fingerprint::Command { .. } => {
+                    // An unhashable binary can never be recorded (T2-7b), so say
+                    // so here rather than letting the screen reappear mysteriously.
+                    let recurring = if fp.is_hashed() {
+                        ""
+                    } else {
+                        "\nThis program cannot be hashed, so hotl cannot record the \
+                         approval and will ask again every time."
+                    };
+                    format!(
+                        "first use of MCP server `{server}` (or its program changed).\n\
+                         {fp}\n\
+                         Approving runs this program on your machine and lets its \
+                         output into the model's context.{recurring}"
+                    )
+                }
             };
             Permission::AskProtected {
                 summary,
-                // `Fingerprint`'s Display *is* the screen text, so the value
-                // shown and the value recorded come from one read (H-07).
-                why: format!(
-                    "first use of MCP server `{server}` (or its program changed).\n\
-                     {fp}\n\
-                     Approving runs this program on your machine and lets its \
-                     output into the model's context.{recurring}"
-                ),
+                why,
                 class: hotl_tools::ProtectedClass::TrustFirstUse,
             }
         }
@@ -493,6 +503,34 @@ mod tests {
                 })
             }),
         )
+    }
+
+    /// 0063 T2: a URL server's first-use screen is protected like a program's
+    /// and names where tool calls will go and which env var the token is
+    /// read from — never the token.
+    #[test]
+    fn the_url_first_use_screen_is_protected_and_names_the_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ServerConfig {
+            bearer_token_env: Some("GITHUB_MCP_TOKEN".into()),
+            ..ServerConfig::http("gh", "https://api.githubcopilot.com/mcp/")
+        };
+        let tool = McpTool::with_connector(
+            vec![cfg],
+            TrustStore::load(dir.path()),
+            Box::new(|_cfg| Box::pin(async { Err("not used".to_string()) })),
+        );
+        let Permission::AskProtected { why, class, .. } = tool.permission(&json!({"server": "gh"}))
+        else {
+            panic!("first use is protected");
+        };
+        assert_eq!(class, hotl_tools::ProtectedClass::TrustFirstUse);
+        assert!(
+            why.contains("hotl will send tool calls to https://api.githubcopilot.com"),
+            "{why}"
+        );
+        assert!(why.contains("token from $GITHUB_MCP_TOKEN"), "{why}");
+        assert!(!why.contains("runs this program"), "{why}");
     }
 
     #[test]
