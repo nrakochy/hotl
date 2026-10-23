@@ -190,7 +190,11 @@ jobs:
       # the same trust shape as dist's installer. It skips doctests; Linux
       # runs those.
       - name: Install cargo-nextest
-        run: curl -LsSf https://get.nexte.st/latest/windows-tar | tar zxf - -C "${CARGO_HOME:-$HOME/.cargo}/bin"
+        # cygpath: GNU tar reads the `C:` of a Windows path as a remote host.
+        run: |
+          bin="$(cygpath -u "${CARGO_HOME:-$USERPROFILE/.cargo}")/bin"
+          curl -LsSf https://get.nexte.st/latest/windows-tar | tar zxf - -C "$bin"
+          cargo nextest --version
       - name: Clippy (harness crates + binary)
         run: cargo clippy ${{ env.HARNESS_EXCLUDE }} --all-targets -- -D warnings
       - name: Test (harness crates + binary)
